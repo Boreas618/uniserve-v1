@@ -1,6 +1,6 @@
-//! One batch's worker columns, filled from the calls the mechanism planned.
+//! One batch's worker columns, filled from the calls the mechanism prepared.
 //!
-//! A batch is one numerical call of one phase on one component (§4.4, `M499`),
+//! A batch is one numerical call of one phase on one stage (§4.4, `M499`),
 //! and the worker reads it in the layout the kernels address: `ipc::execution::BatchRows`
 //! — one [`BatchRow`] per call with the half-open row range it owns, then
 //! the token and row columns — beside the sampler's own columns. Nothing is
@@ -9,7 +9,7 @@
 //!
 //! The columns this module fills are the ones the calls themselves state:
 //!
-//! - **rows**: one `BatchRow` per call, contiguous in plan order, with the
+//! - **rows**: one `BatchRow` per call, contiguous in output order, with the
 //!   request slot the call's rows belong to, its [`RowKind`] and its rows;
 //! - **positions**: each call's query tokens start at its own logical position;
 //! - **slot_mapping**: one absolute slot per token through the call's block
@@ -63,11 +63,11 @@
 //!   a verification installs the base its accepted span advances from. Every
 //!   cell of the table is decided by these rules, and nothing here is a default:
 //!   a call the table cannot state — a decode or a verification that samples
-//!   nothing, a row writing past its block table — answers `None`.
+//!   nothing, a row writing past its block table — returns `None`.
 //!
 //! A batch whose calls disagree with what the layout promises — a call whose
 //! rows belong to several requests, a token outside its table, a call a token
-//! batch cannot carry — answers `None`: a planning fault, never a batch that
+//! batch cannot carry — returns `None`: a preparation fault, never a batch that
 //! would run on plausible values. The worker's own `BatchColumns::check` is
 //! the second line of that defence.
 
@@ -83,7 +83,7 @@ use proto::request::SamplingParams;
 
 use super::slots;
 
-/// One row a token call evaluates, as its planner states it.
+/// One row a token call evaluates, as its builder states it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Row {
     /// The row's total attention length: cached prefix plus its own query.
@@ -99,7 +99,7 @@ pub(crate) struct Row {
 /// its request's slot, and the cache tables, fresh units and host page loads
 /// its forward reads through.
 ///
-/// The call planner states this once per call, and the batch's device layout
+/// The call builder states this once per call, and the batch's device layout
 /// (`ExecutionBatch::device`) is written from it; nothing else carries a
 /// call's rows or tables. A call that evaluates no token rows (a media or
 /// transfer call) states no rows.
@@ -143,16 +143,16 @@ impl CallLayout {
 /// token batch does not carry.
 ///
 /// A media call's numerical extent is its own (`worker`'s media runners), and
-/// a transfer moves bytes: neither is a token row. `ForwardMode::TokenDenoising`
-/// likewise runs on the diffusion LM's canvas rather than on token rows, so it
-/// is not a token batch of this shape either — the media fold's batch is the
-/// one that carries it (`M521`, `M708` question 4).
+/// a transfer moves bytes: neither is a token row. A token-denoising call is
+/// one row over its request's block: it reads the request's cached context
+/// and writes no page.
 const fn row_kind(kind: CallKind) -> Option<RowKind> {
     match kind {
         CallKind::Forward(ForwardMode::Prefill) => Some(RowKind::Prefill),
         CallKind::Forward(ForwardMode::Decode) => Some(RowKind::Decode),
         CallKind::Forward(ForwardMode::Verify) => Some(RowKind::Verify),
-        _ => None,
+        CallKind::Forward(ForwardMode::TokenDenoising) => Some(RowKind::Denoise),
+        CallKind::Media(_) => None,
     }
 }
 
@@ -268,11 +268,11 @@ const TEMPERATURE_COLUMN: usize = proto::program::sampler::TEMPERATURE as usize;
 /// The same holds of the page size the caller passes.
 ///
 /// `state` is the deployment's state group, when its model keeps one, and
-/// `resident[i]` whether call `i`'s request slot already holds the request's
+/// `on_device[i]` whether call `i`'s request slot already holds the request's
 /// recurrent state at the call's first token: false for a request's first call
 /// on its slot, which restores the state from the checkpoint ending at its read
 /// start when it resumes from a cached prefix. A call that resumes past position
-/// zero with no checkpoint there is a planning fault.
+/// zero with no checkpoint there is a preparation fault.
 ///
 /// `fresh[i]` is, when call `i`'s request slot does not yet hold the
 /// request's sampling state on its worker, the tokens the request generated
@@ -280,7 +280,7 @@ const TEMPERATURE_COLUMN: usize = proto::program::sampler::TEMPERATURE as usize;
 /// penalty counts the worker starts at those tokens when the request's
 /// penalties count any ([`uses_penalties`]) and at zero otherwise, and a
 /// request that adjusts its logits ([`adjusts_logits`]) installs its bias row,
-/// which every row of it reads afterwards. `None` is a resident slot, and an
+/// which every row of it reads afterwards. `None` is a slot whose state is on the device, and an
 /// empty `fresh` starts nothing. A call whose
 /// `SamplingState` states a per-step allowed set is refused: the worker keeps an
 /// allowed set only as the request's own slot row.
@@ -298,14 +298,14 @@ pub(crate) fn columns(
     block_size: u32,
     max_kv_len: u32,
     state: Option<StatePages>,
-    resident: &[bool],
+    on_device: &[bool],
     fresh: &[Option<&[u32]>],
 ) -> Option<BatchColumns> {
     if requests.len() != inputs.len()
         || requests.len() != sampling.len()
         || requests.len() != draws.len()
         || requests.len() != tables.len()
-        || (state.is_some() && requests.len() != resident.len())
+        || (state.is_some() && requests.len() != on_device.len())
         || (!fresh.is_empty() && requests.len() != fresh.len())
     {
         return None;
@@ -347,7 +347,13 @@ pub(crate) fn columns(
         // before the token it precedes.
         let first = call.coordinates.logical_position;
         let batch_token = u32::try_from(input_ids.len()).ok()?;
-        let context = Context::of(first, inputs, &call.vision_inputs, batch_token)?;
+        let context = if kind == RowKind::Denoise {
+            // The rank holds the block's tokens between its steps, so the row states the
+            // block's positions and no id: the embedding reads the running request block.
+            Context::block(first, tokens_of_call)?
+        } else {
+            Context::of(first, inputs, &call.vision_inputs, batch_token)?
+        };
         if usize::try_from(tokens_of_call).ok()? != context.ids.len() {
             return None;
         }
@@ -373,16 +379,23 @@ pub(crate) fn columns(
             .get(index)?
             .iter()
             .find(|table| table.group_id == 0)?;
-        let mapped = slots::slot_mapping_where(
-            table,
-            block_size,
-            cache_first..cache_first.checked_add(tokens_of_call)?,
-            |position| {
-                let offset = usize::try_from(position - cache_first).unwrap_or(usize::MAX);
-                writes.get(offset).copied().unwrap_or(false)
-            },
-        );
-        rows.slot_mapping.extend(mapped?);
+        if kind == RowKind::Denoise {
+            // A block lies past the request's cached context and is never written: no page
+            // of the table holds it.
+            rows.slot_mapping
+                .extend(std::iter::repeat_n(-1, tokens_of_call as usize));
+        } else {
+            let mapped = slots::slot_mapping_where(
+                table,
+                block_size,
+                cache_first..cache_first.checked_add(tokens_of_call)?,
+                |position| {
+                    let offset = usize::try_from(position - cache_first).unwrap_or(usize::MAX);
+                    writes.get(offset).copied().unwrap_or(false)
+                },
+            );
+            rows.slot_mapping.extend(mapped?);
+        }
 
         for row in &call_rows.rows {
             rows.seq_lens.push(i32::try_from(row.seq_len).ok()?);
@@ -399,7 +412,7 @@ pub(crate) fn columns(
                 // The first row of a request's first call on its slot continues from the
                 // checkpoint its reused prefix ends at; a row from position zero starts from a zero
                 // state the kernels write themselves.
-                if row == 0 && start > 0 && !resident.get(index).copied()? {
+                if row == 0 && start > 0 && !on_device.get(index).copied()? {
                     restores.push(StateCopy {
                         slot: request,
                         units: state.page(table, start)?,
@@ -514,26 +527,33 @@ pub(crate) fn columns(
         // A call samples when it declares a sampled-token output: a decode and
         // a verification always do, and a prompt chunk does only when it is the
         // chunk that ends the prompt. `consumer_slots` is the worker's, filled
-        // after this runs, so the mechanism's own answer is `token_output`.
-        let sampled = call.token_output.is_some();
+        // after this runs, so the mechanism's own response is `token_output`.
+        //
+        // A denoising step installs no sampled token: the step that stops its block reports
+        // the block's tokens, which a later prefill commits to the cache.
+        let sampled = call.token_output.is_some() && kind != RowKind::Denoise;
         if matches!(kind, RowKind::Decode | RowKind::Verify) && !sampled {
+            return None;
+        }
+        if (kind == RowKind::Denoise) != call.block_step.is_some() {
             return None;
         }
         let mode = match kind {
             RowKind::Decode => commit::mode::DECODE,
             RowKind::Verify => commit::mode::VERIFY,
             RowKind::Prefill if sampled => commit::mode::EXPLICIT,
-            RowKind::Prefill => commit::mode::CACHE,
+            // A denoising step states the cache extent it reads, which it leaves as it is.
+            RowKind::Prefill | RowKind::Denoise => commit::mode::CACHE,
         };
         let explicit = mode == commit::mode::EXPLICIT;
         let verify = mode == commit::mode::VERIFY;
         // The tokens this call commits to the cache: a decode its one token,
         // a prefill the query of every row that writes, and a verification
         // none, its accepted span being the device's to install. A call that
-        // would write past its block table is a planning fault, not a clamp.
+        // would write past its block table is a preparation fault, not a clamp.
         let committed = match kind {
             RowKind::Decode => 1,
-            RowKind::Verify => 0,
+            RowKind::Verify | RowKind::Denoise => 0,
             RowKind::Prefill => call_rows
                 .rows
                 .iter()
@@ -558,7 +578,8 @@ pub(crate) fn columns(
         };
         // Every prefill states its cache extent, sampled or not; a decode and a
         // verification advance it on the device.
-        cells[commit::column::CACHE_LENGTH] = if matches!(kind, RowKind::Prefill) {
+        cells[commit::column::CACHE_LENGTH] = if matches!(kind, RowKind::Prefill | RowKind::Denoise)
+        {
             i64::from(length)
         } else {
             0
@@ -599,6 +620,15 @@ pub(crate) fn columns(
         }
     }
 
+    // A batch denoises blocks or it does not: one batch is one phase.
+    let block_steps: Vec<ipc::BlockStep> = requests
+        .iter()
+        .filter_map(|(call, _)| call.block_step)
+        .collect();
+    if !block_steps.is_empty() && block_steps.len() != requests.len() {
+        return None;
+    }
+
     rows.query_offsets = slots::query_offsets(&queries)?;
     rows.logits_rows = slots::logits_rows_of(
         requests
@@ -627,7 +657,7 @@ pub(crate) fn columns(
         // Every restore precedes the forward and every checkpoint follows it.
         state_copies: restores.into_iter().chain(keeps).collect(),
         // A batch none of whose calls drafts states none, as a deployment that does not
-        // speculate plans.
+        // speculate schedules.
         drafts: if drafts
             .iter()
             .all(|draft| *draft == ipc::DraftWork::default())
@@ -658,6 +688,7 @@ pub(crate) fn columns(
             fresh_slots.dedup_by_key(|fresh| fresh.slot);
             fresh_slots
         },
+        block_steps,
     })
 }
 
@@ -676,10 +707,25 @@ struct Context {
 }
 
 impl Context {
+    /// The rows of a denoising step over a block of `tokens` tokens at logical position `first`:
+    /// the block's positions, and no id.
+    fn block(first: u32, tokens: u32) -> Option<Self> {
+        let end = first.checked_add(tokens)?;
+        Some(Self {
+            ids: vec![0; tokens as usize],
+            positions: (first..end)
+                .map(i32::try_from)
+                .collect::<Result<_, _>>()
+                .ok()?,
+            vision: Vec::new(),
+            end,
+        })
+    }
+
     /// The rows of a call at logical position `first` whose input tokens are `inputs` and whose
     /// image blocks are `blocks`, the call's first row being the batch's token `batch_token`.
     ///
-    /// Answers `None` for a block past the call's tokens or blocks out of order.
+    /// Returns `None` for a block past the call's tokens or blocks out of order.
     fn of(
         first: u32,
         inputs: &[i32],
@@ -748,7 +794,9 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> ipc::execution::Shape {
         .calls
         .iter()
         .any(|call| matches!(call.kind, RowKind::Prefill));
-    let variant = if prefill && columns.targets.iter().any(|target| *target >= 0) {
+    let variant = if !columns.block_steps.is_empty() {
+        Variant::TokenDenoise
+    } else if prefill && columns.targets.iter().any(|target| *target >= 0) {
         // Scoring projects every token of the bucket, so only a batch that scores pays for it.
         Variant::PrefillScored
     } else if prefill {
@@ -813,7 +861,7 @@ mod tests {
         block_size: u32,
         max_kv_len: u32,
         state: Option<StatePages>,
-        resident: &[bool],
+        on_device: &[bool],
     ) -> Option<BatchColumns> {
         let requests: Vec<(&Call, &CallLayout)> =
             requests.iter().map(|(call, rows)| (call, rows)).collect();
@@ -826,7 +874,7 @@ mod tests {
             block_size,
             max_kv_len,
             state,
-            resident,
+            on_device,
             &[],
         )
     }
@@ -850,8 +898,8 @@ mod tests {
             kind,
         );
         // A call that samples declares the output it samples into, which is
-        // what the planner sets (`plan_decode`, `plan_verify`, a sampling
-        // `plan_prefill`); `consumer_slots` is the worker's, filled later.
+        // what the builder sets (`prepare_decode`, `prepare_verify`, a sampling
+        // `prepare_prefill`); `consumer_slots` is the worker's, filled later.
         call.token_output = Some(ipc::TensorRef {
             request_key: ipc::RequestKey::new(1, ipc::RequestId(1), 1),
             producer_call_id: ipc::CallId::new(1, 0),
@@ -941,7 +989,7 @@ mod tests {
         kv.allocated_tokens = 20;
         let requests = vec![(call(prefill(), 8, &[8]), dispatch(1, &[8], &[true]))];
         let tables = vec![vec![kv, state_table]];
-        let fill = |resident: bool| {
+        let fill = |running: bool| {
             columns(
                 &requests,
                 &tables,
@@ -951,7 +999,7 @@ mod tests {
                 BLOCK_SIZE,
                 2048,
                 Some(state),
-                &[resident],
+                &[running],
             )
             .expect("a prompt batch over a state group")
         };
@@ -1008,7 +1056,7 @@ mod tests {
         // model reads this column verbatim into its factor tables, so a row index here would put
         // every decode at RoPE angle zero and produce plausible, wrong logits.
         assert_eq!(columns.rows.positions, vec![12]);
-        // The row's attention length is the planner's `Row::seq_len` - cached prefix plus
+        // The row's attention length is the builder's `Row::seq_len` - cached prefix plus
         // this row's queries - and not the call's position: this fixture states a prefix of 8 for a
         // call at position 12, so the column carries 9. The two are separate inputs on purpose (a
         // retained cache can be shorter than the sequence), and a live decode states them equal.
@@ -1043,7 +1091,7 @@ mod tests {
         );
     }
 
-    /// A request that starts on a slot with tokens already generated - handed over from its
+    /// A request that starts on a slot with tokens already generated - given over from its
     /// prefill group, migrated, or admitted again - starts its slot's penalty counts at them, so its
     /// penalties count what a slot it held from its first token would; a request whose penalties
     /// count nothing starts at zero, as one that generated nothing does.
@@ -1099,7 +1147,7 @@ mod tests {
     }
 
     /// A request with a logit bias or an allowed set installs its slot's bias row with the call
-    /// that is not yet resident, flags every row of it, and bans its call's suppressed tokens; a
+    /// that is not yet running, flags every row of it, and bans its call's suppressed tokens; a
     /// request with neither, beside it, states nothing, and a batch of such requests alone states
     /// no adjustment at all.
     #[test]
@@ -1168,14 +1216,14 @@ mod tests {
             .check(&batch_shape(&columns))
             .expect("the adjustments are canonical and one per row");
 
-        // Once the row is resident the request still reads it, and installs nothing.
-        let resident = fill(&[None, None], [&restricted, &plain]);
-        assert!(resident.adjustments.installs.is_empty());
+        // Once the row is running the request still reads it, and installs nothing.
+        let running = fill(&[None, None], [&restricted, &plain]);
+        assert!(running.adjustments.installs.is_empty());
         assert!(
-            resident.fresh_slots.is_empty(),
-            "a resident slot keeps its counts"
+            running.fresh_slots.is_empty(),
+            "a running request slot keeps its counts"
         );
-        assert_eq!(resident.adjustments.biased, vec![true, false]);
+        assert_eq!(running.adjustments.biased, vec![true, false]);
 
         // A per-step allowed set has no device form: the batch is refused rather than served
         // without it.
@@ -1529,7 +1577,7 @@ mod tests {
         );
 
         // A prefill writing past the extent its block table covers is a
-        // planning fault, not a clamped extent.
+        // preparation fault, not a clamped extent.
         let mut overlong = call(prefill(), 18, &[4]);
         overlong.coordinates.cache_visible_len = 18;
         assert!(

@@ -1,14 +1,14 @@
-//! Answers to media batches, read from what the mechanism staged for each request.
+//! Responds to media batches, read from what the mechanism staged for each request.
 //!
 //! A media batch carries no token columns: each of its rows is one request's staged record
 //! ([`ipc::execution::StagedRequest`]), which names the request, the diffusion step the call runs
-//! and, for a muxing call, the encoded rounds it hands over. [`Media`] answers such a batch the way
+//! and, for a muxing call, the encoded rounds it hands over. [`Media`] responds such a batch the way
 //! a media runner's completion reads:
 //!
 //! - a latent preparation opens its trajectory at the step its restore stored, or at zero;
 //! - a denoising call completes the step it runs (`step + 1`);
 //! - the final muxing call, the one that hands no round, publishes the artifact into a POSIX
-//!   shared-memory object the mechanism claims;
+//!   shared-memory object the mechanism takes;
 //! - every other call completes with nothing to report.
 //!
 //! A case can refuse a request's calls as the model would refuse its inputs, overstate the length
@@ -23,14 +23,14 @@ use ipc::execution::{
 };
 use ipc::{CallStatus, ErrorCode, MediaCall, RankLatentLayout, RequestId, TimingCounters};
 
-use crate::batches::Answer;
+use crate::batches::OutputFn;
 
-/// The media half of a fake worker: what its media calls answer.
+/// The media half of a fake worker: what its media calls response.
 #[derive(Default)]
 pub struct Media {
     /// Requests whose media calls the model refuses, with the reason it states.
     refused: Mutex<HashMap<RequestId, String>>,
-    /// Bytes a published artifact claims beyond what it holds.
+    /// Bytes a published artifact states beyond what it holds.
     overstatement: u64,
     /// The page layout every latent preparation reports, one entry per denoising rank.
     latent_layouts: Vec<RankLatentLayout>,
@@ -42,7 +42,7 @@ impl Media {
         Self::default()
     }
 
-    /// States `extra` bytes more than every published artifact holds, which the mechanism's claim
+    /// States `extra` bytes more than every published artifact holds, which the mechanism's opening
     /// must refuse.
     #[must_use]
     pub fn overstating(mut self, extra: u64) -> Self {
@@ -65,9 +65,9 @@ impl Media {
             .insert(id, reason.to_owned());
     }
 
-    /// The answer of a fake whose batches are all media batches.
-    pub fn answering(self: Arc<Self>) -> Answer {
-        Arc::new(move |batch| self.answer(batch))
+    /// The response of a fake whose batches are all media batches.
+    pub fn output_fn(self: Arc<Self>) -> OutputFn {
+        Arc::new(move |batch| self.output(batch))
     }
 
     /// The bucket a fake serves `computation` in: the extent the mechanism stated, so every media
@@ -78,7 +78,7 @@ impl Media {
 
     /// The completion of media batch `batch`; a batch without media columns fails, since no
     /// runner of this fake serves it.
-    pub fn answer(&self, batch: &Batch) -> Outcome<BatchOutput> {
+    pub fn output(&self, batch: &Batch) -> Outcome<BatchOutput> {
         let Some(columns) = batch.media.as_ref() else {
             return failed(format!("batch {} carries no media columns", batch.id.0));
         };
@@ -147,7 +147,7 @@ impl Media {
             MediaCall::LatentPreparation => output.latent_layouts = self.latent_layouts.clone(),
             // The muxer takes each round's encoded units as they arrive and assembles the
             // artifact on the call that hands none.
-            MediaCall::Muxing if staged.handed == 0 => {
+            MediaCall::Muxing if staged.rounds == 0 => {
                 let payload = format!("uniserve-fake-video request={}", request.0);
                 output.media_output = Some(publish(payload.as_bytes(), self.overstatement)?);
             }
@@ -163,7 +163,7 @@ fn failed(message: String) -> Outcome<BatchOutput> {
 }
 
 /// Publishes `bytes` as a POSIX shared-memory object stating `extra` bytes more than it holds, as
-/// a worker's media stage relinquishes an artifact for the mechanism to claim.
+/// a worker's media stage relinquishes an artifact for the mechanism to take.
 fn publish(bytes: &[u8], extra: u64) -> Result<ipc::MediaOutput, String> {
     let storage = || -> std::io::Result<String> {
         let mut storage = tempfile::Builder::new()

@@ -4,8 +4,7 @@
 //! [`RequestDispatch`] it chose, plus lifecycle commands, and lays it out once
 //! as the `ipc::execution::Batch` the device worker reads
 //! ([`ExecutionBatch::device`]). `Submissions` hands that batch to the device
-//! worker, stamped with the step's generation, or gives the whole record to
-//! the simulated one.
+//! worker, stamped with the step's generation.
 
 use super::WorkerGroupId;
 use ipc::{BatchCommand, BufferAllocation, Call, DecodeRange, NewRequest, RequestKey};
@@ -60,8 +59,8 @@ pub struct RequestDispatch {
     /// rank of the worker that backs them. Request retirement retains every
     /// physical reader and writer allocation.
     pub buffers: Vec<RankBuffer>,
-    /// For a video request's call, the worker routed to each component that
-    /// reads its products, keyed by component name, as the request's graph
+    /// For a video request's call, the worker routed to each stage that
+    /// reads its products, keyed by stage name, as the request's graph
     /// connects its calls; empty for a call whose products leave the graph.
     /// Admission fixes a video request's route, so a product is published
     /// only toward the replicas that read it. `None` for calls outside a
@@ -151,6 +150,172 @@ impl ExecutionBatch {
         }
     }
 
+    /// The pools the batch takes a slot of: those its calls and its page
+    /// offloads run on.
+    pub(crate) fn pools(&self) -> Vec<WorkerGroupId> {
+        let mut pools: Vec<WorkerGroupId> = self
+            .requests
+            .iter()
+            .map(|(_, dispatch)| dispatch.worker.clone())
+            .chain(
+                self.page_offloads
+                    .iter()
+                    .map(|offloads| offloads.worker.clone()),
+            )
+            .collect();
+        pools.sort();
+        pools.dedup();
+        pools
+    }
+
+    /// The products the batch's commands release: the rank frees each before
+    /// it serves the batch, its last reader having completed. The batch's
+    /// other commands are the scheduler's own.
+    pub(crate) fn frees(&self) -> Vec<ipc::BufferId> {
+        self.commands
+            .iter()
+            .filter_map(|command| match command {
+                BatchCommand::Free { buffer } => Some(*buffer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The batch as its devices read it, on generation `generation`, with the
+    /// scheduler's names for its calls in the order the batch numbers them.
+    ///
+    /// The batch was laid out once when the scheduler assembled it
+    /// ([`Self::device`]); this stamps the generation and checks the layout
+    /// against the calls before it leaves. A batch the scheduler could not lay
+    /// out, a token batch carrying a media call or a media batch a token call,
+    /// a batch whose calls name no device phase or several, and columns that
+    /// do not fit their shape are refused rather than served on invented
+    /// values.
+    ///
+    /// Of the batch's lifecycle commands only its frees travel
+    /// (`Batch::frees`): a product's storage is the rank's, and the rank
+    /// releases it before it serves the batch. A batch of commands alone
+    /// carries its frees to `frees_group`, the group that encodes images,
+    /// which releases them and responds to no call. A batch that completes
+    /// reports no command as failed, which the scheduler reads as its
+    /// commands having been applied.
+    pub(crate) fn device_batch(
+        &self,
+        generation: u64,
+        frees_group: &str,
+    ) -> anyhow::Result<(ipc::execution::Batch, Vec<(RequestKey, ipc::CallId)>)> {
+        if self.requests.is_empty() {
+            let phase =
+                crate::submission::wire_phase(ipc::CallKind::Media(ipc::MediaCall::VisionEncoding))
+                    .unwrap_or(ipc::PhaseId(0));
+            let batch = ipc::execution::Batch {
+                id: ipc::execution::BatchId(self.id),
+                phase,
+                group: frees_group.to_owned(),
+                calls: Vec::new(),
+                shape: ipc::execution::Shape {
+                    rows: 0,
+                    tokens: 0,
+                    variant: ipc::execution::Variant::ConditionEncode,
+                },
+                columns: Default::default(),
+                generation,
+                cache_units: Vec::new(),
+                block_tables: Vec::new(),
+                page_loads: Vec::new(),
+                page_offloads: Vec::new(),
+                latent_restores: Vec::new(),
+                host_outputs: Vec::new(),
+                images: Vec::new(),
+                frees: self.frees(),
+                media: None,
+            };
+            return Ok((batch, Vec::new()));
+        }
+        let device = self.device.as_ref().ok_or_else(|| {
+            // A media batch that arrives without its layout is a different fact from a token
+            // batch without one: the scheduler states a media computation's per-request buffers
+            // only for the computations a device serves, so the refusal names the computation
+            // rather than the token layout that batch never had.
+            match self.requests.first().map(|(call, _)| call.kind) {
+                Some(ipc::CallKind::Media(call)) => anyhow::anyhow!(
+                    "batch {} states no media columns: no per-request buffers are stated for a \
+                     {:?} computation",
+                    self.id,
+                    call
+                ),
+                _ => anyhow::anyhow!(
+                    "batch {} carries no columns: the scheduler could not state the layout its \
+                     kernels read",
+                    self.id
+                ),
+            }
+        })?;
+        // One batch is one computation: a token batch is the typed columns the scheduler wrote,
+        // and a media batch is the computation its kernels were captured for beside the request's
+        // own stated parameters.
+        let media = device.media.is_some();
+        let mut calls = Vec::with_capacity(self.requests.len());
+        for (call, dispatch) in &self.requests {
+            // The devices of the batch's group run it, so every call is that group's.
+            anyhow::ensure!(
+                dispatch.worker.0 == device.group,
+                "batch {} runs on worker group {} and carries a call placed on {}",
+                self.id,
+                device.group,
+                dispatch.worker.0
+            );
+            let media_call = matches!(call.kind, ipc::CallKind::Media(_));
+            anyhow::ensure!(
+                !media_call || media,
+                "no media call is served from a token batch (batch {}): {:?}",
+                self.id,
+                call.kind
+            );
+            anyhow::ensure!(
+                media_call || !media,
+                "batch {} states media columns and carries a call no media phase serves: {:?}",
+                self.id,
+                call.kind
+            );
+            let phase = crate::submission::wire_phase(call.kind).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "batch {} carries a call kind no device phase serves: {:?}",
+                    self.id,
+                    call.kind
+                )
+            })?;
+            anyhow::ensure!(
+                phase == device.phase,
+                "batch {} mixes phases: one batch serves one phase",
+                self.id
+            );
+            calls.push((call.request_key, call.call_id));
+        }
+        if let Some(media) = &device.media {
+            // A text encoding is the one media computation that reads token columns: its prompt.
+            anyhow::ensure!(
+                device.columns == ipc::execution::BatchColumns::default()
+                    || media.computation.call == ipc::MediaCall::TextEncoding,
+                "batch {} states token columns and media columns: one batch is one computation",
+                self.id
+            );
+            media
+                .check()
+                .map_err(|error| anyhow::anyhow!("batch {}: {error}", self.id))?;
+        } else {
+            device
+                .columns
+                .check(&device.shape)
+                .map_err(|error| anyhow::anyhow!("batch {}: {error}", self.id))?;
+        }
+        let mut device = device.clone();
+        device.generation = generation;
+        // The products whose last reader completed reach the rank that holds them.
+        device.frees = self.frees();
+        Ok((device, calls))
+    }
+
     /// Iterates over request admissions carried by batch commands.
     pub fn admissions(&self) -> impl Iterator<Item = &NewRequest> {
         self.commands.iter().filter_map(|command| match command {
@@ -211,7 +376,7 @@ impl ExecutionBatch {
             // `WorkerGroupId`'s public field admits any string; only its
             // constructor checks the identifier syntax.
             WorkerGroupId::new(dispatch.worker.0.clone())?;
-            anyhow::ensure!(!call.component.is_empty(), "call requires a component");
+            anyhow::ensure!(!call.stage.is_empty(), "call requires a stage");
             anyhow::ensure!(
                 identities.insert(call.call_id),
                 "logical batch repeats a call identity"

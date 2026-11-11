@@ -1,4 +1,4 @@
-//! What a policy decides: the plan of one step, and the victims of a shortage.
+//! What a policy decides: the output of one step, and the victims of a shortage.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,12 +11,12 @@ use crate::ids::{EncodingId, PageId, PhaseId, RequestId};
 /// write a field the mechanism added, and the mechanism then executes the
 /// empty entry.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Plan {
-    /// Queued requests to admit, in order. The mechanism admits each; the
-    /// first one it cannot place and the ones after it stay queued.
+pub struct DispatchOutput {
+    /// Waiting requests to admit, in order. The mechanism admits each; the
+    /// first one it cannot place and the ones after it stay waiting.
     #[serde(default)]
     pub admit: Vec<RequestId>,
-    /// Queued requests to reject as over capacity.
+    /// Waiting requests to reject as over capacity.
     #[serde(default)]
     pub reject: Vec<RequestId>,
     /// This step's work, in the order it runs: which request, which phase, how
@@ -67,9 +67,9 @@ pub struct Inflight {
 
 /// The room this step has left (design §4.4).
 ///
-/// The policy emits a `Plan` that fits it; a plan over the step's token, call,
-/// graph-tier or slot limits is a policy failure, and a plan whose work does
-/// not fit the free KV units after `reclaim` leaves that work to the next step.
+/// The policy emits a `DispatchOutput` that fits it; a dispatch output over the step's token, call,
+/// graph-tier or slot limits is a policy failure, and a dispatch output whose work does
+/// not fit the free KV units after `preempt` leaves that work to the next step.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Room {
     /// The step number this room belongs to.

@@ -223,11 +223,11 @@ impl Denoiser {
         );
         let fake = Arc::new(
             FakeBatches::new(vec![inventory])
-                .answering(Arc::new(move |batch| {
+                .with_output(Arc::new(move |batch| {
                     if let Some(gate) = &gate {
                         gate.pass(batch);
                     }
-                    media.answer(batch)
+                    media.output(batch)
                 }))
                 .with_media(Arc::new(Media::serves)),
         );

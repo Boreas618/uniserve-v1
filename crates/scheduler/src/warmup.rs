@@ -7,9 +7,9 @@
 //!
 //! It runs at the opening of admission, not at startup or at the epoch's first
 //! switchover, because its requests are batches like a client's: the scheduler
-//! plans them into the device's captured buckets, and the switchover only
+//! schedules them into the device's captured buckets, and the switchover only
 //! queues those captures, which run behind it for as long as a model's bucket
-//! catalogue takes. A batch planned before its bucket is captured finds no graph
+//! buckets take. A batch prepared before its bucket is captured finds no graph
 //! to replay, which fails the worker. Admission opens once every capture has
 //! run, and a scheduler that admits has a policy (one with none forms no batch),
 //! so the owner of admission starts the warm-up then
@@ -153,11 +153,11 @@ pub(crate) fn groups(
     // Keeps the requests clients could submit, naming what it leaves out.
     let servable = |what: &str, requests: Vec<GenerationRequest>| {
         // A deployment with block sampling generates every request in
-        // canvases, so admission checks its canvas features.
-        let canvases = facts.canvas_sampling.is_some();
+        // blocks, so admission checks its block features.
+        let blocks = facts.block_sampling.is_some();
         let (kept, refused): (Vec<_>, Vec<_>) = requests.into_iter().partition(|request| {
-            let needs = if canvases {
-                request.canvas_features()
+            let needs = if blocks {
+                request.block_features()
             } else {
                 request.required_features()
             };
@@ -191,10 +191,10 @@ pub(crate) fn groups(
     }
 
     if info.diffusion_lm_step_rows > 0 {
-        let sampling = facts.canvas_sampling.context(
+        let sampling = facts.block_sampling.context(
             "workers report diffusion LM step rows but the deployment has no block sampling",
         )?;
-        let length = sampling.canvas_length as usize;
+        let length = sampling.block_length as usize;
         // Requests of different lengths stop stepping together once the
         // shortest finishes: each commits its block in its own batch, and
         // whether two of them step together again depends on timing. So each
@@ -203,7 +203,7 @@ pub(crate) fn groups(
             let blocks = if rows == 1 { 2 } else { 1 };
             let requests = servable(
                 "diffusion LM",
-                // The scheduler generates every such request in canvases of
+                // The scheduler generates every such request in blocks of
                 // the deployment's block sampling.
                 (0..rows).map(|_| und(blocks * length)).collect(),
             );
@@ -318,47 +318,45 @@ fn await_finish(core: &Warm, group: &str, stream: &mut EventRx) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use crate::{GenerationFeatures, GenerationLimits};
-    use ipc::CanvasSampling;
+    use ipc::BlockSampling;
 
     use super::*;
-    use crate::core::SchedulerHandle;
-    use crate::sim::{SimEngine, SimWorker};
 
-    /// The warm-up's groups on `sim`, which reports running on a CUDA device, in
-    /// the deployment `deployment` adjusts.
-    ///
-    /// The requests are stated without being submitted: a scheduler with no
-    /// policy forms no batch, so a warm-up only runs once the epoch's first
-    /// policy serves, and what a deployment's shapes ask for is checked here.
-    fn groups_of(sim: SimEngine, deployment: impl FnOnce(&mut EngineArgs)) -> Vec<Group> {
-        let mut args = crate::core::sim_args("warmup");
+    /// The launch arguments of a deployment whose ranks run on a CUDA device.
+    fn cuda_args() -> EngineArgs {
+        let mut args = testkit::args("warmup");
         args.engine_config.parallel.worker_groups[0].ranks[0].device = "cuda:0".to_owned();
-        deployment(&mut args);
-        let worker = SimWorker::new(sim);
-        let core = SchedulerHandle::with_worker(
-            &args,
-            crate::SchedulerConfig::default(),
-            Box::new(worker),
-        )
-        .unwrap();
+        args
+    }
+
+    /// The warm-up's groups of a deployment whose rank reports `info`, admitted
+    /// under `limits`.
+    ///
+    /// The requests are stated without being submitted: what a deployment's
+    /// shapes ask for is checked here, and that they run when admission opens
+    /// in the serving cases.
+    fn groups_of(
+        args: &EngineArgs,
+        info: &ipc::MainProcessInfo,
+        limits: &GenerationLimits,
+    ) -> Vec<Group> {
         let mut id = 0;
-        let groups = groups(&args, core.info(), &core.generation_limits(), || {
+        groups(args, info, limits, || {
             id += 1;
             ipc::RequestId(id)
         })
-        .expect("the deployment's warm-up requests are stated");
-        core.shutdown();
-        groups
-    }
-
-    /// The model configuration `args` states, which a test adjusts.
-    fn facts(args: &mut EngineArgs) -> &mut proto::config::ModelConfig {
-        &mut args.engine_config.model
+        .expect("the deployment's warm-up requests are stated")
     }
 
     #[test]
     fn a_token_deployment_warms_a_prefill_and_a_decode() {
-        let groups = groups_of(SimEngine::new(), |_| {});
+        let args = cuda_args();
+        let info = testkit::rank("localhost");
+        let limits = GenerationLimits {
+            features: GenerationFeatures::UNDERSTANDING,
+            ..args.engine_config.model.generation_limits.clone()
+        };
+        let groups = groups_of(&args, &info, &limits);
         assert_eq!(groups.len(), 1, "one group: the token runtime's");
         assert_eq!(groups[0].what, "token");
         // A one-token prompt and two generated tokens: the prefill, then a
@@ -372,33 +370,25 @@ mod tests {
 
     #[test]
     fn a_cpu_deployment_runs_no_warmup() {
-        // `sim_args` runs on CPU, where no serving path is captured.
-        let args = crate::core::sim_args("warmup");
-        let worker = SimWorker::new(SimEngine::new());
-        let core = SchedulerHandle::with_worker(
-            &args,
-            crate::SchedulerConfig::default(),
-            Box::new(worker),
-        )
-        .unwrap();
-        let intent = core.warmup();
-        let result = warm(&intent, &args);
-        core.shutdown();
-        result.expect("a CPU deployment has nothing to warm");
+        // `testkit::args` runs on CPU, where no serving path is captured: the
+        // warm-up submits nothing, so its command channel is never read.
+        let args = testkit::args("warmup");
+        let (commands, _unread) = crossbeam_channel::unbounded();
+        let intent = Warm {
+            info: testkit::rank("localhost"),
+            generation_limits: args.engine_config.model.generation_limits.clone(),
+            next_id: Default::default(),
+            dead: Default::default(),
+            failure: Default::default(),
+            commands: crate::CommandSender::new(commands),
+        };
+        warm(&intent, &args).expect("a CPU deployment has nothing to warm");
     }
 
     #[test]
     fn a_diffusion_lm_steps_at_every_row_count_and_commits_a_block() {
-        let mut sim = SimEngine::new();
-        sim.mut_info_for_test().supported_calls = vec![
-            CallKind::Forward(ForwardMode::Prefill),
-            CallKind::Forward(ForwardMode::TokenDenoising),
-        ];
-        sim.mut_info_for_test().diffusion_lm_step_rows = 3;
-        sim.set_queue_depth(8);
-        sim.set_block_size(16);
-        let canvas = CanvasSampling {
-            canvas_length: 16,
+        let sampling = BlockSampling {
+            block_length: 16,
             max_steps: 2,
             entropy_bound: 0.1,
             t_min: 0.4,
@@ -406,18 +396,25 @@ mod tests {
             confidence_threshold: 0.005,
             stability_threshold: 1,
         };
-        // The ranks run under the deployment's block sampling.
-        sim.set_canvas_sampling(canvas);
+        // The rank prefills prompts and denoises blocks, three rows a step.
+        let info = ipc::MainProcessInfo {
+            supported_calls: vec![
+                CallKind::Forward(ForwardMode::Prefill),
+                CallKind::Forward(ForwardMode::TokenDenoising),
+            ],
+            diffusion_lm_step_rows: 3,
+            ..testkit::rank("localhost")
+        };
+        let mut args = cuda_args();
+        let model = &mut args.engine_config.model;
+        model.generation_limits = GenerationLimits {
+            features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::TOKEN_DENOISING,
+            ..model.generation_limits.clone()
+        };
+        model.block_sampling = Some(sampling);
+        let limits = model.generation_limits.clone();
 
-        let groups = groups_of(sim, |args| {
-            let facts = facts(args);
-            facts.generation_limits = GenerationLimits {
-                features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::TOKEN_DENOISING,
-                ..facts.generation_limits.clone()
-            };
-            facts.canvas_sampling = Some(canvas);
-        });
-
+        let groups = groups_of(&args, &info, &limits);
         let rows: Vec<usize> = groups
             .iter()
             .filter(|group| group.what == "diffusion LM")
@@ -428,13 +425,12 @@ mod tests {
             [3, 2, 1],
             "every row count from the rank's largest down to one, as its own group"
         );
-        // Each group asks for its own number of blocks of the canvas; the
-        // one-row request asks for two, so its committed block runs the prefill
-        // of a commit.
+        // Each group asks for its own number of blocks; the one-row request
+        // asks for two, so its committed block runs the prefill of a commit.
         let blocks: Vec<usize> = groups
             .iter()
             .filter(|group| group.what == "diffusion LM")
-            .map(|group| group.requests[0].max_und_tokens / canvas.canvas_length as usize)
+            .map(|group| group.requests[0].max_und_tokens / sampling.block_length as usize)
             .collect();
         assert_eq!(blocks, [1, 1, 2]);
     }

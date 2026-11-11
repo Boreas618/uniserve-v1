@@ -8,18 +8,12 @@
 //! what a successor may read, the log-probabilities a client asked for, the
 //! artifact — and the mechanism keeps *its own rules*: the
 //! stop conditions are evaluated here from the sampled token
-//! (`OutputSender::und_token_outcome`), and the call's budget, cache window and
-//! sampling rows are the plan's.
+//! (`OutputSender::und_token_kind`), and the call's budget, cache window and
+//! sampling rows are the output's.
 //!
-//! Two fillers produce these types, both at the edge of the mechanism and
-//! neither inventing a value:
-//!
-//! - [`BatchReport::from_output`] / [`CallCompletion::from_output`] for the
-//!   in-process worker, which reports `ipc::execution::BatchOutput`: the
-//!   device's own account of each call (2.4).
-//! - `CallCompletion::from_wire` / `BatchReport::from_wire` for a simulated
-//!   worker, which reports in `ipc`'s types; built only with the `testing`
-//!   feature.
+//! [`BatchReport::from_output`] and [`CallCompletion::from_output`] fill these
+//! types at the edge of the mechanism from `ipc::execution::BatchOutput`, the
+//! device's own account of each call, and invent no value.
 
 use std::sync::Arc;
 
@@ -27,9 +21,6 @@ use ipc::{
     CallId, CallStatus, ErrorCode, ForwardStats, RankLatentLayout, RequestKey, SharedMedia,
     SharedMediaError, TimingCounters, TokenLogprob,
 };
-
-#[cfg(feature = "testing")]
-use crate::worker::{BatchResult, CallResult};
 
 /// One call's completion, as the mechanism reads it.
 #[derive(Clone, Debug)]
@@ -63,41 +54,12 @@ pub(crate) struct CallCompletion {
     pub draft_token_ids: Vec<u32>,
     /// A video latent preparation's per-rank page layout.
     pub latent_layouts: Vec<RankLatentLayout>,
-    /// The immutable storage the device published, claimed by the mechanism —
-    /// or its claim's error, which belongs to the request that asked for it.
+    /// The immutable storage the device published, taken by the mechanism —
+    /// or the error of opening it, which belongs to the request that asked for it.
     pub media: Result<Option<Arc<SharedMedia>>, SharedMediaError>,
 }
 
-impl CallCompletion {
-    /// The simulated edge: what a simulated rank reported, in the mechanism's
-    /// type.
-    ///
-    /// A rank's `finish_flags` are dropped rather than carried: the stop
-    /// conditions are the request's own rules and the mechanism evaluates them
-    /// from the sampled token, so a second, device-side copy of that rule would
-    /// be a weaker one.
-    #[cfg(feature = "testing")]
-    pub(crate) fn from_wire(result: CallResult) -> Self {
-        let output = result.output;
-        Self {
-            request_key: output.request_key,
-            call_id: output.call_id,
-            status: output.status,
-            error_code: output.error_code,
-            error_message: output.error_message,
-            timing_counters: output.timing_counters,
-            cache_visible_len: output.cache_visible_len,
-            cache_computed_len: output.cache_computed_len,
-            step_index: output.step_index,
-            committed_tokens: output.committed_tokens,
-            token_logprobs: output.token_logprobs,
-            prompt_logprobs: output.prompt_logprobs,
-            draft_token_ids: output.draft_token_ids,
-            latent_layouts: output.latent_layouts,
-            media: result.media,
-        }
-    }
-}
+impl CallCompletion {}
 
 impl CallCompletion {
     /// The in-process edge: what a device's runner reported, in the mechanism's
@@ -106,8 +68,8 @@ impl CallCompletion {
     /// The mechanism names the call: the worker numbers a batch's calls by
     /// their index, so the pair comes from the batch that was submitted. A host
     /// call publishes its artifact into a POSIX shared-memory object and names
-    /// it, and that name is claimed here — the mapping is what the mechanism
-    /// delivers, and claiming it is what unlinks the name.
+    /// it, and that name is taken here — the mapping is what the mechanism
+    /// delivers, and taking it is what unlinks the name.
     ///
     /// Two things the device reports differently from a worker, both stated
     /// rather than filled in: a call has no timing of its own (the batch
@@ -137,27 +99,27 @@ impl CallCompletion {
             draft_token_ids: output.draft_token_ids,
             latent_layouts: output.latent_layouts,
             media: match output.media_output.as_ref() {
-                Some(published) => claim(published),
+                Some(published) => open(published),
                 None => Ok(None),
             },
         }
     }
 }
 
-/// Claims the artifact an in-process host call published.
+/// Opens the artifact an in-process host call published.
 ///
 /// The worker's media stage copies the mux's bytes into a shared-memory object and relinquishes
 /// it (`ipc::MediaSource::into_locator`), which states the object's name and its exact length; the
-/// claim is the mechanism's, and it is the call that unlinks the name and maps the bytes.
+/// opening is the mechanism's, and it is the call that unlinks the name and maps the bytes.
 ///
 /// # Safety
 ///
 /// The publisher writes nothing after it relinquishes the object and never resizes it, which is the
-/// contract `SharedMedia::open` requires. The mechanism is the only claimer of a name the worker
+/// requirement `SharedMedia::open` states. The mechanism is the only opener of a name the worker
 /// published for one completion.
-fn claim(published: &ipc::MediaOutput) -> Result<Option<Arc<SharedMedia>>, SharedMediaError> {
+fn open(published: &ipc::MediaOutput) -> Result<Option<Arc<SharedMedia>>, SharedMediaError> {
     let ipc::ArtifactHandle::PosixShm { name } = &published.handle;
-    // SAFETY: see this function's contract - the bytes are written before the publisher
+    // SAFETY: see this function's requirement - the bytes are written before the publisher
     // relinquishes the object and no process modifies it while the mapping lives.
     let media = unsafe { SharedMedia::open(name, published.bytes)? };
     Ok(Some(Arc::new(media)))
@@ -182,31 +144,6 @@ pub(crate) struct BatchReport {
 }
 
 impl BatchReport {
-    /// The simulated edge: a logical result, in the mechanism's type.
-    #[cfg(feature = "testing")]
-    pub(crate) fn from_wire(result: BatchResult) -> Self {
-        Self {
-            batch_id: result.batch_id,
-            calls: result
-                .results
-                .into_iter()
-                .map(CallCompletion::from_wire)
-                .collect(),
-            command_results: result.command_results,
-            done: result.done,
-            // The wire states a duration per worker; the mechanism measures a
-            // step by the device work it waited for, which is their sum.
-            timing: TimingCounters {
-                device_us: result
-                    .worker_exec_us
-                    .into_iter()
-                    .fold(0u64, u64::saturating_add),
-                ..TimingCounters::default()
-            },
-            forward_stats: result.forward_stats,
-        }
-    }
-
     /// The in-process edge: what this process's devices reported, in the
     /// mechanism's type.
     ///
@@ -314,7 +251,7 @@ mod tests {
     use ipc::execution::{BatchOutput, CallId as DeviceCallId, CallOutput as DeviceCall};
 
     /// What one device call reports: `committed` tokens, the batches it stands
-    /// at, and the log-probability of each when the deployment planned them.
+    /// at, and the log-probability of each when the deployment prepared them.
     fn device_call(index: u64, committed: &[u32], logprobs: &[f32]) -> DeviceCall {
         let mut call = DeviceCall::completed(
             DeviceCallId(index),

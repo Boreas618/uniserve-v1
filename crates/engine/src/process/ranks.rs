@@ -502,9 +502,9 @@ pub(super) fn scheduler(
                 // Every component the rank reports is placed on the group's ranks. A text rank
                 // reports the one default component, and a media rank one per block of its
                 // pipeline, which the scheduler reads a call's width and owner from.
-                components: pool
+                stages: pool
                     .report
-                    .components
+                    .stages
                     .iter()
                     .flat_map(|component| {
                         scheduler::WorkerGroupConfig::single_component(
@@ -535,7 +535,7 @@ pub(super) fn scheduler(
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.
     let progress = scheduler::CommandWaker::new(move || control.wake());
-    scheduler::SchedulerHandle::over_batches_telling(&args, limits, batches, progress)
+    scheduler::SchedulerHandle::over_batches(&args, limits, batches, progress)
 }
 
 /// How long the scheduler node waits for a peer to report the first rank of a worker group it

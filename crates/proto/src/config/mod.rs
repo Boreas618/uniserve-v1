@@ -268,11 +268,11 @@ pub struct SchedulerConfig {
     /// configuration's `max_running_requests`.
     #[serde(skip)]
     pub max_running_requests: usize,
-    /// Block-diffusion sampling of every canvas the deployment generates, resolved from the model.
+    /// Block-diffusion sampling of every block the deployment generates, resolved from the model.
     /// A block-diffusion runtime has no autoregressive decode, so each request it serves runs
     /// under this sampling.
     #[serde(skip)]
-    pub canvas: Option<crate::request::CanvasSampling>,
+    pub block_sampling: Option<crate::request::BlockSampling>,
     /// The most draft tokens a verification carries per request
     /// (`speculative_config.num_draft_tokens`); zero when the deployment does not speculate.
     #[serde(skip)]
@@ -294,7 +294,7 @@ impl Default for SchedulerConfig {
             max_batch: positive(DEFAULT_MAX_BATCH),
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
-            canvas: None,
+            block_sampling: None,
             draft_tokens: 0,
             graph_tiers: Vec::new(),
         }
@@ -307,7 +307,7 @@ impl SchedulerConfig {
     /// sizes in tokens, ascending (§4.4, §4.5).
     ///
     /// The rest is the configuration's: its running requests, its waiting queue and its prefill
-    /// chunk, the model's canvas sampling, and the drafter's tokens.
+    /// chunk, the model's block sampling, and the drafter's tokens.
     pub fn of(
         engine: &EngineConfig,
         max_batch: usize,
@@ -326,7 +326,7 @@ impl SchedulerConfig {
             max_batch: positive(max_batch),
             max_num_batched_tokens,
             max_running_requests: engine.max_running_requests.get(),
-            canvas: engine.model.canvas_sampling,
+            block_sampling: engine.model.block_sampling,
             draft_tokens: engine.speculative.num_draft_tokens as usize,
             graph_tiers,
         }
@@ -892,8 +892,8 @@ pub struct ModelConfig {
     pub bos: u32,
     /// Every end-of-sequence token, the primary one first.
     pub eos: Vec<u32>,
-    /// A block-diffusion model's canvas sampling; absent for other models.
-    pub canvas_sampling: Option<crate::request::CanvasSampling>,
+    /// A block-diffusion model's block sampling; absent for other models.
+    pub block_sampling: Option<crate::request::BlockSampling>,
     /// Whether a prompt's prefill returns outputs, which only conditioning prefills of
     /// block-diffusion models do not.
     pub prefill_outputs: bool,
@@ -901,13 +901,13 @@ pub struct ModelConfig {
 
 impl ModelConfig {
     /// Whether `other` processes requests as this model does: the same generation limits,
-    /// control tokens, context length and canvas sampling, read from the checkpoint.
+    /// control tokens, context length and block sampling, read from the checkpoint.
     pub fn processes_as(&self, other: &Self) -> bool {
         self.generation_limits == other.generation_limits
             && self.bos == other.bos
             && self.eos == other.eos
             && self.max_model_len == other.max_model_len
-            && self.canvas_sampling == other.canvas_sampling
+            && self.block_sampling == other.block_sampling
             && self.prefill_outputs == other.prefill_outputs
     }
 }

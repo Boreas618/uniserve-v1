@@ -8,7 +8,7 @@ fn claimed_media_remains_readable_after_its_name_and_first_consumer_are_gone() {
     let locator = MediaSource::publish(b"complete media bytes")
         .unwrap()
         .into_locator();
-    // SAFETY: export completed every write and handed off ownership.
+    // SAFETY: export completed every write and transferred ownership.
     let media = Arc::new(unsafe { SharedMedia::open(&locator.name, locator.bytes) }.unwrap());
     assert_eq!(media.len(), 20);
     assert!(!media.is_empty());
@@ -31,7 +31,7 @@ fn a_truncated_export_is_rejected_and_releases_its_named_storage() {
     // The locator claims one byte more than was written. The length check runs
     // after the name is unlinked, so even a correctly sized retry finds no
     // object: the rejected export does not retain named storage.
-    // SAFETY: export completed every write and handed off ownership.
+    // SAFETY: export completed every write and transferred ownership.
     assert!(unsafe { SharedMedia::open(&locator.name, 6) }.is_err());
     // SAFETY: as above; nothing writes the export after its publisher finished.
     assert!(unsafe { SharedMedia::open(&locator.name, 5) }.is_err());

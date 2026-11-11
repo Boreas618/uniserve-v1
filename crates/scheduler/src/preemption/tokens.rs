@@ -2,9 +2,11 @@
 //! call needs.
 //!
 //! A running request that could not get the units of its next call is
-//! starved ([`Scheduler::note_starved`]). The step's reclaim relieves it:
-//! the policy names a victim that gives its units up and is recomputed
-//! (`Scheduler::reclaim_shortage`). Two states remain that the reclaim
+//! starved ([`Scheduler::note_starved`]). The step's preemption relieves it:
+//! the policy names the victims of the shortage, and the mechanism frees
+//! exactly those ([`Scheduler::preempt_shortage`]): a request gives its units
+//! up and is recomputed, an idle page goes to the host pool, an encoder
+//! entry leaves the encoder cache. Two states remain that the preemption
 //! does not reach, and this module ends them: a request whose sequence
 //! outgrew the whole cache ends with the cache-capacity finish
 //! ([`Scheduler::finish_outgrown`]), and when every running request starves
@@ -16,8 +18,8 @@ use crate::*;
 
 impl Scheduler {
     /// Notes that the running request `id` could not get the `needed` units
-    /// its next call needs, for the next step's reclaim
-    /// (`Scheduler::reclaim_shortage`), [`Self::recompute_starved`] and,
+    /// its next call needs, for the next step's preemption
+    /// (`Scheduler::preempt_shortage`), [`Self::recompute_starved`] and,
     /// while the tail is given back, [`Self::note_stuck_holder`].
     pub(crate) fn note_starved(&mut self, id: RequestId, needed: usize) {
         match self.starved.iter_mut().find(|(starved, _)| *starved == id) {
@@ -25,6 +27,101 @@ impl Scheduler {
             None => self.starved.push((id, needed)),
         }
         self.note_stuck_holder(id);
+    }
+
+    /// Asks the policy for the victims of the shortage the mechanism reports,
+    /// validates them, and frees exactly those (design §4.4).
+    ///
+    /// The mechanism decides that there is a shortage and owns every cache; the
+    /// policy decides what to give up. A victim list that does not validate is
+    /// a policy failure, like any other invalid decision.
+    pub(crate) fn preempt_shortage(&mut self) {
+        // A request no victim could let grow is no shortage a policy can
+        // relieve: it ends at the length the cache holds.
+        self.finish_outgrown();
+        let Some(shortage) = views::shortage_now(self) else {
+            return;
+        };
+        let Some(mut policy) = self.policy.take() else {
+            return;
+        };
+        let victims = match policy.preempt(&shortage) {
+            Ok(victims) => victims,
+            Err(error) => {
+                let _ = self.policy_failed(policy, error);
+                return;
+            }
+        };
+        let live = self.live();
+        match mechanism::validate_victims(&shortage, &victims, &live) {
+            Ok(()) => {}
+            Err(mechanism::VictimError::Invalid(error)) => {
+                let _ = self.policy_failed(policy, error);
+                return;
+            }
+            Err(mechanism::VictimError::Vanished(message)) => {
+                // Nothing of this step can free a page or end a request between
+                // the observation the policy responded from and this call, so a
+                // victim that is gone means the mechanism let go of it without
+                // recording that it did: an invariant of its own, never the
+                // policy's decision (§4.4's taxonomy).
+                self.policy = Some(policy);
+                self.invariant_broken(&message);
+                return;
+            }
+        }
+        self.policy = Some(policy);
+        for victim in &victims {
+            self.free_victim(victim);
+        }
+        if !victims.is_empty() {
+            tracing::debug!(
+                kind = ?shortage.kind,
+                need = shortage.need,
+                victims = victims.len(),
+                "the policy freed what it named"
+            );
+        }
+    }
+
+    /// Frees the one thing a victim names.
+    ///
+    /// An encoder entry leaves the encoder cache and its worker buffer goes with
+    /// it; a device page goes to the host KV cache, exactly as a withdrawal's
+    /// pages do, and the units it held return when the copy completes (or at
+    /// once when the host cache has nowhere to put it).
+    fn free_victim(&mut self, victim: &scheduling::guest::Victim) {
+        match victim {
+            scheduling::guest::Victim::Encoding(id) => {
+                let key = self
+                    .storage
+                    .encoder_cache
+                    .entries()
+                    .map(|(key, _)| key)
+                    .find(|key| views::encoding_id(key) == *id);
+                let freed = key.and_then(|key| self.storage.encoder_cache.evict(&key));
+                if let Some(product) = freed {
+                    self.free_buffers([product.buffer_id()]);
+                }
+            }
+            scheduling::guest::Victim::Page(page) => {
+                if let Some(unit) = views::unit_of(*page) {
+                    self.offload_units(&[unit]);
+                }
+            }
+            // Today's capacity preemption, which the design keeps: a request
+            // that must give its units away is marked migratable with `Drain`,
+            // as `recompute_starved` does when it withdraws the units its
+            // requests hold. `Drain` asks the engine to hold the epoch the
+            // stream is in, and there is no epoch change here, so the daemon
+            // resubmits the request as a continuation carrying the state it
+            // reached. Only a migratable request is marked: one the daemon
+            // could not resubmit would be lost. The request retires at its next
+            // call boundary, and what it holds returns then.
+            scheduling::guest::Victim::Request(request) => {
+                self.migrate_running(MigrationCause::Drain, |id| id.0 == request.0);
+            }
+        }
     }
 
     /// Ends the starved requests no preemption can let grow: the units one
@@ -39,8 +136,8 @@ impl Scheduler {
             .starved
             .iter()
             .filter_map(|&(id, needed)| {
-                let state = self.running.get(&id)?;
-                if state.terminal_intent.is_some() {
+                let state = self.requests.tokens(&id)?;
+                if self.requests.finished(&id) {
                     return None;
                 }
                 let held: usize = state
@@ -60,11 +157,8 @@ impl Scheduler {
                 "a request needs more KV cache units than the cache holds: it ends at the length \
                  the cache holds"
             );
-            if let Some(state) = self.running.get_mut(&id) {
-                crate::terminal::latch_finish(
-                    &mut state.terminal_intent,
-                    FinishReason::CacheCapacity,
-                );
+            if let Some(status) = self.requests.status_mut(&id) {
+                status.finish(Terminal::finish(FinishReason::CacheCapacity));
             }
         }
     }
@@ -81,9 +175,9 @@ impl Scheduler {
     /// giving up its own units, and is not recomputed: one the cache cannot
     /// hold ends at its length ([`Self::finish_outgrown`]).
     ///
-    /// The step's reclaim is where a starved request is relieved: the policy
-    /// names the victim (`Scheduler::reclaim_shortage`). This breaks the one
-    /// state that reclaim would not reach, a policy that names no request.
+    /// The step's preemption is where a starved request is relieved: the policy
+    /// names the victim (`Scheduler::preempt_shortage`). This breaks the one
+    /// state that preemption would not reach, a policy that names no request.
     pub(crate) fn recompute_starved(&mut self, submitted: bool) {
         self.finish_outgrown();
         if self.starved.is_empty()
@@ -92,29 +186,33 @@ impl Scheduler {
             || !self.inflight.pending_batches.is_empty()
             || !self.inflight.pending_submissions.is_empty()
             || self
-                .running
-                .values()
-                .any(|state| state.terminal_intent.is_some())
+                .requests
+                .running_tokens()
+                .any(|(_, status, _)| status.is_finished())
         {
             return;
         }
         let starved = |id: &RequestId| self.starved.iter().any(|(starved, _)| starved == id);
-        let live: Vec<(&RequestId, &RequestState)> = self
-            .running
-            .iter()
-            .filter(|(_, state)| !state.terminal_intent.is_some())
+        // Each live token request with its priority and the time it arrived.
+        let live: Vec<(RequestId, i32, u64)> = self
+            .requests
+            .running_tokens()
+            .filter(|(_, status, _)| !status.is_finished())
+            .map(|(id, _, state)| {
+                let queued_us = self
+                    .requests
+                    .get(&id)
+                    .map_or(0, |request| request.queued_us);
+                (id, state.req.priority, queued_us)
+            })
             .collect();
-        if live.len() < 2 || live.iter().any(|(id, _)| !starved(id)) {
+        if live.len() < 2 || live.iter().any(|(id, _, _)| !starved(id)) {
             return;
         }
         let Some(victim) = live
             .iter()
-            .max_by(|(_, a), (_, b)| {
-                (a.req.priority, a.queued_us)
-                    .partial_cmp(&(b.req.priority, b.queued_us))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(id, _)| **id)
+            .max_by_key(|(_, priority, queued_us)| (*priority, *queued_us))
+            .map(|(id, _, _)| *id)
         else {
             return;
         };

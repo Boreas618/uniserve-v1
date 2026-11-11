@@ -17,7 +17,7 @@
 //! one local [`Wake`], which the owner's other threads fire for work that did
 //! not arrive on the socket. An owner that closes a connection on purpose
 //! calls [`Channel::flush`] first, since dropping a channel discards the
-//! frames still queued.
+//! frames still waiting.
 //!
 //! A closed connection is terminal. Frames that arrived whole before the
 //! close are still delivered; every call after them fails. A TCP connection
@@ -44,7 +44,7 @@ use crate::frame::Frame;
 /// The prefix of a Unix socket address; the rest is the socket's path.
 const UNIX_PREFIX: &str = "unix:";
 
-/// Seconds after which a TCP connection whose peer has stopped answering
+/// Seconds after which a TCP connection whose peer has stopped responding
 /// fails.
 ///
 /// A host that dies sends no close. Without this bound its ranks' requests
@@ -85,7 +85,7 @@ impl Stream {
     }
 }
 
-/// Makes a TCP connection fail when its peer's host stops answering.
+/// Makes a TCP connection fail when its peer's host stops responding.
 ///
 /// A host that dies sends no close, so without probes its connection stays
 /// open for as long as nothing is sent to it.
@@ -113,7 +113,7 @@ fn keep_alive(stream: &TcpStream) -> IpcResult<()> {
     };
 
     // An idle connection is probed after half the bound and fails when three
-    // probes, spread over the other half, go unanswered. Sent data that stays
+    // probes, spread over the other half, go unresolved. Sent data that stays
     // unacknowledged fails the connection after the whole bound.
     set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
     #[cfg(target_os = "linux")]
@@ -199,7 +199,7 @@ impl FrameReader {
         let mut closed = false;
         loop {
             match stream.read(&mut chunk) {
-                // A peer that answers and then exits closes the stream with
+                // A peer that responds and then exits closes the stream with
                 // its last frames still unread, so the bytes already taken are
                 // formed into frames before the close is reported.
                 Ok(0) => {
@@ -356,7 +356,7 @@ impl Wake {
 struct LocalWake {
     /// Non-blocking end the owner polls and drains.
     reader: UnixStream,
-    /// The firing end, shared with every [`Wake`] handed out.
+    /// The firing end, shared with every [`Wake`] given out.
     wake: Wake,
 }
 
@@ -600,7 +600,7 @@ impl Channel {
 
     /// Writes out every queued frame, waiting for the socket to accept them.
     ///
-    /// Dropping a channel discards what is still queued, so an owner calls
+    /// Dropping a channel discards what is still waiting, so an owner calls
     /// this before it closes a connection on purpose: without it a rank's
     /// last response, queued behind a large result the engine is still
     /// reading, is lost and the engine reports a truncated frame instead of
@@ -981,9 +981,9 @@ mod tests {
             near.send(&request).unwrap();
             assert_eq!(recv::<MainProcessRequest>(&mut far).unwrap(), request);
 
-            let answer = response_of(77, 16);
-            far.send(&answer).unwrap();
-            assert_eq!(recv::<MainProcessResponse>(&mut near).unwrap(), answer);
+            let response = response_of(77, 16);
+            far.send(&response).unwrap();
+            assert_eq!(recv::<MainProcessResponse>(&mut near).unwrap(), response);
         }
     }
 

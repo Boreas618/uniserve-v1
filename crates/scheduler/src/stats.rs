@@ -24,7 +24,7 @@ pub struct GeneralStats {
     pub running: AtomicUsize,
     /// Current number of token and media requests waiting for admission.
     pub pending: AtomicUsize,
-    /// Current number of batches registered in flight, from planning until
+    /// Current number of batches registered in flight, from preparing until
     /// their final result or a worker failure that empties them, including
     /// batches still awaiting submission.
     pub in_flight: AtomicUsize,
@@ -73,7 +73,7 @@ pub struct EncoderStats {
     pub cache_queries: AtomicU64,
     /// Cumulative encoder-cache hits.
     pub cache_hits: AtomicU64,
-    /// Current number of resident encoder products.
+    /// Current number of encoder products held on workers.
     pub cached: AtomicUsize,
 }
 
@@ -119,7 +119,7 @@ pub struct DomainStats {
     /// Cumulative calls skipped by a false predicate.
     pub predicated_calls: AtomicU64,
     /// Cumulative calls that returned an error status or whose credit was
-    /// reclaimed after an execution failure.
+    /// returned after an execution failure.
     pub error_calls: AtomicU64,
     /// Cumulative submissions rejected by worker backpressure.
     pub backpressure_events: AtomicU64,
@@ -127,9 +127,9 @@ pub struct DomainStats {
     pub reclaimed_credits: AtomicU64,
     /// Cumulative batch result reports that contained calls of this domain.
     pub completed_batches: AtomicU64,
-    /// Cumulative scheduler time from planning a call to registering it in
-    /// flight, in microseconds. Calls of media requests, planned by
-    /// `plan_media_call`, contribute zero.
+    /// Cumulative scheduler time from preparing a call to registering it in
+    /// flight, in microseconds. Calls of media requests, prepared by
+    /// `prepare_media_call`, contribute zero.
     pub queue_us: AtomicU64,
     /// Cumulative worker-reported wait before execution
     /// (`TimingCounters::queued_us`), in microseconds.
@@ -151,8 +151,8 @@ pub struct ExecutionDomainStats {
     /// Counters for every other media call: latent preparation, denoising,
     /// decoding, media encoding, and muxing.
     pub flow: DomainStats,
-    /// Counters for token-canvas denoising passes.
-    pub canvas: DomainStats,
+    /// Counters for token-block denoising passes.
+    pub block: DomainStats,
 }
 
 impl ExecutionDomainStats {
@@ -184,7 +184,7 @@ impl ExecutionDomainStats {
             ("prefill", &self.prefill),
             ("decode", &self.decode),
             ("flow", &self.flow),
-            ("canvas", &self.canvas),
+            ("block", &self.block),
         ]
     }
 
@@ -205,15 +205,15 @@ pub struct WorkerStats {
     pub forward_mode_tokens: Mutex<BTreeMap<String, u64>>,
     /// Forward execution time keyed by worker runtime mode, in microseconds.
     pub forward_mode_us: Mutex<BTreeMap<String, u64>>,
-    /// Forward execution time keyed by worker component, in microseconds.
-    pub forward_component_us: Mutex<BTreeMap<String, u64>>,
+    /// Forward execution time keyed by module, in microseconds.
+    pub forward_module_us: Mutex<BTreeMap<String, u64>>,
     /// Worker stream device time keyed `{stream}/{state}`, in microseconds
     /// (`ForwardStats::stream_us`).
     pub stream_us: Mutex<BTreeMap<String, u64>>,
     /// Worker driver calls that waited for the device, keyed
     /// `{thread}/{call}` (`ForwardStats::blocking_calls`).
     pub blocking_calls: Mutex<BTreeMap<String, u64>>,
-    /// Fence probe step durations keyed `{stage}/{component}`
+    /// Fence probe step durations keyed `{stage}/{module}`
     /// (`ForwardStats::fence_us`).
     pub fence_us: Mutex<BTreeMap<String, ipc::FenceHistogram>>,
     /// Cumulative fence probe records the workers lost.
@@ -249,17 +249,17 @@ pub struct WorkerStats {
     pub text_decode_position_relay_hits: AtomicU64,
     /// Cumulative decode rows that required a host-supplied position.
     pub text_decode_position_relay_misses: AtomicU64,
-    /// Cumulative FlashInfer decode-plan constructions.
+    /// Cumulative FlashInfer decode-output constructions.
     pub flashinfer_decode_plan_calls: AtomicU64,
-    /// Cumulative FlashInfer decode-plan cache reuses.
+    /// Cumulative FlashInfer decode-output cache reuses.
     pub flashinfer_decode_plan_reuses: AtomicU64,
-    /// Cumulative rows included in FlashInfer decode plans.
+    /// Cumulative rows included in FlashInfer decode schedules.
     pub flashinfer_decode_plan_rows: AtomicU64,
-    /// Cumulative page-table indices included in FlashInfer decode plans.
+    /// Cumulative page-table indices included in FlashInfer decode schedules.
     pub flashinfer_decode_plan_indices: AtomicU64,
-    /// Cumulative graph-compatible FlashInfer decode-plan constructions.
+    /// Cumulative graph-compatible FlashInfer decode-output constructions.
     pub flashinfer_decode_graph_plan_calls: AtomicU64,
-    /// Cumulative graph-compatible FlashInfer decode-plan reuses.
+    /// Cumulative graph-compatible FlashInfer decode-output reuses.
     pub flashinfer_decode_graph_plan_reuses: AtomicU64,
     /// Cumulative rows processed by speculative verification.
     pub spec_verify_rows: AtomicU64,

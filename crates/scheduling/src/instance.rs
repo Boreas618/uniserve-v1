@@ -12,7 +12,7 @@
 //! it, or traps, fails the call: the instance is not used again, and the
 //! mechanism instantiates the policy it keeps from the module (§7.3).
 
-use scheduling_guest::decision::{Plan, Room, Shortage, Victim};
+use scheduling_guest::decision::{DispatchOutput, Room, Shortage, Victim};
 use scheduling_guest::event::Event;
 use scheduling_guest::limits::{Limits, Parameters};
 use scheduling_guest::policy::Instantiation;
@@ -54,7 +54,7 @@ pub struct PolicyInstance {
 }
 
 /// The calls one instance has made, by decision (design §4.4's rule that a step
-/// costs one `observe` and one `dispatch` whatever they answer, and §12's
+/// costs one `observe` and one `dispatch` whatever they respond, and §12's
 /// measurement of what a policy costs).
 ///
 /// The mechanism counts a step's calls; this counts an instance's, so the two
@@ -110,7 +110,7 @@ struct Exports {
     init: TypedFunc<(u32, u32), u64>,
     observe: TypedFunc<(u32, u32), u64>,
     dispatch: TypedFunc<(u32, u32), u64>,
-    reclaim: TypedFunc<(u32, u32), u64>,
+    preempt: TypedFunc<(u32, u32), u64>,
     route: TypedFunc<(u32, u32), u32>,
     place: TypedFunc<(u32, u32), u32>,
     limits: TypedFunc<(), u64>,
@@ -126,25 +126,25 @@ impl Exports {
             init: bind(store, instance, Call::Init.export())?,
             observe: bind(store, instance, Call::Observe.export())?,
             dispatch: bind(store, instance, Call::Dispatch.export())?,
-            reclaim: bind(store, instance, Call::Reclaim.export())?,
+            preempt: bind(store, instance, Call::Preempt.export())?,
             route: bind(store, instance, Call::Route.export())?,
             place: bind(store, instance, Call::Place.export())?,
             limits: bind(store, instance, Call::Limits.export())?,
         })
     }
 
-    /// The export of a call that answers with a reply buffer.
+    /// The export of a call that responds with a reply buffer.
     fn replying(&self, call: Call) -> Option<&TypedFunc<(u32, u32), u64>> {
         match call {
             Call::Init => Some(&self.init),
             Call::Observe => Some(&self.observe),
             Call::Dispatch => Some(&self.dispatch),
-            Call::Reclaim => Some(&self.reclaim),
+            Call::Preempt => Some(&self.preempt),
             Call::Route | Call::Place | Call::Limits => None,
         }
     }
 
-    /// The export of a call that answers with the chosen index.
+    /// The export of a call that responds with the chosen index.
     fn indexing(&self, call: Call) -> Option<&TypedFunc<(u32, u32), u32>> {
         match call {
             Call::Route => Some(&self.route),
@@ -265,7 +265,7 @@ impl PolicyInstance {
 
     // -- the decisions of §4.4, in the order a policy's life makes them ------
 
-    /// `init`, called once at instantiation. Answers nothing.
+    /// `init`, called once at instantiation. Returns nothing.
     fn initialize(&mut self, init: &Instantiation) -> Result<(), PolicyError> {
         self.run(Call::Init, |policy| {
             let message = encode(Call::Init, init)?;
@@ -274,7 +274,7 @@ impl PolicyInstance {
         })
     }
 
-    /// `observe`: every event since the previous step, in order. Answers
+    /// `observe`: every event since the previous step, in order. Returns
     /// nothing.
     pub fn observe(&mut self, events: &[Event]) -> Result<(), PolicyError> {
         self.run(Call::Observe, |policy| {
@@ -284,8 +284,8 @@ impl PolicyInstance {
         })
     }
 
-    /// `dispatch`: this step's plan.
-    pub fn dispatch(&mut self, room: &Room) -> Result<Plan, PolicyError> {
+    /// `dispatch`: this step's output.
+    pub fn dispatch(&mut self, room: &Room) -> Result<DispatchOutput, PolicyError> {
         self.run(Call::Dispatch, |policy| {
             let message = encode(Call::Dispatch, room)?;
             let reply = policy.send(Call::Dispatch, &message)?;
@@ -293,13 +293,13 @@ impl PolicyInstance {
         })
     }
 
-    /// `reclaim`: which objects to free, in order, for a shortage. An empty
-    /// answer frees nothing.
-    pub fn reclaim(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
-        self.run(Call::Reclaim, |policy| {
-            let message = encode(Call::Reclaim, shortage)?;
-            match policy.send(Call::Reclaim, &message)? {
-                Some(reply) => decode(Call::Reclaim, Some(reply)),
+    /// `preempt`: which objects to free, in order, for a shortage. An empty
+    /// response frees nothing.
+    pub fn preempt(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
+        self.run(Call::Preempt, |policy| {
+            let message = encode(Call::Preempt, shortage)?;
+            match policy.send(Call::Preempt, &message)? {
+                Some(reply) => decode(Call::Preempt, Some(reply)),
                 None => Ok(Vec::new()),
             }
         })
@@ -369,7 +369,7 @@ impl PolicyInstance {
         }
     }
 
-    /// Sends a message to a call that answers with a reply buffer, and returns
+    /// Sends a message to a call that responds with a reply buffer, and returns
     /// the reply's bytes (`None` for the empty reply).
     fn send(&mut self, call: Call, message: &[u8]) -> Result<Option<Vec<u8>>, PolicyError> {
         let len = u32::try_from(message.len())
@@ -381,7 +381,7 @@ impl PolicyInstance {
             let export = self
                 .exports
                 .replying(call)
-                .ok_or_else(|| malformed(call, "this call does not answer with a buffer"))?;
+                .ok_or_else(|| malformed(call, "this call does not respond with a buffer"))?;
             let reply = export
                 .call(&mut self.store, (ptr, len))
                 .map_err(|error| classify(call, error))?;
@@ -392,7 +392,7 @@ impl PolicyInstance {
         self.take_reply(call, packed)
     }
 
-    /// Sends a message to a call that answers with the chosen index.
+    /// Sends a message to a call that responds with the chosen index.
     fn send_index(&mut self, call: Call, message: &[u8]) -> Result<u32, PolicyError> {
         let len = u32::try_from(message.len())
             .map_err(|_| malformed(call, "the message is larger than wasm32 can address"))?;
@@ -403,7 +403,7 @@ impl PolicyInstance {
             let export = self
                 .exports
                 .indexing(call)
-                .ok_or_else(|| malformed(call, "this call does not answer with an index"))?;
+                .ok_or_else(|| malformed(call, "this call does not respond with an index"))?;
             let index = export
                 .call(&mut self.store, (ptr, len))
                 .map_err(|error| classify(call, error))?;
@@ -511,17 +511,17 @@ fn encode<T: serde::Serialize>(call: Call, message: &T) -> Result<Vec<u8>, Polic
 
 /// Decodes a reply of the call's type; `None` is the empty reply.
 ///
-/// A decision whose answer carries something (`dispatch`, `limits`) must
-/// answer; `reclaim` may answer nothing, which frees nothing.
+/// A decision whose response carries something (`dispatch`, `limits`) must
+/// response; `preempt` may respond nothing, which frees nothing.
 fn decode<T: serde::de::DeserializeOwned>(
     call: Call,
     reply: Option<Vec<u8>>,
 ) -> Result<T, PolicyError> {
     let Some(reply) = reply else {
-        return Err(malformed(call, "the policy answered nothing"));
+        return Err(malformed(call, "the policy responded nothing"));
     };
     wire::decode(&reply)
-        .map_err(|error| malformed(call, format!("the answer does not decode: {error}")))
+        .map_err(|error| malformed(call, format!("the response does not decode: {error}")))
 }
 
 /// A protocol failure of the call's own making.

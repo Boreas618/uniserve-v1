@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn tensor_spans_are_aligned_exclusive_and_reclaimable() {
+    fn tensor_spans_are_aligned_exclusive_and_reusable() {
         let mut pool = BufferPool::new(1024);
         let first = pool.allocate(owner(1), 200, 256).unwrap();
         let second = pool.allocate(owner(2), 200, 256).unwrap();

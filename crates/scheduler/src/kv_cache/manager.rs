@@ -12,7 +12,7 @@
 //! - a sliding window reads only the pages of the window before it, those
 //!   covering `[boundary - window, boundary)`.
 //!
-//! The walk over the boundaries goes from the deepest down, and a boundary a
+//! The search over the boundaries goes from the deepest down, and a boundary a
 //! manager rejects does not end it: a sliding window absent at one boundary
 //! may be present at an earlier one. The reuse is the deepest boundary every
 //! manager accepts.
@@ -145,10 +145,10 @@ mod tests {
         assert!(!window.accepts(12, &pages));
     }
 
-    /// A boundary one manager rejects does not end the walk: a window
+    /// A boundary one manager rejects does not end the search: a window
     /// absent at the deepest boundary is present at an earlier one.
     #[test]
-    fn the_walk_continues_past_a_rejected_boundary() {
+    fn the_search_continues_past_a_rejected_boundary() {
         let managers = [
             AttentionManager::Full(FullAttentionManager { block_size: 4 }),
             AttentionManager::SlidingWindow(SlidingWindowManager {

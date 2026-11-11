@@ -1,97 +1,79 @@
-//! Scheduling, KV cache management and request control of a node's main
-//! process (`uniserve engine`).
+//! Scheduling, KV cache management and request control of an engine.
 //!
-//! A deployment runs one scheduler per DP rank: a main process builds a
-//! `SchedulerHandle` (`core`) over the devices it holds and runs the
-//! `Scheduler` (this crate's root, `run`) on a thread of its own. The process's control
-//! thread submits and controls requests through the handle and receives each
-//! request's events on its `EventRx` (`handle`). On its thread, the
-//! `Scheduler` admits requests, assigns cache pages (`kv_cache`) and other
-//! storage (`allocation`, `reservation`), and submits batches through
-//! `Submissions` (`submission`) to the worker crate's `Batches`.
+//! An engine runs one scheduler per data-parallel rank: it builds a
+//! `SchedulerHandle` (`core`) over the devices it holds, which runs the
+//! [`Scheduler`] on a thread of its own. The engine's control thread submits
+//! and controls requests through the handle and receives each request's
+//! events on its `EventRx` (`handle`).
 //!
-//! The `testing` feature additionally exports `SimWorker`, `SimEngine`, and
-//! `BatchEvent` (`sim`), a GPU-free worker for scheduler tests, which plugs in
-//! through the `Worker` trait.
+//! The scheduler's surface is five calls, vLLM's: [`Scheduler::add_request`],
+//! [`Scheduler::cancel`], [`Scheduler::schedule`], [`Scheduler::update`] and
+//! [`Scheduler::drain`]. [`Scheduler::run`] is the step loop over them: take
+//! what arrived, `update` with each completed batch, `schedule` the batches
+//! that fit, submit them to the executors (`submission`), and block until
+//! something arrives. All scheduler state stays on that thread.
 //!
-//! The scheduler is the request algorithms and the single-owner control loop.
-//! The loop combines request progress, scheduler policy, storage allocations, and
-//! asynchronous worker completions. All mutable engine state stays on its
-//! owner thread.
-//!
-//! Scheduling admits from its waiting queue and chunks prefill against sequence
-//! and token budgets. A token request with context images reserves its
-//! worst-case cache blocks at admission; a text-only request needs
-//! only the blocks of its first prefill chunk. A request larger than the total
-//! cache capacity is rejected. A resident request is never relocated or
-//! preempted: when capacity is short, admission waits.
-//!
-//! Static worker state crosses the boundary once in [`NewRequest`]; subsequent
-//! calls carry only step-specific deltas.
+//! A request is one type from arrival to end (`request`): waiting, running
+//! or finished, with a graph of calls that is a token request's loop or a
+//! video request's chain. Admission gives a request a slot and the pages its
+//! next call needs after its cached prefix was looked up (`kv_cache`); a
+//! request that cannot be admitted waits, a request larger than the cache is
+//! rejected, and when running requests themselves cannot grow the policy
+//! names a victim, which ends as migratable.
 //!
 //! The scheduler's modules:
 //!
-//! - `run`: construction and the owner-thread loop.
-//! - `admission`: admission, resource reservation, and waiting-queue insertion.
-//! - `batching`: generation-path batch selection and call planning.
-//! - `generation`: per-request generation state, call builders, and result
+//! - `run`: construction, the step loop and its wait.
+//! - `request`: a request, its status and the table of every request.
+//! - `admission`: arrival, the waiting queue and admission.
+//! - `batching`: batch assembly and the calls a batch carries.
+//! - `generation`: a token request's state, call builders and result
 //!   validation.
 //! - `denoising`: solver progress of one latent trajectory.
 //! - `graph`: the call graph of one video request.
-//! - `execution`: submission, completion application, video media scheduling,
-//!   and allocation reclamation.
-//! - `inflight`: submitted batches and calls, and request-local completion
-//!   ordering.
+//! - `execution`: the step (`schedule`, `update`), video scheduling and
+//!   failure handling.
+//! - `inflight`: batches and calls in flight, and request-local completion
+//!   order.
+//! - `submission`: the door to the executors and the scheduler's wake.
 //! - `output`: public events, semantic result resolution, and termination.
-//! - `reservation` and `dispatch`: what requests hold of the storage pools, and
-//!   worker dispatch.
-//! - `control`: cancellation and frontend lifecycle commands.
-//! - `config`, `stats`, and `stats_report`: limits and statistics.
+//! - `allocation` and `dispatch`: what requests hold of the storage pools,
+//!   and the worker group each call runs on.
+//! - `control`: the control thread's commands.
+//! - `policy`, `mechanism` and `views`: the policy module, the checks of its
+//!   decisions and what it reads.
+//! - `stats` and `stats_report`: statistics.
 
 /// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
 /// error is public.
 pub mod allocation;
 mod clock;
 mod core;
+mod encoder_cache;
 mod encoder_outputs;
-mod hand_off;
 mod handle;
 mod host_pages;
 mod kv_cache;
-#[cfg(feature = "testing")]
-mod sim;
 mod trajectories;
+mod transfer;
 mod warmup;
 mod worker;
 
-#[cfg(feature = "testing")]
-pub use crate::core::sim_args;
 pub use crate::core::{SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,
     EventSendError, EventTx, HookBarrier, PolicyPrograms, StageApplied, StreamCancelCause,
     Submission, SubmitError, Wake, WeightsInFlight,
 };
-#[cfg(feature = "testing")]
-pub use crate::worker::{BatchResult, CallResult, Worker};
 pub use crate::worker::{
-    BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ExecuteError, ExecutionBatch,
+    BlockConfig, BlockDistribution, CommandResult, CommandStatus, ExecuteError, ExecutionBatch,
     PageOffloads, RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel, WorkerError,
-    WorkerFailure, WorkerGroupId, WorkerInfo, WorkerSubmitError,
+    WorkerFailure, WorkerGroupId, WorkerInfo,
 };
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
 pub use crate::kv_cache::{HostCacheSize, IndexedPage, prefix_seeds};
 pub use crate::submission::Submissions;
-// The simulated engine is test support: `mod sim` is built only with the
-// `testing` feature, so its surface is exported only with it. A production
-// build that exported these would not compile - the module they come from is
-// not there.
-#[cfg(feature = "testing")]
-pub use crate::sim::{
-    BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimSpeculation, SimWorker,
-    sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
-};
 pub use ipc::{MediaCall, VideoDenoiserInfo};
 pub use proto::config::DEFAULT_BLOCK;
 /// Serializable scheduler, cache, and worker performance snapshots.
@@ -120,7 +102,7 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
 mod completion;
 mod stats;
 mod terminal;
-use terminal::{Terminal, Usage, latch_finish};
+use terminal::{Terminal, Usage};
 pub(crate) mod stats_report;
 
 pub use epoch::{GroupCache, ParkedCache};
@@ -134,8 +116,8 @@ pub use proto::config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
 };
-/// The phases the scheduler plans with, and the id each is numbered with: a rank's plan, a policy's
-/// `Plan` and a batch's phase must all use this table, so it is exported from where the scheduler
+/// The phases the scheduler schedules with, and the id each is numbered with: a rank's output, a policy's
+/// `DispatchOutput` and a batch's phase must all use this table, so it is exported from where the scheduler
 /// keeps it rather than restated by whoever needs a phase id.
 pub use scheduling::guest::view::{PhaseKind, RankView};
 pub use stats::{
@@ -153,29 +135,19 @@ mod denoising;
 mod dispatch;
 pub(crate) mod encodings;
 mod execution;
-use execution::{MediaFlowState, PendingMedia};
+use execution::VideoState;
 pub(crate) mod generation;
 pub(crate) mod graph;
 mod inflight;
-mod ledger;
 mod mechanism;
 pub(crate) mod output;
 mod policy;
 mod preemption;
-mod residents;
+mod quota;
+mod request;
 mod run;
 mod speculation;
 pub(crate) mod submission;
-/// Policy modules as WebAssembly text for the policy switch's unit tests.
-#[cfg(test)]
-mod toy;
-
-/// The mechanism's door to a worker a test supplies.
-#[cfg(feature = "testing")]
-pub(crate) fn submissions(worker: Box<dyn Worker>) -> submission::Submissions {
-    submission::Submissions::new(worker)
-}
-
 /// The mechanism's door to the worker crate's batch path, the in-process
 /// submission path of §2.4 and §7.3's splice.
 pub(crate) fn submissions_over(
@@ -198,7 +170,7 @@ use crate::generation::{
 };
 
 use crate::allocation::{BufferPool, BufferSpan, RequestPool, RequestSlot};
-use crate::kv_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordinator};
+use crate::kv_cache::{BlockPool, BlockTable, CacheAllocation, KvCacheManager};
 use crossbeam_channel::Receiver;
 use ipc::RequestId;
 use ipc::execution::EpochOperation;
@@ -216,10 +188,11 @@ use allocation::requests::{
     UnknownMediaGroup,
 };
 use denoising::Denoising;
-use generation::RequestState;
+use generation::TokenState;
 use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
+use request::{Graph, RequestStatus};
 
 /// The kind of pass a call kind is batched in (see `batch_kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,26 +200,18 @@ enum BatchKind {
     /// Every forward prefill, and text, vision, and latent encoding.
     Prefill,
     /// Calls that advance admitted requests without growing their prompt:
-    /// token decode, speculative verification, and canvas denoising.
+    /// token decode, speculative verification, and block denoising.
     Decode,
     /// Latent preparation, denoising, video and audio decoding, video and
     /// audio encoding, muxing, and transfers.
     Media,
 }
 
-/// Timeout of `Worker::poll` while the loop parks
-/// (`Scheduler::park_for_progress`). A result ends the park, and a worker
-/// with wake integration also returns early on commands and consumer reads;
-/// the timeout is only a liveness deadline.
-const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 /// Longest a drain (`Scheduler::drain_batches`) may go without a batch or a
 /// submission leaving the pending set before it calls what it still holds
 /// abandoned. It bounds silence, not the drain: every completion restarts it,
 /// so a scheduler that keeps receiving results is never cut off under load.
 const DRAIN_SILENCE: Duration = Duration::from_secs(300);
-/// Timeout of a park while the host KV cache's answers are awaited: the
-/// Storage Server answers a local connection within this.
-const KV_OFFLOAD_POLL: Duration = Duration::from_millis(1);
 /// Longest a closing scheduler waits for its last pages to reach the
 /// host KV cache: for the batches in flight, which carry offloads, and for
 /// the batches of the remaining offloads.
@@ -268,7 +233,7 @@ pub struct SpecialTokenIds {
 
 /// Request-held reference to a reusable encoder-cache entry.
 struct EncoderCachePin {
-    key: crate::kv_cache::EncoderKey,
+    key: crate::encoder_cache::EncoderKey,
     product: TensorRef,
 }
 
@@ -276,14 +241,14 @@ struct EncoderCachePin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Restoring {
     /// Its stored trajectory's pages are being pinned in the host latent
-    /// pools; the preparation waits for the answers.
+    /// pools; the preparation waits for the responses.
     Pinning,
     /// The pages are pinned (`Some`), or the trajectory starts from noise:
     /// the request names no stored steps, the host latent pools do not
     /// serve its denoiser, or a page is missing. The preparation takes it.
     Ready(Option<ipc::LatentRestore>),
-    /// The preparation was planned; the pins, if any, end with its result.
-    Planned,
+    /// The preparation was prepared; the pins, if any, end with its result.
+    Prepared,
 }
 
 impl Default for Restoring {
@@ -335,7 +300,7 @@ enum WorkerRegistration {
 enum Lifecycle {
     /// Admits and runs requests.
     Serving,
-    /// A park waits for the scheduler's requests to end; it answers once
+    /// A park waits for the scheduler's requests to end; it responds once
     /// they did.
     Parking(epoch::Parking),
     /// Parked: it admits and executes nothing until it resumes, and keeps
@@ -349,22 +314,20 @@ enum Lifecycle {
 pub struct Scheduler {
     worker: submission::Submissions,
     inflight: inflight::Inflight,
-    /// Resident resource ownership and reservation accounting.
+    /// Ownership and reservation accounting of what running requests hold.
     storage: allocation::requests::Storage,
     dispatch: dispatch::Dispatch,
     /// Aggregate capacity view of the loaded workers.
     info: MainProcessInfo,
     generation_limits: crate::GenerationLimits,
     special_tokens: SpecialTokenIds,
-    /// Token requests awaiting admission, in admission order: arrival order,
-    /// or priority then arrival under the priority policy.
-    waiting: VecDeque<RequestState>,
-    /// Media requests awaiting admission, in arrival order.
-    waiting_media: VecDeque<PendingMedia>,
-    /// The resident token requests, which mark the requests whose policy view
-    /// moved (`residents.rs`).
-    running: residents::Residents,
-    running_media: HashMap<RequestId, MediaFlowState>,
+    /// Every request the scheduler knows, waiting or running, by id.
+    requests: request::Requests,
+    /// The requests awaiting admission, token and video alike: the requests
+    /// that resume work another engine began first, then arrival order
+    /// (`Scheduler::add_request`). Which of them a step admits is the
+    /// policy's decision; the mechanism tries the named ones in this order.
+    waiting: VecDeque<RequestId>,
     /// What the epoch measures of speculation, which the refill policy
     /// weighs.
     speculation_meter: speculation::SpeculationMeter,
@@ -379,10 +342,10 @@ pub struct Scheduler {
     /// scheduler exists and before its first step.
     policy: Option<policy::PolicySlot>,
     /// The report of a policy failure the mechanism did not take from `fail`'s
-    /// answer, for the control thread.
+    /// response, for the control thread.
     policy_report: Option<policy::PolicyReverted>,
     /// §7.3 step 2's paired pass: an update asked that the following step's
-    /// batches also run in shadow for an epoch generation, and the answer waits
+    /// batches also run in shadow for an epoch generation, and the response waits
     /// for the step that shadows them.
     shadow_pass: Option<control::ShadowPass>,
     /// The candidate a precopy is preparing on a blocking thread, while it runs
@@ -397,37 +360,44 @@ pub struct Scheduler {
     /// the epoch last switched to, written by the control thread's switchover
     /// arm while it holds the generations' lock, read once per step.
     generation: Arc<std::sync::atomic::AtomicU64>,
+    /// The generation the current step's batches are laid out for: read from
+    /// `generation` once per step, so a switch mid-step cannot split one
+    /// step across two generations.
+    step_generation: u64,
     /// Tells the thread that reads this scheduler's output that there is some:
-    /// its events and its answers wait for that thread, so a step that produced
+    /// its events and its responses wait for that thread, so a step that produced
     /// them says so rather than leaving them to its next periodic pass.
     progress: CommandWaker,
-    /// The stage §7.3 asked for and the answer to give once it is applied: a
+    /// The stage §7.3 asked for and the response to give once it is applied: a
     /// stage changes the serving policy, so it waits for a boundary where no
     /// batch and no submission is in flight.
     policy_stage: Option<(
         policy::Stage,
-        Option<crate::handle::StageAnswer>,
+        Option<crate::handle::StageResponse>,
         Option<u64>,
     )>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,
     /// The device pages that exist, kept from the epoch's snapshot and from the
     /// `Cached`/`Freed` announcements of each step: the table `Live` checks a
-    /// named page against, without a step walking the prefix cache.
+    /// named page against, without a step scanning the prefix cache.
     pages: std::collections::BTreeMap<scheduling::guest::PageId, scheduling::guest::PageView>,
-    /// The resident requests that hold a row of the request pool: what
+    /// The running requests that hold a row of the request pool: what
     /// `Room::slots` subtracts from the pool's rows.
     ///
     /// Maintained where a request's allocations are installed (admission) and
-    /// taken (the end of its execution), because a step must not walk the
-    /// residents to count them (design §4.4).
+    /// taken (the end of its execution), because a step must not scan the
+    /// running requests to count them (design §4.4).
     rows_held: usize,
     /// Whether `pages` was built yet. It is built on the first step that
-    /// announces a change, from `views::page_index`, which is the one walk.
+    /// announces a change, from `views::page_index`, which is the one scan.
     pages_seeded: bool,
-    /// The starvation watchdog: a resident request that does not advance
+    /// The starvation watchdog: a running request that does not advance
     /// within the policy's `timeout` is the policy's failure (§4.4).
     watchdog: mechanism::Watchdog,
+    /// The moment of the last step's starvation check: a request past its
+    /// bound by then was judged by that step (`Scheduler::wait`).
+    starvation_judged: scheduling::guest::Nanos,
     /// The step number this scheduler is at.
     step: u64,
     /// `engine_id` of every `RequestKey` this scheduler issues.
@@ -441,16 +411,16 @@ pub struct Scheduler {
     /// results from an earlier lifetime of a request id never match it.
     next_request_epoch: u64,
     config: SchedulerConfig,
-    /// Token and media requests in admission order. Media scheduling visits
-    /// them in this order; batch assembly uses it to break ties within
-    /// `assembly_priority`.
-    running_order: Vec<RequestId>,
+    /// The admitted requests, token and video alike, in admission order.
+    /// Media scheduling visits them in this order; batch assembly uses it
+    /// to break ties within `assembly_priority`.
+    running: Vec<RequestId>,
     output: output::OutputSender,
     /// Where the scheduler is in its life: serving, parking, parked, or
     /// failed (`Lifecycle`).
     lifecycle: Lifecycle,
     /// Shared scheduler counters and latency accumulators.
-    pub stats: Arc<SchedulerStats>,
+    stats: Arc<SchedulerStats>,
     /// The host KV cache, when it serves a worker group
     /// (`Scheduler::enable_kv_offload`).
     kv_offload: Option<crate::kv_cache::KvOffloadManager>,
@@ -463,9 +433,9 @@ pub struct Scheduler {
     /// The host encoder pools of the video encoders, when they serve their
     /// worker groups (`Scheduler::enable_encoder_store`).
     encoder_outputs: Option<crate::encoder_outputs::EncoderStore>,
-    /// The hand-offs from the prefill groups to the decode groups, when the
-    /// deployment has prefill groups (`Scheduler::enable_hand_off`).
-    hand_offs: Option<crate::hand_off::HandOffs>,
+    /// The transfers from the prefill groups to the decode groups, when the
+    /// deployment has prefill groups (`Scheduler::enable_transfer`).
+    transfers: Option<crate::transfer::Transfers>,
     /// Set while an operation waits for the batches in flight to complete
     /// (`Scheduler::drain_batches`, `Scheduler::flush_offloads` and the
     /// commands that drain before they act): the scheduler admits and
@@ -480,7 +450,7 @@ pub struct Scheduler {
     /// The requests held for the index meanwhile, in arrival order: the
     /// others are admitted past them, and they return to the head of the
     /// queue when the index arrives or the wait ends.
-    held_for_index: Vec<RequestState>,
+    held_for_index: Vec<RequestId>,
     /// Whether forming batches is held for a change of the device's storage
     /// (`CacheChange::Hold`): nothing runs, and every request keeps its state.
     ///
@@ -492,8 +462,8 @@ pub struct Scheduler {
     /// (`Scheduler::resize_cache`).
     resizing: Option<cache_storage::PendingResize>,
     /// The running requests the latest assembly could not grow, each with the
-    /// cache units its growth needed. The next step's reclaim reads them before
-    /// its assembly notes them again (`Scheduler::reclaim_shortage`,
+    /// cache units its growth needed. The next step's preemption reads them before
+    /// its assembly notes them again (`Scheduler::preempt_shortage`,
     /// `Scheduler::recompute_starved`), and admission waits while any is here.
     starved: Vec<(RequestId, usize)>,
     /// The workers gave back the cache and graph storage: the scheduler
@@ -619,12 +589,12 @@ const OUTPUT_JOURNAL_CAPACITY: usize = EVENT_BUFFER_CAPACITY;
 /// free for the request's terminal events.
 const OUTPUT_TERMINAL_RESERVE: usize = 2;
 
-/// Cache extent of one planned generation call, in tokens.
+/// Cache extent of one prepared generation call, in tokens.
 #[derive(Debug, Clone, Copy)]
 struct CacheLengths {
     /// Tokens the call's cache-writing forward row appends: the prompt slice
     /// length, the feature write's token capacity, or one for decode and
-    /// verify. Zero for a canvas step, which only reads the request's
+    /// verify. Zero for a block step, which only reads the request's
     /// prefix cache.
     input: u32,
     /// Scheduled visible cache length before the call.
@@ -644,7 +614,7 @@ pub(crate) const MAX_VERIFY_DRAFTS: usize = 16;
 /// add to its request's event journal.
 ///
 /// `Scheduler::output_window_ready` charges this for every in-flight call and
-/// for the call the request plans next.
+/// for the call the request schedules next.
 fn output_bound(kind: CallKind) -> usize {
     match kind {
         CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,

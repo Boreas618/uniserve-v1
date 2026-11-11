@@ -71,29 +71,40 @@ impl Scheduler {
         cause: MigrationCause,
         select: impl Fn(RequestId) -> bool,
     ) {
-        let (queued, staying): (VecDeque<PendingMedia>, VecDeque<PendingMedia>) =
-            std::mem::take(&mut self.waiting_media)
-                .into_iter()
-                .partition(|pending| select(pending.request.request_id));
-        self.waiting_media = staying;
-        for pending in queued {
-            // A queued request stored nothing here: the daemon submits it
+        let waiting: Vec<RequestId> = self
+            .waiting
+            .iter()
+            .copied()
+            .filter(|id| {
+                select(*id)
+                    && self
+                        .requests
+                        .get(id)
+                        .is_some_and(|request| request.video().is_some())
+            })
+            .collect();
+        for id in waiting {
+            // A waiting request stored nothing here: the daemon submits it
             // again naming the trajectory it named.
-            let _ = pending.event_tx.send(Event::Migratable {
-                cause,
-                denoised_steps: 0,
-                stored_layout: Vec::new(),
-            });
+            self.end_waiting(
+                id,
+                scheduling::guest::event::End::Migratable,
+                Event::Migratable {
+                    cause,
+                    denoised_steps: 0,
+                    stored_layout: Vec::new(),
+                },
+            );
         }
         let running: Vec<RequestId> = self
-            .running_media
-            .iter()
-            .filter(|(id, state)| {
-                select(**id)
-                    && !state.terminal_intent.is_some()
-                    && self.scheduled_steps(**id, &state.denoising) < state.denoising.steps()
+            .requests
+            .running_video()
+            .filter(|(id, status, state)| {
+                select(*id)
+                    && !status.is_finished()
+                    && self.scheduled_steps(*id, &state.denoising) < state.denoising.steps()
             })
-            .map(|(id, _)| *id)
+            .map(|(id, _, _)| id)
             .collect();
         for id in running {
             if let Some(state) = self.media_state_mut(id) {
@@ -103,24 +114,26 @@ impl Scheduler {
                     ?cause,
                     "preempting a video request at its next denoising step boundary"
                 );
-                state.terminal_intent = Some(Terminal::migrate(cause));
+            }
+            if let Some(status) = self.requests.status_mut(&id) {
+                *status = RequestStatus::Finished(Terminal::migrate(cause));
             }
         }
     }
 
     /// The worker group that holds `request_key`'s trajectory: the replica
-    /// its denoising calls are placed on, as the component that serves them
+    /// its denoising calls are placed on, as the stage that serves them
     /// binds there.
     fn denoiser_worker(&self, request_key: RequestKey) -> Option<WorkerGroupId> {
         let kind = CallKind::Media(MediaCall::Denoising);
-        let component = self
+        let stage = self
             .info
-            .media_components
+            .media_stages
             .get(&MediaCall::Denoising)
             .map_or(DEFAULT_BLOCK, String::as_str);
         let (_, bound, _) = self
             .dispatch
-            .component_candidates(&self.worker, kind, component)
+            .stage_candidates(&self.worker, kind, stage)
             .next()?;
         self.dispatch
             .affinity
@@ -133,7 +146,7 @@ impl Scheduler {
     /// storing: past its first step and not past its last, of a request the
     /// daemon gave a trajectory identity, preempted by a drain while its
     /// workers hold it. `offloading` states whether the host latent pools
-    /// are storing it already, whose answer then decides how it leaves.
+    /// are storing it already, whose response then decides how it leaves.
     fn store_preempted(
         &mut self,
         id: RequestId,
@@ -183,13 +196,13 @@ impl Scheduler {
 
     /// Ends preempted video request `id`, whose calls completed: its
     /// trajectory is stored when it reached a step worth storing, and it
-    /// leaves once the store answered. Returns whether it left.
+    /// leaves once the store responded. Returns whether it left.
     pub(crate) fn retire_preempted(&mut self, id: RequestId, cause: MigrationCause) -> bool {
         let Some(state) = self.media_state(id) else {
             return true;
         };
         let preempted = Preempted {
-            request_key: state.admission.request_key,
+            request_key: state.request_key,
             registered: state.admission_state == WorkerRegistration::Registered,
             trajectory: state.request.trajectory.id,
             completed: state.denoising.completed(),
@@ -202,7 +215,7 @@ impl Scheduler {
                 if steps > 0 {
                     tracing::info!(request = id.0, steps, "stored a preempted video trajectory");
                 }
-                self.finish_media(
+                self.retire(
                     id,
                     Terminal::Migrated {
                         cause,
@@ -222,7 +235,7 @@ impl Scheduler {
         }
     }
 
-    /// Takes the host latent pools' answers: a resumed request's restore
+    /// Takes the host latent pools' responses: a resumed request's restore
     /// resolves, and the copies of a preempted request's trajectory leave
     /// in a batch of latent offloads alone to its denoiser's worker group.
     /// Returns whether anything moved on.
@@ -232,10 +245,10 @@ impl Scheduler {
         };
         let moved = store.poll();
         let pinning: Vec<RequestId> = self
-            .running_media
-            .iter()
-            .filter(|(_, state)| state.host_trajectory.restoring == Restoring::Pinning)
-            .map(|(id, _)| *id)
+            .requests
+            .running_video()
+            .filter(|(_, _, state)| state.host_trajectory.restoring == Restoring::Pinning)
+            .map(|(id, _, _)| id)
             .collect();
         for id in pinning {
             let Some(restored) = self
@@ -310,7 +323,7 @@ impl Scheduler {
         if trajectory.denoised_steps == 0 || trajectory.denoised_steps >= state.denoising.steps() {
             return Restoring::Ready(None);
         }
-        let request_key = state.admission.request_key;
+        let request_key = state.request_key;
         let Some(worker) = self.denoiser_worker(request_key) else {
             return Restoring::Ready(None);
         };

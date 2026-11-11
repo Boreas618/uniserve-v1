@@ -8,10 +8,10 @@
 //!
 //! The failures §4.4 names split in two. Those of the module itself are found
 //! here: a trap, running past the fuel of one call, limits outside the build
-//! config's ceilings, and an answer that breaks the call protocol. Those over a
+//! config's ceilings, and a response that breaks the call protocol. Those over a
 //! decision are found by the mechanism and reported through the same type: a
 //! decision naming an object that does not exist, does not fit or cannot be
-//! chosen, work that breaks a hard limit, and a resident request starved past `limits().timeout`.
+//! chosen, work that breaks a hard limit, and a running request starved past `limits().timeout`.
 //!
 //! Nothing here is recoverable inside the instance: a policy that trapped is
 //! not called again.
@@ -44,12 +44,12 @@ pub enum PolicyError {
     /// a timeout above the 30 seconds §4.4's watchdog allows.
     #[error("the policy's limits are outside the build config: {message}")]
     BadLimits { message: String },
-    /// The policy's answer breaks the call protocol: a buffer the module cannot
+    /// The policy's response breaks the call protocol: a buffer the module cannot
     /// hold, bytes that do not decode into the interface's type, or a decision
     /// that names an object which does not exist or cannot be chosen.
-    #[error("the policy's answer in `{}` is malformed: {message}", call.method())]
+    #[error("the policy's response in `{}` is malformed: {message}", call.method())]
     Malformed { call: Call, message: String },
-    /// The mechanism's watchdog found a resident request that did not progress
+    /// The mechanism's watchdog found a running request that did not progress
     /// past `limits().timeout` (§4.4). This is the failure sched_ext's watchdog
     /// makes: a runnable task that waited longer than the scheduler declared is
     /// the scheduler's failure, not the task's.

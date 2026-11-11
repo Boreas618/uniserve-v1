@@ -1,4 +1,4 @@
-//! Reference-counted cache of worker-resident encoder products: the device
+//! Reference-counted cache of encoder products held on workers: the device
 //! tier of image requests' encoder outputs, nearer than the host encoder
 //! pools (`crate::encoder_outputs`).
 //!
@@ -53,7 +53,7 @@ pub(crate) struct EncoderCacheManager {
     budget: usize,                       // max cached entries
     entries: HashMap<EncoderKey, Entry>, // content key -> entry
     // `invalidate_buffers` removes entries from lookup immediately, but a
-    // worker-side tensor cannot be reclaimed while an in-flight request still
+    // worker-side tensor cannot be released while an in-flight request still
     // holds a reference. Those entries remain here until their final pin is
     // released. Inserting the identical product under the same hash, while no
     // active entry holds that hash, reactivates the retired entry with its
@@ -94,7 +94,7 @@ impl EncoderCacheManager {
         self.budget
     }
 
-    /// Returns a resident output without changing LRU order or cache metrics.
+    /// Returns a cached output without changing LRU order or cache metrics.
     pub(crate) fn peek_product(&self, hash: EncoderKey) -> Option<TensorRef> {
         self.entries.get(&hash).map(|entry| entry.product.clone())
     }
@@ -103,7 +103,7 @@ impl EncoderCacheManager {
     ///
     /// Every active entry whose product lives in one of `buffers` leaves
     /// lookup and counts as an eviction. Unpinned entries are returned for
-    /// reclaim; pinned ones move to the retired set and are returned by the
+    /// release; pinned ones move to the retired set and are returned by the
     /// `release` that drops their last pin, unless an `insert` of the same
     /// product reactivates them first.
     pub(crate) fn invalidate_buffers(
@@ -114,17 +114,17 @@ impl EncoderCacheManager {
             .entries
             .extract_if(|_, entry| buffers.contains(&entry.product.buffer_id()))
             .collect::<Vec<_>>();
-        let mut reclaimable = Vec::new();
+        let mut releasable = Vec::new();
         for (hash, entry) in revoked {
             self.evictable.remove(&entry.lru);
             self.stats.evictions += 1;
             if entry.ref_cnt == 0 {
-                reclaimable.push(entry.product);
+                releasable.push(entry.product);
             } else {
                 self.retired.entry(hash).or_default().push(entry);
             }
         }
-        reclaimable
+        releasable
     }
 
     /// Returns and advances the cache recency counter.
@@ -177,7 +177,7 @@ impl EncoderCacheManager {
     /// This is the encoder cache as a policy sees it: `Snapshot.encodings`
     /// describes each entry by `views::encoding_id(key)` and its last use, and
     /// `Victim::Encoding` names one. A pinned entry is listed too — it is live,
-    /// and whether it may be freed is [`Self::evict`]'s answer.
+    /// and whether it may be freed is [`Self::evict`]'s response.
     pub(crate) fn entries(&self) -> impl Iterator<Item = (EncoderKey, u64)> + '_ {
         self.entries.iter().map(|(key, entry)| (*key, entry.lru))
     }
@@ -236,7 +236,7 @@ impl EncoderCacheManager {
                 }
                 // Concurrent misses compute equivalent output. Preserve the
                 // existing entry and its references; a distinct redundant
-                // product is returned for the caller to reclaim.
+                // product is returned for the caller to release.
                 return (existing_product != product).then_some(product);
             }
         }
@@ -316,7 +316,7 @@ impl EncoderCacheManager {
     }
 
     /// Releases a reference. Active entries become evictable at zero references;
-    /// retired entries are removed and return their worker handle for reclaim.
+    /// retired entries are removed and return their worker handle for release.
     ///
     /// The pin is matched by both `hash` and `product`, so a request that
     /// pinned a since-invalidated product releases the retired entry, not an
@@ -386,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn lru_eviction_reports_the_exact_reclaimable_product() {
+    fn lru_eviction_reports_the_exact_releasable_product() {
         let mut cache = EncoderCacheManager::new(2);
         let first = product(100);
         let second = product(200);
@@ -411,7 +411,7 @@ mod tests {
 
     /// Invalidation frees an unpinned product at once and retires a pinned one
     /// until its last pin is released. A replacement inserted under the same
-    /// key stays resident through those releases, and an extra release of the
+    /// key stays cached through those releases, and an extra release of the
     /// retired product is a no-op.
     #[test]
     fn invalidation_preserves_pins_and_independent_replacements() {

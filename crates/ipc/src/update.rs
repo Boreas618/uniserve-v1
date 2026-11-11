@@ -98,7 +98,7 @@ impl UpdateFailure {
 /// the scheduler of its epoch (§7.3).
 ///
 /// Every status names the generation it is about. A `Failed` and a
-/// `PolicyReverted` are sent unasked, like a stall report; the others answer the
+/// `PolicyReverted` are sent unasked, like a stall report; the others response the
 /// command that caused them.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

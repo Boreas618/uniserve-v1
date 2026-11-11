@@ -15,8 +15,8 @@
 
 use scheduling::guest::wire::{self, Call};
 use scheduling::guest::{
-    CallView, Limits, Nanos, PageId, Parameters, PhaseId, Plan, RankView, RequestId, RequestView,
-    Room, Shortage, Snapshot, Storage, Victim, Work,
+    CallView, DispatchOutput, Limits, Nanos, PageId, Parameters, PhaseId, RankView, RequestId,
+    RequestView, Room, Shortage, Snapshot, Storage, Victim, Work,
 };
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
 
@@ -30,8 +30,8 @@ const HEAP_BASE: u32 = 65536 / 2;
 /// Each call of the protocol gets one of: a reply buffer holding the encoding of
 /// a value, raw bytes that need not decode, the index itself (for `route` and
 /// `place`), or a `wat` body written directly (for a call that traps, loops or
-/// answers with an address of its own). A call not given anything answers the
-/// empty reply, except `limits`, which answers the default limits so that every
+/// responds with an address of its own). A call not given anything responds to the
+/// empty reply, except `limits`, which responds to the default limits so that every
 /// toy instantiates.
 #[derive(Default)]
 struct Toy {
@@ -49,25 +49,25 @@ impl Toy {
         Self::default()
     }
 
-    /// Answers `export` with the encoding of `value`.
+    /// Returns `export` with the encoding of `value`.
     fn reply<T: serde::Serialize>(mut self, export: &'static str, value: &T) -> Self {
         self.replies.push((export, wire::encode(value).unwrap()));
         self
     }
 
-    /// Answers `export` with these bytes, which need not decode.
+    /// Returns `export` with these bytes, which need not decode.
     fn raw_reply(mut self, export: &'static str, bytes: &[u8]) -> Self {
         self.replies.push((export, bytes.to_vec()));
         self
     }
 
-    /// Answers `export` with the index itself.
+    /// Returns `export` with the index itself.
     fn index(mut self, export: &'static str, index: u32) -> Self {
         self.indexes.push((export, index));
         self
     }
 
-    /// Answers `export` with a body written in `wat`, whose value is the
+    /// Returns `export` with a body written in `wat`, whose value is the
     /// export's result.
     fn body(mut self, export: &'static str, body: impl Into<String>) -> Self {
         self.bodies.push((export, body.into()));
@@ -188,7 +188,7 @@ impl Toy {
     }
 }
 
-/// The `wat` expression answering with the buffer at `offset` of `len` bytes.
+/// The `wat` expression responding with the buffer at `offset` of `len` bytes.
 fn packed(offset: u32, len: usize) -> String {
     if len == 0 {
         return "i64.const 0".into();
@@ -215,14 +215,14 @@ fn engine() -> Engine {
     Engine::new().unwrap()
 }
 
-/// A queued token request, as the mechanism views one.
+/// A waiting token request, as the mechanism views one.
 ///
 /// Built from the encoding rather than from a struct literal: a view is an
 /// append-only list, so the fields this test does not name are the defaults the
 /// interface gives them, and a field added to `RequestView` later does not
 /// touch this test.
 fn request() -> RequestView {
-    wire::decode(br#"{"id":1,"state":{"state":"queued"},"class":{"class":"token"}}"#).unwrap()
+    wire::decode(br#"{"id":1,"state":{"state":"waiting"},"class":{"class":"token"}}"#).unwrap()
 }
 
 /// A request's first call on a block.
@@ -243,28 +243,28 @@ fn policy(engine: &Engine, toy: Toy) -> PolicyInstance {
 }
 
 #[test]
-fn every_decision_reaches_its_export_and_answers() {
+fn every_decision_reaches_its_export_and_returns() {
     let engine = engine();
-    let plan = Plan {
+    let output = DispatchOutput {
         work: vec![Work {
             request: RequestId(7),
             phase: PhaseId(1),
             tokens: 32,
         }],
-        ..Plan::default()
+        ..DispatchOutput::default()
     };
     let victims = vec![Victim::Request(RequestId(3)), Victim::Page(PageId(4))];
     let toy = Toy::new()
-        .reply(Call::Dispatch.export(), &plan)
-        .reply(Call::Reclaim.export(), &victims)
+        .reply(Call::Dispatch.export(), &output)
+        .reply(Call::Preempt.export(), &victims)
         .index(Call::Route.export(), 2)
         .index(Call::Place.export(), 1);
     let mut policy = policy(&engine, toy);
 
-    assert_eq!(policy.dispatch(&Room::default()).unwrap().work, plan.work);
+    assert_eq!(policy.dispatch(&Room::default()).unwrap().work, output.work);
     assert_eq!(
         policy
-            .reclaim(&Shortage {
+            .preempt(&Shortage {
                 kind: Storage::KvUnits,
                 need: 4,
             })
@@ -279,15 +279,15 @@ fn every_decision_reaches_its_export_and_answers() {
 }
 
 #[test]
-fn reclaim_may_answer_nothing() {
+fn preempt_may_name_nobody() {
     let engine = engine();
-    // A toy whose reclaim answers the empty reply frees nothing; that is a
+    // A toy whose preempt responds to the empty reply frees nothing; that is a
     // decision, not a failure.
     let mut policy = policy(&engine, Toy::new());
 
     assert!(
         policy
-            .reclaim(&Shortage {
+            .preempt(&Shortage {
                 kind: Storage::HostPages,
                 need: 1,
             })
@@ -297,10 +297,10 @@ fn reclaim_may_answer_nothing() {
 }
 
 #[test]
-fn an_answer_with_a_field_the_host_does_not_know_still_decodes() {
+fn an_output_with_a_field_the_host_does_not_know_still_decodes() {
     let engine = engine();
     // The views and decisions are append-only lists: a policy built against a
-    // later interface writes fields this host does not know, and its answer
+    // later interface writes fields this host does not know, and its response
     // still means what the host knows of it.
     let toy = Toy::new().raw_reply(
         Call::Dispatch.export(),
@@ -308,9 +308,9 @@ fn an_answer_with_a_field_the_host_does_not_know_still_decodes() {
     );
     let mut policy = policy(&engine, toy);
 
-    let plan = policy.dispatch(&Room::default()).unwrap();
+    let output = policy.dispatch(&Room::default()).unwrap();
     assert_eq!(
-        plan.work,
+        output.work,
         vec![Work {
             request: RequestId(7),
             phase: PhaseId(1),
@@ -322,7 +322,7 @@ fn an_answer_with_a_field_the_host_does_not_know_still_decodes() {
 #[test]
 fn the_message_is_written_into_the_module() {
     let engine = engine();
-    // The toy answers with the first byte of the message it was handed, so the
+    // The toy responds with the first byte of the message it was given, so the
     // host must have written that message at the pointer the module returned.
     // The route message is the interface's `(RequestView, &[RankView])` tuple
     // (the guest decodes a tuple too), and a tuple encodes as a JSON sequence:
@@ -359,7 +359,7 @@ fn a_precompiled_module_loads_and_runs_in_another_engine() {
         .unwrap();
 
     assert!(policy.failure().is_none());
-    // The module answers the limits it was initialized with, so the call runs.
+    // The module responds to the limits it was initialized with, so the call runs.
     let limits = policy.limits();
     assert_eq!(limits.max_batch, Limits::default().max_batch);
     assert_eq!(
@@ -374,12 +374,12 @@ fn fuel_is_renewed_for_every_call() {
     // A dispatch that costs a measurable amount, so the budget can be set
     // between one call's cost and two calls' cost: three calls then prove the
     // budget is renewed per call rather than shared by the instance.
-    // Dispatch is one of the calls whose answer must carry something, so the
-    // body runs the loop and then answers with an empty plan: every call of the
+    // Dispatch is one of the calls whose response must carry something, so the
+    // body runs the loop and then responds with an empty output: every call of the
     // loop below is a complete dispatch, not one the host rejects for silence.
-    let reply = wire::encode(&Plan::default()).unwrap();
+    let reply = wire::encode(&DispatchOutput::default()).unwrap();
     let toy = Toy::new()
-        .reply(Call::Dispatch.export(), &Plan::default())
+        .reply(Call::Dispatch.export(), &DispatchOutput::default())
         .body(
             Call::Dispatch.export(),
             format!(
@@ -446,14 +446,14 @@ fn a_decision_that_traps_fails_and_ends_the_instance() {
 }
 
 #[test]
-fn an_answer_that_does_not_decode_is_malformed() {
+fn an_output_that_does_not_decode_is_malformed() {
     let engine = engine();
-    let toy = Toy::new().raw_reply(Call::Dispatch.export(), b"not a plan");
+    let toy = Toy::new().raw_reply(Call::Dispatch.export(), b"not a dispatch output");
     let mut policy = policy(&engine, toy);
 
     match policy.dispatch(&Room::default()) {
         Err(PolicyError::Malformed { call, .. }) => assert_eq!(call, Call::Dispatch),
-        other => panic!("expected a malformed answer, got {other:?}"),
+        other => panic!("expected a malformed response, got {other:?}"),
     }
 }
 
@@ -490,7 +490,7 @@ fn a_reply_outside_the_module_memory_is_malformed() {
 
     match policy.dispatch(&Room::default()) {
         Err(PolicyError::Malformed { call, .. }) => assert_eq!(call, Call::Dispatch),
-        other => panic!("expected a malformed answer, got {other:?}"),
+        other => panic!("expected a malformed response, got {other:?}"),
     }
 }
 
@@ -620,11 +620,11 @@ fn the_policy_s_limits_are_read_at_instantiation() {
 #[test]
 fn a_precompiled_module_round_trips() {
     let engine = engine();
-    let plan = Plan {
+    let output = DispatchOutput {
         admit: vec![RequestId(5)],
-        ..Plan::default()
+        ..DispatchOutput::default()
     };
-    let toy = Toy::new().reply(Call::Dispatch.export(), &plan);
+    let toy = Toy::new().reply(Call::Dispatch.export(), &output);
     let text = toy.wat();
 
     // The Program Server compiles and precompiles for this host and serves the
@@ -661,13 +661,13 @@ fn two_instances_of_one_module_are_independent() {
     // The serving instance, the control thread's route instance and a trial
     // instance during precopy are all made from one module (§4.4, §7.3): a
     // failure of one must leave the others serving.
-    let plan = Plan {
+    let output = DispatchOutput {
         admit: vec![RequestId(1)],
-        ..Plan::default()
+        ..DispatchOutput::default()
     };
     let toy = Toy::new()
         .body(Call::Observe.export(), "unreachable")
-        .reply(Call::Dispatch.export(), &plan);
+        .reply(Call::Dispatch.export(), &output);
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
     let mut failing = module
         .instantiate(

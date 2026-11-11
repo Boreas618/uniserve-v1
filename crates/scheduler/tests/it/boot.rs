@@ -8,8 +8,8 @@
 //! inventory is the only statement of what it serves, and one request served
 //! through it to a token the pool itself sampled.
 //!
-//! The pool stands in for the worker only: it is handed the mechanism's batch
-//! and answers its calls. What the boot derives — the group, the budgets, the
+//! The pool stands in for the worker only: it is given the mechanism's batch
+//! and responds to its calls. What the boot derives — the group, the budgets, the
 //! cache geometry, the tokenizer's bounds — is the code under test.
 
 use std::sync::Arc;
@@ -20,23 +20,23 @@ use ipc::execution::Batches;
 use scheduler::{BatchCapacity, Event, GenerationRequest, SchedulerConfig, SchedulerHandle, Stage};
 use testkit::{Extent, FakeBatches, SAMPLED, Tokens};
 
-/// How long a command answer may take.
+/// How long a command response may take.
 ///
 /// Generous because the first one is the whole installation of a policy: the
 /// tree's `fcfs` module is built for `wasm32-unknown-unknown` on first use and
 /// then loaded and instantiated, on a machine that runs this suite's tests in
 /// parallel. The bound is the harness's, not the mechanism's; a mechanism that
-/// stopped answering would still fail here, only later.
-const ANSWER: Duration = Duration::from_secs(60);
+/// stopped responding would still fail here, only later.
+const RESPONSE: Duration = Duration::from_secs(60);
 
 /// How long a request may take to emit its first token.
 const FIRST_TOKEN: Duration = Duration::from_secs(20);
 
-/// Blocks until a command answers, and answers its result.
-fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
-    match receiver.recv_timeout(ANSWER) {
+/// Blocks until a command responses, and responds to its result.
+fn response<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
+    match receiver.recv_timeout(RESPONSE) {
         Ok(result) => result,
-        Err(error) => panic!("the scheduler did not answer: {error}"),
+        Err(error) => panic!("the scheduler did not response: {error}"),
     }
 }
 
@@ -45,7 +45,7 @@ fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result
 fn launch() -> (proto::config::EngineArgs, SchedulerConfig) {
     let mut args = testkit::args("boot-model");
     args.engine_config.max_running_requests = std::num::NonZeroUsize::new(4).expect("positive");
-    // The budgets the pool below is built for, stated rather than left to a default: a plan may
+    // The budgets the pool below is built for, stated rather than left to a default: a dispatch output may
     // not exceed what the epoch was built for, so a budget tighter than the pool's would refuse
     // the very batch a request needs and read as "the policy served nothing".
     let limits = SchedulerConfig::of(&args.engine_config, 16, 512, vec![1, 8]);
@@ -109,8 +109,8 @@ fn policy_program(pool: &FakeBatches) -> scheduler::PolicyProgram {
 fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    answer(handle.precopy_policy(policy_program(pool), source)).expect("the policy is precopied");
-    answer(handle.stage(Stage::Switchover)).expect("the policy serves");
+    response(handle.precopy_policy(policy_program(pool), source)).expect("the policy is precopied");
+    response(handle.stage(Stage::Switchover)).expect("the policy serves");
 }
 
 #[test]
@@ -120,15 +120,16 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
     // The boot's whole shape: the facts of a launch file, the worker's batch
     // path, one handle. Nothing is launched: the pool is the rank.
     let (args, limits) = launch();
-    let handle = SchedulerHandle::over_batches(&args, limits, batches)
-        .expect("the launch boots a scheduler");
+    let handle =
+        SchedulerHandle::over_batches(&args, limits, batches, scheduler::CommandWaker::noop())
+            .expect("the launch boots a scheduler");
 
-    // The handle is the launched path's: its commands answer, and a stage waits
+    // The handle is the launched path's: its commands response, and a stage waits
     // for a boundary.
     let progress = handle
         .progress()
-        .recv_timeout(ANSWER)
-        .expect("the scheduler answers with its progress");
+        .recv_timeout(RESPONSE)
+        .expect("the scheduler responds with its progress");
     assert_eq!(progress.step, 0, "no step ran before a policy served");
 
     install(&handle, &serving);
@@ -143,7 +144,7 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
         .expect("the request is submitted");
 
     // A token arrives: the booted scheduler admitted the request, the policy
-    // planned it, the batch path served it, and the report reached the request.
+    // prepared it, the batch path served it, and the report reached the request.
     let deadline = Instant::now() + FIRST_TOKEN;
     let mut first_token = None;
     while first_token.is_none() && Instant::now() < deadline {
@@ -161,7 +162,7 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
     );
     assert!(
         !serving.submitted().is_empty(),
-        "the worker was handed the work the facts' budgets admit"
+        "the worker was given the work the facts' budgets admit"
     );
 }
 
@@ -180,13 +181,14 @@ fn the_serving_warmup_waits_for_admission_to_open() {
             rank.device = "cuda:0".to_owned();
         }
     }
-    let handle = SchedulerHandle::over_batches(&args, limits, batches)
-        .expect("the launch boots a scheduler");
+    let handle =
+        SchedulerHandle::over_batches(&args, limits, batches, scheduler::CommandWaker::noop())
+            .expect("the launch boots a scheduler");
 
     install(&handle, &serving);
     // The policy serves and could form a batch from here on; the device's captures are still
     // running, so nothing may reach it. A warm-up started by the policy would have submitted its
-    // prefill by now: the scheduler plans a queued request at its next step.
+    // prefill by now: the scheduler schedules a waiting request at its next step.
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         serving.submitted().is_empty(),

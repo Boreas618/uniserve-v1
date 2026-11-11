@@ -56,12 +56,12 @@ use scheduler::{
 fn text(depth: usize, end: Option<EndOfText>) -> Arc<FakeBatches> {
     Arc::new(
         support::text_pool(support::text_rank(), depth, end)
-            .answering_media(Arc::new(testkit::Media::new())),
+            .with_media_outputs(Arc::new(testkit::Media::new())),
     )
 }
 
 /// A scheduler over `pool` batching at most 32 calls a pass.
-fn scheduler_over(pool: &Arc<FakeBatches>) -> scheduler::Scheduler {
+fn scheduler_over(pool: &Arc<FakeBatches>) -> support::fake::Serving {
     support::fake::scheduler_over(
         Arc::clone(pool) as Arc<dyn ipc::execution::Batches>,
         SchedulerConfig {
@@ -71,6 +71,45 @@ fn scheduler_over(pool: &Arc<FakeBatches>) -> scheduler::Scheduler {
         Default::default(),
     )
     .expect("the scheduler is built over the fake")
+}
+
+/// How long a case waits between two looks at what a running scheduler
+/// published.
+const LOOK: Duration = Duration::from_millis(2);
+
+/// Runs `scheduler` on a thread of its own, reading `commands`, and returns
+/// the statistics it shares with the thread to join.
+fn run(
+    scheduler: support::fake::Serving,
+    commands: crossbeam_channel::Receiver<scheduler::Command>,
+) -> (Arc<scheduler::SchedulerStats>, thread::JoinHandle<bool>) {
+    let stats = scheduler.stats_handle();
+    (stats, thread::spawn(move || scheduler.run(commands)))
+}
+
+/// Waits until `settled` holds of the statistics a scheduler publishes after
+/// each step, or five seconds pass.
+fn settle(stats: &scheduler::SchedulerStats, settled: impl Fn(&scheduler::GeneralStats) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !settled(&stats.general) {
+        thread::sleep(LOOK);
+    }
+}
+
+/// Waits until the scheduler over `pool` has submitted and then stopped
+/// submitting: no batch is on the device and none arrived for fifty
+/// milliseconds, a thousand times what a step of these cases takes.
+fn stall(pool: &FakeBatches) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let submitted = pool.submitted().len();
+        thread::sleep(Duration::from_millis(50));
+        // A scheduler that has not submitted yet is still starting.
+        let quiet = submitted > 0 && pool.held() == 0 && pool.submitted().len() == submitted;
+        if quiet || Instant::now() >= deadline {
+            return;
+        }
+    }
 }
 
 /// The calls of `batch` and the kind of its first call's rows: a token batch
@@ -404,7 +443,10 @@ fn call_window_metrics_record_the_full_lifecycle() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
     let handle = scheduler::CommandSender::new(command_tx);
 
-    let mut scheduler = scheduler_over(&text(2, Some(EndOfText::after(5, 6))));
+    let (stats, runner) = run(
+        scheduler_over(&text(2, Some(EndOfText::after(5, 6)))),
+        commands,
+    );
     let request = generation_request(
         RequestId(1),
         text_input(vec![1, 2, 3, 4, 5]),
@@ -413,28 +455,24 @@ fn call_window_metrics_record_the_full_lifecycle() {
     );
     let mut events = handle.submit(request).unwrap();
     let mut finished = false;
-    for _ in 0..512 {
-        scheduler.step(&commands);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !finished {
         while let Ok(event) = events.try_recv() {
             if matches!(event, Event::Finished { .. }) {
                 finished = true;
             }
         }
-        if finished {
-            break;
-        }
+        thread::sleep(LOOK);
     }
     assert!(finished, "request finished");
-    // Keep stepping after the terminal event so the counters are compared only
-    // once the loop has drained.
-    for _ in 0..32 {
-        scheduler.step(&commands);
-    }
+    // The counters are compared once the loop has drained and stopped.
+    handle.shutdown();
+    assert!(!runner.join().unwrap(), "the scheduler failed");
 
     let active_domains = [
-        &scheduler.stats.domains.prefill,
-        &scheduler.stats.domains.decode,
-        &scheduler.stats.domains.flow,
+        &stats.domains.prefill,
+        &stats.domains.decode,
+        &stats.domains.flow,
     ]
     .into_iter()
     .filter(|domain| domain.launched_calls.load(Ordering::Relaxed) > 0)
@@ -453,7 +491,7 @@ fn call_window_metrics_record_the_full_lifecycle() {
         assert!(domain.completed_batches.load(Ordering::Relaxed) > 0);
     }
     let mut reporter = scheduler::SchedulerStatsReporter::default();
-    let snapshot = reporter.snapshot(&scheduler.stats);
+    let snapshot = reporter.snapshot(&stats);
     let decoded_active = snapshot
         .domain_stats
         .iter()
@@ -467,8 +505,8 @@ fn call_window_metrics_record_the_full_lifecycle() {
     }));
 }
 
-/// Runs one text request by stepping a fresh scheduler on the test thread and
-/// returns its emitted token ids.
+/// Runs one text request on a fresh scheduler and returns its emitted token
+/// ids.
 ///
 /// `depth` is the pool's queue depth: 1 gives the serial oracle, and 2 lets
 /// the scheduler submit a successor before its predecessor's token has been
@@ -484,7 +522,10 @@ fn relay_run(
     let (command_tx, commands) = crossbeam_channel::unbounded();
     let handle = scheduler::CommandSender::new(command_tx);
 
-    let mut scheduler = scheduler_over(&text(depth, Some(EndOfText::after(5, text_len as u64))));
+    let (_stats, runner) = run(
+        scheduler_over(&text(depth, Some(EndOfText::after(5, text_len as u64)))),
+        commands,
+    );
     let mut request = generation_request(
         RequestId(1),
         text_input(vec![1, 2, 3, 4, 5]),
@@ -495,8 +536,8 @@ fn relay_run(
     let mut events = handle.submit(request).unwrap();
     let mut tokens = Vec::new();
     let mut finished = false;
-    for _ in 0..512 {
-        scheduler.step(&commands);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !finished {
         while let Ok(event) = events.try_recv() {
             match event {
                 Event::TextToken { id, .. } => tokens.push(id),
@@ -504,11 +545,11 @@ fn relay_run(
                 _ => {}
             }
         }
-        if finished {
-            break;
-        }
+        thread::sleep(LOOK);
     }
     assert!(finished, "processor request reached a terminal event");
+    handle.shutdown();
+    assert!(!runner.join().unwrap(), "the scheduler failed");
 
     tokens
 }
@@ -582,15 +623,15 @@ fn generalized_processor_successors_match_depth_one_before_observation() {
 /// queue depths 1 and 2.
 #[test]
 fn image_context_decode_is_depth_invariant() {
-    // One command channel serves both runs: each run's scheduler drains the
-    // submission made just before it is stepped.
-    let (command_tx, commands) = crossbeam_channel::unbounded();
-    let handle = scheduler::CommandSender::new(command_tx);
-
     let mut runs = Vec::new();
     for queue_depth in [1, 2] {
+        let (command_tx, commands) = crossbeam_channel::unbounded();
+        let handle = scheduler::CommandSender::new(command_tx);
         // Two prompt tokens, the image's four positions and two more tokens.
-        let mut scheduler = scheduler_over(&text(queue_depth, Some(EndOfText::after(8, 8))));
+        let (_stats, runner) = run(
+            scheduler_over(&text(queue_depth, Some(EndOfText::after(8, 8)))),
+            commands,
+        );
         let request = generation_request(
             RequestId(1),
             image_input(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
@@ -600,8 +641,8 @@ fn image_context_decode_is_depth_invariant() {
         let mut events = handle.submit(request).unwrap();
         let mut finish_reason = None;
         let mut tokens = Vec::new();
-        for _ in 0..512 {
-            scheduler.step(&commands);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && finish_reason.is_none() {
             while let Ok(event) = events.try_recv() {
                 match event {
                     Event::TextToken { id, .. } => tokens.push(id),
@@ -609,10 +650,10 @@ fn image_context_decode_is_depth_invariant() {
                     _ => {}
                 }
             }
-            if finish_reason.is_some() {
-                break;
-            }
+            thread::sleep(LOOK);
         }
+        handle.shutdown();
+        assert!(!runner.join().unwrap(), "the scheduler failed");
         assert_eq!(finish_reason, Some(FinishReason::Eos));
         assert_eq!(tokens.len(), 8);
         runs.push(tokens);
@@ -810,6 +851,7 @@ fn prefix_cache_configuration_controls_reuse() {
             &args,
             testkit::limits(pool.as_ref()),
             Arc::clone(&pool) as Arc<dyn ipc::execution::Batches>,
+            scheduler::CommandWaker::noop(),
         )
         .unwrap();
         support::install_policy_on(&engine, scheduler::BatchCapacity::of(&support::text_rank()));
@@ -914,6 +956,7 @@ fn a_state_group_reuses_prefixes_up_to_a_checkpoint() {
         &args,
         testkit::limits(pool.as_ref()),
         Arc::clone(&pool) as Arc<dyn ipc::execution::Batches>,
+        scheduler::CommandWaker::noop(),
     )
     .unwrap();
     support::install_policy_on(&engine, scheduler::BatchCapacity::of(&rank));
@@ -1039,7 +1082,7 @@ fn a_scheduler_without_a_host_cache_warms_nothing() {
     let handle = CommandSender::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let answer = handle
+    let response = handle
         .cache_warm(
             storage::manifest::cache::Operation::Warmed,
             scheduler::HookBarrier::new(1),
@@ -1047,7 +1090,7 @@ fn a_scheduler_without_a_host_cache_warms_nothing() {
         .recv()
         .unwrap()
         .unwrap();
-    let snapshot: storage::manifest::cache::Snapshot = serde_json::from_str(&answer[0]).unwrap();
+    let snapshot: storage::manifest::cache::Snapshot = serde_json::from_str(&response[0]).unwrap();
     assert!(snapshot.prefixes.is_empty());
 
     drop(handle);
@@ -1238,7 +1281,7 @@ fn min_tokens_floor_overrides_early_eos() {
 }
 
 /// The first request with a context image misses the encoder cache and leaves
-/// its encoder output resident; a second request with the same image hash hits
+/// its encoder output running; a second request with the same image hash hits
 /// that cached output.
 #[test]
 fn multimodal_encode_then_cache_hit() {
@@ -1317,7 +1360,7 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
     let handle = scheduler::CommandSender::new(command_tx);
 
     // Three prompt tokens, the image's four positions and one more token.
-    let mut scheduler = scheduler_over(&text(2, Some(EndOfText::after(8, 6))));
+    let scheduler = scheduler_over(&text(2, Some(EndOfText::after(8, 6))));
     let request = |request_id| {
         generation_request(
             RequestId(request_id),
@@ -1331,10 +1374,12 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
     let mut reasons = [None, None];
     let mut text_tokens = [0_usize, 0_usize];
     let mut seen = [Vec::new(), Vec::new()];
+    // Both requests wait before the scheduler takes its first step.
+    let (stats, runner) = run(scheduler, commands);
     let deadline = Instant::now() + Duration::from_secs(5);
 
     while Instant::now() < deadline {
-        scheduler.step(&commands);
+        thread::sleep(LOOK);
         for (index, events) in [&mut first, &mut second].into_iter().enumerate() {
             while let Ok(event) = events.try_recv() {
                 seen[index].push(format!("{event:?}"));
@@ -1356,9 +1401,10 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
         "events={seen:?}"
     );
     assert!(text_tokens.iter().all(|count| *count > 0));
+    handle.shutdown();
+    assert!(!runner.join().unwrap(), "the scheduler failed");
     assert_eq!(
-        scheduler
-            .stats_handle()
+        stats
             .encoder
             .cached
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -1508,7 +1554,10 @@ fn cache_resources_return_after_completion() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
     let handle = scheduler::CommandSender::new(command_tx);
 
-    let mut sched = scheduler_over(&text(1, Some(EndOfText::after(5, 8))));
+    let (stats, runner) = run(
+        scheduler_over(&text(1, Some(EndOfText::after(5, 8)))),
+        commands,
+    );
 
     // Keep receivers alive — a dropped receiver is treated as a cancellation.
     let mut keep_alive = Vec::new();
@@ -1522,21 +1571,26 @@ fn cache_resources_return_after_completion() {
         keep_alive.push(handle.submit(req).unwrap());
     }
 
-    let mut idle_steps = 0;
-    for _ in 0..5000 {
-        let progressed = sched.step(&commands);
-        // Converged when several consecutive steps make no progress.
-        idle_steps = if progressed { 0 } else { idle_steps + 1 };
-        if idle_steps >= 3 {
-            break;
+    // Every request finishes, and the scheduler stops once it is idle.
+    for events in &mut keep_alive {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !matches!(events.try_recv(), Ok(Event::Finished { .. }))
+        {
+            thread::sleep(Duration::from_micros(200));
         }
     }
+    settle(&stats, |general| {
+        general.running.load(Ordering::Relaxed) == 0
+            && general.in_flight.load(Ordering::Relaxed) == 0
+    });
+    handle.shutdown();
+    assert!(!runner.join().unwrap(), "the scheduler failed");
 
-    assert_eq!(sched.stats.general.running.load(Ordering::Relaxed), 0);
-    assert_eq!(sched.stats.general.in_flight.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.general.running.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.general.in_flight.load(Ordering::Relaxed), 0);
     assert_eq!(
-        sched.stats.prefix_cache.free_units.load(Ordering::Relaxed),
-        sched.stats.prefix_cache.num_units.load(Ordering::Relaxed)
+        stats.prefix_cache.free_units.load(Ordering::Relaxed),
+        stats.prefix_cache.num_units.load(Ordering::Relaxed)
     );
 }
 
@@ -1548,7 +1602,10 @@ fn cancellation_storm_retires_every_request() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
     let handle = scheduler::CommandSender::new(command_tx);
 
-    let mut scheduler = scheduler_over(&text(1, Some(EndOfText::after(3, 8))));
+    let (stats, runner) = run(
+        scheduler_over(&text(1, Some(EndOfText::after(3, 8)))),
+        commands,
+    );
     let receivers = (1..=128)
         .map(|request_id| {
             handle
@@ -1563,20 +1620,14 @@ fn cancellation_storm_retires_every_request() {
         .collect::<Vec<_>>();
     drop(receivers);
 
-    for _ in 0..10_000 {
-        scheduler.step(&commands);
-        if scheduler.stats.general.running.load(Ordering::Relaxed) == 0
-            && scheduler.stats.general.pending.load(Ordering::Relaxed) == 0
-            && scheduler.stats.general.in_flight.load(Ordering::Relaxed) == 0
-        {
-            break;
-        }
-        thread::sleep(Duration::from_micros(50));
-    }
+    // The scheduler stops once it has read every cancellation the dropped
+    // receivers sent, so the counters below are its last.
+    handle.shutdown();
+    assert!(!runner.join().unwrap(), "the scheduler failed");
 
-    assert_eq!(scheduler.stats.general.running.load(Ordering::Relaxed), 0);
-    assert_eq!(scheduler.stats.general.pending.load(Ordering::Relaxed), 0);
-    assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.general.running.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.general.pending.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.general.in_flight.load(Ordering::Relaxed), 0);
 }
 
 /// A client that never reads its events stalls its own request on output
@@ -1588,7 +1639,8 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     let (command_tx, commands) = crossbeam_channel::unbounded();
     let handle = scheduler::CommandSender::new(command_tx);
 
-    let mut scheduler = scheduler_over(&text(1, None));
+    let pool = text(1, None);
+    let (stats, runner) = run(scheduler_over(&pool), commands);
     let slow_events = handle
         .submit(generation_request(
             RequestId(1),
@@ -1609,37 +1661,35 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut fast_finished = false;
     while Instant::now() < deadline && !fast_finished {
-        scheduler.step(&commands);
         while let Ok(event) = fast_events.try_recv() {
             fast_finished |= matches!(event, Event::Finished { .. });
         }
+        thread::sleep(LOOK);
     }
     assert!(
         fast_finished,
         "the consuming client must complete independently"
     );
 
-    // Step until the loop stops making progress, which leaves the slow request
-    // parked on output capacity.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && scheduler.step(&commands) {}
+    // The loop stops making progress, which leaves the slow request parked on
+    // output capacity: it runs, and nothing of it is in flight.
+    stall(&pool);
     assert_eq!(
-        scheduler.stats.general.in_flight.load(Ordering::Relaxed),
+        stats.general.in_flight.load(Ordering::Relaxed),
         0,
         "an output-stalled request cannot retain an execution slot"
     );
-    assert_eq!(scheduler.stats.general.running.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.general.running.load(Ordering::Relaxed), 1);
 
     drop(slow_events);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline
-        && (scheduler.stats.general.running.load(Ordering::Relaxed) > 0
-            || scheduler.stats.general.in_flight.load(Ordering::Relaxed) > 0)
-    {
-        scheduler.step(&commands);
-    }
-    assert_eq!(scheduler.stats.general.running.load(Ordering::Relaxed), 0);
-    assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);
+    settle(&stats, |general| {
+        general.running.load(Ordering::Relaxed) == 0
+            && general.in_flight.load(Ordering::Relaxed) == 0
+    });
+    handle.shutdown();
+    assert!(!runner.join().unwrap(), "the scheduler failed");
+    assert_eq!(stats.general.running.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.general.in_flight.load(Ordering::Relaxed), 0);
 }
 
 /// A worker failure that stops the engine still delivers `Finished { Aborted }`
@@ -1653,7 +1703,7 @@ fn engine_death_delivers_the_terminal_behind_a_full_event_channel() {
     let handle = CommandSender::new(command_tx);
 
     let pool = text(1, None);
-    let mut scheduler = scheduler_over(&pool);
+    let (stats, runner) = run(scheduler_over(&pool), commands);
     let mut events = handle
         .submit(generation_request(
             RequestId(1),
@@ -1665,10 +1715,9 @@ fn engine_death_delivers_the_terminal_behind_a_full_event_channel() {
 
     // The client reads nothing, so the request fills its event channel and
     // parks on output capacity with nothing in flight.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && scheduler.step(&commands) {}
-    assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);
-    assert_eq!(scheduler.stats.general.running.load(Ordering::Relaxed), 1);
+    stall(&pool);
+    assert_eq!(stats.general.in_flight.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.general.running.load(Ordering::Relaxed), 1);
 
     pool.hold();
     let _second = handle
@@ -1681,14 +1730,14 @@ fn engine_death_delivers_the_terminal_behind_a_full_event_channel() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while pool.held() == 0 && Instant::now() < deadline {
-        scheduler.step(&commands);
+        thread::sleep(LOOK);
     }
     assert_eq!(
         pool.fail_held("the worker was lost"),
         1,
         "the second request's batch runs"
     );
-    assert!(scheduler.run(commands), "a lost worker stops the engine");
+    assert!(runner.join().unwrap(), "a lost worker stops the engine");
 
     let mut received = Vec::new();
     loop {
@@ -1811,7 +1860,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
 
 /// An engine whose only worker is lost stops admitting work: a batch it
 /// accepted fails, its scheduler thread ends, and a submission after that is
-/// refused rather than queued for a worker that will never answer.
+/// refused rather than queued for a worker that will never response.
 #[test]
 fn losing_every_worker_stops_request_admission() {
     let mut rank = support::text_rank();

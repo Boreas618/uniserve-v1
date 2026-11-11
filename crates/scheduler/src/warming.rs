@@ -7,17 +7,17 @@ use storage::manifest::cache::{Operation, Page, Prefix, Snapshot};
 #[derive(Default)]
 pub(super) struct Warming {
     leased: Vec<PageRef>,
-    /// The pages this precopy claimed for the requests it resumes from a stored
-    /// cache, in claim order: `Room.warming` reads them through
+    /// The pages this precopy took for the requests it resumes from a stored
+    /// cache, in the order they were taken: `Room.warming` reads them through
     /// [`Warming::reserved`].
     pub(super) reserved: Vec<Reserved>,
     pub(super) prefill_tokens: Option<usize>,
     /// The tokens of each request in flight its host pages held when no offload
-    /// was on its way: what [`Scheduler::host_coverage`] answers meanwhile.
+    /// was on its way: what [`Scheduler::host_coverage`] responds meanwhile.
     host_tokens: HashMap<RequestId, u32>,
 }
 
-/// One claimed page of a precopy: the stored page, the request it serves, and
+/// One taken page of a precopy: the stored page, the request it serves, and
 /// where it goes.
 pub(super) struct Reserved {
     pub(super) page: Page,
@@ -32,7 +32,7 @@ pub(super) struct Reserved {
 impl Warming {
     /// Admission has acquired every usable page into the request's ordinary
     /// block tables, so the warming reservation no longer pins those units.
-    pub(super) fn claimed(&mut self, resume: proto::request::CacheResume) {
+    pub(super) fn took(&mut self, resume: proto::request::CacheResume) {
         self.reserved.retain(|page| page.resume != resume);
     }
 }
@@ -191,11 +191,11 @@ impl Scheduler {
             let manifest = ipc::memory::CacheManifest {
                 pages: storage::manifest::cache::Pages { pages, host },
             };
-            let answers = self
+            let responses = self
                 .worker
                 .operate(&manifest.into())
                 .map_err(|error| format!("{error:#}"))?;
-            ipc::memory::replies::<ipc::memory::CacheManifest>(&answers)
+            ipc::memory::replies::<ipc::memory::CacheManifest>(&responses)
                 .map_err(|error| error.to_string())?
                 .into_iter()
                 .flatten()
@@ -206,7 +206,9 @@ impl Scheduler {
             page_tokens: self.page_tokens(),
             prefixes,
             ranks,
-            nodes: self.worker.storage_nodes(),
+            // This process's devices hold no deployment storage of their own: the engine's
+            // host KV path is served by the Storage Server it reaches itself.
+            nodes: BTreeMap::new(),
         })
     }
 
@@ -215,7 +217,7 @@ impl Scheduler {
     /// published to the host as it completes (`Scheduler::advance_prefix_pages`),
     /// so the read waits for no copy of its own: the boundary a request offered
     /// holds once no offload is on its way, and until then the last one that
-    /// held answers, which is what a successor's admission can read now.
+    /// held responses, which is what a successor's admission can read now.
     fn host_coverage(&mut self) -> Vec<Prefix> {
         let Some(kv_offload) = self.kv_offload.as_ref() else {
             return Vec::new();
@@ -224,8 +226,8 @@ impl Scheduler {
         let page_tokens = self.page_tokens();
         let mut prefixes = Vec::new();
         let mut live = HashMap::new();
-        for (&id, state) in &self.running {
-            if state.terminal_intent.is_some() {
+        for (id, status, state) in self.requests.running_tokens() {
+            if status.is_finished() {
                 continue;
             }
             // A request that publishes no page computes its state again whatever a wait does.
@@ -275,8 +277,8 @@ impl Scheduler {
             return Ok(Vec::new());
         };
         let mut prefixes = Vec::new();
-        for (&id, state) in &self.running {
-            if state.terminal_intent.is_some() {
+        for (id, status, state) in self.requests.running_tokens() {
+            if status.is_finished() {
                 continue;
             }
             let Some(allocation) = state.allocations.as_ref() else {
@@ -387,7 +389,7 @@ impl Scheduler {
                 resume: Some(resume),
             };
             let mut hashes = vec![Vec::new(); cache.groups().len()];
-            cache.extend_hashes(&mut hashes, CachedTokens::prompt(&prefix.tokens), scope);
+            cache.extend_page_keys(&mut hashes, CachedTokens::prompt(&prefix.tokens), scope);
             let source_pages = std::mem::take(&mut prefix.pages);
             for (group, shape) in cache.groups().iter().enumerate() {
                 if shape.draft() {
@@ -480,7 +482,7 @@ impl Scheduler {
                     .filter(|(_, worker)| worker.prefix_cache.is_some())
                     .map(|(_, worker)| {
                         cache
-                            .probe_prefix(&prefix.tokens, true, false, scope, &worker.endpoint)
+                            .find_prefix(&prefix.tokens, true, false, scope, &worker.endpoint)
                             .cached_tokens as u32
                     })
                     .max()

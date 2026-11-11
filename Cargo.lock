@@ -3914,7 +3914,7 @@ dependencies = [
  "png",
  "program-server",
  "proto",
- "scheduler",
+ "rustix",
  "scheduling",
  "serde",
  "serde_json",

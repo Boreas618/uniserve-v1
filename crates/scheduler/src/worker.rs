@@ -1,14 +1,12 @@
-//! Logical execution batches, physical execution, and worker contracts.
+//! What the scheduler knows of the ranks it schedules, and how their work
+//! ends.
 //!
-//! A serving scheduler submits its batches through the worker crate's
-//! `Batches` (`Submissions::over_batches`). [`Worker`] is the same boundary
-//! for a simulated pool: `SimWorker` (`crate::sim`) is its implementation,
-//! and a scheduler test plugs it in through `SchedulerHandle::with_worker`.
-//!
-//! Besides the trait, this module owns the values that cross that boundary:
+//! A scheduler submits its batches through the batch interface of its
+//! process's devices (`ipc::execution::Batches`, `Submissions::over_batches`).
+//! This module owns the values that describe the other side of it:
 //! [`WorkerInfo`], which merges the pools' reported capabilities, beside
-//! their layout, into the single capacity view the scheduler plans against;
-//! and the result types a poll returns.
+//! their layout, into the single capacity view the scheduler schedules
+//! against, and the failures a pool reports.
 
 pub use proto::config::{BlockConfig, BlockDistribution, SequenceParallel, WorkerGroupId};
 
@@ -16,15 +14,9 @@ pub use proto::config::{BlockConfig, BlockDistribution, SequenceParallel, Worker
 use ipc::VideoDenoiserInfo;
 use ipc::{ForwardMode, MediaCall};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-#[cfg(feature = "testing")]
-use std::sync::Arc;
-#[cfg(feature = "testing")]
-use std::time::Duration;
 
 use anyhow::Context as _;
 
-#[cfg(feature = "testing")]
-use ipc::BatchCommand;
 use ipc::{CallId, CallKind, MainProcessInfo, RequestKey};
 
 mod batch;
@@ -44,7 +36,7 @@ pub struct WorkerInfo {
     /// stated.
     pub max_model_len: u32,
     /// For each pool, how it is placed. A pool absent from the map is placed
-    /// with no components and a queue depth of one.
+    /// with no stages and a queue depth of one.
     ///
     /// `from_inventory` and `SimWorker` fill this; `from_workers` leaves it
     /// empty.
@@ -53,35 +45,33 @@ pub struct WorkerInfo {
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
     ///
-    /// `from_inventory` fills this from the layout; `from_workers` and
-    /// `SimWorker` leave it empty. Scheduler admission restricts a video
+    /// `from_inventory` fills this from the layout; `from_workers` leaves it
+    /// empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the worker chosen to decode.
     pub video_codecs: BTreeMap<WorkerGroupId, BTreeSet<WorkerGroupId>>,
     /// For each pool, the persistent buffer bytes each of its ranks backs,
     /// in rank order, as the ranks reported them. Each rank has its own
-    /// buffer pool, sized to the products of the components it executes and
-    /// of the components that read them, so the engine places a pool's
+    /// buffer pool, sized to the products of the stages it executes and
+    /// of the stages that read them, so the engine places a pool's
     /// media buffers rank by rank.
     ///
     /// `from_inventory` fills this from its ranks; a pool absent from it, as
-    /// `from_workers` and `SimWorker` leave every pool, has its placed ranks
+    /// `from_workers` leaves every pool, has its placed ranks
     /// (`PoolLayout::ranks`, one when it has no layout), each backing
     /// its reported `buffer_pool_bytes`.
     pub rank_buffer_bytes: BTreeMap<WorkerGroupId, Vec<u64>>,
     /// For each pool, each rank's prefix cache as the rank reported it, with
     /// the host page pools it maps, and the rank's host, in rank order.
     ///
-    /// `from_inventory` fills this from its ranks; `from_workers` and
-    /// `SimWorker` leave it empty, which serves no pool through the host KV
-    /// cache.
+    /// `from_inventory` fills this from its ranks; `from_workers` leaves it
+    /// empty, which serves no pool through the host KV cache.
     pub rank_caches: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::PrefixCacheInfo>)>>,
     /// For each pool, each rank's host latent pool as the rank reported it,
     /// and the rank's host, in rank order: the video denoising ranks report
     /// one, every other rank none (`ipc::MainProcessInfo::latent_pool`).
     ///
     /// `from_inventory` fills this from its ranks; `from_workers` leaves it
-    /// empty, which stores no preempted trajectory, and a
-    /// simulated worker states its own (`SimEngine::set_latent_pools`).
+    /// empty, which stores no preempted trajectory.
     pub rank_latents: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::LatentPoolInfo>)>>,
     /// For each pool, each rank's host encoder pool as the rank reported it,
     /// and the rank's host, in rank order: the ranks that execute video
@@ -89,8 +79,7 @@ pub struct WorkerInfo {
     /// (`ipc::MainProcessInfo::encoder_pool`).
     ///
     /// `from_inventory` fills this from its ranks; `from_workers` leaves it
-    /// empty, which stores no encoder output, and a simulated
-    /// worker states its own (`SimEngine::set_encoder_pools`).
+    /// empty, which stores no encoder output.
     pub rank_encoders: BTreeMap<WorkerGroupId, RankEncoderPools>,
 }
 
@@ -103,25 +92,25 @@ impl WorkerInfo {
     ///
     /// Each rank validated the report it built, so the records are taken as
     /// they are. Fails when `pools` is empty, repeats a pool id, or holds
-    /// replicas of one component that expose different numerical outputs.
+    /// replicas of one stage that expose different numerical outputs.
     pub fn from_workers(pools: Vec<(WorkerGroupId, MainProcessInfo)>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !pools.is_empty(),
             "worker info must contain at least one pool"
         );
         let mut ids = std::collections::HashSet::new();
-        let mut components: BTreeMap<&str, &ipc::ComponentInfo> = BTreeMap::new();
+        let mut stages: BTreeMap<&str, &ipc::StageInfo> = BTreeMap::new();
         for (id, info) in &pools {
             anyhow::ensure!(ids.insert(id), "worker info repeats pool id {id}");
-            for component in &info.components {
-                if let Some(other) = components.get(component.name.as_str()) {
+            for stage in &info.stages {
+                if let Some(other) = stages.get(stage.name.as_str()) {
                     anyhow::ensure!(
-                        other.outputs == component.outputs,
-                        "replicas of component {} expose different numerical outputs",
-                        component.name
+                        other.outputs == stage.outputs,
+                        "replicas of stage {} expose different numerical outputs",
+                        stage.name
                     );
                 } else {
-                    components.insert(&component.name, component);
+                    stages.insert(&stage.name, stage);
                 }
             }
         }
@@ -131,10 +120,10 @@ impl WorkerInfo {
         })
     }
 
-    /// Returns the configuration the engine placed component `name` with on
-    /// `worker`, or `None` when the pool holds no such component.
-    pub fn component_config(&self, worker: &WorkerGroupId, name: &str) -> Option<&BlockConfig> {
-        self.layouts.get(worker)?.components.get(name)
+    /// Returns the configuration the engine placed stage `name` with on
+    /// `worker`, or `None` when the pool holds no such stage.
+    pub fn stage_config(&self, worker: &WorkerGroupId, name: &str) -> Option<&BlockConfig> {
+        self.layouts.get(worker)?.stages.get(name)
     }
 
     /// The persistent buffer bytes each rank of `worker` backs, in rank
@@ -159,27 +148,27 @@ impl WorkerInfo {
         self.rank_buffer_bytes(worker).len().max(1)
     }
 
-    /// Resolves which component serves each media call across every worker.
+    /// Resolves which stage serves each media call across every worker.
     ///
     /// The video graph may span workers: a model worker serves decoding and a
     /// host worker serves encoding and muxing. Each call is served by one
-    /// component, which several workers may replicate, and a deployment that
+    /// stage, which several workers may replicate, and a deployment that
     /// muxes serves the whole video graph between its workers.
     pub fn media_routing(&self) -> anyhow::Result<BTreeMap<MediaCall, String>> {
         // The first worker seen serving a call is kept only to name it if
-        // another worker routes that call to a different component.
+        // another worker routes that call to a different stage.
         let mut routing: BTreeMap<MediaCall, (String, &WorkerGroupId)> = BTreeMap::new();
         for (id, info) in &self.workers {
-            for (call, component) in &info.media_components {
+            for (call, stage) in &info.media_stages {
                 if let Some((other, owner)) = routing.get(call) {
                     anyhow::ensure!(
-                        other == component,
-                        "media call {call:?} is served by component {other} of worker {owner} \
-                         and by component {component} of worker {id}"
+                        other == stage,
+                        "media call {call:?} is served by stage {other} of worker {owner} \
+                         and by stage {stage} of worker {id}"
                     );
                     continue;
                 }
-                routing.insert(*call, (component.clone(), id));
+                routing.insert(*call, (stage.clone(), id));
             }
         }
         if routing.contains_key(&MediaCall::Muxing) {
@@ -190,19 +179,19 @@ impl WorkerInfo {
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 missing.is_empty(),
-                "a deployment that muxes video serves no component for {}",
+                "a deployment that muxes video serves no stage for {}",
                 missing.join(", ")
             );
         }
         Ok(routing
             .into_iter()
-            .map(|(call, (component, _))| (call, component))
+            .map(|(call, (stage, _))| (call, stage))
             .collect())
     }
 
     /// Returns the media units one call of `call` covers at once: the ranks
-    /// of a distributed serving component times its `units_per_rank`, or one
-    /// for any other component, on the narrowest worker serving the call.
+    /// of a distributed serving stage times its `units_per_rank`, or one
+    /// for any other stage, on the narrowest worker serving the call.
     ///
     /// A latent encoding round is dealt to the latent encoder's ranks that a
     /// request's prompt does not take (`Scheduler::latent_round`), so while
@@ -217,17 +206,17 @@ impl WorkerInfo {
         self.workers
             .iter()
             .filter_map(|(worker, info)| {
-                let component = info.media_components.get(&call)?;
-                let config = self.component_config(worker, component)?;
+                let stage = info.media_stages.get(&call)?;
+                let config = self.stage_config(worker, stage)?;
                 if config.distribution.is_none() {
                     return Some(1);
                 }
 
                 let prompt = info
-                    .media_components
+                    .media_stages
                     .get(&MediaCall::TextEncoding)
                     .filter(|_| call == MediaCall::LatentEncoding)
-                    .and_then(|name| self.component_config(worker, name));
+                    .and_then(|name| self.stage_config(worker, name));
                 let unshared = config
                     .ranks
                     .iter()
@@ -256,7 +245,7 @@ impl WorkerInfo {
     /// The exceptions are the prefix cache, whose layout the cache pools must share
     /// and whose block count is their smallest and per-token footprint their
     /// largest; request slots of a deployment that muxes video,
-    /// the narrowest per-component sum of replica slots; and the video
+    /// the narrowest per-stage sum of replica slots; and the video
     /// denoiser and latent page geometry, taken from the first denoising
     /// pool and absent or zero without one.
     ///
@@ -305,7 +294,7 @@ impl WorkerInfo {
         // Fields not merged below keep the seed pool's values.
         let seed_index = cache_indices.first().copied().unwrap_or(0);
         let mut merged = self.workers[seed_index].1.clone();
-        merged.media_components = self.media_routing()?;
+        merged.media_stages = self.media_routing()?;
         let denoising = routed(CallKind::Media(MediaCall::Denoising));
         // The denoising worker owns the denoiser: its description is the
         // deployment's.
@@ -313,7 +302,7 @@ impl WorkerInfo {
         // A deployment that assembles video denoises over the fixed schedule
         // the denoising worker describes.
         anyhow::ensure!(
-            !merged.media_components.contains_key(&MediaCall::Muxing)
+            !merged.media_stages.contains_key(&MediaCall::Muxing)
                 || merged.video_denoiser.is_some(),
             "a deployment that muxes video reports no video denoiser"
         );
@@ -364,27 +353,24 @@ impl WorkerInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
-        merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
+        merged.request_slots = if merged.media_stages.contains_key(&MediaCall::Muxing) {
             // A replicated media route owns an independent request-row bank in
             // every group. End-to-end concurrency is the narrowest sum
-            // of replica capacities among the graph's components. Each
-            // component is keyed to the first call it serves; its replicas are
-            // the pools that support that call and bind the component.
-            let mut components = BTreeMap::new();
-            for (call, component) in &merged.media_components {
-                components.entry(component.as_str()).or_insert(*call);
+            // of replica capacities among the graph's stages. Each
+            // stage is keyed to the first call it serves; its replicas are
+            // the pools that support that call and bind the stage.
+            let mut stages = BTreeMap::new();
+            for (call, stage) in &merged.media_stages {
+                stages.entry(stage.as_str()).or_insert(*call);
             }
-            components
+            stages
                 .into_iter()
-                .map(|(component, call)| {
+                .map(|(stage, call)| {
                     self.workers
                         .iter()
                         .filter(|(_, info)| {
                             info.supported_calls.contains(&CallKind::Media(call))
-                                && info
-                                    .components
-                                    .iter()
-                                    .any(|binding| binding.name == component)
+                                && info.stages.iter().any(|binding| binding.name == stage)
                         })
                         .map(|(_, info)| info.request_slots)
                         .try_fold(0u32, |total, slots| total.checked_add(slots))
@@ -471,10 +457,10 @@ impl WorkerInfo {
     }
 }
 
-/// Checks that the deployment places a component for every call its video
+/// Checks that the deployment places a stage for every call its video
 /// denoiser's requests make.
 ///
-/// A conditioned request reads its media on a host component and encodes its
+/// A conditioned request reads its media on a host stage and encodes its
 /// conditions before denoising, so a deployment whose denoiser takes
 /// conditions must place the media reader and both condition encoders as
 /// well as the generation calls.
@@ -484,12 +470,12 @@ fn check_video_tasks(info: &MainProcessInfo) -> anyhow::Result<()> {
     };
     let missing = crate::graph::video_calls(denoiser.takes_conditions)
         .into_iter()
-        .filter(|call| !info.media_components.contains_key(call))
+        .filter(|call| !info.media_stages.contains_key(call))
         .map(|call| format!("{call:?}"))
         .collect::<Vec<_>>();
     anyhow::ensure!(
         missing.is_empty(),
-        "the deployment's denoiser {} but places no component for {}",
+        "the deployment's denoiser {} but places no stage for {}",
         if denoiser.takes_conditions {
             "takes conditions"
         } else {
@@ -500,19 +486,9 @@ fn check_video_tasks(info: &MainProcessInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One call result returned from a simulated batch.
-#[cfg(feature = "testing")]
-#[derive(Debug, Clone)]
-pub struct CallResult {
-    /// Validated completion values; media storage is carried by `media` below.
-    pub output: crate::sim::CallOutput,
-    /// Claimed immutable output storage, or its request-local acquisition error.
-    pub media: Result<Option<Arc<ipc::SharedMedia>>, ipc::SharedMediaError>,
-}
-
 /// Distinguishes applied control from physical retirement and unacknowledged failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandOutcome {
+pub enum CommandStatus {
     /// Every target pool acknowledged the command.
     Applied,
     /// The targeted request was tainted by a worker failure, so the command
@@ -524,7 +500,7 @@ pub enum CommandOutcome {
     Failed,
 }
 
-/// Terminal outcome of one logical lifecycle command.
+/// Terminal status of one logical lifecycle command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
     /// Position among lifecycle commands, excluding request admissions.
@@ -532,26 +508,7 @@ pub struct CommandResult {
     /// Request targeted by the command.
     pub request_key: RequestKey,
     /// A failed command retains physical ownership until a subsequent release succeeds.
-    pub outcome: CommandOutcome,
-}
-
-/// One independently ready subset of a logical batch, as a simulated pool
-/// reports it.
-#[cfg(feature = "testing")]
-#[derive(Debug, Clone)]
-pub struct BatchResult {
-    /// Logical batch identity assigned at submission.
-    pub batch_id: u64,
-    /// Call completions this join reports as ready.
-    pub results: Vec<CallResult>,
-    /// Receipts for the batch's lifecycle commands; empty unless `done`.
-    pub command_results: Vec<CommandResult>,
-    /// Whether this join completes the batch.
-    pub done: bool,
-    /// Per-worker execution durations in microseconds.
-    pub worker_exec_us: Vec<u64>,
-    /// Per-worker model-forward statistics.
-    pub forward_stats: Vec<ipc::ForwardStats>,
+    pub status: CommandStatus,
 }
 
 /// Dynamic error returned while polling or administering a worker.
@@ -563,17 +520,6 @@ pub struct BatchResult {
 /// (`ExecuteError`).
 pub type WorkerError = anyhow::Error;
 
-/// Backpressure and terminal failures returned by logical batch submission.
-#[derive(Debug, thiserror::Error)]
-pub enum WorkerSubmitError {
-    #[error("worker queue is full")]
-    /// Returns ownership of a batch rejected by bounded queue capacity.
-    WouldBlock(Box<ExecutionBatch>),
-    #[error(transparent)]
-    /// Reports a terminal submission failure.
-    Failed(#[from] anyhow::Error),
-}
-
 /// A worker-reported execution error classified for scheduler failure policy.
 ///
 /// The typed taxonomy and execution context travel together so failure policy
@@ -582,7 +528,7 @@ pub enum WorkerSubmitError {
 #[error("worker execute error: {message}")]
 pub struct ExecuteError {
     /// Batch whose response carried this error. Composite workers use it to
-    /// join the same terminal outcome across ranks before returning the
+    /// join the same terminal status across ranks before returning the
     /// failure to the scheduler.
     pub batch_id: Option<u64>,
     /// Whether the error invalidates the worker.
@@ -598,35 +544,6 @@ pub struct ExecuteError {
     pub route: Option<String>,
     /// Calls affected by the worker failure.
     pub calls: Vec<ipc::ErrorCallIdentity>,
-}
-
-impl ExecuteError {
-    /// The classification of a batch some of whose calls computed
-    /// non-finite logits (`ErrorCode::NumericalFault`), which fails an epoch
-    /// on trial as a whole; `None` for a batch whose failed calls failed
-    /// otherwise, whose failure the scheduler reconciles by their requests
-    /// alone.
-    #[cfg(feature = "testing")]
-    pub fn non_finite<'a>(
-        batch_id: u64,
-        outputs: impl IntoIterator<Item = &'a crate::sim::CallOutput>,
-    ) -> Option<Self> {
-        let code = ipc::ErrorCode::NumericalFault;
-        outputs
-            .into_iter()
-            .any(|output| {
-                output.status == ipc::CallStatus::Error && output.error_code == Some(code)
-            })
-            .then(|| Self {
-                batch_id: Some(batch_id),
-                fatal: false,
-                code: Some(code),
-                message: format!("calls of batch {batch_id} computed non-finite logits"),
-                phase: None,
-                route: None,
-                calls: Vec::new(),
-            })
-    }
 }
 
 /// Terminal work abandoned by one Worker, with the exact invalidated ownership.
@@ -654,122 +571,6 @@ pub struct WorkerFailure {
     pub message: String,
 }
 
-/// The asynchronous, pipelined boundary a simulated pool implements.
-///
-/// One submitted batch may come back from `poll` as several
-/// [`BatchResult`]s: each carries completions not reported by an earlier one,
-/// and the last has `done` set and carries the lifecycle command receipts.
-/// A failure may instead surface as an error from `poll`.
-#[cfg(feature = "testing")]
-pub trait Worker: Send {
-    /// Returns the worker's concrete pool capabilities.
-    fn info(&self) -> &WorkerInfo;
-    /// Whether every worker of group `worker` is ready to accept execution.
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool;
-    /// Whether group `worker` executes nothing further: it is closed, or
-    /// could not be replaced. A group whose replacement is starting is not
-    /// ready but not closed either. The default suits a worker that
-    /// replaces no group in the background: a group that is not ready is
-    /// closed.
-    fn is_closed(&self, worker: &WorkerGroupId) -> bool {
-        !self.is_ready(worker)
-    }
-    /// Whether group `worker` has an unclaimed destination submission slot.
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool;
-    /// Whether every physical owner of a lifecycle command can accept its submission.
-    fn command_has_capacity(&self, command: &BatchCommand) -> bool;
-    /// Submits one logical batch without blocking for capacity.
-    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), WorkerSubmitError>;
-    /// Waits up to `timeout` for one partial or terminal batch result.
-    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, WorkerError>;
-    /// Closes the worker and its physical workers.
-    fn close(&mut self) -> Result<(), WorkerError>;
-    /// Commits the workers' epoch: each worker takes the predecessor
-    /// epoch's storage it mapped read-only. Returns what each worker
-    /// reported. The default suits a worker whose workers succeed no
-    /// epoch.
-    fn commit(&mut self) -> Result<Vec<String>, WorkerError> {
-        Ok(Vec::new())
-    }
-    /// Publishes this epoch's immutable pages after its commit decision.
-    /// Workers without shared storage have nothing to publish.
-    fn publish_epoch(&mut self) -> Result<(), WorkerError> {
-        Ok(())
-    }
-    /// Ends the storage of every epoch of `epochs` on the nodes of the
-    /// worker's workers. The default suits a worker that retains no
-    /// storage.
-    fn retire(&mut self, epochs: &[u64]) -> Result<(), WorkerError> {
-        let _ = epochs;
-        Ok(())
-    }
-    /// Keeps the weights alone of every epoch of `epochs` on the nodes of
-    /// the worker's workers, in host storage when `to_host`, and returns
-    /// each node's report. The default suits a worker that retains no
-    /// storage, which has no node to report.
-    fn keep_weights(
-        &mut self,
-        epochs: &[u64],
-        to_host: bool,
-        cache_keys: &[Vec<u8>],
-    ) -> Result<Vec<String>, WorkerError> {
-        let _ = (epochs, to_host, cache_keys);
-        Ok(Vec::new())
-    }
-    /// The storage ledgers of the nodes of the worker's workers: for each
-    /// node, JSON of `{"host": ..., "ledgers": [...], "host_storage": {...}}`.
-    /// The default suits a worker that retains no storage, whose ledgers
-    /// are empty.
-    fn ledgers(&mut self) -> Result<Vec<String>, WorkerError> {
-        Ok(Vec::new())
-    }
-
-    /// Storage Server endpoints for the deployment nodes. Local numerical
-    /// workers retain no storage outside their process.
-    fn storage_nodes(&self) -> std::collections::BTreeMap<String, String> {
-        std::collections::BTreeMap::new()
-    }
-    /// Performs the storage `operation` on every worker while none runs a
-    /// batch, and returns each worker group's identity with its ranks'
-    /// results, in rank order. The default refuses: the worker has no
-    /// workers to operate on.
-    fn operate_groups(
-        &mut self,
-        operation: &ipc::execution::EpochOperation,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
-        anyhow::bail!("this worker performs no storage operation ({operation:?})")
-    }
-    /// Maps the host KV cache's page pools on every worker's ranks, each
-    /// holding `tokens` tokens of every cache group (`uniserve.host_cache`),
-    /// while none runs a batch, and returns each worker group's identity
-    /// with its ranks' pools (JSON, `null` for a rank that copies no pages),
-    /// in rank order. The default refuses: the worker has no workers.
-    fn map_host_cache(
-        &mut self,
-        tokens: u64,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
-        anyhow::bail!("this worker maps no host KV cache ({tokens} tokens)")
-    }
-    /// Performs the storage `operation` on every worker while none runs a
-    /// batch, and returns each worker's result. The default refuses: the
-    /// worker has no workers to operate on.
-    fn operate(
-        &mut self,
-        operation: &ipc::execution::EpochOperation,
-    ) -> Result<Vec<String>, WorkerError> {
-        anyhow::bail!("this worker performs no storage operation ({operation:?})")
-    }
-
-    /// Commit prepared expert allocations.
-    fn commit_experts(
-        &mut self,
-        order: &BTreeMap<String, Vec<u32>>,
-    ) -> Result<Vec<String>, WorkerError> {
-        let _ = order;
-        anyhow::bail!("this worker holds no expert weights")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,9 +580,9 @@ mod tests {
     fn media_info(routes: &[(MediaCall, &str)]) -> MainProcessInfo {
         let denoises = routes.iter().any(|(call, _)| *call == MediaCall::Denoising);
         MainProcessInfo {
-            media_components: routes
+            media_stages: routes
                 .iter()
-                .map(|(call, component)| (*call, (*component).to_owned()))
+                .map(|(call, stage)| (*call, (*stage).to_owned()))
                 .collect(),
             supported_calls: routes
                 .iter()
@@ -803,12 +604,12 @@ mod tests {
     ) -> (WorkerGroupId, MainProcessInfo) {
         let mut info = media_info(routes);
         info.request_slots = request_slots;
-        info.components = routes
+        info.stages = routes
             .iter()
-            .map(|(_, component)| *component)
+            .map(|(_, stage)| *stage)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .map(|name| ipc::ComponentInfo {
+            .map(|name| ipc::StageInfo {
                 name: name.to_owned(),
                 outputs: Vec::new(),
             })
@@ -835,7 +636,7 @@ mod tests {
 
     #[test]
     fn replicated_media_routes_add_independent_request_capacity() -> anyhow::Result<()> {
-        // Each pool serves the whole video graph, so every component's
+        // Each pool serves the whole video graph, so every stage's
         // replica capacity is the sum over both pools.
         let info = WorkerInfo::from_workers(vec![
             media_replica("replica-0", 2),
@@ -904,7 +705,7 @@ mod tests {
         assert_eq!(routing[&MediaCall::VideoDecoding], "video_decoder");
     }
 
-    /// A distributed component's round covers its ranks times its units per
+    /// A distributed stage's round covers its ranks times its units per
     /// rank, an undistributed one's a single unit, and the narrowest replica
     /// binds; a call no worker serves has no round units. A latent encoding
     /// round leaves out the ranks its worker's text encoder takes.
@@ -916,13 +717,13 @@ mod tests {
             units_per_rank,
             ..parallel(ranks)
         };
-        // A pool placing each named component as configured.
+        // A pool placing each named stage as configured.
         let pool = |id: &str, routes: &[(MediaCall, &str)], configs: Vec<(&str, BlockConfig)>| {
             let (id, info) = media_pool(id, routes, 0);
             let layout = PoolLayout {
                 queue_depth: 1,
                 ranks: 8,
-                components: configs
+                stages: configs
                     .into_iter()
                     .map(|(name, config)| (name.to_owned(), config))
                     .collect(),
@@ -1002,7 +803,7 @@ mod tests {
     /// media reader and both condition encoders; one serving `t2va` alone
     /// needs only the generation calls.
     #[test]
-    fn a_denoiser_that_takes_conditions_requires_its_condition_components() {
+    fn a_denoiser_that_takes_conditions_requires_its_condition_stages() {
         let generation = [
             (MediaCall::TextEncoding, "text_encoder"),
             (MediaCall::LatentPreparation, "denoiser"),

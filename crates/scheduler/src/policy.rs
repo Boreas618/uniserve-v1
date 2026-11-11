@@ -2,14 +2,14 @@
 //! that replaces it in place (§4.4, §7.3).
 //!
 //! The mechanism asks the policy for one decision at each decision point and
-//! validates and executes the answer; this module owns the wasmtime instance
-//! that answers, the module kept for a revert, the instance a precopy prepared,
+//! validates and executes the response; this module owns the wasmtime instance
+//! that responses, the module kept for a revert, the instance a precopy prepared,
 //! the stages that change them, and the control thread's own instance for
 //! `route`.
 //!
 //! The switch follows §7.3's stages. A precopy instantiates the new policy on
 //! the state that exists now and asks it every decision once, executing
-//! nothing, so an illegal answer or an invalid decision fails the update while
+//! nothing, so an illegal response or an invalid decision fails the update while
 //! the serving policy is untouched. A switchover puts the prepared instance in
 //! at a batch boundary and keeps the module it replaced. A commit leaves that
 //! module in place until the next precopy, which is where §7.3's purge of it
@@ -20,19 +20,19 @@
 //!
 //! Both instances — each scheduler thread's and the control thread's
 //! [`Router`] — come from one program and switch together (§4.4: "两者是同一个
-//! program，一起换代"). The router's instance answers `route` from the arriving
+//! program，一起换代"). The router's instance returns `route` from the arriving
 //! request's view and the ranks' views alone; it is told no events.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use scheduling::guest::decision::{Plan, Room, Shortage, Victim};
+use scheduling::guest::decision::{DispatchOutput, Room, Shortage, Victim};
 use scheduling::guest::event::Event;
 pub use scheduling::guest::limits::{Limits, Parameters};
 use scheduling::guest::policy::Instantiation;
 use scheduling::guest::view::{
-    CallView, RankView, ReplicaView, RequestState, RequestView, Snapshot,
+    CallView, RankView, ReplicaView, RequestStatus, RequestView, Snapshot,
 };
 use scheduling::guest::wire::Call;
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
@@ -317,13 +317,13 @@ impl ProgramSource {
         let client = client.as_mut().ok_or_else(|| PolicyError::Load {
             message: "the Program Server connection was closed".to_owned(),
         })?;
-        let answer = ask(client);
-        if answer.is_err() {
+        let response = ask(client);
+        if response.is_err() {
             // A failed exchange may leave the stream out of step; the next
             // precopy opens a new one.
             *crate::lock(&self.client) = None;
         }
-        answer
+        response
     }
 }
 
@@ -397,7 +397,7 @@ impl PolicySource for ProgramSource {
     }
 }
 
-/// A policy module a caller already holds in memory: a store's answer, read
+/// A policy module a caller already holds in memory: a store's response, read
 /// once, that keeps handing out the same bytes.
 #[derive(Clone, Debug, Default)]
 pub struct PolicyBytes {
@@ -423,8 +423,8 @@ impl PolicySource for PolicyBytes {
 /// decisions, as the mechanism holds it at one moment (§4.4).
 ///
 /// It is owned so it can be built on the scheduler thread at a step boundary
-/// and handed to a blocking thread for a precopy, and so a revert instantiates
-/// the previous policy on the state it is handed rather than on a capture taken
+/// and given to a blocking thread for a precopy, and so a revert instantiates
+/// the previous policy on the state it is given rather than on a capture taken
 /// when the failing policy was installed. The mechanism builds it; the switch
 /// only reads it.
 #[derive(Clone, Debug, Default)]
@@ -433,17 +433,17 @@ pub struct TrialState {
     pub snapshot: Snapshot,
     /// The step's room, for `dispatch`.
     pub room: Room,
-    /// The shortage the mechanism faces, for `reclaim`; `None` skips the call,
-    /// as the mechanism calls `reclaim` only when something is short.
+    /// The shortage the mechanism faces, for `preempt`; `None` skips the call,
+    /// as the mechanism calls `preempt` only when something is short.
     pub shortage: Option<Shortage>,
-    /// A queued request and the ranks, for `route`; `None` skips the call.
+    /// A waiting request and the ranks, for `route`; `None` skips the call.
     pub arrival: Option<(RequestView, Vec<RankView>)>,
     /// A request's first call on a block and the replicas, for `place`; `None`
     /// skips the call.
     pub call: Option<(CallView, Vec<ReplicaView>)>,
 }
 
-/// The mechanism's validation of a decision's answer, without executing it
+/// The mechanism's validation of a decision's response, without executing it
 /// (§4.4, §7.3 step 2).
 ///
 /// The validators are the mechanism's own — the same ones that gate a live
@@ -451,9 +451,9 @@ pub struct TrialState {
 /// will judge it once it serves. They are grouped here so the switch can run
 /// them on a candidate; the mechanism implements this for its own validators.
 pub trait Validators {
-    /// Whether `plan` names only objects that exist and are selectable, and
+    /// Whether `output` names only objects that exist and are selectable, and
     /// fits the step's hard limits.
-    fn plan(&self, plan: &Plan) -> Result<(), PolicyError>;
+    fn output(&self, output: &DispatchOutput) -> Result<(), PolicyError>;
 
     /// Whether every victim is evictable for `shortage`, and legal for it.
     fn victims(&self, shortage: &Shortage, victims: &[Victim]) -> Result<(), PolicyError>;
@@ -530,7 +530,7 @@ pub struct PolicyUsage {
     /// replaced (§4.4).
     ///
     /// This is the epoch's call discipline as a caller can see it: one `observe`
-    /// and one `dispatch` per step whatever they answer, each optional decision
+    /// and one `dispatch` per step whatever they respond, each optional decision
     /// only where the state names it, and the trial a precopy ran on the
     /// instance a switchover adopts. A policy that replaced another carries the
     /// replaced instance's counts forward, as `calls` and `fuel` do.
@@ -744,7 +744,7 @@ impl Arrival {
 pub fn arrival_view(arrival: &Arrival) -> RequestView {
     RequestView {
         id: scheduling::guest::ids::RequestId(arrival.id.0),
-        state: RequestState::Queued,
+        state: RequestStatus::Waiting,
         phase: None,
         priority: arrival.priority,
         arrived_at: arrival.arrived_at,
@@ -877,16 +877,16 @@ impl PolicySlot {
         cost.call(instance, |instance| instance.observe(events))
     }
 
-    /// `dispatch`: this step's plan (§4.4).
-    pub fn dispatch(&mut self, room: &Room) -> Result<Plan, PolicyError> {
+    /// `dispatch`: this step's output (§4.4).
+    pub fn dispatch(&mut self, room: &Room) -> Result<DispatchOutput, PolicyError> {
         let (instance, cost) = (&mut self.instance, &mut self.cost);
         cost.call(instance, |instance| instance.dispatch(room))
     }
 
-    /// `reclaim`: which objects to free, in order, for a shortage (§4.4).
-    pub fn reclaim(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
+    /// `preempt`: which objects to free, in order, for a shortage (§4.4).
+    pub fn preempt(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
         let (instance, cost) = (&mut self.instance, &mut self.cost);
-        cost.call(instance, |instance| instance.reclaim(shortage))
+        cost.call(instance, |instance| instance.preempt(shortage))
     }
 
     /// `route`: the rank that serves a request that has just arrived (§4.4).
@@ -919,14 +919,14 @@ impl PolicySlot {
     /// §7.3 step 2: instantiate `program` on `state` and ask it every decision
     /// of §4.4 once, executing nothing.
     ///
-    /// An answer that does not decode, a trap, fuel exhaustion, limits outside
+    /// A response that does not decode, a trap, fuel exhaustion, limits outside
     /// the build config, a decision that names something that does not exist or
     /// cannot be chosen all fail the precopy: no candidate is returned and the serving policy is
     /// untouched. `validators` are the mechanism's own, so the candidate is
     /// judged by what will judge it live.
     ///
     /// A static function so it runs on a blocking thread and its [`Candidate`]
-    /// is handed back to the scheduler thread, which keeps the serving slot
+    /// is given back to the scheduler thread, which keeps the serving slot
     /// throughout.
     pub fn prepare(
         engine: &Engine,
@@ -963,10 +963,10 @@ impl PolicySlot {
         // Every decision of §4.4's table once, on the state that exists now and
         // without executing any of it. The calls are the trial's cost, counted
         // once the candidate is adopted; `TrialCost` records them below.
-        let plan = instance.dispatch(&room)?;
-        validators.plan(&plan)?;
+        let output = instance.dispatch(&room)?;
+        validators.output(&output)?;
         if let Some(shortage) = &shortage {
-            let victims = instance.reclaim(shortage)?;
+            let victims = instance.preempt(shortage)?;
             validators.victims(shortage, &victims)?;
         }
         if let Some((request, ranks)) = &arrival {
@@ -1145,7 +1145,7 @@ impl PolicySlot {
         Ok(())
     }
 
-    /// A decision failed: serve on under the previous policy and answer the
+    /// A decision failed: serve on under the previous policy and respond to the
     /// report the control thread hands to the daemons (§7.3, "提交之后调度策略
     /// 出错").
     ///
@@ -1179,13 +1179,13 @@ fn init_of(program: &PolicyProgram, state: &TrialState) -> Instantiation {
 
 /// The mechanism's validation of the control thread's only decision.
 ///
-/// The route instance answers `route` alone: a plan, victims and a placement
+/// The route instance returns `route` alone: a dispatch output, victims and a placement
 /// are a scheduler thread's decisions, judged there. A route decision must name
 /// a rank that was offered and is alive.
 pub struct RouteTrial;
 
 impl Validators for RouteTrial {
-    fn plan(&self, _plan: &Plan) -> Result<(), PolicyError> {
+    fn output(&self, _output: &DispatchOutput) -> Result<(), PolicyError> {
         Ok(())
     }
 
@@ -1212,13 +1212,13 @@ impl Validators for RouteTrial {
     }
 }
 
-/// The policy instance that answers `route` for every data-parallel rank of a
+/// The policy instance that returns `route` for every data-parallel rank of a
 /// main process (§4.4).
 ///
 /// # Which instance routes
 ///
 /// Routing is decided on the engine's control thread, before any scheduler
-/// holds the request, so the instance that answers it is the control thread's
+/// holds the request, so the instance that responds to it is the control thread's
 /// own: an instance of the epoch's policy program, prepared, switched over,
 /// committed and reverted with the schedulers' instances, so all of them run
 /// one program (§4.4: "两者是同一个 program，一起换代"). It is the only
@@ -1277,7 +1277,7 @@ impl Router {
     /// it on `ranks`, executing nothing.
     ///
     /// A static function, so the module's compilation runs on a thread of
-    /// the caller's choosing; [`Self::adopt`] keeps the answer.
+    /// the caller's choosing; [`Self::adopt`] keeps the response.
     pub fn prepare(
         source: &dyn PolicySource,
         program: PolicyProgram,
@@ -1374,7 +1374,7 @@ impl Router {
     /// A node with one scheduler serves every request on that rank and asks
     /// no policy. A request that resumes a stored cache is routed to the rank
     /// recorded for it by the policy itself (`RequestView::cache_rank`), and
-    /// the answer is checked like any other. An answer that names no live rank
+    /// the response is checked like any other. A response that names no live rank
     /// offered fails the policy: the previous program is instantiated on
     /// `ranks` and routes this request and later ones. When no previous
     /// program can take over, the request is refused and the refusal's
@@ -1408,7 +1408,7 @@ impl Router {
         }
     }
 
-    /// One `route` answer of the serving instance, checked; a failure reverts
+    /// One `route` response of the serving instance, checked; a failure reverts
     /// the instance ([`Self::route`]).
     fn decide(&mut self, arrival: &Arrival, ranks: &[RankView]) -> Result<usize, RouteRefusal> {
         let Some(slot) = self.slot.as_mut() else {
@@ -1420,10 +1420,10 @@ impl Router {
             });
         };
         let request = arrival_view(arrival);
-        let answer = slot
+        let response = slot
             .route(&request, ranks)
             .and_then(|index| RouteTrial.route(&request, ranks, index).map(|()| index));
-        let error = match answer {
+        let error = match response {
             Ok(index) => return Ok(index),
             Err(error) => error,
         };
@@ -1453,51 +1453,16 @@ mod tests {
     //! The switch of §7.3 over toy policy modules written as WebAssembly text.
     //!
     //! The toys speak the committed call protocol (`scheduling::guest::wire`)
-    //! and answer with the interface's own JSON, so the tests exercise the
+    //! and respond with the interface's own JSON, so the tests exercise the
     //! switch rather than a mock of it: a trap, a fuel run-out, a limit outside
     //! the build config, an invalid decision, and the stages of §7.3.
 
-    use scheduling::guest::decision::{Plan, Shortage, Storage, Victim};
+    use scheduling::guest::decision::{Shortage, Storage};
     use scheduling::guest::ids::RequestId;
     use scheduling::guest::time::Nanos;
-    use scheduling::guest::view::{RankView, RequestClass, RequestState};
+    use scheduling::guest::view::{RankView, RequestClass, RequestStatus};
 
     use super::*;
-
-    use crate::toy::{Toy, fitting_limits, toy_module};
-
-    /// A `PolicySource` of one toy module.
-    fn source(toy: &Toy) -> PolicyBytes {
-        PolicyBytes::new(toy_module(toy))
-    }
-
-    /// The program the tests install.
-    fn program(backend: &str, revision: u32) -> PolicyProgram {
-        PolicyProgram {
-            backend: backend.to_owned(),
-            revision,
-            arguments: Parameters::default(),
-            stated: Default::default(),
-        }
-    }
-
-    /// A plan that names one request, so two programs' answers differ.
-    fn plan_of(request: u64) -> Plan {
-        Plan {
-            refill: vec![RequestId(request)],
-            ..Plan::default()
-        }
-    }
-
-    /// The ceilings a test's build config states.
-    fn ceilings() -> Limits {
-        Limits {
-            max_batch: 8,
-            max_num_batched_tokens: 1024,
-            chunked_prefill_size: 512,
-            ..Limits::default()
-        }
-    }
 
     /// A state whose every optional decision has something to decide about.
     fn state() -> TrialState {
@@ -1511,7 +1476,7 @@ mod tests {
             arrival: Some((
                 RequestView {
                     id: RequestId(7),
-                    state: RequestState::Queued,
+                    state: RequestStatus::Waiting,
                     phase: None,
                     priority: 0,
                     arrived_at: Nanos(0),
@@ -1583,350 +1548,6 @@ mod tests {
         );
     }
 
-    /// A `Validators` that accepts every answer unless told otherwise.
-    #[derive(Default)]
-    struct Checks {
-        /// Refuse every route answer.
-        refuse_route: bool,
-        /// Refuse the plan.
-        refuse_plan: bool,
-    }
-
-    impl Validators for Checks {
-        fn plan(&self, _plan: &Plan) -> Result<(), PolicyError> {
-            if self.refuse_plan {
-                return Err(PolicyError::invalid(Call::Dispatch, "refused"));
-            }
-            Ok(())
-        }
-
-        fn victims(&self, _shortage: &Shortage, _victims: &[Victim]) -> Result<(), PolicyError> {
-            Ok(())
-        }
-
-        fn route(
-            &self,
-            _request: &RequestView,
-            _ranks: &[RankView],
-            _index: usize,
-        ) -> Result<(), PolicyError> {
-            if self.refuse_route {
-                return Err(PolicyError::invalid(Call::Route, "refused"));
-            }
-            Ok(())
-        }
-
-        fn place(
-            &self,
-            _call: &CallView,
-            _replicas: &[ReplicaView],
-            _index: usize,
-        ) -> Result<(), PolicyError> {
-            Ok(())
-        }
-    }
-
-    /// A slot serving `toy` as program `a`.
-    fn slot(toy: &Toy) -> PolicySlot {
-        PolicySlot::install(
-            &Engine::new().expect("an engine"),
-            &source(toy),
-            program("a", 1),
-            &state(),
-            &ceilings(),
-        )
-        .expect("the toy policy installs")
-    }
-
-    /// Switches `slot` to `toy` at a boundary, as a daemon's precopy,
-    /// switchover and commit do.
-    fn switch_to(slot: &mut PolicySlot, toy: &Toy) {
-        slot.precopy(&source(toy), program("b", 2), state(), &Checks::default())
-            .expect("the candidate passes its precopy");
-        slot.request(Stage::Switchover);
-        slot.boundary(&state()).expect("the switchover applies");
-        slot.request(Stage::Commit);
-        slot.boundary(&state()).expect("the commit applies");
-    }
-
-    #[test]
-    fn a_slot_serves_the_limits_its_program_declares() {
-        let declared = Limits {
-            max_batch: 3,
-            ..fitting_limits()
-        };
-        let slot = slot(&Toy {
-            limits: declared,
-            ..Toy::default()
-        });
-        assert_eq!(slot.limits().max_batch, 3);
-        assert_eq!(slot.program().backend, "a");
-    }
-
-    #[test]
-    fn a_policy_whose_limits_exceed_the_build_config_does_not_install() {
-        let too_large = Limits {
-            max_num_batched_tokens: ceilings().max_num_batched_tokens + 1,
-            ..fitting_limits()
-        };
-        let installed = PolicySlot::install(
-            &Engine::new().expect("an engine"),
-            &source(&Toy {
-                limits: too_large,
-                ..Toy::default()
-            }),
-            program("a", 1),
-            &state(),
-            &ceilings(),
-        );
-        assert!(matches!(installed, Err(PolicyError::BadLimits { .. })));
-    }
-
-    #[test]
-    fn a_precopy_prepares_a_candidate_apart_from_the_serving_policy_and_adopting_it_switches() {
-        let engine = Engine::new().expect("an engine");
-        let mut slot = slot(&Toy {
-            plan: plan_of(1),
-            ..Toy::default()
-        });
-
-        // The precopy runs where the serving slot is not: the serving policy
-        // answers throughout, and the candidate is only a value.
-        let candidate = PolicySlot::prepare(
-            &engine,
-            &source(&Toy {
-                plan: plan_of(2),
-                ..Toy::default()
-            }),
-            program("b", 2),
-            state(),
-            &ceilings(),
-            &Checks::default(),
-        )
-        .expect("the candidate passes its precopy");
-        assert_eq!(candidate.program().backend, "b");
-        assert_eq!(slot.program().backend, "a");
-        assert_eq!(
-            slot.dispatch(&Room::default()).expect("an answer").refill,
-            plan_of(1).refill
-        );
-
-        slot.adopt(candidate);
-        slot.request(Stage::Switchover);
-        assert!(
-            slot.boundary(&state())
-                .expect("the boundary applies")
-                .is_none()
-        );
-        assert_eq!(slot.program().backend, "b");
-        assert_eq!(
-            slot.dispatch(&Room::default()).expect("an answer").refill,
-            plan_of(2).refill
-        );
-    }
-
-    #[test]
-    fn a_precopy_asks_every_decision_the_state_names() {
-        // A trap in each decision's export fails the precopy, which proves the
-        // decision was asked: reclaim and route only when the state names
-        // them.
-        for call in [Call::Dispatch, Call::Reclaim, Call::Route] {
-            let mut slot = slot(&Toy::default());
-            let candidate = Toy {
-                trap: Some(call),
-                ..Toy::default()
-            };
-            let prepared = slot.precopy(
-                &source(&candidate),
-                program("b", 2),
-                state(),
-                &Checks::default(),
-            );
-            assert!(
-                matches!(prepared, Err(PolicyError::Trap { call: failed, .. }) if failed == call),
-                "{call:?} was not asked: {prepared:?}"
-            );
-            assert!(!slot.has_candidate());
-        }
-    }
-
-    #[test]
-    fn a_candidate_that_runs_past_its_fuel_fails_the_precopy() {
-        let mut slot = slot(&Toy::default());
-        let candidate = Toy {
-            spin: Some(Call::Dispatch),
-            ..Toy::default()
-        };
-        let prepared = slot.precopy(
-            &source(&candidate),
-            program("b", 2),
-            state(),
-            &Checks::default(),
-        );
-        assert!(matches!(
-            prepared,
-            Err(PolicyError::FuelExhausted {
-                call: Call::Dispatch
-            })
-        ));
-        assert!(!slot.has_candidate());
-    }
-
-    #[test]
-    fn an_invalid_decision_fails_the_precopy() {
-        let mut slot = slot(&Toy::default());
-        let refused_plan = slot.precopy(
-            &source(&Toy::default()),
-            program("b", 2),
-            state(),
-            &Checks {
-                refuse_plan: true,
-                ..Checks::default()
-            },
-        );
-        assert!(matches!(
-            refused_plan,
-            Err(PolicyError::Malformed {
-                call: Call::Dispatch,
-                ..
-            })
-        ));
-        let refused_route = slot.precopy(
-            &source(&Toy::default()),
-            program("b", 2),
-            state(),
-            &Checks {
-                refuse_route: true,
-                ..Checks::default()
-            },
-        );
-        assert!(matches!(
-            refused_route,
-            Err(PolicyError::Malformed {
-                call: Call::Route,
-                ..
-            })
-        ));
-        assert!(!slot.has_candidate());
-    }
-
-    #[test]
-    fn a_switchover_serves_the_prepared_policy_and_a_commit_keeps_the_one_it_replaced() {
-        let mut slot = slot(&Toy {
-            plan: plan_of(1),
-            ..Toy::default()
-        });
-        assert_eq!(
-            slot.dispatch(&Room::default()).expect("an answer").refill,
-            plan_of(1).refill
-        );
-
-        slot.precopy(
-            &source(&Toy {
-                plan: plan_of(2),
-                ..Toy::default()
-            }),
-            program("b", 2),
-            state(),
-            &Checks::default(),
-        )
-        .expect("the candidate passes");
-        // Until the switchover the serving policy answers.
-        assert_eq!(
-            slot.dispatch(&Room::default()).expect("an answer").refill,
-            plan_of(1).refill
-        );
-        assert_eq!(slot.program().backend, "a");
-
-        slot.request(Stage::Switchover);
-        assert!(
-            slot.boundary(&state())
-                .expect("the boundary applies")
-                .is_none()
-        );
-        assert_eq!(
-            slot.dispatch(&Room::default()).expect("an answer").refill,
-            plan_of(2).refill
-        );
-        assert_eq!(slot.program().backend, "b");
-
-        // The commit keeps the replaced policy, so a later failure reverts.
-        slot.request(Stage::Commit);
-        assert!(
-            slot.boundary(&state())
-                .expect("the boundary applies")
-                .is_none()
-        );
-        let report = slot
-            .fail(
-                &PolicyError::invalid(Call::Dispatch, "the policy answered nothing"),
-                &state(),
-            )
-            .expect("the previous policy is kept");
-        assert_eq!(report.program.backend, "b");
-        assert_eq!(
-            slot.dispatch(&Room::default()).expect("an answer").refill,
-            plan_of(1).refill
-        );
-        assert_eq!(slot.program().backend, "a");
-    }
-
-    #[test]
-    fn a_failure_with_no_previous_policy_cannot_be_reverted() {
-        let mut slot = slot(&Toy::default());
-        let failed = slot.fail(&PolicyError::invalid(Call::Dispatch, "refused"), &state());
-        assert!(matches!(failed, Err(PolicyError::Malformed { .. })));
-    }
-
-    #[test]
-    fn a_purge_drops_the_previous_policy_so_a_later_failure_cannot_be_reverted() {
-        let mut slot = slot(&Toy::default());
-        switch_to(&mut slot, &Toy::default());
-        slot.request(Stage::Purge);
-        assert!(
-            slot.boundary(&state())
-                .expect("the boundary applies")
-                .is_none()
-        );
-        let failed = slot.fail(&PolicyError::invalid(Call::Dispatch, "refused"), &state());
-        assert!(matches!(failed, Err(PolicyError::Malformed { .. })));
-    }
-
-    #[test]
-    fn a_daemon_revert_instantiates_the_previous_policy_on_the_current_state() {
-        let mut slot = slot(&Toy {
-            plan: plan_of(1),
-            ..Toy::default()
-        });
-        switch_to(
-            &mut slot,
-            &Toy {
-                plan: plan_of(2),
-                ..Toy::default()
-            },
-        );
-        assert_eq!(
-            slot.dispatch(&Room::default()).expect("an answer").refill,
-            plan_of(2).refill
-        );
-
-        // The state a revert is instantiated on is this one, not the one the
-        // precopy saw.
-        let mut later = state();
-        later.room.step = 9;
-        slot.request(Stage::Revert);
-        assert!(
-            slot.boundary(&later)
-                .expect("the boundary applies")
-                .is_none()
-        );
-        assert_eq!(slot.program().backend, "a");
-        assert_eq!(
-            slot.dispatch(&Room::default()).expect("an answer").refill,
-            plan_of(1).refill
-        );
-    }
-
     #[test]
     fn a_program_is_built_from_the_arguments_the_daemon_states() {
         let arguments = [
@@ -1980,71 +1601,6 @@ mod tests {
     }
 
     #[test]
-    fn the_router_routes_switches_reverts_and_refuses_a_rank_it_was_not_offered() {
-        let ranks = vec![
-            RankView {
-                index: 0,
-                in_flight: 0,
-                alive: true,
-            },
-            RankView {
-                index: 1,
-                in_flight: 0,
-                alive: true,
-            },
-        ];
-        let arrival = Arrival {
-            id: ipc::RequestId(7),
-            priority: 0,
-            class: RequestClass::Token,
-            prompt_tokens: 8,
-            generated_tokens: 0,
-            remaining_tokens: 8,
-            migratable: false,
-            cache_rank: None,
-            arrived_at: Nanos(0),
-        };
-        let mut router = Router::new(ceilings());
-        assert!(
-            router.route(&arrival, &ranks).is_err(),
-            "no policy routes yet"
-        );
-        assert!(router.switchover(&ranks).is_err(), "nothing was prepared");
-
-        let toy = |route: u32| Toy {
-            route,
-            ..Toy::default()
-        };
-        let prepared = Router::prepare(&source(&toy(1)), program("a", 1), &ranks, &ceilings())
-            .expect("the candidate prepares");
-        router.adopt(prepared);
-        router
-            .switchover(&ranks)
-            .expect("the switchover installs it");
-        assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
-
-        // A program that names a rank it was not offered fails, and the
-        // program before it routes the request and those after it.
-        let prepared = Router::prepare(&source(&toy(5)), program("b", 2), &ranks, &ceilings())
-            .expect("the candidate prepares");
-        router.adopt(prepared);
-        router
-            .switchover(&ranks)
-            .expect("the switchover installs it");
-        assert_eq!(
-            router
-                .route(&arrival, &ranks)
-                .expect("the previous program routes"),
-            1
-        );
-        assert_eq!(router.program().map(|p| p.backend.as_str()), Some("a"));
-        assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
-
-        // A node of one scheduler routes every request there and asks no policy.
-        assert_eq!(router.route(&arrival, &ranks[..1]).expect("rank 0"), 0);
-    }
-
-    #[test]
     fn a_program_resolves_with_the_arguments_the_deployment_stated() {
         // The Program Server resolves a program by backend, revision and the
         // arguments that were stated; it fills the package's defaults for the
@@ -2071,7 +1627,7 @@ mod tests {
     #[test]
     fn a_policy_is_resolved_under_the_stores_wasm_key() {
         // A policy is one artifact per revision, written at install for the
-        // store's wasm target (`Manifest::builds_for` answers that key and no
+        // store's wasm target (`Manifest::builds_for` responds to that key and no
         // other for a package with no kernel), so a source that named a CPU
         // triple asked for a path no install writes and no package declares.
         let source = ProgramSource::connect("/tmp/none.sock");

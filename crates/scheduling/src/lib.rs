@@ -10,7 +10,7 @@
 //!
 //! This crate is the host side of that boundary: it loads the policy's wasm32
 //! module and runs it in the scheduler thread under wasmtime, with a fuel budget
-//! on every call. The interface itself — [`Policy`], `Plan`, `Room`, `Event` and
+//! on every call. The interface itself — [`Policy`], `DispatchOutput`, `Room`, `Event` and
 //! the views — lives in `crates/scheduling/guest` together with the wire
 //! encoding, because the policy crates are compiled against the same types. The
 //! default policies are `fcfs` and `priority` of `crates/scheduling/policies`.
@@ -18,7 +18,7 @@
 //! The three failures of §4.4 that belong to the module itself are reported as
 //! [`PolicyError`]: a trap, running past the fuel, and limits outside the build
 //! config. A decision that names something that does not exist or cannot be
-//! chosen, work that breaks a hard limit, and a resident request starved past `limits().timeout` are
+//! chosen, work that breaks a hard limit, and a running request starved past `limits().timeout` are
 //! found by the mechanism, which fails the policy through the same type. Either
 //! way the policy has failed: during probation the update is reverted, and after
 //! a commit the mechanism instantiates the previous policy on the state it holds

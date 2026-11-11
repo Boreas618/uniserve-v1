@@ -80,7 +80,7 @@ impl Denoising {
 
     /// Accepts a completed denoising call.
     ///
-    /// The worker owns the trajectory's step ledger and reports the steps it
+    /// The worker owns the trajectory's step usage and reports the steps it
     /// has completed; the report becomes the request's progress. Returns
     /// `false`, leaving progress unchanged, when the report does not advance
     /// it, since a denoising call that makes no progress would be scheduled

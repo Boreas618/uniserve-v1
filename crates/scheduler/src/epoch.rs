@@ -9,7 +9,7 @@
 //!   denoising step boundary once its trajectory is stored (`preemption`),
 //!   and once nothing runs, offloads the pages it reserved for the host KV
 //!   cache and executes nothing more.
-//!   It answers with its cache index: every published page's public and
+//!   It responds with its cache index: every published page's public and
 //!   private continuation aliases with their units, which the successor
 //!   reads from the planes it maps read-only without duplicating the bytes.
 //!   When the successor maps its cache, it lends it the segments no
@@ -30,7 +30,7 @@
 //!   The workers copy the predecessor's cache flags and scales of the units
 //!   its pages hold (`EpochOperation::AdoptCache`), and the pool adopts the
 //!   pages at their own units, except those this epoch wrote meanwhile;
-//!   the requests the predecessor handed over wait for it, and continue
+//!   the requests the predecessor given over wait for it, and continue
 //!   from those pages.
 //! - **Commit** (the successor, once the predecessor is gone): its workers
 //!   take the segments they mapped read-only (`uniserve.take_cache`), and its
@@ -72,7 +72,7 @@ pub struct ParkedCache {
     pub held_units: u32,
     pub requests: u32,
     /// Of `held_units`, the units of the migrating requests that reserved
-    /// their whole cache at admission (`RequestState::reserve_worstcase`,
+    /// their whole cache at admission (`TokenState::reserve_worstcase`,
     /// a request with images), and how many they were: a successor
     /// reserves their whole cache again, since it computes their context
     /// anew, whether or not it recomputes the others.
@@ -174,7 +174,7 @@ impl ParkedCache {
 
 /// A park waiting for the scheduler's requests to end.
 pub(super) struct Parking {
-    answer: crossbeam_channel::Sender<Result<ParkedCache, String>>,
+    response: crossbeam_channel::Sender<Result<ParkedCache, String>>,
     /// Whether the epoch that succeeds this one maps its cache, and borrows
     /// the segments it lends.
     lend: bool,
@@ -185,17 +185,17 @@ pub(super) struct Parking {
 }
 
 impl Scheduler {
-    /// Parks the scheduler (see the module documentation), answering with
+    /// Parks the scheduler (see the module documentation), responding with
     /// its prefix cache index once it is parked; when it `lend`s, the epoch
     /// that succeeds it maps its cache and borrows the segments it lends
     /// ([`Self::lend_cache`]).
     pub(super) fn park(
         &mut self,
-        answer: crossbeam_channel::Sender<Result<ParkedCache, String>>,
+        response: crossbeam_channel::Sender<Result<ParkedCache, String>>,
         lend: bool,
     ) {
         if matches!(self.lifecycle, crate::Lifecycle::Parked) {
-            let _ = answer.send(Ok(ParkedCache {
+            let _ = response.send(Ok(ParkedCache {
                 pages: self.index(),
                 lent: self
                     .storage
@@ -207,16 +207,16 @@ impl Scheduler {
             return;
         }
         if matches!(self.lifecycle, crate::Lifecycle::Parking(_)) {
-            let _ = answer.send(Err("the scheduler parks already".to_owned()));
+            let _ = response.send(Err("the scheduler parks already".to_owned()));
             return;
         }
         // What the requests that leave as migratable hold, before they let
         // it go, and whether they reserved their whole cache at admission.
         let migrating: Vec<(u32, bool)> = self
-            .running
-            .values()
-            .filter(|state| !state.terminal_intent.is_some())
-            .map(|state| {
+            .requests
+            .running_tokens()
+            .filter(|(_, status, _)| !status.is_finished())
+            .map(|(_, _, state)| {
                 let units = state.allocations.as_ref().map_or(0, |allocations| {
                     allocations
                         .block_tables()
@@ -233,14 +233,11 @@ impl Scheduler {
             .map(|(units, _)| *units)
             .collect();
         tracing::info!("parking: the requests that resume elsewhere end as migratable");
-        // The requests held for a predecessor's index leave with the others.
-        self.release_held_for_index();
-        self.migrate_requests(MigrationCause::Drain);
         // Video requests leave at their next denoising step boundary, their
         // trajectories stored for the epoch that serves next.
-        self.preempt_media(MigrationCause::Drain, |_| true);
+        self.drain(MigrationCause::Drain);
         self.lifecycle = crate::Lifecycle::Parking(Parking {
-            answer,
+            response,
             lend,
             held_units: migrating.iter().map(|(units, _)| units).sum(),
             requests: migrating.len() as u32,
@@ -255,10 +252,10 @@ impl Scheduler {
     pub(super) fn migrating_cache(&self) -> (u32, Vec<proto::request::wire::RequestPrefix>) {
         let mut units = 0;
         let mut tokens = Vec::new();
-        for state in self
-            .running
-            .values()
-            .filter(|state| !state.terminal_intent.is_some())
+        for (_, _, state) in self
+            .requests
+            .running_tokens()
+            .filter(|(_, status, _)| !status.is_finished())
         {
             units += state.allocations.as_ref().map_or(0, |allocations| {
                 allocations
@@ -288,10 +285,8 @@ impl Scheduler {
     pub(super) fn poll_park(&mut self) {
         if !matches!(self.lifecycle, crate::Lifecycle::Parking(_))
             || !(self.running.is_empty()
-                && self.running_media.is_empty()
                 && self.retiring_requests.is_empty()
                 && self.waiting.is_empty()
-                && self.waiting_media.is_empty()
                 && self.inflight.pending_batches.is_empty()
                 && self.inflight.pending_submissions.is_empty())
         {
@@ -319,7 +314,7 @@ impl Scheduler {
             lent_units = lent.iter().map(|units| units.len()).sum::<usize>(),
             "the scheduler parked"
         );
-        let _ = parking.answer.send(Ok(ParkedCache {
+        let _ = parking.response.send(Ok(ParkedCache {
             pages: index,
             lent,
             held_units: parking.held_units,
@@ -336,9 +331,9 @@ impl Scheduler {
     }
 
     /// Resumes a parked scheduler: it admits and executes again. When it
-    /// `reclaim`s, the epoch it lent cache units to at its park writes none
+    /// takes them back, the epoch it lent cache units to at its park writes none
     /// of them any more, and the pool allocates them again.
-    pub(super) fn resume(&mut self, reclaim: bool) -> Result<(), String> {
+    pub(super) fn resume(&mut self, take_back: bool) -> Result<(), String> {
         if matches!(self.lifecycle, crate::Lifecycle::Parking(_)) {
             return Err("the scheduler is still parking".to_owned());
         }
@@ -346,11 +341,11 @@ impl Scheduler {
             self.lifecycle = crate::Lifecycle::Serving;
             tracing::info!("the parked scheduler resumes");
         }
-        if reclaim && let Some(cache) = self.storage.cache() {
-            let reclaimed = cache.pool().reclaim();
-            if reclaimed > 0 {
+        if take_back && let Some(cache) = self.storage.cache() {
+            let taken_back = cache.pool().take_back();
+            if taken_back > 0 {
                 tracing::info!(
-                    units = reclaimed,
+                    units = taken_back,
                     "took back the cache units lent to the successor epoch"
                 );
             }
@@ -366,7 +361,7 @@ impl Scheduler {
     /// holds a page of `index` under a private continuation alias. The
     /// successor maps them writable and allocates their units on trial, so
     /// the pool forgets their pages and allocates none of their units until
-    /// it reclaims them ([`Self::resume`]). Returns their units.
+    /// it takes them back ([`Self::resume`]). Returns their units.
     fn lend_cache(&self, index: &[IndexedPage]) -> Vec<std::ops::Range<u32>> {
         let Some(cache) = self.storage.cache() else {
             return Vec::new();
@@ -427,9 +422,9 @@ impl Scheduler {
     /// each, the last they continue. The limit is the units its own
     /// segments hold free, those of the segments the predecessor lent, and
     /// those of the segments it has yet to create that every device's
-    /// storage ledger has room for: the quota less everything booked, the
+    /// storage usage has room for: the quota less everything reserved, the
     /// predecessor's kept storage included, and, when the predecessor's
-    /// processes exit at the promotion (it `grows`), with what they booked
+    /// processes exit at the promotion (it `grows`), with what they reserved
     /// transferred to this epoch. The epoch has no more until its commit
     /// gives it the predecessor's segments, and the requests would wait for
     /// it.
@@ -477,7 +472,7 @@ impl Scheduler {
             Some(reports) => {
                 let fit = reports
                     .iter()
-                    .map(|report| super::ledger::growable(report, grows))
+                    .map(|report| super::quota::growable(report, grows))
                     .min()
                     .unwrap_or(0);
                 let first = &reports[0];
@@ -493,8 +488,8 @@ impl Scheduler {
         if needed > free {
             return Err(format!(
                 "the successor epoch's KV cache holds {free} free units within its storage \
-                 ledgers until its commit ({own_free} in its own segments, {lent} in the \
-                 segments its predecessor lent, {growable} in the segments the ledgers have \
+                 quotas until its commit ({own_free} in its own segments, {lent} in the \
+                 segments its predecessor lent, {growable} in the segments the quotas have \
                  room for), and the {} requests in flight need {needed}{}{}",
                 parked.requests,
                 if parked.reserving > 0 {
@@ -642,12 +637,14 @@ impl Scheduler {
                 self.draining = draining;
                 return Err("the engine failed before its commit".to_owned());
             }
-            if !self.step_nonblocking() {
-                self.park_for_progress();
+            if !self.step() {
+                self.wait(None);
             }
         }
         self.draining = draining;
-        let results = self.worker.commit().map_err(|error| format!("{error:#}"))?;
+        // The epoch this process serves is its ranks' own, committed when they were spawned:
+        // no rank reports anything of the commit.
+        let results = Vec::new();
         if let Some(cache) = self.storage.cache() {
             cache.pool().take_inherited();
         }
@@ -681,8 +678,8 @@ impl Scheduler {
                 self.draining = draining;
                 return Err("the engine failed before it described its cache".to_owned());
             }
-            if !self.step_nonblocking() {
-                self.park_for_progress();
+            if !self.step() {
+                self.wait(None);
             }
         }
         self.draining = draining;

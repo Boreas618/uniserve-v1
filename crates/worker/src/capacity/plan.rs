@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use std::sync::Arc;
 
-use ipc::{CallKind, ComponentInfo, MainProcessEndpoint, MainProcessInfo, MediaCall};
+use ipc::{CallKind, StageInfo, MainProcessEndpoint, MainProcessInfo, MediaCall};
 use proto::config::EngineConfig;
 
 use super::{ArenaCapacity, CacheCapacity, CacheDemand, TokenBounds, call_window};
@@ -82,8 +82,8 @@ pub struct Report {
     pub device_exports: bool,
     pub fabric_handles: bool,
     pub supported_calls: Vec<CallKind>,
-    pub media_components: BTreeMap<MediaCall, String>,
-    pub components: Vec<ComponentInfo>,
+    pub media_stages: BTreeMap<MediaCall, String>,
+    pub components: Vec<StageInfo>,
 }
 
 /// The resolved memory of a rank: what the main process builds its resident
@@ -118,11 +118,11 @@ fn narrow(value: usize, name: &str) -> Result<u32> {
 
 fn base_info(report: Report, request: &MemoryRequest, slots: usize) -> Result<MainProcessInfo> {
     Ok(MainProcessInfo {
-        media_components: report.media_components,
+        media_stages: report.media_stages,
         video_denoiser: None,
         endpoint: report.endpoint,
         fabric_handles: report.fabric_handles,
-        components: report.components,
+        stages: report.components,
         supported_calls: report.supported_calls,
         max_batch_calls: narrow(request.max_batch_calls, "max batch calls")?,
         max_batch_tokens: narrow(request.max_batch_tokens, "max batch tokens")?,
@@ -571,7 +571,7 @@ mod tests {
             device_exports: false,
             fabric_handles: false,
             supported_calls: Vec::new(),
-            media_components: Default::default(),
+            media_stages: Default::default(),
             components: Vec::new(),
         }
     }
@@ -592,7 +592,7 @@ mod tests {
                 generation_limits: Default::default(),
                 bos: 0,
                 eos: Vec::new(),
-                canvas_sampling: None,
+                block_sampling: None,
                 prefill_outputs: true,
             },
             parallel: proto::config::ParallelConfig {

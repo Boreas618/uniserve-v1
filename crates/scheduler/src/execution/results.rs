@@ -8,7 +8,7 @@ use crate::completion::{BatchReport, CallCompletion};
 use ipc::{ForwardMode, MediaCall};
 
 /// Describes a rejected worker result for the request's terminal error and
-/// its error finish's log line: the rejection, then the call it answered.
+/// its error finish's log line: the rejection, then the call it responded.
 fn rejection_cause(call: &Call, error: &generation::GenerationResultError) -> String {
     format!(
         "{error} (call {}.{}, {:?})",
@@ -38,21 +38,22 @@ impl Scheduler {
             .get(&id)
             .is_some_and(|pending| pending.contains_key(&call_id));
         if !known || duplicate {
-            if let Some(state) = self.media_state_mut(id) {
-                state.terminal_intent = Some(Terminal::Failed(
-                    "worker returned an unknown media call".to_string(),
-                ));
-            } else if self.running.contains_key(&id) {
+            if self.media_state(id).is_some() {
+                self.decide(
+                    id,
+                    Terminal::Failed("worker returned an unknown media call".to_string()),
+                );
+            } else if self.requests.tokens(&id).is_some() {
                 self.finish(id, FinishReason::Error);
             }
             return;
         }
 
-        // Output storage the worker could not claim fails the call rather
+        // Output storage the worker could not open fails the call rather
         // than dropping its completion, so request-local ordering still sees
         // the call return.
-        // The claim moves into the pending completion, which keeps its storage
-        // alive while the result waits; the record keeps an empty claim.
+        // The opened storage moves into the pending completion, which keeps its storage
+        // alive while the result waits; the record keeps none.
         let media = match std::mem::replace(&mut record.media, Ok(None)) {
             Ok(media) => media,
             Err(error) => {
@@ -97,7 +98,7 @@ impl Scheduler {
     /// request that has not already failed frees the products the call
     /// consumed. Once no call of the request remains in flight, a terminal
     /// intent, a closed output or a muxed artifact retires the request
-    /// through `finish_media`.
+    /// through `retire`.
     pub(crate) fn process_diffusion_result(
         &mut self,
         call: Call,
@@ -110,9 +111,10 @@ impl Scheduler {
             return;
         };
         let mut consumed_products = Vec::new();
-        let already_failed = state
-            .terminal_intent
-            .as_ref()
+        let already_failed = self
+            .requests
+            .status(&id)
+            .and_then(RequestStatus::terminal)
             .is_some_and(Terminal::is_failure);
 
         // Only the final muxing call, the one that carries no media units,
@@ -176,12 +178,13 @@ impl Scheduler {
                 let refusal = (record.error_code == Some(ipc::ErrorCode::InputError))
                     .then(|| record.error_message.clone())
                     .flatten();
-                if let Some(state) = self.media_state_mut(id) {
-                    state.terminal_intent = match refusal {
-                        Some(reason) => Some(Terminal::Rejected(reason)),
-                        None => Some(Terminal::Failed("media worker call failed".to_string())),
-                    };
-                }
+                self.decide(
+                    id,
+                    match refusal {
+                        Some(reason) => Terminal::Rejected(reason),
+                        None => Terminal::Failed("media worker call failed".to_string()),
+                    },
+                );
             } else if let Some(state) = self.media_state_mut(id) {
                 // A condition product retires once the calls reading it have
                 // completed: the vision patches with the vision encoding, the
@@ -337,7 +340,7 @@ impl Scheduler {
             }
             // A latched migration leaves through `retire_preempted`
             // (`reap_cancellations`), unless the output closed first.
-            match &state.terminal_intent {
+            match self.requests.status(&id).and_then(RequestStatus::terminal) {
                 Some(terminal) if terminal.migration().is_none() => Some(terminal.clone()),
                 _ if state.output.is_closed() => Some(Terminal::finish(FinishReason::Cancelled)),
                 _ if state.graph.done(MediaCall::Muxing) => {
@@ -350,71 +353,16 @@ impl Scheduler {
             }
         });
         if let Some(event) = terminal {
-            self.finish_media(id, event);
+            self.retire(id, event);
         }
     }
 
-    /// Emits terminal media output and releases all request-owned resources.
-    ///
-    /// A request whose admission was never placed in a batch frees its
-    /// allocations at once. Otherwise a `Finish` command is queued and the
-    /// allocations wait in `retiring_requests` until `acknowledge_commands`
-    /// sees that command complete.
-    pub(crate) fn finish_media(&mut self, id: RequestId, event: Terminal) {
-        let Some(mut state) = self.take_media_state(id) else {
-            return;
-        };
-        // The policy sees the request end, with how it ended, exactly as a token
-        // request's end is stated (`retire_token_request`): a media request the
-        // policy still holds resident is one it plans work for, and the
-        // mechanism refuses that work as naming a request it no longer holds.
-        let end = event.end();
-        let request = scheduling::guest::RequestId(id.0);
-        self.recorder.record(views::finished(request, end));
-        self.watchdog.finished(request);
-        self.running_order.retain(|candidate| *candidate != id);
-        // The pins of its stored trajectory end, and a store not yet carried
-        // to its workers is aborted; so do its encoder outputs' pins and
-        // reservations.
-        if let Some(store) = self.trajectories.as_mut() {
-            store.forget(id);
+    /// Decides the end of the running request `id` as `terminal`, replacing
+    /// an end decided earlier: a failure outranks what was decided before it.
+    pub(crate) fn decide(&mut self, id: RequestId, terminal: Terminal) {
+        if let Some(status) = self.requests.status_mut(&id) {
+            *status = RequestStatus::Finished(terminal);
         }
-        if let Some(store) = self.encoder_outputs.as_mut() {
-            store.forget(state.admission.request_key);
-        }
-        let usage = Usage {
-            prompt_tokens: state.request.prompt_token_ids.len(),
-            ..Usage::default()
-        };
-        for event in event.events(usage) {
-            let _ = state.output.enqueue(event);
-        }
-        self.output.retire(id, state.output);
-
-        // No worker holds state for a request whose admission was never
-        // placed in a batch, so there is nothing to retire remotely.
-        if state.admission_state == WorkerRegistration::Unsubmitted {
-            if let Err(unknown) = state.allocations.free(&mut self.storage) {
-                self.invariant_broken(&unknown.to_string());
-            }
-            return;
-        }
-        let request_key = state.admission.request_key;
-        self.inflight
-            .pending_commands
-            .push_back(BatchCommand::Finish {
-                request_key,
-                retained_buffers: Vec::new(),
-            });
-        self.retiring_requests.insert(
-            id,
-            RetiringRequest {
-                request_key,
-                allocations: Vec::new(),
-                media_allocations: Some(state.allocations),
-                buffers: HashMap::new(),
-            },
-        );
     }
 
     /// Removes the in-flight call a worker result names, releasing its
@@ -430,8 +378,8 @@ impl Scheduler {
         call_id: CallId,
     ) -> Option<(Call, InflightInput)> {
         let inflight = self.inflight.pop_pending_call(request_key, call_id)?;
-        self.running.mark(request_key.request_id);
-        self.reclaim_domain_credit(inflight.call.kind, false);
+        self.requests.mark(request_key.request_id);
+        self.return_domain_credit(inflight.call.kind, false);
         Some((inflight.call, inflight.input))
     }
 
@@ -475,7 +423,7 @@ impl Scheduler {
     ///    settle its lifecycle command receipts.
     /// 3. Queue and apply: hold each completion until
     ///    `Inflight::take_ready_completions` releases it in request-local
-    ///    dependency order, then reclaim resources and resolve the public
+    ///    dependency order, then release resources and resolve the public
     ///    effects in lifecycle priority and arrival order.
     pub(crate) fn apply_result(&mut self, report: BatchReport) {
         let result_batch_id = report.batch_id;
@@ -562,12 +510,12 @@ impl Scheduler {
                 continue;
             };
             // A group's batch timing is the maximum of each phase over its calls.
-            let component = returned_groups[crate::stats::ExecutionDomainStats::index(kind)]
+            let stage = returned_groups[crate::stats::ExecutionDomainStats::index(kind)]
                 .get_or_insert(TimingCounters::default());
-            component.queued_us = component.queued_us.max(record.timing_counters.queued_us);
-            component.device_us = component.device_us.max(record.timing_counters.device_us);
-            component.copy_us = component.copy_us.max(record.timing_counters.copy_us);
-            component.host_us = component.host_us.max(record.timing_counters.host_us);
+            stage.queued_us = stage.queued_us.max(record.timing_counters.queued_us);
+            stage.device_us = stage.device_us.max(record.timing_counters.device_us);
+            stage.copy_us = stage.copy_us.max(record.timing_counters.copy_us);
+            stage.host_us = stage.host_us.max(record.timing_counters.host_us);
         }
 
         let calls_complete = self
@@ -650,7 +598,7 @@ impl Scheduler {
             for (index, command) in pending.commands.into_iter().enumerate() {
                 let failed = report.command_results.iter().any(|result| {
                     result.command_index == index as u32
-                        && result.outcome == crate::worker::CommandOutcome::Failed
+                        && result.status == crate::worker::CommandStatus::Failed
                 });
                 if failed {
                     match command {
@@ -726,11 +674,14 @@ impl Scheduler {
                 let id = record.request_key.request_id;
                 let call_id = record.call_id;
                 let Some((call, input)) = self.pop_inflight(record.request_key, call_id) else {
-                    if let Some(state) = self.media_state_mut(id) {
-                        state.terminal_intent = Some(Terminal::Failed(
-                            "worker returned an out-of-order media call".to_string(),
-                        ));
-                    } else if self.running.contains_key(&id) {
+                    if self.media_state(id).is_some() {
+                        self.decide(
+                            id,
+                            Terminal::Failed(
+                                "worker returned an out-of-order media call".to_string(),
+                            ),
+                        );
+                    } else if self.requests.tokens(&id).is_some() {
                         self.finish(id, FinishReason::Error);
                     }
                     continue;
@@ -776,12 +727,12 @@ impl Scheduler {
                 // products are freed, and the chain stays marked while later
                 // descendants remain in flight.
                 let discard_invalidated_descendant = self
-                    .running
-                    .get(&id)
+                    .requests
+                    .tokens(&id)
                     .is_some_and(|state| state.speculative_chain_invalidated);
                 if discard_invalidated_descendant {
                     let has_unresolved_descendants = self.inflight.has_pending_calls(id);
-                    if let Some(state) = self.running.get_mut(&id) {
+                    if let Some(state) = self.requests.tokens_mut(&id) {
                         state.num_cache_units_sent = state
                             .num_cache_units_sent
                             .saturating_sub(u64::from(call.bounds.max_cache_units));
@@ -793,8 +744,8 @@ impl Scheduler {
                 }
 
                 let Some(state) = self
-                    .running
-                    .get(&id)
+                    .requests
+                    .tokens(&id)
                     .filter(|state| state.request_epoch == call.request_key.request_epoch)
                 else {
                     // Finish already owns retirement for a closed epoch, including
@@ -821,7 +772,7 @@ impl Scheduler {
                     image_cache,
                     state,
                     &record,
-                    self.config.canvas.as_ref(),
+                    self.config.block_sampling.as_ref(),
                 ) {
                     self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;
@@ -855,10 +806,8 @@ impl Scheduler {
                 }
 
                 // Terminal requests take no further semantic effect.
-                let semantic_blocked = self
-                    .running
-                    .get(&id)
-                    .is_some_and(|state| state.terminal_intent.is_some())
+                let semantic_blocked = (self.requests.tokens(&id).is_some()
+                    && self.requests.finished(&id))
                     || self.inflight.pending_finishes.contains_key(&id);
                 if semantic_blocked {
                     self.finish_pending_if_idle(id);
@@ -874,8 +823,8 @@ impl Scheduler {
                 }
 
                 let progress_result = if record.status == CallStatus::Ok {
-                    self.running
-                        .get_mut(&id)
+                    self.requests
+                        .tokens_mut(&id)
                         .map(|state| state.process_generation_result(&call, &record))
                 } else {
                     None
@@ -919,7 +868,7 @@ impl Scheduler {
                 // decode's device input (`can_reuse_resolved_token_product`)
                 // only when no call of the request is still in flight.
                 let retain_device_token = !self.inflight.has_pending_calls(id);
-                if let Some(state) = self.running.get_mut(&id)
+                if let Some(state) = self.requests.tokens_mut(&id)
                     && advanced
                 {
                     state.last_state_call_id = record.call_id;
@@ -932,8 +881,8 @@ impl Scheduler {
 
                 let priority = completion_priority(call_variant);
                 let public_tokens_before = self
-                    .running
-                    .get(&id)
+                    .requests
+                    .tokens(&id)
                     .map_or(0, |state| state.output.tokens_sent);
                 // A predicated call was skipped because its device predicate
                 // was false, so it is rolled back like an invalidated
@@ -941,18 +890,18 @@ impl Scheduler {
                 // A step queued behind the step that stopped its block is the
                 // exception: the host knew it for a no-op once it accepted the
                 // stopping step, and every call queued since, the block's
-                // commit and the next block's steps, was planned from that
+                // commit and the next block's steps, was prepared from that
                 // host-observed stop (`follows_unconditionally`).
                 if record.status == CallStatus::Predicated {
                     let has_unresolved_descendants = self.inflight.has_pending_calls(id);
-                    if let Some(state) = self.running.get_mut(&id) {
+                    if let Some(state) = self.requests.tokens_mut(&id) {
                         state.num_cache_units_sent = state
                             .num_cache_units_sent
                             .saturating_sub(u64::from(call.bounds.max_cache_units));
-                        let stop_observed = state.phase == Phase::CommitCanvas
+                        let stop_observed = state.phase == Phase::CommitBlock
                             && call
-                                .canvas
-                                .is_some_and(|step| step.block == state.canvas_block);
+                                .block_step
+                                .is_some_and(|step| step.block == state.block_index);
                         if !stop_observed {
                             state.speculative_chain_invalidated = has_unresolved_descendants;
                         }
@@ -980,7 +929,7 @@ impl Scheduler {
                     CallKind::Forward(ForwardMode::Prefill)
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)
-                ) || call.canvas.is_some();
+                ) || call.block_step.is_some();
                 // With stop strings, push a placeholder decoder boundary before
                 // resolving, so a non-error finish reached while resolving
                 // waits for the frontend decoder's stop-string decision on this
@@ -988,19 +937,19 @@ impl Scheduler {
                 // placeholder becomes the end of the tokens this call
                 // published, or is removed when it published none.
                 let awaiting_decoder = token_call
-                    && match self.running.get_mut(&id) {
+                    && match self.requests.tokens_mut(&id) {
                         Some(state) if !state.req.stop_strings.is_empty() => {
                             state.output.decoder_boundaries.push_back(usize::MAX);
                             true
                         }
                         _ => false,
                     };
-                if self.running.contains_key(&id)
+                if self.requests.tokens(&id).is_some()
                     && !self.inflight.pending_finishes.contains_key(&id)
                 {
                     self.resolve(id, call, record);
                 }
-                if awaiting_decoder && let Some(state) = self.running.get_mut(&id) {
+                if awaiting_decoder && let Some(state) = self.requests.tokens_mut(&id) {
                     // Cancellation clears the boundaries while resolving, which
                     // leaves no reserved boundary to settle.
                     if state.output.tokens_sent > public_tokens_before {
@@ -1024,7 +973,7 @@ impl Scheduler {
         add_worker_forward_map(&self.stats.worker.forward_mode_counts, &stats.mode_counts);
         add_worker_forward_map(&self.stats.worker.forward_mode_tokens, &stats.mode_tokens);
         add_worker_forward_map(&self.stats.worker.forward_mode_us, &stats.mode_us);
-        add_worker_forward_map(&self.stats.worker.forward_component_us, &stats.component_us);
+        add_worker_forward_map(&self.stats.worker.forward_module_us, &stats.component_us);
         add_worker_forward_map(&self.stats.worker.stream_us, &stats.stream_us);
         add_worker_forward_map(&self.stats.worker.blocking_calls, &stats.blocking_calls);
         add_worker_forward_map(&self.stats.worker.profile, &stats.profile);

@@ -2,7 +2,7 @@
 //!
 //! The scheduler owns the logical allocation of worker-side storage: it
 //! chooses request rows, cache pages, latent pages, and buffer byte spans, and
-//! workers use the addresses they are handed. Allocations follow a request
+//! workers use the addresses they are given. Allocations follow a request
 //! from admission (`RequestAllocations`, `MediaAllocations`) through
 //! retirement: a finished request registered with its workers parks its
 //! allocations in a `RetiringRequest` until its `Finish` command is
@@ -15,8 +15,8 @@ use ipc::BufferId;
 /// Logical storage reservations and retained exports owned by the engine.
 pub(crate) struct Storage {
     /// Text cache pages and prefix cache; `None` when the runtime has no prefix cache.
-    pub(crate) cache: Option<PrefixCacheCoordinator>,
-    pub(crate) encoder_cache: crate::kv_cache::EncoderCacheManager,
+    pub(crate) cache: Option<KvCacheManager>,
+    pub(crate) encoder_cache: crate::encoder_cache::EncoderCacheManager,
     /// Encoder-cache entries promised to admitted requests. `admit` checks it
     /// against `EncoderCacheManager::budget` only for requests that reserve
     /// their worst case.
@@ -87,7 +87,7 @@ impl Storage {
 
     /// Returns the text prefix cache, which exists when the worker serves token
     /// generation; token requests are rejected at submission without it.
-    pub(crate) fn cache(&self) -> Option<&PrefixCacheCoordinator> {
+    pub(crate) fn cache(&self) -> Option<&KvCacheManager> {
         self.cache.as_ref()
     }
 
@@ -203,21 +203,21 @@ impl RequestAllocations {
     }
 
     /// Releases each resource through its owning pool.
-    ///
-    /// Cache units need no explicit release: each page in `prefix_cache` is a counted
-    /// reference, dropped with `self`.
     pub(crate) fn free(self, storage: &mut Storage) {
         for buffer in self.buffers.into_values() {
             storage.buffer_pool.free(buffer);
         }
         storage.request_pool.free(self.request_slot);
+        if let Some(cache) = storage.cache.as_ref() {
+            cache.free(self.prefix_cache);
+        }
     }
 }
 
 /// Storage one media request reserves at admission in the per-worker address
 /// spaces of `Storage::media_storage`.
 pub(crate) struct MediaAllocations {
-    /// Declared results keyed by component name and output index.
+    /// Declared results keyed by stage name and output index.
     pub(crate) tensors: HashMap<(String, u32), MediaTensorAllocation>,
     /// The request's row on each worker of its route.
     pub(crate) request_slots: HashMap<crate::WorkerGroupId, RequestSlot>,
@@ -238,35 +238,35 @@ pub(crate) struct MediaTensorAllocation {
 /// identity keeps those physical addresses distinct.
 ///
 /// Request rows are one address space for the group. Each rank has its own
-/// buffer pool, holding only the results of the components it executes and of
-/// the components that read them, so the pool the engine allocates from is
+/// buffer pool, holding only the results of the stages it executes and of
+/// the stages that read them, so the pool the engine allocates from is
 /// the pool the rank backs.
 pub(crate) struct MediaStorage {
     pub(crate) requests: RequestPool,
     /// The buffer address space of each rank, in rank order.
     pub(crate) buffers: Vec<BufferPool>,
-    /// The ranks that back the declared results of each component.
+    /// The ranks that back the declared results of each stage.
     holders: HashMap<String, Vec<u32>>,
 }
 
 impl MediaStorage {
     /// Builds the address spaces of a group whose ranks back `rank_bytes`.
     ///
-    /// A rank backs a component's results when it is one of the component's
-    /// ranks in `components`, the group's layout, or one of a reading
-    /// component's, where readers follow the video
+    /// A rank backs a stage's results when it is one of the stage's
+    /// ranks in `stages`, the group's layout, or one of a reading
+    /// stage's, where readers follow the video
     /// graph's persistent product edges (`MediaCall::readers`) through the
     /// deployment's `routing`; the worker sizes each rank's pool by the same
-    /// rule. A group placed with no components backs every result on every
+    /// rule. A group placed with no stages backs every result on every
     /// rank.
     pub(crate) fn new(
         request_slots: usize,
         rank_bytes: &[u64],
-        components: &BTreeMap<String, proto::config::BlockConfig>,
+        stages: &BTreeMap<String, proto::config::BlockConfig>,
         routing: &BTreeMap<MediaCall, String>,
     ) -> Self {
         let ranks = rank_bytes.len() as u32;
-        let placed = components
+        let placed = stages
             .iter()
             .map(|(name, config)| (name.as_str(), &config.ranks))
             .collect::<HashMap<_, _>>();
@@ -276,22 +276,22 @@ impl MediaStorage {
             .chain(placed.keys().copied())
             .map(|name| {
                 let mut holding = BTreeSet::new();
-                if components.is_empty() {
+                if stages.is_empty() {
                     holding.extend(0..ranks);
                 }
                 let readers = routing
                     .iter()
-                    .filter(|(_, component)| component.as_str() == name)
+                    .filter(|(_, stage)| stage.as_str() == name)
                     .flat_map(|(call, _)| call.readers())
-                    .filter(|reader| !reader.reads_resident_state())
+                    .filter(|reader| !reader.reads_device_state())
                     .filter_map(|reader| routing.get(reader).map(String::as_str));
-                for component in std::iter::once(name).chain(readers) {
-                    if let Some(members) = placed.get(component) {
+                for stage in std::iter::once(name).chain(readers) {
+                    if let Some(members) = placed.get(stage) {
                         holding.extend(members.iter().map(|rank| *rank as u32));
                     }
                 }
                 // A rank with no pool keeps its products in its own process: it backs nothing here,
-                // so a reservation books no bytes and binds no span on it.
+                // so a reservation reserves no bytes and binds no span on it.
                 holding.retain(|rank| {
                     rank_bytes
                         .get(*rank as usize)
@@ -310,10 +310,10 @@ impl MediaStorage {
         }
     }
 
-    /// The ranks that back the declared results of `component`, in rank
-    /// order; none for a component no route or dispatch names.
-    pub(crate) fn holders(&self, component: &str) -> &[u32] {
-        self.holders.get(component).map_or(&[], Vec::as_slice)
+    /// The ranks that back the declared results of `stage`, in rank
+    /// order; none for a stage no route or dispatch names.
+    pub(crate) fn holders(&self, stage: &str) -> &[u32] {
+        self.holders.get(stage).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -359,7 +359,7 @@ impl MediaAllocations {
     /// Releases the request rows, keeping the declared results the worker
     /// still holds.
     ///
-    /// A row is the scheduler's capacity, so it is handed back as soon as the
+    /// A row is the scheduler's capacity, so it is given back as soon as the
     /// `Finish` that closes it has been submitted; a tensor is a span the
     /// worker writes and reads until it has seen that `Finish`, so it stays in
     /// the record until the acknowledgement releases it.

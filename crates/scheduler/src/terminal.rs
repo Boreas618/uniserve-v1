@@ -5,9 +5,9 @@ use crate::{ArtifactEvent, Event, FinishReason, MigrationCause, RejectionKind, S
 
 /// How a request ends.
 ///
-/// A request latches its terminal as soon as it is decided (its
-/// `terminal_intent`, `None` while it runs); the request is retired with it
-/// once its calls in flight drain. A media request's completion with its
+/// A request's terminal is latched in its status as soon as it is decided
+/// (`RequestStatus::Finished`); the request is retired with it once its calls
+/// in flight drain. A media request's completion with its
 /// artifact is decided at that point, from its muxer's last round, and is
 /// never latched.
 #[derive(Debug, Clone)]
@@ -125,13 +125,5 @@ impl Terminal {
                 message,
             }],
         }
-    }
-}
-
-/// Latches a finish for `reason` unless a terminal is already latched: the
-/// first decided terminal wins.
-pub(crate) fn latch_finish(intent: &mut Option<Terminal>, reason: FinishReason) {
-    if intent.is_none() {
-        *intent = Some(Terminal::finish(reason));
     }
 }

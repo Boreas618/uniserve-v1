@@ -28,8 +28,8 @@ use std::process::ExitCode;
 
 use scheduling::guest::wire;
 use scheduling::guest::{
-    CallView, Duration, Event, Limits, Parameters, Plan, RankView, ReplicaView, RequestId,
-    RequestView, Room, Shortage, Snapshot, Storage,
+    CallView, DispatchOutput, Duration, Event, Limits, Parameters, RankView, ReplicaView,
+    RequestId, RequestView, Room, Shortage, Snapshot, Storage,
 };
 use scheduling::{Engine, PolicyInstance};
 use serde::de::DeserializeOwned;
@@ -103,10 +103,10 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
         limits.timeout.0
     );
 
-    // An arrival each, then a resident request's view changing: a policy that
+    // An arrival each, then a running request's view changing: a policy that
     // sizes a chunk from the prefilled prefix, as `fcfs` does, reads it from
-    // `Updated` (§4.4: a resident request's changing view reaches the policy
-    // as a state change, not as a per-step dump of every resident).
+    // `Updated` (§4.4: a running request's changing view reaches the policy
+    // as a state change, not as a per-step dump of every running request).
     let events = [
         Event::Arrived {
             request: request(1)?,
@@ -153,9 +153,9 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
         }
         let mut room = step_room.clone();
         room.step = u64::from(step);
-        let plan = policy.dispatch(&room)?;
+        let output = policy.dispatch(&room)?;
         if step == 1 {
-            print_plan(&plan);
+            print_output(&output);
         }
         // Step 1's `observe` ran above, outside the loop; later steps observe
         // the one event a quiet step carries.
@@ -175,12 +175,12 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
     }
 
     let before = Meter::of(&policy);
-    let victims = policy.reclaim(&Shortage {
+    let victims = policy.preempt(&Shortage {
         kind: Storage::KvUnits,
         need: 1,
     })?;
-    println!("reclaim: {} victims", victims.len());
-    before.report(&policy, "reclaim");
+    println!("preempt: {} victims", victims.len());
+    before.report(&policy, "preempt");
 
     let ranks: Vec<RankView> = decode(br#"[{"index":0,"in_flight":1},{"index":1,"in_flight":0}]"#)?;
     let before = Meter::of(&policy);
@@ -191,7 +191,7 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
     let call: CallView = decode(br#"{"request":1,"phase":1,"kind":{"kind":"prefill"}}"#)?;
     let replicas: Vec<ReplicaView> = decode(
         br#"[{"index":0,"block":0,"kinds":[{"kind":"prefill"},{"kind":"decode"}],
-              "resident_requests":1,"capacity":7}]"#,
+              "running_requests":1,"capacity":7}]"#,
     )?;
     let before = Meter::of(&policy);
     let replica = policy.place(&call, &replicas)?;
@@ -207,11 +207,11 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
             .filter(|(_, calls)| *calls > 0)
             .collect::<Vec<_>>()
     );
-    println!("ok: every call answered");
+    println!("ok: every call responded");
     Ok(())
 }
 
-/// A small state at instantiation: two queued token requests, one prefill
+/// A small state at instantiation: two waiting token requests, one prefill
 /// phase, two ranks.
 ///
 /// Written as the encoding rather than as a struct literal, so a view that
@@ -221,9 +221,9 @@ fn snapshot() -> Result<Snapshot, Box<dyn Error>> {
         br#"{
             "step": 0,
             "requests": [
-                {"id":1,"state":{"state":"queued"},"class":{"class":"token"},
+                {"id":1,"state":{"state":"waiting"},"class":{"class":"token"},
                  "prompt_tokens":128,"phase":1},
-                {"id":2,"state":{"state":"queued"},"class":{"class":"token"},
+                {"id":2,"state":{"state":"waiting"},"class":{"class":"token"},
                  "prompt_tokens":64,"phase":1}
             ],
             "phases": [{"id":1,"kind":{"kind":"prefill"},"block":0}],
@@ -232,19 +232,19 @@ fn snapshot() -> Result<Snapshot, Box<dyn Error>> {
     )
 }
 
-/// One resident token request whose prompt is `prompt` tokens long and whose
+/// One running token request whose prompt is `prompt` tokens long and whose
 /// prefix cache holds `prefilled` of them.
 fn updated(id: u64, prompt: u32, prefilled: u32) -> Result<RequestView, Box<dyn Error>> {
     decode(
         format!(
-            r#"{{"id":{id},"state":{{"state":"resident"}},"class":{{"class":"token"}},
+            r#"{{"id":{id},"state":{{"state":"running"}},"class":{{"class":"token"}},
                  "phase":1,"prompt_tokens":{prompt},"cached_prefix_tokens":{prefilled}}}"#
         )
         .as_bytes(),
     )
 }
 
-/// One queued token request.
+/// One waiting token request.
 fn request(id: u64) -> Result<RequestView, Box<dyn Error>> {
     decode(
         format!(
@@ -278,7 +278,7 @@ impl Meter {
         }
     }
 
-    /// Prints what the module did since `self`, and answers the fuel it burned.
+    /// Prints what the module did since `self`, and responds to the fuel it burned.
     fn report(&self, policy: &PolicyInstance, call: &str) -> u64 {
         let fuel = policy.fuel_consumed().saturating_sub(self.fuel);
         let calls: u64 = policy
@@ -291,18 +291,18 @@ impl Meter {
     }
 }
 
-/// Prints what a step's plan asks for.
-fn print_plan(plan: &Plan) {
+/// Prints what a step's output asks for.
+fn print_output(output: &DispatchOutput) {
     println!(
         "dispatch: admit {} reject {} work {} offload {} prefetch {} refill {}",
-        plan.admit.len(),
-        plan.reject.len(),
-        plan.work.len(),
-        plan.offload.len(),
-        plan.prefetch.len(),
-        plan.refill.len()
+        output.admit.len(),
+        output.reject.len(),
+        output.work.len(),
+        output.offload.len(),
+        output.prefetch.len(),
+        output.refill.len()
     );
-    for work in &plan.work {
+    for work in &output.work {
         println!(
             "  work request {} phase {} tokens {}",
             work.request.0, work.phase.0, work.tokens

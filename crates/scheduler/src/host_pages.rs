@@ -5,16 +5,16 @@
 //! Each store that keeps derived state in the pools (the host KV cache and
 //! KV storage, `kv_cache::offload`; latent trajectories, `trajectories`;
 //! encoder outputs, `encoder_outputs`) states only its keys, which pages it
-//! stores and when, and what each answer means to it (its own purpose `S`).
+//! stores and when, and what each response means to it (its own purpose `S`).
 //! The page lifecycle is the same for all of them and is stated here once:
 //! a reader pins the pages it reads ([`Servers::pin`]) and unpins them when
 //! done ([`Servers::unpin`]); a writer reserves slots for the pages it
 //! writes ([`Servers::reserve`]), copies into them, and commits them, or
 //! aborts them when its copy failed ([`Servers::settle`]). A reader or a
-//! writer that ends before its pins or reservation are answered turns them
+//! writer that ends before its pins or reservation get their responses turns them
 //! into [`Purpose::Orphan`] or [`Purpose::Abandoned`] ([`Servers::pending_mut`]),
-//! and the client releases whatever they took once they are answered, so
-//! a store reads only the answers of its own purposes.
+//! and the client releases whatever they took once they are responded, so
+//! a store reads only the responses of its own purposes.
 //!
 //! The scheduler connects as a head of its engine's epoch, so what an epoch
 //! on trial commits stays its own until its commit.
@@ -34,7 +34,7 @@
 //! network. Requests to the servers
 //! never block the scheduler: [`Servers::submit`] sends one with what it was
 //! asked for (its purpose), and [`Servers::take`] takes the events and
-//! answers that arrived, at every scheduler step.
+//! responds to that arrived, at every scheduler step.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -122,40 +122,40 @@ impl PoolRead {
 }
 
 /// What [`Servers::take`] takes: the events, each with the connection it
-/// arrived on, and the answers of the store's own purposes.
+/// arrived on, and the responses of the store's own purposes.
 pub(crate) type Arrivals<S> = (Vec<(usize, Event)>, Vec<(S, Reply)>);
 
 /// What a request to the host page pools is for: one of the store's own
-/// (`S`), whose answer the store reads, or an end of the page lifecycle,
-/// whose answer the client settles itself ([`Servers::take`]).
+/// (`S`), whose response the store reads, or an end of the page lifecycle,
+/// whose response the client settles itself ([`Servers::take`]).
 pub(crate) enum Purpose<S> {
-    /// A request whose answer the store reads.
+    /// A request whose response the store reads.
     Store(S),
-    /// Pins of `keys` in `pool` for `reader`, answered after the reader
+    /// Pins of `keys` in `pool` for `reader`, responded after the reader
     /// ended: the pages they pinned are unpinned. A pool counts pins per
-    /// reader, so only the pages the answer names as pinned are.
+    /// reader, so only the pages the response names as pinned are.
     Orphan {
         client: usize,
         pool: u64,
         reader: Scope,
         keys: Vec<Key>,
     },
-    /// Pins of `keys` at the peer of connection `peer`, answered after their
+    /// Pins of `keys` at the peer of connection `peer`, responded after their
     /// reader ended: every page they pinned is unpinned at the peer.
     PeerOrphan { peer: usize, keys: Vec<Key> },
-    /// A reservation of `keys` in `pool`, answered after its writer ended:
+    /// A reservation of `keys` in `pool`, responded after its writer ended:
     /// the slots it reserved are aborted.
     Abandoned {
         client: usize,
         pool: u64,
         keys: Vec<Key>,
     },
-    /// A request whose answer only reports a failure: an unpin, a commit,
+    /// A request whose response only reports a failure: an unpin, a commit,
     /// an abort, a cancel or a prefetch.
     Settle,
 }
 
-/// The keys of `keys` whose pages a pin's answer `slots` pinned.
+/// The keys of `keys` whose pages a pin's response `slots` pinned.
 fn pinned(keys: &[Key], slots: &[Option<u64>]) -> Vec<Key> {
     keys.iter()
         .zip(slots)
@@ -165,7 +165,7 @@ fn pinned(keys: &[Key], slots: &[Option<u64>]) -> Vec<Key> {
 }
 
 /// The connections to the servers of the pools one store uses, with the
-/// purpose of every request they have not answered.
+/// purpose of every request they have not responded.
 pub(crate) struct Servers<S> {
     deployment: String,
     epoch: u64,
@@ -178,7 +178,7 @@ pub(crate) struct Servers<S> {
     /// The connections to peer hosts' servers, as a [`Role::Peer`], by
     /// endpoint.
     peers: HashMap<String, usize>,
-    /// Requests submitted and not yet answered, by connection and request.
+    /// Requests submitted and not yet responded, by connection and request.
     pending: HashMap<(usize, u64), Purpose<S>>,
 }
 
@@ -244,7 +244,7 @@ impl<S> Servers<S> {
         }
     }
 
-    /// Send `request` on connection `client` and wait for its answer: for
+    /// Send `request` on connection `client` and wait for its response: for
     /// the requests that size the pools before the store serves, never on
     /// a scheduler step.
     ///
@@ -291,7 +291,7 @@ impl<S> Servers<S> {
     }
 
     /// Pin the published pages of `keys` of the deployment at the peer of
-    /// connection `peer`, in its pools of the page `layouts`, answered
+    /// connection `peer`, in its pools of the page `layouts`, responded
     /// (`Reply::PeerPinned`) for `purpose`.
     pub(crate) fn peer_pin(
         &mut self,
@@ -318,7 +318,7 @@ impl<S> Servers<S> {
     }
 
     /// Reserve slots for `keys` in `pool` for the head's own transfer task,
-    /// a peer read, answered (`Reply::Reserved`) for `purpose`.
+    /// a peer read, responded (`Reply::Reserved`) for `purpose`.
     pub(crate) fn reserve_read(
         &mut self,
         client: usize,
@@ -336,7 +336,7 @@ impl<S> Servers<S> {
     }
 
     /// Submit the transfer task of `read` to its local server, at the
-    /// priority of what a request waits for, answered (`Reply::Transferring`)
+    /// priority of what a request waits for, responded (`Reply::Transferring`)
     /// for `purpose`; its end arrives as an [`Event::Transferred`] on that
     /// connection.
     pub(crate) fn read_pages(&mut self, read: &PoolRead, purpose: S) -> bool {
@@ -370,7 +370,7 @@ impl<S> Servers<S> {
         self.peer_unpin(read.peer, read.peer_pool, keys);
     }
 
-    /// Submit `request` on connection `client`, answered for `purpose`.
+    /// Submit `request` on connection `client`, responded for `purpose`.
     /// Returns whether it was sent.
     pub(crate) fn submit(&mut self, client: usize, request: &Request, purpose: Purpose<S>) -> bool {
         let Some(connection) = self.clients[client].as_mut() else {
@@ -388,7 +388,7 @@ impl<S> Servers<S> {
         }
     }
 
-    /// Pin `keys` in `pool` on connection `client` for `reader`, answered
+    /// Pin `keys` in `pool` on connection `client` for `reader`, responded
     /// (`Reply::Pinned`) for `purpose`: the slots of the pages the pool
     /// holds, which it keeps until the reader unpins them.
     pub(crate) fn pin(
@@ -427,7 +427,7 @@ impl<S> Servers<S> {
     }
 
     /// Reserve slots for `keys` in `pool` for `writer`, the pages of one
-    /// `window` evicted whole when one is named, answered
+    /// `window` evicted whole when one is named, responded
     /// (`Reply::Reserved`) for `purpose`.
     pub(crate) fn reserve(
         &mut self,
@@ -467,21 +467,21 @@ impl<S> Servers<S> {
         self.submit(client, &request, Purpose::Settle)
     }
 
-    /// The purposes of the requests not yet answered.
+    /// The purposes of the requests not yet responded.
     pub(crate) fn pending(&self) -> impl Iterator<Item = &Purpose<S>> {
         self.pending.values()
     }
 
-    /// The purposes of the requests not yet answered, to be changed when
+    /// The purposes of the requests not yet responded, to be changed when
     /// what asked for them ended: a store's pins become an
     /// [`Purpose::Orphan`], its reservation an [`Purpose::Abandoned`].
     pub(crate) fn pending_mut(&mut self) -> impl Iterator<Item = &mut Purpose<S>> {
         self.pending.values_mut()
     }
 
-    /// Settles the answer of a lifecycle end: releases what an orphaned pin
+    /// Settles the response of a lifecycle end: releases what an orphaned pin
     /// or an abandoned reservation took, and reports a failure.
-    fn settle_answer(&mut self, purpose: Purpose<S>, reply: Reply) {
+    fn settle_response(&mut self, purpose: Purpose<S>, reply: Reply) {
         match (purpose, reply) {
             (Purpose::Store(_), _) => {}
             (
@@ -521,12 +521,12 @@ impl<S> Servers<S> {
         }
     }
 
-    /// The events, each with the connection it arrived on, and the answers
+    /// The events, each with the connection it arrived on, and the responses
     /// of the store's own purposes that arrived since the last call, each
-    /// with its purpose; the answers of lifecycle ends are settled here.
+    /// with its purpose; the responses of lifecycle ends are settled here.
     ///
     /// A peer connection that failed is dropped, and each request it will
-    /// not answer is answered with [`Reply::Error`]; the connections to the
+    /// not respond gets its response with [`Reply::Error`]; the connections to the
     /// deployment's own hosts stay, as their failures are their ranks'.
     pub(crate) fn take(&mut self) -> Arrivals<S> {
         let mut events = Vec::new();
@@ -543,7 +543,7 @@ impl<S> Servers<S> {
                 events.push((index, event));
             }
         }
-        let mut answers = Vec::new();
+        let mut responses = Vec::new();
         for client in failed {
             if !self.peers.values().any(|&peer| peer == client) {
                 continue;
@@ -561,40 +561,47 @@ impl<S> Servers<S> {
                         kind: ErrorKind::Unavailable,
                         message: "the peer storage server connection failed".to_owned(),
                     };
-                    answers.push((purpose, reply));
+                    responses.push((purpose, reply));
                 }
             }
         }
         let ids: Vec<(usize, u64)> = self.pending.keys().copied().collect();
         for id in ids {
-            let Some(answer) = self.clients[id.0]
+            let Some(response) = self.clients[id.0]
                 .as_mut()
                 .and_then(|client| client.take(id.1))
             else {
                 continue;
             };
             if let Some(purpose) = self.pending.remove(&id) {
-                answers.push((purpose, answer.reply));
+                responses.push((purpose, response.reply));
             }
         }
-        let mut own = Vec::with_capacity(answers.len());
-        for (purpose, reply) in answers {
+        let mut own = Vec::with_capacity(responses.len());
+        for (purpose, reply) in responses {
             match purpose {
                 Purpose::Store(purpose) => own.push((purpose, reply)),
-                lifecycle => self.settle_answer(lifecycle, reply),
+                lifecycle => self.settle_response(lifecycle, reply),
             }
         }
         (events, own)
     }
 
-    /// The answers that arrived since the last call, each with its purpose,
+    /// The responds to that arrived since the last call, each with its purpose,
     /// for a store that awaits no event.
-    pub(crate) fn answers(&mut self) -> Vec<(S, Reply)> {
+    pub(crate) fn responses(&mut self) -> Vec<(S, Reply)> {
         self.take().1
     }
 
-    /// Whether a request awaits its answer.
+    /// Whether a request awaits its response.
+    #[cfg(test)]
     pub(crate) fn waiting(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// The connections' descriptors, each readable when a response or an
+    /// event arrived on it: what the scheduler waits on beside its wake.
+    pub(crate) fn descriptors(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
+        self.clients.iter().flatten().map(storage::Client::as_fd)
     }
 }

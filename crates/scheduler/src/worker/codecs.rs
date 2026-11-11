@@ -12,7 +12,7 @@ use crate::worker::WorkerGroupId;
 ///
 /// A decoded media unit is a host product that its encoder reads in place
 /// from shared storage, which is named in one host's namespace. A round deals
-/// its units to each component's ranks in order, `units_per_rank` consecutive
+/// its units to each stage's ranks in order, `units_per_rank` consecutive
 /// positions each, so position `p` is decoded by the decoder's rank
 /// `p / per_decoder` and encoded by the encoder's rank `p / per_encoder`. A
 /// pairing is admissible when the encoder covers a whole round and those two
@@ -21,7 +21,7 @@ use crate::worker::WorkerGroupId;
 /// startup, naming the unit and the hosts it would cross.
 ///
 /// Returns an empty map when the routing lacks a video decoding or a video
-/// encoding component.
+/// encoding stage.
 pub(crate) fn video_unit_codecs(
     routing: &std::collections::BTreeMap<ipc::MediaCall, String>,
     layouts: &[(
@@ -39,13 +39,11 @@ pub(crate) fn video_unit_codecs(
     ) else {
         return Ok(pairings);
     };
-    let holders = |component: &str| {
+    let holders = |stage: &str| {
         layouts
             .iter()
-            .filter_map(|(id, ranks, components)| {
-                components
-                    .get(component)
-                    .map(|config| (id.clone(), ranks, config))
+            .filter_map(|(id, ranks, stages)| {
+                stages.get(stage).map(|config| (id.clone(), ranks, config))
             })
             .collect::<Vec<_>>()
     };
@@ -147,11 +145,11 @@ mod tests {
     ) -> anyhow::Result<BTreeMap<WorkerGroupId, std::collections::BTreeSet<WorkerGroupId>>> {
         let placed = layouts
             .iter()
-            .map(|(id, ranks, components)| {
+            .map(|(id, ranks, stages)| {
                 (
                     (*id).clone(),
                     ranks.iter().map(|rank| rank.host.clone()).collect(),
-                    (*components).clone(),
+                    (*stages).clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -174,13 +172,13 @@ mod tests {
             rank("b", "cpu"),
             rank("b", "cpu"),
         ];
-        let model_components =
+        let model_stages =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
-        let host_components =
+        let host_stages =
             BTreeMap::from([("video_codec".to_owned(), distributed(vec![0, 1, 2, 3], 1))]);
         let pairings = pairing(&[
-            (&model, &model_ranks, &model_components),
-            (&host, &cpu_workers, &host_components),
+            (&model, &model_ranks, &model_stages),
+            (&host, &cpu_workers, &host_stages),
         ])
         .expect("each unit is encoded on its own host");
         assert_eq!(pairings[&model], [host].into());
@@ -204,13 +202,13 @@ mod tests {
             .into_iter()
             .map(|host| rank(host, "cpu"))
             .collect::<Vec<_>>();
-        let model_components =
+        let model_stages =
             BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0, 1, 2, 3], 2))]);
-        let host_components =
+        let host_stages =
             BTreeMap::from([("video_codec".to_owned(), distributed((0..8).collect(), 1))]);
         pairing(&[
-            (&model, &model_ranks, &model_components),
-            (&host, &cpu_workers, &host_components),
+            (&model, &model_ranks, &model_stages),
+            (&host, &cpu_workers, &host_stages),
         ])
         .expect("each host's units are encoded on it");
 
@@ -221,8 +219,8 @@ mod tests {
             .map(|host| rank(host, "cpu"))
             .collect::<Vec<_>>();
         let error = pairing(&[
-            (&model, &model_ranks, &model_components),
-            (&host, &cpu_workers, &host_components),
+            (&model, &model_ranks, &model_stages),
+            (&host, &cpu_workers, &host_stages),
         ])
         .expect_err("the fourth unit leaves host a");
         assert!(error.to_string().contains("media unit 3"), "{error}");

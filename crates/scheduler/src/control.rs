@@ -1,8 +1,8 @@
 //! Cancellation, terminal cleanup, and lifecycle handling.
 //!
 //! The scheduler thread applies each frontend `Command` (see `crate::handle`)
-//! here. Cancelling a queued request finishes it at once. A running request
-//! records a terminal intent and closes only after every submitted call has
+//! here. Cancelling a waiting request finishes it at once. A running request
+//! has its end decided and closes only after every submitted call has
 //! resolved: a media request with nothing in flight finishes immediately, and
 //! `reap_cancellations` finishes the rest once their calls drain.
 //! Acknowledgements resolve the stop-string decisions a request awaits
@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::handle;
+use crate::request::Request;
 
 /// The name a stage's refusal uses.
 fn stage_name(stage: Stage) -> &'static str {
@@ -23,7 +24,7 @@ fn stage_name(stage: Stage) -> &'static str {
 }
 
 /// What an engine command this scheduler does not apply itself is called, for
-/// the answer that names its owner.
+/// the response that names its owner.
 fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
     use proto::process::command::Kind;
     match kind {
@@ -42,228 +43,174 @@ fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
 }
 
 /// An update's ask that the following step's batches also run in shadow for an
-/// epoch generation (§7.3 step 2), with the answer that waits for the step which
+/// epoch generation (§7.3 step 2), with the response that waits for the step which
 /// shadows them.
 ///
-/// The ask is kept until it is answered: a refused shadow submission answers it
-/// at once with the worker's reason, and a submitted one answers it when its
-/// step has ended, so an answer never claims a pass that has not run.
+/// The ask is kept until it is responded: a refused shadow submission responds to it
+/// at once with the worker's reason, and a submitted one responds to it when its
+/// step has ended, so a response never states a pass that has not run.
 pub(super) struct ShadowPass {
     /// The epoch generation whose operators the shadow pass runs.
     pub(super) generation: u64,
     /// One of the step's batches was submitted as a shadow: the step that owns
-    /// the answer has begun, and ends before the answer is sent.
+    /// the response has begun, and ends before the response is sent.
     pub(super) shadowed: bool,
     /// The shapes this pass has compared. A shape is compared once (§7.3 step
     /// 2): a pass that shadowed every batch of a shape would keep a slow
     /// comparison in flight for as long as traffic lasts, and it would neither
     /// settle nor leave the device to the requests it serves.
     pub(super) shapes: std::collections::HashSet<ipc::execution::Shape>,
-    /// Where the ask's answer goes, in the shape every stage's answer takes.
-    pub(super) answer: crossbeam_channel::Sender<Result<(), String>>,
+    /// Where the ask's response goes, in the shape every stage's response takes.
+    pub(super) response: crossbeam_channel::Sender<Result<(), String>>,
 }
 
 impl Scheduler {
-    /// Removes a queued media request while preserving FIFO order for its peers.
-    fn remove_waiting_media(&mut self, request_id: RequestId) -> Option<PendingMedia> {
-        let index = self
-            .waiting_media
-            .iter()
-            .position(|submission| submission.request.request_id == request_id)?;
-        self.waiting_media.remove(index)
-    }
-
-    /// Removes a queued token request while preserving admission order for its peers.
-    pub(super) fn remove_waiting(&mut self, request_id: RequestId) -> Option<RequestState> {
-        if let Some(index) = self
-            .held_for_index
-            .iter()
-            .position(|held| held.req.request_id == request_id)
-        {
-            return Some(self.held_for_index.remove(index));
+    /// Takes a waiting request out of the queue and the request table,
+    /// preserving the order of its peers; `None` for a request that is not
+    /// waiting.
+    pub(super) fn remove_waiting(&mut self, id: RequestId) -> Option<Request> {
+        if let Some(index) = self.held_for_index.iter().position(|held| *held == id) {
+            self.held_for_index.remove(index);
+        } else {
+            let index = self.waiting.iter().position(|queued| *queued == id)?;
+            self.waiting.remove(index);
         }
-        let index = self
-            .waiting
-            .iter()
-            .position(|queued| queued.req.request_id == request_id)?;
-        self.waiting.remove(index)
+        self.requests.remove(&id)
     }
 
     /// Aborts every queued/gated/running request with a terminal event.
     ///
-    /// `Scheduler::run` calls this on shutdown and after engine-fatal, and
-    /// `Scheduler::step` on shutdown, each right before closing the worker.
+    /// `Scheduler::run` calls this on shutdown and after an engine-fatal fault.
     /// Shutdown covers both a `Shutdown` command and a disconnected command
     /// channel. Running requests finish immediately rather than waiting for
     /// their in-flight calls, and batches assembled but not yet submitted are
     /// dropped. Events still journaled behind a full channel, including these
-    /// terminal events, are handed to their receivers, since no later flush
+    /// terminal events, are given to their receivers, since no later flush
     /// will deliver them.
     pub(super) fn abort_all_requests(&mut self) {
         self.release_held_for_index();
         self.inflight.pending_submissions.clear();
 
-        while let Some(submission) = self.waiting_media.pop_front() {
-            let _ = submission.event_tx.send(Event::Finished {
-                reason: FinishReason::Aborted,
-                stop_reason: None,
-                prompt_tokens: submission.request.prompt_token_ids.len(),
-                completion_tokens: 0,
-            });
-        }
-        let media = self.media_ids();
-        for id in media {
-            self.finish_media(id, Terminal::finish(FinishReason::Aborted));
-        }
-
-        let queued: Vec<RequestId> = {
-            let mut ids = Vec::new();
-            while let Some(st) = self.waiting.pop_front() {
-                ids.push(st.req.request_id);
-                let _ = st.output.events.event_tx.send(Event::Finished {
+        while let Some(id) = self.waiting.pop_front() {
+            if let Some(request) = self.requests.remove(&id) {
+                let _ = request.event_tx().send(Event::Finished {
                     reason: FinishReason::Aborted,
                     stop_reason: None,
-                    prompt_tokens: st.charged_prompt_tokens(),
+                    prompt_tokens: request.prompt_tokens(),
                     completion_tokens: 0,
                 });
             }
-            ids
-        };
-        let _ = queued;
-        let running: Vec<RequestId> = self.running.keys().copied().collect();
-        for id in running {
-            self.finish(id, FinishReason::Aborted);
+        }
+        for id in self.running.clone() {
+            self.retire(id, Terminal::finish(FinishReason::Aborted));
         }
 
         // Every running request has now retired its journal, so the retained
         // journals hold all output the control loop can no longer deliver.
-        self.output.hand_off_retired();
+        self.output.transfer_retired();
     }
 
     /// Applies one command; returns true on shutdown.
     ///
-    /// Every submission is validated by `enqueue` or `enqueue_media`, which
-    /// refuse what the loaded workers cannot serve and report their own
-    /// rejections.
+    /// Every submission is validated by `add_request`, which refuses what
+    /// the loaded workers cannot serve and reports its own rejections.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         // Work that finished on another thread before this command arrived is
-        // taken first, so every answer describes the state the command found:
+        // taken first, so every response describes the state the command found:
         // the slot holds the candidate a precopy prepared by the time its
-        // answer was sent.
+        // response was sent.
         self.take_prepared_policy();
         self.apply_policy_stage();
 
         match cmd {
             Command::Submit(submissions) => {
                 for Submission { request, event_tx } in submissions {
-                    match *request {
-                        Request::Generation(request) => self.enqueue(*request, event_tx),
-                        Request::Diffusion(request) => {
-                            self.enqueue_media(request, event_tx, crate::clock::now_monotonic_us())
-                        }
-                    }
+                    self.add_request(*request, event_tx);
                 }
             }
-            Command::Cancel(request_id) => self.mark_cancelled(request_id, false),
+            Command::Cancel(request_id) => self.cancel(request_id),
             Command::Acknowledge {
                 request_id,
                 output_token_count,
             } => self.acknowledge_output(request_id, output_token_count),
             Command::Stop(request_id) => self.mark_stopped(request_id),
             Command::Abort(id) => self.mark_cancelled(id, true),
-            Command::Park { lend, answer } => self.park(answer, lend),
-            Command::Resume { reclaim, answer } => {
-                let _ = answer.send(self.resume(reclaim));
+            Command::Park { lend, response } => self.park(response, lend),
+            Command::Resume {
+                take_back,
+                response,
+            } => {
+                let _ = response.send(self.resume(take_back));
             }
             Command::Promote {
                 cache,
                 recompute,
                 grows,
-                answer,
+                response,
             } => {
-                let _ = answer.send(self.promote(&cache, recompute, grows));
+                let _ = response.send(self.promote(&cache, recompute, grows));
             }
             Command::AwaitIndex(bound) => {
                 self.awaiting_index = Some(std::time::Instant::now() + bound);
             }
-            Command::Inherit { caches, answer } => {
-                let _ = answer.send(self.inherit(&caches));
+            Command::Inherit { caches, response } => {
+                let _ = response.send(self.inherit(&caches));
             }
-            Command::Commit(answer) => {
-                let _ = answer.send(self.commit());
+            Command::Commit(response) => {
+                let _ = response.send(self.commit());
             }
-            Command::PublishEpoch(answer) => {
-                let published = self
-                    .worker
-                    .publish_epoch()
-                    .map_err(|error| format!("{error:#}"));
-                let _ = answer.send(published);
+            // The four storage commands below concern storage the ranks of this
+            // process do not hold through their scheduler: the engine's storage path
+            // publishes and retires epochs, keeps weights and reads the quota, so a
+            // scheduler has nothing to do and nothing to report.
+            Command::PublishEpoch(response) | Command::Retire { response, .. } => {
+                let _ = response.send(Ok(()));
             }
-            Command::Retire { epochs, answer } => {
-                let retired = self
-                    .worker
-                    .retire(&epochs)
-                    .map_err(|error| format!("{error:#}"));
-                let _ = answer.send(retired);
+            Command::KeepWeights { response, .. } | Command::Usage(response) => {
+                let _ = response.send(Ok(Vec::new()));
             }
-            Command::KeepWeights {
-                epochs,
-                to_host,
-                cache_keys,
-                answer,
-            } => {
-                let kept = self
-                    .worker
-                    .keep_weights(&epochs, to_host, &cache_keys)
-                    .map_err(|error| format!("{error:#}"));
-                let _ = answer.send(kept);
+            Command::DescribeCache(response) => {
+                let _ = response.send(self.describe_cache());
             }
-            Command::Ledgers(answer) => {
-                let read = self.worker.ledgers().map_err(|error| format!("{error:#}"));
-                let _ = answer.send(read);
+            Command::DescribeRequests(response) => {
+                let _ = response.send(self.migrating_cache().1);
             }
-            Command::DescribeCache(answer) => {
-                let _ = answer.send(self.describe_cache());
+            Command::TakePolicyReport(response) => {
+                let _ = response.send(self.take_policy_report());
             }
-            Command::DescribeRequests(answer) => {
-                let _ = answer.send(self.migrating_cache().1);
-            }
-            Command::TakePolicyReport(answer) => {
-                let _ = answer.send(self.take_policy_report());
-            }
-            Command::Progress { answer } => {
+            Command::Progress { response } => {
                 let progress = policy::Progress {
                     step: self.step,
                     usage: self.policy.as_ref().map(policy::PolicySlot::usage),
                 };
-                let _ = answer.send(progress);
+                let _ = response.send(progress);
             }
             Command::CacheWarm {
                 operation,
                 together,
-                answer,
+                response,
             } => {
-                let _ = answer.send(self.warm_cache(operation, &together));
+                let _ = response.send(self.warm_cache(operation, &together));
             }
             Command::FlushCache => {
                 let pages = self.storage.flush_prefix_cache();
                 tracing::info!(pages, "flushed the prefix cache");
             }
-            Command::Configure { limits, answer } => {
-                let _ = answer.send(self.reconfigure(*limits));
+            Command::Configure { limits, response } => {
+                let _ = response.send(self.reconfigure(*limits));
             }
-            Command::ResizeCache { change, answer } => self.resize_cache(change, answer),
+            Command::ResizeCache { change, response } => self.resize_cache(change, response),
             Command::UpdateWeights {
                 model_path,
                 in_flight,
-                answer,
+                response,
             } => {
-                self.update_weights(model_path, in_flight, answer);
+                self.update_weights(model_path, in_flight, response);
             }
             Command::CommitExperts {
                 order,
                 together,
-                answer,
+                response,
             } => {
                 let committed = self.run_together(&together, |scheduler| {
                     scheduler
@@ -276,30 +223,33 @@ impl Scheduler {
                     // may issue a batch through a partially changed union.
                     self.fail(format!("expert commit failed: {error}"));
                 }
-                let _ = answer.send(committed);
+                let _ = response.send(committed);
             }
             Command::PrecopyPolicy {
                 program,
                 source,
-                answer,
-            } => self.precopy_policy(program, source, answer),
-            Command::StagePolicy { stage, answer } => {
-                self.request_stage(stage, Some(answer), None);
+                response,
+            } => self.precopy_policy(program, source, response),
+            Command::StagePolicy { stage, response } => {
+                self.request_stage(stage, Some(response), None);
             }
-            Command::EngineCommand { command, answer } => {
-                self.engine_command(command, answer);
+            Command::EngineCommand { command, response } => {
+                self.engine_command(command, response);
             }
-            Command::ProgramCommand { command, answer } => {
-                self.program_command(command, answer);
+            Command::ProgramCommand { command, response } => {
+                self.program_command(command, response);
             }
-            Command::Shadow { generation, answer } => {
-                self.ask_shadow(generation, answer);
+            Command::Shadow {
+                generation,
+                response,
+            } => {
+                self.ask_shadow(generation, response);
             }
-            Command::Counters { answer } => {
-                let _ = answer.send(self.counters());
+            Command::Counters { response } => {
+                let _ = response.send(self.counters());
             }
-            Command::PolicyPrograms { answer } => {
-                let _ = answer.send(handle::PolicyPrograms {
+            Command::PolicyPrograms { response } => {
+                let _ = response.send(handle::PolicyPrograms {
                     running: self.policy.as_ref().map(|policy| policy.program().clone()),
                     prepared: self
                         .policy_prepared
@@ -327,15 +277,15 @@ impl Scheduler {
     ///
     /// The state is read here, at a boundary, and the load, the instantiation
     /// and the trial of each decision run on a blocking thread, so the serving
-    /// thread is never held by them. The answer arrives when that thread is
+    /// thread is never held by them. The response arrives when that thread is
     /// done; [`Self::take_prepared_policy`] takes the candidate.
     fn precopy_policy(
         &mut self,
         program: PolicyProgram,
         source: Arc<dyn PolicySource + Send + Sync>,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     ) {
-        let answer_moved = answer.clone();
+        let response_moved = response.clone();
         let step = self.step;
         // The scheduler's own entry for §7.3 step 2, on the serving thread at a boundary: a log that
         // has the control thread's marker and not this line is a command that never left the queue,
@@ -369,64 +319,23 @@ impl Scheduler {
                 let failed = built.as_ref().err().map(|error| error.to_string());
                 let _ = prepared.send(built);
                 let _ = match failed {
-                    Some(error) => answer_moved.send(Err(error)),
-                    None => answer_moved.send(Ok(())),
+                    Some(error) => response_moved.send(Err(error)),
+                    None => response_moved.send(Ok(())),
                 };
             });
         match spawned {
             Ok(_) => self.policy_precopy = Some(candidate),
             Err(error) => {
                 let _ = self.policy_precopy.take();
-                let _ = answer.send(Err(format!("the precopy thread did not start: {error}")));
+                let _ = response.send(Err(format!("the precopy thread did not start: {error}")));
             }
         }
-    }
-
-    /// Installs `program` as this scheduler's policy without a control thread.
-    ///
-    /// §7.3's two stages run here on the calling thread: the precopy
-    /// instantiates the program on this boundary's state and trials every
-    /// decision of §4.4's table against it, and the switchover puts it in. An
-    /// epoch with no control thread — the integration tests, and a simulated
-    /// engine's — has no other way to have a policy, and a scheduler with no
-    /// policy decides nothing, so without this such an epoch schedules no work
-    /// at all.
-    ///
-    /// Production installs a policy through the `PrecopyPolicy` and
-    /// `StagePolicy` commands, with the load, the instantiation and the trial on
-    /// a blocking thread so the serving thread is never held; this is that pair
-    /// without the thread and without the blocking hop, and it is for tests
-    /// only: the caller pays the whole cost of the precopy.
-    ///
-    /// The stage is applied where a stage is always applied — at a boundary with
-    /// nothing in flight — so the first call happens before the epoch submits
-    /// anything.
-    pub fn install_policy(
-        &mut self,
-        program: PolicyProgram,
-        source: &dyn PolicySource,
-    ) -> Result<(), String> {
-        let state = views::trial_state(self, self.step, self.recorder.recorded());
-        let live = views::live(self, self.step, self.recorder.recorded());
-        let ceilings = ceilings_of(BatchCapacity::of(&self.info));
-        let engine = policy::process_engine().map_err(|error| error.to_string())?;
-        let room = state.room.clone();
-        let checked = mechanism::Checked::new(&live, &room);
-        let candidate = PolicySlot::prepare(engine, source, program, state, &ceilings, &checked)
-            .map_err(|error| error.to_string())?;
-        self.policy_prepared = Some(candidate);
-        self.request_stage(Stage::Switchover, None, None);
-        self.apply_policy_stage();
-        if self.policy.is_none() {
-            return Err("the policy did not become this scheduler's".to_owned());
-        }
-        Ok(())
     }
 
     /// Takes the candidate a precopy prepared, once its blocking thread is done.
     ///
     /// The scheduler that is about to switch reads it; a candidate that failed
-    /// is dropped, and its failure is the answer the precopy already gave.
+    /// is dropped, and its failure is the response the precopy already gave.
     pub(super) fn take_prepared_policy(&mut self) {
         let Some(precopy) = self.policy_precopy.as_ref() else {
             return;
@@ -443,27 +352,20 @@ impl Scheduler {
 
     /// §7.3 step 2's shadow pass: the following step's batches also run in
     /// shadow for `generation`, the worker pairing that epoch's operators
-    /// against the serving one's resident data without writing resident memory.
+    /// against the serving one's data without writing its memory.
     ///
     /// The ask is kept until a step has shadowed its batches, which is when it
-    /// is answered; a shadow submission the worker refuses answers it at once
+    /// is responded; a shadow submission the worker refuses responds to it at once
     /// with the worker's reason. Only the in-process arm shadows: a supplied
     /// worker runs no shadow pass, so the ask is refused there rather than
     /// left waiting for a step that cannot run it.
     fn ask_shadow(
         &mut self,
         generation: u64,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     ) {
-        if !self.worker.serves_in_process() {
-            let _ = answer.send(Err(format!(
-                "the shadow pass of generation {generation} starts when a step submits through \
-                 ::worker::Batches; this scheduler submits its batches to a supplied worker"
-            )));
-            return;
-        }
         if let Some(pending) = self.shadow_pass.as_ref() {
-            let _ = answer.send(Err(format!(
+            let _ = response.send(Err(format!(
                 "the shadow pass of generation {} is waiting for the step that runs it",
                 pending.generation
             )));
@@ -473,7 +375,7 @@ impl Scheduler {
             generation,
             shadowed: false,
             shapes: std::collections::HashSet::new(),
-            answer,
+            response,
         });
     }
 
@@ -492,7 +394,7 @@ impl Scheduler {
     }
 
     /// Records that a batch of this step was submitted as a shadow pass: the
-    /// ask is answered when the step ends, so an answer never claims a pass
+    /// ask gets its response when the step ends, so a response never states a pass
     /// that has not run.
     pub(super) fn note_shadowed(&mut self, shape: Option<ipc::execution::Shape>) {
         if let Some(pass) = self.shadow_pass.as_mut() {
@@ -502,20 +404,20 @@ impl Scheduler {
     }
 
     /// A shadow submission the worker refused: a shadow pass's failure is the
-    /// update's (§7.3 step 2), so the ask is answered with it and the epoch
+    /// update's (§7.3 step 2), so the ask gets its response with it and the epoch
     /// serves on.
     pub(super) fn shadow_failed(&mut self, reason: impl Into<String>) {
         if let Some(pass) = self.shadow_pass.take() {
-            let _ = pass.answer.send(Err(reason.into()));
+            let _ = pass.response.send(Err(reason.into()));
         }
     }
 
-    /// Answers an ask whose step has shadowed its batches, once every shadow
+    /// Responds to an ask whose step has shadowed its batches, once every shadow
     /// batch of that pass has finished (7.3 step 2).
     ///
-    /// The answer is the comparison's: a paired forward that left its
+    /// The response is the comparison's: a paired forward that left its
     /// operator's tolerance, or failed on the device, is the update's failure.
-    /// Answering when the step ended rather than when the batches finished let
+    /// Responding when the step ended rather than when the batches finished let
     /// a wrong kernel report as compared and reach the switchover.
     pub(super) fn settle_shadow(&mut self) {
         let shadowed = self.shadow_pass.as_ref().is_some_and(|pass| pass.shadowed);
@@ -528,7 +430,7 @@ impl Scheduler {
             crate::submission::ShadowStatus::Pending => {}
             crate::submission::ShadowStatus::Settled => {
                 if let Some(pass) = self.shadow_pass.take() {
-                    let _ = pass.answer.send(Ok(()));
+                    let _ = pass.response.send(Ok(()));
                 }
             }
             crate::submission::ShadowStatus::Failed(reason) => {
@@ -570,11 +472,11 @@ impl Scheduler {
     /// the program layer's, and the scheduling policy, whose module comes from
     /// the Program Server: the process that holds that source resolves it once
     /// and precopies each scheduler (`SchedulerHandle::precopy_policy`), so the
-    /// command itself is answered with that rather than half applied here.
+    /// command itself gets its response with that rather than half applied here.
     fn program_command(
         &mut self,
         command: ipc::ProgramCommand,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     ) {
         let (stage, at) = match command {
             ipc::ProgramCommand::Switchover { step, .. } => (Stage::Switchover, step),
@@ -582,7 +484,7 @@ impl Scheduler {
             ipc::ProgramCommand::Revert { .. } => (Stage::Revert, None),
             ipc::ProgramCommand::Purge { .. } => (Stage::Purge, None),
             ipc::ProgramCommand::Precopy { .. } => {
-                let _ = answer.send(Err(
+                let _ = response.send(Err(
                     "a precopy's policy is resolved through the Program Server by the process \
                      that holds its client, which then precopies each scheduler's policy"
                         .to_owned(),
@@ -590,22 +492,22 @@ impl Scheduler {
                 return;
             }
         };
-        self.request_stage(stage, Some(handle::StageAnswer::Applied(answer)), at);
+        self.request_stage(stage, Some(handle::StageResponse::Applied(response)), at);
     }
 
     /// Applies an engine command that concerns this scheduler (§7.3).
     ///
     /// The steps of an update are one scheduler's to apply — a switchover, a
-    /// commit, a revert, a purge — so they are answered here. The rest belong to
+    /// commit, a revert, a purge — so they get their responses here. The rest belong to
     /// the process that owns what they name: a precopy is resolved by the
     /// process holding the Program Server (it instantiates one candidate per
     /// scheduler), and a park, promote, drain, serve or pause is the engine
-    /// process's own lifecycle. Each answer names that rather than reporting
+    /// process's own lifecycle. Each response names that rather than reporting
     /// success for work that did not happen.
     fn engine_command(
         &mut self,
         command: proto::process::Command,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     ) {
         use proto::process::command::Kind;
 
@@ -615,7 +517,7 @@ impl Scheduler {
             Some(Kind::Revert(_)) => Stage::Revert,
             Some(Kind::Purge(_)) => Stage::Purge,
             Some(Kind::Precopy(_)) => {
-                let _ = answer.send(Err(
+                let _ = response.send(Err(
                     "a precopy is resolved once per epoch by the process that holds the Program \
                      Server, which then precopies each scheduler's policy"
                         .to_owned(),
@@ -623,21 +525,21 @@ impl Scheduler {
                 return;
             }
             Some(other) => {
-                let _ = answer.send(Err(format!(
+                let _ = response.send(Err(format!(
                     "{} is the main process's own command, not one scheduler's",
                     engine_command_name(&other)
                 )));
                 return;
             }
             None => {
-                let _ = answer.send(Err("an engine command names no kind".to_owned()));
+                let _ = response.send(Err("an engine command names no kind".to_owned()));
                 return;
             }
         };
-        self.request_stage(stage, Some(handle::StageAnswer::Applied(answer)), None);
+        self.request_stage(stage, Some(handle::StageResponse::Applied(response)), None);
     }
 
-    /// Asks for a stage of §7.3, answered when it is applied.
+    /// Asks for a stage of §7.3, responded when it is applied.
     ///
     /// A stage changes the serving policy, so it is applied where no batch and
     /// no submission is in flight — never in the middle of one (§7.3: "在一个
@@ -650,17 +552,17 @@ impl Scheduler {
     fn request_stage(
         &mut self,
         stage: Stage,
-        answer: Option<handle::StageAnswer>,
+        response: Option<handle::StageResponse>,
         at: Option<u64>,
     ) {
         // One stage owns the next boundary. A second one is refused with the
         // first's name rather than replacing it: replacing it would drop the
-        // first caller's answer, and applying both would change the serving
+        // first caller's response, and applying both would change the serving
         // policy twice on one boundary.
         if let Some((waiting, _, _)) = &self.policy_stage {
             let waiting = *waiting;
-            if let Some(answer) = answer {
-                answer.send(Err(format!(
+            if let Some(response) = response {
+                response.send(Err(format!(
                     "a {} is already waiting for the boundary that applies it",
                     stage_name(waiting)
                 )));
@@ -670,15 +572,15 @@ impl Scheduler {
         if stage == Stage::Switchover {
             self.take_prepared_policy();
             if self.policy_prepared.is_none() {
-                if let Some(answer) = answer {
-                    answer.send(Err(
+                if let Some(response) = response {
+                    response.send(Err(
                         "a switchover arrived without a policy prepared by a precopy".to_owned(),
                     ));
                 }
                 return;
             }
         }
-        self.policy_stage = Some((stage, answer, at));
+        self.policy_stage = Some((stage, response, at));
         self.apply_policy_stage();
     }
 
@@ -717,11 +619,11 @@ impl Scheduler {
                 return;
             }
             if self.step > at {
-                let Some((stage, answer, _)) = self.policy_stage.take() else {
+                let Some((stage, response, _)) = self.policy_stage.take() else {
                     return;
                 };
-                if let Some(answer) = answer {
-                    answer.send(Err(format!(
+                if let Some(response) = response {
+                    response.send(Err(format!(
                         "the {} was to apply at step {at}, which this scheduler passed at step {}",
                         stage_name(stage),
                         self.step
@@ -730,7 +632,7 @@ impl Scheduler {
                 return;
             }
         }
-        let Some((stage, answer, _at)) = self.policy_stage.take() else {
+        let Some((stage, response, _at)) = self.policy_stage.take() else {
             return;
         };
         tracing::info!(
@@ -764,9 +666,9 @@ impl Scheduler {
                 Err(reason)
             }
         };
-        tracing::info!(ok = applied.is_ok(), "a policy stage answered");
-        if let Some(answer) = answer {
-            answer.send(applied);
+        tracing::info!(ok = applied.is_ok(), "a policy stage responded");
+        if let Some(response) = response {
+            response.send(applied);
         }
     }
 
@@ -820,9 +722,8 @@ impl Scheduler {
     /// Selects commands with available destinations without bypassing an older
     /// command for the same request. Other requests remain independently eligible.
     ///
-    /// A command is deferred when `include` rejects it or
-    /// `Worker::command_has_capacity` reports a full destination; deferred
-    /// commands keep their relative order in `pending_commands`.
+    /// A command is deferred when `include` rejects it; deferred commands
+    /// keep their relative order in `pending_commands`.
     pub(super) fn take_commands(
         &mut self,
         include: impl Fn(&BatchCommand) -> bool,
@@ -833,10 +734,7 @@ impl Scheduler {
             let request = command.request_key();
             // Once one command of a request is deferred, every later command
             // of that request is deferred with it.
-            if blocked.contains(&request)
-                || !include(&command)
-                || !self.worker.command_has_capacity(&command)
-            {
+            if blocked.contains(&request) || !include(&command) {
                 blocked.insert(request);
                 self.inflight.pending_commands.push_back(command);
             } else {
@@ -850,7 +748,7 @@ impl Scheduler {
     /// itself.
     ///
     /// A policy's state is append-only: it learns a request from `Arrived` and
-    /// nothing else about it unless the mechanism says so. A queued request the
+    /// nothing else about it unless the mechanism says so. A waiting request the
     /// mechanism drops without an `End` stays in the policy's own queue, and
     /// the next `dispatch` names it in `admit`, where the mechanism refuses it
     /// as "not queued" — a policy failure, on a name the policy could not have
@@ -860,76 +758,71 @@ impl Scheduler {
         self.recorder.record(views::ended(id, end));
     }
 
-    /// Records cancellation or abortion across queued, media, and running request states.
+    /// Cancels the request `id` for its client: a waiting request finishes
+    /// at once with `Cancelled`, a running one once its calls in flight
+    /// drain. An unknown request is ignored.
+    pub fn cancel(&mut self, id: RequestId) {
+        self.mark_cancelled(id, false);
+    }
+
+    /// Ends every request as migratable for `cause`, to be submitted again
+    /// with what it generated: the engine is being drained, or lost.
     ///
-    /// A queued request finishes here with `Aborted` or `Cancelled`. A running
-    /// media request records the reason, keeping an earlier terminal intent,
-    /// and finishes here only when none of its calls are in flight. A running
-    /// token request drops its pending decoder decisions, records the reason
-    /// as its terminal intent and is finished by `reap_cancellations` once its
+    /// A waiting request leaves at once. A running token request ends once
+    /// its calls in flight drain, with the tokens it generated; a running
+    /// video request finishes its calls in flight, stores its trajectory at
+    /// its next denoising step boundary and ends with its stored step.
+    pub fn drain(&mut self, cause: MigrationCause) {
+        // The requests held for a predecessor's index leave with the others.
+        self.release_held_for_index();
+        self.migrate_requests(cause);
+        self.preempt_media(cause, |_| true);
+    }
+
+    /// Cancels the request `id` for its client, or drops it when `abort`.
+    ///
+    /// A waiting request finishes here with `Aborted` or `Cancelled`. A
+    /// running video request records the reason, keeping an earlier decided
+    /// end, and finishes here only when none of its calls are in flight. A
+    /// running token request drops its pending decoder decisions, records
+    /// the reason as its end and is retired by `reap_cancellations` once its
     /// calls drain. Unknown requests are ignored.
     pub(super) fn mark_cancelled(&mut self, id: RequestId, abort: bool) {
-        if let Some(submission) = self.remove_waiting_media(id) {
-            let reason = if abort {
-                FinishReason::Aborted
-            } else {
-                FinishReason::Cancelled
-            };
+        let reason = if abort {
+            FinishReason::Aborted
+        } else {
+            FinishReason::Cancelled
+        };
+        let Some(request) = self.requests.get_mut(&id) else {
+            return;
+        };
+        if !request.admitted() {
             // Both reasons are the client's will: it cancelled the request, or
             // it asked for it to be dropped, and the epoch goes on either way.
-            self.announce_end(id, scheduling::guest::event::End::Cancelled);
-            let _ = submission.event_tx.send(Event::Finished {
-                reason,
-                stop_reason: None,
-                prompt_tokens: submission.request.prompt_token_ids.len(),
-                completion_tokens: 0,
-            });
-            return;
-        }
-        if let Some(state) = self.media_state_mut(id) {
-            latch_finish(
-                &mut state.terminal_intent,
-                if abort {
-                    FinishReason::Aborted
-                } else {
-                    FinishReason::Cancelled
+            let prompt_tokens = request.prompt_tokens();
+            self.end_waiting(
+                id,
+                scheduling::guest::event::End::Cancelled,
+                Event::Finished {
+                    reason,
+                    stop_reason: None,
+                    prompt_tokens,
+                    completion_tokens: 0,
                 },
             );
-            let drained = !self.inflight.has_pending_calls(id);
-            if drained {
-                self.finish_media(
-                    id,
-                    Terminal::finish(if abort {
-                        FinishReason::Aborted
-                    } else {
-                        FinishReason::Cancelled
-                    }),
-                );
-            }
             return;
         }
-        if let Some(st) = self.running.get_mut(&id) {
-            st.output.decoder_boundaries.clear();
-            st.terminal_intent = if abort {
-                Some(Terminal::finish(FinishReason::Aborted))
-            } else {
-                Some(Terminal::finish(FinishReason::Cancelled))
-            };
-        }
-        // A request not yet admitted leaves the waiting queue with its reason.
-        if let Some(st) = self.remove_waiting(id) {
-            self.announce_end(id, scheduling::guest::event::End::Cancelled);
-            let reason = if abort {
-                FinishReason::Aborted
-            } else {
-                FinishReason::Cancelled
-            };
-            let _ = st.output.events.event_tx.send(Event::Finished {
-                reason,
-                stop_reason: None,
-                prompt_tokens: st.charged_prompt_tokens(),
-                completion_tokens: 0,
-            });
+        match &mut request.graph {
+            Graph::Video(_) => {
+                request.status.finish(Terminal::finish(reason.clone()));
+                if !self.inflight.has_pending_calls(id) {
+                    self.retire(id, Terminal::finish(reason));
+                }
+            }
+            Graph::Tokens(state) => {
+                state.output.decoder_boundaries.clear();
+                request.status = RequestStatus::Finished(Terminal::finish(reason));
+            }
         }
     }
 
@@ -941,7 +834,7 @@ impl Scheduler {
     /// and may apply a finish deferred on them. Requests that are not running
     /// are ignored.
     pub(super) fn acknowledge_output(&mut self, id: RequestId, output_token_count: usize) {
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         while state
@@ -959,7 +852,7 @@ impl Scheduler {
     /// migratable, for `cause`.
     ///
     /// A request resumes from the tokens and images it generated on a
-    /// deployment that does not generate in canvases. A queued one ends at
+    /// deployment that does not generate in blocks. A waiting one ends at
     /// once. A running one stops scheduling, drops the decoder decisions it
     /// awaits, and ends
     /// once its calls in flight drain, after every token and image it
@@ -972,19 +865,30 @@ impl Scheduler {
     /// and which the engine that serves next continues. A request already
     /// finishing finishes. Video requests go on.
     pub(super) fn migrate_requests(&mut self, cause: MigrationCause) {
-        if self.config.canvas.is_some() {
+        if self.config.block_sampling.is_some() {
             return;
         }
-        let queued: Vec<RequestId> = self.waiting.iter().map(|st| st.req.request_id).collect();
-        for id in queued {
-            if let Some(st) = self.remove_waiting(id) {
-                self.announce_end(id, scheduling::guest::event::End::Migratable);
-                let _ = st.output.events.event_tx.send(Event::Migratable {
+        let waiting: Vec<RequestId> = self
+            .waiting
+            .iter()
+            .chain(&self.held_for_index)
+            .copied()
+            .filter(|id| {
+                self.requests
+                    .get(id)
+                    .is_some_and(|request| request.tokens().is_some())
+            })
+            .collect();
+        for id in waiting {
+            self.end_waiting(
+                id,
+                scheduling::guest::event::End::Migratable,
+                Event::Migratable {
                     cause,
                     denoised_steps: 0,
                     stored_layout: Vec::new(),
-                });
-            }
+                },
+            );
         }
         self.migrate_running(cause, |_| true);
     }
@@ -997,16 +901,22 @@ impl Scheduler {
         cause: MigrationCause,
         select: impl Fn(RequestId) -> bool,
     ) {
-        if self.config.canvas.is_some() {
+        if self.config.block_sampling.is_some() {
             return;
         }
-        for (id, st) in self.running.iter_mut() {
-            if select(*id)
-                && !st.terminal_intent.is_some()
-                && !self.inflight.pending_finishes.contains_key(id)
-            {
-                st.output.decoder_boundaries.clear();
-                st.terminal_intent = Some(Terminal::migrate(cause));
+        for id in self.running.clone() {
+            if !select(id) || self.inflight.pending_finishes.contains_key(&id) {
+                continue;
+            }
+            let Some(request) = self.requests.get_mut(&id) else {
+                continue;
+            };
+            if request.status.is_finished() {
+                continue;
+            }
+            if let Graph::Tokens(state) = &mut request.graph {
+                state.output.decoder_boundaries.clear();
+                request.status = RequestStatus::Finished(Terminal::migrate(cause));
             }
         }
     }
@@ -1014,14 +924,20 @@ impl Scheduler {
     /// Stops a running token request whose frontend decoder matched a stop
     /// string.
     ///
-    /// Drops pending decoder decisions and sets a `Stop` terminal intent that
+    /// Drops pending decoder decisions and decides a `Stop` end that
     /// `reap_cancellations` applies once the request's calls drain. Requests
     /// that are not running are ignored.
     pub(super) fn mark_stopped(&mut self, id: RequestId) {
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(request) = self
+            .requests
+            .get_mut(&id)
+            .filter(|request| request.admitted())
+        else {
             return;
         };
-        state.output.decoder_boundaries.clear();
-        state.terminal_intent = Some(Terminal::finish(FinishReason::Stop));
+        if let Graph::Tokens(state) = &mut request.graph {
+            state.output.decoder_boundaries.clear();
+            request.status = RequestStatus::Finished(Terminal::finish(FinishReason::Stop));
+        }
     }
 }

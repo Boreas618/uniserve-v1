@@ -40,7 +40,7 @@ use std::ops::Range;
 ///
 /// `None` when:
 /// - a position lies before `start_page` or past the table's last page, which is
-///   a planning fault rather than something to clamp: a batch must not write a
+///   a preparation fault rather than something to clamp: a batch must not write a
 ///   slot it does not hold;
 /// - `block_size == 0`, a page that holds no token.
 ///
@@ -74,7 +74,7 @@ pub(crate) fn positions(call: &ipc::Call) -> Option<Vec<i32>> {
 ///
 /// `rows[i]` is the half-open span of forward rows call `i` occupies, in call
 /// order and contiguous, which is how the assembly builds them. What samples
-/// depends on the kind (`CausalLm`'s reading, model's answer):
+/// depends on the kind (`CausalLm`'s reading, model's response):
 ///
 /// - a **prefill** is sampled once, at its last query row, so only that row's
 ///   entry names a row;
@@ -106,7 +106,7 @@ pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Ve
 ///
 /// The write decision is the mechanism's, per token: a token's KV is written
 /// unless its row's write flag says otherwise, so a caller expands its rows'
-/// flags to tokens and `writes` answers for each position. `-1` writes nothing
+/// flags to tokens and `writes` responds for each position. `-1` writes nothing
 /// and initializes nothing, which is what the kernels do with it; a position
 /// outside the table is still a fault rather than a `-1`.
 pub(crate) fn slot_mapping_where(
@@ -177,7 +177,7 @@ pub(crate) fn positions_of(first: u32, tokens: u32) -> Option<Vec<i32>> {
     Some(positions)
 }
 
-/// [`logits_rows`] over the facts it reads from a call, so a batch can answer it
+/// [`logits_rows`] over the facts it reads from a call, so a batch can respond to it
 /// without materialising the calls.
 ///
 /// `samples` says whether the call's rows are sampled by a consumer; a call with

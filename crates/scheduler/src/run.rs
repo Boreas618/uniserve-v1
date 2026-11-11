@@ -36,7 +36,7 @@ fn resolve_generation_limits(
     if supports(CallKind::Media(MediaCall::LatentEncoding)) {
         available.insert(crate::GenerationFeatures::LATENT_ENCODE);
     }
-    // A canvas denoises over a prompt the same worker's prefill cached.
+    // A block denoises over a prompt the same worker's prefill cached.
     if supports(CallKind::Forward(ForwardMode::Prefill))
         && supports(CallKind::Forward(ForwardMode::TokenDenoising))
     {
@@ -85,21 +85,21 @@ impl Scheduler {
                     .any(|kind| matches!(kind, CallKind::Media(_)))
             })
             .map(|(id, worker)| {
-                // The ranks back the results of the components the engine
-                // placed on them, not a component list a rank reports.
-                let components = submissions
+                // The ranks back the results of the stages the engine
+                // placed on them, not a stage list a rank reports.
+                let stages = submissions
                     .info()
                     .layouts
                     .get(id)
-                    .map(|layout| layout.components.clone())
+                    .map(|layout| layout.stages.clone())
                     .unwrap_or_default();
                 (
                     id.clone(),
                     MediaStorage::new(
                         worker.request_slots as usize,
                         &submissions.info().rank_buffer_bytes(id),
-                        &components,
-                        &info.media_components,
+                        &stages,
+                        &info.media_stages,
                     ),
                 )
             })
@@ -115,10 +115,9 @@ impl Scheduler {
 
         // The request pool also holds the rows the runtime keeps outside
         // `max_running_requests` (`guidance_prefix_rows`).
-        // `SchedulerHandle::over_batches_telling` refuses a token runtime whose
-        // ranks hold too few, so this clamp lowers the limit only for a
-        // supplied worker or for ranks that fit their request pools to
-        // device storage.
+        // `SchedulerHandle::over_batches` refuses a token runtime whose
+        // ranks hold too few, so this clamp lowers the limit only for
+        // ranks that fit their request pools to device storage.
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity.max(1);
 
@@ -153,7 +152,7 @@ impl Scheduler {
                 option = "max_batch",
                 stated = config.max_batch,
                 captured = max_batch_calls,
-                "the catalogue's row bound lowers the batch's call count"
+                "the buckets' row bound lowers the batch's call count"
             );
         }
         if max_batch_calls > 0 {
@@ -162,23 +161,23 @@ impl Scheduler {
                 .min(proto::config::positive(max_batch_calls.max(1)));
         }
 
-        // A canvas step and a block commit each spend a whole canvas of one
-        // scheduling step's token budget, so the deployment's canvas must
+        // A block step and a block commit each spend a whole block of one
+        // scheduling step's token budget, so the deployment's block must
         // fit it.
-        if let Some(canvas) = config.canvas {
-            if let Some(parameter) = canvas.invalid_parameter() {
+        if let Some(sampling) = config.block_sampling {
+            if let Some(parameter) = sampling.invalid_parameter() {
                 anyhow::bail!("block-diffusion sampling parameter `{parameter}` is out of range");
             }
             anyhow::ensure!(
-                canvas.canvas_length as usize <= config.max_num_batched_tokens,
-                "a {}-token generation canvas exceeds the {}-token step budget",
-                canvas.canvas_length,
+                sampling.block_length as usize <= config.max_num_batched_tokens,
+                "a {}-token generation block exceeds the {}-token step budget",
+                sampling.block_length,
                 config.max_num_batched_tokens
             );
         }
 
         // Storage and scheduler statistics share the resolved worker capacities.
-        let cache = PrefixCacheCoordinator::from_main_process_info(&info);
+        let cache = KvCacheManager::from_main_process_info(&info);
         let stats = Arc::new(SchedulerStats::default());
         stats.prefix_cache.num_units.store(
             cache
@@ -195,7 +194,7 @@ impl Scheduler {
             dispatch: dispatch::Dispatch::default(),
             storage: allocation::requests::Storage {
                 cache,
-                encoder_cache: crate::kv_cache::EncoderCacheManager::new(
+                encoder_cache: crate::encoder_cache::EncoderCacheManager::new(
                     generation_limits.encoder_cache_entries as usize,
                 ),
                 reserved_encoder_entries: 0,
@@ -208,10 +207,8 @@ impl Scheduler {
             info,
             generation_limits,
             special_tokens,
+            requests: request::Requests::default(),
             waiting: VecDeque::new(),
-            waiting_media: VecDeque::new(),
-            running: residents::Residents::default(),
-            running_media: HashMap::new(),
             speculation_meter: Default::default(),
             retiring_requests: HashMap::new(),
             rows_held: 0,
@@ -219,12 +216,14 @@ impl Scheduler {
             epoch: 0,
             next_product_generation: 1,
             next_request_epoch: 1,
-            running_order: Vec::new(),
+            running: Vec::new(),
             output: output::OutputSender::default(),
             policy: None,
             policy_report: None,
             shadow_pass: None,
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            step_generation: 0,
+            starvation_judged: scheduling::guest::Nanos(0),
             policy_precopy: None,
             policy_prepared: None,
             progress: crate::CommandWaker::noop(),
@@ -240,7 +239,7 @@ impl Scheduler {
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             trajectories: None,
             encoder_outputs: None,
-            hand_offs: None,
+            transfers: None,
             draining: false,
             awaiting_index: None,
             held_for_index: Vec::new(),
@@ -265,7 +264,7 @@ impl Scheduler {
     }
 
     /// The serving generation's cell, for the handle that writes it.
-    pub fn generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+    pub(crate) fn generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
         Arc::clone(&self.generation)
     }
 
@@ -275,7 +274,7 @@ impl Scheduler {
     }
 
     /// Takes `limits`' scheduling limits and policy from the next step on;
-    /// the canvas stays. The limits must lie within the batch the workers
+    /// the block stays. The limits must lie within the batch the workers
     /// were started for: the running requests within their request rows,
     /// a step's tokens and calls within their batch. A change of policy
     /// reorders the waiting queue by it, as if each request had been queued
@@ -283,7 +282,7 @@ impl Scheduler {
     ///
     /// # Errors
     ///
-    /// Names the first limit beyond the workers' batch, or the canvas the
+    /// Names the first limit beyond the workers' batch, or the block the
     /// step budget no longer holds; the scheduler keeps its limits.
     pub(super) fn reconfigure(&mut self, limits: SchedulerConfig) -> Result<(), String> {
         let info = &self.info;
@@ -313,18 +312,18 @@ impl Scheduler {
         if calls > 0 && limits.max_batch > proto::config::positive(calls) {
             return Err(beyond("max_batch", limits.max_batch.get(), calls));
         }
-        if let Some(canvas) = self.config.canvas
-            && canvas.canvas_length as usize > limits.max_num_batched_tokens.max(1)
+        if let Some(sampling) = self.config.block_sampling
+            && sampling.block_length as usize > limits.max_num_batched_tokens.max(1)
         {
             return Err(format!(
-                "a {}-token generation canvas exceeds the {}-token step budget",
-                canvas.canvas_length, limits.max_num_batched_tokens
+                "a {}-token generation block exceeds the {}-token step budget",
+                sampling.block_length, limits.max_num_batched_tokens
             ));
         }
         // The queue keeps no order of its own: the waiting requests are a
-        // membership set, and each step's admission order is its plan's
+        // membership set, and each step's admission order is its output's
         // `admit` list (design §4.4). A new `policy` therefore reorders
-        // nothing — the next plan does.
+        // nothing — the next output does.
         let graph_tiers = std::mem::take(&mut self.config.graph_tiers);
         self.config = SchedulerConfig {
             policy: Default::default(),
@@ -337,7 +336,7 @@ impl Scheduler {
             max_queued_requests: limits
                 .max_queued_requests
                 .map(|bound| bound.max(proto::config::positive(1))),
-            canvas: self.config.canvas,
+            block_sampling: self.config.block_sampling,
             // The draft limit is the epoch's; the refill policy is a
             // scheduling choice.
             draft_tokens: self.config.draft_tokens,
@@ -349,25 +348,31 @@ impl Scheduler {
 
     /// The worker groups that prefill only (`WorkerGroupRole::Prefill`),
     /// whose requests hand their KV cache to a decode group.
-    pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
+    pub(crate) fn set_prefill_groups(
+        &mut self,
+        groups: impl IntoIterator<Item = crate::WorkerGroupId>,
+    ) {
         self.dispatch.prefill_groups = groups.into_iter().collect();
     }
 
     /// The worker groups that decode only (`WorkerGroupRole::Decode`), which
-    /// take requests by their hand-off alone.
-    pub fn set_decode_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
+    /// take requests by their transfer alone.
+    pub(crate) fn set_decode_groups(
+        &mut self,
+        groups: impl IntoIterator<Item = crate::WorkerGroupId>,
+    ) {
         self.dispatch.decode_groups = groups.into_iter().collect();
     }
 
     /// Hand requests off from the prefill groups to the decode groups through
     /// this host's Storage Server, at `socket`, as a head of `epoch` of
-    /// `deployment`, on host `host` (`crate::hand_off`).
+    /// `deployment`, on host `host` (`crate::transfer`).
     ///
     /// # Errors
     ///
     /// Fails when a Storage Server cannot be reached or a rank reports no
     /// retained cache planes.
-    pub fn enable_hand_off(
+    pub(crate) fn enable_transfer(
         &mut self,
         socket: &std::path::Path,
         deployment: &str,
@@ -375,7 +380,7 @@ impl Scheduler {
         host: &str,
     ) -> anyhow::Result<()> {
         let ranks = self.worker.info().rank_caches.clone();
-        self.hand_offs = Some(crate::hand_off::HandOffs::connect(
+        self.transfers = Some(crate::transfer::Transfers::connect(
             socket, deployment, epoch, host, &ranks,
         )?);
         Ok(())
@@ -396,7 +401,7 @@ impl Scheduler {
     /// Checkpoints the state groups of decoding requests at the page
     /// boundaries that are multiples of `tokens`; a prompt call checkpoints
     /// the last boundary it reaches whatever the interval.
-    pub fn set_state_interval(&mut self, tokens: usize) {
+    pub(crate) fn set_state_interval(&mut self, tokens: usize) {
         self.state_interval = tokens.max(1);
     }
 
@@ -424,7 +429,7 @@ impl Scheduler {
         clippy::too_many_arguments,
         reason = "the deployment, its epoch and host, and the host KV cache's settings"
     )]
-    pub fn enable_kv_offload(
+    pub(crate) fn enable_kv_offload(
         &mut self,
         deployment: &str,
         epoch: u64,
@@ -512,8 +517,8 @@ impl Scheduler {
     /// the TCP address another host's rank reports, when every rank that
     /// executes the denoiser reports one (`WorkerInfo::rank_latents`), as
     /// a head of `deployment` in `epoch`, whose trajectories the servers
-    /// keep its own while it is on trial. The denoiser is the component
-    /// that serves denoising calls, or the protocol's default component of
+    /// keep its own while it is on trial. The denoiser is the stage
+    /// that serves denoising calls, or the protocol's default stage of
     /// a model that routes none. Without them a preempted request continues
     /// from noise wherever it resumes.
     pub fn enable_trajectory_store(
@@ -523,19 +528,19 @@ impl Scheduler {
         epoch: u64,
         host: &str,
     ) {
-        let component = self
+        let stage = self
             .info
-            .media_components
+            .media_stages
             .get(&MediaCall::Denoising)
             .cloned()
             .unwrap_or_else(|| DEFAULT_BLOCK.to_owned());
         let info = self.worker.info();
         let mut denoisers = Vec::new();
         for (worker, ranks) in &info.rank_latents {
-            // The ranks that hold trajectories: those the denoiser's component
+            // The ranks that hold trajectories: those the denoiser's stage
             // config assigns, or every rank of a group placed without one.
             let holders: Vec<usize> = info
-                .component_config(worker, &component)
+                .stage_config(worker, &stage)
                 .map_or_else(|| (0..ranks.len()).collect(), |config| config.ranks.clone());
             let reports: Option<Vec<(u32, crate::trajectories::RankLatents<'_>)>> = holders
                 .iter()
@@ -654,14 +659,14 @@ impl Scheduler {
     }
 
     /// Returns the worker's aggregate worker capabilities.
-    pub fn info(&self) -> &MainProcessInfo {
+    pub(crate) fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 
     /// Returns the first worker group with a prefix cache, whose units the
     /// pool allocates and whose identity names its index for a successor
     /// epoch.
-    pub fn cache_group(&self) -> Option<String> {
+    pub(crate) fn cache_group(&self) -> Option<String> {
         self.worker
             .info()
             .workers
@@ -672,7 +677,7 @@ impl Scheduler {
 
     /// The worker groups that keep a paged cache, each with its worker's
     /// endpoint: the groups a prefix cache index names.
-    pub fn cache_workers(&self) -> Vec<(String, ipc::MainProcessEndpoint)> {
+    pub(crate) fn cache_workers(&self) -> Vec<(String, ipc::MainProcessEndpoint)> {
         self.worker
             .info()
             .workers
@@ -693,7 +698,9 @@ impl Scheduler {
     /// # Errors
     ///
     /// Fails when the worker's media routing is inconsistent.
-    pub fn media_units(&self) -> anyhow::Result<std::collections::BTreeMap<ipc::MediaCall, u32>> {
+    pub(crate) fn media_units(
+        &self,
+    ) -> anyhow::Result<std::collections::BTreeMap<ipc::MediaCall, u32>> {
         let info = self.worker.info();
         Ok(info
             .media_routing()?
@@ -714,7 +721,7 @@ impl Scheduler {
     }
 
     /// Whether the scheduler's epoch is on trial.
-    pub fn on_trial(&self) -> bool {
+    pub(crate) fn on_trial(&self) -> bool {
         self.trial
     }
 
@@ -724,45 +731,40 @@ impl Scheduler {
         Arc::clone(&self.failure)
     }
 
-    /// Returns shared access to a media request state.
-    pub(super) fn media_state(&self, id: RequestId) -> Option<&MediaFlowState> {
-        self.running_media.get(&id)
+    /// Returns shared access to an admitted video request's state.
+    pub(super) fn media_state(&self, id: RequestId) -> Option<&VideoState> {
+        self.requests.video(&id)
     }
 
-    /// Returns mutable access to a media request state.
-    pub(super) fn media_state_mut(&mut self, id: RequestId) -> Option<&mut MediaFlowState> {
-        self.running.mark(id);
-        self.running_media.get_mut(&id)
+    /// Returns mutable access to an admitted video request's state.
+    pub(super) fn media_state_mut(&mut self, id: RequestId) -> Option<&mut VideoState> {
+        self.requests.video_mut(&id)
     }
 
-    /// Returns the active media request identifiers.
+    /// Returns the admitted video requests' identifiers, in id order.
     pub(super) fn media_ids(&self) -> Vec<RequestId> {
-        self.running_media.keys().copied().collect()
-    }
-
-    /// Removes and returns a media request's state.
-    pub(super) fn take_media_state(&mut self, id: RequestId) -> Option<MediaFlowState> {
-        self.running_media.remove(&id)
+        self.requests.running_video().map(|(id, _, _)| id).collect()
     }
 
     /// Returns the number of running requests.
     pub(super) fn running_request_count(&self) -> usize {
-        self.running.len().saturating_add(self.running_media.len())
+        self.running.len()
     }
 
-    /// Returns the number of pending requests.
+    /// Returns the number of requests awaiting admission, the ones held for
+    /// their predecessor's index included.
     pub(super) fn pending_request_count(&self) -> usize {
-        self.waiting.len().saturating_add(self.waiting_media.len())
+        self.waiting.len().saturating_add(self.held_for_index.len())
     }
 
     /// All drivers consume the same command ingress before scheduling work.
     ///
-    /// Applies every queued command without blocking. Answers whether the
+    /// Applies every queued command without blocking. Returns whether the
     /// engine must stop — a `Shutdown` command arrived or every sender has
     /// disconnected — and whether any command was applied, which is progress a
     /// tick made even when it formed no batch: a submission that only queues a
-    /// request still changed the epoch a step is planned from.
-    pub(super) fn drain_commands(&mut self, commands: &Receiver<Command>) -> (bool, bool) {
+    /// request still changed the epoch a step is prepared from.
+    pub(super) fn take_commands_from(&mut self, commands: &Receiver<Command>) -> (bool, bool) {
         let mut handled = false;
         loop {
             match commands.try_recv() {
@@ -778,17 +780,24 @@ impl Scheduler {
         }
     }
 
-    /// Runs the owner-thread control loop, blocking only when fully idle.
+    /// Runs the step loop on the calling thread, which owns every piece of the
+    /// scheduler's state from here on:
     ///
-    /// Returns `true` if the engine died (worker or worker failure) rather
-    /// than shutting down on a `Shutdown` command or command-channel
-    /// disconnect. Either way, every queued or running request is finished
-    /// with `Aborted`, every receiver still open can read its complete event
-    /// stream through its terminal event, and the worker is closed before
-    /// returning.
+    /// 1. take what arrived: new requests, cancellations and the control
+    ///    thread's other commands, and one completed batch;
+    /// 2. `update` with the completed batch: advance its requests, publish
+    ///    their pages, emit their events;
+    /// 3. `schedule`: assemble the batches that fit now;
+    /// 4. submit them to the executors, and block until something arrives.
+    ///
+    /// Returns `true` if the engine died (a device or a scheduler invariant
+    /// failed) rather than shutting down on a `Shutdown` command or a closed
+    /// command channel. Either way, every waiting or running request is
+    /// finished with `Aborted`, and every receiver still open can read its
+    /// complete event stream through its terminal event.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
         loop {
-            let (stop, handled) = self.drain_commands(&rx);
+            let (stop, handled) = self.take_commands_from(&rx);
             if stop {
                 break;
             }
@@ -796,13 +805,13 @@ impl Scheduler {
             if handled {
                 self.progress.wake();
             }
-            let progressed = self.step_nonblocking() || handled;
-            // An update's shadow pass is answered once the step that ran it has
-            // ended (§7.3 step 2): the answer never claims a comparison the
+            let progressed = self.step() || handled;
+            // An update's shadow pass gets its response once the step that ran it has
+            // ended (§7.3 step 2): the response never states a comparison the
             // step has not finished.
             self.settle_shadow();
             if !self.failed() && !progressed {
-                self.park_for_progress();
+                self.wait(None);
             }
             if self.failed() {
                 let _ = self.failure.set("the worker or a worker failed".to_owned());
@@ -814,17 +823,15 @@ impl Scheduler {
                     self.hand_back_requests();
                 }
                 self.abort_all_requests();
-                let _ = self.worker.close();
                 return true;
             }
         }
-        // Finish everything still queued or running with `Aborted` before
+        // Finish everything still waiting or running with `Aborted` before
         // closing the worker, so every open consumer receives a terminal
         // event rather than only a closed channel. The pages published so
         // far reach the host KV cache first.
         self.flush_offloads();
         self.abort_all_requests();
-        let _ = self.worker.close();
         false
     }
 
@@ -885,8 +892,8 @@ impl Scheduler {
                 );
                 return;
             }
-            if !self.step_nonblocking() {
-                self.park_for_progress();
+            if !self.step() {
+                self.wait(Some(deadline));
             }
         }
     }
@@ -902,8 +909,8 @@ impl Scheduler {
         let drained = self.drain_batches();
         self.draining = draining;
         drained?;
-        let answers = self.operate_workers(&operation)?;
-        ipc::memory::replies::<O>(&answers)
+        let responses = self.operate_workers(&operation)?;
+        ipc::memory::replies::<O>(&responses)
             .map_err(|error| format!("a worker's reply to {operation:?}: {error}"))
     }
 
@@ -935,7 +942,7 @@ impl Scheduler {
     /// caller set `draining`.
     ///
     /// The drain is unbounded in what it may wait for and bounded only in
-    /// silence: a batch the worker never answers, and never finishes,
+    /// silence: a batch the worker never responses, and never finishes,
     /// would otherwise hold the hook the drain serves for ever. Whenever a
     /// batch or a submission leaves the pending set the drain has made
     /// progress and its silence clock restarts, so a scheduler that keeps
@@ -949,8 +956,8 @@ impl Scheduler {
             if self.failed() {
                 return Err("the engine failed before the hook ran".to_owned());
             }
-            if !self.step_nonblocking() {
-                self.park_for_progress();
+            if !self.step() {
+                self.wait(Some(silent_since + DRAIN_SILENCE));
             }
             // Comparing the two sizes is enough because a drain sets
             // `draining`: nothing enters either pending set while it runs, so
@@ -994,56 +1001,71 @@ impl Scheduler {
         Ok(results)
     }
 
-    /// Parks until a result, command, worker death, CPU continuation, or output-capacity wake.
+    /// Blocks until something arrives: a command, a completed batch, a reader
+    /// that freed room in an event channel, or a response of a Storage Server.
     ///
-    /// Waits in `Worker::poll` and applies at most one returned result.
-    /// Commands and consumer reads fire the engine's `CommandWaker`. A real
-    /// waker, such as `Submissions::waker`, ends the poll early.
-    /// With the no-op waker, a command waits for the worker's own wake
-    /// sources or the timeout. The timeout (`IDLE_LIVENESS_POLL`) is solely a
-    /// liveness deadline.
-    pub(super) fn park_for_progress(&mut self) {
-        let _span = tracing::trace_span!("scheduler.park").entered();
-        // Answers of the host KV cache, of the host latent and encoder pools
-        // and of the hand-offs' copies arrive on connections the worker does
-        // not wait on: while some are awaited, the park is short.
-        // So is the park of a closing scheduler, which awaits its last
-        // page commits.
-        let timeout = if self.draining
-            || self
-                .kv_offload
+    /// The wait has no tick. It ends without an arrival only at a moment the
+    /// scheduler itself acts at: `bound`, which a caller that waits for
+    /// something in particular states (a drain's silence, a flush's limit),
+    /// the starvation bound of a running request, the end of the wait for a
+    /// predecessor's index, or the host KV cache's own patience.
+    pub(super) fn wait(&mut self, bound: Option<Instant>) {
+        let _span = tracing::trace_span!("scheduler.wait").entered();
+        let deadline = [
+            bound,
+            self.starvation_deadline(),
+            self.awaiting_index
+                .filter(|_| !self.held_for_index.is_empty()),
+            self.kv_offload
                 .as_ref()
-                .is_some_and(crate::kv_cache::KvOffloadManager::waiting)
-            || self
-                .trajectories
-                .as_ref()
-                .is_some_and(crate::trajectories::TrajectoryStore::waiting)
-            || self
-                .encoder_outputs
-                .as_ref()
-                .is_some_and(crate::encoder_outputs::EncoderStore::waiting)
-            || self
-                .hand_offs
-                .as_ref()
-                .is_some_and(crate::hand_off::HandOffs::waiting)
-        {
-            KV_OFFLOAD_POLL
-        } else {
-            IDLE_LIVENESS_POLL
-        };
-        match self.worker.poll(timeout) {
-            Ok(Some(result)) => {
-                self.apply_result(result);
-                self.progress.wake();
-            }
-            Ok(None) => {}
-            Err(error) => self.on_worker_error(error),
-        }
-        self.stats
-            .general
-            .in_flight
-            .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
-        self.publish_cache_stats();
+                .and_then(crate::kv_cache::KvOffloadManager::deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        // The Storage Servers response on connections of their own: the host KV
+        // cache's, the host latent and encoder pools' and the transfers'.
+        let connections: Vec<std::os::fd::BorrowedFd<'_>> = self
+            .kv_offload
+            .iter()
+            .flat_map(crate::kv_cache::KvOffloadManager::descriptors)
+            .chain(
+                self.trajectories
+                    .iter()
+                    .flat_map(crate::trajectories::TrajectoryStore::descriptors),
+            )
+            .chain(
+                self.encoder_outputs
+                    .iter()
+                    .flat_map(crate::encoder_outputs::EncoderStore::descriptors),
+            )
+            .chain(
+                self.transfers
+                    .iter()
+                    .flat_map(crate::transfer::Transfers::descriptors),
+            )
+            .collect();
+        self.worker.wait(deadline, &connections);
+    }
+
+    /// When the first running request that the last step found within its
+    /// starvation bound passes it, which is when a step must judge it.
+    ///
+    /// A request the last step already found past its bound was judged by it
+    /// (it waits for a transfer, or it ended), so only later moments count,
+    /// and never one less than a millisecond away: a step that could not
+    /// judge (a full queue, a held scheduler) does not spin on it.
+    fn starvation_deadline(&self) -> Option<Instant> {
+        let timeout = self.policy.as_ref()?.limits().timeout;
+        let now = crate::clock::now_monotonic_us().saturating_mul(1_000);
+        let passes = self
+            .watchdog
+            .advancing()
+            .map(|(_, since)| since.0.saturating_add(timeout.0))
+            .filter(|passes| *passes > self.starvation_judged.0)
+            .min()?;
+        let remaining = Duration::from_nanos(passes.saturating_sub(now));
+        Some(Instant::now() + remaining.max(Duration::from_millis(1)))
     }
 
     /// States what the step tells when it produced something (`progress`).
@@ -1056,7 +1078,7 @@ impl Scheduler {
 /// age and the requests it carries, and the submissions the worker never
 /// accepted.
 ///
-/// A batch the worker never answered and never finished is named by id, with
+/// A batch the worker never responded and never finished is named by id, with
 /// how long it has been in flight and which requests it carries, so a hook that
 /// stopped can be diagnosed from its error alone.
 fn abandoned_drain(inflight: &super::inflight::Inflight, held: (usize, usize)) -> String {
@@ -1130,6 +1152,7 @@ mod tests {
         inflight.pending_batches.insert(
             7,
             PendingBatch {
+                numbered: Vec::new(),
                 started: Instant::now(),
                 calls: [
                     (key(3), CallId::new(7, 0)),

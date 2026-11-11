@@ -1,7 +1,7 @@
 //! The policy source a test epoch installs.
 //!
 //! A deployed epoch takes its policy from the Program Server; a test epoch has none, and a
-//! scheduler with no policy decides nothing — no plan, no admission, no batch — so an epoch that
+//! scheduler with no policy decides nothing — no output, no admission, no batch — so an epoch that
 //! submits a request must be given a module. [`packaged_policy`] is that source: the real `fcfs`
 //! program this tree builds, with the arguments that make its declared limits fit the capacity the
 //! caller's epoch was built for. It installs through the same precopy and switchover a deployment
@@ -45,8 +45,8 @@ pub fn packaged_program(capacity: BatchCapacity) -> PolicyProgram {
     }
 }
 
-/// The `fcfs` module this tree builds for `wasm32-unknown-unknown`, read once per process and
-/// shared by every fixture that installs a policy.
+/// The `fcfs` module this tree builds for `wasm32-unknown-unknown`, precompiled for this host,
+/// made once per process and shared by every fixture that installs a policy.
 ///
 /// `SCHED_POLICY_WASM` names a module to serve with instead, which a caller testing a build of its
 /// own sets. Unset, the module is built from this tree's `scheduling-policy-fcfs` on first use,
@@ -60,11 +60,18 @@ pub fn packaged_program(capacity: BatchCapacity) -> PolicyProgram {
 pub fn packaged_module() -> Vec<u8> {
     static MODULE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     MODULE
-        .get_or_init(|| match std::env::var("SCHED_POLICY_WASM") {
-            Ok(path) => std::fs::read(&path).unwrap_or_else(|error| {
-                panic!("SCHED_POLICY_WASM names `{path}`, which cannot be read: {error}")
-            }),
-            Err(_) => build_packaged_module(),
+        .get_or_init(|| {
+            let wasm = match std::env::var("SCHED_POLICY_WASM") {
+                Ok(path) => std::fs::read(&path).unwrap_or_else(|error| {
+                    panic!("SCHED_POLICY_WASM names `{path}`, which cannot be read: {error}")
+                }),
+                Err(_) => build_packaged_module(),
+            };
+            // Served precompiled for this host, as a deployment's store serves a policy: a
+            // precopy then loads the artifact instead of compiling the module again.
+            scheduling::Engine::new()
+                .and_then(|engine| engine.precompile(&wasm))
+                .unwrap_or_else(|error| panic!("precompiling the fcfs policy module: {error}"))
         })
         .clone()
 }

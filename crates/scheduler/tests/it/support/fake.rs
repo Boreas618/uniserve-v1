@@ -45,27 +45,108 @@ pub(crate) fn rank_of(batches: &FakeBatches) -> ipc::MainProcessInfo {
         .expect("the fake states a pool")
 }
 
+/// A scheduler over a fake and the policy its epoch serves with.
+///
+/// A scheduler decides nothing until a policy serves it, and an epoch's first
+/// policy is installed by commands: a precopy, then a switchover. [`Self::run`]
+/// installs `fcfs` that way before it passes the case's commands on, so a
+/// case's requests arrive at a scheduler that serves, as a launched epoch's
+/// do.
+pub(crate) struct Serving {
+    scheduler: Scheduler,
+    /// Ends the scheduler's wait when a command arrives.
+    waker: scheduler::CommandWaker,
+    program: scheduler::PolicyProgram,
+    /// The policy's module, read when the scheduler was built: the first read
+    /// of a process builds it, which no case's deadline should span.
+    source: Arc<dyn scheduler::PolicySource + Send + Sync>,
+}
+
+impl std::ops::Deref for Serving {
+    type Target = Scheduler;
+
+    fn deref(&self) -> &Scheduler {
+        &self.scheduler
+    }
+}
+
+impl std::ops::DerefMut for Serving {
+    fn deref_mut(&mut self) -> &mut Scheduler {
+        &mut self.scheduler
+    }
+}
+
+impl Serving {
+    /// Runs the scheduler on the calling thread until `commands` shuts it
+    /// down or closes, and responds to what `Scheduler::run` responses: whether the
+    /// engine died.
+    ///
+    /// The commands a case sends wait until the policy serves, then reach the
+    /// scheduler in order, each waking it.
+    pub(crate) fn run(self, commands: crossbeam_channel::Receiver<scheduler::Command>) -> bool {
+        let Self {
+            scheduler,
+            waker,
+            program,
+            source,
+        } = self;
+        let (sender, own) = crossbeam_channel::unbounded();
+        let installer = scheduler::CommandSender::with_waker(sender.clone(), waker.clone());
+        // Closed when the scheduler stops, so the case's commands are refused
+        // from then on, as a stopped engine's are.
+        let (stopped, stop) = crossbeam_channel::bounded::<()>(0);
+        let forwarder = std::thread::spawn(move || {
+            super::applied(installer.precopy_policy(program, source), "a precopy");
+            super::applied(
+                installer.stage(scheduler::Stage::Switchover),
+                "a switchover",
+            );
+            loop {
+                crossbeam_channel::select! {
+                    recv(commands) -> command => {
+                        let Ok(command) = command else { break };
+                        if sender.send(command).is_err() {
+                            break;
+                        }
+                        waker.wake();
+                    }
+                    recv(stop) -> _ => break,
+                }
+            }
+        });
+        let died = scheduler.run(own);
+        drop(stopped);
+        let _ = forwarder.join();
+        died
+    }
+}
+
 /// A scheduler over `batches` through the production door, with the model
 /// limits its pools' call kinds imply (`super::generation_limits`), the
-/// launches' control tokens (`testkit::special_tokens`), and `fcfs` installed
+/// launches' control tokens (`testkit::special_tokens`), and `fcfs` to install
 /// under the ceilings its pool advertises with `stated` beside them.
 pub(crate) fn scheduler_over(
     batches: Arc<dyn Batches>,
     config: SchedulerConfig,
     stated: Parameters,
-) -> anyhow::Result<Scheduler> {
+) -> anyhow::Result<Serving> {
     let info = WorkerInfo::from_inventory(batches.inventory())?.runtime_info()?;
     let limits = super::generation_limits(&info.supported_calls);
     let submissions = Submissions::over_batches(batches)?;
-    let mut scheduler = Scheduler::new(submissions, testkit::special_tokens(), config, limits)?;
-    super::install_policy_stating(&mut scheduler, BatchCapacity::of(&info), stated);
-    Ok(scheduler)
+    let waker = submissions.waker();
+    let scheduler = Scheduler::new(submissions, testkit::special_tokens(), config, limits)?;
+    Ok(Serving {
+        scheduler,
+        waker,
+        program: super::fcfs(BatchCapacity::of(&info), stated),
+        source: super::policy_source(),
+    })
 }
 
 /// The scheduler of [`scheduler_over`] running on a thread of its own, and
 /// the command sender a case submits through.
 pub(crate) fn spawn(
-    scheduler: Scheduler,
+    scheduler: Serving,
 ) -> (scheduler::CommandSender, std::thread::JoinHandle<bool>) {
     let (tx, rx) = crossbeam_channel::unbounded();
     let thread = std::thread::spawn(move || scheduler.run(rx));

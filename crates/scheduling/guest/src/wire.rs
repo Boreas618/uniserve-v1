@@ -13,7 +13,7 @@
 //! - `sched_free(ptr: u32, len: u32)`: releases a buffer this module allocated,
 //!   whether the mechanism wrote it or the module returned it.
 //! - `sched_init(ptr, len) -> u64`, `sched_observe(ptr, len) -> u64`,
-//!   `sched_dispatch(ptr, len) -> u64`, `sched_reclaim(ptr, len) -> u64`:
+//!   `sched_dispatch(ptr, len) -> u64`, `sched_preempt(ptr, len) -> u64`:
 //!   the reply is `ptr << 32 | len` of a buffer the module allocated and the
 //!   mechanism frees with `sched_free`, or `0` for an empty reply.
 //! - `sched_route(ptr, len) -> u32`, `sched_place(ptr, len) -> u32`: the
@@ -33,8 +33,8 @@ pub const EXPORT_INIT: &str = "sched_init";
 pub const EXPORT_OBSERVE: &str = "sched_observe";
 /// The export that dispatches: its message is [`crate::decision::Room`].
 pub const EXPORT_DISPATCH: &str = "sched_dispatch";
-/// The export that reclaims: its message is [`crate::decision::Shortage`].
-pub const EXPORT_RECLAIM: &str = "sched_reclaim";
+/// The export that preempts: its message is [`crate::decision::Shortage`].
+pub const EXPORT_PREEMPT: &str = "sched_preempt";
 /// The export that routes: its message is `(&RequestView, &[RankView])` as a
 /// two-element tuple.
 pub const EXPORT_ROUTE: &str = "sched_route";
@@ -50,7 +50,7 @@ pub enum Call {
     Init,
     Observe,
     Dispatch,
-    Reclaim,
+    Preempt,
     Route,
     Place,
     Limits,
@@ -62,7 +62,7 @@ impl Call {
         Call::Init,
         Call::Observe,
         Call::Dispatch,
-        Call::Reclaim,
+        Call::Preempt,
         Call::Route,
         Call::Place,
         Call::Limits,
@@ -74,7 +74,7 @@ impl Call {
             Call::Init => EXPORT_INIT,
             Call::Observe => EXPORT_OBSERVE,
             Call::Dispatch => EXPORT_DISPATCH,
-            Call::Reclaim => EXPORT_RECLAIM,
+            Call::Preempt => EXPORT_PREEMPT,
             Call::Route => EXPORT_ROUTE,
             Call::Place => EXPORT_PLACE,
             Call::Limits => EXPORT_LIMITS,
@@ -87,7 +87,7 @@ impl Call {
             Call::Init => "init",
             Call::Observe => "observe",
             Call::Dispatch => "dispatch",
-            Call::Reclaim => "reclaim",
+            Call::Preempt => "preempt",
             Call::Route => "route",
             Call::Place => "place",
             Call::Limits => "limits",

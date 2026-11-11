@@ -1,12 +1,12 @@
 //! Giving back and restoring the KV cache's device storage against the GPU's
-//! storage ledger: a shrink keeps the segments the quota leaves the serving
-//! epoch beside everything else the ledger books and what a successor adds,
+//! storage usage: a shrink keeps the segments the quota leaves the serving
+//! epoch beside everything else the usage counts and what a successor adds,
 //! lets the requests that hold the tail it withdraws run to their end (or
 //! recomputes them past its bound, or once they cannot get a unit to
 //! continue) before the workers give the tail back,
 //! and refuses a successor whose limit cannot hold the first segment; a
 //! restore creates the tail again and a growth as much of it as the
-//! ledger's room holds; a sleeping scheduler admits nothing until it wakes,
+//! quota's room holds; a sleeping scheduler admits nothing until it wakes,
 //! and a weight update rewrites the weights while the workers sleep.
 
 use std::sync::{Arc, Mutex};
@@ -46,16 +46,16 @@ const EPOCH: u64 = 1;
 struct SimWorkers {
     /// The quota of the worker's GPU.
     quota: u64,
-    /// What the worker's process books beside its weights and its cache.
+    /// What the worker's process reserves beside its weights and its cache.
     process_bytes: u64,
     /// The serving epoch's captured graph allocations.
     graph_bytes: u64,
-    /// What the Transfer Server books on the GPU.
+    /// What the Transfer Server reserves on the GPU.
     transfer_bytes: u64,
     /// What the Transfer Server's context takes on the GPU while held,
-    /// which the ledger reports booked or not.
+    /// which the usage reports reserved or not.
     transfer_context: u64,
-    /// What another epoch's process books on the GPU.
+    /// What another epoch's process reserves on the GPU.
     other_epoch_bytes: u64,
     /// The serving epoch's weights on the GPU.
     weights_bytes: u64,
@@ -71,9 +71,9 @@ struct SimWorkers {
     /// Whether an expert worker, which holds no cache, reports beside the
     /// worker that holds it.
     experts: bool,
-    /// What the expert worker's process books on a GPU of its own whose
+    /// What the expert worker's process reserves on a GPU of its own whose
     /// quota is 1000 bytes; `None` for an expert worker that reports no
-    /// ledger.
+    /// usage.
     expert_process: Option<u64>,
     /// Each storage operation performed, in order.
     operations: Vec<EpochOperation>,
@@ -99,10 +99,10 @@ impl SimWorkers {
         }
     }
 
-    /// The deployment's ledger of the worker's GPU: each held segment of the
+    /// The deployment's usage of the worker's GPU: each held segment of the
     /// serving epoch, its process, and the other epoch's and the Transfer
-    /// Server's bookings.
-    fn ledger(&self) -> GpuLedger {
+    /// Server's reservations.
+    fn usage(&self) -> GpuLedger {
         let scope = Scope {
             deployment: "model".into(),
             group: "model".into(),
@@ -182,7 +182,7 @@ impl SimWorkers {
 const STEP: Duration = Duration::from_millis(10);
 
 /// The engine's own storage operations as `workers`, whose planes are
-/// segmented, answer them.
+/// segmented, respond to them.
 fn operate(
     workers: &Mutex<SimWorkers>,
     operation: &EpochOperation,
@@ -209,7 +209,7 @@ fn operate(
             "host": "node0",
             "scope": {"deployment": "model", "group": "model", "rank": 0},
             "epoch": EPOCH,
-            "ledger": workers.ledger(),
+            "usage": workers.usage(),
             "host_storage": {"available": 1u64 << 40, "reserve": 10u64 << 30, "unallocated": 0},
         }),
         EpochOperation::ReleaseCache(ReleaseCache { from }) => {
@@ -237,7 +237,7 @@ fn operate(
     };
     let mut results = vec![result.to_string()];
     if workers.experts && matches!(operation, EpochOperation::CacheStorage(_)) {
-        let ledger = workers.expert_process.map(|process| GpuLedger {
+        let usage = workers.expert_process.map(|process| GpuLedger {
             gpu: [8; 16],
             deployment: "model".into(),
             total: 2_000,
@@ -264,7 +264,7 @@ fn operate(
                 "host": "node1",
                 "scope": {"deployment": "model", "group": "experts", "rank": 0},
                 "epoch": EPOCH,
-                "ledger": ledger,
+                "usage": usage,
             })
             .to_string(),
         );
@@ -321,7 +321,7 @@ fn start_split(
     let operated = Arc::clone(&workers);
     let pool = Arc::new(
         FakeBatches::new(vec![inventory])
-            .answering(Arc::new(|batch| {
+            .with_output(Arc::new(|batch| {
                 thread::sleep(STEP);
                 ipc::execution::Outcome::Success(testkit::completed(
                     batch,
@@ -393,12 +393,12 @@ fn terminal(events: &mut EventRx) -> Option<Event> {
     None
 }
 
-/// The answer to a change of the cache's storage, within ten seconds.
+/// The response to a change of the cache's storage, within ten seconds.
 fn resize(handle: &CommandSender, change: CacheChange) -> Result<Vec<String>, String> {
     handle
         .resize_cache(change)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers")
+        .expect("the scheduler responds")
 }
 
 /// A request holding the tail that cannot get a unit to continue is
@@ -441,10 +441,10 @@ fn room_recomputes_the_holders_of_the_tail_that_cannot_continue() {
     thread.join().unwrap();
 }
 
-/// A growth creates as many of the segments given back as the ledger's
+/// A growth creates as many of the segments given back as the usage's
 /// room within the quota holds, and returns their units to allocation.
 #[test]
-fn a_growth_creates_the_segments_the_ledgers_room_holds() {
+fn a_growth_creates_the_segments_the_quotas_room_holds() {
     let (handle, workers, thread) = start(SimWorkers::filling(3_500));
     assert!(
         resize(
@@ -488,7 +488,7 @@ fn a_growth_creates_the_segments_the_ledgers_room_holds() {
 /// cache and the process fill: 1500 bytes take the last two segments, which
 /// the request holding units 1..=27 keeps until it ends, before the workers
 /// give them back; once the session's storage is released, a growth
-/// creates them again. A ledger with room withdraws nothing, and storage
+/// creates them again. A usage with room withdraws nothing, and storage
 /// that even every segment past the first does not make room for is
 /// refused, naming the bytes, with the cache kept whole.
 #[test]
@@ -509,10 +509,10 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
     );
     let reports = made
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers")
+        .expect("the scheduler responds")
         .unwrap();
-    let plan: serde_json::Value = serde_json::from_str(&reports[0]).unwrap();
-    assert_eq!(plan["segments_kept"], 6);
+    let output: serde_json::Value = serde_json::from_str(&reports[0]).unwrap();
+    assert_eq!(output["segments_kept"], 6);
 
     // The room is there: nothing more is given back.
     assert!(
@@ -526,7 +526,7 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
         .is_ok()
     );
     assert_eq!(workers.lock().unwrap().held, 6);
-    // The session books its storage, and releases it as it ends.
+    // The session reserves its storage, and releases it as it ends.
     workers.lock().unwrap().process_bytes = 5_000;
     assert!(resize(&handle, CacheChange::Grow).is_ok());
     assert_eq!(
@@ -551,7 +551,7 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
         "{error}"
     );
     assert!(
-        error.contains("11500 of a quota of 11500 bytes booked"),
+        error.contains("11500 of a quota of 11500 bytes reserved"),
         "{error}"
     );
     assert_eq!(workers.lock().unwrap().held, SEGMENTS);
@@ -579,7 +579,7 @@ fn room_accounts_for_each_devices_allocation_and_dedicated_experts() {
     // A dedicated expert GPU cannot borrow the attention GPU's cache room.
     let error = resize(&handle, request(101)).unwrap_err();
     assert!(
-        error.contains("900 of a quota of 1000 bytes booked"),
+        error.contains("900 of a quota of 1000 bytes reserved"),
         "{error}"
     );
     let mut served = handle.submit(request_of(1, 8, 2)).unwrap();
@@ -589,15 +589,21 @@ fn room_accounts_for_each_devices_allocation_and_dedicated_experts() {
     ));
 
     let reports = resize(&handle, request(100)).unwrap();
-    let plans = reports
+    let schedules = reports
         .iter()
         .map(|report| serde_json::from_str::<serde_json::Value>(report).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(plans.len(), 2);
-    assert!(plans.iter().all(|plan| plan["feasible"] == true));
-    let attention = plans.iter().find(|plan| plan["bytes"] == 1_500).unwrap();
+    assert_eq!(schedules.len(), 2);
+    assert!(schedules.iter().all(|output| output["feasible"] == true));
+    let attention = schedules
+        .iter()
+        .find(|output| output["bytes"] == 1_500)
+        .unwrap();
     assert_eq!(attention["segments_kept"], 6);
-    let experts = plans.iter().find(|plan| plan["bytes"] == 100).unwrap();
+    let experts = schedules
+        .iter()
+        .find(|output| output["bytes"] == 100)
+        .unwrap();
     assert_eq!(experts["segments_held"], 0);
     let mut served = handle.submit(request_of(2, 8, 2)).unwrap();
     assert!(matches!(
@@ -690,7 +696,7 @@ fn a_parked_epoch_lends_the_segments_no_request_in_flight_continues_from() {
     let parked = handle
         .park(true)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers")
+        .expect("the scheduler responds")
         .expect("the scheduler parks");
     assert!(matches!(
         terminal(&mut running),
@@ -723,7 +729,7 @@ fn a_parked_epoch_lends_the_segments_no_request_in_flight_continues_from() {
     let resumed = handle
         .resume(false)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(resumed.is_ok(), "{resumed:?}");
     let mut asking = request(2, kept + 1, 1);
     asking.prompt_token_ids = vec![9; asking.prompt_token_ids.len()];
@@ -733,11 +739,11 @@ fn a_parked_epoch_lends_the_segments_no_request_in_flight_continues_from() {
         std::iter::from_fn(|| waiting.try_recv().ok()).all(|event| !event.is_terminal()),
         "the request ended within the units the epoch kept"
     );
-    let reclaimed = handle
+    let preempted = handle
         .resume(true)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
-    assert!(reclaimed.is_ok(), "{reclaimed:?}");
+        .expect("the scheduler responds");
+    assert!(preempted.is_ok(), "{preempted:?}");
     assert!(matches!(
         terminal(&mut waiting),
         Some(Event::Finished { .. })
@@ -749,7 +755,7 @@ fn a_parked_epoch_lends_the_segments_no_request_in_flight_continues_from() {
 
 /// A successor promoted with the segments its predecessor lent maps them
 /// writable (`EpochOperation::AdoptCache`), counts their units in what its cache
-/// holds on trial, and allocates them: the requests handed over fit, and a
+/// holds on trial, and allocates them: the requests given over fit, and a
 /// request that needs its own free units and the lent ones runs.
 #[test]
 fn a_successor_allocates_the_segments_its_predecessor_lent() {
@@ -766,7 +772,7 @@ fn a_successor_allocates_the_segments_its_predecessor_lent() {
     let refused = handle
         .promote(parked.clone(), true, false)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers")
+        .expect("the scheduler responds")
         .expect_err("15 free units cannot hold 21");
     assert!(
         refused.contains("15 free units") && refused.contains("need 21"),
@@ -779,7 +785,7 @@ fn a_successor_allocates_the_segments_its_predecessor_lent() {
     let promoted = handle
         .promote(lent, true, false)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(promoted.is_ok(), "{promoted:?}");
     assert!(
         workers
@@ -866,7 +872,7 @@ fn an_aborting_sleep_ends_every_request_before_the_workers_sleep() {
     let updated = handle
         .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Abort)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(updated.is_ok(), "{updated:?}");
     assert!(resize(&handle, CacheChange::Wake).is_ok());
     assert_eq!(
@@ -878,7 +884,7 @@ fn an_aborting_sleep_ends_every_request_before_the_workers_sleep() {
     thread.join().unwrap();
 }
 
-/// A held scheduler forms no batch and answers once those in flight completed.
+/// A held scheduler forms no batch and responds once those in flight completed.
 /// Every request keeps its state through the hold, and generates on from the
 /// token it reached once the hold ends.
 #[test]
@@ -921,7 +927,7 @@ fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sle
     let updated = handle
         .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Recompute)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(updated.is_ok(), "{updated:?}");
     assert!(matches!(
         terminal(&mut running),
@@ -946,7 +952,7 @@ fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sle
 
 /// A weight update that keeps the requests in flight rewrites the weights
 /// beside their KV cache, and the request running continues to its end
-/// without being handed back.
+/// without being given back.
 #[test]
 fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
     let (handle, workers, thread) = start(SimWorkers::filling(0));
@@ -956,7 +962,7 @@ fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
     let updated = handle
         .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Keep)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(updated.is_ok(), "{updated:?}");
     assert_eq!(
         workers.lock().unwrap().operations,
@@ -985,7 +991,7 @@ fn a_weight_update_aborting_the_requests_in_flight_ends_them() {
     let updated = handle
         .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Abort)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(updated.is_ok(), "{updated:?}");
     assert!(matches!(
         terminal(&mut running),

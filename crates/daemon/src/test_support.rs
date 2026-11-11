@@ -6,7 +6,7 @@
 //! Requests travel through the server's router (`http::router`) into a real
 //! `Leader`, whose client submits them over the request interface to
 //! production schedulers built over `testkit::FakeBatches` through the
-//! serving door (`SchedulerHandle::over_batches_telling`); the schedulers
+//! serving door (`SchedulerHandle::over_batches`); the schedulers
 //! serve the interface on a thread of this process (`testkit::serve_requests`),
 //! as an engine process serves it. The default fake serves text alone, so the
 //! engine refuses every video submission as an invalid request.
@@ -118,7 +118,7 @@ pub(crate) fn fake_core(
     fake: Arc<FakeBatches>,
 ) -> SchedulerHandle {
     let limits = testkit::limits(fake.as_ref());
-    let core = SchedulerHandle::over_batches_telling(
+    let core = SchedulerHandle::over_batches(
         &args,
         limits,
         fake as Arc<dyn ipc::execution::Batches>,

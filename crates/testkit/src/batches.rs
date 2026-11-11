@@ -1,19 +1,21 @@
 //! The one test double at the worker's batch interface.
 //!
 //! [`FakeBatches`] implements [`Batches`], the door a serving scheduler executes through, and
-//! answers every batch from what the mechanism wrote into it: the calls it names, the rows each
+//! responds to every batch from what the mechanism wrote into it: the calls it names, the rows each
 //! call owns ([`ipc::execution::BatchRow::rows`]), the keys those rows see (`seq_lens`) and the
 //! Philox address of each sampling row (`draws`). It reads nothing private to the scheduler, so a
 //! case written against it observes the mechanism through the same completion path a device
-//! worker's answer takes.
+//! worker's response takes.
 //!
 //! What a case can vary, and nothing else:
 //!
 //! - the pools the fake states ([`FakeBatches::new`]) and how many devices run them
 //!   ([`FakeBatches::with_devices`]);
 //! - the token each call samples ([`Tokens`]) and the extent it leaves ([`Extent`]), or a whole
-//!   answer of its own ([`FakeBatches::answering`]);
+//!   response of its own ([`FakeBatches::with_output`]);
 //! - the media computations it serves ([`FakeBatches::with_media`]);
+//! - the step limit of the blocks a diffusion language model denoises
+//!   ([`FakeBatches::with_block_steps`]), which a block stops within ([`block_stop_step`]);
 //! - when a batch completes: at once, or held until the case releases it
 //!   ([`FakeBatches::hold`], [`FakeBatches::release`]), which is how a case paces the mechanism
 //!   or leaves a batch stalled on the device;
@@ -28,7 +30,7 @@ use ipc::TimingCounters;
 use ipc::execution::{
     Batch, BatchId, BatchOutput, Batches, CallOutput, Computation, EpochOperation,
     Extent as MediaExtent, Fault, Inventory, Outcome, RowState, Submission, SubmissionId,
-    SubmissionState,
+    SubmissionState, Variant,
 };
 use ipc::philox::DrawAddress;
 
@@ -58,6 +60,17 @@ pub fn draw_token(draw: DrawAddress) -> u32 {
     SAMPLED + (mixed % u64::from(VOCABULARY)) as u32
 }
 
+/// The zero-based step at which the fake stops block `block` of the request whose Philox stream
+/// is `key`: one of a block's first three steps, within the deployment's `max_steps`.
+///
+/// A function of the stream and the block alone, as a device's convergence is of the request's
+/// draws, so a case computes where each block of a request stops, and a step queued behind the
+/// one that stopped its block is the same no-op wherever it runs.
+pub fn block_stop_step(key: u64, block: u32, max_steps: u32) -> u32 {
+    let third = (key.wrapping_add(u64::from(block)) % 3) as u32;
+    third.min(max_steps.saturating_sub(1))
+}
+
 /// Which token a call samples.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tokens {
@@ -85,8 +98,8 @@ pub enum Extent {
     OnePast,
 }
 
-/// A case's own answer to a batch, in place of the [`Tokens`] and [`Extent`] rules.
-pub type Answer = Arc<dyn Fn(&Batch) -> Outcome<BatchOutput> + Send + Sync>;
+/// A case's own response to a batch, in place of the [`Tokens`] and [`Extent`] rules.
+pub type OutputFn = Arc<dyn Fn(&Batch) -> Outcome<BatchOutput> + Send + Sync>;
 
 /// The media capability a fake states: the bucket it serves a computation in, or `None`.
 pub type Media = Arc<dyn Fn(&Computation) -> Option<MediaExtent> + Send + Sync>;
@@ -116,14 +129,16 @@ pub struct FakeBatches {
     devices: usize,
     tokens: Tokens,
     extent: Extent,
-    answer: Option<Answer>,
+    output: Option<OutputFn>,
     media: Option<Media>,
-    /// The answers to media batches ([`FakeBatches::answering_media`]); token batches keep the
+    /// The outputs of media batches ([`FakeBatches::with_media_outputs`]); token batches keep the
     /// token and extent rules.
-    media_answers: Option<Arc<crate::Media>>,
+    media_outputs: Option<Arc<crate::Media>>,
     end: Option<EndOfText>,
     /// How many tokens each request's text holds before it ends ([`FakeBatches::with_text_len`]).
     text_len: Option<u64>,
+    /// The most steps a block of tokens is denoised for ([`FakeBatches::with_block_steps`]).
+    block_steps: Option<u32>,
     /// The logical position of the first token the fake sampled on each request's Philox stream,
     /// by stream key: where its generated text begins.
     text_starts: Mutex<HashMap<u64, u64>>,
@@ -160,11 +175,12 @@ impl FakeBatches {
             devices: 1,
             tokens: Tokens::default(),
             extent: Extent::default(),
-            answer: None,
+            output: None,
             media: None,
-            media_answers: None,
+            media_outputs: None,
             end: None,
             text_len: None,
+            block_steps: None,
             text_starts: Mutex::new(HashMap::new()),
             operate: None,
             submitted: Mutex::new(Vec::new()),
@@ -218,10 +234,20 @@ impl FakeBatches {
         self
     }
 
-    /// Answers every batch with `answer` instead of the token and extent rules.
+    /// Serves the token-denoising batches of a diffusion language model whose blocks run at most
+    /// `max_steps` steps: block `b` of a request stops at step [`block_stop_step`] and then holds
+    /// the request's text, [`draw_token`] at each of its logical positions, with [`crate::EOS`]
+    /// from the text's end on ([`Self::with_text_len`]).
     #[must_use]
-    pub fn answering(mut self, answer: Answer) -> Self {
-        self.answer = Some(answer);
+    pub fn with_block_steps(mut self, max_steps: u32) -> Self {
+        self.block_steps = Some(max_steps);
+        self
+    }
+
+    /// Completes every batch with `output` instead of the token and extent rules.
+    #[must_use]
+    pub fn with_output(mut self, output: OutputFn) -> Self {
+        self.output = Some(output);
         self
     }
 
@@ -233,17 +259,17 @@ impl FakeBatches {
     }
 
     /// Serves every media computation in the extent the mechanism stated ([`crate::Media::serves`])
-    /// and answers each media batch with `media`, as a rank whose media runners serve them;
+    /// and responds to each media batch with `media`, as a rank whose media runners serve them;
     /// token batches keep the token and extent rules, the end of text included.
     #[must_use]
-    pub fn answering_media(mut self, media: Arc<crate::Media>) -> Self {
+    pub fn with_media_outputs(mut self, media: Arc<crate::Media>) -> Self {
         self.media = Some(Arc::new(crate::Media::serves));
-        self.media_answers = Some(media);
+        self.media_outputs = Some(media);
         self
     }
 
     /// Performs the storage operations the mechanism asks for with `operate`, as the ranks of a
-    /// worker with storage of its own answer them; without one, every operation answers nothing.
+    /// worker with storage of its own performs them; without one, every operation returns nothing.
     pub fn with_operate(mut self, operate: Operate) -> Self {
         self.operate = Some(operate);
         self
@@ -292,7 +318,7 @@ impl FakeBatches {
         lock(&self.held).len()
     }
 
-    /// Completes up to `count` held batches, oldest first, with their answers; answers how many it
+    /// Completes up to `count` held batches, oldest first, with their outputs; returns how many it
     /// completed.
     pub fn release(&self, count: usize) -> usize {
         let released: Vec<Held> = {
@@ -308,7 +334,7 @@ impl FakeBatches {
     }
 
     /// Fails every held batch with `message`: the device that ran them was lost after it accepted
-    /// them. Answers how many it failed.
+    /// them. Returns how many it failed.
     pub fn fail_held(&self, message: &str) -> usize {
         let failed: Vec<Held> = lock(&self.held).drain(..).collect();
         let count = failed.len();
@@ -319,14 +345,23 @@ impl FakeBatches {
         count
     }
 
-    /// The outcome a batch completes with: the case's own answer, or each call completed by the
+    /// The outcome a batch completes with: the case's own response, or each call completed by the
     /// token and extent rules.
-    fn answer(&self, batch: &Batch) -> Outcome<BatchOutput> {
-        if let Some(answer) = &self.answer {
-            return answer(batch);
+    fn output(&self, batch: &Batch) -> Outcome<BatchOutput> {
+        if let Some(output) = &self.output {
+            return output(batch);
         }
-        if let (Some(media), Some(_)) = (&self.media_answers, &batch.media) {
-            return media.answer(batch);
+        if let (Some(media), Some(_)) = (&self.media_outputs, &batch.media) {
+            return media.output(batch);
+        }
+
+        if batch.shape.variant == Variant::TokenDenoise {
+            return match self.block_steps {
+                Some(max_steps) => Outcome::Success(self.denoised(batch, max_steps)),
+                None => Outcome::Failed(Arc::from(Box::<Fault>::from(
+                    "the fake serves no token denoising: no block step limit is stated".to_owned(),
+                ))),
+            };
         }
 
         let mut output = completed_until(batch, self.tokens, self.extent, self.end);
@@ -354,14 +389,72 @@ impl FakeBatches {
         }
     }
 
-    /// Accepts `batch` and answers its submission: completed now, or held.
+    /// A token-denoising `batch` completed: each call runs one step of its request's block.
+    ///
+    /// A step before the block's stopping step ([`block_stop_step`]) reports no token; the
+    /// stopping step reports the block's tokens; a step behind it finds the block stopped,
+    /// computes nothing and reports [`ipc::CallStatus::Predicated`].
+    fn denoised(&self, batch: &Batch, max_steps: u32) -> BatchOutput {
+        let rows = &batch.columns.rows;
+        let mut starts = lock(&self.text_starts);
+        let calls = (0..batch.calls.len())
+            .map(|index| {
+                let row = sampling_row(batch, index);
+                let seen = rows.seq_lens.get(row).copied().unwrap_or(0).max(0) as u32;
+                let state = RowState {
+                    step_index: 0,
+                    cache_computed_len: seen,
+                    cache_visible_len: seen,
+                };
+                let mut output = CallOutput::completed(batch.calls[index], Vec::new(), state);
+                let (Some(step), Some(draw)) = (
+                    batch.columns.block_steps.get(index).copied(),
+                    batch.columns.draws.get(row).copied(),
+                ) else {
+                    return output;
+                };
+                // The row's query is the block: its draw states the position after it.
+                let length = match (rows.query_offsets.get(row), rows.query_offsets.get(row + 1)) {
+                    (Some(start), Some(end)) => u64::try_from(end - start).unwrap_or(0),
+                    _ => 0,
+                };
+                let first = draw.position.saturating_sub(length);
+                let stop = block_stop_step(draw.key, step.block, max_steps);
+                if step.step > stop {
+                    output.status = ipc::CallStatus::Predicated;
+                } else if step.step == stop {
+                    // The request's text begins where its first block does.
+                    let text_start = *starts
+                        .entry(draw.key)
+                        .or_insert_with(|| first.saturating_sub(u64::from(step.block) * length));
+                    output.tokens = (first..first + length)
+                        .map(|position| match self.text_len {
+                            Some(text_len) if position >= text_start + text_len => crate::EOS,
+                            _ => draw_token(DrawAddress {
+                                key: draw.key,
+                                position,
+                            }),
+                        })
+                        .collect();
+                }
+                output
+            })
+            .collect();
+        BatchOutput {
+            calls,
+            timing: TimingCounters::default(),
+            forward_stats: None,
+        }
+    }
+
+    /// Accepts `batch` and responds to its submission: completed now, or held.
     fn serve(&self, batch: &Batch) -> Result<Submission, Box<Fault>> {
         if let Some(message) = lock(&self.refusal).clone() {
             return Err(message.into());
         }
 
         let id = SubmissionId(self.next.fetch_add(1, Ordering::Relaxed));
-        let outcome = self.answer(batch);
+        let outcome = self.output(batch);
         if !*lock(&self.holding) {
             return Ok(Submission::completed(id, outcome));
         }
@@ -377,7 +470,7 @@ impl FakeBatches {
 }
 
 /// `batch` completed as the fake completes it by `tokens` and `extent`: each call samples one
-/// token and leaves the extent its last row states. A case's own [`Answer`] starts from this to
+/// token and leaves the extent its last row states. A case's own [`OutputFn`] starts from this to
 /// change some calls and keep the rest.
 pub fn completed(batch: &Batch, tokens: Tokens, extent: Extent) -> BatchOutput {
     completed_until(batch, tokens, extent, None)

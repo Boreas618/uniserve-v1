@@ -26,20 +26,22 @@ impl Scheduler {
         mut call: Call,
         reserved_buffers: Vec<BufferSpan>,
         admitted: bool,
-        planned_us: u64,
+        scheduled_us: u64,
         batch: &mut ExecutionBatch,
         layouts: &mut Vec<columns::CallLayout>,
     ) -> Option<()> {
         let request_id = call.request_key.request_id;
 
-        // Planning may queue successors speculatively, but registration still
-        // requires the request epoch and exact resident predecessor.
-        let Some((request_epoch, latest_token)) = self.running.get(&request_id).and_then(|state| {
-            state
-                .worker_registered
-                .then(|| (state.request_epoch, state.latest_token.clone()))
-        }) else {
-            tracing::error!(request_id = request_id.0, "planned call lost its request");
+        // Preparing may queue successors speculatively, but registration still
+        // requires the request epoch and exact predecessor on the device.
+        let Some((request_epoch, latest_token)) =
+            self.requests.tokens(&request_id).and_then(|state| {
+                state
+                    .worker_registered
+                    .then(|| (state.request_epoch, state.latest_token.clone()))
+            })
+        else {
+            tracing::error!(request_id = request_id.0, "prepared call lost its request");
             self.latch_fatal();
             return None;
         };
@@ -64,7 +66,7 @@ impl Scheduler {
         // carry no predicate.
         // A verification carries its current token among its host tokens,
         // whose draft pass reads them, so it never continues from a
-        // device-resident token.
+        // device-running token.
         let projected_successor = self.inflight.has_pending_calls(request_id);
         let reusable_device_token = if !projected_successor
             && call.kind != CallKind::Forward(ForwardMode::Verify)
@@ -151,7 +153,7 @@ impl Scheduler {
         // A latent image extension declares the cache tokens of the current
         // input image's encoder that produced its feature.
         let num_image_cache_tokens = if consumes_image_features(&call) {
-            let state = self.running.get(&request_id)?;
+            let state = self.requests.tokens(&request_id)?;
             state
                 .req
                 .multimodal_inputs
@@ -163,9 +165,9 @@ impl Scheduler {
             None
         };
 
-        // A generation step denoises the request's resident canvas of
+        // A generation step denoises the request's block on the device of
         // `max_tokens` tokens, one read-only forward row below.
-        let canvas_lengths = if call.canvas.is_some() {
+        let block_lengths = if call.block_step.is_some() {
             vec![call.bounds.max_tokens]
         } else {
             Vec::new()
@@ -192,15 +194,15 @@ impl Scheduler {
         if let Some(lengths) = cache_lengths {
             // Registration above found the request running, and a running
             // token request always has its cache tables.
-            let Some(state) = self.running.get_mut(&request_id) else {
+            let Some(state) = self.requests.tokens_mut(&request_id) else {
                 self.invariant_broken("a registered token request is admitted with a prefix cache");
                 return None;
             };
             let fresh_count = u64::from(call.bounds.max_cache_units);
             let declared = state.num_cache_units_sent;
-            // A handed-off request's first call is its first on the decode group.
-            let handed_off = state.hand_off == generation::HandOff::Copied;
-            state.hand_off = generation::HandOff::None;
+            // A given-off request's first call is its first on the decode group.
+            let transferred = state.transfer == generation::TransferState::Copied;
+            state.transfer = generation::TransferState::None;
             let (Some(request_pool_idx), Some(allocation)) =
                 (state.request_pool_idx(), state.prefix_cache_mut())
             else {
@@ -213,19 +215,19 @@ impl Scheduler {
             // its last declaration (growth, or window retirement in a
             // sliding-window group) or it holds fresh units, which the worker
             // must reset before use. A forward's fresh units are those
-            // allocated since the declared watermark (`plan_call`).
+            // allocated since the declared watermark (`prepare_call`).
             // Admission (or re-admission) declares every table again, with
             // every allocated page fresh; pages acquired from the prefix
             // cache already hold computed keys and values and are never fresh.
-            // A handed-off request's first call declares them to the decode
-            // group, which has seen none, with no fresh unit: the hand-off
+            // A given-off request's first call declares them to the decode
+            // group, which has seen none, with no fresh unit: the transfer
             // copied every unit's pages there.
-            if admitted || handed_off {
+            if admitted || transferred {
                 allocation.clear_sent();
             }
             let fresh_since = if admitted {
                 Some(0)
-            } else if handed_off {
+            } else if transferred {
                 None
             } else {
                 (fresh_count > 0).then(|| declared.saturating_sub(fresh_count))
@@ -286,10 +288,10 @@ impl Scheduler {
                     call.draft.refill.is_none(),
                 );
             }
-            // One read-only row per canvas: it attends to the visible prefix
-            // and its own canvas, and persists nothing.
-            for canvas in &canvas_lengths {
-                layout.push(lengths.visible + canvas, *canvas, false);
+            // One read-only row per block: it attends to the visible prefix
+            // and its own block, and persists nothing.
+            for length in &block_lengths {
+                layout.push(lengths.visible + length, *length, false);
             }
         }
 
@@ -331,8 +333,8 @@ impl Scheduler {
         }
         let mut call_buffers = Vec::with_capacity(reserved_buffers.len());
         let Some(allocations) = self
-            .running
-            .get_mut(&request_id)
+            .requests
+            .tokens_mut(&request_id)
             .and_then(|state| state.allocations_mut())
         else {
             for allocation in reserved_buffers {
@@ -353,18 +355,18 @@ impl Scheduler {
         }
 
         // Worker selection records the request's residency on that worker. A
-        // request that has not run this component yet is placed where the
+        // request that has not run this stage yet is placed where the
         // policy says (§4.4); one that has goes back to the replica holding its
-        // state, whatever the policy would answer.
+        // state, whatever the policy would response.
         let choice = self.place_call(&call)?;
         let Some((worker, entry)) =
             self.dispatch
                 .select_worker(&self.worker, &self.info, &call, &choice)
         else {
-            self.invariant_broken("a planned call retains an executable component");
+            self.invariant_broken("a prepared call retains an executable stage");
             return None;
         };
-        call.component = entry;
+        call.stage = entry;
 
         // An image extension writes its block's prefix cache, whose extent its
         // result is checked against.
@@ -381,7 +383,7 @@ impl Scheduler {
         self.register_inflight(
             call.clone(),
             InflightInput::Generation { image_cache },
-            submitted_us.saturating_sub(planned_us),
+            submitted_us.saturating_sub(scheduled_us),
         );
         // The runtime's buffer pool is one address space, so every rank of
         // the worker holds each span at the same offset.
@@ -400,7 +402,7 @@ impl Scheduler {
         layouts.push(layout);
         // The resolved token product serves only the first call after its
         // resolution; later calls chain from the in-flight one.
-        if let Some(st) = self.running.get_mut(&request_id) {
+        if let Some(st) = self.requests.tokens_mut(&request_id) {
             st.latest_token = None;
         }
         Some(())
@@ -473,7 +475,7 @@ impl Scheduler {
     /// first ([`Self::release_drafts`]).
     ///
     /// A refusal states the units the growth needed, one when the tables do
-    /// not say: what a reclaim must free for the request to go on.
+    /// not say: what a preemption must free for the request to go on.
     fn grow_request_tables(
         &mut self,
         id: RequestId,
@@ -493,7 +495,7 @@ impl Scheduler {
                     return Err(units.max(1));
                 }
             }
-            let Some(state) = self.running.get_mut(&id) else {
+            let Some(state) = self.requests.tokens_mut(&id) else {
                 return Err(1);
             };
             let (Some(allocations), Some(cache)) =
@@ -503,13 +505,13 @@ impl Scheduler {
                 return Err(1);
             };
             if cache
-                .grow(
+                .allocate(
                     &mut allocations.prefix_cache,
-                    read_start,
-                    total_tokens,
+                    read_start as usize,
+                    total_tokens as usize,
                     checkpoint,
                 )
-                .is_ok()
+                .is_some()
             {
                 return Ok(());
             }
@@ -528,7 +530,7 @@ impl Scheduler {
     /// A request holds tables only once admitted, and only token requests,
     /// which always have the prefix cache, hold them.
     pub(crate) fn activate_request_tables(&self, id: RequestId) {
-        let tables = self.running.get(&id).and_then(RequestState::block_tables);
+        let tables = self.requests.tokens(&id).and_then(TokenState::block_tables);
         if let (Some(tables), Some(prefix_cache)) = (tables, self.storage.cache()) {
             for table in tables {
                 table.activate(prefix_cache.pool());

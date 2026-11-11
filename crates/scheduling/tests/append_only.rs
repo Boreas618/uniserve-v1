@@ -15,11 +15,11 @@
 
 use scheduling::guest::wire;
 use scheduling::guest::{
-    End, Event, Limits, Plan, RequestId, RequestState, RequestView, Room, Shortage, Snapshot,
-    Storage, Victim, Work,
+    DispatchOutput, End, Event, Limits, RequestId, RequestStatus, RequestView, Room, Shortage,
+    Snapshot, Storage, Victim, Work,
 };
 
-/// Decodes the way the mechanism decodes a policy's answer, and the way a
+/// Decodes the way the mechanism decodes a policy's response, and the way a
 /// policy decodes a message from the mechanism.
 fn decode<T: serde::de::DeserializeOwned>(json: &str) -> T {
     wire::decode(json.as_bytes()).expect("an append-only message decodes")
@@ -38,34 +38,34 @@ fn an_event_kind_the_host_does_not_know_is_ignored() {
 #[test]
 fn a_field_the_host_does_not_know_does_not_hide_the_ones_it_does() {
     let request: RequestView = decode(
-        r#"{"id":3,"state":{"state":"resident"},"class":{"class":"token"},
+        r#"{"id":3,"state":{"state":"running"},"class":{"class":"token"},
             "prompt_tokens":64,"cached_prefix_tokens":32,"slo_class":2}"#,
     );
     assert_eq!(request.id, RequestId(3));
-    assert_eq!(request.state, RequestState::Resident);
+    assert_eq!(request.state, RequestStatus::Running);
     assert_eq!(request.cached_prefix_tokens, 32);
 
-    // The same on a decision a policy answers with.
-    let plan: Plan = decode(
+    // The same on a decision a policy responds with.
+    let output: DispatchOutput = decode(
         r#"{"admit":[1],"work":[{"request":1,"phase":2,"tokens":16}],
             "admission_window":4}"#,
     );
-    assert_eq!(plan.admit, vec![RequestId(1)]);
-    assert_eq!(plan.work.len(), 1);
-    assert_eq!(plan.work[0].tokens, 16);
+    assert_eq!(output.admit, vec![RequestId(1)]);
+    assert_eq!(output.work.len(), 1);
+    assert_eq!(output.work[0].tokens, 16);
 }
 
-/// A field a later mechanism appends and an older policy omits answers its
-/// default: an answer built against the older revision still means what it
+/// A field a later mechanism appends and an older policy omits takes its
+/// default: a response built against the older revision still means what it
 /// said.
 #[test]
-fn an_answer_that_omits_a_later_field_means_its_default() {
+fn an_output_that_omits_a_later_field_means_its_default() {
     // A policy that predates `prefetch` and `refill` says nothing about them,
     // which is "no deepening, no refill".
-    let plan: Plan = decode(r#"{"admit":[],"reject":[2],"work":[]}"#);
-    assert!(plan.prefetch.is_empty());
-    assert!(plan.refill.is_empty());
-    assert!(plan.offload.is_empty());
+    let output: DispatchOutput = decode(r#"{"admit":[],"reject":[2],"work":[]}"#);
+    assert!(output.prefetch.is_empty());
+    assert!(output.refill.is_empty());
+    assert!(output.offload.is_empty());
 
     let victims: Vec<Victim> = decode(r#"[{"page":1},{"request":2},{"encoding":3}]"#);
     assert_eq!(victims.len(), 3);
@@ -85,7 +85,7 @@ fn an_answer_that_omits_a_later_field_means_its_default() {
 fn a_snapshot_survives_a_field_appended_to_a_view() {
     let snapshot: Snapshot = decode(
         r#"{"step":4,
-            "requests":[{"id":1,"state":{"state":"queued"},"class":{"class":"token"},
+            "requests":[{"id":1,"state":{"state":"waiting"},"class":{"class":"token"},
                          "waiting_transfer":false,"affinity":7}],
             "pages":[{"id":9,"tokens":16,"last_used":0,"on_host":false,"evictable":true,
                       "tier":1}],

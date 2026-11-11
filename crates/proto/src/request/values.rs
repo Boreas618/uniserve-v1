@@ -30,9 +30,9 @@ pub struct DiffusionSamplingParams {
     pub video_units: u32,
     /// Deterministic request-level noise seed.
     pub seed: u64,
-    /// Output raster width in pixels: the request's canvas.
+    /// Output raster width in pixels: the request's resolution.
     pub width: u32,
-    /// Output raster height in pixels: the request's canvas.
+    /// Output raster height in pixels: the request's resolution.
     pub height: u32,
     /// Denoiser rows the request's conditions take, as the denoiser packs them; zero without
     /// conditions. A denoising step's layout holds them, so this is what selects its graph.
@@ -61,24 +61,24 @@ impl ImageEncoder {
     }
 }
 
-/// Block-diffusion sampling of a deployment's canvases.
+/// Block-diffusion sampling of a deployment's blocks.
 ///
-/// Text is generated in blocks of `canvas_length` tokens. A block starts as
+/// Text is generated in blocks of `block_length` tokens. A block starts as
 /// uniformly random tokens and is denoised for at most `max_steps` steps: a
 /// step samples every position from the model's logits at a temperature that
 /// falls linearly from `t_max` to `t_min`, accepts the lowest-entropy samples
 /// within `entropy_bound` and renoises the others. A block stops early once
-/// its argmax canvas has held for `stability_threshold` steps and its mean
-/// entropy is below `confidence_threshold`. The block's argmax canvas is then
+/// its argmax block has held for `stability_threshold` steps and its mean
+/// entropy is below `confidence_threshold`. The block's argmax block is then
 /// committed to the request's context as causal prompt, and the next block
 /// follows it. Every draw follows the request's `SamplingParams::seed`.
 ///
 /// The deployment's launch configuration owns the sampling: every request a
 /// block-diffusion runtime generates, rather than reads out, runs under it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct CanvasSampling {
+pub struct BlockSampling {
     /// Tokens of one block.
-    pub canvas_length: u32,
+    pub block_length: u32,
     /// Denoising steps a block runs at most.
     pub max_steps: u32,
     /// Entropy, in nats, the accepted samples of one step may carry beyond
@@ -88,25 +88,25 @@ pub struct CanvasSampling {
     pub t_min: f32,
     /// Sampling temperature of a block's first step.
     pub t_max: f32,
-    /// Mean canvas entropy, in nats, below which a stable block stops; zero
+    /// Mean block entropy, in nats, below which a stable block stops; zero
     /// never stops a block early.
     pub confidence_threshold: f32,
-    /// Steps the argmax canvas must hold unchanged before a block stops;
+    /// Steps the argmax block must hold unchanged before a block stops;
     /// zero stops a block on confidence alone.
     pub stability_threshold: u32,
 }
 
-impl CanvasSampling {
+impl BlockSampling {
     /// Returns the first parameter outside the domain the block-diffusion
-    /// sampler takes, if any: a positive canvas length and step limit, a
+    /// sampler takes, if any: a positive block length and step limit, a
     /// positive entropy bound, temperatures with `0 <= t_min < t_max`, and a
     /// non-negative confidence threshold, all finite. A zero stability
     /// threshold stops a block on confidence alone, and a zero confidence
     /// threshold runs every block for all its steps.
     pub fn invalid_parameter(&self) -> Option<&'static str> {
         let positive = |value: f32| value.is_finite() && value > 0.0;
-        if self.canvas_length == 0 {
-            Some("canvas_length")
+        if self.block_length == 0 {
+            Some("block_length")
         } else if self.max_steps == 0 {
             Some("max_steps")
         } else if !positive(self.entropy_bound) {

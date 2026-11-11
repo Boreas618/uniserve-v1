@@ -28,6 +28,10 @@ pub fn rank(host: &str) -> MainProcessInfo {
         // The prefix cache is `MainProcessInfo::default`'s: a rank without one is refused every
         // token request at admission, which is the rule for a media-only rank and not this one.
         buffer_pool_bytes: 1 << 20,
+        // A rank that samples states how many candidates it computes for a position, which
+        // bounds what a request may ask (`GenerationLimits::max_logprobs`): the fake reports
+        // every sampled token's log-probability, as a launch with `max_logprobs = 20` does.
+        max_logprobs: 20,
         ..MainProcessInfo::default()
     }
 }
@@ -41,7 +45,7 @@ pub fn pool(group: &str) -> Inventory {
         layout: PoolLayout {
             queue_depth: 1,
             ranks: 1,
-            components: std::collections::BTreeMap::from([(
+            stages: std::collections::BTreeMap::from([(
                 proto::config::DEFAULT_BLOCK.to_owned(),
                 BlockConfig {
                     ranks: vec![0],
@@ -103,7 +107,7 @@ fn launch(model: impl Into<String>) -> EngineArgs {
             // The end of text a fake samples (`crate::EOS`), which the scheduler must
             // recognize to finish a request.
             eos: vec![crate::EOS],
-            canvas_sampling: None,
+            block_sampling: None,
             prefill_outputs: true,
         },
         parallel: proto::config::ParallelConfig {

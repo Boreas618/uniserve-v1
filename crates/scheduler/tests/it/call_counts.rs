@@ -1,7 +1,7 @@
 //! §4.4's call discipline, stated as the numbers an epoch can be asked for.
 //!
 //! The design fixes how often the mechanism asks a policy: `observe` and
-//! `dispatch` once per step whatever they answer, and the limits once per
+//! `dispatch` once per step whatever they respond, and the limits once per
 //! instance. Those calls are the mechanism's own, and a policy that traps on a
 //! breach cannot be the witness here: a policy that names no work serves no
 //! request, so it takes no steps either. The witness is the epoch's own
@@ -11,7 +11,7 @@
 //! limits, and one `observe` and one `dispatch` per step: `observe == step` and
 //! `dispatch == step + 1`.
 //!
-//! So the epoch here runs the real `fcfs` program over a pool that answers every
+//! So the epoch here runs the real `fcfs` program over a pool that responds to every
 //! batch, serves a request through it, and then reads the counts. A mechanism
 //! that asked a step's halves twice, or asked a decision outside a step, would
 //! report it in the arithmetic; a policy that failed would report itself.
@@ -37,18 +37,18 @@ use scheduler::{
 use scheduling::Call;
 use testkit::{Extent, FakeBatches, Tokens};
 
-/// How long a command answer may take: a precopy loads and instantiates a
+/// How long a command response may take: a precopy loads and instantiates a
 /// module on its own thread.
-const ANSWER: Duration = Duration::from_secs(30);
+const RESPONSE: Duration = Duration::from_secs(30);
 
 /// How long an epoch may take to reach the step the test asks for.
 const STEPS: Duration = Duration::from_secs(20);
 
-/// Blocks until a command answers, and answers its result.
-fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
-    match receiver.recv_timeout(ANSWER) {
+/// Blocks until a command responses, and responds to its result.
+fn response<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
+    match receiver.recv_timeout(RESPONSE) {
         Ok(result) => result,
-        Err(error) => panic!("the scheduler did not answer: {error}"),
+        Err(error) => panic!("the scheduler did not response: {error}"),
     }
 }
 
@@ -104,13 +104,13 @@ fn text_request(id: u64, prompt: usize, max_tokens: usize) -> GenerationRequest 
 }
 
 /// The epoch's policy: prepared, then switched in on the handle's own command
-/// surface. Both answers are checked, so a trial that broke the discipline would
+/// surface. Both responds are checked, so a trial that broke the discipline would
 /// fail the install rather than the test's first assertion.
 fn install(handle: &SchedulerHandle, serving: &FakeBatches) {
     let source: Arc<dyn PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    answer(handle.precopy_policy(program(serving), source)).expect("the policy is precopied");
-    answer(handle.stage(Stage::Switchover)).expect("the policy serves");
+    response(handle.precopy_policy(program(serving), source)).expect("the policy is precopied");
+    response(handle.stage(Stage::Switchover)).expect("the policy serves");
 }
 
 /// The epoch's progress once it has taken at least `steps` steps.
@@ -119,8 +119,8 @@ fn reached(handle: &SchedulerHandle, steps: u64) -> Progress {
     loop {
         let progress = handle
             .progress()
-            .recv_timeout(ANSWER)
-            .expect("the scheduler answers with its progress");
+            .recv_timeout(RESPONSE)
+            .expect("the scheduler responds with its progress");
         if progress.step >= steps || Instant::now() > deadline {
             return progress;
         }
@@ -137,7 +137,9 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
         max_running_requests: 4,
         ..SchedulerConfig::default()
     };
-    let handle = SchedulerHandle::over_batches(&args, limits, batches).expect("the pool serves");
+    let handle =
+        SchedulerHandle::over_batches(&args, limits, batches, scheduler::CommandWaker::noop())
+            .expect("the pool serves");
 
     // The trial asks the decision set once on the state that exists now - a
     // `dispatch` and no `observe`, since observing a step's events is the step's
@@ -173,7 +175,7 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
     );
 
     // Requests make the epoch step: the real program admits them, the pool
-    // answers their batches, and every step is one `observe` and one
+    // responds to their batches, and every step is one `observe` and one
     // `dispatch`.
     handle
         .generation()

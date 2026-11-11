@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::decision::{Plan, Room, Shortage, Victim};
+use crate::decision::{DispatchOutput, Room, Shortage, Victim};
 use crate::event::Event;
 use crate::limits::{Limits, Parameters};
 use crate::view::{CallView, RankView, ReplicaView, RequestView, Snapshot};
@@ -47,11 +47,11 @@ pub trait Policy {
     fn observe(&mut self, events: &[Event]);
 
     /// Once per step: what this step does.
-    fn dispatch(&mut self, room: &Room) -> Plan;
+    fn dispatch(&mut self, room: &Room) -> DispatchOutput;
 
     /// When device KV units, the host KV page pool or the encoder cache is
     /// short: which objects to free, in order.
-    fn reclaim(&mut self, shortage: &Shortage) -> Vec<Victim>;
+    fn preempt(&mut self, shortage: &Shortage) -> Vec<Victim>;
 
     /// When a request reaches the main process: which DP rank serves it.
     fn route(&mut self, request: &RequestView, ranks: &[RankView]) -> usize;

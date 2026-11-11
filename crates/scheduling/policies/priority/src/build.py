@@ -6,7 +6,7 @@ script` (design §5.2, §6.2): the script writes the raw module, and the server
 then precompiles it with `scheduling-precompile` into the artifact the main
 process loads.
 
-Contract with the server:
+Interface with the server:
 
 - reads `UNISERVE_OUT`, the directory it must write into;
 - writes `$UNISERVE_OUT/policy.wasm`, the raw wasm32 module;

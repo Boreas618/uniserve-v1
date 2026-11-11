@@ -1,6 +1,6 @@
 //! What the mechanism learns of the pools a worker serves (4.2, 7.3).
 //!
-//! [`WorkerInfo`] is what the scheduler plans against: each pool's capabilities, the capacities
+//! [`WorkerInfo`] is what the scheduler schedules against: each pool's capabilities, the capacities
 //! the engine launched it with, each rank's host pools in launch order, and the codec pairing that
 //! keeps a media unit on the host that decoded it. A deployment launched as processes derives those
 //! values from the ranks' startup reports; a deployment served in process derives them from what its
@@ -27,7 +27,7 @@ impl WorkerInfo {
     /// Fails, naming the pool, when a pool reports no rank, states no longest sequence, states a
     /// longest sequence another pool does not, or when its layout disagrees with the ranks it
     /// reports; fails as [`WorkerInfo::from_workers`] does when two pools share an identity or
-    /// replicas of one component expose different numerical outputs.
+    /// replicas of one stage expose different numerical outputs.
     pub fn from_inventory(pools: &[ipc::execution::Inventory]) -> anyhow::Result<Self> {
         ensure!(
             !pools.is_empty(),
@@ -45,7 +45,7 @@ impl WorkerInfo {
                 .map_err(|error| error.context(format!("pool {}", named(&pool.group))))?;
             reports.push((WorkerGroupId(pool.group.clone()), info));
         }
-        // Pool identities are unique and replicas of one component agree, which
+        // Pool identities are unique and replicas of one stage agree, which
         // is the same check every launch passes (`from_workers`).
         let mut info = Self::from_workers(reports)?;
 
@@ -92,7 +92,7 @@ impl WorkerInfo {
                 PoolLayout {
                     queue_depth: pool.layout.queue_depth.max(1),
                     ranks: pool.ranks.len(),
-                    components: pool.layout.components.clone(),
+                    stages: pool.layout.stages.clone(),
                 },
             );
             // Each rank's own reports, in launch order: media buffers, the
@@ -146,7 +146,7 @@ impl WorkerInfo {
                         .iter()
                         .map(|rank| rank.endpoint.host.clone())
                         .collect::<Vec<_>>(),
-                    pool.layout.components.clone(),
+                    pool.layout.stages.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -170,7 +170,7 @@ pub(crate) fn pool_info(ranks: &[MainProcessInfo]) -> anyhow::Result<MainProcess
     info.latent_pool = None;
     info.encoder_pool = None;
 
-    // A rank's product storage follows the components it holds, so the pool
+    // A rank's product storage follows the stages it holds, so the pool
     // reports the smallest nonzero pool, which no rank that holds products
     // falls short of.
     info.buffer_pool_bytes = ranks
@@ -319,7 +319,7 @@ mod tests {
         }
     }
 
-    fn components(names: &[(&str, &[usize])]) -> BTreeMap<String, BlockConfig> {
+    fn stages(names: &[(&str, &[usize])]) -> BTreeMap<String, BlockConfig> {
         names
             .iter()
             .map(|(name, ranks)| {
@@ -343,7 +343,7 @@ mod tests {
         group: &str,
         ranks: Vec<MainProcessInfo>,
         placed_ranks: usize,
-        components: BTreeMap<String, BlockConfig>,
+        stages: BTreeMap<String, BlockConfig>,
         max_model_len: u32,
     ) -> ipc::execution::Inventory {
         ipc::execution::Inventory {
@@ -352,7 +352,7 @@ mod tests {
             layout: ipc::execution::PoolLayout {
                 queue_depth: 2,
                 ranks: placed_ranks,
-                components,
+                stages,
             },
             max_model_len,
         }
@@ -362,13 +362,13 @@ mod tests {
     /// is an admissible pairing for its decoder.
     fn media_pool(host: &str) -> ipc::execution::Inventory {
         let mut info = rank(host, 64, None);
-        info.media_components = BTreeMap::from([
+        info.media_stages = BTreeMap::from([
             (MediaCall::VideoDecoding, "decode".to_owned()),
             (MediaCall::VideoEncoding, "encode".to_owned()),
         ]);
-        info.components = ["decode", "encode"]
+        info.stages = ["decode", "encode"]
             .into_iter()
-            .map(|name| ipc::ComponentInfo {
+            .map(|name| ipc::StageInfo {
                 name: name.to_owned(),
                 outputs: Vec::new(),
             })
@@ -377,7 +377,7 @@ mod tests {
             "media",
             vec![info],
             1,
-            components(&[("decode", &[0]), ("encode", &[0])]),
+            stages(&[("decode", &[0]), ("encode", &[0])]),
             4096,
         )
     }
@@ -388,7 +388,7 @@ mod tests {
             "text",
             vec![rank("gpu-a", 128, None), rank("gpu-b", 96, None)],
             2,
-            components(&[("text", &[0, 1])]),
+            stages(&[("text", &[0, 1])]),
             4096,
         );
         let info = WorkerInfo::from_inventory(&[text]).expect("one pool's facts describe it");
@@ -412,7 +412,7 @@ mod tests {
         let layout = info.layouts.get(&id).expect("the pool's launch");
         assert_eq!(layout.ranks, 2);
         assert_eq!(layout.queue_depth, 2);
-        assert_eq!(layout.components, components(&[("text", &[0, 1])]));
+        assert_eq!(layout.stages, stages(&[("text", &[0, 1])]));
         assert_eq!(info.max_model_len, 4096);
         assert_eq!(info.rank_count(&id), 2);
     }
@@ -426,7 +426,7 @@ mod tests {
             "text",
             vec![rank("gpu-a", 128, None)],
             1,
-            components(&[("text", &[0])]),
+            stages(&[("text", &[0])]),
             0,
         );
         let error = WorkerInfo::from_inventory(&[silent]).expect_err("a pool that states none");
@@ -439,14 +439,14 @@ mod tests {
             "text",
             vec![rank("gpu-a", 128, None)],
             1,
-            components(&[("text", &[0])]),
+            stages(&[("text", &[0])]),
             4096,
         );
         let wide = pool(
             "media",
             vec![rank("gpu-b", 64, None)],
             1,
-            components(&[("text", &[0])]),
+            stages(&[("text", &[0])]),
             8192,
         );
         let error = WorkerInfo::from_inventory(&[narrow, wide]).expect_err("two pools disagree");
@@ -493,7 +493,7 @@ mod tests {
         // The refusals that name the pool are the ones `from_inventory` makes.
         for (pools, named) in [
             (
-                vec![pool("no-ranks", Vec::new(), 1, components(&[]), 4096)],
+                vec![pool("no-ranks", Vec::new(), 1, stages(&[]), 4096)],
                 "no-ranks",
             ),
             (
@@ -501,7 +501,7 @@ mod tests {
                     "unbounded",
                     vec![rank("gpu-a", 64, None)],
                     1,
-                    components(&[("text", &[0])]),
+                    stages(&[("text", &[0])]),
                     0,
                 )],
                 "unbounded",
@@ -512,14 +512,14 @@ mod tests {
                         "short",
                         vec![rank("gpu-a", 64, None)],
                         1,
-                        components(&[("text", &[0])]),
+                        stages(&[("text", &[0])]),
                         4096,
                     ),
                     pool(
                         "long",
                         vec![rank("gpu-b", 64, None)],
                         1,
-                        components(&[("text", &[0])]),
+                        stages(&[("text", &[0])]),
                         8192,
                     ),
                 ],

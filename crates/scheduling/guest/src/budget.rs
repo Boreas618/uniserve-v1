@@ -1,6 +1,6 @@
 //! Filling one scheduling step's work under the step's room.
 //!
-//! Design §4.4: the mechanism states each step's room and rejects a `Plan`
+//! Design §4.4: the mechanism states each step's room and rejects a `DispatchOutput`
 //! that exceeds its token, call, graph-tier or slot limits as a policy
 //! failure, so a policy charges itself as it fills the step. This is the
 //! structure that does the charging, shared by every policy.

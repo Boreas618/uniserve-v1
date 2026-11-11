@@ -20,7 +20,7 @@ pub(crate) struct ScheduledContext {
 impl Scheduler {
     /// Counts prompt tokens accepted or present in pending forward inputs.
     pub(crate) fn num_scheduled_prompt_tokens(&self, id: RequestId) -> Option<u32> {
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         Some(
             self.inflight
                 .pending_calls
@@ -54,7 +54,7 @@ impl Scheduler {
     /// Projects the request's accepted context through its in-flight calls:
     /// logical and cache extents, and the input-image block cursor.
     pub(crate) fn scheduled_context(&self, id: RequestId) -> Option<ScheduledContext> {
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         let (mut logical, mut physical) = (state.logical_position, state.cache_visible_len);
         let mut blocks = state.block_cursor();
         for pending in self.inflight.pending_calls.get(&id).into_iter().flatten() {
@@ -102,7 +102,7 @@ impl Scheduler {
     /// visible. Only a verifier leaves the two apart, and its acceptance
     /// resolves before any successor is scheduled.
     pub(crate) fn projected_coordinates(&self, id: RequestId) -> Option<CallCoordinates> {
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         let (logical_position, cache_visible_len) = self.scheduled_token_lengths(id)?;
         let forward_submitted = self
             .inflight
@@ -125,7 +125,7 @@ impl Scheduler {
     /// Selects the next call from the last pending input, or from accepted
     /// request progress when no call remains. No request state is replayed.
     pub(crate) fn next_generation_phase(&self, id: RequestId) -> Option<Phase> {
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         let pending = self
             .inflight
             .pending_calls
@@ -150,10 +150,10 @@ impl Scheduler {
                             .iter()
                             .any(|inflight| is_prompt_extend(&inflight.call))
                     });
-                    if state.phase == Phase::CommitCanvas && !behind_commit {
-                        Phase::CommitCanvas
+                    if state.phase == Phase::CommitBlock && !behind_commit {
+                        Phase::CommitBlock
                     } else {
-                        Phase::Canvas
+                        Phase::Block
                     }
                 }
                 // A latent input-image block: context ingestion continues
@@ -166,7 +166,7 @@ impl Scheduler {
             None => state.phase,
         };
         Some(match phase {
-            // A complete prompt conditions a canvas-generating request's
+            // A complete prompt conditions a block-generating request's
             // blocks; any other request decodes from it. A block commit also
             // projects here, since it extends the context the same way, and
             // the next block follows it.
@@ -176,10 +176,10 @@ impl Scheduler {
                     && self.num_scheduled_images(id)?
                         >= state.req.multimodal_inputs.images.len() =>
             {
-                if self.config.canvas.is_some() {
-                    Phase::Canvas
+                if self.config.block_sampling.is_some() {
+                    Phase::Block
                 } else if self.decodes_elsewhere(id) {
-                    Phase::HandOff
+                    Phase::TransferState
                 } else {
                     Phase::DecodeUnd
                 }
@@ -192,7 +192,7 @@ impl Scheduler {
     /// request is not running or its current epoch is not yet registered
     /// with its workers.
     pub(crate) fn state_predecessor(&self, id: RequestId) -> Option<CallId> {
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         state.worker_registered.then_some(())?;
         Some(state.last_state_call_id)
     }
@@ -238,8 +238,8 @@ impl Scheduler {
                     .pending_buffer_frees
                     .remove(buffer)
                     .or_else(|| {
-                        self.running
-                            .get_mut(&id)
+                        self.requests
+                            .tokens_mut(&id)
                             .filter(|state| state.request_epoch == buffer.owner.request_epoch)
                             .and_then(|state| state.allocations_mut()?.take_buffer(*buffer))
                     })
@@ -290,7 +290,7 @@ impl Scheduler {
     pub(crate) fn can_queue_successor(&self, id: RequestId, target: CallKind) -> bool {
         // Successor projection requires both live runtime state and an unresolved
         // predecessor whose device products carry the accepted execution result.
-        let Some(state) = self.running.get(&id) else {
+        let Some(state) = self.requests.tokens(&id) else {
             return false;
         };
         let Some(queue) = self
@@ -305,7 +305,7 @@ impl Scheduler {
         // Bound speculation by worker capacity and exclude requests whose
         // terminal or relay state makes the projection unsafe.
         if queue.len() >= self.info.max_unresolved_calls as usize
-            || state.terminal_intent.is_some()
+            || self.requests.finished(&id)
             || self.inflight.pending_finishes.contains_key(&id)
             || !Self::device_token_relay_eligible(state)
         {
@@ -356,7 +356,7 @@ impl Scheduler {
     /// is, and so carries no predicate.
     ///
     /// Two successors follow unconditionally:
-    /// - The canvas pass that follows the prefill completing a context (a
+    /// - The block pass that follows the prefill completing a context (a
     ///   block's first step), since the prefill cannot stop the request.
     ///   The pass reads the prefix cache the prefill writes, and only
     ///   the worker's device order puts the write first: the worker runs the
@@ -367,8 +367,8 @@ impl Scheduler {
     ///   flight. The host has accepted the step that stopped the block, so
     ///   every step behind it is a no-op whose completion is false, and the
     ///   commit runs regardless. The commit writes the block's tokens to cache
-    ///   positions `[P, P + canvas)`, where `P` is the context length each
-    ///   step of the block reads; a canvas step reads cache below `P` and writes
+    ///   positions `[P, P + block)`, where `P` is the context length each
+    ///   step of the block reads; a block step reads cache below `P` and writes
     ///   none, so the commit's writes never overlap what those steps read.
     ///   Each rank also runs the commit after them in submission order on
     ///   its device stream, under data and expert parallelism alike.
@@ -383,13 +383,15 @@ impl Scheduler {
         };
         match target {
             CallKind::Forward(ForwardMode::TokenDenoising) => is_prompt_extend(&predecessor.call),
-            CallKind::Forward(ForwardMode::Prefill) => self.running.get(&id).is_some_and(|state| {
-                state.phase == Phase::CommitCanvas
-                    && predecessor
-                        .call
-                        .canvas
-                        .is_some_and(|step| step.block == state.canvas_block)
-            }),
+            CallKind::Forward(ForwardMode::Prefill) => {
+                self.requests.tokens(&id).is_some_and(|state| {
+                    state.phase == Phase::CommitBlock
+                        && predecessor
+                            .call
+                            .block_step
+                            .is_some_and(|step| step.block == state.block_index)
+                })
+            }
             _ => false,
         }
     }
@@ -403,7 +405,7 @@ impl Scheduler {
         if !self.inflight.has_pending_calls(id) {
             return None;
         }
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         if self.num_scheduled_prompt_tokens(id)? < state.req.prompt_token_ids.len() as u32
             || self.num_scheduled_images(id)? < state.req.multimodal_inputs.images.len()
         {
@@ -412,16 +414,16 @@ impl Scheduler {
         self.inflight.pending_calls.get(&id)?.back()?;
         Some(match self.next_generation_phase(id)? {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
-            // The hand-off copies the request's cache with no call.
-            Phase::HandOff => return None,
-            Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
-            Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
+            // The transfer copies the request's cache with no call.
+            Phase::TransferState => return None,
+            Phase::Block => CallKind::Forward(ForwardMode::TokenDenoising),
+            Phase::CommitBlock => CallKind::Forward(ForwardMode::Prefill),
             Phase::IngestState => return None,
         })
     }
 
     /// Returns whether a successor can consume device-selected tokens before host observation.
-    pub(crate) fn device_token_relay_eligible(state: &RequestState) -> bool {
+    pub(crate) fn device_token_relay_eligible(state: &TokenState) -> bool {
         // A successor may consume the parent's device-selected point before host
         // observation whenever its own sampling state is device-representable
         // from registered coordinates and device products alone. Multi-token
@@ -437,7 +439,7 @@ impl Scheduler {
     /// to the next decode. CPU stop and EOS decisions are complete before this
     /// check; a continuing request therefore names the same sampled token.
     pub(crate) fn can_reuse_resolved_token_product(&self, id: RequestId) -> bool {
-        self.running.get(&id).is_some_and(|state| {
+        self.requests.tokens(&id).is_some_and(|state| {
             state.worker_registered
                 && state.num_generated_tokens > 0
                 && state.latest_token.as_ref().is_some()
@@ -448,9 +450,9 @@ impl Scheduler {
 
     /// Whether the request's prompt was prefilled on a group that does not
     /// decode (`WorkerGroupRole::Prefill`): it decodes on a decode group,
-    /// to which `Phase::HandOff` moves its KV cache.
+    /// to which `Phase::TransferState` moves its KV cache.
     pub(crate) fn decodes_elsewhere(&self, id: RequestId) -> bool {
-        let Some(state) = self.running.get(&id) else {
+        let Some(state) = self.requests.tokens(&id) else {
             return false;
         };
         let key = RequestKey::new(self.engine_id, id, state.request_epoch);
@@ -460,27 +462,30 @@ impl Scheduler {
             .is_some_and(|owner| self.dispatch.prefill_groups.contains(owner))
     }
 
-    /// Whether a media request may take its next call.
+    /// Returns whether request `id` may take its next call.
     ///
-    /// A media request has no token output window to fill and no decoder
-    /// boundaries: its own state (`MediaFlowState`) names the calls it has
-    /// ready, and the media flow checks that, its admission in flight and the
-    /// component and host task pools it occupies when it plans one. Its output
-    /// journal is unbounded — one event per call — so there is no window to
-    /// wait for either; only a finish in flight holds it.
-    pub(crate) fn media_can_schedule_next(&self, id: RequestId) -> bool {
-        !self.inflight.pending_finishes.contains_key(&id)
-    }
-
-    /// Returns whether the next call can be scheduled.
+    /// No request does while a finish of it is in flight. A video request
+    /// has no token output window to fill and no decoder boundaries: its
+    /// graph names the calls it has ready, and assembly checks its admission
+    /// in flight and the stage and host thread pools it occupies when it
+    /// builds one; its output is one event per call, so there is no window to
+    /// wait for either. A token request also waits for room in its output
+    /// window, for the frontend decoder's decisions, for a worker that
+    /// serves its next call, and for its calls in flight unless a successor
+    /// may be queued behind them.
     pub(crate) fn can_schedule_next(&self, id: RequestId) -> bool {
-        !self.inflight.pending_finishes.contains_key(&id)
-            && self.output_window_ready(id)
-            && self.running.get(&id).is_some_and(|state| {
+        if self.inflight.pending_finishes.contains_key(&id) {
+            return false;
+        }
+        if self.requests.video(&id).is_some() {
+            return true;
+        }
+        self.output_window_ready(id)
+            && self.requests.tokens(&id).is_some_and(|state| {
                 !state.speculative_chain_invalidated
                     && state.output.decoder_boundaries.len()
                         < self.info.max_unresolved_calls.max(1) as usize
-                    && self.peek_next_call_variant(id).is_none_or(|kind| {
+                    && self.token_next_call(id).is_none_or(|kind| {
                         self.dispatch
                             .worker_target(
                                 &self.worker,
@@ -527,10 +532,10 @@ impl Scheduler {
     ///
     /// The request's event journal must hold, besides `OUTPUT_TERMINAL_RESERVE`
     /// events kept for its terminal output, the `output_bound` of every
-    /// in-flight call plus that of the call it plans next. Returns `false`
+    /// in-flight call plus that of the call it schedules next. Returns `false`
     /// for a request that is not running or whose journal is closed.
     pub(crate) fn output_window_ready(&self, id: RequestId) -> bool {
-        let Some(state) = self.running.get(&id) else {
+        let Some(state) = self.requests.tokens(&id) else {
             return false;
         };
         if state.output.events.is_closed() {
@@ -546,7 +551,7 @@ impl Scheduler {
             .map(|pending| output_bound(pending.call.kind))
             .sum::<usize>();
         let next = self
-            .peek_next_call_variant(id)
+            .token_next_call(id)
             .map_or(DEFAULT_OUTPUT_EVENTS, output_bound);
         available
             .saturating_sub(reserved)

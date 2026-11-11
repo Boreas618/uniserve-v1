@@ -20,7 +20,7 @@
 //!
 //! The device tier is the nearer: an input image's encoding it holds is
 //! pinned for the request without a call. Otherwise the encoding is looked
-//! up in the host tier before its call is planned (`encoding_ready`), and
+//! up in the host tier before its call is prepared (`encoding_ready`), and
 //! the call reads its output from the pool's pages instead of encoding
 //! (an import), or encodes and writes its output to them (an export), or
 //! encodes alone when the pools cannot serve it
@@ -64,7 +64,7 @@ fn inputs(image: &[u8; 32], draw: Option<(u64, u32)>) -> [u8; 32] {
 
 /// The device tier's key of an encoding of output `name` that read what
 /// `inputs` digests.
-fn device_key(name: &str, inputs: &[u8; 32]) -> crate::kv_cache::EncoderKey {
+fn device_key(name: &str, inputs: &[u8; 32]) -> crate::encoder_cache::EncoderKey {
     let mut digest = Digest::new(b"encoder-cache");
     digest.text(name);
     digest.bytes(inputs);
@@ -85,7 +85,7 @@ pub(crate) struct Encoding {
 
 impl Encoding {
     /// The device tier's key of the encoding.
-    pub(super) fn device_key(&self) -> crate::kv_cache::EncoderKey {
+    pub(super) fn device_key(&self) -> crate::encoder_cache::EncoderKey {
         device_key(self.output.name, &self.inputs)
     }
 }
@@ -129,16 +129,16 @@ impl Scheduler {
         })
     }
 
-    /// Whether request `id`'s `encoding` may be planned now: its lookup in
+    /// Whether request `id`'s `encoding` may be prepared now: its lookup in
     /// the host encoder pools resolved, or it has none. Starts the lookup
     /// when the request has not looked the encoding up yet, ending the
-    /// lookup of an encoding it no longer plans. The encoding is looked up
+    /// lookup of an encoding it no longer schedules. The encoding is looked up
     /// on the replica its call will run on, to which the request is bound
     /// now, when the pools serve its output there and the request's cache
     /// policy reads or writes cached outputs (`CachePolicy`); while that
     /// replica has no room for the call, the encoding waits.
     pub(super) fn encoding_ready(&mut self, id: RequestId, encoding: Encoding) -> bool {
-        let Some(state) = self.running.get(&id) else {
+        let Some(state) = self.requests.tokens(&id) else {
             return false;
         };
         if self.encoder_outputs.is_none() {
@@ -176,7 +176,7 @@ impl Scheduler {
                 output = encoding.output.name,
                 "the image encoding is computed: no rank states its rows"
             );
-            if let Some(state) = self.running.get_mut(&id) {
+            if let Some(state) = self.requests.tokens_mut(&id) {
                 state.host_encoding = Some(encoding);
             }
             return true;
@@ -212,7 +212,7 @@ impl Scheduler {
         );
         // An encoding that could not be looked up is computed: its call
         // carries no host output.
-        if let Some(state) = self.running.get_mut(&id) {
+        if let Some(state) = self.requests.tokens_mut(&id) {
             state.host_encoding = Some(encoding);
         }
         self.encoder_outputs
@@ -223,7 +223,7 @@ impl Scheduler {
     /// Ends request `id`'s lookup of `encoding` in the host encoder pools,
     /// which the request reads from its engine's encoder cache instead.
     pub(super) fn drop_host_encoding(&mut self, id: RequestId, encoding: Encoding) {
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         if state.host_encoding != Some(encoding) {
@@ -249,7 +249,7 @@ impl Scheduler {
         ) {
             return;
         }
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         let Some(encoding) = state.host_encoding.take() else {
@@ -262,7 +262,7 @@ impl Scheduler {
         // The encoding's output is the call's whole output: its first row is
         // the stored output's first, and its rows are bounded by the block's
         // cache tokens.
-        call.host_output = store.plan_call(
+        call.host_output = store.prepare_call(
             request_key,
             encoding.output,
             call.call_id,

@@ -40,11 +40,11 @@ pub(crate) fn rank_report(
         .chain(speculates.then_some(ipc::CallKind::Forward(ipc::ForwardMode::Verify)))
         .chain(images.then_some(ipc::CallKind::Media(ipc::MediaCall::VisionEncoding)))
         .collect(),
-        media_components: std::collections::BTreeMap::new(),
+        media_stages: std::collections::BTreeMap::new(),
         // The component this rank holds, named as the rank layout names it (`schedulers` places one
         // component over every rank). The scheduler routes a call by component name, so a rank that
         // advertised a name of its own would hold nothing any pool asks for.
-        components: vec![ipc::ComponentInfo {
+        components: vec![ipc::StageInfo {
             name: proto::config::DEFAULT_BLOCK.to_owned(),
             outputs: Vec::new(),
         }],
@@ -166,47 +166,47 @@ pub(super) fn media_rank_report(
     // The stage names are the deployment's own, which the pipeline's stages answer to: a scheduler
     // routes a call by that name, and a rank that advertised names of its own would hold nothing
     // any pool asks for.
-    let mut media_components = std::collections::BTreeMap::new();
-    media_components.insert(
+    let mut media_stages = std::collections::BTreeMap::new();
+    media_stages.insert(
         MediaCall::TextEncoding,
         Stage::TextEncoder.name().to_owned(),
     );
-    media_components.insert(MediaCall::LatentPreparation, denoiser.to_owned());
-    media_components.insert(MediaCall::Denoising, denoiser.to_owned());
+    media_stages.insert(MediaCall::LatentPreparation, denoiser.to_owned());
+    media_stages.insert(MediaCall::Denoising, denoiser.to_owned());
     // A conditioned request's own calls: a rank that takes none states an empty bound for them, and
     // a request's graph holds them only when it carries conditions.
     if bounds.conditions.rows > 0 {
-        media_components.insert(MediaCall::MediaReading, "media_reader".to_owned());
-        media_components.insert(
+        media_stages.insert(MediaCall::MediaReading, "media_reader".to_owned());
+        media_stages.insert(
             MediaCall::VisionEncoding,
             Stage::TextEncoder.name().to_owned(),
         );
-        media_components.insert(
+        media_stages.insert(
             MediaCall::LatentEncoding,
             Stage::LatentEncoder.name().to_owned(),
         );
     }
-    media_components.insert(
+    media_stages.insert(
         MediaCall::VideoDecoding,
         Stage::VideoDecoder.name().to_owned(),
     );
-    media_components.insert(
+    media_stages.insert(
         MediaCall::AudioDecoding,
         Stage::AudioDecoder.name().to_owned(),
     );
-    media_components.insert(MediaCall::VideoEncoding, "video_codec".to_owned());
-    media_components.insert(MediaCall::AudioEncoding, "muxer".to_owned());
-    media_components.insert(MediaCall::Muxing, "muxer".to_owned());
-    let supported_calls: Vec<ipc::CallKind> = media_components
+    media_stages.insert(MediaCall::VideoEncoding, "video_codec".to_owned());
+    media_stages.insert(MediaCall::AudioEncoding, "muxer".to_owned());
+    media_stages.insert(MediaCall::Muxing, "muxer".to_owned());
+    let supported_calls: Vec<ipc::CallKind> = media_stages
         .keys()
         .copied()
         .map(ipc::CallKind::Media)
         .collect();
-    let components: Vec<ipc::ComponentInfo> = media_components
+    let components: Vec<ipc::StageInfo> = media_stages
         .values()
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
-        .map(|name| ipc::ComponentInfo {
+        .map(|name| ipc::StageInfo {
             name: name.clone(),
             outputs: media_outputs(name, &bounds),
         })
@@ -220,7 +220,7 @@ pub(super) fn media_rank_report(
         device_exports: false,
         fabric_handles: platform::HandleType::probe(device)? == platform::HandleType::Fabric,
         supported_calls,
-        media_components,
+        media_stages,
         components,
     })
 }

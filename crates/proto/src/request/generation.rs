@@ -107,7 +107,7 @@ bitflags::bitflags! {
         const VISION_ENCODE = 1 << 1;
         /// Variational-autoencoder latent encoding.
         const LATENT_ENCODE = 1 << 2;
-        /// Denoising passes of token canvases that read a prompt's prefix cache
+        /// Denoising passes of token blocks that read a prompt's prefix cache
         /// without writing it.
         const TOKEN_DENOISING = 1 << 4;
     }
@@ -484,8 +484,8 @@ impl GenerationRequest {
 
     /// Returns the runtime features the request's computation reaches:
     /// understanding and the encoders of its context images. A request a
-    /// block-diffusion runtime generates in canvases needs
-    /// [`GenerationRequest::canvas_features`] instead.
+    /// block-diffusion runtime generates in blocks needs
+    /// [`GenerationRequest::block_features`] instead.
     pub fn required_features(&self) -> GenerationFeatures {
         self.context_encoders()
             .fold(GenerationFeatures::UNDERSTANDING, |needs, step| {
@@ -493,9 +493,9 @@ impl GenerationRequest {
             })
     }
 
-    /// Returns the features of denoising canvases over the request's context:
+    /// Returns the features of denoising blocks over the request's context:
     /// token denoising and the encoders of the context images.
-    pub fn canvas_features(&self) -> GenerationFeatures {
+    pub fn block_features(&self) -> GenerationFeatures {
         self.context_encoders()
             .fold(GenerationFeatures::TOKEN_DENOISING, |needs, step| {
                 needs | encoder_feature(step)
@@ -669,10 +669,10 @@ pub enum GenerationRequestError {
         /// The request's token limit.
         max_und_tokens: usize,
     },
-    /// A request a block-diffusion runtime generates in canvases names no
+    /// A request a block-diffusion runtime generates in blocks names no
     /// seed for its draws.
-    #[error("a canvas-generating request requires a sampling seed")]
-    UnseededCanvas,
+    #[error("a block-generating request requires a sampling seed")]
+    UnseededBlock,
     /// Text sampling parameters are invalid.
     #[error("invalid sampling parameters: {0}")]
     InvalidSampling(#[source] SamplingParamsError),
@@ -768,7 +768,7 @@ mod tests {
                 | GenerationFeatures::VISION_ENCODE
         );
         assert_eq!(
-            request.canvas_features(),
+            request.block_features(),
             GenerationFeatures::TOKEN_DENOISING
                 | GenerationFeatures::LATENT_ENCODE
                 | GenerationFeatures::VISION_ENCODE

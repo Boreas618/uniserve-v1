@@ -2,11 +2,11 @@
 //!
 //! One [`MainProcessRequest`] or [`MainProcessResponse`] is the message of one
 //! [`Frame`]. Each envelope's optional `message_id` is the
-//! request-response correlation identity: a rank answers a request under the
+//! request-response correlation identity: a rank responds to a request under the
 //! identity it carried, and a transport that matches a response to its request
 //! reads the identity from the decoded envelope, taking `None` as zero. It is
-//! unrelated to the planned calls' [`CallId`] values inside a batch. The one
-//! message a rank sends unasked, [`MainProcessResponse::Stalled`], answers no
+//! unrelated to the prepared calls' [`CallId`] values inside a batch. The one
+//! message a rank sends unasked, [`MainProcessResponse::Stalled`], responds to no
 //! request and carries no identity.
 
 use super::*;
@@ -49,7 +49,7 @@ pub enum MainProcessRequest {
     },
     /// Submits a shadow batch (§7.3 step 2): the paired forwards of the batch's generation
     /// against the serving one, which a group's ranks run together as they run its serving
-    /// batches. Answered as [`Self::Submit`] is.
+    /// batches. Responds as [`Self::Submit`] is.
     Shadow {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
@@ -64,14 +64,14 @@ pub enum MainProcessRequest {
     /// Promotes a parked standby worker to serving: it takes write access
     /// to the exclusive storages its predecessor held, once the predecessor
     /// is out, and makes their mappings writable at unchanged addresses.
-    /// Answered with `Ok` once the worker serves.
+    /// Responds with `Ok` once the worker serves.
     Promote {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
     },
     /// Runs the worker hook `name` (`uniserve.hooks`), which a plugin
     /// implements, with `payload`, a JSON value. The engine sends it while
-    /// the worker runs no forward. Answered with
+    /// the worker runs no forward. Responds with
     /// [`MainProcessResponse::Hooked`] and the hook's JSON result.
     Hook {
         /// Optional request-response correlation identity.
@@ -241,7 +241,7 @@ pub enum MainProcessResponse {
         /// Structured failure details.
         error: MainProcessResponseError,
     },
-    /// Answers a [`MainProcessRequest::Hook`] with the hook's JSON result.
+    /// Responds to a [`MainProcessRequest::Hook`] with the hook's JSON result.
     Hooked {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,

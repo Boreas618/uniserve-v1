@@ -6,6 +6,7 @@
 
 pub(crate) mod fake;
 pub(crate) mod storage;
+pub(crate) mod toy;
 pub(crate) mod video;
 
 pub(crate) use testkit::{SAMPLED, pool};
@@ -74,35 +75,8 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
 
 use ipc::{CallKind, ForwardMode, MainProcessInfo, MediaCall};
 use scheduler::{GenerationFeatures, GenerationLimits};
-use scheduler::{Parameters, PolicyProgram, Scheduler, SchedulerConfig, SpecialTokenIds, Worker};
+use scheduler::{Parameters, PolicyProgram, SchedulerConfig};
 use testkit::EndOfText;
-
-/// Builds a scheduler over the simulated worker `worker`, whose model limits
-/// follow from its call kinds (`generation_limits`), with `fcfs` installed.
-///
-/// Only the block-diffusion cases (`canvas`, `image_context`) still run over
-/// the simulator: the column writer lays out no token-denoising call, so the
-/// batch fake cannot observe them.
-pub(crate) fn scheduler_with(
-    worker: Box<dyn Worker>,
-    special_tokens: SpecialTokenIds,
-    config: SchedulerConfig,
-) -> anyhow::Result<Scheduler> {
-    let info = worker.info().runtime_info()?;
-    let limits = generation_limits(&info.supported_calls);
-    let mut scheduler = Scheduler::new(
-        scheduler::Submissions::new(worker),
-        special_tokens,
-        config,
-        limits,
-    )?;
-    install_policy_stating(
-        &mut scheduler,
-        scheduler::BatchCapacity::of(&info),
-        Parameters::default(),
-    );
-    Ok(scheduler)
-}
 
 /// A rank of the scheduler tests' text deployment: every call kind, a buffer
 /// pool and encoder cache large enough for any test's products, up to 1024
@@ -137,7 +111,7 @@ pub(crate) fn text_pool(
         layout: ipc::execution::PoolLayout {
             queue_depth,
             ranks: 1,
-            components: std::collections::BTreeMap::new(),
+            stages: std::collections::BTreeMap::new(),
         },
         max_model_len: TEXT_MAX_MODEL_LEN,
     };
@@ -151,7 +125,7 @@ pub(crate) fn text_pool(
 /// The model limits a deployment whose workers serve `calls` states.
 ///
 /// A token-denoising worker without text decode generates block-diffusion
-/// canvases over prompts that may carry encoded images; one that prepares
+/// blocks over prompts that may carry encoded images; one that prepares
 /// latents without decoding text serves video diffusion, which needs no
 /// generation feature. Any other vision- or latent-encoding worker reads
 /// images without bound, and the rest serve text.
@@ -192,7 +166,7 @@ pub(crate) fn generation_limits(calls: &[CallKind]) -> GenerationLimits {
 /// The policy module every integration test's epoch serves with.
 ///
 /// A deployed epoch takes its policy from the Program Server; a test epoch has
-/// none, and a scheduler with no policy decides nothing — no plan, no
+/// none, and a scheduler with no policy decides nothing — no output, no
 /// admission, no batch — so an epoch that submits a request must be given one.
 /// The module is the `fcfs` program this tree builds for
 /// `wasm32-unknown-unknown`, the one that reproduces the rules the tests were
@@ -202,20 +176,16 @@ pub(crate) fn policy_module() -> Vec<u8> {
     testkit::packaged_module()
 }
 
-/// Installs `fcfs` with the ceilings an epoch advertises and the parameters the
-/// epoch states about itself.
+/// The `fcfs` program with the ceilings an epoch advertises and the parameters
+/// the epoch states about itself.
 ///
 /// A judgement the views cannot carry is the policy's, weighed from the
-/// parameters the deployment states (design §7.7): an epoch that speculates
-/// states its speedup and what a refilled token costs there, because the
-/// mechanism's own measurement is not a view a policy reads.
-pub(crate) fn install_policy_stating(
-    scheduler: &mut Scheduler,
-    capacity: scheduler::BatchCapacity,
-    stated: Parameters,
-) {
+/// parameters the deployment states: an epoch that speculates states its
+/// speedup and what a refilled token costs there, because the mechanism's own
+/// measurement is not a view a policy reads.
+pub(crate) fn fcfs(capacity: scheduler::BatchCapacity, stated: Parameters) -> PolicyProgram {
     let ceilings = scheduler::ceilings_of(capacity);
-    let program = PolicyProgram {
+    PolicyProgram {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: Parameters {
@@ -228,11 +198,23 @@ pub(crate) fn install_policy_stating(
             ..stated
         },
         stated: Default::default(),
-    };
-    let source = scheduler::PolicyBytes::new(policy_module());
-    scheduler
-        .install_policy(program, &source)
-        .unwrap_or_else(|error| panic!("the fcfs policy is installed: {error}"));
+    }
+}
+
+/// The source the tests' policy module is read from.
+pub(crate) fn policy_source() -> std::sync::Arc<dyn scheduler::PolicySource + Send + Sync> {
+    std::sync::Arc::new(scheduler::PolicyBytes::new(policy_module()))
+}
+
+/// The response to a policy command, which a scheduler gives within a minute.
+pub(crate) fn applied<T>(
+    response: crossbeam_channel::Receiver<Result<T, String>>,
+    what: &str,
+) -> T {
+    response
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("the scheduler responds {what}"))
+        .unwrap_or_else(|error| panic!("{what} of the fcfs policy: {error}"))
 }
 
 /// Installs `fcfs` on a handle's epoch through the command surface the launch
@@ -245,70 +227,7 @@ pub(crate) fn install_policy_on(
     handle: &scheduler::SchedulerHandle,
     capacity: scheduler::BatchCapacity,
 ) {
-    let ceilings = scheduler::ceilings_of(capacity);
-    let program = PolicyProgram {
-        backend: "fcfs".to_owned(),
-        revision: 1,
-        arguments: Parameters {
-            chunked_prefill_size: Some(ceilings.chunked_prefill_size),
-            max_queued_requests: ceilings.max_queued_requests,
-            max_batch: Some(ceilings.max_batch),
-            max_num_batched_tokens: Some(ceilings.max_num_batched_tokens),
-            prefetch_min_tokens: Some(ceilings.prefetch_min_tokens),
-            timeout: Some(ceilings.timeout),
-            ..Default::default()
-        },
-        stated: Default::default(),
-    };
-    let source: std::sync::Arc<dyn scheduler::PolicySource + Send + Sync> =
-        std::sync::Arc::new(scheduler::PolicyBytes::new(policy_module()));
-    handle
-        .precopy_policy(program, source)
-        .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("the scheduler answers a precopy")
-        .expect("the fcfs policy is precopied");
-    handle
-        .stage(scheduler::Stage::Switchover)
-        .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("the scheduler answers a switchover")
-        .expect("the fcfs policy serves");
-}
-
-/// One call's rows as a batch's device layout states them, column by column.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct CallRows {
-    pub(crate) request_pool_indices: Vec<u32>,
-    pub(crate) seq_lens: Vec<u32>,
-    pub(crate) query_lens: Vec<u32>,
-    pub(crate) write_cache: Vec<bool>,
-}
-
-/// The rows the call at `index` of `batch` evaluates, read back from the
-/// batch's device layout: per row its request slot, attention length, query
-/// length and whether it writes the cache. Empty for a call of a batch the
-/// mechanism laid out no token columns for (a media or canvas call).
-pub(crate) fn rows_of(batch: &scheduler::ExecutionBatch, index: usize) -> CallRows {
-    let mut forward = CallRows::default();
-    let Some(device) = batch
-        .device
-        .as_ref()
-        .filter(|device| device.media.is_none())
-    else {
-        return forward;
-    };
-    let rows = &device.columns.rows;
-    let Some(call) = rows.calls.get(index) else {
-        return forward;
-    };
-    for row in call.rows.clone() {
-        let row = row as usize;
-        let start = rows.query_offsets[row];
-        let end = rows.query_offsets[row + 1];
-        let writes = rows.slot_mapping[start as usize] >= 0;
-        forward.request_pool_indices.push(call.request);
-        forward.seq_lens.push(rows.seq_lens[row] as u32);
-        forward.query_lens.push((end - start) as u32);
-        forward.write_cache.push(writes);
-    }
-    forward
+    let program = fcfs(capacity, Parameters::default());
+    applied(handle.precopy_policy(program, policy_source()), "a precopy");
+    applied(handle.stage(scheduler::Stage::Switchover), "a switchover");
 }

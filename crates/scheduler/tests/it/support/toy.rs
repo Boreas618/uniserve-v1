@@ -1,37 +1,37 @@
-//! The WebAssembly-text policy modules the policy switch's own unit tests state.
+//! The WebAssembly-text policy modules the policy switch's cases state.
 //!
-//! A [`Toy`] answers what a real policy never gives — a trap, a spent fuel budget, a decision
+//! A [`Toy`] responds to what a real policy never gives — a trap, a spent fuel budget, a decision
 //! outside the limits — so the switch's refusals can be stated. It is not a policy anyone serves
 //! with; a test epoch installs the packaged `fcfs` module (`testkit::packaged_policy`).
 
-use scheduling::guest::decision::{Plan, Victim};
+use scheduling::guest::decision::{DispatchOutput, Victim};
 use scheduling::guest::limits::Limits;
 use scheduling::guest::wire::Call;
 use serde::Serialize;
 
 /// Where a module keeps its message buffer and its replies.
 const MESSAGE: u32 = 4096;
-const PLAN: u32 = 8192;
+const OUTPUT: u32 = 8192;
 const LIMITS: u32 = 12288;
 const VICTIMS: u32 = 16384;
 
-/// The answer a toy policy module gives, and the calls it fails in.
+/// The response a toy policy module gives, and the calls it fails in.
 pub(crate) struct Toy {
-    pub(crate) plan: Plan,
+    pub(crate) output: DispatchOutput,
     pub(crate) limits: Limits,
     pub(crate) victims: Vec<Victim>,
     /// The call whose export traps (`unreachable`).
     pub(crate) trap: Option<Call>,
     /// The call whose export never returns.
     pub(crate) spin: Option<Call>,
-    /// The rank index `route` answers.
+    /// The rank index `route` responses.
     pub(crate) route: u32,
 }
 
 impl Default for Toy {
     fn default() -> Self {
         Self {
-            plan: Plan::default(),
+            output: DispatchOutput::default(),
             limits: fitting_limits(),
             victims: Vec::new(),
             trap: None,
@@ -44,8 +44,8 @@ impl Default for Toy {
 /// The module bytes of `toy`.
 pub(crate) fn toy_module(toy: &Toy) -> Vec<u8> {
     let bodies = [
-        (Call::Dispatch, PLAN, json(&toy.plan)),
-        (Call::Reclaim, VICTIMS, json(&toy.victims)),
+        (Call::Dispatch, OUTPUT, json(&toy.output)),
+        (Call::Preempt, VICTIMS, json(&toy.victims)),
     ];
     let mut functions = vec![
         format!("(func (export \"sched_alloc\") (param i32) (result i32) i32.const {MESSAGE})"),
@@ -54,15 +54,15 @@ pub(crate) fn toy_module(toy: &Toy) -> Vec<u8> {
         "(func (export \"sched_observe\") (param i32 i32) (result i64) i64.const 0)".to_owned(),
     ];
     let mut data = vec![format!(
-        "(data (i32.const {PLAN}) \"{}\")",
-        escape(&json(&toy.plan))
+        "(data (i32.const {OUTPUT}) \"{}\")",
+        escape(&json(&toy.output))
     )];
-    for (call, offset, answer) in bodies {
+    for (call, offset, response) in bodies {
         data.push(format!(
             "(data (i32.const {offset}) \"{}\")",
-            escape(&answer)
+            escape(&response)
         ));
-        functions.push(buffered(call, offset, answer.len(), toy));
+        functions.push(buffered(call, offset, response.len(), toy));
     }
     functions.push(buffered(Call::Limits, LIMITS, json(&toy.limits).len(), toy));
     data.push(format!(
@@ -80,7 +80,7 @@ pub(crate) fn toy_module(toy: &Toy) -> Vec<u8> {
     wat::parse_str(&source).expect("the toy policy module is valid WebAssembly text")
 }
 
-/// The export of a call that answers with a reply buffer.
+/// The export of a call that responds with a reply buffer.
 fn buffered(call: Call, offset: u32, len: usize, toy: &Toy) -> String {
     let params = if call == Call::Limits {
         String::new()
@@ -106,7 +106,7 @@ fn buffered(call: Call, offset: u32, len: usize, toy: &Toy) -> String {
     }
 }
 
-/// The export of a call that answers with the chosen index.
+/// The export of a call that responds with the chosen index.
 fn indexed(call: Call, index: u32, toy: &Toy) -> String {
     if toy.trap == Some(call) {
         format!(

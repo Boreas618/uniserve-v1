@@ -680,7 +680,7 @@ impl ModelRunner {
             && self.engine_config().kv_cache.prefix_caching
     }
 
-    /// What this rank's scheduler starts with ([`scheduler::SchedulerHandle::over_batches_telling`]):
+    /// What this rank's scheduler starts with ([`scheduler::SchedulerHandle::over_batches`]):
     /// the process's arguments `launch`, with the engine configuration as this process resolves it,
     /// and the mechanism's limits for this rank ([`scheduler::SchedulerConfig::of`]).
     ///
@@ -723,7 +723,7 @@ impl ModelRunner {
                 (running, tokens as usize, Vec::new())
             }
         };
-        model.canvas_sampling = None;
+        model.block_sampling = None;
         model.prefill_outputs = true;
         if !host_kv_cache {
             args.engine_config.kv_cache.host_tier = false;

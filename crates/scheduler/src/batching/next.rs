@@ -1,4 +1,4 @@
-//! Planning a request's next call: the call chosen from its accepted state
+//! Preparing a request's next call: the call chosen from its accepted state
 //! and pending input ranges (context prefill with the encodes its blocks need,
 //! the phases of generation), built with the cache units
 //! its dispatch owns, and the token constraints that vary with its scheduled
@@ -14,16 +14,16 @@ impl Scheduler {
     /// group's table gained since the last dispatch and advances
     /// `num_cache_units_sent`; a caller that drops the call must roll that back.
     ///
-    /// Returns `None` when the request is not running, when planning fails
+    /// Returns `None` when the request is not running, when preparing it fails
     /// (the request is then finished with `Error`), or, after latching
     /// engine-fatal, when a forward's request holds no cache tables.
-    pub(crate) fn plan_call(
+    pub(crate) fn prepare_call(
         &mut self,
         id: RequestId,
-        build: impl FnOnce(&Self, &GenerationRequest) -> Result<Call, generation::PlanningError>,
+        build: impl FnOnce(&Self, &GenerationRequest) -> Result<Call, generation::CallError>,
     ) -> Option<Call> {
-        let planned = build(self, &self.running.get(&id)?.req);
-        match planned {
+        let prepared = build(self, &self.requests.tokens(&id)?.req);
+        match prepared {
             Ok(mut call) => {
                 if matches!(
                     call.kind,
@@ -33,13 +33,13 @@ impl Scheduler {
                 ) {
                     // The cache owner keeps unit identities. The scheduled record
                     // only needs the number of fresh units for dispatch and drain.
-                    let state = self.running.get_mut(&id)?;
+                    let state = self.requests.tokens_mut(&id)?;
                     let Some(allocated) = state
                         .allocations()
                         .map(|allocations| allocations.prefix_cache.allocated_units())
                     else {
                         self.invariant_broken(
-                            "a request planning a forward holds its cache tables",
+                            "a request preparing a forward holds its cache tables",
                         );
                         return None;
                     };
@@ -52,7 +52,11 @@ impl Scheduler {
                 Some(call)
             }
             Err(error) => {
-                tracing::error!(request_id = id.0, ?error, "generation planning failed");
+                tracing::error!(
+                    request_id = id.0,
+                    ?error,
+                    "preparing the generation call failed"
+                );
                 self.finish(id, FinishReason::Error);
                 None
             }
@@ -63,10 +67,10 @@ impl Scheduler {
     ///
     /// Prompt text and input images still to ingest go through
     /// `next_context_call`; otherwise the request's next phase decides.
-    /// A canvas step takes one of the pass's canvas `rows`, and a context
+    /// A block step takes one of the pass's block `rows`, and a context
     /// prefill the segments that fit its context rows within `budget` tokens.
-    /// Returns `None` when nothing can be planned now, including when the
-    /// cache capacity a call needs or room for one whole canvas row is
+    /// Returns `None` when nothing can be prepared now, including when the
+    /// cache capacity a call needs or room for one whole block row is
     /// unavailable.
     pub(crate) fn next_generation_call(
         &mut self,
@@ -74,9 +78,9 @@ impl Scheduler {
         budget: usize,
         rows: PassRows,
     ) -> Option<Call> {
-        let canvas_rows = rows.canvas;
+        let block_rows = rows.block;
         let (_, cache_visible_len) = self.scheduled_token_lengths(id)?;
-        let context_pending = self.running.get(&id).is_some_and(|st| {
+        let context_pending = self.requests.tokens(&id).is_some_and(|st| {
             self.num_scheduled_prompt_tokens(id)
                 .is_some_and(|count| count < st.req.prompt_token_ids.len() as u32)
                 || self
@@ -89,8 +93,8 @@ impl Scheduler {
         let phase = self.next_generation_phase(id)?;
         match phase {
             Phase::Prefill => {
-                let st = self.running.get(&id)?;
-                let samples = self.config.canvas.is_none();
+                let st = self.requests.tokens(&id)?;
+                let samples = self.config.block_sampling.is_none();
                 let n = st.req.prompt_token_ids.len();
                 let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
                 // Chunked prefill with the clip rule: the chunk is bounded by
@@ -104,7 +108,7 @@ impl Scheduler {
                 // token after it, and the last proposes drafts, whose
                 // chained steps take the positions after the prompt.
                 let draft = if self.speculates() {
-                    let prompt = &self.running.get(&id)?.req.prompt_token_ids;
+                    let prompt = &self.requests.tokens(&id)?.req.prompt_token_ids;
                     ipc::DraftWork {
                         proposals: if end == n {
                             self.proposals_for(id, cache_visible_len)
@@ -123,8 +127,8 @@ impl Scheduler {
                     return None;
                 }
                 let sampling_state = self.build_token_masks(id, 0);
-                self.plan_call(id, |_scheduler, request| {
-                    generation::plan_prompt(
+                self.prepare_call(id, |_scheduler, request| {
+                    generation::prepare_prompt(
                         request,
                         cursor as u32,
                         end as u32,
@@ -146,7 +150,7 @@ impl Scheduler {
             // the tokens it accepted and the drafts after them.
             Phase::DecodeUnd if self.speculates() => {
                 let sampling_state = self.build_token_masks(id, 0);
-                let input_token = self.running.get(&id)?.next_token;
+                let input_token = self.requests.tokens(&id)?.next_token;
                 let drafts = self.verify_drafts(id, cache_visible_len);
                 let proposals = self.proposals_for(id, cache_visible_len);
                 // The cache holds the verified tokens and, for the drafter's
@@ -159,7 +163,7 @@ impl Scheduler {
                 );
                 if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
                     // The request stays where it is for this step, and the pass
-                    // stays non-token behind it. A plan the mechanism cannot
+                    // stays non-token behind it. A dispatch output the mechanism cannot
                     // build is a stall the rest of the epoch cannot see, so it
                     // is named at `warn`: a policy that keeps asking for a
                     // verification the cache has no room for would otherwise
@@ -174,8 +178,8 @@ impl Scheduler {
                     );
                     return None;
                 }
-                let planned = self.plan_call(id, |_scheduler, request| {
-                    generation::plan_verify(
+                let prepared = self.prepare_call(id, |_scheduler, request| {
+                    generation::prepare_verify(
                         request,
                         input_token,
                         &drafts,
@@ -183,7 +187,7 @@ impl Scheduler {
                         sampling_state,
                     )
                 });
-                if planned.is_none() {
+                if prepared.is_none() {
                     tracing::warn!(
                         request = id.0,
                         drafts = drafts.len(),
@@ -191,7 +195,7 @@ impl Scheduler {
                         "a verification could not be built from the request's state"
                     );
                 }
-                planned
+                prepared
             }
             Phase::DecodeUnd => {
                 let projected_successor = self.inflight.has_pending_calls(id);
@@ -204,7 +208,7 @@ impl Scheduler {
                     0
                 };
                 let sampling_state = self.build_token_masks(id, projected);
-                let st = self.running.get(&id)?;
+                let st = self.requests.tokens(&id)?;
                 // The prior committed token this decode continues from. It is
                 // attached as a host input only when no exact selected-point
                 // product is eligible for device continuation.
@@ -215,15 +219,15 @@ impl Scheduler {
                     return None;
                 }
 
-                self.plan_call(id, |_scheduler, request| {
-                    generation::plan_decode(request, input_token, relay_input, sampling_state)
+                self.prepare_call(id, |_scheduler, request| {
+                    generation::prepare_decode(request, input_token, relay_input, sampling_state)
                 })
             }
-            // The hand-off copies the request's cache with no call.
-            Phase::HandOff => None,
+            // The transfer copies the request's cache with no call.
+            Phase::TransferState => None,
             Phase::IngestState => self.next_context_call(id, budget, rows.context),
-            Phase::Canvas => {
-                // One step of the request's block is one read-only canvas row
+            Phase::Block => {
+                // One step of the request's block is one read-only block row
                 // of the pass. The next step may be queued behind the steps
                 // still in flight, predicated on the last one's completion:
                 // the worker runs it as a no-op once an earlier step stopped
@@ -234,20 +238,20 @@ impl Scheduler {
                 // A block's first step may likewise be queued behind the
                 // prefill that completes its context: the prompt's last
                 // chunk, or the previous block's commit, which makes the
-                // planned step the next block's step zero.
-                let st = self.running.get(&id)?;
-                let canvas = self.config.canvas?;
-                let canvas_length = canvas.canvas_length as usize;
+                // prepared step the next block's step zero.
+                let st = self.requests.tokens(&id)?;
+                let sampling = self.config.block_sampling?;
+                let block_length = sampling.block_length as usize;
                 let pending = self.inflight.num_pending_calls(id);
                 if (pending > 0
                     && !self
                         .can_queue_successor(id, CallKind::Forward(ForwardMode::TokenDenoising)))
-                    || canvas_rows == 0
-                    || canvas_length > budget
+                    || block_rows == 0
+                    || block_length > budget
                 {
                     return None;
                 }
-                // The steps in flight that the planned step follows are those
+                // The steps in flight that the prepared step follows are those
                 // behind the latest queued prefill: steps queued before a
                 // commit are the stopped block's no-ops.
                 let queued = self.inflight.pending_calls.get(&id);
@@ -256,38 +260,38 @@ impl Scheduler {
                         .iter()
                         .rev()
                         .take_while(|inflight| !is_prompt_extend(&inflight.call))
-                        .filter(|inflight| inflight.call.canvas.is_some())
+                        .filter(|inflight| inflight.call.block_step.is_some())
                         .count()
                 });
-                let commit_in_flight = st.phase == Phase::CommitCanvas
+                let commit_in_flight = st.phase == Phase::CommitBlock
                     && queued.is_some_and(|calls| {
                         calls
                             .iter()
                             .any(|inflight| is_prompt_extend(&inflight.call))
                     });
                 let (block, first_step) = if commit_in_flight {
-                    (st.canvas_block.saturating_add(1), 0)
+                    (st.block_index.saturating_add(1), 0)
                 } else {
-                    (st.canvas_block, st.canvas_step)
+                    (st.block_index, st.block_step)
                 };
                 let step =
                     first_step.saturating_add(u32::try_from(steps_in_flight).unwrap_or(u32::MAX));
-                if step >= canvas.max_steps {
+                if step >= sampling.max_steps {
                     return None;
                 }
-                self.plan_call(id, |_scheduler, request| {
-                    generation::plan_canvas_step(request, &canvas, block, step)
+                self.prepare_call(id, |_scheduler, request| {
+                    generation::prepare_block_step(request, &sampling, block, step)
                 })
             }
-            Phase::CommitCanvas => {
+            Phase::CommitBlock => {
                 // The stopped block's tokens extend the context as one causal
-                // prefill row. The commit is planned once the host accepts
+                // prefill row. The commit is prepared once the host accepts
                 // the step that stopped the block, queued without a predicate
                 // behind the block's steps still in flight, which are no-ops
                 // (`follows_unconditionally`), so the worker launches it
                 // while they run.
-                let st = self.running.get(&id)?;
-                let tokens = st.canvas_commit.clone();
+                let st = self.requests.tokens(&id)?;
+                let tokens = st.block_commit.clone();
                 if (self.inflight.has_pending_calls(id)
                     && !self.can_queue_successor(id, CallKind::Forward(ForwardMode::Prefill)))
                     || tokens.len() > budget
@@ -298,14 +302,14 @@ impl Scheduler {
                 if !self.ensure_request_capacity(id, cache_visible_len as usize, end) {
                     return None;
                 }
-                self.plan_call(id, |_scheduler, request| {
-                    generation::plan_canvas_commit(request, &tokens)
+                self.prepare_call(id, |_scheduler, request| {
+                    generation::prepare_block_commit(request, &tokens)
                 })
             }
         }
     }
 
-    /// Plans the next context-ingest call within `budget` tokens.
+    /// Prepares the next context-ingest call within `budget` tokens.
     ///
     /// The context is the prompt with the blocks of its input images at their
     /// positions: each encoder of an image writes one block, in encoder order.
@@ -322,7 +326,7 @@ impl Scheduler {
     /// not fit waits for the next chunk, which it starts, and a chunk that
     /// starts with a block may exceed the threshold within the budget. It is
     /// one forward row, which `context_rows` must leave room for.
-    /// Returns `None` when nothing can be planned now, including when the
+    /// Returns `None` when nothing can be prepared now, including when the
     /// next block does not fit this pass or the request's cache capacity is
     /// unavailable.
     pub(crate) fn next_context_call(
@@ -338,8 +342,8 @@ impl Scheduler {
         let (_, cache_visible_len) = self.scheduled_token_lengths(id)?;
 
         // A latent block's encoder product awaits its own extension.
-        if self.running.get(&id)?.phase == Phase::IngestState {
-            let state = self.running.get(&id)?;
+        if self.requests.tokens(&id)?.phase == Phase::IngestState {
+            let state = self.requests.tokens(&id)?;
             let feature = state.input_image_features.clone()?;
             let (_, encoder_input) = state.input_block(state.block_cursor())?;
             let encoder_input = *encoder_input;
@@ -356,8 +360,8 @@ impl Scheduler {
             ) {
                 return None;
             }
-            return self.plan_call(id, |scheduler, request| {
-                generation::plan_image_extend(
+            return self.prepare_call(id, |scheduler, request| {
+                generation::prepare_image_extend(
                     &scheduler.generation_limits,
                     request,
                     encoder_input,
@@ -369,9 +373,9 @@ impl Scheduler {
         // Encode the next block the context needs. A product the encoder
         // cache holds is pinned for the request instead, without a call;
         // otherwise the encoding is looked up in the host encoder pools before
-        // its call is planned.
+        // its call is prepared.
         while let Some((block, step)) = self.next_context_encode(id) {
-            let state = self.running.get(&id)?;
+            let state = self.requests.tokens(&id)?;
             let (image, _) = state.input_block(block)?;
             let Some(encoding) = self.encoding(&state.req, block) else {
                 self.invariant_broken("a queued input encoder has a valid cache capacity");
@@ -386,15 +390,15 @@ impl Scheduler {
             };
             let Some(cached_product) = cached else {
                 // A cache miss schedules the encoder. Nothing else of the
-                // request is planned while it is in flight, so its completion
+                // request is prepared while it is in flight, so its completion
                 // finds the same block here.
                 if !self.encoding_ready(id, encoding) {
                     return None;
                 }
-                let state = self.running.get(&id)?;
+                let state = self.requests.tokens(&id)?;
                 let draw = generation::latent_draw(&state.req, block);
-                return self.plan_call(id, |scheduler, request| {
-                    generation::plan_encode(
+                return self.prepare_call(id, |scheduler, request| {
+                    generation::prepare_encode(
                         &scheduler.generation_limits,
                         request,
                         step.into(),
@@ -404,7 +408,7 @@ impl Scheduler {
                 });
             };
             let product = self.storage.encoder_cache.acquire(cache_key)?;
-            // Planning a call that reads a cached feature re-uses the entry, so
+            // Preparing a call that reads a cached feature re-uses the entry, so
             // the policy's LRU sees the use.
             self.record_encoded(cache_key);
             if product != cached_product {
@@ -415,7 +419,7 @@ impl Scheduler {
             self.drop_host_encoding(id, encoding);
             // If request ownership disappeared during acquisition, release
             // the pin.
-            let Some(state) = self.running.get_mut(&id) else {
+            let Some(state) = self.requests.tokens_mut(&id) else {
                 let _ = self.storage.encoder_cache.release(cache_key, &product);
                 return None;
             };
@@ -436,7 +440,7 @@ impl Scheduler {
         // not yet encoded ends the chunk.
         let limit = budget.max(1).min(self.config.prefill_chunk());
         let (end, blocks, block_tokens) = {
-            let state = self.running.get(&id)?;
+            let state = self.requests.tokens(&id)?;
             let prompt_len = state.req.prompt_token_ids.len();
             let mut end = cursor;
             let mut used = 0usize;
@@ -508,9 +512,9 @@ impl Scheduler {
         }
 
         let sampling_state = self.build_token_masks(id, 0);
-        let samples = self.config.canvas.is_none();
-        self.plan_call(id, |_scheduler, request| {
-            generation::plan_prompt(
+        let samples = self.config.block_sampling.is_none();
+        self.prepare_call(id, |_scheduler, request| {
+            generation::prepare_prompt(
                 request,
                 cursor as u32,
                 end as u32,
@@ -526,20 +530,20 @@ impl Scheduler {
     /// advance, with its encoder, or `None` when the next context call needs
     /// no encode.
     ///
-    /// Walks the blocks after the accepted block cursor, whose leading
+    /// Goes through the blocks after the accepted block cursor, whose leading
     /// products `context_features` holds: the latent block at the scheduled
     /// prompt cursor is encoded for its own extension; vision blocks are
     /// encoded in order ahead of the context prefill that writes them, while
     /// their image lies within the long-prefill threshold of the scheduled
-    /// prompt cursor. The walk stops at a latent block past that cursor,
-    /// which the chunk before it does not reach. A request plans nothing
+    /// prompt cursor. The search stops at a latent block past that cursor,
+    /// which the chunk before it does not reach. A request schedules nothing
     /// while its encode is in flight, so the encode's completion identifies
-    /// its block by the same walk.
+    /// its block by the same search.
     pub(crate) fn next_context_encode(
         &self,
         id: RequestId,
     ) -> Option<(BlockCursor, crate::ImageEncoder)> {
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         if state.phase == Phase::IngestState {
             return None;
         }
@@ -569,7 +573,7 @@ impl Scheduler {
     /// its blocks, and each block's exact cache length. The blocks are the
     /// request's next ones after its scheduled block cursor.
     pub(super) fn context_segments(&self, id: RequestId, call: &Call) -> Option<Vec<u32>> {
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         let mut block = self.scheduled_context(id)?.blocks;
         let mut segments = Vec::with_capacity(2 * call.vision_inputs.len() + 1);
         let mut text_start = 0u32;
@@ -605,10 +609,10 @@ impl Scheduler {
         id: RequestId,
         projected: usize,
     ) -> Option<SamplingState> {
-        let n_generated = self.running.get(&id).map_or(0, |state| {
+        let n_generated = self.requests.tokens(&id).map_or(0, |state| {
             state.num_generated_tokens.saturating_add(projected)
         });
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         let suppress = suppressed_tokens(
             &state.req.sampling,
             &self.special_tokens.eos,

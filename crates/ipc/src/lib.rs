@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 /// Result type for semantic worker-message validation.
 pub type ValidationResult<T> = std::result::Result<T, ValidationError>;
 
-/// Describes a worker message that violates the protocol contract.
+/// Describes a worker message that violates the protocol.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid worker message: {0}")]
 pub struct ValidationError(String);
@@ -127,7 +127,7 @@ pub use phase::PhaseId;
 pub use program::ProgramCommand;
 pub use proto::report::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
 pub use proto::request::{
-    CanvasSampling, DiffusionSamplingParams, PrefixCacheDtype, PrefixCacheDtypeParseError,
+    BlockSampling, DiffusionSamplingParams, PrefixCacheDtype, PrefixCacheDtypeParseError,
     RequestId, SamplingParams, SamplingParamsError, StandbyStorage, TokenLogprob,
 };
 pub use request::*;

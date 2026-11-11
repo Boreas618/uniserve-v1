@@ -1153,7 +1153,7 @@ fn stage_batch(
             (request.width, request.height),
             &units,
             request.unit as usize,
-            request.handed,
+            request.rounds,
         )?;
         staged_calls.push(StagedCall {
             request: request.request,
@@ -1490,7 +1490,7 @@ mod tests {
                 width: 1344,
                 height: 768,
                 frames: 56,
-                handed: 0,
+                rounds: 0,
             },
             // The second request's first unit is already through; the first request's is not.
             ipc::execution::StagedRequest {
@@ -1503,7 +1503,7 @@ mod tests {
                 width: 768,
                 height: 768,
                 frames: 39,
-                handed: 0,
+                rounds: 0,
             },
         ];
         let video = ipc::execution::Computation {

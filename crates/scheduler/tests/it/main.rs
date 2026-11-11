@@ -7,10 +7,10 @@
 // green run is how one stayed silent. Denied here so it is a build failure.
 #![deny(dead_code)]
 
+mod block_diffusion;
 mod boot;
 mod cache_storage;
 mod call_counts;
-mod canvas;
 mod control_plane;
 mod encoder_outputs;
 mod error_taxonomy;
