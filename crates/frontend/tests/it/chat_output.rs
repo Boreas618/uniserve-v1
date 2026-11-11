@@ -1,4 +1,5 @@
-//! Qwen3 reasoning and tool-call output behavior across stream boundaries.
+//! Reasoning and tool-call parsing of a chat request's output across stream boundaries, in each
+//! tool-call format.
 
 use std::sync::Arc;
 
@@ -12,7 +13,8 @@ use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 /// Builds a tokenizer whose only special tokens are the reasoning delimiters
-/// that `Qwen3ReasoningParser` requires and the `<|im_end|>` turn delimiter.
+/// that the `<think>` reasoning parser requires and the `<|im_end|>` turn
+/// delimiter.
 fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + Sync>> {
     let model = BPE::builder()
         .vocab_and_merges([("<unk>".to_string(), 0), ("a".to_string(), 1)], Vec::new())
@@ -28,17 +30,18 @@ fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + S
     Ok(Arc::new(HuggingFaceTokenizer::from_json(definition)?))
 }
 
-/// The parsers of a Qwen3 request: `<think>` reasoning when `reasoning` is
-/// set, JSON tool calls when `tools` is.
+/// The parsers of a request whose family writes JSON tool calls: `<think>`
+/// reasoning when `reasoning` is set, tool calls when `tools` is.
 fn qwen3(
     tools: bool,
     tokenizer: DynTokenizer,
     reasoning: bool,
 ) -> Result<ChatParser, Box<dyn std::error::Error + Send + Sync>> {
     let parser = handoff::Parser {
-        kind: handoff::parser::Kind::ParserKindQwen3 as i32,
+        kind: handoff::parser::Kind::ParserKindJson as i32,
         parse_reasoning: reasoning,
         parse_tools: tools,
+        tools: String::new(),
     };
     Ok(ChatParser::new(&parser, tokenizer)?)
 }
@@ -204,5 +207,59 @@ fn disabled_reasoning_parsing_streams_delimiters_as_content() -> TestResult {
     let events = parse(processor, &[], &["<think>", "hi</think>after"])?;
 
     assert_eq!(ordered(events), vec![text("<think>hi</think>after")]);
+    Ok(())
+}
+
+/// A family that writes function and parameter tags has its calls parsed in
+/// that format, each value typed by the schema of the tool the request
+/// declared, after its reasoning and among its text.
+#[test]
+fn function_and_parameter_tags_become_typed_tool_calls() -> TestResult {
+    let parser = handoff::Parser {
+        kind: handoff::parser::Kind::ParserKindXml as i32,
+        parse_reasoning: true,
+        parse_tools: true,
+        tools: serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}, "limit": {"type": "integer"}},
+                },
+            },
+        }])
+        .to_string(),
+    };
+    let processor = ChatParser::new(&parser, qwen_tokenizer()?)?;
+
+    // The deltas cut the reasoning delimiter, a tag and a value.
+    let events = parse(
+        processor,
+        &[],
+        &[
+            "<think>look it up</think>Searching.<tool_call>\n<func",
+            "tion=lookup>\n<parameter=q>\nrust tra",
+            "its\n</parameter>\n<parameter=limit>\n3\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=lookup>\n<parameter=q>\nx\n</parameter>\n</function>\n</tool_call>done",
+        ],
+    )?;
+
+    assert_eq!(
+        ordered(events),
+        vec![
+            OrderedOutput::Text(AssistantBlockKind::Reasoning, "look it up".to_string()),
+            text("Searching."),
+            OrderedOutput::Call {
+                name: "lookup".to_string(),
+                arguments: r#"{"q": "rust traits", "limit": 3}"#.to_string(),
+            },
+            OrderedOutput::Call {
+                name: "lookup".to_string(),
+                arguments: r#"{"q": "x"}"#.to_string(),
+            },
+            text("done"),
+        ]
+    );
     Ok(())
 }

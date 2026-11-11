@@ -42,14 +42,26 @@ const SPECIAL_TOKENS: &[&str] = &[
     "</answer>",
 ];
 
+/// A chat family that declares neither a reasoning nor a tool-call format.
+const PLAIN: Family = Family {
+    id: "plain",
+    model_types: &["plain"],
+    classes: &[],
+    serving: Serving::Chat(ChatProfile {
+        reasoning: None,
+        tool_calls: None,
+        images: None,
+    }),
+};
+
 /// A chat family of Qwen3's `model_type`s whose outputs are parsed in its formats.
 const CHAT: Family = Family {
     id: "chat",
     model_types: &["qwen3", "qwen3_moe"],
     classes: &[],
     serving: Serving::Chat(ChatProfile {
-        reasoning: Some(ReasoningFormat::Qwen3),
-        tool_calls: Some(ToolCallFormat::Qwen3),
+        reasoning: Some(ReasoningFormat::Think),
+        tool_calls: Some(ToolCallFormat::Json),
         images: None,
     }),
 };
@@ -146,7 +158,7 @@ fn try_resolved_model(
         .build()
         .unwrap()
         .block_on(ModelConfig::from_files(
-            &Catalogue::new([CHAT]).unwrap(),
+            &Catalogue::new([CHAT, PLAIN, processing::qwen::QWEN4_EXP]).unwrap(),
             &files,
             Some(4096),
             tokenizer.as_ref(),
@@ -374,8 +386,8 @@ const QWEN3_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/templates/qwen3.jinja"
 ));
-/// Tool instruction in the style of Qwen3-Coder templates, which ask for XML
-/// `<function=...>` calls instead of JSON objects.
+/// A template whose tool instruction shows function and parameter tags
+/// instead of JSON objects.
 const XML_CALL_TEMPLATE: &str = "{%- if tools -%}<|im_start|>system\n# Tools\n<tools>{%- for tool in tools -%}{{ tool | tojson }}{%- endfor -%}</tools>\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter>\nvalue\n</parameter>\n</function>\n</tool_call><|im_end|>\n{%- endif -%}{%- for message in messages -%}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";
 
 /// Rebinds a resolved Qwen3-family model to `template`.
@@ -427,12 +439,13 @@ fn a_chat_request_for_image_output_is_refused_by_name() {
     }
 }
 
-/// Dense and mixture-of-experts Qwen3 checkpoints serve tool calls only when
-/// their chat template asks for the JSON calls the Qwen3 parser reads; a
-/// template asking for another call format refuses requests with tools
-/// instead of returning their calls as unparsed text.
+/// A family's chat profile declares its tool-call format, and that alone
+/// decides whether requests with tools are served: whatever the checkpoint's
+/// template text instructs, a family that declares a format has its calls
+/// parsed in it, and the lowering states the format and the request's tools
+/// to output processing.
 #[test]
-fn qwen3_family_declares_tool_calling_only_for_json_calls() {
+fn the_profile_declares_the_tool_call_format() {
     let tool_request = serde_json::json!({
         "model": SERVED_MODEL,
         "messages": [{"role": "user", "content": "weather?"}],
@@ -442,32 +455,87 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
         }}]
     });
     for model_type in ["qwen3", "qwen3_moe"] {
-        let json_calls = with_template(model_type, QWEN3_TEMPLATE);
-        assert!(json_calls.supports_tool_calling(), "{model_type}");
-        preprocess_chat(
-            &json_calls,
-            String::from("json-tools"),
-            serde_json::from_value(tool_request.clone()).unwrap(),
-            Vec::new(),
-        )
-        .unwrap();
-
-        for template in [XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
-            let other = with_template(model_type, template);
-            assert!(!other.supports_tool_calling(), "{model_type}");
-            let error = preprocess_chat(
-                &other,
-                String::from("other-tools"),
+        for template in [QWEN3_TEMPLATE, XML_CALL_TEMPLATE, CHAT_TEMPLATE] {
+            let processor = with_template(model_type, template);
+            assert!(processor.supports_tool_calling(), "{model_type}");
+            let (_, lowering) = preprocess_chat(
+                &processor,
+                String::from("tools"),
                 serde_json::from_value(tool_request.clone()).unwrap(),
                 Vec::new(),
             )
-            .err()
             .unwrap();
-            assert_eq!(error.status_code().as_u16(), 400, "{model_type}");
-            let message = error.to_error_response().error.message;
-            assert!(message.contains("tool_calling"), "{message}");
+
+            let parser = lowering.parser.unwrap();
+            assert_eq!(
+                parser.kind,
+                proto::handoff::parser::Kind::ParserKindJson as i32
+            );
+            assert!(parser.parse_tools && parser.parse_reasoning);
+            let tools: serde_json::Value = serde_json::from_str(&parser.tools).unwrap();
+            assert_eq!(tools[0]["function"]["name"], "weather");
         }
     }
+
+    // `tool_choice: none` withholds the tools from the model, so no call is parsed.
+    let mut withheld = tool_request.clone();
+    withheld["tool_choice"] = serde_json::json!("none");
+    let (_, lowering) = preprocess_chat(
+        &with_template("qwen3", QWEN3_TEMPLATE),
+        String::from("no-tools"),
+        serde_json::from_value(withheld).unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
+    let parser = lowering.parser.unwrap();
+    assert!(!parser.parse_tools);
+    assert!(parser.tools.is_empty());
+}
+
+/// A family whose profile declares no tool-call format refuses a request
+/// with tools by name, rather than returning its calls as unparsed text, and
+/// one that declares function and parameter tags has them stated to output
+/// processing.
+#[test]
+fn tool_calling_follows_the_familys_declared_format() {
+    let tool_request = serde_json::json!({
+        "model": SERVED_MODEL,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"type": "function", "function": {
+            "name": "weather",
+            "parameters": {"type": "object", "properties": {}}
+        }}]
+    });
+
+    let (_directory, _, plain) = resolved_model("plain");
+    assert!(!plain.supports_tool_calling());
+    let error = preprocess_chat(
+        &plain,
+        String::from("plain-tools"),
+        serde_json::from_value(tool_request.clone()).unwrap(),
+        Vec::new(),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.status_code().as_u16(), 400);
+    let message = error.to_error_response().error.message;
+    assert!(message.contains("tool_calling"), "{message}");
+
+    let (_directory, _, tagged) = resolved_model("qwen4_exp");
+    assert!(tagged.supports_tool_calling());
+    let (_, lowering) = preprocess_chat(
+        &tagged,
+        String::from("xml-tools"),
+        serde_json::from_value(tool_request).unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
+    let parser = lowering.parser.unwrap();
+    assert_eq!(
+        parser.kind,
+        proto::handoff::parser::Kind::ParserKindXml as i32
+    );
+    assert!(parser.parse_tools);
 }
 
 /// Negative seeds are accepted and reinterpreted as their two's-complement

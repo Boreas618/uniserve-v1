@@ -7,7 +7,7 @@ use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
 use crate::tokenizer::DynTokenizer;
 
-use super::{DelimitedReasoningParser, Qwen3ReasoningParser, ReasoningParser};
+use super::DelimitedReasoningParser;
 
 /// Builds a tokenizer whose only special tokens are the reasoning delimiters
 /// and `<|im_end|>`, which stands in for a chat-turn boundary.
@@ -31,6 +31,12 @@ fn reasoning_tokenizer() -> DynTokenizer {
         AddedToken::from("<|im_end|>", true),
     ]);
     Arc::new(crate::test_support::load_tokenizer(&tokenizer))
+}
+
+/// The parser of `<think>` reasoning, which waits for an explicit start
+/// delimiter when the prompt states no reasoning boundary.
+fn think_parser(tokenizer: DynTokenizer) -> DelimitedReasoningParser {
+    DelimitedReasoningParser::new(tokenizer, "<think>", "</think>", false).unwrap()
 }
 
 fn token_id(tokenizer: &DynTokenizer, token: &str) -> u32 {
@@ -70,7 +76,7 @@ fn delimited_parser_flushes_partial_end_marker() {
 #[test]
 fn qwen3_without_prompt_boundary_waits_for_reasoning_start() {
     let tokenizer = reasoning_tokenizer();
-    let mut parser = Qwen3ReasoningParser::new(tokenizer).unwrap();
+    let mut parser = think_parser(tokenizer);
 
     let delta = parser.push("reason</think>answer");
     assert_eq!(delta.reasoning, None);
@@ -83,11 +89,11 @@ fn qwen3_prompt_boundaries_select_the_initial_output_region() {
     let start = token_id(&tokenizer, "<think>");
     let end = token_id(&tokenizer, "</think>");
 
-    let mut content = Qwen3ReasoningParser::new(Arc::clone(&tokenizer)).unwrap();
+    let mut content = think_parser(Arc::clone(&tokenizer));
     content.initialize(&[end]);
     assert_eq!(content.push("answer").content.as_deref(), Some("answer"));
 
-    let mut reasoning = Qwen3ReasoningParser::new(tokenizer).unwrap();
+    let mut reasoning = think_parser(tokenizer);
     reasoning.initialize(&[start]);
     let delta = reasoning.push("reason</think>answer");
     assert_eq!(delta.reasoning.as_deref(), Some("reason"));
@@ -101,7 +107,7 @@ fn qwen3_prompt_scan_stops_at_the_last_special_token() {
     let tokenizer = reasoning_tokenizer();
     let start = token_id(&tokenizer, "<think>");
     let prompt_end = token_id(&tokenizer, "<|im_end|>");
-    let mut parser = Qwen3ReasoningParser::new(tokenizer).unwrap();
+    let mut parser = think_parser(tokenizer);
 
     parser.initialize(&[start, prompt_end]);
     let delta = parser.push("answer");

@@ -118,7 +118,7 @@ impl OutputProcessor {
         stats: Box<dyn Stats>,
     ) -> Result<Self, OutputError> {
         let response = lowering.response.clone().unwrap_or_default();
-        let parser = lowering.parser.unwrap_or_default();
+        let parser = lowering.parser.clone().unwrap_or_default();
         let failed = |source: crate::output::chat::Error| OutputError {
             request_id: response.request_id.clone(),
             source,
@@ -294,7 +294,7 @@ impl OutputProcessor {
             decode_options: Some(self.decode.options().clone()),
             prompt_logprobs: self.prompt_logprobs,
             logprobs: self.logprobs,
-            parser: Some(self.parser),
+            parser: Some(self.parser.clone()),
             response: Some(self.response.clone()),
             compile_us: self.clock.compile_us(),
             started_unix_us: self.clock.started_unix_us(),

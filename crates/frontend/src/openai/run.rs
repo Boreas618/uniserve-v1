@@ -783,9 +783,9 @@ mod tests {
             ..decode()
         };
         let parser = handoff::Parser {
-            kind: handoff::parser::Kind::ParserKindQwen3 as i32,
+            kind: handoff::parser::Kind::ParserKindJson as i32,
             parse_reasoning: true,
-            parse_tools: false,
+            ..Default::default()
         };
         let document = document(
             parser,

@@ -331,8 +331,8 @@ mod tests {
         model_types: &["qwen3", "qwen3_moe"],
         classes: &[],
         serving: Serving::Chat(ChatProfile {
-            reasoning: Some(ReasoningFormat::Qwen3),
-            tool_calls: Some(ToolCallFormat::Qwen3),
+            reasoning: Some(ReasoningFormat::Think),
+            tool_calls: Some(ToolCallFormat::Json),
             images: None,
         }),
     };

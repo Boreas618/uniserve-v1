@@ -1,11 +1,13 @@
-//! Streaming tool-call parsers.
+//! Streaming tool-call parsers, one per tool-call format.
 //!
-//! The chat output tool stage (`output::chat`) feeds visible
-//! assistant text chunk by chunk to a [`ToolParser`]: `Qwen25ToolParser`
-//! for Qwen3. The parser turns each chunk
-//! into an ordered sequence of plain text and `ToolCallDelta` updates, holding
-//! back bytes it cannot classify yet, such as a partial marker or an
-//! incomplete tool call.
+//! The chat output tool stage (`output::chat`) feeds visible assistant text
+//! chunk by chunk to the [`ToolParser`] of the format the request's model
+//! family writes (`processing::ToolCallFormat`): [`JsonToolParser`] for one
+//! JSON object inside `<tool_call>` tags, [`XmlToolParser`] for function and
+//! parameter tags. A parser is named for its format, never for a model. It
+//! turns each chunk into an ordered sequence of plain text and
+//! `ToolCallDelta` updates, holding back bytes it cannot classify yet, such
+//! as a partial tag or an incomplete tool call.
 
 #[macro_use]
 mod error;
@@ -13,11 +15,13 @@ mod json;
 #[cfg(test)]
 mod test_utils;
 mod utils;
+mod xml;
 
 use proto::handoff;
 
 pub use error::{Result, ToolParserError};
-pub use json::Qwen25ToolParser;
+pub use json::JsonToolParser;
+pub use xml::XmlToolParser;
 
 /// Incremental extraction of tool calls from one assistant turn's visible
 /// text.
@@ -81,9 +85,9 @@ pub struct ToolCallDelta {
     pub name: Option<String>,
     /// Arguments text contributed by this update. Concatenating every update
     /// for one `tool_index` yields the call's arguments as JSON text.
-    /// `Qwen25ToolParser` forwards the JSON exactly as the model wrote it,
-    /// neither parsed nor normalized; `Qwen25ToolParser` translates Qwen3's
-    /// native argument encoding into JSON.
+    /// `JsonToolParser` forwards the JSON exactly as the model wrote it,
+    /// neither parsed nor normalized; `XmlToolParser` writes each parameter's
+    /// value as the JSON its tool's schema types it to.
     pub arguments: String,
 }
 

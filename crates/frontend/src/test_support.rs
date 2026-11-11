@@ -77,14 +77,14 @@ pub fn configured_tokenizer() -> DynTokenizer {
     Arc::new(load_tokenizer(&tokenizer))
 }
 
-/// A chat family whose outputs are parsed in the Qwen3 formats.
+/// A chat family whose outputs are parsed as `<think>` reasoning and JSON tool calls.
 pub const CHAT: processing::Family = processing::Family {
     id: "chat",
     model_types: &["chat"],
     classes: &[],
     serving: processing::Serving::Chat(processing::ChatProfile {
-        reasoning: Some(processing::ReasoningFormat::Qwen3),
-        tool_calls: Some(processing::ToolCallFormat::Qwen3),
+        reasoning: Some(processing::ReasoningFormat::Think),
+        tool_calls: Some(processing::ToolCallFormat::Json),
         images: None,
     }),
 };

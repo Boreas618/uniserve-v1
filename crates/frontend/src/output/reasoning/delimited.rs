@@ -10,13 +10,13 @@
 
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
-use super::{ReasoningDelta, ReasoningError, ReasoningParser, Result};
+use super::{ReasoningDelta, ReasoningError, Result};
 
 /// Shared incremental state machine for configured tag-delimited reasoning.
 ///
-/// One instance serves one generation stream through its [`ReasoningParser`]
-/// implementation: optionally call `initialize` with the prompt, then `push`
-/// for each decoded delta, then `finish` once at end of stream.
+/// One instance serves one generation stream: optionally call `initialize`
+/// with the prompt, then `push` for each decoded delta, then `finish` once at
+/// end of stream.
 pub struct DelimitedReasoningParser {
     tokenizer: DynTokenizer,
     current_in_reasoning: bool,
@@ -217,7 +217,7 @@ impl DelimitedReasoningParser {
     }
 }
 
-impl ReasoningParser for DelimitedReasoningParser {
+impl DelimitedReasoningParser {
     /// Initializes parser state from the prompt token IDs.
     ///
     /// The last delimiter token in the prompt decides where generation starts
@@ -225,7 +225,7 @@ impl ReasoningParser for DelimitedReasoningParser {
     /// prompt ending in `<think>` starts inside reasoning and one ending in
     /// `</think>` starts in visible content. Otherwise the parser starts in the
     /// `default_in_reasoning` region.
-    fn initialize(&mut self, prompt_token_ids: &[u32]) {
+    pub fn initialize(&mut self, prompt_token_ids: &[u32]) {
         self.current_in_reasoning = last_reasoning_boundary(
             prompt_token_ids,
             self.start_token_id,
@@ -239,7 +239,7 @@ impl ReasoningParser for DelimitedReasoningParser {
     ///
     /// Text that could begin a delimiter or a section label stays buffered,
     /// so the returned delta may be empty.
-    fn push(&mut self, delta: &str) -> ReasoningDelta {
+    pub fn push(&mut self, delta: &str) -> ReasoningDelta {
         self.buffer.push_str(delta);
         self.parse_buffer(false)
     }
@@ -248,18 +248,8 @@ impl ReasoningParser for DelimitedReasoningParser {
     ///
     /// An unfinished delimiter is emitted as ordinary text of the current
     /// region, and a section's complete label is stripped.
-    fn finish(&mut self) -> ReasoningDelta {
+    pub fn finish(&mut self) -> ReasoningDelta {
         self.parse_buffer(true)
-    }
-
-    /// The state machine's state, as the inherent method reports it.
-    fn state(&self) -> Option<proto::handoff::Reasoning> {
-        Some(DelimitedReasoningParser::state(self))
-    }
-
-    /// Restores the state machine's state.
-    fn resume(&mut self, state: &proto::handoff::Reasoning) {
-        DelimitedReasoningParser::resume(self, state);
     }
 }
 

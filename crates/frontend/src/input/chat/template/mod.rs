@@ -553,41 +553,6 @@ fn to_template_tools(tools: &[Tool]) -> Vec<TemplateTool> {
         .collect()
 }
 
-/// The tool-call instruction of Qwen3 chat templates: one JSON object with
-/// `name` and `arguments` inside `<tool_call>` lines, the format
-/// `Qwen25ToolParser` reads.
-const JSON_CALL_INSTRUCTION: &str =
-    "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
-
-/// Returns whether `renderer`'s template instructs the model to write tool
-/// calls in the format `Qwen25ToolParser` reads.
-///
-/// Checkpoints of the Qwen3 families share a chat-template contract but not
-/// always its tool-call format: Qwen3-Coder templates instruct XML
-/// `<function=...>` calls. Rendering one request that declares a tool
-/// observes the instruction the model actually receives, independent of how
-/// the template source escapes it. A template that cannot render tools
-/// instructs no format.
-pub fn template_instructs_json_tool_calls(renderer: &HfChatRenderer) -> bool {
-    let probe: ChatCompletionRequest = match serde_json::from_value(serde_json::json!({
-        "model": "probe",
-        "messages": [{"role": "user", "content": "probe"}],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "probe",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        }],
-    })) {
-        Ok(probe) => probe,
-        Err(_) => return false,
-    };
-    renderer
-        .render(&probe, GenerationPromptMode::StartNewAssistant)
-        .is_ok_and(|prompt| prompt.contains(JSON_CALL_INSTRUCTION))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

@@ -52,9 +52,6 @@ pub struct Processor {
     // Worker-advertised generation features and resource limits.
     pub(super) limits: GenerationLimits,
     pub(super) parse_reasoning: bool,
-    // Whether the chat family writes tool calls and its checkpoint's template
-    // asks for them in that format.
-    tool_calls: bool,
     // The family's image processor, when the family takes images and the workers encode them.
     images: Option<Arc<dyn ImageProcessor>>,
 }
@@ -306,25 +303,12 @@ impl Processor {
         };
         validate_runtime_features(&config, &limits, needs)?;
 
-        // A chat checkpoint serves tool calls only when its family writes them
-        // and its template asks for them in that format; otherwise requests
-        // with tools are refused rather than returned with unparsed calls.
-        let tool_calls = match (config.chat(), &renderer) {
-            (Some(profile), RequestRenderer::Chat(renderer)) => match profile.tool_calls {
-                Some(ToolCallFormat::Qwen3) => {
-                    crate::input::chat::template::template_instructs_json_tool_calls(renderer)
-                }
-                None => false,
-            },
-            _ => false,
-        };
         Ok(Self {
             config,
             tokenizer,
             renderer,
             limits,
             parse_reasoning,
-            tool_calls,
             images: None,
         })
     }
@@ -379,9 +363,12 @@ impl Processor {
         self.images.is_some()
     }
 
-    /// Returns whether the model parses tool calls from its output.
+    /// Returns whether the model's tool calls are parsed from its output: whether its
+    /// family's chat profile names the format it writes them in.
     pub fn supports_tool_calling(&self) -> bool {
-        self.tool_calls
+        self.config
+            .chat()
+            .is_some_and(|profile| profile.tool_calls.is_some())
     }
 
     /// Returns whether the model produces structured reasoning output.
@@ -526,17 +513,27 @@ impl Processor {
         let Some(profile) = self.config.chat() else {
             return handoff::Parser::default();
         };
+        // The kind names the tool-call format; a family that writes none has its reasoning
+        // parsed under the first kind, which then parses no tool call.
         let kind = match (profile.reasoning, profile.tool_calls) {
-            (Some(ReasoningFormat::Qwen3), _) | (None, Some(ToolCallFormat::Qwen3)) => {
-                handoff::parser::Kind::ParserKindQwen3
-            }
             (None, None) => handoff::parser::Kind::ParserKindNone,
+            (_, Some(ToolCallFormat::Xml)) => handoff::parser::Kind::ParserKindXml,
+            (_, Some(ToolCallFormat::Json)) | (Some(ReasoningFormat::Think), None) => {
+                handoff::parser::Kind::ParserKindJson
+            }
         };
+        let tools = request
+            .callable_tools()
+            .filter(|_| profile.tool_calls.is_some());
 
         handoff::Parser {
             kind: kind as i32,
             parse_reasoning: self.parse_reasoning && profile.reasoning.is_some(),
-            parse_tools: profile.tool_calls.is_some() && request.callable_tools().is_some(),
+            parse_tools: tools.is_some(),
+            // A request's tools serialize as it stated them.
+            tools: tools
+                .and_then(|tools| serde_json::to_string(tools).ok())
+                .unwrap_or_default(),
         }
     }
 }
