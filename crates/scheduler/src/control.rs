@@ -80,8 +80,7 @@ impl Scheduler {
 
     /// Aborts every queued/gated/running request with a terminal event.
     ///
-    /// `Scheduler::run` calls this on shutdown and after engine-fatal, and
-    /// `Scheduler::step` on shutdown, each right before closing the worker.
+    /// `Scheduler::run` calls this on shutdown and after an engine-fatal fault.
     /// Shutdown covers both a `Shutdown` command and a disconnected command
     /// channel. Running requests finish immediately rather than waiting for
     /// their in-flight calls, and batches assembled but not yet submitted are
@@ -133,7 +132,7 @@ impl Scheduler {
                     self.add_request(*request, event_tx);
                 }
             }
-            Command::Cancel(request_id) => self.mark_cancelled(request_id, false),
+            Command::Cancel(request_id) => self.cancel(request_id),
             Command::Acknowledge {
                 request_id,
                 output_token_count,
@@ -755,6 +754,27 @@ impl Scheduler {
     /// announced here, with the end that pop means.
     pub(super) fn announce_end(&mut self, id: RequestId, end: scheduling::guest::event::End) {
         self.recorder.record(views::ended(id, end));
+    }
+
+    /// Cancels the request `id` for its client: a waiting request finishes
+    /// at once with `Cancelled`, a running one once its calls in flight
+    /// drain. An unknown request is ignored.
+    pub fn cancel(&mut self, id: RequestId) {
+        self.mark_cancelled(id, false);
+    }
+
+    /// Ends every request as migratable for `cause`, to be submitted again
+    /// with what it generated: the engine is being drained, or lost.
+    ///
+    /// A waiting request leaves at once. A running token request ends once
+    /// its calls in flight drain, with the tokens it generated; a running
+    /// video request finishes its calls in flight, stores its trajectory at
+    /// its next denoising step boundary and ends with its stored step.
+    pub fn drain(&mut self, cause: MigrationCause) {
+        // The requests held for a predecessor's index leave with the others.
+        self.release_held_for_index();
+        self.migrate_requests(cause);
+        self.preempt_media(cause, |_| true);
     }
 
     /// Cancels the request `id` for its client, or drops it when `abort`.

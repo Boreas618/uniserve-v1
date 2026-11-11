@@ -523,17 +523,6 @@ pub struct CommandResult {
 /// (`ExecuteError`).
 pub type WorkerError = anyhow::Error;
 
-/// Backpressure and terminal failures returned by logical batch submission.
-#[derive(Debug, thiserror::Error)]
-pub enum WorkerSubmitError {
-    #[error("worker queue is full")]
-    /// Returns ownership of a batch rejected by bounded queue capacity.
-    WouldBlock(Box<ExecutionBatch>),
-    #[error(transparent)]
-    /// Reports a terminal submission failure.
-    Failed(#[from] anyhow::Error),
-}
-
 /// A worker-reported execution error classified for scheduler failure policy.
 ///
 /// The typed taxonomy and execution context travel together so failure policy

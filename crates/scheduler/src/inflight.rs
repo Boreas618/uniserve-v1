@@ -65,6 +65,9 @@ pub(super) struct PendingBatch {
     /// Time the scheduling pass planned the batch; the batch round trip is
     /// measured from it.
     pub(super) started: Instant,
+    /// The batch's calls in the order the batch numbers them, once its
+    /// devices' layout was stated: a completion names a call by its index.
+    pub(super) numbered: Vec<(RequestKey, CallId)>,
     /// Call identities whose results have not arrived. Result validation
     /// removes each identity once and treats a repeated or unknown one as
     /// invalid; the final result must leave this set empty.
@@ -96,8 +99,12 @@ fn query_tokens(call: &ipc::Call) -> u64 {
 
 /// Owns submitted identities and their lifetime through ordered reconciliation.
 pub(super) struct Inflight {
-    /// Planned batches the worker has not accepted yet, in dispatch order.
+    /// Batches formed and not yet handed out, in order: their devices had no
+    /// slot free.
     pub(super) pending_submissions: VecDeque<ExecutionBatch>,
+    /// The shadow copies of the batches handed out by the current pass, each
+    /// with the token shape it compares, which the pass submits after them.
+    pub(super) pending_shadows: Vec<(ipc::execution::Batch, Option<ipc::execution::Shape>)>,
     /// Last issued batch id; ids start at 1, so a call id with batch zero has
     /// not been assigned to a batch.
     pub(super) batch_id: u64,
@@ -126,6 +133,7 @@ impl Inflight {
     pub(super) fn new() -> Self {
         Self {
             pending_submissions: VecDeque::new(),
+            pending_shadows: Vec::new(),
             batch_id: 0,
             next_arrival_seq: 1,
             pending_calls: HashMap::new(),
@@ -147,6 +155,7 @@ impl Inflight {
             batch.id,
             PendingBatch {
                 started,
+                numbered: Vec::new(),
                 calls: batch
                     .requests
                     .iter()

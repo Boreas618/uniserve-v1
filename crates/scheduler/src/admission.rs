@@ -102,6 +102,8 @@ impl Scheduler {
             let _ = event_tx.send(Event::Rejected { kind, message });
         };
         let full = "scheduler waiting queue is full".to_owned();
+        // The request's reader wakes this scheduler when it frees room.
+        event_tx.served_by(self.worker.waker());
         let graph = match request {
             crate::Request::Generation(mut req) => {
                 let max_cache_tokens = match self.validate_submission(&req) {

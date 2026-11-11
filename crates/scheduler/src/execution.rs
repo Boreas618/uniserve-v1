@@ -1,37 +1,23 @@
-//! Batch submission, completion application, and allocation reclamation.
+//! The step: what a scheduler does between two waits.
 //!
-//! This part of the scheduler sits between request state and the worker:
-//!
-//! - Refill and dispatch: `refill_worker` admits requests, asks the
-//!   generation assembler (`assemble`) and the video media planner
-//!   for batches while a rank queue has room, and
-//!   `dispatch_submissions` hands them to the worker in order per worker,
+//! - `schedule` forms batches while a rank queue has room, by asking the
+//!   policy for one step's decisions and assembling them (`batching`), and
+//!   `release` hands out, in order, the batches whose devices have a slot,
 //!   each after the batches producing its inputs.
-//! - Video media scheduling: a video request runs the calls of its graph
-//!   (`graph::VideoGraph`, built at admission from its task and conditions),
-//!   offered by `ready_calls` as their inputs become available. Calls occupy
-//!   their components' capacity on their workers and, for media reading,
-//!   encoding and muxing, host task pools, tracked by the media occupancy,
-//!   and `plan_media_call` builds one call with its products, buffer
-//!   bindings, latent pages and reading components.
-//! - Successor projection: queries such as `projected_coordinates`,
+//! - `update` takes one completed batch: `apply_result` (`results`)
+//!   validates every returned call against the batches in flight before any
+//!   completion is applied, and applies them in request-local order.
+//! - Video scheduling (`media`): a video request runs the calls of its graph
+//!   (`graph::VideoGraph`), offered by `ready_calls` as their inputs become
+//!   available. Calls occupy their stages' capacity on their workers and,
+//!   for media reading, encoding and muxing, host thread pools.
+//! - Successor projection (`projection`): `projected_coordinates`,
 //!   `pending_successor_code` and `can_queue_successor` project a token
-//!   request's accepted state through its in-flight calls, so the batching
-//!   path can queue a successor before its predecessor's result returns.
-//! - Result reconciliation: `apply_result` validates every returned call
-//!   identity against the in-flight window before any completion is applied,
-//!   stages completions, and applies them in request-local dependency order.
-//! - Failure reconciliation: `on_worker_error` retires only the work a
-//!   `WorkerFailure` invalidates. Any other worker error, and a worker
-//!   failure classified as a control-plane invariant violation, is
-//!   engine-fatal.
-//!
-//! Refill and dispatch live here; video media scheduling, successor
-//! projection, result reconciliation and failure reconciliation live in
-//! `media`, `projection`, `results` and `failure`.
-//!
-//! `Scheduler::run` drives these in production; `Scheduler::step` is a
-//! single-tick driver for tests and examples.
+//!   request's accepted state through its calls in flight, so a successor
+//!   can be queued before its predecessor's result returns.
+//! - Failure handling (`failure`): `on_worker_error` retires only the work a
+//!   `WorkerFailure` invalidates. Any other error of the devices, and a
+//!   failure classified as a broken invariant, stops the engine.
 
 mod failure;
 mod media;
@@ -55,19 +41,29 @@ fn batch_products(batch: &ExecutionBatch) -> impl Iterator<Item = BufferId> + '_
         .flat_map(|(call, _)| call.output_buffers())
 }
 
+/// The steps one pass may take in a row that form no batch while the views
+/// the policy reads keep moving.
+const IDLE_STEPS: usize = 16;
+
 impl Scheduler {
-    /// Dispatches queued work while preserving order at every shared destination
-    /// and after every product it reads.
-    /// The caller retains blocked destinations for the whole scheduling tick, so
-    /// assembling more work cannot repeatedly retry an unavailable worker.
+    /// Releases the batches formed and not yet handed out whose devices have
+    /// a slot free, in order, preserving order at every shared destination
+    /// and after every product a batch reads.
     ///
-    /// Each queued batch is tried once per invocation; a batch that cannot be
-    /// submitted goes back to the end of the queue. Returns whether any batch
-    /// was submitted, or `true` after a terminal submission failure, which is
-    /// handed to `on_worker_error` and stops dispatching.
-    fn dispatch_submissions(
+    /// Each formed batch is tried once per call. One that fits takes its
+    /// slots, is laid out for its devices on the step's generation and joins
+    /// `released`, which the caller submits in order; one that does not fit
+    /// goes back to the end of the queue, and `blocked_workers` keeps its
+    /// destinations for the whole pass, so forming more work cannot overtake
+    /// it there. Page copies that ride no batch are issued here: they are
+    /// storage work with no layout to hand out.
+    ///
+    /// Returns whether any batch was released or settled, or `true` after a
+    /// failure, which is handed to `on_worker_error` and ends the pass.
+    fn release(
         &mut self,
         blocked_workers: &mut HashSet<crate::WorkerGroupId>,
+        released: &mut Vec<ipc::execution::Batch>,
     ) -> bool {
         let mut progressed = false;
         // Products of the batches held back in this pass. A call may be
@@ -77,6 +73,16 @@ impl Scheduler {
         // queued after its producer and held batches keep their order, so the
         // producer is always tried first.
         let mut held_products = HashSet::new();
+        // Image features are encoded where a request's prompt is computed, which is the first
+        // group of a scheduler that serves several (a deployment's prefill group): a batch of
+        // frees alone goes there.
+        let frees_group = self
+            .worker
+            .info()
+            .workers
+            .first()
+            .map(|(group, _)| group.0.clone())
+            .unwrap_or_default();
         let pending_count = self.inflight.pending_submissions.len();
         for _ in 0..pending_count {
             let Some(batch) = self.inflight.pending_submissions.pop_front() else {
@@ -96,36 +102,28 @@ impl Scheduler {
                 self.inflight.pending_submissions.push_back(batch);
                 continue;
             }
-            // An update may have asked this step's batches to run in shadow too:
-            // the same work against the epoch whose kernels are being compared,
-            // submitted beside the serving one (7.3 step 2). The copy is made
-            // only when an update asked, and before the serving submit takes the
-            // batch.
-            let shadow = self.shadow_generation(&batch);
-            let shadow_batch = shadow.map(|_| batch.clone());
-            // The `Finish` commands this batch carries close the rows of the
-            // requests they name once it is submitted: batches reach a rank in
-            // submission order, so no later `Start` can name a row before the
-            // worker has seen its close.
-            // The in-process arm has nothing to tell: the rows and buffers a
-            // lifecycle command closes are this scheduler's own
-            // pools, so the command is answered here, where it would have been
-            // submitted. Its `Finish` has nothing left to reach, nor its `Free` unless a rank
-            // holds image features, whose storage is the rank's (`Batch::frees`). A batch that
-            // carries page offloads, of the host KV cache or of a preempted trajectory, is work
-            // for the worker and goes to it.
+            // A batch of lifecycle commands alone has nothing to tell a device:
+            // the slots and buffers a command closes are this scheduler's own
+            // pools, so the command is settled here. Its `Finish` has nothing left to reach,
+            // nor its `Free` unless a rank holds image features, whose storage is the rank's
+            // (`Batch::frees`). A batch that carries page offloads, of the host KV cache or of a
+            // preempted trajectory, is work for a device and goes to it.
             if batch.requests.is_empty()
                 && batch.page_offloads.is_none()
-                && !(self.holds_image_features() && !crate::submission::frees(&batch).is_empty())
+                && !(self.holds_image_features() && !batch.frees().is_empty())
             {
                 self.acknowledge_commands(&batch.commands);
-                // Nothing went to a worker, so no result will ever end this batch: it leaves
+                // Nothing went to a device, so no completion will ever end this batch: it leaves
                 // the in-flight window here, or every boundary that waits for an empty window (a
                 // policy stage, a park, a drain) waits for it forever.
                 self.inflight.pending_batches.remove(&batch.id);
                 progressed = true;
                 continue;
             }
+            // The `Finish` commands this batch carries close the slots of the
+            // requests they name once it is handed out: batches reach a rank in
+            // the order they are released, so no later `Start` can name a slot
+            // before the worker has seen its close.
             let finishing: Vec<RequestKey> = batch
                 .commands
                 .iter()
@@ -134,41 +132,129 @@ impl Scheduler {
                     _ => None,
                 })
                 .collect();
-            match self.worker.submit(batch) {
-                Ok(()) => {
-                    progressed = true;
-                    for request_key in finishing {
-                        self.close_retiring_row(request_key);
-                    }
-                    // A wall or a full queue is not the pass's failure: the
-                    // batch stays with the step and the next one tries again,
-                    // as the serving submit does. A refused pass is answered at
-                    // once, because waiting will not shadow it.
-                    if let (Some(generation), Some(shadow_batch)) = (shadow, shadow_batch) {
-                        let shape = shadow_batch.token_shape();
-                        match self.worker.shadow(shadow_batch, generation) {
-                            Ok(()) => self.note_shadowed(shape),
-                            Err(WorkerSubmitError::Failed(error)) => {
-                                self.shadow_failed(format!("{error:#}"));
-                            }
-                            Err(WorkerSubmitError::WouldBlock(_)) => {}
-                        }
-                    }
+            let id = ipc::execution::BatchId(batch.id);
+            // A preempted request's trajectory waits for nothing on the device but the batches
+            // that advanced it, and pages that wait while nothing runs ride no forward: each is
+            // a copy of its own, whose end the scheduler reads as it reads a batch's.
+            let copies = batch
+                .page_offloads
+                .as_ref()
+                .filter(|_| batch.requests.is_empty());
+            let copied = match copies {
+                Some(offloads) if !offloads.latents.is_empty() => {
+                    Some(self.worker.offload_latents(id, offloads.latents.clone()))
                 }
-                Err(WorkerSubmitError::WouldBlock(batch)) => {
+                Some(offloads) if !offloads.pages.is_empty() => {
+                    Some(self.worker.copy_pages(id, offloads.pages.clone()))
+                }
+                _ => None,
+            };
+            match copied {
+                Some(Ok(())) => {
+                    progressed = true;
+                    continue;
+                }
+                Some(Err(error)) => {
+                    self.on_worker_error(error);
+                    return true;
+                }
+                None => {}
+            }
+            // An update may have asked this step's batches to run in shadow too:
+            // the same work against the generation whose kernels are being
+            // compared, submitted beside the serving one.
+            let shadow = self.shadow_generation(&batch);
+            let laid_out = batch
+                .device_batch(self.step_generation, &frees_group)
+                .and_then(|(device, numbered)| {
+                    let reserved = self.worker.reserve(&device, &batch.pools())?;
+                    Ok((device, numbered, reserved))
+                });
+            let (device, numbered) = match laid_out {
+                Ok((device, numbered, true)) => (device, numbered),
+                // A full queue is not the pass's failure: the batch stays
+                // with the scheduler and a later pass tries again.
+                Ok((_, _, false)) => {
                     blocked_workers.extend(targets);
                     held_products.extend(batch_products(&batch));
-                    self.inflight.pending_submissions.push_back(*batch);
+                    self.inflight.pending_submissions.push_back(batch);
+                    continue;
                 }
-                Err(WorkerSubmitError::Failed(error)) => {
+                Err(error) => {
                     // Failure reconciliation owns the pending identities until
                     // every affected call has been retired.
                     self.on_worker_error(error);
                     return true;
                 }
+            };
+            if let Some(pending) = self.inflight.pending_batches.get_mut(&batch.id) {
+                pending.numbered = numbered;
             }
+            progressed = true;
+            for request_key in finishing {
+                self.close_retiring_row(request_key);
+            }
+            if let Some(generation) = shadow {
+                match batch.device_batch(generation, &frees_group) {
+                    Ok((copy, _)) => self
+                        .inflight
+                        .pending_shadows
+                        .push((copy, batch.token_shape())),
+                    // A refused pass is answered at once, because waiting will
+                    // not shadow it.
+                    Err(error) => self.shadow_failed(format!("{error:#}")),
+                }
+            }
+            released.push(device);
         }
         progressed
+    }
+
+    /// Submits `batches`, in order, to the executors, then the shadow copies
+    /// an update asked for. A failed submission is the devices' failure
+    /// (`on_worker_error`) and ends the submitting.
+    fn submit(&mut self, batches: Vec<ipc::execution::Batch>) {
+        for batch in batches {
+            if let Err(error) = self.worker.submit(batch) {
+                self.on_worker_error(error);
+                return;
+            }
+        }
+        for (copy, shape) in std::mem::take(&mut self.inflight.pending_shadows) {
+            match self.worker.shadow(copy) {
+                Ok(()) => self.note_shadowed(shape),
+                Err(error) => self.shadow_failed(format!("{error:#}")),
+            }
+        }
+    }
+
+    /// Takes one completed batch `batch` with its `outcome`: gives back the
+    /// slots it held, advances its requests in request order, publishes
+    /// their pages and emits their events.
+    ///
+    /// A batch that failed on its device is the engine's failure: the
+    /// requests it carried end, and the scheduler stops.
+    pub fn update(
+        &mut self,
+        batch: ipc::execution::BatchId,
+        outcome: ipc::execution::Outcome<ipc::execution::BatchOutput>,
+    ) {
+        self.worker.release(batch);
+        let numbered = self
+            .inflight
+            .pending_batches
+            .get(&batch.0)
+            .map(|pending| pending.numbered.clone())
+            .unwrap_or_default();
+        match crate::completion::BatchReport::from_output(batch.0, outcome, &numbered) {
+            Ok(report) => self.apply_result(report),
+            Err(error) => {
+                // A failure retires what the devices held: no slot is kept
+                // for a batch that will not complete.
+                self.worker.release_all();
+                self.on_worker_error(error);
+            }
+        }
     }
 
     /// Returns whether any rank queue can still accept a batch.
@@ -280,7 +366,12 @@ impl Scheduler {
             .contains_key(crate::encodings::VISION_FEATURES)
     }
 
-    pub(super) fn step_nonblocking(&mut self) -> bool {
+    /// One pass of the step loop, without waiting: flushes the output
+    /// journals, takes one completed batch (`update`), reads what the Storage
+    /// Servers answered, assembles the batches that fit (`schedule`) and
+    /// submits them. Returns whether anything happened; a caller that finds
+    /// nothing did waits (`Scheduler::wait`).
+    pub(super) fn step(&mut self) -> bool {
         let _span = tracing::trace_span!("scheduler.step").entered();
         let mut progressed = self.flush_output_journals();
         // Resolve one batch result. Refilling immediately after one
@@ -288,7 +379,17 @@ impl Scheduler {
         // responses become ready together at queue depth greater than one.
         // The owner loop returns here without parking while progress is being
         // made, so subsequent ready completions are handled on successive turns.
-        progressed |= self.poll_one_result();
+        progressed |= self.take_completed();
+        // The wait for a predecessor's index ended: the requests held for it
+        // return to the head of the queue.
+        if !self.held_for_index.is_empty()
+            && self
+                .awaiting_index
+                .is_some_and(|until| Instant::now() >= until)
+        {
+            self.release_held_for_index();
+            progressed = true;
+        }
         // A stage that arrived while a batch was executing is applied at the
         // first batch boundary with nothing in flight: no batch is ever decided
         // by one policy and executed under another (design §7.3).
@@ -301,7 +402,9 @@ impl Scheduler {
             .as_mut()
             .is_some_and(crate::encoder_outputs::EncoderStore::poll);
 
-        let submitted = self.refill_worker();
+        let mut batches = Vec::new();
+        let submitted = self.schedule_into(&mut batches);
+        self.submit(batches);
         progressed |= submitted;
         self.poll_resize();
         self.recompute_starved(submitted);
@@ -340,12 +443,25 @@ impl Scheduler {
         answered
     }
 
-    /// Dispatches queued batches, reaps cancellations, admits requests, and
-    /// fills every available worker slot.
+    /// Assembles the batches that fit now, at most one per worker group and
+    /// phase with room in its queue, and returns them for submission, in
+    /// order.
     ///
-    /// Returns whether it queued or submitted a batch or handled a submission
-    /// failure. Stops early once the engine-fatal latch is set.
-    pub(super) fn refill_worker(&mut self) -> bool {
+    /// The running requests that can make progress come first, within the
+    /// step's call and token budgets; then the waiting queue in the policy's
+    /// order, each request admitted when it can be given a slot and the pages
+    /// its next call needs. A batch whose devices are full stays with the
+    /// scheduler and is returned by a later call.
+    pub fn schedule(&mut self) -> Vec<ipc::execution::Batch> {
+        let mut released = Vec::new();
+        self.schedule_into(&mut released);
+        released
+    }
+
+    /// [`Self::schedule`] into `released`; returns whether the pass formed,
+    /// released or settled a batch, or handled a failure. Stops early once
+    /// the engine-fatal latch is set.
+    pub(super) fn schedule_into(&mut self, released: &mut Vec<ipc::execution::Batch>) -> bool {
         let mut progressed = false;
         // Drop residency for requests that are no longer running or retiring.
         // A retiring request keeps its entries because
@@ -364,7 +480,7 @@ impl Scheduler {
             .retain(|(request, _), _| live(&request.request_id));
 
         let mut blocked_workers = HashSet::new();
-        progressed |= self.dispatch_submissions(&mut blocked_workers);
+        progressed |= self.release(&mut blocked_workers, released);
         if self.failed() {
             return progressed;
         }
@@ -372,8 +488,9 @@ impl Scheduler {
         // Reap cancellations before assembling.
         self.reap_cancellations();
 
-        // Submit as many batches as the rank queues admit. Admission is not
-        // done here: it is the plan's `admit`, executed once per step.
+        // Form as many batches as the rank queues admit. Admission is not
+        // done here: it is the policy's `admit`, executed once per step.
+        let mut idle_steps = 0;
         loop {
             if !self.a_rank_queue_admits() {
                 break;
@@ -386,11 +503,23 @@ impl Scheduler {
             }
             let batches = self.schedule_batches();
             if batches.is_empty() {
+                // A step that formed no batch may still have moved a request:
+                // an image found in the encoder cache needs no encode, so the
+                // work the policy gave its encode became nothing and its
+                // prefill is the next decision. The policy decides again on
+                // the views that moved, within a bound that keeps a pair of
+                // views that would move each other for ever from spinning.
+                idle_steps += 1;
+                if idle_steps <= IDLE_STEPS && self.policy.is_some() && self.refresh_views() {
+                    progressed = true;
+                    continue;
+                }
                 break;
             }
+            idle_steps = 0;
             self.inflight.pending_submissions.extend(batches);
             progressed = true;
-            self.dispatch_submissions(&mut blocked_workers);
+            self.release(&mut blocked_workers, released);
             if self.failed() {
                 return progressed;
             }
@@ -424,7 +553,7 @@ impl Scheduler {
                 self.inflight.pending_submissions.push_back(batch);
                 progressed = true;
             }
-            self.dispatch_submissions(&mut blocked_workers);
+            self.release(&mut blocked_workers, released);
             if self.failed() {
                 return progressed;
             }
@@ -446,7 +575,7 @@ impl Scheduler {
             );
             self.inflight.pending_submissions.push_back(batch);
             progressed = true;
-            self.dispatch_submissions(&mut blocked_workers);
+            self.release(&mut blocked_workers, released);
             if self.failed() {
                 return progressed;
             }
@@ -673,7 +802,7 @@ impl Scheduler {
         // that completes mid-step must not split one step across two epochs
         // (4.2, 7.3).
         let generation = self.serving_generation();
-        self.worker.set_generation(generation);
+        self.step_generation = generation;
         // The pages that appeared and went since the previous step, then
         // everything else that changed, in the order it happened, closed before
         // this step's dispatch. The room, the live state, and the plan's checks
@@ -685,7 +814,7 @@ impl Scheduler {
         // append-only, so a phase it is never told about is a phase it does not
         // have, and an admitted request it never hears of again is one it can
         // never plan work for.
-        self.refresh_views();
+        let _ = self.refresh_views();
         // The policy's knowledge and the mechanism's own must be the same: a
         // request the mechanism holds and the policy never heard of is one it
         // cannot plan work for, and a request the policy still holds after the
@@ -701,6 +830,7 @@ impl Scheduler {
         // The epoch ends only when nothing else could have been served, which
         // is the case a reader must be able to see from the log.
         let now = scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+        self.starvation_judged = now;
         let starved = {
             let live = self.live();
             self.watchdog
@@ -755,7 +885,7 @@ impl Scheduler {
         // The rest is read against the state admission has left: the admitted
         // requests' views moved, and the pages are the scheduler's own table
         // borrowed for the check (design §4.4).
-        self.refresh_views();
+        let _ = self.refresh_views();
         let live = self.live();
         if let Err(error) = mechanism::validate_after_admission(&plan, &room, &live) {
             return self.policy_failed(policy, error);
@@ -830,7 +960,10 @@ impl Scheduler {
     /// calls other requests hold in flight on a shared component, so every
     /// resident media request is stated each step; they are few, and a token
     /// resident is never walked.
-    fn refresh_views(&mut self) {
+    ///
+    /// Returns whether any view differed: the policy has something new to
+    /// decide on.
+    fn refresh_views(&mut self) -> bool {
         let mut changed = self.requests.take_changed();
         changed.extend(self.requests.running_video().map(|(id, _, _)| id));
         for id in changed {
@@ -838,7 +971,7 @@ impl Scheduler {
                 self.recorder.update(view);
             }
         }
-        self.recorder.close();
+        self.recorder.close()
     }
 
     /// Ends the step's accounting: the step number, and the policy's per-step
@@ -1221,20 +1354,16 @@ impl Scheduler {
             .store(self.storage.encoder_cache.len(), Ordering::Relaxed);
     }
 
-    /// Resolves at most one ready result so assembly can refill the freed slot
-    /// before another completion is consumed.
-    pub(super) fn poll_one_result(&mut self) -> bool {
-        let _span = tracing::trace_span!("scheduler.poll_one_result").entered();
-        match self.worker.poll(Duration::ZERO) {
-            Ok(Some(result)) => {
-                self.apply_result(result);
+    /// Takes at most one completed batch, so the next pass can refill the slot
+    /// it freed before another completion is taken.
+    pub(super) fn take_completed(&mut self) -> bool {
+        let _span = tracing::trace_span!("scheduler.take_completed").entered();
+        match self.worker.take_completed() {
+            Some((batch, outcome)) => {
+                self.update(batch, outcome);
                 true
             }
-            Ok(None) => false,
-            Err(error) => {
-                self.on_worker_error(error);
-                true
-            }
+            None => false,
         }
     }
 }

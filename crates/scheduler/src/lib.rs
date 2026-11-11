@@ -1,48 +1,48 @@
-//! Scheduling, KV cache management and request control of a node's main
-//! process (`uniserve engine`).
+//! Scheduling, KV cache management and request control of an engine.
 //!
-//! A deployment runs one scheduler per DP rank: a main process builds a
-//! `SchedulerHandle` (`core`) over the devices it holds and runs the
-//! `Scheduler` (this crate's root, `run`) on a thread of its own. The process's control
-//! thread submits and controls requests through the handle and receives each
-//! request's events on its `EventRx` (`handle`). On its thread, the
-//! `Scheduler` admits requests, assigns cache pages (`kv_cache`) and other
-//! storage (`allocation`, `reservation`), and submits batches through
-//! `Submissions` (`submission`) to the worker crate's `Batches`.
+//! An engine runs one scheduler per data-parallel rank: it builds a
+//! `SchedulerHandle` (`core`) over the devices it holds, which runs the
+//! [`Scheduler`] on a thread of its own. The engine's control thread submits
+//! and controls requests through the handle and receives each request's
+//! events on its `EventRx` (`handle`).
 //!
-//! The scheduler is the request algorithms and the single-owner control loop.
-//! The loop combines request progress, scheduler policy, storage allocations, and
-//! asynchronous worker completions. All mutable engine state stays on its
-//! owner thread.
+//! The scheduler's surface is five calls, vLLM's: [`Scheduler::add_request`],
+//! [`Scheduler::cancel`], [`Scheduler::schedule`], [`Scheduler::update`] and
+//! [`Scheduler::drain`]. [`Scheduler::run`] is the step loop over them: take
+//! what arrived, `update` with each completed batch, `schedule` the batches
+//! that fit, submit them to the executors (`submission`), and block until
+//! something arrives. All scheduler state stays on that thread.
 //!
-//! Scheduling admits from its waiting queue and chunks prefill against sequence
-//! and token budgets. A token request with context images reserves its
-//! worst-case cache blocks at admission; a text-only request needs
-//! only the blocks of its first prefill chunk. A request larger than the total
-//! cache capacity is rejected. A resident request is never relocated or
-//! preempted: when capacity is short, admission waits.
-//!
-//! Static worker state crosses the boundary once in [`NewRequest`]; subsequent
-//! calls carry only step-specific deltas.
+//! A request is one type from arrival to end (`request`): waiting, running
+//! or finished, with a graph of calls that is a token request's loop or a
+//! video request's chain. Admission gives a request a slot and the pages its
+//! next call needs after its cached prefix was looked up (`kv_cache`); a
+//! request that cannot be admitted waits, a request larger than the cache is
+//! rejected, and when running requests themselves cannot grow the policy
+//! names a victim, which ends as migratable.
 //!
 //! The scheduler's modules:
 //!
-//! - `run`: construction and the owner-thread loop.
-//! - `admission`: admission, resource reservation, and waiting-queue insertion.
-//! - `batching`: generation-path batch selection and call planning.
-//! - `generation`: per-request generation state, call builders, and result
+//! - `run`: construction, the step loop and its wait.
+//! - `request`: a request, its status and the table of every request.
+//! - `admission`: arrival, the waiting queue and admission.
+//! - `batching`: batch assembly and the calls a batch carries.
+//! - `generation`: a token request's state, call builders and result
 //!   validation.
 //! - `denoising`: solver progress of one latent trajectory.
 //! - `graph`: the call graph of one video request.
-//! - `execution`: submission, completion application, video media scheduling,
-//!   and allocation reclamation.
-//! - `inflight`: submitted batches and calls, and request-local completion
-//!   ordering.
+//! - `execution`: the step (`schedule`, `update`), video scheduling and
+//!   failure handling.
+//! - `inflight`: batches and calls in flight, and request-local completion
+//!   order.
+//! - `submission`: the door to the executors and the scheduler's wake.
 //! - `output`: public events, semantic result resolution, and termination.
-//! - `reservation` and `dispatch`: what requests hold of the storage pools, and
-//!   worker dispatch.
-//! - `control`: cancellation and frontend lifecycle commands.
-//! - `config`, `stats`, and `stats_report`: limits and statistics.
+//! - `allocation` and `dispatch`: what requests hold of the storage pools,
+//!   and the worker group each call runs on.
+//! - `control`: the control thread's commands.
+//! - `policy`, `mechanism` and `views`: the policy module, the checks of its
+//!   decisions and what it reads.
+//! - `stats` and `stats_report`: statistics.
 
 /// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
 /// error is public.
@@ -67,7 +67,7 @@ pub use crate::handle::{
 pub use crate::worker::{
     BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ExecuteError, ExecutionBatch,
     PageOffloads, RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel, WorkerError,
-    WorkerFailure, WorkerGroupId, WorkerInfo, WorkerSubmitError,
+    WorkerFailure, WorkerGroupId, WorkerInfo,
 };
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
@@ -206,19 +206,11 @@ enum BatchKind {
     Media,
 }
 
-/// Timeout of `Worker::poll` while the loop parks
-/// (`Scheduler::park_for_progress`). A result ends the park, and a worker
-/// with wake integration also returns early on commands and consumer reads;
-/// the timeout is only a liveness deadline.
-const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 /// Longest a drain (`Scheduler::drain_batches`) may go without a batch or a
 /// submission leaving the pending set before it calls what it still holds
 /// abandoned. It bounds silence, not the drain: every completion restarts it,
 /// so a scheduler that keeps receiving results is never cut off under load.
 const DRAIN_SILENCE: Duration = Duration::from_secs(300);
-/// Timeout of a park while the host KV cache's answers are awaited: the
-/// Storage Server answers a local connection within this.
-const KV_OFFLOAD_POLL: Duration = Duration::from_millis(1);
 /// Longest a closing scheduler waits for its last pages to reach the
 /// host KV cache: for the batches in flight, which carry offloads, and for
 /// the batches of the remaining offloads.
@@ -367,6 +359,10 @@ pub struct Scheduler {
     /// the epoch last switched to, written by the control thread's switchover
     /// arm while it holds the generations' lock, read once per step.
     generation: Arc<std::sync::atomic::AtomicU64>,
+    /// The generation the current step's batches are laid out for: read from
+    /// `generation` once per step, so a switch mid-step cannot split one
+    /// step across two generations.
+    step_generation: u64,
     /// Tells the thread that reads this scheduler's output that there is some:
     /// its events and its answers wait for that thread, so a step that produced
     /// them says so rather than leaving them to its next periodic pass.
@@ -398,6 +394,9 @@ pub struct Scheduler {
     /// The starvation watchdog: a resident request that does not advance
     /// within the policy's `timeout` is the policy's failure (§4.4).
     watchdog: mechanism::Watchdog,
+    /// The moment of the last step's starvation check: a request past its
+    /// bound by then was judged by that step (`Scheduler::wait`).
+    starvation_judged: scheduling::guest::Nanos,
     /// The step number this scheduler is at.
     step: u64,
     /// `engine_id` of every `RequestKey` this scheduler issues.
@@ -420,7 +419,7 @@ pub struct Scheduler {
     /// failed (`Lifecycle`).
     lifecycle: Lifecycle,
     /// Shared scheduler counters and latency accumulators.
-    pub stats: Arc<SchedulerStats>,
+    stats: Arc<SchedulerStats>,
     /// The host KV cache, when it serves a worker group
     /// (`Scheduler::enable_kv_offload`).
     kv_offload: Option<crate::kv_cache::KvOffloadManager>,

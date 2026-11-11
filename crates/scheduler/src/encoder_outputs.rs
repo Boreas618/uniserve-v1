@@ -702,8 +702,9 @@ impl EncoderStore {
         moved
     }
 
-    /// Whether a request to a server awaits its answer.
-    pub(crate) fn waiting(&self) -> bool {
-        self.servers.waiting()
+    /// The store's Storage Server connections, which the scheduler waits on
+    /// beside its wake: an answer or an event ends the wait.
+    pub(crate) fn descriptors(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
+        self.servers.descriptors()
     }
 }

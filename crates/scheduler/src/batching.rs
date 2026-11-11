@@ -1192,7 +1192,7 @@ impl Scheduler {
         mut batch: ExecutionBatch,
         submit_at: Instant,
     ) -> ExecutionBatch {
-        // Command-only batches from `refill_worker` arrive with id zero.
+        // Batches of commands alone, which `schedule` forms, arrive with id zero.
         if batch.id == 0 {
             batch.id = self.inflight.next_batch_id();
         }

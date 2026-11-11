@@ -594,7 +594,14 @@ impl<S> Servers<S> {
     }
 
     /// Whether a request awaits its answer.
+    #[cfg(test)]
     pub(crate) fn waiting(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// The connections' descriptors, each readable when an answer or an
+    /// event arrived on it: what the scheduler waits on beside its wake.
+    pub(crate) fn descriptors(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
+        self.clients.iter().flatten().map(storage::Client::as_fd)
     }
 }

@@ -238,11 +238,10 @@ impl HandOffs {
         Ok(())
     }
 
-    /// Whether a server's answer or a copy's end is awaited: a task's end
-    /// arrives as an event after its answer, on a connection the worker does
-    /// not wait on, so the scheduler parks briefly until every copy ended.
-    pub(crate) fn waiting(&self) -> bool {
-        self.servers.waiting() || !self.copies.is_empty()
+    /// The store's Storage Server connections, which the scheduler waits on
+    /// beside its wake: an answer or an event ends the wait.
+    pub(crate) fn descriptors(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
+        self.servers.descriptors()
     }
 
     /// Take the servers' answers and events, and the hand-offs that ended.

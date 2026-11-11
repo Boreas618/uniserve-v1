@@ -1,77 +1,77 @@
 //! The scheduler's one door to execution.
 //!
-//! The step submits a batch, waits for results, and asks what the pool can do;
-//! it does not know what runs the batch. This module is the door: every path
-//! of the scheduler that executes something comes through it, to the batch
-//! interface of this process's devices (`ipc::execution::Batches`). The
-//! scheduler's own completion type is filled from
-//! `ipc::execution::BatchOutput` there.
+//! The step submits a batch, takes the batches that completed, and asks what
+//! the pools can do; it does not know what runs a batch. This module is the
+//! door: every path of the scheduler that executes something comes through
+//! it, to the batch interface of this process's devices
+//! (`ipc::execution::Batches`).
+//!
+//! The door also holds what ends the scheduler's wait. A scheduler with
+//! nothing to do blocks in [`Submissions::wait`] until something arrives: a
+//! command or a reader that freed room in an event channel
+//! ([`Submissions::waker`]), a submission that settled on its device, or an
+//! answer on a Storage Server connection. Nothing polls for any of them: the
+//! wake is an eventfd, waited on beside the connections in one `poll(2)`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::Instant;
+
+use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec};
 
 use crate::WorkerGroupId;
-use crate::completion::BatchReport;
-use crate::worker::ExecutionBatch;
-use crate::worker::{WorkerError, WorkerInfo, WorkerSubmitError};
-use ipc::execution::{Batch as DeviceBatch, Batches, Submission};
+use crate::worker::{WorkerError, WorkerInfo};
+use ipc::execution::{Batch, BatchId, BatchOutput, Batches, Submission};
 use ipc::execution::{EpochOperation, Outcome};
 
 /// What the scheduler executes through: the batch interface of this
 /// process's own devices (`ipc::execution::Batches`).
 ///
-/// A batch is converted to the worker's own description of it (the shape it
-/// pads to, the host columns the kernels read, the generation whose kernels
-/// serve it) and submitted. The completion comes back on a waiting thread, as
-/// the scheduler's own type: the scheduler thread never blocks on one
-/// device's completion, because a step is taken whether or not a device has
-/// answered.
+/// A batch reaches a device as the scheduler laid it out, and its submission
+/// is held here until the device settles it; the scheduler takes the outcome
+/// at its next step ([`Self::take_completed`]). The scheduler thread never
+/// blocks on one device's completion: it waits for whatever arrives first.
 ///
 /// Public because a scheduler is built with one: `Scheduler::new` takes a
 /// `Submissions`, made with `over_batches`.
 pub struct Submissions {
     batches: Arc<dyn Batches>,
     info: WorkerInfo,
-    /// The kernels this step's batches serve on. The scheduler reads its
-    /// generation cell once per step and stamps every batch of that step, so a
-    /// switchover mid-step cannot split one step across two epochs.
-    generation: u64,
-    /// Completed reports, in the order the devices finished them.
-    ready: crossbeam_channel::Receiver<Result<BatchReport, WorkerError>>,
-    /// The sending end of `nudged`, which `Submissions::waker` hands out.
-    nudge: crossbeam_channel::Sender<()>,
-    /// Ends a park that no result would end (`Submissions::waker`).
-    nudged: crossbeam_channel::Receiver<()>,
-    /// Submissions still to be waited on, handed to the waiting thread.
-    queue: crossbeam_channel::Sender<Pending>,
-    /// Shadow submissions in flight (7.3 step 2).
+    /// What ends the scheduler's wait ([`Self::wait`]): an eventfd that
+    /// [`Self::waker`] hands out and every held submission signals when it
+    /// settles.
+    wake: Arc<OwnedFd>,
+    /// The batches submitted and not yet taken as completed, in submission
+    /// order.
+    held: Vec<(BatchId, Submission)>,
+    /// Shadow submissions in flight.
     ///
     /// A shadow batch's paired forwards compare themselves on the device, and
     /// the comparison's verdict is this submission's outcome - no other path
     /// carries it to the update. The scheduler reads them in `shadow_status`,
     /// which is why a submission is kept until it has finished.
     shadows: Vec<Submission>,
-    /// The pool devices each unresolved batch holds a slot of, by batch.
+    /// The pool devices each batch in flight holds a slot of, by batch.
     ///
     /// A device of a pool admits `queue_depth` batches at once, and that bound is what makes a step
-    /// a batch: a request becomes ready when its own batch ends, so a mechanism that refills at
+    /// a batch: a request becomes ready when its own batch ends, so a scheduler that refills at
     /// once sends it alone, the batch after it carries one row again, and requests that run
     /// together never meet in a step. While the slots are taken the ready requests wait for each
-    /// other. The bound is each device's, as the capacity plan reserves it: a batch takes a slot
-    /// on every device it runs on, so a step that runs on all of them takes one everywhere, and
-    /// the clips a media request decodes on different devices go out together.
-    unresolved: HashMap<u64, Vec<(WorkerGroupId, usize)>>,
+    /// other. The bound is each device's: a batch takes a slot on every device it runs on, so a
+    /// step that runs on all of them takes one everywhere, and the clips a media request decodes
+    /// on different devices go out together.
+    slots: HashMap<BatchId, Vec<(WorkerGroupId, usize)>>,
     /// How many batches hold a slot of each device of each pool.
     occupied: HashMap<(WorkerGroupId, usize), usize>,
 }
 
-/// The state of the shadow submissions an update's pass asked for (7.3 step 2).
+/// The state of the shadow submissions an update's pass asked for.
 ///
 /// The pass is answered by the comparison's verdict, not by the fact that the
 /// batch was submitted: a paired forward that failed on the device is the
 /// update's failure, and answering earlier let a wrong kernel reach the
-/// switchover.
+/// switch.
 pub(super) enum ShadowStatus {
     /// At least one shadow batch has not finished.
     Pending,
@@ -81,23 +81,13 @@ pub(super) enum ShadowStatus {
     Failed(String),
 }
 
-/// One submitted batch, with what the report's calls name.
-struct Pending {
-    batch: u64,
-    submission: Submission,
-    /// Index for index with the batch's calls: the mechanism's name for the
-    /// call the worker numbers by its index.
-    calls: Vec<(ipc::RequestKey, ipc::CallId)>,
-}
-
 impl Submissions {
-    /// The mechanism over this process's own devices (2.4).
+    /// The door over this process's own devices.
     ///
-    /// The pools come from the worker's own inventory and nowhere else: an
+    /// The pools come from the worker's own inventory and nowhere else: a
     /// worker that states no pool is refused here rather than served with a
     /// guessed one, for the same reason `WorkerInfo::from_inventory` refuses
-    /// a pool that states no rank or no longest sequence — a mechanism that
-    /// assumes a rank's cache makes the host KV path disappear at runtime.
+    /// a pool that states no rank or no longest sequence.
     pub fn over_batches(batches: Arc<dyn Batches>) -> anyhow::Result<Submissions> {
         let info = WorkerInfo::from_inventory(batches.inventory())?;
         anyhow::ensure!(
@@ -107,226 +97,234 @@ impl Submissions {
         // A batch carries the columns the kernels read, and every KV view is
         // shaped to the longest sequence the deployment was built for: without
         // that number no batch is servable, so it is a fact of the boot and not
-        // something to discover at the first step as "nothing was dispatched"
-        // (design §4.3's layout, §4.4's hard limits).
+        // something to discover at the first step as "nothing was dispatched".
         anyhow::ensure!(
             info.max_model_len > 0,
             "the in-process worker states no longest sequence; a policy cannot be shaped to a \
              KV view without one"
         );
-        let (queue, pending) = crossbeam_channel::unbounded::<Pending>();
-        let (reports, ready) = crossbeam_channel::unbounded();
-        // One slot: a nudge that finds one waiting has nothing to add.
-        let (nudge, nudged) = crossbeam_channel::bounded(1);
-        std::thread::Builder::new()
-            .name("sched-in-process-wait".into())
-            .spawn(move || {
-                // One waiting thread for the whole epoch: a submission's
-                // outcome is a device's, and the scheduler thread reads only
-                // what this thread has already collected. The devices finish
-                // in their own order, so a batch is reported when it ends: a
-                // report held behind an earlier batch on another device is a
-                // next call that many milliseconds late.
-                //
-                // The thread blocks: on the queue while nothing is held, and
-                // otherwise on `settled`, which every held submission signals
-                // when one of its parts lands (`Submission::on_settled`) and
-                // the queue's forwarder signals when a new one is handed over.
-                let (settled, woken) = crossbeam_channel::bounded::<()>(1);
-                let wake: ipc::execution::Waker = Arc::new(move || {
-                    // A full slot already wakes the thread.
-                    let _ = settled.try_send(());
-                });
-                let mut held: Vec<Pending> = Vec::new();
-                loop {
-                    if held.is_empty() {
-                        match pending.recv() {
-                            Ok(next) => {
-                                next.submission.on_settled(&wake);
-                                held.push(next);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    for next in pending.try_iter() {
-                        next.submission.on_settled(&wake);
-                        held.push(next);
-                    }
-                    let mut index = 0;
-                    let mut reported = false;
-                    while index < held.len() {
-                        let Some(outcome) = held[index].submission.outcome() else {
-                            index += 1;
-                            continue;
-                        };
-                        let done = held.remove(index);
-                        let report = BatchReport::from_output(done.batch, outcome, &done.calls);
-                        if reports.send(report).is_err() {
-                            return;
-                        }
-                        reported = true;
-                    }
-                    if !reported && !held.is_empty() {
-                        // Either a held part settled or another batch was
-                        // handed over; both are re-read at the top.
-                        crossbeam_channel::select! {
-                            recv(woken) -> _ => {}
-                            recv(pending) -> next => match next {
-                                Ok(next) => {
-                                    next.submission.on_settled(&wake);
-                                    held.push(next);
-                                }
-                                Err(_) => {
-                                    // No further batch; the held ones still
-                                    // settle and wake the thread.
-                                    let _ = woken.recv();
-                                }
-                            },
-                        }
-                    }
-                }
-            })
-            .map_err(|error| anyhow::anyhow!("starting the in-process waiting thread: {error}"))?;
+        // Nonblocking: a wake adds to the counter and a wait reads it empty,
+        // so wakes that arrive together end one wait.
+        let wake = rustix::event::eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC)
+            .map_err(|error| anyhow::anyhow!("opening the scheduler's wake: {error}"))?;
         Ok(Submissions {
             batches,
             info,
-            generation: 0,
-            ready,
-            nudge,
-            nudged,
-            queue,
+            wake: Arc::new(wake),
+            held: Vec::new(),
             shadows: Vec::new(),
-            unresolved: HashMap::new(),
+            slots: HashMap::new(),
             occupied: HashMap::new(),
         })
     }
 
-    /// What ends this scheduler's park when something other than a batch's
-    /// result arrives: a command, or a reader that freed room in an event
+    /// What ends this scheduler's wait when something other than a batch's
+    /// completion arrives: a command, or a reader that freed room in an event
     /// channel.
     ///
-    /// The in-process arm parks on its results, so without this a command to an
-    /// idle scheduler waits out the park's whole liveness bound: a request
-    /// admitted that much later, and every stage of an update that much slower.
+    /// The scheduler blocks while nothing arrives, so a command that did not
+    /// wake it would wait for the next completion.
     pub fn waker(&self) -> crate::CommandWaker {
-        let nudge = self.nudge.clone();
-        crate::CommandWaker::new(move || {
-            let _ = nudge.try_send(());
-        })
+        let wake = Arc::clone(&self.wake);
+        crate::CommandWaker::new(move || signal(&wake))
     }
 
-    /// States the generation this step's batches serve on (4.2, 7.3).
+    /// Blocks until something arrived since the last wait: a wake, or an
+    /// answer or event on one of `connections`, the scheduler's Storage
+    /// Server connections. `deadline` is a bound of the scheduler's own that
+    /// passes without any arrival (a starvation bound, a wait for a
+    /// predecessor's index, a prefetch's patience, a drain's silence); with
+    /// none, the wait has no end but an arrival.
     ///
-    /// The scheduler calls this once per step, before it dispatches anything:
-    /// every batch of one step runs on one epoch's kernels.
-    pub(super) fn set_generation(&mut self, generation: u64) {
-        self.generation = generation
+    /// A wait that fails (an interrupted call) returns as an arrival does:
+    /// the scheduler takes a step that finds nothing and waits again.
+    pub(super) fn wait(&self, deadline: Option<Instant>, connections: &[BorrowedFd<'_>]) {
+        let mut waited: Vec<PollFd<'_>> = Vec::with_capacity(1 + connections.len());
+        waited.push(PollFd::new(&*self.wake, PollFlags::IN));
+        waited.extend(
+            connections
+                .iter()
+                .map(|connection| PollFd::from_borrowed_fd(*connection, PollFlags::IN)),
+        );
+        let remaining = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .and_then(|remaining| Timespec::try_from(remaining).ok());
+        let _ = rustix::event::poll(&mut waited, remaining.as_ref());
+
+        // Every wake since the last wait is taken at once: the step that
+        // follows reads everything that arrived.
+        let mut counter = [0u8; 8];
+        let _ = rustix::io::read(&*self.wake, &mut counter);
     }
 
-    /// The pool's capabilities: its workers, components, pools, and limits.
+    /// The pools' capabilities: their ranks, stages and limits.
     pub(super) fn info(&self) -> &WorkerInfo {
         &self.info
     }
 
-    /// Whether every rank of the pool `group` is ready to accept execution.
+    /// Whether every rank of the pool `group` is ready to accept execution:
+    /// the door serves the pools its inventory states and no others.
     pub(super) fn is_ready(&self, group: &WorkerGroupId) -> bool {
-        // The arm serves the pools its inventory states and no others.
         self.info.workers.iter().any(|(id, _)| id == group)
     }
 
-    /// Whether the pool `group` has an unclaimed destination submission slot.
+    /// Whether `group` is a stated pool with a slot free on some device: a
+    /// batch may still be formed for it, and [`Self::reserve`] holds back one
+    /// whose own devices are full.
     pub(super) fn has_capacity(&self, group: &WorkerGroupId) -> bool {
-        self.has_room(group)
+        self.is_ready(group)
+            && (0..self.batches.device_count().max(1))
+                .any(|device| self.slot_free(&(group.clone(), device)))
     }
 
-    /// The extent of the bucket this worker would serve `computation` in, when it serves one
-    /// (2.4).
-    ///
-    /// The mechanism asks before it forms a media batch, because the batch states the extent its
-    /// kernels were captured for and only the worker's own plan knows it: a bucket planned for
-    /// one canvas serves no other, and deriving the extent in the mechanism would be a second
-    /// statement of the runner's plan. `None` is the answer for a computation no device of this
-    /// rank serves.
-    pub(super) fn media(
-        &self,
-        phase: ipc::PhaseId,
-        computation: &ipc::execution::Computation,
-    ) -> Option<ipc::execution::Extent> {
-        self.batches.media(phase, computation).ok().flatten()
-    }
-
-    /// Maps the host KV cache's page pools on every rank of the pool, each
-    /// holding `tokens` tokens of every cache group.
-    pub(super) fn map_host_cache(
-        &mut self,
-        tokens: u64,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
-        // The ranks of this process map their pools through the worker that owns their
-        // caches: its device threads issue the copies.
-        let mapped = self
-            .batches
-            .map_host_cache(tokens)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        mapped
-            .into_iter()
-            .map(|(group, ranks)| {
-                let results = ranks
-                    .iter()
-                    .map(|pools| serde_json::to_string(&Some(pools)))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| anyhow::anyhow!(error))?;
-                Ok((WorkerGroupId(group), results))
-            })
-            .collect()
-    }
-
-    /// Performs the storage `operation` on every rank while none runs a batch.
-    pub(super) fn operate(
-        &mut self,
-        operation: &EpochOperation,
-    ) -> Result<Vec<String>, WorkerError> {
-        self.batches
-            .operate(operation)
-            .map_err(|error| anyhow::anyhow!(error))
-    }
-
-    /// Performs the storage `operation`, answering each group with its ranks' results.
-    pub(super) fn operate_groups(
-        &mut self,
-        operation: &EpochOperation,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
-        // This process's data plane answers for its ranks in rank order. Every group of a
-        // scheduler indexes the one unit space its ranks agreed their cache over, so each
-        // group states what every rank reports.
-        let results = self
-            .batches
-            .operate(operation)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        if results.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(self
+    /// Whether one device of a pool has a slot free: fewer of its batches in
+    /// flight than the pool's `queue_depth`.
+    fn slot_free(&self, slot: &(WorkerGroupId, usize)) -> bool {
+        let depth = self
             .info
-            .workers
-            .iter()
-            .map(|(group, _)| (group.clone(), results.clone()))
-            .collect())
+            .layouts
+            .get(&slot.0)
+            .map_or(1, |layout| layout.queue_depth.max(1));
+        self.occupied.get(slot).copied().unwrap_or(0) < depth
     }
 
-    /// Commits prepared expert allocations and retains their order.
-    pub(super) fn commit_experts(
+    /// Takes a slot for `batch` on every device of `pools` it runs on, when
+    /// each has one free, and answers whether it did. A batch that took its
+    /// slots is submitted next; one that did not waits for a completion.
+    ///
+    /// # Errors
+    ///
+    /// When the worker cannot say which devices run the batch.
+    pub(super) fn reserve(
         &mut self,
-        order: &BTreeMap<String, Vec<u32>>,
-    ) -> Result<Vec<String>, WorkerError> {
-        self.batches
-            .commit_experts(order)
-            .map_err(|error| anyhow::anyhow!(error))
+        batch: &Batch,
+        pools: &[WorkerGroupId],
+    ) -> Result<bool, WorkerError> {
+        let devices = self
+            .batches
+            .devices(batch)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let slots: Vec<(WorkerGroupId, usize)> = pools
+            .iter()
+            .flat_map(|pool| devices.iter().map(move |index| (pool.clone(), *index)))
+            .collect();
+        if !slots
+            .iter()
+            .all(|slot| self.is_ready(&slot.0) && self.slot_free(slot))
+        {
+            return Ok(false);
+        }
+        for slot in &slots {
+            *self.occupied.entry(slot.clone()).or_default() += 1;
+        }
+        self.slots.insert(batch.id, slots);
+        Ok(true)
     }
-}
 
-impl Submissions {
+    /// Gives back the slots `batch` held: it completed.
+    pub(super) fn release(&mut self, batch: BatchId) {
+        for slot in self.slots.remove(&batch).unwrap_or_default() {
+            if let Some(count) = self.occupied.get_mut(&slot) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Gives back every slot: the devices failed, and the scheduler retires
+    /// what they held without waiting for their batches.
+    pub(super) fn release_all(&mut self) {
+        self.slots.clear();
+        self.occupied.clear();
+    }
+
+    /// Submits `batch` to the devices of its group and holds its submission
+    /// until they settle it.
+    pub(super) fn submit(&mut self, batch: Batch) -> Result<(), WorkerError> {
+        let id = batch.id;
+        let submission = self
+            .batches
+            .submit(batch)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        self.hold(id, submission);
+        Ok(())
+    }
+
+    /// Copies `pages` to the host KV cache as batch `id`, which carries no
+    /// call: pages that wait while nothing runs ride no forward.
+    pub(super) fn copy_pages(
+        &mut self,
+        id: BatchId,
+        pages: Vec<ipc::PageCopy>,
+    ) -> Result<(), WorkerError> {
+        let submission = self
+            .batches
+            .copy_pages(pages)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        self.hold(id, submission);
+        Ok(())
+    }
+
+    /// Copies preempted requests' trajectories to the host latent pools as
+    /// batch `id`, which carries no call: a trajectory waits for nothing on
+    /// the device but the batches that advanced it.
+    pub(super) fn offload_latents(
+        &mut self,
+        id: BatchId,
+        latents: Vec<ipc::LatentOffload>,
+    ) -> Result<(), WorkerError> {
+        let submission = self
+            .batches
+            .offload_latents(latents)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        self.hold(id, submission);
+        Ok(())
+    }
+
+    /// Keeps `submission` until it settles, which wakes the scheduler.
+    fn hold(&mut self, id: BatchId, submission: Submission) {
+        submission.on_settled(&self.settled());
+        self.held.push((id, submission));
+    }
+
+    /// What a submission calls when it settles: the scheduler's wake.
+    fn settled(&self) -> ipc::execution::Waker {
+        let wake = Arc::clone(&self.wake);
+        Arc::new(move || signal(&wake))
+    }
+
+    /// The oldest submitted batch that settled, with its outcome; `None`
+    /// while every batch in flight is still on its device.
+    ///
+    /// The devices finish in their own order, so a batch is taken when it
+    /// ends rather than behind an earlier batch of another device.
+    pub(super) fn take_completed(&mut self) -> Option<(BatchId, Outcome<BatchOutput>)> {
+        let (index, outcome) = self
+            .held
+            .iter()
+            .enumerate()
+            .find_map(|(index, (_, submission))| Some((index, submission.outcome()?)))?;
+        let (id, _) = self.held.remove(index);
+        Some((id, outcome))
+    }
+
+    /// Submits `batch`, which names another generation than the one serving,
+    /// for the update's paired forwards: the worker compares them, and the
+    /// batch reports nothing of its own.
+    pub(super) fn shadow(&mut self, batch: Batch) -> Result<(), WorkerError> {
+        let submission = self
+            .batches
+            .shadow(batch)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        // The update's pass is answered at the step after its verdict.
+        submission.on_settled(&self.settled());
+        self.shadows.push(submission);
+        self.shadows
+            .retain(|submission| submission.outcome().is_none());
+        Ok(())
+    }
+
     /// The state of this pass's shadow submissions, reading every one that has
-    /// finished and answering the first failure (7.3 step 2).
+    /// finished and answering the first failure.
     ///
     /// A failure carries the device thread's label beside its error, so the
     /// update states which paired forward of which operator and bucket left
@@ -359,387 +357,103 @@ impl Submissions {
         }
     }
 
-    /// Whether `worker` is a stated pool with a slot free on some device: a batch may still be
-    /// formed for it, and `submit` holds back one whose own devices are full.
-    fn has_room(&self, worker: &WorkerGroupId) -> bool {
-        self.info.workers.iter().any(|(id, _)| id == worker)
-            && (0..self.batches.device_count().max(1))
-                .any(|device| self.slot_free(&(worker.clone(), device)))
+    /// The extent of the bucket the worker would serve `computation` in, when
+    /// it serves one.
+    ///
+    /// The scheduler asks before it forms a media batch, because the batch
+    /// states the extent its kernels were captured for and only the runner
+    /// knows it: a bucket captured for one resolution serves no other, and
+    /// deriving the extent in the scheduler would be a second statement of
+    /// the runner's buckets. `None` is the answer for a computation no device
+    /// of this rank serves.
+    pub(super) fn media(
+        &self,
+        phase: ipc::PhaseId,
+        computation: &ipc::execution::Computation,
+    ) -> Option<ipc::execution::Extent> {
+        self.batches.media(phase, computation).ok().flatten()
     }
 
-    /// Whether one device of a pool has a slot free: fewer of its batches unresolved than the
-    /// pool's `queue_depth`.
-    fn slot_free(&self, slot: &(WorkerGroupId, usize)) -> bool {
-        let depth = self
-            .info
-            .layouts
-            .get(&slot.0)
-            .map_or(1, |layout| layout.queue_depth.max(1));
-        self.occupied.get(slot).copied().unwrap_or(0) < depth
-    }
-
-    /// The pools `batch` takes a slot of: those its calls and its page offloads run on.
-    fn pools(batch: &ExecutionBatch) -> Vec<WorkerGroupId> {
-        let mut pools: Vec<WorkerGroupId> = batch
-            .requests
-            .iter()
-            .map(|(_, dispatch)| dispatch.worker.clone())
-            .chain(
-                batch
-                    .page_offloads
-                    .iter()
-                    .map(|offloads| offloads.worker.clone()),
-            )
-            .collect();
-        pools.sort();
-        pools.dedup();
-        pools
-    }
-
-    pub(super) fn submit(&mut self, batch: ExecutionBatch) -> Result<(), WorkerSubmitError> {
-        // A preempted request's trajectory waits for nothing on the device but the batches that
-        // advanced it, and rides no forward: it is a batch of its own, whose end commits the pool
-        // slots the engine reserved.
-        if batch.requests.is_empty()
-            && let Some(offloads) = batch
-                .page_offloads
-                .as_ref()
-                .filter(|offloads| !offloads.latents.is_empty())
-        {
-            let submission = self
-                .batches
-                .offload_latents(offloads.latents.clone())
-                .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
-            return self
-                .queue
-                .send(Pending {
-                    batch: batch.id,
-                    submission,
-                    calls: Vec::new(),
-                })
-                .map_err(|error| {
-                    WorkerSubmitError::Failed(anyhow::anyhow!(
-                        "the in-process waiting thread has gone: {error}"
-                    ))
-                });
-        }
-        // Pages that wait while nothing runs ride no forward: they are a batch of their own, which
-        // the mechanism reads the end of as it reads any other.
-        if batch.requests.is_empty()
-            && let Some(offloads) = batch
-                .page_offloads
-                .as_ref()
-                .filter(|offloads| !offloads.pages.is_empty())
-        {
-            let submission = self
-                .batches
-                .copy_pages(offloads.pages.clone())
-                .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
-            return self
-                .queue
-                .send(Pending {
-                    batch: batch.id,
-                    submission,
-                    calls: Vec::new(),
-                })
-                .map_err(|error| {
-                    WorkerSubmitError::Failed(anyhow::anyhow!(
-                        "the in-process waiting thread has gone: {error}"
-                    ))
-                });
-        }
-        let (device, calls) = if batch.requests.is_empty() {
-            (self.frees_only(&batch), Vec::new())
-        } else {
-            self.describe(&batch).map_err(WorkerSubmitError::Failed)?
-        };
-        let devices = self
+    /// Maps the host KV cache's page pools on every rank of the pools, each
+    /// holding `tokens` tokens of every cache group.
+    ///
+    /// The ranks of this process map their pools through the worker that owns
+    /// their caches: its device threads issue the copies.
+    pub(super) fn map_host_cache(
+        &mut self,
+        tokens: u64,
+    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
+        let mapped = self
             .batches
-            .devices(&device)
-            .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
-        let slots: Vec<(WorkerGroupId, usize)> = Self::pools(&batch)
+            .map_host_cache(tokens)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        mapped
             .into_iter()
-            .flat_map(|pool| devices.iter().map(move |index| (pool.clone(), *index)))
-            .collect();
-        if !slots.iter().all(|slot| {
-            self.info.workers.iter().any(|(id, _)| *id == slot.0) && self.slot_free(slot)
-        }) {
-            return Err(WorkerSubmitError::WouldBlock(Box::new(batch)));
-        }
-        let submission = self
-            .batches
-            .submit(device)
-            .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
-        for slot in &slots {
-            *self.occupied.entry(slot.clone()).or_default() += 1;
-        }
-        self.unresolved.insert(batch.id, slots);
-        self.queue
-            .send(Pending {
-                batch: batch.id,
-                submission,
-                calls,
+            .map(|(group, ranks)| {
+                let results = ranks
+                    .iter()
+                    .map(|pools| serde_json::to_string(&Some(pools)))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                Ok((WorkerGroupId(group), results))
             })
-            .map_err(|error| {
-                WorkerSubmitError::Failed(anyhow::anyhow!(
-                    "the in-process waiting thread has gone: {error}"
-                ))
-            })
+            .collect()
     }
 
-    /// Gives back the slots of the batch `report` ends.
-    fn resolved(&mut self, report: &BatchReport) {
-        if !report.done {
-            return;
-        }
-        for slot in self.unresolved.remove(&report.batch_id).unwrap_or_default() {
-            if let Some(count) = self.occupied.get_mut(&slot) {
-                *count = count.saturating_sub(1);
-            }
-        }
-    }
-
-    pub(super) fn shadow(
+    /// Performs the storage `operation` on every rank and returns what each
+    /// reported.
+    pub(super) fn operate(
         &mut self,
-        batch: ExecutionBatch,
-        generation: u64,
-    ) -> Result<(), WorkerSubmitError> {
-        // A shadow batch reports nothing of its own: the passes are the epoch
-        // update's paired forwards, compared by each operator's tolerance on the
-        // generation they name.
-        let (device, _) = self
-            .describe_with(&batch, generation)
-            .map_err(WorkerSubmitError::Failed)?;
-        let submission = self
-            .batches
-            .shadow(device)
-            .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
-        self.shadows.push(submission);
-        self.shadows
-            .retain(|submission| submission.outcome().is_none());
-        Ok(())
+        operation: &EpochOperation,
+    ) -> Result<Vec<String>, WorkerError> {
+        self.batches
+            .operate(operation)
+            .map_err(|error| anyhow::anyhow!(error))
     }
 
-    /// A report the waiting thread collected, with its batch's slots given back.
-    fn received(
+    /// Performs the storage `operation` on every rank and returns what each
+    /// reported, by pool.
+    ///
+    /// This process's data path answers for its ranks in rank order. Every
+    /// group of a scheduler indexes the one unit space its ranks agreed their
+    /// cache over, so each group states what every rank reports.
+    pub(super) fn operate_groups(
         &mut self,
-        report: Result<BatchReport, WorkerError>,
-    ) -> Result<Option<BatchReport>, WorkerError> {
-        match report {
-            Ok(report) => {
-                self.resolved(&report);
-                Ok(Some(report))
-            }
-            // A failure names no batch, and the mechanism retires what it affected: no slot is
-            // kept for a batch that will not report.
-            Err(error) => {
-                self.unresolved.clear();
-                self.occupied.clear();
-                Err(error)
-            }
+        operation: &EpochOperation,
+    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
+        let results = self.operate(operation)?;
+        if results.is_empty() {
+            return Ok(Vec::new());
         }
+        Ok(self
+            .info
+            .workers
+            .iter()
+            .map(|(group, _)| (group.clone(), results.clone()))
+            .collect())
     }
 
-    pub(super) fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, WorkerError> {
-        let gone = || {
-            anyhow::anyhow!("the in-process waiting thread has gone while batches were outstanding")
-        };
-        // A poll that does not wait takes a result if one is there, and leaves a
-        // nudge for the park that follows, which is the one it is meant to end.
-        if timeout.is_zero() {
-            return match self.ready.try_recv() {
-                Ok(report) => self.received(report),
-                Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
-                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(gone()),
-            };
-        }
-        crossbeam_channel::select! {
-            recv(self.ready) -> report => match report {
-                Ok(report) => self.received(report),
-                Err(_) => Err(gone()),
-            },
-            recv(self.nudged) -> _ => Ok(None),
-            default(timeout) => Ok(None),
-        }
-    }
-
-    /// The batch as the worker reads it, with the mechanism's names for its
-    /// calls.
-    ///
-    /// The batch was laid out once when the mechanism assembled it
-    /// (`ExecutionBatch::device`); this seam stamps the step's generation and
-    /// checks the layout against the calls before it leaves. The refusals are
-    /// the mechanism's, stated here because this is where the batch crosses
-    /// into the worker: a batch the mechanism could not lay out, a token
-    /// batch carrying a media call or a media batch a token call, a batch
-    /// whose calls name no device phase or several, and columns that do not
-    /// fit their shape are refused rather than served on invented values.
-    ///
-    /// Of the batch's lifecycle commands only its frees travel
-    /// (`Batch::frees`): a product's storage is the rank's, and the rank
-    /// releases it before it serves the batch. The other resources a command
-    /// retires — a request's row, its pages — belong to this process's worker
-    /// once it holds the columns. A batch that completes reports no command
-    /// as failed, which the mechanism reads as its commands having been
-    /// applied.
-    fn describe(
-        &self,
-        batch: &ExecutionBatch,
-    ) -> anyhow::Result<(DeviceBatch, Vec<(ipc::RequestKey, ipc::CallId)>)> {
-        self.describe_with(batch, self.generation)
-    }
-
-    /// A batch of commands alone whose products the rank holds: the frees of image features,
-    /// served by the rank that encodes images, which releases them and answers no call.
-    fn frees_only(&self, batch: &ExecutionBatch) -> DeviceBatch {
-        let phase = wire_phase(ipc::CallKind::Media(ipc::MediaCall::VisionEncoding))
-            .unwrap_or(ipc::PhaseId(0));
-        DeviceBatch {
-            id: ipc::execution::BatchId(batch.id),
-            phase,
-            // Image features are encoded where a request's prompt is computed, which is the first
-            // group of a scheduler that serves several (a deployment's prefill group).
-            group: self
-                .info
-                .workers
-                .first()
-                .map(|(group, _)| group.0.clone())
-                .unwrap_or_default(),
-            calls: Vec::new(),
-            shape: ipc::execution::Shape {
-                rows: 0,
-                tokens: 0,
-                variant: ipc::execution::Variant::ConditionEncode,
-            },
-            columns: Default::default(),
-            generation: self.generation,
-            cache_units: Vec::new(),
-            block_tables: Vec::new(),
-            page_loads: Vec::new(),
-            page_offloads: Vec::new(),
-            latent_restores: Vec::new(),
-            host_outputs: Vec::new(),
-            images: Vec::new(),
-            frees: frees(batch),
-            media: None,
-        }
-    }
-
-    /// The batch as the worker reads it, on generation `generation`.
-    ///
-    /// The serving path stamps the generation the step read; a shadow batch
-    /// names the epoch whose kernels it compares against, which is another.
-    fn describe_with(
-        &self,
-        batch: &ExecutionBatch,
-        generation: u64,
-    ) -> anyhow::Result<(DeviceBatch, Vec<(ipc::RequestKey, ipc::CallId)>)> {
-        let device = batch.device.as_ref().ok_or_else(|| {
-            // A media batch that arrives without its layout is a different fact from a token
-            // batch without one: the mechanism states a media computation's per-request buffers
-            // only for the computations a device serves, so the refusal names the computation
-            // rather than the token layout that batch never had.
-            match batch.requests.first().map(|(call, _)| call.kind) {
-                Some(ipc::CallKind::Media(call)) => anyhow::anyhow!(
-                    "batch {} states no media columns: the mechanism stages no per-request buffers \
-                     for a {:?} computation",
-                    batch.id,
-                    call
-                ),
-                _ => anyhow::anyhow!(
-                    "batch {} carries no columns: the mechanism could not state the layout its \
-                     kernels read",
-                    batch.id
-                ),
-            }
-        })?;
-        // One batch is one computation: a token batch is the typed columns the mechanism wrote,
-        // and a media batch is the computation its kernels were captured for beside the request's
-        // own stated parameters.
-        let media = device.media.is_some();
-        let mut calls = Vec::with_capacity(batch.requests.len());
-        for (call, dispatch) in &batch.requests {
-            // The devices of the batch's group run it, so every call is that group's.
-            anyhow::ensure!(
-                dispatch.worker.0 == device.group,
-                "batch {} runs on worker group {} and carries a call placed on {}",
-                batch.id,
-                device.group,
-                dispatch.worker.0
-            );
-            let media_call = matches!(call.kind, ipc::CallKind::Media(_));
-            anyhow::ensure!(
-                !media_call || media,
-                "in-process execution serves no media call from a token batch (batch {}): {:?}",
-                batch.id,
-                call.kind
-            );
-            anyhow::ensure!(
-                media_call || !media,
-                "batch {} states media columns and carries a call no media phase serves: {:?}",
-                batch.id,
-                call.kind
-            );
-            let phase = wire_phase(call.kind).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "batch {} carries a call kind no device phase serves: {:?}",
-                    batch.id,
-                    call.kind
-                )
-            })?;
-            anyhow::ensure!(
-                phase == device.phase,
-                "batch {} mixes phases: one batch serves one phase",
-                batch.id
-            );
-            calls.push((call.request_key, call.call_id));
-        }
-        anyhow::ensure!(
-            !calls.is_empty(),
-            "batch {} carries no call to serve",
-            batch.id
-        );
-        if let Some(media) = &device.media {
-            // A text encoding is the one media computation that reads token columns: its prompt.
-            anyhow::ensure!(
-                device.columns == ipc::execution::BatchColumns::default()
-                    || media.computation.call == ipc::MediaCall::TextEncoding,
-                "batch {} states token columns and media columns: one batch is one computation",
-                batch.id
-            );
-            media
-                .check()
-                .map_err(|error| anyhow::anyhow!("batch {}: {error}", batch.id))?;
-        } else {
-            device
-                .columns
-                .check(&device.shape)
-                .map_err(|error| anyhow::anyhow!("batch {}: {error}", batch.id))?;
-        }
-        let mut device = device.clone();
-        device.generation = generation;
-        // The products whose last reader completed reach the rank that holds them.
-        device.frees = frees(batch);
-        Ok((device, calls))
+    /// Applies the expert `order` on every rank and returns what each
+    /// reported.
+    pub(super) fn commit_experts(
+        &mut self,
+        order: &BTreeMap<String, Vec<u32>>,
+    ) -> Result<Vec<String>, WorkerError> {
+        self.batches
+            .commit_experts(order)
+            .map_err(|error| anyhow::anyhow!(error))
     }
 }
 
-/// The products a batch's commands release: the rank frees each before it serves the batch, its
-/// last reader having completed. The batch's other commands are the mechanism's own.
-pub(crate) fn frees(batch: &ExecutionBatch) -> Vec<ipc::BufferId> {
-    batch
-        .commands
-        .iter()
-        .filter_map(|command| match command {
-            ipc::BatchCommand::Free { buffer } => Some(*buffer),
-            _ => None,
-        })
-        .collect()
+/// Ends the wait on `wake`. A counter that is already full ends it too, so
+/// the write's failure is nothing to report.
+fn signal(wake: &OwnedFd) {
+    let _ = rustix::io::write(wake, &1u64.to_ne_bytes());
 }
 
-/// The phase id the device worker addresses a batch by (2.4, 4.4).
+/// The phase id the device worker addresses a batch by.
 ///
-/// The mechanism names phases with `scheduling`'s ids and the worker with
+/// The scheduler names phases with `scheduling`'s ids and the worker with
 /// `ipc`'s; both are the same fixed vocabulary in the same order, and this is
 /// the one place the two meet, so neither type grows a second numbering.
 pub(super) fn wire_phase(kind: ipc::CallKind) -> Option<ipc::PhaseId> {
@@ -750,127 +464,37 @@ pub(super) fn wire_phase(kind: ipc::CallKind) -> Option<ipc::PhaseId> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
-    use ipc::execution::{BatchOutput, Inventory, MediaColumns, PoolLayout, StagedRequest};
-    use ipc::execution::{Computation, Extent, Variant};
-    use ipc::execution::{Fault, SubmissionId};
-    use ipc::{Call, CallKind, MediaCall};
+    use ipc::execution::{Computation, Extent, MediaColumns, StagedRequest, Variant};
+    use ipc::{CallKind, MediaCall};
 
-    /// What one in-process submission carried to the worker.
-    #[derive(Clone, Debug)]
-    struct Delivered {
-        phase: ipc::PhaseId,
-        generation: u64,
-        media: Option<MediaColumns>,
+    /// The door over a fake pool named `gpu` of `devices` devices, two batches
+    /// in flight a device.
+    fn door(devices: usize) -> (Submissions, WorkerGroupId) {
+        let mut pool = testkit::pool("gpu");
+        pool.layout.queue_depth = 2;
+        let fake = testkit::FakeBatches::new(vec![pool]).with_devices(devices);
+        let submissions =
+            Submissions::over_batches(Arc::new(fake)).expect("the fake states a pool");
+        let pool = submissions.info().workers[0].0.clone();
+        (submissions, pool)
     }
 
-    /// The worker's own devices, as a double: it states one pool, answers the extent of the bucket its plan
-    /// would serve, and records every batch the mechanism hands it.
-    struct Devices {
-        inventory: Vec<Inventory>,
-        extent: Option<Extent>,
-        delivered: Arc<Mutex<Vec<Delivered>>>,
-        /// The devices the double runs batches on: a video decode on its unit's, in turn, and
-        /// any other batch on all of them, as `Workers` routes.
-        devices: usize,
-    }
-
-    impl Devices {
-        fn one(extent: Option<Extent>) -> (Arc<Self>, Arc<Mutex<Vec<Delivered>>>) {
-            let delivered = Arc::new(Mutex::new(Vec::new()));
-            let inventory = Inventory {
-                group: "gpu".to_owned(),
-                ranks: vec![ipc::MainProcessInfo::default()],
-                layout: PoolLayout {
-                    queue_depth: 2,
-                    ..PoolLayout::default()
-                },
-                max_model_len: 4096,
-            };
-            (
-                Arc::new(Self {
-                    inventory: vec![inventory],
-                    extent,
-                    delivered: Arc::clone(&delivered),
-                    devices: 1,
-                }),
-                delivered,
-            )
-        }
-
-        /// The double over `devices` devices.
-        fn several(
-            extent: Option<Extent>,
-            devices: usize,
-        ) -> (Arc<Self>, Arc<Mutex<Vec<Delivered>>>) {
-            let (one, delivered) = Self::one(extent);
-            let one = Arc::into_inner(one).expect("the double has one owner");
-            (Arc::new(Self { devices, ..one }), delivered)
-        }
-    }
-
-    impl Batches for Devices {
-        fn submit(&self, batch: DeviceBatch) -> Result<Submission, Box<Fault>> {
-            self.delivered
-                .lock()
-                .expect("the recorder is not poisoned")
-                .push(Delivered {
-                    phase: batch.phase,
-                    generation: batch.generation,
-                    media: batch.media,
-                });
-            Ok(Submission::completed(
-                SubmissionId(1),
-                Outcome::Success(BatchOutput::default()),
-            ))
-        }
-
-        fn shadow(&self, batch: DeviceBatch) -> Result<Submission, Box<Fault>> {
-            self.submit(batch)
-        }
-
-        fn media(
-            &self,
-            _phase: ipc::PhaseId,
-            _computation: &Computation,
-        ) -> Result<Option<Extent>, Box<Fault>> {
-            Ok(self.extent)
-        }
-
-        fn inventory(&self) -> &[Inventory] {
-            &self.inventory
-        }
-
-        fn devices(&self, batch: &DeviceBatch) -> Result<Vec<usize>, Box<Fault>> {
-            match &batch.media {
-                Some(media) if media.computation.call == MediaCall::VideoDecoding => {
-                    Ok(vec![media.request(0)?.unit as usize % self.devices])
-                }
-                _ => Ok((0..self.devices).collect()),
-            }
-        }
-
-        fn device_count(&self) -> usize {
-            self.devices
-        }
-    }
-
-    /// The extent a denoise is planned into: one step over one small request, the extent a media
-    /// batch states.
-    fn denoise_extent() -> Extent {
-        Extent::Request {
-            frames: 5,
-            width: 128,
-            height: 128,
-            text_rows: 4,
-            condition_rows: 0,
-        }
-    }
-
-    fn staged() -> StagedRequest {
-        StagedRequest {
+    /// One denoising step of one request as batch `id` of pool `gpu`.
+    fn denoise(id: u64) -> Batch {
+        let computation = Computation {
+            call: MediaCall::Denoising,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::Request {
+                frames: 5,
+                width: 128,
+                height: 128,
+                text_rows: 4,
+                condition_rows: 0,
+            },
+        };
+        let staged = StagedRequest {
             request: ipc::RequestKey::new(1, ipc::RequestId(9), 0),
             conditioning: vec![1, 2, 3],
             step: 2,
@@ -881,62 +505,16 @@ mod tests {
             frames: 121,
             handed: 0,
             unit: 0,
-        }
-    }
-
-    /// One call as the plan hands it to the mechanism.
-    fn call(kind: CallKind, request_id: u64) -> (Call, crate::worker::RequestDispatch) {
-        let key = ipc::RequestKey::new(1, ipc::RequestId(request_id), 0);
-        let call = Call::new(key, ipc::CallId::new(0, 0), kind);
-        (
-            call,
-            crate::worker::RequestDispatch {
-                worker: WorkerGroupId("gpu".to_owned()),
-                request_pool_idx: None,
-                decode: None,
-                buffers: Vec::new(),
-                readers: None,
-            },
-        )
-    }
-
-    /// A media batch as `batching::attach_media` stamps it: the computation the plan selected,
-    /// with the extent the worker answered.
-    fn media_batch(id: u64, call_kind: MediaCall, rows: u32) -> ExecutionBatch {
-        let computation = Computation {
-            call: call_kind,
-            rows,
-            tokens: 0,
-            extent: denoise_extent(),
         };
-        let mut batch = ExecutionBatch::new(
-            id,
-            (0..rows)
-                .map(|row| call(CallKind::Media(call_kind), u64::from(row)))
-                .collect(),
-            Vec::new(),
-        );
-        let staged = vec![staged(); rows as usize];
-        with_media(&mut batch, MediaColumns::staged(computation, &staged));
-        batch
-    }
-
-    /// Lays `batch` out as a media computation over `media`, as `attach_media` does.
-    fn with_media(batch: &mut ExecutionBatch, media: MediaColumns) {
-        let phase = wire_phase(batch.requests[0].0.kind).expect("a media call has a phase");
-        let computation = media.computation;
-        let group = batch.requests[0].1.worker.0.clone();
-        batch.device = Some(DeviceBatch {
-            id: ipc::execution::BatchId(batch.id),
-            phase,
-            group,
-            calls: (0..batch.requests.len() as u64)
-                .map(ipc::execution::CallId)
-                .collect(),
+        Batch {
+            id: BatchId(id),
+            phase: wire_phase(CallKind::Media(MediaCall::Denoising)).expect("a media phase"),
+            group: "gpu".to_owned(),
+            calls: vec![ipc::execution::CallId(0)],
             shape: ipc::execution::Shape {
-                rows: computation.rows,
-                tokens: computation.tokens,
-                variant: computation.variant().expect("a served computation"),
+                rows: 1,
+                tokens: 0,
+                variant: Variant::Denoise,
             },
             columns: ipc::execution::BatchColumns::default(),
             generation: 0,
@@ -948,267 +526,100 @@ mod tests {
             host_outputs: Vec::new(),
             images: Vec::new(),
             frees: Vec::new(),
-            media: Some(media),
-        });
+            media: Some(MediaColumns::staged(computation, &[staged])),
+        }
     }
 
-    /// The phase a call kind is served at, as the mechanism's one translation states it.
-    fn phase_of(kind: CallKind) -> ipc::PhaseId {
-        wire_phase(kind).expect("every call kind has a phase")
-    }
-
-    /// A media batch reaches the worker at the phase its call names, with the generation the
-    /// step read and the computation its kernels were captured for.
+    /// A device holds `queue_depth` batches in flight, and a completed batch
+    /// gives its slot back.
     ///
-    /// The phase is checked against what the call kind states and against the token path's own
-    /// phase: a media arm that borrowed the token phase, or one that named a constant instead of
-    /// reading each call, would pass neither. Both are read here as facts of the call — the arm's
-    /// own translation is compared with itself elsewhere, because `views` is the crate's.
-    #[test]
-    fn a_media_batch_is_served_at_the_phase_its_call_names_and_the_step_generation() {
-        let (devices, delivered) = Devices::one(Some(denoise_extent()));
-        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
-        let generation = 7;
-        submissions.set_generation(generation);
-
-        submissions
-            .submit(media_batch(11, MediaCall::Denoising, 1))
-            .expect("a media batch is served in process");
-        submissions
-            .submit(media_batch(12, MediaCall::VideoDecoding, 1))
-            .expect("a media batch is served in process");
-
-        let delivered = delivered.lock().expect("the recorder is not poisoned");
-        let [denoising, decoding] = delivered.as_slice() else {
-            panic!("two submissions were made, and {} arrived", delivered.len());
-        };
-        assert_eq!(
-            denoising.phase,
-            phase_of(CallKind::Media(MediaCall::Denoising)),
-            "a denoising call is served at the denoise phase"
-        );
-        assert_eq!(
-            decoding.phase,
-            phase_of(CallKind::Media(MediaCall::VideoDecoding)),
-            "a decoding call is served at the decode phase"
-        );
-        assert_ne!(
-            denoising.phase,
-            phase_of(CallKind::Forward(ipc::ForwardMode::Prefill)),
-            "a media batch does not borrow the token path's phase"
-        );
-        let one = denoising;
-        assert_eq!(
-            one.generation, generation,
-            "a batch runs on the generation the step read"
-        );
-        let media = one
-            .media
-            .as_ref()
-            .expect("a media batch arrives with its computation");
-        assert_eq!(media.computation.call, MediaCall::Denoising);
-        assert_eq!(media.computation.rows, 1);
-        assert_eq!(
-            media.computation.extent,
-            denoise_extent(),
-            "the extent is the bucket's, which is what the worker answered"
-        );
-    }
-
-    /// A pool holds `queue_depth` unresolved batches, and a report gives its slot back.
-    ///
-    /// This is what makes requests that run together meet in one step: each is ready when its own
-    /// batch ends, so a pool that always took the next batch would serve them one row at a time.
+    /// This is what makes requests that run together meet in one step: each is
+    /// ready when its own batch ends, so a pool that always took the next
+    /// batch would serve them one row at a time.
     #[test]
     fn a_pool_holds_no_more_batches_than_its_queue_depth() {
-        let (devices, delivered) = Devices::one(Some(denoise_extent()));
-        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
-        let pool = submissions.info().workers[0].0.clone();
+        let (mut submissions, pool) = door(1);
+        let pools = [pool.clone()];
 
         assert!(submissions.has_capacity(&pool), "an idle pool has room");
-        for batch in 1..=2 {
-            submissions
-                .submit(media_batch(batch, MediaCall::Denoising, 1))
-                .expect("a batch within the depth is taken");
+        for id in 1..=2 {
+            assert!(
+                submissions
+                    .reserve(&denoise(id), &pools)
+                    .expect("the fake states its devices"),
+                "a batch within the depth takes its slot"
+            );
         }
         assert!(!submissions.has_capacity(&pool), "the depth is taken");
-        let refused = submissions.submit(media_batch(3, MediaCall::Denoising, 1));
         assert!(
-            matches!(refused, Err(WorkerSubmitError::WouldBlock(_))),
+            !submissions
+                .reserve(&denoise(3), &pools)
+                .expect("the fake states its devices"),
             "a batch past the depth waits for a slot"
         );
-        assert_eq!(
-            delivered
-                .lock()
-                .expect("the recorder is not poisoned")
-                .len(),
-            2,
-            "a batch that waits reaches no device"
-        );
 
-        // The double's batches report no calls, which the mechanism reads as a failure: it ends
-        // the batches all the same, so the slots come back.
-        let _ = submissions.poll(Duration::from_secs(5));
-        assert!(submissions.has_capacity(&pool), "a report frees its slot");
+        submissions.release(BatchId(1));
+        assert!(
+            submissions.has_capacity(&pool),
+            "a completion frees its slot"
+        );
+        assert!(
+            submissions
+                .reserve(&denoise(3), &pools)
+                .expect("the fake states its devices"),
+            "the batch that waited takes the freed slot"
+        );
     }
 
-    /// A device holds `queue_depth` unresolved batches of its own: the clips of a video decoded on
-    /// different devices go out together beside a step that runs on all of them, and a clip whose
-    /// device is full waits while the other devices' clips do not.
-    ///
-    /// Four devices at depth two hold one denoising step (a slot on each) and the first four clips
-    /// (one each); the fifth clip is the first device's again and waits for a report. Counted
-    /// against the pool as a whole, the depth would admit the step and one clip.
+    /// A batch takes a slot on every device it runs on: a pool of two devices
+    /// at depth two holds two steps that run on both, and a third waits.
     #[test]
-    fn each_device_holds_its_own_queue_depth() {
-        let (devices, delivered) = Devices::several(Some(denoise_extent()), 4);
-        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
-        let pool = submissions.info().workers[0].0.clone();
-        let decode = |id: u64, unit: u32| {
-            let mut batch = media_batch(id, MediaCall::VideoDecoding, 1);
-            let computation = batch
-                .device
-                .as_ref()
-                .and_then(|device| device.media.as_ref())
-                .expect("a media batch")
-                .computation;
-            with_media(
-                &mut batch,
-                MediaColumns::staged(computation, &[StagedRequest { unit, ..staged() }]),
+    fn a_batch_takes_a_slot_on_every_device_it_runs_on() {
+        let (mut submissions, pool) = door(2);
+        let pools = [pool.clone()];
+        for id in 1..=2 {
+            assert!(
+                submissions
+                    .reserve(&denoise(id), &pools)
+                    .expect("the fake states its devices")
             );
-            batch
-        };
-
-        submissions
-            .submit(media_batch(1, MediaCall::Denoising, 1))
-            .expect("a step on every device is taken");
-        for unit in 0..4 {
-            submissions
-                .submit(decode(2 + u64::from(unit), unit))
-                .expect("a clip on a device with a free slot is taken");
         }
         assert!(
             !submissions.has_capacity(&pool),
-            "every device holds the step and one clip"
+            "both devices hold both steps"
         );
-        let refused = submissions.submit(decode(6, 4));
+        submissions.release_all();
         assert!(
-            matches!(refused, Err(WorkerSubmitError::WouldBlock(_))),
-            "the fifth clip waits for its device"
-        );
-        assert_eq!(
-            delivered
-                .lock()
-                .expect("the recorder is not poisoned")
-                .len(),
-            5,
-            "the step and four clips reached the devices"
-        );
-        let _ = submissions.poll(Duration::from_secs(5));
-        assert!(submissions.has_capacity(&pool), "a report frees its slots");
-    }
-
-    /// The generation is the step's, for every batch of the step: a switchover mid-step cannot
-    /// split one step across two epochs, so a token batch and a media batch of one step carry the
-    /// same number.
-    #[test]
-    fn every_batch_of_a_step_carries_the_same_generation() {
-        let (devices, delivered) = Devices::one(Some(denoise_extent()));
-        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
-        submissions.set_generation(3);
-        submissions
-            .submit(media_batch(1, MediaCall::Denoising, 1))
-            .expect("a media batch is served in process");
-        submissions.set_generation(4);
-        submissions
-            .submit(media_batch(2, MediaCall::Denoising, 1))
-            .expect("a media batch is served in process");
-
-        let delivered = delivered.lock().expect("the recorder is not poisoned");
-        let generations: Vec<u64> = delivered.iter().map(|one| one.generation).collect();
-        assert_eq!(
-            generations,
-            vec![3, 4],
-            "each batch carries the generation its step read, in the order the steps ran"
+            submissions.has_capacity(&pool),
+            "failed devices hold nothing"
         );
     }
 
-    /// A batch that carries neither token columns nor a media computation is refused by name: the
-    /// mechanism could not state what its kernels read, and it is not served on invented values.
+    /// A submitted batch is taken once, when its device settled it, and its
+    /// settling ends the scheduler's wait.
     #[test]
-    fn a_batch_the_mechanism_could_not_state_is_refused_by_name() {
-        let (devices, delivered) = Devices::one(Some(denoise_extent()));
-        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
-        let batch = ExecutionBatch::new(
-            5,
-            vec![call(CallKind::Media(MediaCall::Denoising), 0)],
-            Vec::new(),
+    fn a_settled_batch_wakes_the_wait_and_is_taken_once() {
+        let mut pool = testkit::pool("gpu");
+        pool.layout.queue_depth = 2;
+        let fake = Arc::new(
+            testkit::FakeBatches::new(vec![pool]).answering_media(Arc::new(testkit::Media::new())),
         );
-        let refusal = submissions
-            .submit(batch)
-            .expect_err("a batch with no columns of either family is refused");
-        let text = format!("{refusal}");
-        assert!(
-            text.contains("states no media columns") && text.contains("Denoising"),
-            "the refusal names the family whose buffers nobody staged: {text}"
-        );
-        assert!(
-            delivered
-                .lock()
-                .expect("the recorder is not poisoned")
-                .is_empty(),
-            "nothing reaches the worker"
-        );
-    }
+        fake.hold();
+        let mut submissions =
+            Submissions::over_batches(Arc::clone(&fake) as Arc<dyn Batches>).expect("a pool");
 
-    /// One batch is one computation: media columns beside token columns, or a media computation
-    /// carrying a token call, are each refused rather than served twice over.
-    #[test]
-    fn one_batch_is_one_computation() {
-        let (devices, _) = Devices::one(Some(denoise_extent()));
-        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
-
-        let mut both = media_batch(6, MediaCall::Denoising, 1);
-        both.device.as_mut().expect("a laid-out batch").columns = ipc::execution::BatchColumns {
-            input_ids: vec![1],
-            ..ipc::execution::BatchColumns::default()
-        };
-        let refusal = format!(
-            "{}",
-            submissions
-                .submit(both)
-                .expect_err("a batch states one layout or the other")
-        );
+        submissions.submit(denoise(7)).expect("the fake accepts");
         assert!(
-            refusal.contains("one batch is one computation"),
-            "the refusal names the rule: {refusal}"
+            submissions.take_completed().is_none(),
+            "a batch on its device has no outcome"
         );
 
-        let mut mixed = media_batch(7, MediaCall::Denoising, 1);
-        mixed
-            .requests
-            .push(call(CallKind::Forward(ipc::ForwardMode::Prefill), 9));
-        let refusal = format!(
-            "{}",
-            submissions
-                .submit(mixed)
-                .expect_err("a media computation carries media calls")
-        );
-        assert!(
-            refusal.contains("no media phase serves"),
-            "the refusal names the call: {refusal}"
-        );
-
-        let variant = Computation {
-            call: MediaCall::Denoising,
-            rows: 1,
-            tokens: 0,
-            extent: denoise_extent(),
-        };
-        assert_eq!(
-            variant.variant(),
-            Some(Variant::Denoise),
-            "a denoise computation is the variant the worker plans"
-        );
+        fake.release(1);
+        // The settled submission woke the wait, so this returns at once.
+        submissions.wait(None, &[]);
+        let (id, outcome) = submissions.take_completed().expect("the batch settled");
+        assert_eq!(id, BatchId(7));
+        assert!(matches!(outcome, Outcome::Success(_)));
+        assert!(submissions.take_completed().is_none(), "taken once");
     }
 }

@@ -222,6 +222,8 @@ impl Scheduler {
             policy_report: None,
             shadow_pass: None,
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            step_generation: 0,
+            starvation_judged: scheduling::guest::Nanos(0),
             policy_precopy: None,
             policy_prepared: None,
             progress: crate::CommandWaker::noop(),
@@ -262,7 +264,7 @@ impl Scheduler {
     }
 
     /// The serving generation's cell, for the handle that writes it.
-    pub fn generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+    pub(crate) fn generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
         Arc::clone(&self.generation)
     }
 
@@ -346,13 +348,19 @@ impl Scheduler {
 
     /// The worker groups that prefill only (`WorkerGroupRole::Prefill`),
     /// whose requests hand their KV cache to a decode group.
-    pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
+    pub(crate) fn set_prefill_groups(
+        &mut self,
+        groups: impl IntoIterator<Item = crate::WorkerGroupId>,
+    ) {
         self.dispatch.prefill_groups = groups.into_iter().collect();
     }
 
     /// The worker groups that decode only (`WorkerGroupRole::Decode`), which
     /// take requests by their hand-off alone.
-    pub fn set_decode_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
+    pub(crate) fn set_decode_groups(
+        &mut self,
+        groups: impl IntoIterator<Item = crate::WorkerGroupId>,
+    ) {
         self.dispatch.decode_groups = groups.into_iter().collect();
     }
 
@@ -364,7 +372,7 @@ impl Scheduler {
     ///
     /// Fails when a Storage Server cannot be reached or a rank reports no
     /// retained cache planes.
-    pub fn enable_hand_off(
+    pub(crate) fn enable_hand_off(
         &mut self,
         socket: &std::path::Path,
         deployment: &str,
@@ -393,7 +401,7 @@ impl Scheduler {
     /// Checkpoints the state groups of decoding requests at the page
     /// boundaries that are multiples of `tokens`; a prompt call checkpoints
     /// the last boundary it reaches whatever the interval.
-    pub fn set_state_interval(&mut self, tokens: usize) {
+    pub(crate) fn set_state_interval(&mut self, tokens: usize) {
         self.state_interval = tokens.max(1);
     }
 
@@ -421,7 +429,7 @@ impl Scheduler {
         clippy::too_many_arguments,
         reason = "the deployment, its epoch and host, and the host KV cache's settings"
     )]
-    pub fn enable_kv_offload(
+    pub(crate) fn enable_kv_offload(
         &mut self,
         deployment: &str,
         epoch: u64,
@@ -651,14 +659,14 @@ impl Scheduler {
     }
 
     /// Returns the worker's aggregate worker capabilities.
-    pub fn info(&self) -> &MainProcessInfo {
+    pub(crate) fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 
     /// Returns the first worker group with a prefix cache, whose units the
     /// pool allocates and whose identity names its index for a successor
     /// epoch.
-    pub fn cache_group(&self) -> Option<String> {
+    pub(crate) fn cache_group(&self) -> Option<String> {
         self.worker
             .info()
             .workers
@@ -669,7 +677,7 @@ impl Scheduler {
 
     /// The worker groups that keep a paged cache, each with its worker's
     /// endpoint: the groups a prefix cache index names.
-    pub fn cache_workers(&self) -> Vec<(String, ipc::MainProcessEndpoint)> {
+    pub(crate) fn cache_workers(&self) -> Vec<(String, ipc::MainProcessEndpoint)> {
         self.worker
             .info()
             .workers
@@ -690,7 +698,9 @@ impl Scheduler {
     /// # Errors
     ///
     /// Fails when the worker's media routing is inconsistent.
-    pub fn media_units(&self) -> anyhow::Result<std::collections::BTreeMap<ipc::MediaCall, u32>> {
+    pub(crate) fn media_units(
+        &self,
+    ) -> anyhow::Result<std::collections::BTreeMap<ipc::MediaCall, u32>> {
         let info = self.worker.info();
         Ok(info
             .media_routing()?
@@ -711,7 +721,7 @@ impl Scheduler {
     }
 
     /// Whether the scheduler's epoch is on trial.
-    pub fn on_trial(&self) -> bool {
+    pub(crate) fn on_trial(&self) -> bool {
         self.trial
     }
 
@@ -754,7 +764,7 @@ impl Scheduler {
     /// disconnected — and whether any command was applied, which is progress a
     /// tick made even when it formed no batch: a submission that only queues a
     /// request still changed the epoch a step is planned from.
-    pub(super) fn drain_commands(&mut self, commands: &Receiver<Command>) -> (bool, bool) {
+    pub(super) fn take_commands_from(&mut self, commands: &Receiver<Command>) -> (bool, bool) {
         let mut handled = false;
         loop {
             match commands.try_recv() {
@@ -770,17 +780,24 @@ impl Scheduler {
         }
     }
 
-    /// Runs the owner-thread control loop, blocking only when fully idle.
+    /// Runs the step loop on the calling thread, which owns every piece of the
+    /// scheduler's state from here on:
     ///
-    /// Returns `true` if the engine died (worker or worker failure) rather
-    /// than shutting down on a `Shutdown` command or command-channel
-    /// disconnect. Either way, every queued or running request is finished
-    /// with `Aborted`, every receiver still open can read its complete event
-    /// stream through its terminal event, and the worker is closed before
-    /// returning.
+    /// 1. take what arrived: new requests, cancellations and the control
+    ///    thread's other commands, and one completed batch;
+    /// 2. `update` with the completed batch: advance its requests, publish
+    ///    their pages, emit their events;
+    /// 3. `schedule`: assemble the batches that fit now;
+    /// 4. submit them to the executors, and block until something arrives.
+    ///
+    /// Returns `true` if the engine died (a device or a scheduler invariant
+    /// failed) rather than shutting down on a `Shutdown` command or a closed
+    /// command channel. Either way, every waiting or running request is
+    /// finished with `Aborted`, and every receiver still open can read its
+    /// complete event stream through its terminal event.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
         loop {
-            let (stop, handled) = self.drain_commands(&rx);
+            let (stop, handled) = self.take_commands_from(&rx);
             if stop {
                 break;
             }
@@ -788,13 +805,13 @@ impl Scheduler {
             if handled {
                 self.progress.wake();
             }
-            let progressed = self.step_nonblocking() || handled;
+            let progressed = self.step() || handled;
             // An update's shadow pass is answered once the step that ran it has
             // ended (§7.3 step 2): the answer never claims a comparison the
             // step has not finished.
             self.settle_shadow();
             if !self.failed() && !progressed {
-                self.park_for_progress();
+                self.wait(None);
             }
             if self.failed() {
                 let _ = self.failure.set("the worker or a worker failed".to_owned());
@@ -875,8 +892,8 @@ impl Scheduler {
                 );
                 return;
             }
-            if !self.step_nonblocking() {
-                self.park_for_progress();
+            if !self.step() {
+                self.wait(Some(deadline));
             }
         }
     }
@@ -939,8 +956,8 @@ impl Scheduler {
             if self.failed() {
                 return Err("the engine failed before the hook ran".to_owned());
             }
-            if !self.step_nonblocking() {
-                self.park_for_progress();
+            if !self.step() {
+                self.wait(Some(silent_since + DRAIN_SILENCE));
             }
             // Comparing the two sizes is enough because a drain sets
             // `draining`: nothing enters either pending set while it runs, so
@@ -984,56 +1001,71 @@ impl Scheduler {
         Ok(results)
     }
 
-    /// Parks until a result, command, worker death, CPU continuation, or output-capacity wake.
+    /// Blocks until something arrives: a command, a completed batch, a reader
+    /// that freed room in an event channel, or an answer of a Storage Server.
     ///
-    /// Waits in `Worker::poll` and applies at most one returned result.
-    /// Commands and consumer reads fire the engine's `CommandWaker`. A real
-    /// waker, such as `Submissions::waker`, ends the poll early.
-    /// With the no-op waker, a command waits for the worker's own wake
-    /// sources or the timeout. The timeout (`IDLE_LIVENESS_POLL`) is solely a
-    /// liveness deadline.
-    pub(super) fn park_for_progress(&mut self) {
-        let _span = tracing::trace_span!("scheduler.park").entered();
-        // Answers of the host KV cache, of the host latent and encoder pools
-        // and of the hand-offs' copies arrive on connections the worker does
-        // not wait on: while some are awaited, the park is short.
-        // So is the park of a closing scheduler, which awaits its last
-        // page commits.
-        let timeout = if self.draining
-            || self
-                .kv_offload
+    /// The wait has no tick. It ends without an arrival only at a moment the
+    /// scheduler itself acts at: `bound`, which a caller that waits for
+    /// something in particular states (a drain's silence, a flush's limit),
+    /// the starvation bound of a running request, the end of the wait for a
+    /// predecessor's index, or the host KV cache's own patience.
+    pub(super) fn wait(&mut self, bound: Option<Instant>) {
+        let _span = tracing::trace_span!("scheduler.wait").entered();
+        let deadline = [
+            bound,
+            self.starvation_deadline(),
+            self.awaiting_index
+                .filter(|_| !self.held_for_index.is_empty()),
+            self.kv_offload
                 .as_ref()
-                .is_some_and(crate::kv_cache::KvOffloadManager::waiting)
-            || self
-                .trajectories
-                .as_ref()
-                .is_some_and(crate::trajectories::TrajectoryStore::waiting)
-            || self
-                .encoder_outputs
-                .as_ref()
-                .is_some_and(crate::encoder_outputs::EncoderStore::waiting)
-            || self
-                .hand_offs
-                .as_ref()
-                .is_some_and(crate::hand_off::HandOffs::waiting)
-        {
-            KV_OFFLOAD_POLL
-        } else {
-            IDLE_LIVENESS_POLL
-        };
-        match self.worker.poll(timeout) {
-            Ok(Some(result)) => {
-                self.apply_result(result);
-                self.progress.wake();
-            }
-            Ok(None) => {}
-            Err(error) => self.on_worker_error(error),
-        }
-        self.stats
-            .general
-            .in_flight
-            .store(self.inflight.pending_batches.len(), Ordering::Relaxed);
-        self.publish_cache_stats();
+                .and_then(crate::kv_cache::KvOffloadManager::deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        // The Storage Servers answer on connections of their own: the host KV
+        // cache's, the host latent and encoder pools' and the transfers'.
+        let connections: Vec<std::os::fd::BorrowedFd<'_>> = self
+            .kv_offload
+            .iter()
+            .flat_map(crate::kv_cache::KvOffloadManager::descriptors)
+            .chain(
+                self.trajectories
+                    .iter()
+                    .flat_map(crate::trajectories::TrajectoryStore::descriptors),
+            )
+            .chain(
+                self.encoder_outputs
+                    .iter()
+                    .flat_map(crate::encoder_outputs::EncoderStore::descriptors),
+            )
+            .chain(
+                self.hand_offs
+                    .iter()
+                    .flat_map(crate::hand_off::HandOffs::descriptors),
+            )
+            .collect();
+        self.worker.wait(deadline, &connections);
+    }
+
+    /// When the first running request that the last step found within its
+    /// starvation bound passes it, which is when a step must judge it.
+    ///
+    /// A request the last step already found past its bound was judged by it
+    /// (it waits for a transfer, or it ended), so only later moments count,
+    /// and never one less than a millisecond away: a step that could not
+    /// judge (a full queue, a held scheduler) does not spin on it.
+    fn starvation_deadline(&self) -> Option<Instant> {
+        let timeout = self.policy.as_ref()?.limits().timeout;
+        let now = crate::clock::now_monotonic_us().saturating_mul(1_000);
+        let passes = self
+            .watchdog
+            .advancing()
+            .map(|(_, since)| since.0.saturating_add(timeout.0))
+            .filter(|passes| *passes > self.starvation_judged.0)
+            .min()?;
+        let remaining = Duration::from_nanos(passes.saturating_sub(now));
+        Some(Instant::now() + remaining.max(Duration::from_millis(1)))
     }
 
     /// States what the step tells when it produced something (`progress`).
@@ -1120,6 +1152,7 @@ mod tests {
         inflight.pending_batches.insert(
             7,
             PendingBatch {
+                numbered: Vec::new(),
                 started: Instant::now(),
                 calls: [
                     (key(3), CallId::new(7, 0)),

@@ -215,11 +215,17 @@ pub enum SubmitError {
     Dead,
 }
 
+/// What wakes the scheduler that serves a request, shared by the two ends
+/// of the request's event channel: the scheduler states it when it takes the
+/// request, and the receiver signals it when it frees room.
+type Server = Arc<std::sync::OnceLock<CommandWaker>>;
+
 /// Bounded engine-to-caller event sender.
 #[derive(Clone)]
 pub struct EventTx {
     inner: mpsc::Sender<Event>,
     handoff: Handoff,
+    server: Server,
 }
 
 impl EventTx {
@@ -236,6 +242,14 @@ impl EventTx {
         // The events are in place before this sender drops, so a receiver
         // that observes the closed channel also observes them.
         lock(&self.handoff).extend(events);
+    }
+
+    /// States what wakes the scheduler that now serves the request: its
+    /// receiver signals `waker` whenever it frees room in the channel, so a
+    /// request stalled on output capacity runs again without the scheduler
+    /// looking. The first scheduler to take the request is the one woken.
+    pub(crate) fn served_by(&self, waker: CommandWaker) {
+        let _ = self.server.set(waker);
     }
 
     /// Attempts to publish an event without waiting for channel capacity.
@@ -271,7 +285,7 @@ impl EventTx {
 pub struct EventRx {
     inner: mpsc::Receiver<Event>,
     handoff: Handoff,
-    waker: CommandWaker,
+    server: Server,
     cancellation: Option<EventCancellation>,
     /// Text tokens of the received `TextToken` and `TextTokens` events.
     text_tokens_received: usize,
@@ -308,7 +322,7 @@ impl EventRx {
                 self.observe(event);
                 // The freed channel slot may unblock a request stalled on
                 // output capacity.
-                self.waker.wake();
+                self.wake_server();
             }
             None => self.finish(),
         }
@@ -328,9 +342,16 @@ impl EventRx {
         };
         if let Ok(event) = event.as_ref() {
             self.observe(event);
-            self.waker.wake();
+            self.wake_server();
         }
         event
+    }
+
+    /// Wakes the scheduler that serves the request, once one took it.
+    fn wake_server(&self) {
+        if let Some(waker) = self.server.get() {
+            waker.wake();
+        }
     }
 
     /// Removes the next event a closed sender handed over.
@@ -415,25 +436,24 @@ impl Drop for EventRx {
         if let Some(on_finish) = self.on_finish.take() {
             on_finish();
         }
-        self.waker.wake();
+        self.wake_server();
     }
 }
 
-fn event_channel_with_waker(
-    waker: CommandWaker,
-    cancellation: Option<EventCancellation>,
-) -> (EventTx, EventRx) {
+fn event_channel(cancellation: Option<EventCancellation>) -> (EventTx, EventRx) {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER_CAPACITY);
     let handoff = Handoff::default();
+    let server = Server::default();
     (
         EventTx {
             inner: tx,
             handoff: Arc::clone(&handoff),
+            server: Arc::clone(&server),
         },
         EventRx {
             inner: rx,
             handoff,
-            waker,
+            server,
             cancellation,
             text_tokens_received: 0,
             acknowledged_token_count: 0,
@@ -781,7 +801,7 @@ pub enum CacheChange {
 }
 
 /// The cloneable sender of one scheduler's commands: the counterpart of the
-/// receiver `Scheduler::run` and `Scheduler::step` drain. A
+/// receiver `Scheduler::run` reads. A
 /// [`SchedulerHandle`](crate::SchedulerHandle) holds the sender of the
 /// scheduler it runs.
 ///
@@ -874,14 +894,11 @@ impl CommandSender {
             Request::Generation(request) => !request.stop_strings.is_empty(),
             Request::Diffusion(_) => false,
         };
-        let (event_tx, event_rx) = event_channel_with_waker(
-            self.waker.clone(),
-            Some(EventCancellation {
-                handle: self.clone(),
-                request_id,
-                awaits_decoder,
-            }),
-        );
+        let (event_tx, event_rx) = event_channel(Some(EventCancellation {
+            handle: self.clone(),
+            request_id,
+            awaits_decoder,
+        }));
         let submission = Submission {
             request: Box::new(request),
             event_tx,

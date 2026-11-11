@@ -1064,7 +1064,10 @@ impl Recorder {
     /// an update after it would be about a request it has already retired. The
     /// id is forgotten as soon as that touch is skipped, so the set holds only
     /// the requests that ended in this step.
-    pub(crate) fn close(&mut self) {
+    ///
+    /// Returns whether any view moved.
+    pub(crate) fn close(&mut self) -> bool {
+        let mut moved = false;
         for (id, view) in std::mem::take(&mut self.touched) {
             if self.finished.remove(&id) {
                 continue;
@@ -1073,8 +1076,10 @@ impl Recorder {
             if changed {
                 self.told.insert(id, view.clone());
                 self.pending.push(Event::Updated { request: view });
+                moved = true;
             }
         }
+        moved
     }
 
     /// Notes the prefix a request was admitted with: the prompt tokens the

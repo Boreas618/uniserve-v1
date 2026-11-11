@@ -233,12 +233,9 @@ impl Scheduler {
             .map(|(units, _)| *units)
             .collect();
         tracing::info!("parking: the requests that resume elsewhere end as migratable");
-        // The requests held for a predecessor's index leave with the others.
-        self.release_held_for_index();
-        self.migrate_requests(MigrationCause::Drain);
         // Video requests leave at their next denoising step boundary, their
         // trajectories stored for the epoch that serves next.
-        self.preempt_media(MigrationCause::Drain, |_| true);
+        self.drain(MigrationCause::Drain);
         self.lifecycle = crate::Lifecycle::Parking(Parking {
             answer,
             lend,
@@ -640,8 +637,8 @@ impl Scheduler {
                 self.draining = draining;
                 return Err("the engine failed before its commit".to_owned());
             }
-            if !self.step_nonblocking() {
-                self.park_for_progress();
+            if !self.step() {
+                self.wait(None);
             }
         }
         self.draining = draining;
@@ -681,8 +678,8 @@ impl Scheduler {
                 self.draining = draining;
                 return Err("the engine failed before it described its cache".to_owned());
             }
-            if !self.step_nonblocking() {
-                self.park_for_progress();
+            if !self.step() {
+                self.wait(None);
             }
         }
         self.draining = draining;

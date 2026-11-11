@@ -20,7 +20,7 @@ pub(super) struct Dispatch {
     /// of a media request; `select_worker` records an entry each time it places
     /// a call, keyed by the name the worker binds (which may be
     /// `DEFAULT_BLOCK` rather than the requested name).
-    /// `Scheduler::refill_worker` prunes entries of requests that are no
+    /// `Scheduler::schedule` prunes entries of requests that are no
     /// longer running or retiring.
     pub(super) affinity: HashMap<(RequestKey, String), crate::WorkerGroupId>,
     /// Replica that decodes each request for one bound component name: the
@@ -284,7 +284,7 @@ impl Dispatch {
     /// Includes lifecycle commands in destination ordering, even when a batch has no compute.
     ///
     /// Returns each call's placed worker plus every worker holding residency
-    /// for a command's request. `Scheduler::dispatch_submissions` uses this
+    /// for a command's request. `Scheduler::release` uses this
     /// set to hold back later batches that share a blocked destination.
     pub(super) fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::WorkerGroupId> {
         let mut targets = batch

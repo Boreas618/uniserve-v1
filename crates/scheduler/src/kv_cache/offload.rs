@@ -2079,16 +2079,24 @@ impl KvOffloadManager {
         }
     }
 
-    /// Whether answers are awaited, which the scheduler polls for, or pages
-    /// of an eviction wait to ask their pools again.
-    pub(crate) fn waiting(&self) -> bool {
-        self.servers.waiting()
-            || !self.deferred.is_empty()
-            || self
-                .pins
-                .values()
-                .any(|pins| matches!(pins.stage, Stage::Fetching { .. } | Stage::Reading { .. }))
-            || !self.reads.is_empty()
+    /// The store's Storage Server connections, which the scheduler waits on
+    /// beside its wake: an answer or an event ends the wait.
+    pub(crate) fn descriptors(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
+        self.servers.descriptors()
+    }
+
+    /// The next moment the cache acts without an arrival: a prefetch or a
+    /// peer read whose patience ends, or the next time the pages of an
+    /// eviction ask their pools again. `None` when it only waits for answers.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let patience = self.pins.values().filter_map(|pins| match pins.stage {
+            Stage::Fetching { deadline, .. } | Stage::Reading { deadline } => Some(deadline),
+            _ => None,
+        });
+        let retry = (!self.deferred.is_empty()).then_some(self.retry_at);
+        // A moment already past was acted on by the step that read it.
+        patience.chain(retry).filter(|at| *at > now).min()
     }
 
     /// Offload published pages of `worker`'s cache group `group` to the host
