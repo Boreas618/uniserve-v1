@@ -90,7 +90,11 @@ fn logit_bias(
 /// Converts a wire logprob count into the engine count.
 ///
 /// The chat request validation admits a non-negative count or `-1`, which
-/// requests every candidate and maps to `u32::MAX`; an absent count is zero.
+/// asks for every candidate of the vocabulary and maps to `u32::MAX`; an
+/// absent count is zero. The deployment's `max_logprobs` then bounds the
+/// count (`GenerationLimits::covers_logprobs`), as vLLM's does: a deployment
+/// computes that many candidates a position, so a larger count, `-1`
+/// included, is refused.
 fn logprob_count(value: Option<i32>) -> u32 {
     value.map_or(0, |value| u32::try_from(value).unwrap_or(u32::MAX))
 }

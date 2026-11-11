@@ -471,21 +471,67 @@ fn qwen3_family_declares_tool_calling_only_for_json_calls() {
 }
 
 /// Negative seeds are accepted and reinterpreted as their two's-complement
-/// `u64` value, and a logprob count of `-1` requests every candidate
-/// (`u32::MAX`).
+/// `u64` value.
 #[test]
-fn negative_seeds_and_logprob_counts_are_reinterpreted() {
+fn negative_seeds_are_reinterpreted() {
     let (_directory, _, model) = resolved_model("qwen3");
     for seed in [-1, -2] {
         let (request, _) = preprocess_chat(
             &model,
             String::from("sampling"),
-            chat_request(serde_json::json!({"seed": seed, "logprobs": true, "top_logprobs": -1})),
+            chat_request(serde_json::json!({"seed": seed})),
             Vec::new(),
         )
         .unwrap();
         assert_eq!(request.sampling.seed, Some(seed as u64));
-        assert_eq!(request.sampling.n_logprobs, u32::MAX);
+    }
+}
+
+/// A request may ask for as many candidates at a position as the deployment's
+/// `max_logprobs` (20 here), and no more, as vLLM rules: a larger count is
+/// refused, and so is `-1`, every candidate of the vocabulary, which vLLM
+/// serves only where `max_logprobs` itself is `-1`. A deployment's workers
+/// compute `max_logprobs` candidates a position, a count, so no deployment
+/// here serves the whole vocabulary.
+#[test]
+fn a_logprob_count_above_max_logprobs_is_refused() {
+    let (_directory, _, model) = resolved_model("qwen3");
+    let lowered = |fields: serde_json::Value| {
+        preprocess_chat(
+            &model,
+            String::from("logprobs"),
+            chat_request(fields),
+            Vec::new(),
+        )
+    };
+
+    for count in [0, 5, 20] {
+        let (generated, _) =
+            lowered(serde_json::json!({"logprobs": true, "top_logprobs": count})).unwrap();
+        assert_eq!(generated.sampling.n_logprobs, count);
+        let (prompt, _) = lowered(serde_json::json!({"prompt_logprobs": count})).unwrap();
+        assert_eq!(prompt.sampling.n_prompt_logprobs, count);
+    }
+
+    for count in [21, -1] {
+        for (fields, parameter) in [
+            (
+                serde_json::json!({"logprobs": true, "top_logprobs": count}),
+                "logprobs",
+            ),
+            (
+                serde_json::json!({"prompt_logprobs": count}),
+                "prompt_logprobs",
+            ),
+        ] {
+            let error = lowered(fields)
+                .err()
+                .unwrap_or_else(|| panic!("{parameter} of {count} was admitted"));
+            assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
+            let message = error.to_error_response().error.message;
+            assert!(message.contains(parameter), "{count}: {message}");
+            assert!(message.contains("20"), "{count}: {message}");
+        }
     }
 }
 
