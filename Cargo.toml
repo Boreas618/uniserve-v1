@@ -19,7 +19,7 @@ members = [
     "crates/nn",
     "crates/ops",
     "crates/processing",
-    "crates/program-server",
+    "crates/build-server",
     "crates/proto",
     "crates/scheduling",
     "crates/scheduling/guest",
@@ -50,9 +50,9 @@ minimax-h3.workspace = true
 nn.workspace = true
 # The request-processing side of the families, which the daemon serves.
 processing.workspace = true
-# The host's devices, whose architectures a Program Server this executable runs builds for.
+# The host's devices, whose architectures a Build Server this executable runs builds for.
 platform.workspace = true
-program-server.workspace = true
+build-server.workspace = true
 qwen3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -94,7 +94,7 @@ qwen3 = { path = "crates/models/qwen3" }
 minimax-h3 = { path = "crates/models/minimax-h3" }
 nixl = { path = "crates/nixl" }
 processing = { path = "crates/processing" }
-program-server = { path = "crates/program-server" }
+build-server = { path = "crates/build-server" }
 proto = { path = "crates/proto" }
 scheduling = { path = "crates/scheduling" }
 testkit = { path = "crates/testkit" }

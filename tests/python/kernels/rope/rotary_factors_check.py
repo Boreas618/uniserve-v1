@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `rotary_factors`'s kernel and check the tables a rotary embedding reads, **on a device**.
 
-    crates/program-server/python/.venv/bin/python rotary_factors_check.py [--self-test]
+    crates/build-server/python/.venv/bin/python rotary_factors_check.py [--self-test]
 
 ```text
 cosine[t, j] = cos(position[axis(j), t] · frequency[j]) · scale

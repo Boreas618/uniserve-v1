@@ -109,7 +109,7 @@ pub(crate) fn dtype_code(dtype: crate::tensor::DType) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DType, DevicePtr, Shape, Operand};
+    use crate::tensor::{DType, DevicePtr, Operand, Shape};
 
     /// A C++ entry's dtype numbers are the operator crate's, or the build says so here.
     ///

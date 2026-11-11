@@ -25,7 +25,7 @@ use nn::layers::{
     Rounding, Spectrum, StepIndexed,
 };
 use nn::weights::WeightLoader;
-use nn::{DType, Forward, Shape, Operand};
+use nn::{DType, Forward, Operand, Shape};
 
 use crate::attention::{self, Visibility};
 use crate::config::{AttentionKind, TransformerConfig};

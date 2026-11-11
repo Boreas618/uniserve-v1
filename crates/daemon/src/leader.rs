@@ -54,17 +54,17 @@ use frontend::input::{
 use frontend::model::ModelConfig;
 use frontend::output::RequestOutputStream;
 
-/// How long the epoch's Program Servers may take to select its programs.
+/// How long the epoch's Build Servers may take to select its modules.
 ///
-/// A Program Server that selects a program compiles it when it has no module:
+/// A Build Server that selects a package compiles it when it has no module:
 /// a cold store builds every kernel of the epoch, which minutes of compiler
 /// work per kernel makes long. The budget is the engine's own for the precopy
 /// (§7.3), and it is a backstop rather than the signal a reader follows: the
-/// line the install prints before it waits, and the Program Server's own
+/// line the install prints before it waits, and the Build Server's own
 /// module progress, say whether the selection is working or stopped.
 const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
-/// How often a wait on the epoch's programs says it is still waiting.
+/// How often a wait on the epoch's modules says it is still waiting.
 ///
 /// The budgets below are longer than a run, on purpose: a cold store's modules
 /// are minutes of compiler work, and an experiment that lasts fifteen minutes
@@ -73,7 +73,7 @@ const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 *
 /// the step the daemon is in and how long it has been in it.
 const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long the main processes may take to take the epoch's programs.
+/// How long the main processes may take to take the epoch's modules.
 ///
 /// A backstop beyond the engine's own budget for the steps (§7.3: the precopy
 /// waits up to 20 minutes, a switch, commit, revert or purge 2), which fire
@@ -163,10 +163,10 @@ pub(crate) struct SwitchTarget {
     pub(crate) args: proto::config::EngineArgs,
     /// The configuration the target serves.
     pub(crate) config: ServerArgs,
-    /// The programs the target takes before it is promoted.
-    pub(crate) programs: crate::epoch::FilledPrograms,
-    /// The Program Servers that select those programs' revisions, and the host that leads them.
-    pub(crate) servers: Vec<crate::engine::control::ProgramServer>,
+    /// The modules the target takes before it is promoted.
+    pub(crate) modules: crate::epoch::ModuleSet,
+    /// The Build Servers that select those modules' revisions, and the host that leads them.
+    pub(crate) servers: Vec<crate::engine::control::BuildServer>,
     pub(crate) leader: String,
     /// The target's launch generation, the number its links state.
     pub(crate) engine: u64,
@@ -329,12 +329,12 @@ impl Leader {
     pub(crate) fn engine_handoff(&self) -> anyhow::Result<Vec<EngineHandoff>> {
         // A handover passes the serving engine, its epoch and the
         // configuration to the successor, not the update in progress: an
-        // epoch switch's children and phases or a program trial's record do
+        // epoch switch's children and phases or a package trial's record do
         // not cross it, so the handover waits for the update to end
         // (one update at a time).
         if let Some(update) = crate::updates::in_flight(
             self.updates.running(),
-            self.epochs().program_update().is_some(),
+            self.epochs().generation_update().is_some(),
         ) {
             anyhow::bail!("{update}: a daemon handover waits until the update ends");
         }
@@ -415,7 +415,7 @@ impl Leader {
     /// into a free slot, as vLLM's `load_lora_adapter` does: every rank
     /// publishes its tensors at the Storage Server under the slot (`adapter`).
     /// A new engine, after a hot update or a relaunch, loads it again before
-    /// it serves. What computes with an adapter is a kernel program, so a
+    /// it serves. What computes with an adapter is a kernel package, so a
     /// request naming it is refused until one serves (`docs/admin.md`).
     ///
     /// # Errors
@@ -584,7 +584,7 @@ impl Leader {
             daemon,
             config.host_identity.clone(),
             config.served_model_name().to_owned(),
-            crate::engine::control::ensure_program_server(&config.program_config)?,
+            crate::engine::control::ensure_build_server(&config.build_config)?,
         )?);
         let replicas = replica_configs(&prepared.engine)?;
         let clients =
@@ -606,7 +606,7 @@ impl Leader {
             .collect::<anyhow::Result<Vec<_>>>()
             .context("failed to start the UniServe engine")?;
         // The main processes this node started, by the engine number their
-        // reports carry, for the epoch's first program switch.
+        // reports carry, for the epoch's first package switch.
         let engines: Vec<crate::engine::control::EpochProcess> = clients
             .iter()
             .flat_map(|(client, _, _)| client.processes())
@@ -645,13 +645,13 @@ impl Leader {
         }
         if let Some(commands) = commands {
             // The epoch's record commands the same main processes the
-            // daemon's channel reaches, for every later program-layer
+            // daemon's channel reaches, for every later generation
             // update (§2.3, §7.3).
             leader.epochs().supervise(commands.clone());
             leader
-                .install_programs(commands, config, engines, epoch)
+                .install_modules(commands, config, engines, epoch)
                 .await
-                .context("installing the epoch's programs in its main processes")?;
+                .context("installing the epoch's modules in its main processes")?;
             // A committed epoch's tensors are what the next epoch starts from: until it is
             // published its storage is private to it, and a target of another epoch finds nothing.
             let publishing = Arc::clone(&control);
@@ -659,7 +659,7 @@ impl Leader {
                 .await
                 .context("publishing the first epoch")?
                 .context("publishing the first epoch")?;
-            // The epoch's programs serve, which is what the standbys were waiting to prepare from.
+            // The epoch's modules serve, which is what the standbys were waiting to prepare from.
             for replica in leader.replicas() {
                 replica.prepare_standby();
             }
@@ -667,23 +667,23 @@ impl Leader {
         Ok(leader)
     }
 
-    /// The programs `config` names for what this deployment launches.
+    /// The modules `config` names for what this deployment launches.
     ///
     /// The configuration selects a backend for attention and for the grouped experts, which are a
     /// causal language model's operators. A video deployment launches neither, so a slot filled for
-    /// them would pin a program no call reaches: every operator it runs is filled from the store.
-    fn named_programs(&self, config: &ServerArgs) -> crate::epoch::FilledPrograms {
-        let mut filled = crate::epoch::FilledPrograms::of(config);
+    /// them would pin a package no call reaches: every operator it runs is filled from the store.
+    fn named_modules(&self, config: &ServerArgs) -> crate::epoch::ModuleSet {
+        let mut filled = crate::epoch::ModuleSet::of(config);
         if self.video_service().is_some() {
             filled.kernels.clear();
         }
         filled
     }
 
-    /// Prepares the epoch's programs and switches this node's main processes
+    /// Prepares the epoch's modules and switches this node's main processes
     /// to them (§7.3 steps 2-3, §3): a main process reports ready without
     /// waiting for warmup and serves only once the switchover has installed
-    /// the epoch's programs, the scheduling policy among them, so the daemon
+    /// the epoch's modules, the scheduling policy among them, so the daemon
     /// switches every main process once before it accepts a request.
     ///
     /// The generation is each main process's own, as its `Precopied` names
@@ -692,29 +692,29 @@ impl Leader {
     ///
     /// # Errors
     ///
-    /// Refuses when a Program Server cannot select the epoch's programs, and
+    /// Refuses when a Build Server cannot select the epoch's modules, and
     /// fails with the first main process that refuses or does not answer.
-    async fn install_programs(
+    async fn install_modules(
         &self,
         commands: &crate::supervision::ProcessCommands,
         config: &ServerArgs,
         engines: Vec<crate::engine::control::EpochProcess>,
         epoch: u64,
     ) -> anyhow::Result<()> {
-        let filled = self.named_programs(config);
-        // The startup switch installs the epoch's programs as its record names
+        let filled = self.named_modules(config);
+        // The startup switch installs the epoch's modules as its record names
         // them: the scheduling policy *and* the kernel of every operator the
         // deployment selects. A main process resolves no kernel itself — its
-        // backends are the installed programs, and a kernel it was never given
+        // backends are the installed modules, and a kernel it was never given
         // fails the first request that needs it — so an epoch that prepared the
         // policy alone serves its first token with nothing to run.
         //
-        // A Program Server without a program for one of those operators refuses
+        // A Build Server without a package for one of those operators refuses
         // the epoch by name here, before it serves, which is the correct
         // refusal: the deployment selects a backend whose package is not
         // installed.
-        let servers = self.program_servers(config);
-        let leader_host = self.program_leader_host(config, &servers);
+        let servers = self.build_servers(config);
+        let leader_host = self.build_leader_host(config, &servers);
         // Each step of the install says so before it waits: a deployment that
         // hangs here is otherwise silent for as long as the run lasts, and the
         // last line printed is the only thing that names where it waited.
@@ -728,7 +728,7 @@ impl Leader {
                 .iter()
                 .map(|server| format!("{} at {}", server.host, server.socket.display()))
                 .collect::<Vec<_>>(),
-            "preparing the epoch's programs at its Program Servers"
+            "preparing the epoch's modules at its Build Servers"
         );
         let prepared = {
             let servers = servers.clone();
@@ -739,11 +739,11 @@ impl Leader {
             let steps = crate::engine::control::PrepareSteps::new();
             let recorded = steps.clone();
             let preparing = tokio::task::spawn_blocking(move || {
-                // The record holds the generation's full program set: the named programs and
+                // The record holds the generation's full module set: the named modules and
                 // the packages the store holds for every other operator, so a later revision of
                 // one of those is a change `route` sees.
                 let complete =
-                    crate::engine::control::with_store_programs(&servers, &leader_host, &filled)?;
+                    crate::engine::control::with_store_modules(&servers, &leader_host, &filled)?;
                 crate::engine::control::prepare_epoch(
                     &servers,
                     &leader_host,
@@ -758,9 +758,9 @@ impl Leader {
             loop {
                 let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                 match tokio::time::timeout(left.min(HEARTBEAT), &mut preparing).await {
-                    Ok(joined) => break joined.context("the epoch's programs")?,
+                    Ok(joined) => break joined.context("the epoch's modules")?,
                     Err(_) if left <= HEARTBEAT => anyhow::bail!(
-                        "the epoch's Program Servers selected nothing within {} s: \
+                        "the epoch's Build Servers selected nothing within {} s: \
                          the daemon was {}",
                         PREPARE_TIMEOUT.as_secs(),
                         steps.describe()
@@ -768,38 +768,38 @@ impl Leader {
                     Err(_) => tracing::info!(
                         waited_s = started.elapsed().as_secs(),
                         step = %steps.describe(),
-                        "still preparing the epoch's programs"
+                        "still preparing the epoch's modules"
                     ),
                 }
             }
-            .context("preparing the epoch's programs")?
+            .context("preparing the epoch's modules")?
         };
         tracing::info!(
             epoch,
             kernels = prepared.kernels.len(),
             policy = %prepared.policy.backend,
-            "the epoch's programs are resolved; sending them to the main processes"
+            "the epoch's modules are resolved; sending them to the main processes"
         );
-        // The record states the programs the main processes took, revisions
+        // The record states the modules the main processes took, revisions
         // included — the ones `prepare_epoch` selected — and not the ones the
-        // configuration asked for: a filled program's revision is zero until a
-        // Program Server selects one, so recording the request would leave
+        // configuration asked for: a filled package's revision is zero until a
+        // Build Server selects one, so recording the request would leave
         // `GET /admin/config` naming numbers no package has and a later
         // handover to a joining process (`Epochs::hand_to`) sending a revision
         // the store never built.
-        let deployment = crate::epoch::Epoch::with_programs(config.clone(), prepared.clone())?;
+        let deployment = crate::epoch::Epoch::with_modules(config.clone(), prepared.clone())?;
         // Every main process of every engine, each on its own host: a worker group that spans
         // hosts switches every one of its processes together.
         let processes = engines;
         let commands = commands.clone();
         let installed = deployment.clone();
         let switching = tokio::task::spawn_blocking(move || {
-            let mut switch = crate::engine::control::ProgramSwitch::new(
+            let mut switch = crate::engine::control::GenerationSwitch::new(
                 &commands,
                 processes,
                 crate::epoch::Update::new(0, installed),
             );
-            // The epoch's programs, kernels and policy alike: the main
+            // The epoch's modules, kernels and policy alike: the main
             // processes serve their first request with them.
             switch.precopy(&prepared.kernels, &prepared.policy)?;
             switch.switchover()?;
@@ -807,9 +807,9 @@ impl Leader {
             Ok::<_, crate::epoch::Failure>(switch.generations().to_vec())
         });
         let generations = match tokio::time::timeout(SWITCH_TIMEOUT, switching).await {
-            Ok(joined) => joined.context("switching the main processes to the epoch's programs")?,
+            Ok(joined) => joined.context("switching the main processes to the epoch's modules")?,
             Err(_) => anyhow::bail!(
-                "the main processes took the epoch's programs in neither Precopy, \
+                "the main processes took the epoch's modules in neither Precopy, \
                  Switchover nor Commit within {} s (the last step logged above is \
                  where the daemon waited)",
                 SWITCH_TIMEOUT.as_secs()
@@ -817,13 +817,13 @@ impl Leader {
         }
         .map_err(|failure| {
             anyhow::anyhow!(
-                "the main processes did not take the epoch's programs ({}): {}",
+                "the main processes did not take the epoch's modules ({}): {}",
                 failure.kind,
                 failure.reason
             )
         })?;
         // The daemon's record of what executes: the epoch's build config and
-        // the programs its main processes took, with the number they gave
+        // the modules its main processes took, with the number they gave
         // them (`EpochRecord::generation`), which `GET /admin/config`
         // reports and a later update is routed against (§7.2, §7.4).
         // The epoch is recorded under the number its launch gave it, as every later epoch is
@@ -859,7 +859,7 @@ impl Leader {
             epoch,
             epoch,
             generations = ?generations,
-            "the main processes serve the epoch's programs"
+            "the main processes serve the epoch's modules"
         );
         Ok(())
     }
@@ -1359,10 +1359,10 @@ impl Leader {
 
 impl Leader {
     /// The epochs this node keeps: the record the admin API reports and a
-    /// program-layer update lives in (§7.2, §7.3).
+    /// generation update lives in (§7.2, §7.3).
     pub(crate) fn epochs(&self) -> Arc<crate::epoch::Epochs> {
         // One record for the daemon: the epoch layer's driver owns it, the
-        // program layer and the admin API read it (§7.2, §7.3, §7.4).
+        // generation layer and the admin API read it (§7.2, §7.3, §7.4).
         Arc::clone(self.updates.epochs())
     }
 
@@ -1372,7 +1372,7 @@ impl Leader {
     /// # Errors
     ///
     /// `UpdateError::Failed` when no replica serves — the same answer
-    /// [`Self::apply_programs`] gives, so a caller may ask either first.
+    /// [`Self::apply_generation`] gives, so a caller may ask either first.
     pub(crate) fn serving_config(&self) -> Result<ServerArgs, UpdateError> {
         self.replicas()
             .first()
@@ -1381,7 +1381,7 @@ impl Leader {
     }
 
     /// This node's main processes, by the engine number their reports carry
-    /// and the node they run on: the processes a program-layer update
+    /// and the node they run on: the processes a generation update
     /// commands (§7.3).
     pub(crate) fn main_processes(&self) -> Vec<crate::engine::control::EpochProcess> {
         self.replicas()
@@ -1394,14 +1394,14 @@ impl Leader {
             .collect()
     }
 
-    /// Routes `target` and applies its program-layer change to this node's
-    /// main processes: the target's programs are prepared at every host's
-    /// Program Server, precopied into each main process, switched to, and
+    /// Routes `target` and applies its generation change to this node's
+    /// main processes: the target's modules are prepared at every host's
+    /// Build Server, precopied into each main process, switched to, and
     /// recorded as the epoch's probation (§7.3 steps 2-4).
     ///
     /// Answers the update that is on probation. `Ok(None)` when the change
-    /// moves nothing at the program layer — it belongs to the host layer or
-    /// the epoch layer, or fills the programs the epoch already executes —
+    /// moves nothing at the generation layer — it belongs to the host layer or
+    /// the epoch layer, or fills the modules the epoch already executes —
     /// which is where a caller falls through to the epoch path.
     ///
     /// With `dry_run`, the routing decision alone is made and nothing is
@@ -1410,11 +1410,11 @@ impl Leader {
     ///
     /// # Errors
     ///
-    /// `UpdateError::Refused` when a Program Server cannot select the
-    /// target's programs; `UpdateError::Failed` when a main process refuses
+    /// `UpdateError::Refused` when a Build Server cannot select the
+    /// target's modules; `UpdateError::Failed` when a main process refuses
     /// the precopy or the switchover, or does not answer. What serves is
     /// untouched either way.
-    pub(crate) async fn apply_programs(
+    pub(crate) async fn apply_generation(
         &self,
         number: u64,
         target: &ServerArgs,
@@ -1423,8 +1423,8 @@ impl Leader {
         dry_run: bool,
     ) -> Result<Option<crate::epoch::Update>, UpdateError> {
         let current = self.serving_config()?;
-        // One update at a time (§7.2, §7.4): an epoch switch and a program
-        // update are each the deployment's one update, and the program
+        // One update at a time (§7.2, §7.4): an epoch switch and a generation
+        // update are each the deployment's one update, and the generation
         // layer's callers reach this method directly as well as through the
         // entry, so the check lives here. A dry run answers without touching
         // the processes or the records the update in flight owns, which is
@@ -1432,7 +1432,7 @@ impl Leader {
         if !dry_run
             && let Some(update) = crate::updates::in_flight(
                 self.updates.running(),
-                self.epochs().program_update().is_some(),
+                self.epochs().generation_update().is_some(),
             )
         {
             return Err(UpdateError::Refused(format!(
@@ -1440,7 +1440,7 @@ impl Leader {
             )));
         }
         // A target that reverted with a failure is unavailable until it is
-        // applied with `force` (§7.2, §7.3 step 4), the program layer's as
+        // applied with `force` (§7.2, §7.3 step 4), the generation layer's as
         // much as the epoch layer's.
         let resolved_target = deployment(target)?;
         if !force && let Some(failure) = self.epochs().unavailable(&resolved_target) {
@@ -1461,22 +1461,22 @@ impl Leader {
         let processes = self.main_processes();
         let recorded = update.clone();
         let promotion = std::time::Instant::now();
-        tokio::task::spawn_blocking(move || epochs.apply_programs(update, processes, force))
+        tokio::task::spawn_blocking(move || epochs.apply_generation(update, processes, force))
             .await
             .map_err(|error| UpdateError::Failed(anyhow::anyhow!("applying the update: {error}")))?
             .map_err(|failure| {
                 UpdateError::Failed(anyhow::anyhow!(
-                    "the main processes did not take the programs ({}): {}",
+                    "the main processes did not take the modules ({}): {}",
                     failure.kind,
                     failure.reason
                 ))
             })?;
-        // The programs moved in place; a parked standby prepared from the old
+        // The modules moved in place; a parked standby prepared from the old
         // ones is replaced (§2.5).
         for replica in self.replicas.serving.borrow().iter() {
             replica.restart_standby();
         }
-        self.watch_program_trial(number, options, promotion);
+        self.watch_generation_trial(number, options, promotion);
         Ok(Some(recorded))
     }
 
@@ -1484,7 +1484,7 @@ impl Leader {
     /// epoch (§7.3 step 4), and reverts it through the path a main process's failure takes once
     /// one is passed. Serving and the update share an epoch, so the baseline ends at `promotion`,
     /// when the update began to switch, and the trial's reports begin after the switch.
-    fn watch_program_trial(
+    fn watch_generation_trial(
         &self,
         number: u64,
         options: &crate::options::UpdateConfig,
@@ -1521,8 +1521,8 @@ impl Leader {
                 outcomes,
                 move || {
                     standing
-                        .program_update()
-                        .is_some_and(|program| program.update.number == number)
+                        .generation_update()
+                        .is_some_and(|package| package.update.number == number)
                 },
                 move |failure| async move {
                     warn!(
@@ -1531,13 +1531,14 @@ impl Leader {
                         reason = %failure.reason,
                         "the update on trial passed a rollback threshold; it reverts"
                     );
-                    let _ = tokio::task::spawn_blocking(move || reverting.program_failure(failure))
-                        .await;
+                    let _ =
+                        tokio::task::spawn_blocking(move || reverting.generation_failure(failure))
+                            .await;
                 },
             )
             .await;
             updates.end_trial(serde_json::json!({
-                "change": "program",
+                "change": "generation",
                 "update": number,
                 "failure": epochs.update().and_then(|update| update.unavailable().map(|failure| {
                     serde_json::json!({ "kind": failure.kind, "reason": failure.reason })
@@ -1546,28 +1547,28 @@ impl Leader {
         });
     }
 
-    /// Ends update `number`'s program-layer probation: every main process
+    /// Ends update `number`'s generation probation: every main process
     /// commits the generation it executes and purges the one it no longer
     /// runs, and the epoch's record keeps no previous generation (§7.3 steps
     /// 5-6).
     ///
-    /// Answers `Ok(false)` when update `number` is not a program-layer one,
+    /// Answers `Ok(false)` when update `number` is not a generation one,
     /// which is where a caller falls through to the epoch path.
     ///
     /// # Errors
     ///
     /// Fails when `number` names no update, when it is not the update on
     /// probation, or when a main process does not answer the commit.
-    pub(crate) async fn commit_programs(&self, number: u64) -> Result<bool, UpdateError> {
-        let program = self
+    pub(crate) async fn commit_generation(&self, number: u64) -> Result<bool, UpdateError> {
+        let package = self
             .epochs()
-            .program_update()
-            .filter(|program| program.update.number == number);
-        let Some(program) = program else {
+            .generation_update()
+            .filter(|package| package.update.number == number);
+        let Some(package) = package else {
             return Ok(false);
         };
         let epochs = Arc::clone(&self.epochs());
-        let committed = tokio::task::spawn_blocking(move || epochs.commit_programs())
+        let committed = tokio::task::spawn_blocking(move || epochs.commit_generation())
             .await
             .map_err(|error| {
                 UpdateError::Failed(anyhow::anyhow!("committing the update: {error}"))
@@ -1577,7 +1578,7 @@ impl Leader {
         // one that kept the values before this update would undo it at the next change.
         if committed {
             for replica in self.replicas() {
-                *locked(&replica.config) = program.update.target.config.clone();
+                *locked(&replica.config) = package.update.target.config.clone();
             }
         }
         Ok(committed)
@@ -1587,52 +1588,52 @@ impl Leader {
     /// `number`, with `reason`, and records the update as reverted: it is
     /// unavailable until it is applied with `force` (§7.2, §7.3 step 5).
     ///
-    /// Answers `Ok(false)` when update `number` is not a program-layer one.
+    /// Answers `Ok(false)` when update `number` is not a generation one.
     ///
     /// # Errors
     ///
     /// Fails when a main process does not answer the revert. What serves is
     /// the previous generation either way.
-    pub(crate) async fn rollback_programs(
+    pub(crate) async fn rollback_generation(
         &self,
         number: u64,
         reason: &str,
     ) -> Result<bool, UpdateError> {
-        let program = self
+        let package = self
             .epochs()
-            .program_update()
-            .filter(|program| program.update.number == number);
-        if program.is_none() {
+            .generation_update()
+            .filter(|package| package.update.number == number);
+        if package.is_none() {
             return Ok(false);
         }
         let epochs = Arc::clone(&self.epochs());
         let reason = reason.to_owned();
-        tokio::task::spawn_blocking(move || epochs.revert_programs(&reason))
+        tokio::task::spawn_blocking(move || epochs.revert_generation(&reason))
             .await
             .map_err(|error| UpdateError::Failed(anyhow::anyhow!("reverting the update: {error}")))?
             .map_err(UpdateError::Failed)
     }
 }
 
-/// The layer a configuration change moves on, and the update a program-layer
+/// The layer a configuration change moves on, and the update a generation
 /// change starts.
 ///
 /// A change is routed by what it moves and never by what it says (§7.2): the
 /// daemon's and the frontend's own options are the host layer, which a hot
 /// restart applies (§7.5); a different build config is the epoch layer,
-/// whose programs are prepared when the epoch is built (§7.4); and a change
-/// whose build config is the same moves only the programs, which the serving
+/// whose modules are prepared when the epoch is built (§7.4); and a change
+/// whose build config is the same moves only the modules, which the serving
 /// main processes take in place (§7.3).
 ///
-/// The target's programs are prepared at every host's Program Server before
+/// The target's modules are prepared at every host's Build Server before
 /// anything is compared, so a newly installed revision at an unchanged
-/// configuration is a program-layer change: the comparison sees the
-/// revisions the Program Servers select, not the ones the serving epoch
+/// configuration is a generation change: the comparison sees the
+/// revisions the Build Servers select, not the ones the serving epoch
 /// pinned. `prepare` is blocking I/O, so it runs off the async runtime.
 ///
 /// # Errors
 ///
-/// Refuses a target whose programs a Program Server cannot select or build.
+/// Refuses a target whose modules a Build Server cannot select or build.
 impl Leader {
     pub(crate) async fn route(
         &self,
@@ -1647,16 +1648,16 @@ impl Leader {
         if resolved(current)?.build_hash() != engine.build_hash() {
             return Ok(None);
         }
-        // From here only the programs can differ. The descriptors a
+        // From here only the modules can differ. The descriptors a
         // `prepare` builds modules for come from the epoch's engine configuration,
         // which this decision does not resolve: the main process resolves
         // the modules it needs when it loads them (`resolve`), so the
         // selection and the revisions are what this call is for.
-        let filled = self.named_programs(target);
-        let servers = self.program_servers(target);
-        let leader_host = self.program_leader_host(target, &servers);
+        let filled = self.named_modules(target);
+        let servers = self.build_servers(target);
+        let leader_host = self.build_leader_host(target, &servers);
         // Bounded like the epoch install's: the client's two waits have no
-        // deadline, so an unanswering Program Server would otherwise hold the
+        // deadline, so an unanswering Build Server would otherwise hold the
         // update without saying anything at all.
         let steps = crate::engine::control::PrepareSteps::new();
         let recorded = steps.clone();
@@ -1666,7 +1667,7 @@ impl Leader {
             let filled = filled.clone();
             let preparing = tokio::task::spawn_blocking(move || {
                 let complete =
-                    crate::engine::control::with_store_programs(&servers, &leader_host, &filled)?;
+                    crate::engine::control::with_store_modules(&servers, &leader_host, &filled)?;
                 crate::engine::control::prepare_epoch(
                     &servers,
                     &leader_host,
@@ -1684,17 +1685,17 @@ impl Leader {
                     Ok(joined) => {
                         break joined.map_err(|error| {
                             UpdateError::Failed(anyhow::anyhow!(
-                                "preparing the target's programs: {error}"
+                                "preparing the target's modules: {error}"
                             ))
                         })?;
                     }
                     // Not a refusal: the deployment asked for nothing the
-                    // Program Server turned down — the server did not answer
+                    // Build Server turned down — the server did not answer
                     // at all. The change may be legitimate, so this is the
                     // deployment's failure (500), not the request's (400).
                     Err(_) if left <= HEARTBEAT => {
                         return Err(UpdateError::Failed(anyhow::anyhow!(
-                            "preparing the target's programs: no Program Server answered \
+                            "preparing the target's modules: no Build Server answered \
                              within {} s: the daemon was {}",
                             PREPARE_TIMEOUT.as_secs(),
                             steps.describe()
@@ -1703,26 +1704,26 @@ impl Leader {
                     Err(_) => tracing::info!(
                         waited_s = started.elapsed().as_secs(),
                         step = %steps.describe(),
-                        "still preparing the target's programs"
+                        "still preparing the target's modules"
                     ),
                 }
             };
             prepared.map_err(|error| {
-                UpdateError::Refused(format!("preparing the target's programs: {error:#}"))
+                UpdateError::Refused(format!("preparing the target's modules: {error:#}"))
             })?
         };
         let next = crate::epoch::Epoch {
             config: target.clone(),
             engine,
-            programs: prepared,
+            modules: prepared,
         };
-        // The epoch's record and the target's resolution both hold the generation's full program
-        // set - the named programs and the store's packages of every other operator, revisions
+        // The epoch's record and the target's resolution both hold the generation's full module
+        // set - the named modules and the store's packages of every other operator, revisions
         // included - so they are compared whole: a target that resolves to what the epoch runs
         // changes nothing, and a newly installed revision of any operator's package, named or
-        // not, is a program change.
+        // not, is a package change.
         if self.epochs().serving().is_some_and(|(_, record)| {
-            record.policy == next.programs.policy && record.kernels == next.programs.kernels
+            record.policy == next.modules.policy && record.kernels == next.modules.kernels
         }) {
             return Ok(None);
         }
@@ -1733,16 +1734,16 @@ impl Leader {
         Ok(Some(crate::epoch::Update::new(0, next)))
     }
 
-    /// Where each host of the deployment prepares an epoch's programs: the
-    /// Program Server socket the configuration names, or the Program
+    /// Where each host of the deployment prepares an epoch's modules: the
+    /// Build Server socket the configuration names, or the Build
     /// Server's default socket on that host (§5.1, §6.3). The targets are the
-    /// Program Server's own: the daemon does not query the devices of another
+    /// Build Server's own: the daemon does not query the devices of another
     /// host to name them.
-    pub(crate) fn program_servers(
+    pub(crate) fn build_servers(
         &self,
         config: &ServerArgs,
-    ) -> Vec<crate::engine::control::ProgramServer> {
-        let socket = config.program_config.socket();
+    ) -> Vec<crate::engine::control::BuildServer> {
+        let socket = config.build_config.socket();
         let mut servers = Vec::new();
         for replica in self.replicas() {
             let Some(control) = replica.control.get() else {
@@ -1751,11 +1752,11 @@ impl Leader {
             let host = control.host().to_owned();
             if servers
                 .iter()
-                .any(|server: &crate::engine::control::ProgramServer| server.host == host)
+                .any(|server: &crate::engine::control::BuildServer| server.host == host)
             {
                 continue;
             }
-            servers.push(crate::engine::control::ProgramServer {
+            servers.push(crate::engine::control::BuildServer {
                 host,
                 socket: socket.clone(),
                 targets: Vec::new(),
@@ -1764,14 +1765,14 @@ impl Leader {
         servers
     }
 
-    /// The host whose Program Server selects the epoch's revisions first,
+    /// The host whose Build Server selects the epoch's revisions first,
     /// which every other host is then asked for exactly: the epoch's engine
     /// host when the configuration names one, and otherwise the first host
     /// of the deployment.
-    pub(crate) fn program_leader_host(
+    pub(crate) fn build_leader_host(
         &self,
         config: &ServerArgs,
-        servers: &[crate::engine::control::ProgramServer],
+        servers: &[crate::engine::control::BuildServer],
     ) -> String {
         config
             .engine_host
@@ -1849,7 +1850,7 @@ pub struct StandbyStatus {
     /// the world's order: the serving `generation` a promotion leaves is its
     /// first.
     pub generations: Vec<u64>,
-    /// Whether it holds the epoch's programs and captured its graphs, so that
+    /// Whether it holds the epoch's modules and captured its graphs, so that
     /// a promotion has nothing left to build.
     pub prepared: bool,
 }
@@ -2103,9 +2104,9 @@ pub(crate) struct Replica {
     /// both start a process, since a second engine of the same scope is a
     /// whole copy of its device storage.
     standby_starting: tokio::sync::Mutex<()>,
-    /// Whether the epoch's programs serve here, which is what a standby is
+    /// Whether the epoch's modules serve here, which is what a standby is
     /// prepared from.
-    programs_serve: std::sync::atomic::AtomicBool,
+    modules_serve: std::sync::atomic::AtomicBool,
     /// Whether this daemon handed the engine to a successor (§7.5.1): the
     /// successor owns its life then, and a watch that sees its client go away
     /// must not relaunch it.
@@ -2151,7 +2152,7 @@ impl Replica {
             standby: std::sync::Mutex::new(None),
             domain: std::sync::Mutex::new(None),
             standby_starting: tokio::sync::Mutex::new(()),
-            programs_serve: std::sync::atomic::AtomicBool::new(false),
+            modules_serve: std::sync::atomic::AtomicBool::new(false),
             handed_over: AtomicBool::new(false),
             following: AtomicBool::new(false),
         });
@@ -2194,7 +2195,7 @@ impl Replica {
         let SwitchTarget {
             mut args,
             config,
-            programs,
+            modules,
             servers,
             leader,
             engine,
@@ -2246,7 +2247,7 @@ impl Replica {
                     return;
                 }
             };
-            // The target parks with no programs: it takes them here, and the switch promotes it
+            // The target parks with no modules: it takes them here, and the switch promotes it
             // once it holds them.
             let host = config.host_identity.clone();
             let handing = Arc::clone(updates.epochs());
@@ -2258,20 +2259,15 @@ impl Replica {
                 .map_or(0, std::num::NonZeroU32::get);
             let mut source;
             let handed = tokio::task::spawn_blocking(move || {
-                // The update names backends, and a revision is the Program Server's to select.
+                // The update names backends, and a revision is the Build Server's to select.
                 let steps = crate::engine::control::PrepareSteps::new();
-                let pinned = crate::engine::control::prepare_epoch(
-                    &servers,
-                    &leader,
-                    &programs,
-                    &[],
-                    &steps,
-                )
-                .map_err(|error| crate::epoch::Failure {
-                    kind: "prepare_failed".to_owned(),
-                    reason: format!("{error:#}"),
-                    device: None,
-                })?;
+                let pinned =
+                    crate::engine::control::prepare_epoch(&servers, &leader, &modules, &[], &steps)
+                        .map_err(|error| crate::epoch::Failure {
+                            kind: "prepare_failed".to_owned(),
+                            reason: format!("{error:#}"),
+                            device: None,
+                        })?;
                 pinning.pin(&pinned);
                 handing.hand_target(&config.host_identity, engine, &config, &pinned)
             })
@@ -2284,7 +2280,7 @@ impl Replica {
                 Ok(Err(failure)) => {
                     warn!(
                         engine,
-                        "the switch's target took no programs: {}", failure.reason
+                        "the switch's target took no modules: {}", failure.reason
                     );
                     updates.rollback(&failure.reason);
                     return;
@@ -2292,7 +2288,7 @@ impl Replica {
                 Err(error) => {
                     warn!(
                         engine,
-                        "handing the switch's target its programs ended: {error}"
+                        "handing the switch's target its modules ended: {error}"
                     );
                     updates.rollback(&error.to_string());
                     return;
@@ -2522,7 +2518,7 @@ impl Replica {
         started
     }
 
-    /// The process of [`Self::relaunch_previous`], holding the epoch's programs.
+    /// The process of [`Self::relaunch_previous`], holding the epoch's modules.
     async fn start_previous(
         self: &Arc<Self>,
         control: &Arc<EngineControl>,
@@ -2549,16 +2545,16 @@ impl Replica {
         let handed = tokio::task::spawn_blocking(move || handing.hand_to(processes, &config));
         match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
             Ok(joined) => joined
-                .context("handing the epoch's programs to the started engine")?
+                .context("handing the epoch's modules to the started engine")?
                 .map_err(|failure| {
                     anyhow::anyhow!(
-                        "the started engine did not take the epoch's programs ({}): {}",
+                        "the started engine did not take the epoch's modules ({}): {}",
                         failure.kind,
                         failure.reason
                     )
                 })?,
             Err(_) => anyhow::bail!(
-                "the started engine took the epoch's programs in neither Precopy, Switchover nor \
+                "the started engine took the epoch's modules in neither Precopy, Switchover nor \
                  Commit within {} s",
                 SWITCH_TIMEOUT.as_secs()
             ),
@@ -2590,10 +2586,10 @@ impl Replica {
         let client =
             Arc::new(tokio::task::spawn_blocking(move || control.start(args, sink)).await??);
         reload_adapters(self, &client).await;
-        // The epoch's programs, before this process serves: a relaunched main
+        // The epoch's modules, before this process serves: a relaunched main
         // process starts with none, and the epoch they belong to was installed
         // for its predecessor, so nothing else sends them. Without this the
-        // process waits on a program-layer command that never comes and
+        // process waits on a generation command that never comes and
         // answers 503 to every request (§2.5, §7.5).
         if let Some(epochs) = self
             .registry
@@ -2611,16 +2607,16 @@ impl Replica {
             let handed = tokio::task::spawn_blocking(move || handing.hand_to(processes, &config));
             match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
                 Ok(joined) => joined
-                    .context("handing the epoch's programs to the relaunched engine")?
+                    .context("handing the epoch's modules to the relaunched engine")?
                     .map_err(|failure| {
                         anyhow::anyhow!(
-                            "the relaunched engine did not take the epoch's programs ({}): {}",
+                            "the relaunched engine did not take the epoch's modules ({}): {}",
                             failure.kind,
                             failure.reason
                         )
                     })?,
                 Err(_) => anyhow::bail!(
-                    "the relaunched engine took the epoch's programs in neither Precopy, \
+                    "the relaunched engine took the epoch's modules in neither Precopy, \
                      Switchover nor Commit within {} s",
                     SWITCH_TIMEOUT.as_secs()
                 ),
@@ -2663,7 +2659,7 @@ pub(crate) struct Standby {
     /// Each host's standby process and the launch generation it was started under, from the epoch
     /// layer's one allocator, in the world's order.
     pub(crate) generations: Vec<(String, u64)>,
-    /// Whether it holds the epoch's programs and has captured its graphs, so a
+    /// Whether it holds the epoch's modules and has captured its graphs, so a
     /// promotion is the promotion alone (§2.5).
     prepared: bool,
 }
@@ -2703,10 +2699,10 @@ fn domain_processes(
 }
 
 impl Replica {
-    /// Prepares the parked standby in the background, once the epoch's programs
+    /// Prepares the parked standby in the background, once the epoch's modules
     /// serve: the caller is what makes them serve.
     pub(crate) fn prepare_standby(self: &Arc<Self>) {
-        self.programs_serve.store(true, Ordering::SeqCst);
+        self.modules_serve.store(true, Ordering::SeqCst);
         let replica = Arc::clone(self);
         tokio::spawn(async move {
             let _starting = replica.standby_starting.lock().await;
@@ -2714,16 +2710,16 @@ impl Replica {
         });
     }
 
-    /// Hands the parked standby the epoch's programs (§2.5): it captures its
+    /// Hands the parked standby the epoch's modules (§2.5): it captures its
     /// graphs on its own warmup scratch, and the graphs wait at their addresses
     /// for a promotion that then has nothing left to build.
     ///
-    /// A standby the epoch's programs have not reached is kept: the promotion
+    /// A standby the epoch's modules have not reached is kept: the promotion
     /// hands them over itself, later than it should, and still serves. The
     /// caller holds `standby_starting`, so a promotion never meets a handover
     /// half done.
     async fn prepare_parked_standby(self: &Arc<Self>) {
-        if !self.programs_serve.load(Ordering::SeqCst) {
+        if !self.modules_serve.load(Ordering::SeqCst) {
             return;
         }
         let parked = locked(&self.standby)
@@ -2733,7 +2729,7 @@ impl Replica {
         let Some((client, generation)) = parked else {
             return;
         };
-        match self.hand_programs(&client).await {
+        match self.hand_modules(&client).await {
             Ok(()) => {
                 if let Some(standby) = locked(&self.standby)
                     .as_mut()
@@ -2745,14 +2741,14 @@ impl Replica {
             }
             Err(reason) => warn!(
                 generation,
-                "the standby did not take the epoch's programs while parked: {reason}; a \
+                "the standby did not take the epoch's modules while parked: {reason}; a \
                  promotion hands them over itself"
             ),
         }
     }
 
-    /// Gives every main process of `client`'s engine the programs the epoch serves.
-    async fn hand_programs(self: &Arc<Self>, client: &Arc<EngineClient>) -> Result<(), String> {
+    /// Gives every main process of `client`'s engine the modules the epoch serves.
+    async fn hand_modules(self: &Arc<Self>, client: &Arc<EngineClient>) -> Result<(), String> {
         let Some(epochs) = self
             .registry
             .upgrade()
@@ -2901,8 +2897,8 @@ impl Replica {
     }
 
     /// Replaces the parked standby with one prepared from what the deployment
-    /// runs now: a program update moves the serving engine in place, and a
-    /// standby started before it holds the programs the update replaced. A
+    /// runs now: a generation update moves the serving engine in place, and a
+    /// standby started before it holds the modules the update replaced. A
     /// promoted standby would then serve kernels the epoch's record no longer
     /// names, so the parked processes are dropped and others started.
     pub(crate) fn restart_standby(self: &Arc<Self>) {
@@ -3206,16 +3202,16 @@ impl Replica {
         let standby = locked(&self.standby).take()?;
         self.hold.hold();
         // A standby prepares while it parks (`prepare_parked_standby`), and one that is lost to
-        // before its programs reached it takes them here. A promotion that named it serving with
-        // no programs would answer 503 to every request, so the daemon hands them over before it
-        // moves the frontend, and the engine's own refusal of a programless promotion is a guard
+        // before its modules reached it takes them here. A promotion that named it serving with
+        // no modules would answer 503 to every request, so the daemon hands them over before it
+        // moves the frontend, and the engine's own refusal of a promotion that holds no generation is a guard
         // rather than the only defence.
         if !standby.prepared
-            && let Err(reason) = self.hand_programs(&standby.client).await
+            && let Err(reason) = self.hand_modules(&standby.client).await
         {
             warn!(
                 generation = standby.generation(),
-                "the standby did not take the epoch's programs: {reason}; the engine is relaunched"
+                "the standby did not take the epoch's modules: {reason}; the engine is relaunched"
             );
             *locked(&self.domain) = None;
             return None;

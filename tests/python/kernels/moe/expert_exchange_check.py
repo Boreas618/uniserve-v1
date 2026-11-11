@@ -13,8 +13,8 @@ meets: a rank with no tokens, a step whose capacity is below the transport's, a
 launch whose live count is below its extent, and a suspend and restore that must
 keep the addresses. With ``--attention N`` the first N ranks hold no experts: they
 send rows and take sums back, as a dedicated deployment's attention ranks do, and
-the others hold every expert. Run it with the Program Server's environment
-(``crates/program-server/python/.venv/bin/python``), which has torch.
+the others hold every expert. Run it with the Build Server's environment
+(``crates/build-server/python/.venv/bin/python``), which has torch.
 """
 
 import argparse

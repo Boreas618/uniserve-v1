@@ -1,4 +1,4 @@
-//! A media runner prepares a program update's buckets under the lifecycle's rebind rule: a rebind
+//! A media runner prepares a generation update's buckets under the lifecycle's rebind rule: a rebind
 //! that names the generation the runner serves, or a bucket the runner holds no serving graph of,
 //! is refused before anything is walked, so a live graph is never replaced under the batches
 //! running on it.

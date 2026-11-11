@@ -87,8 +87,8 @@ pub use layers::{
     LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding, ParallelLMHead, Residual,
     ResidualStream, RmsNorm, Rotary, Rounding, Scale, Silu, Snake,
 };
-pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, Operand};
-pub use proto::program::PhaseKind;
+pub use ops::{DType, DevicePtr, MAX_RANK, Operand, Shape, Strides};
+pub use proto::module::PhaseKind;
 pub use tensor::Backing;
 pub use weights::{
     ExpertStack, Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, ScaleLayouts,

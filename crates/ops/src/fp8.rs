@@ -15,7 +15,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, Operand};
+use crate::tensor::{DType, Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -70,7 +70,7 @@ pub struct Fp8GemmArgs {
 pub struct Fp8Gemm;
 
 impl Op for Fp8Gemm {
-    const NAME: &'static str = proto::program::operator::FP8_GEMM;
+    const NAME: &'static str = proto::module::operator::FP8_GEMM;
 
     type Descriptor = Fp8GemmDescriptor;
     type Args<'a> = Fp8GemmArgs;

@@ -2,15 +2,15 @@
 
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
-dimensions give, and the compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+dimensions give, and the compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The channel count is baked in because it is the parameter count, and the block because it is the
 program's lane width; the row count, the channel count, the width and the flag stay launch words.
 """
 
 import snake as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The dtypes the signal and the parameter may have.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}

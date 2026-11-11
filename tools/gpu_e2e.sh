@@ -26,7 +26,7 @@
 # (docs/testing.md lists them; a case whose asset is unset is skipped, naming the variable),
 # `UNISERVE_FFMPEG_DIR` for the build, `UNISERVE_E2E_DEVICES` to restrict the GPUs, and
 # `UNISERVE_E2E_WORKERS` for another worker count. `PYTHON` and `CARGO` name the interpreter
-# command and cargo, as in the justfile; `MAX_JOBS` caps the Program Server's kernel compilations
+# command and cargo, as in the justfile; `MAX_JOBS` caps the Build Server's kernel compilations
 # (16 when unset).
 set -euo pipefail
 

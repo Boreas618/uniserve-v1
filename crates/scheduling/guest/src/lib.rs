@@ -9,7 +9,7 @@
 //! # Append-only views and events
 //!
 //! Views and events are append-only lists (design §4.4): the mechanism is the
-//! epoch layer and a policy is the program layer, so a newer mechanism may run
+//! epoch layer and a policy is the generation layer, so a newer mechanism may run
 //! an older policy module. The wire format is therefore self-describing JSON:
 //! a reader ignores struct fields it does not know and skips an event kind it
 //! does not know ([`event::Event::Unknown`]), and every field a policy writes

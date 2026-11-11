@@ -52,9 +52,9 @@ fn main() -> anyhow::Result<()> {
     // A scheduler with no policy decides nothing — no plan, no admission, no
     // batch — so an epoch that serves must be given the default one: `fcfs`
     // revision one, instantiated for the capacity this pool was built for.
-    let (program, module) = testkit::packaged_policy(capacity);
+    let (package, module) = testkit::packaged_policy(capacity);
     sched
-        .install_policy(program, &scheduler::PolicyBytes::new(module))
+        .install_policy(package, &scheduler::PolicyBytes::new(module))
         .map_err(|error| anyhow::anyhow!("the fcfs policy is installed: {error}"))?;
 
     // Prefix reuse is an epoch setting (`EngineConfig::prefix_cache`), off in a

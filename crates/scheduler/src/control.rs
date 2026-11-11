@@ -279,18 +279,18 @@ impl Scheduler {
                 let _ = answer.send(committed);
             }
             Command::PrecopyPolicy {
-                program,
+                package,
                 source,
                 answer,
-            } => self.precopy_policy(program, source, answer),
+            } => self.precopy_policy(package, source, answer),
             Command::StagePolicy { stage, answer } => {
                 self.request_stage(stage, Some(answer), None);
             }
             Command::EngineCommand { command, answer } => {
                 self.engine_command(command, answer);
             }
-            Command::ProgramCommand { command, answer } => {
-                self.program_command(command, answer);
+            Command::GenerationCommand { command, answer } => {
+                self.generation_command(command, answer);
             }
             Command::Shadow { generation, answer } => {
                 self.ask_shadow(generation, answer);
@@ -298,13 +298,13 @@ impl Scheduler {
             Command::Counters { answer } => {
                 let _ = answer.send(self.counters());
             }
-            Command::PolicyPrograms { answer } => {
-                let _ = answer.send(handle::PolicyPrograms {
-                    running: self.policy.as_ref().map(|policy| policy.program().clone()),
+            Command::PolicyPackages { answer } => {
+                let _ = answer.send(handle::PolicyPackages {
+                    running: self.policy.as_ref().map(|policy| policy.package().clone()),
                     prepared: self
                         .policy_prepared
                         .as_ref()
-                        .map(|candidate| candidate.program().clone()),
+                        .map(|candidate| candidate.package().clone()),
                 });
             }
             Command::DiscardPolicy => {
@@ -331,7 +331,7 @@ impl Scheduler {
     /// done; [`Self::take_prepared_policy`] takes the candidate.
     fn precopy_policy(
         &mut self,
-        program: PolicyProgram,
+        package: PolicyPackage,
         source: Arc<dyn PolicySource + Send + Sync>,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     ) {
@@ -341,8 +341,8 @@ impl Scheduler {
         // has the control thread's marker and not this line is a command that never left the queue,
         // and one that has this line and no resolve is a wait inside the preparation itself.
         tracing::info!(
-            backend = %program.backend,
-            revision = program.revision,
+            backend = %package.backend,
+            revision = package.revision,
             step,
             "the scheduler took this precopy at a boundary and is preparing it"
         );
@@ -360,7 +360,7 @@ impl Scheduler {
                     PolicySlot::prepare(
                         &engine,
                         source.as_ref(),
-                        program,
+                        package,
                         state,
                         &ceilings,
                         &checked,
@@ -382,10 +382,10 @@ impl Scheduler {
         }
     }
 
-    /// Installs `program` as this scheduler's policy without a control thread.
+    /// Installs `package` as this scheduler's policy without a control thread.
     ///
     /// §7.3's two stages run here on the calling thread: the precopy
-    /// instantiates the program on this boundary's state and trials every
+    /// instantiates the package on this boundary's state and trials every
     /// decision of §4.4's table against it, and the switchover puts it in. An
     /// epoch with no control thread — the integration tests, and a simulated
     /// engine's — has no other way to have a policy, and a scheduler with no
@@ -403,7 +403,7 @@ impl Scheduler {
     /// anything.
     pub fn install_policy(
         &mut self,
-        program: PolicyProgram,
+        package: PolicyPackage,
         source: &dyn PolicySource,
     ) -> Result<(), String> {
         let state = views::trial_state(self, self.step, self.recorder.recorded());
@@ -412,7 +412,7 @@ impl Scheduler {
         let engine = policy::process_engine().map_err(|error| error.to_string())?;
         let room = state.room.clone();
         let checked = mechanism::Checked::new(&live, &room);
-        let candidate = PolicySlot::prepare(engine, source, program, state, &ceilings, &checked)
+        let candidate = PolicySlot::prepare(engine, source, package, state, &ceilings, &checked)
             .map_err(|error| error.to_string())?;
         self.policy_prepared = Some(candidate);
         self.request_stage(Stage::Switchover, None, None);
@@ -561,29 +561,29 @@ impl Scheduler {
         }
     }
 
-    /// Applies one command of the program-layer update (§2.3, §7.3) to this
+    /// Applies one command of the generation update (§2.3, §7.3) to this
     /// scheduler.
     ///
     /// The stages are a scheduler's: it cuts over at the boundary the command
     /// names, ends probation, reverts, and drops the generation before the
-    /// serving one. A `Precopy` arrives with the operator programs, which are
-    /// the program layer's, and the scheduling policy, whose module comes from
-    /// the Program Server: the process that holds that source resolves it once
+    /// serving one. A `Precopy` arrives with the operator packages, which are
+    /// the generation layer's, and the scheduling policy, whose module comes from
+    /// the Build Server: the process that holds that source resolves it once
     /// and precopies each scheduler (`SchedulerHandle::precopy_policy`), so the
     /// command itself is answered with that rather than half applied here.
-    fn program_command(
+    fn generation_command(
         &mut self,
-        command: ipc::ProgramCommand,
+        command: ipc::GenerationCommand,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     ) {
         let (stage, at) = match command {
-            ipc::ProgramCommand::Switchover { step, .. } => (Stage::Switchover, step),
-            ipc::ProgramCommand::Commit { .. } => (Stage::Commit, None),
-            ipc::ProgramCommand::Revert { .. } => (Stage::Revert, None),
-            ipc::ProgramCommand::Purge { .. } => (Stage::Purge, None),
-            ipc::ProgramCommand::Precopy { .. } => {
+            ipc::GenerationCommand::Switchover { step, .. } => (Stage::Switchover, step),
+            ipc::GenerationCommand::Commit { .. } => (Stage::Commit, None),
+            ipc::GenerationCommand::Revert { .. } => (Stage::Revert, None),
+            ipc::GenerationCommand::Purge { .. } => (Stage::Purge, None),
+            ipc::GenerationCommand::Precopy { .. } => {
                 let _ = answer.send(Err(
-                    "a precopy's policy is resolved through the Program Server by the process \
+                    "a precopy's policy is resolved through the Build Server by the process \
                      that holds its client, which then precopies each scheduler's policy"
                         .to_owned(),
                 ));
@@ -598,7 +598,7 @@ impl Scheduler {
     /// The steps of an update are one scheduler's to apply — a switchover, a
     /// commit, a revert, a purge — so they are answered here. The rest belong to
     /// the process that owns what they name: a precopy is resolved by the
-    /// process holding the Program Server (it instantiates one candidate per
+    /// process holding the Build Server (it instantiates one candidate per
     /// scheduler), and a park, promote, drain, serve or pause is the engine
     /// process's own lifecycle. Each answer names that rather than reporting
     /// success for work that did not happen.
@@ -616,7 +616,7 @@ impl Scheduler {
             Some(Kind::Purge(_)) => Stage::Purge,
             Some(Kind::Precopy(_)) => {
                 let _ = answer.send(Err(
-                    "a precopy is resolved once per epoch by the process that holds the Program \
+                    "a precopy is resolved once per epoch by the process that holds the Build \
                      Server, which then precopies each scheduler's policy"
                         .to_owned(),
                 ));
@@ -752,11 +752,11 @@ impl Scheduler {
                 Ok(applied_at)
             }
             Err(reason) => {
-                let program = self.policy.as_ref().map(|policy| policy.program().clone());
-                if let Some(program) = program {
+                let package = self.policy.as_ref().map(|policy| policy.package().clone());
+                if let Some(package) = package {
                     self.policy_report = Some(policy::PolicyReverted {
                         scheduler: None,
-                        program,
+                        package,
                         reason: reason.clone(),
                         fatal: true,
                     });

@@ -5,14 +5,14 @@
 //! runtime (a host service after it detached). Each event is written as one line of the form
 //! `(<process> pid=<pid>) <LEVEL> <MM-DD HH:MM:SS> [<file>:<line>] <fields>`, where the process is
 //! the label (`Daemon` for `uniserve serve`, `Engine` for an engine process, `StorageServer`,
-//! `ProgramServer` and the Storage Server's helpers for the host services), with the active spans,
+//! `BuildServer` and the Storage Server's helpers for the host services), with the active spans,
 //! if any, written as `outer{..}:inner{..}: ` before the fields.
 //!
 //! `WARN` is printed as `WARNING`, the Python `logging` name, and `--log-level` and
 //! `--log-level-http` take Python level names; `RUST_LOG` refines them (`build_targets_filter`).
 //!
 //! The daemon and the engine log to stdout. A command whose own output is stdout
-//! (`uniserve programs`) and a host service, whose standard error is the log beside its socket,
+//! (`uniserve keys`) and a host service, whose standard error is the log beside its socket,
 //! log to stderr ([`Output`]). ANSI colors follow the `fmt` layer's default: they are on unless
 //! `NO_COLOR` is set to a non-empty value, with no terminal detection, so redirected output also
 //! carries escape sequences.

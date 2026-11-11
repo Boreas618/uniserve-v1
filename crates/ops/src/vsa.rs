@@ -24,7 +24,7 @@ use std::fmt;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -76,7 +76,7 @@ pub struct ZeroPaddingArgs {
 pub struct VsaZeroPadding;
 
 impl Op for VsaZeroPadding {
-    const NAME: &'static str = proto::program::operator::VSA_ZERO_PADDING;
+    const NAME: &'static str = proto::module::operator::VSA_ZERO_PADDING;
 
     type Descriptor = ZeroPaddingDescriptor;
     type Args<'a> = ZeroPaddingArgs;
@@ -183,7 +183,7 @@ pub struct AddGatedTilesArgs {
 pub struct VsaAddGatedTiles;
 
 impl Op for VsaAddGatedTiles {
-    const NAME: &'static str = proto::program::operator::VSA_ADD_GATED_TILES;
+    const NAME: &'static str = proto::module::operator::VSA_ADD_GATED_TILES;
 
     type Descriptor = AddGatedTilesDescriptor;
     type Args<'a> = AddGatedTilesArgs;
@@ -333,7 +333,7 @@ pub struct ComposeGatedRowsArgs {
 pub struct VsaComposeGatedRows;
 
 impl Op for VsaComposeGatedRows {
-    const NAME: &'static str = proto::program::operator::VSA_COMPOSE_GATED_ROWS;
+    const NAME: &'static str = proto::module::operator::VSA_COMPOSE_GATED_ROWS;
 
     type Descriptor = ComposeGatedRowsDescriptor;
     type Args<'a> = ComposeGatedRowsArgs;
@@ -527,7 +527,7 @@ pub struct SelectTilesArgs {
 pub struct VsaSelectTiles;
 
 impl Op for VsaSelectTiles {
-    const NAME: &'static str = proto::program::operator::VSA_SELECT_TILES;
+    const NAME: &'static str = proto::module::operator::VSA_SELECT_TILES;
 
     type Descriptor = SelectTilesDescriptor;
     type Args<'a> = SelectTilesArgs;
@@ -735,7 +735,7 @@ pub struct PrepareTilesArgs {
 pub struct VsaPrepareTiles;
 
 impl Op for VsaPrepareTiles {
-    const NAME: &'static str = proto::program::operator::VSA_PREPARE_TILES;
+    const NAME: &'static str = proto::module::operator::VSA_PREPARE_TILES;
 
     type Descriptor = PrepareTilesDescriptor;
     type Args<'a> = PrepareTilesArgs;
@@ -1062,7 +1062,7 @@ const POOLED_QUERIES: u64 = 16;
 pub struct VsaScores;
 
 impl Op for VsaScores {
-    const NAME: &'static str = proto::program::operator::VSA_SCORES;
+    const NAME: &'static str = proto::module::operator::VSA_SCORES;
 
     type Descriptor = ScoresDescriptor;
     type Args<'a> = ScoresArgs;
@@ -1303,7 +1303,7 @@ pub struct CompressPooledArgs {
 pub struct VsaCompressPooled;
 
 impl Op for VsaCompressPooled {
-    const NAME: &'static str = proto::program::operator::VSA_COMPRESS_POOLED;
+    const NAME: &'static str = proto::module::operator::VSA_COMPRESS_POOLED;
 
     type Descriptor = CompressPooledDescriptor;
     type Args<'a> = CompressPooledArgs;

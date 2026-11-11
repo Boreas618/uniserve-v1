@@ -1,6 +1,6 @@
 """The megamoe package's compile script: one descriptor -> one module.
 
-The Program Server runs this script with its working directory the package root
+The Build Server runs this script with its working directory the package root
 and `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and
 `UNISERVE_OUT` in the environment. It compiles FlashInfer's MegaMoE kernel (the
 pinned `megamoe` source with `patches/megamoe.patch`, see `kernel_sources`) for
@@ -18,8 +18,8 @@ import subprocess
 import sys
 import tempfile
 
-from uniserve_program_server import fetch
-from uniserve_program_server import package as build
+from uniserve_build_server import fetch
+from uniserve_build_server import package as build
 
 ENTRIES = [
     "uniserve_expert_exchange_launch",
@@ -38,7 +38,7 @@ ENTRIES = [
 SM_COUNT = 148
 
 #: The kernel's measured profiles by the largest step's token count: design 5.4
-#: keeps tuning data in the program package. These are FlashInfer's built-in
+#: keeps tuning data in the package. These are FlashInfer's built-in
 #: table.
 MID_TOKENS = {
     "mma_tiler_mnk": (256, 128, 256),
@@ -148,7 +148,7 @@ KERNEL_SOURCES = "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src"
 def kernel_sources(package, staging):
     """The kernel's sources, staged as this package compiles them.
 
-    They are the pinned FlashInfer copy (`uniserve_program_server.fetch`'s
+    They are the pinned FlashInfer copy (`uniserve_build_server.fetch`'s
     `megamoe` pin) with `patches/megamoe.patch` applied, which adds the
     tanh-approximated GELU gate and fixes the peer-metadata stride of the token
     exchange. The patch is applied to copies in the build's staging directory,

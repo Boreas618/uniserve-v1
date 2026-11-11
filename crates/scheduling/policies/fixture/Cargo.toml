@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "A policy package for the program layer's delivery test: the arrival-order body under the fcfs backend name."
+description = "A policy package for the generation layer's delivery test: the arrival-order body under the fcfs backend name."
 
 [lib]
 # A policy package is compiled to `wasm32-unknown-unknown` and loaded as a WASM

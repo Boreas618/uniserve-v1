@@ -96,6 +96,7 @@ mod batch;
 mod cache;
 mod call;
 mod command;
+pub mod generation;
 mod identity;
 mod info;
 mod media;
@@ -105,10 +106,9 @@ pub mod peer;
 /// The scheduler's name for one phase (§4.5).
 pub mod phase;
 pub mod product;
-pub mod program;
 mod request;
 mod tensor;
-/// The vocabulary of a program-layer update (§7.3).
+/// The vocabulary of a generation update (§7.3).
 pub mod update;
 
 pub use batch::*;
@@ -121,10 +121,10 @@ pub use media::{SharedMedia, SharedMediaError};
 pub use proto::{MediaLocator, MediaSource, SharedMemory};
 // The request values the engine carries on to its ranks are the request
 // vocabulary's own.
+pub use generation::GenerationCommand;
 pub use output::*;
 pub use peer::{PeerAccepted, PeerRegistration, VERSION};
 pub use phase::PhaseId;
-pub use program::ProgramCommand;
 pub use proto::report::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
 pub use proto::request::{
     CanvasSampling, DiffusionSamplingParams, PrefixCacheDtype, PrefixCacheDtypeParseError,
@@ -132,4 +132,4 @@ pub use proto::request::{
 };
 pub use request::*;
 pub use tensor::*;
-pub use update::{ProgramStatus, UpdateFailure};
+pub use update::{GenerationStatus, UpdateFailure};

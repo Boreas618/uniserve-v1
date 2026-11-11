@@ -29,9 +29,9 @@ from uniserve_eval.transport.sse import iter_sse_events
 # than the host has.
 HOST_CACHE_GIB = 16
 
-#: The attention program the suite's Qwen3 deployments serve: trtllm-gen, the
-#: program these deployments' shapes take on Blackwell.
-# Explicit until the Program Server selects a program left at `auto` (W4).
+#: The attention package the suite's Qwen3 deployments serve: trtllm-gen, the
+#: package these deployments' shapes take on Blackwell.
+# Explicit until the Build Server selects a package left at `auto` (W4).
 ATTENTION_BACKEND = "trtllm"
 
 #: What ``UNISERVE_QWEN3_MODEL`` names.
@@ -207,22 +207,22 @@ def qwen3_checkpoint() -> str:
     return str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
 
 
-#: The Program Server every deployment that names none is given
-#: (:func:`programs_from`).
-_PROGRAM_SERVER: Path | None = None
+#: The Build Server every deployment that names none is given
+#: (:func:`modules_from`).
+_BUILD_SERVER: Path | None = None
 
 
 @contextmanager
-def programs_from(server: Path) -> Iterator[None]:
-    """Give every deployment started in the block the Program Server whose
-    socket is `server`, unless it names one itself (``program_config.socket``).
+def modules_from(server: Path) -> Iterator[None]:
+    """Give every deployment started in the block the Build Server whose
+    socket is `server`, unless it names one itself (``build_config.socket``).
     """  # noqa: D205
-    global _PROGRAM_SERVER
-    previous, _PROGRAM_SERVER = _PROGRAM_SERVER, server
+    global _BUILD_SERVER
+    previous, _BUILD_SERVER = _BUILD_SERVER, server
     try:
         yield
     finally:
-        _PROGRAM_SERVER = previous
+        _BUILD_SERVER = previous
 
 
 def log_tail(log_path: Path | None, lines: int = 40) -> str:
@@ -280,7 +280,7 @@ def _serves_a_deployment(args: list[str]) -> bool:
     """Whether `args` starts a deployment: the `serve` subcommand of the one
     executable.
 
-    The subcommand is the second word. `uniserve program-server serve` and
+    The subcommand is the second word. `uniserve build-server serve` and
     `uniserve storage-server serve` are other commands: `serve` is theirs too,
     and they take no deployment options.
     """  # noqa: D205
@@ -293,16 +293,16 @@ def start_server(
     """Start `args` in a session of its own, its output to `log_path`.
 
     A deployment that sizes no host KV cache (``kv_cache_config.host_*``) holds
-    `HOST_CACHE_GIB` of it; one that names no Program Server is given the
-    module's (:func:`programs_from`); and every deployment adds `E2E_SET`.
+    `HOST_CACHE_GIB` of it; one that names no Build Server is given the
+    module's (:func:`modules_from`); and every deployment adds `E2E_SET`.
     """
     if _serves_a_deployment(args):
-        named = any("program_config.socket" in arg for arg in args)
-        if not named and _PROGRAM_SERVER is not None:
+        named = any("build_config.socket" in arg for arg in args)
+        if not named and _BUILD_SERVER is not None:
             args = [
                 *args,
                 "--set",
-                f"program_config.socket={_PROGRAM_SERVER}",
+                f"build_config.socket={_BUILD_SERVER}",
             ]
         sized = any("kv_cache_config.host_" in arg for arg in args)
         if not sized:
@@ -449,7 +449,7 @@ def second_host(
             "LD_LIBRARY_PATH",
             "PYTHONPATH",
             "MAX_JOBS",
-            "UNISERVE_PROGRAM_SERVER_PYTHON",
+            "UNISERVE_BUILD_SERVER_PYTHON",
             "FLASHINFER_WORKSPACE_BASE",
             "UCX_NET_DEVICES",
         )

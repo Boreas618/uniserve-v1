@@ -63,7 +63,7 @@ message Engine {
   // states no number, and a daemon refuses it rather than guessing.
   uint64 engine = 2;
   // Which of a process's links this connection is. One main process has two:
-  // the process link, which receives the epoch's program-layer commands, the
+  // the process link, which receives the epoch's generation commands, the
   // storage claim and the §7.3 reports, and the request link, which carries the
   // epoch's requests and metrics. The two are separate sockets and both state
   // the same engine number, so the number alone cannot tell them apart.
@@ -76,7 +76,7 @@ enum Interface {
   // in and refuses nothing, which is how every client that is not a main
   // process connects.
   INTERFACE_UNSPECIFIED = 0;
-  // The process link: the epoch's program-layer commands, its storage claim and
+  // The process link: the epoch's generation commands, its storage claim and
   // its §7.3 reports travel here.
   INTERFACE_PROCESS = 1;
   // The request link: the epoch's requests, their events and its metrics travel
@@ -177,7 +177,7 @@ message Spawn {
   string group = 2;
   uint32 rank = 3;
   uint64 generation = 4;
-  // The executable and its arguments, after the program name.
+  // The executable and its arguments, after the executable's name.
   string executable = 5;
   repeated string arguments = 6;
   // Variables set over the daemon's environment; an empty value is set
@@ -188,7 +188,7 @@ message Spawn {
   repeated uint64 inherit = 8;
   // A main process's launch file (`proto::config::EngineArgs` as JSON); empty
   // for any other process. The node's daemon states its own node's facts in
-  // it (its Program Server's socket), writes it to its runtime directory and
+  // it (its Build Server's socket), writes it to its runtime directory and
   // passes `--launch <path>` after `arguments`, so a main process starts on
   // any node of the deployment from the same request.
   bytes launch = 9;
@@ -338,24 +338,24 @@ message Event {
   }
 }
 
-// A program: the backend that fills an operator or the scheduling interface,
-// the revision of its package the upstream Program Server numbered, and its
-// parameters. The Rust type is `crates/program-server`'s
-// `Program`; this is only its wire form, which the daemon records and sends.
-message Program {
+// A package: the backend that fills an operator or the scheduling interface,
+// the revision of its package the upstream Build Server numbered, and its
+// parameters. The Rust type is `crates/build-server`'s
+// `PackageRevision`; this is only its wire form, which the daemon records and sends.
+message PackageRevision {
   // The backend's name, from the configuration field that selects it.
   string backend = 1;
-  // The revision the upstream Program Server gave the package: the same
+  // The revision the upstream Build Server gave the package: the same
   // content on every host, and never overwritten.
   uint32 revision = 2;
-  // The program's parameters as TOML key/value pairs: each value is the TOML
+  // The package's parameters as TOML key/value pairs: each value is the TOML
   // representation of that parameter's configured value, so `chunked_prefill_size
   // = 4096` arrives as `chunked_prefill_size = "4096"`. A main process of
   // another build reads them back as TOML values.
   map<string, string> arguments = 3;
 }
 
-// The phase of an operator's calls that a kernel program fills. An operator
+// The phase of an operator's calls that a kernel package fills. An operator
 // is filled once for all its phases unless the configuration fills it per
 // phase, which attention allows (`prefill_attention_backend`,
 // `decode_attention_backend`, §5.2).
@@ -367,13 +367,13 @@ enum PhaseKind {
   PHASE_KIND_DENOISE = 4;
 }
 
-// One operator's kernel program, or one phase's of it: the epoch record's
+// One operator's kernel package, or one phase's of it: the epoch record's
 // key is the operator and the phase, `phase` absent for every phase.
-message KernelProgram {
+message KernelPackage {
   // The operator's name, as the `ops` crate names it.
   string op = 1;
   optional PhaseKind phase = 2;
-  Program program = 3;
+  PackageRevision package = 3;
 }
 
 // A command for the main process of one epoch, from the daemon that manages
@@ -428,11 +428,11 @@ message Command {
   }
 }
 
-// The programs an epoch's main process is to switch to: one kernel program
+// The packages an epoch's main process is to switch to: one kernel package
 // per operator (and, for attention, per phase), and the scheduling policy.
 message Precopy {
-  repeated KernelProgram kernels = 1;
-  Program policy = 2;
+  repeated KernelPackage kernels = 1;
+  PackageRevision policy = 2;
 }
 
 message Park {}
@@ -565,12 +565,12 @@ message Promoted {
   // The launch generation this process was spawned at, which the epoch layer
   // promotes a child by.
   uint64 generation = 1;
-  // The program generation this process holds and serves from now on (§7.3):
+  // The module generation this process holds and serves from now on (§7.3):
   // the generation its precopy built. The daemon compares it with the epoch's
   // own before it moves the frontend, so a promotion of a generation the epoch
   // has since reverted is refused there rather than served. Unstated (`0`) is a
   // process that holds none, which is today's behaviour.
-  uint64 program_generation = 2;
+  uint64 module_generation = 2;
 }
 
 // The scheduling policy failed (§4.4): the main process reinstantiated the

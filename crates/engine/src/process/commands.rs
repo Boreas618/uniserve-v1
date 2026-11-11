@@ -1,28 +1,28 @@
 //! The daemon's messages: the process interface's commands, the request interface's frames, and
-//! the dispatch of every program-layer command ([`ipc::ProgramCommand`])
+//! the dispatch of every generation command ([`ipc::GenerationCommand`])
 //! to the stage that applies it, with the answer each one is owed.
 
 use anyhow::{Result, bail};
-use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
+use ipc::{GenerationCommand, GenerationStatus, UpdateFailure};
 
 use super::MainProcess;
 use super::reports::status_name;
 use super::requests::{Served, engine_command_name};
 
-/// The stage a program-layer command belongs to, for the log line each one leaves.
-fn program_stage(command: &ProgramCommand) -> &'static str {
+/// The stage a generation command belongs to, for the log line each one leaves.
+fn generation_stage(command: &GenerationCommand) -> &'static str {
     match command {
-        ProgramCommand::Precopy { .. } => "precopy",
-        ProgramCommand::Switchover { .. } => "switchover",
-        ProgramCommand::Commit { .. } => "commit",
-        ProgramCommand::Revert { .. } => "revert",
-        ProgramCommand::Purge { .. } => "purge",
+        GenerationCommand::Precopy { .. } => "precopy",
+        GenerationCommand::Switchover { .. } => "switchover",
+        GenerationCommand::Commit { .. } => "commit",
+        GenerationCommand::Revert { .. } => "revert",
+        GenerationCommand::Purge { .. } => "purge",
     }
 }
 
 impl MainProcess {
     /// Serves the daemon's buffered messages: request submissions and commands
-    /// go to the schedulers, program-layer commands to [`Self::program`].
+    /// go to the schedulers, generation commands to [`Self::package`].
     pub(super) fn daemon_messages(&mut self) -> Result<Option<UpdateFailure>> {
         // Every front is read in turn, the launching daemon's first: a submission names the front
         // it came from, and so does every command for a request already admitted.
@@ -66,7 +66,7 @@ impl MainProcess {
 
     /// Serves the daemon's request interface: submissions and per-request
     /// commands are routed to the scheduler that holds the request, and
-    /// program-layer commands run the program-layer update's driver.
+    /// generation commands run the generation update's driver.
     fn daemon_message(
         &mut self,
         front: usize,
@@ -118,7 +118,7 @@ impl MainProcess {
                         }
                     };
                     // An adapter's tensors load into their slot, and what computes with them
-                    // is a kernel program this epoch does not hold: computing the base model
+                    // is a kernel package this epoch does not hold: computing the base model
                     // for a request that named an adapter would answer another model's text.
                     if let proto::request::Request::Generation(generation) = &request
                         && generation.adapter != 0
@@ -129,7 +129,7 @@ impl MainProcess {
                             id,
                             proto::request::RejectionKind::Invalid,
                             format!(
-                                "the adapter in slot {adapter} is loaded, and no kernel program of \
+                                "the adapter in slot {adapter} is loaded, and no kernel package of \
                                  this epoch computes with an adapter"
                             ),
                         );
@@ -209,7 +209,7 @@ impl MainProcess {
 
     /// Serves one command of the daemon's process interface.
     ///
-    /// `ipc::ProgramCommand` is the one form the driver reads, whether the command came from the
+    /// `ipc::GenerationCommand` is the one form the driver reads, whether the command came from the
     /// daemon's Protobuf or from a peer of this epoch, so the conversion happens here and nowhere
     /// else. The daemon's `Commit` and `Revert` carry no generation of their own; the one they
     /// name is the generation this process is serving.
@@ -218,7 +218,7 @@ impl MainProcess {
         command: proto::process::Command,
     ) -> Result<Option<UpdateFailure>> {
         let current = self.update.current();
-        // A revert carries the daemon's own account of why, which `ipc::ProgramCommand` does not
+        // A revert carries the daemon's own account of why, which `ipc::GenerationCommand` does not
         // keep: read it here so the report repeats the operator's reason rather than inventing one.
         let reverted_by = match &command.kind {
             Some(proto::process::command::Kind::Revert(revert)) => {
@@ -226,7 +226,7 @@ impl MainProcess {
             }
             _ => None,
         };
-        let Some(program) = ProgramCommand::from_command(command.clone(), current)? else {
+        let Some(package) = GenerationCommand::from_command(command.clone(), current)? else {
             // The rest are this process's own lifecycle, and no scheduler's: sched's handle
             // answers every one of them with exactly that (a park, promote, drain, serve or pause
             // is the engine process's own command). Forwarding them there and ending the epoch on
@@ -248,7 +248,7 @@ impl MainProcess {
                             proto::process::Parked {
                                 // The daemon's epoch layer promotes a child by its
                                 // launch generation: this process's own number, not
-                                // the program generation (which is zero until a
+                                // the module generation (which is zero until a
                                 // `Precopy` names one).
                                 generation: self.control.engine(),
                             },
@@ -261,13 +261,13 @@ impl MainProcess {
                 Some(proto::process::command::Kind::Inherit(inherit)) => {
                     self.inherit(inherit.index)?;
                 }
-                // The five program commands were converted above; a command that states no kind
+                // The five package commands were converted above; a command that states no kind
                 // states nothing to apply.
                 _ => {}
             }
             return Ok(None);
         };
-        match self.program(program, reverted_by)? {
+        match self.package(package, reverted_by)? {
             // A precopy answers when its installs finish, from `advance_precopy`.
             None => Ok(None),
             Some(status) => {
@@ -277,7 +277,7 @@ impl MainProcess {
         }
     }
 
-    /// One program-layer command, with the daemon's own reason when it stated one.
+    /// One generation command, with the daemon's own reason when it stated one.
     ///
     /// A revert's reason is the daemon's account of why an operator ended the probation; it is
     /// carried into the epoch's record instead of a reason this process makes up, and the epoch's
@@ -285,26 +285,26 @@ impl MainProcess {
     ///
     /// A precopy answers later, from [`Self::advance_precopy`], because its module builds run
     /// between serve passes; every other stage answers at once.
-    fn program(
+    fn package(
         &mut self,
-        command: ProgramCommand,
+        command: GenerationCommand,
         reverted_by: Option<String>,
-    ) -> Result<Option<ProgramStatus>> {
-        // The program layer's stages are the epoch's steps, and a step that never arrives is the
+    ) -> Result<Option<GenerationStatus>> {
+        // The generation layer's stages are the epoch's steps, and a step that never arrives is the
         // failure this line is for: it names the command and the generation, so a log that stops
         // after "claimed the deployment's storage" says which step the process is waiting for.
         self.commands_seen += 1;
         tracing::info!(
-            stage = program_stage(&command),
+            stage = generation_stage(&command),
             boundary = self.boundary,
             serving = self.serving,
             warming = self.warming.len(),
-            "a program-layer command arrived"
+            "a generation command arrived"
         );
         let status = match command {
-            ProgramCommand::Precopy {
+            GenerationCommand::Precopy {
                 generation,
-                programs,
+                packages,
                 policy,
             } => {
                 // The receipt: this line says the daemon's step reached this process and what it
@@ -313,15 +313,15 @@ impl MainProcess {
                 // stopped here.
                 tracing::info!(
                     generation,
-                    operators = programs.len(),
+                    operators = packages.len(),
                     policy = %policy.backend,
                     policy_revision = policy.revision,
                     "the daemon's Precopy arrived"
                 );
-                self.start_precopy(generation, &programs, &policy)?;
+                self.start_precopy(generation, &packages, &policy)?;
                 return Ok(None);
             }
-            ProgramCommand::Switchover { generation, step } => {
+            GenerationCommand::Switchover { generation, step } => {
                 tracing::info!(
                     generation,
                     step = step.unwrap_or_default(),
@@ -334,36 +334,36 @@ impl MainProcess {
                     None => return Ok(None),
                 }
             }
-            ProgramCommand::Commit { generation } => self.commit(generation)?,
+            GenerationCommand::Commit { generation } => self.commit(generation)?,
             // The operator's rollback is the daemon's decision, and its reason - when the
             // daemon states one - is what the record keeps. It is not a policy failure: nothing
             // about the scheduling policy failed, and saying it did would put a policy error in
             // the epoch's record and in the daemon's account of why the update ended.
-            ProgramCommand::Revert { generation } => self.revert(
+            GenerationCommand::Revert { generation } => self.revert(
                 generation,
                 UpdateFailure::Threshold {
                     reason: reverted_by.unwrap_or_else(|| "the daemon reverted the update".into()),
                 },
             )?,
-            ProgramCommand::Purge { generation } => self.purge(generation)?,
+            GenerationCommand::Purge { generation } => self.purge(generation)?,
         };
         Ok(Some(status))
     }
 
-    /// Delivers a program-layer status to the daemon.
-    pub(super) fn answer(&mut self, status: ProgramStatus) {
-        // The program layer's steps are answered here. A run that stops between two of them needs
+    /// Delivers a generation status to the daemon.
+    pub(super) fn answer(&mut self, status: GenerationStatus) {
+        // The generation layer's steps are answered here. A run that stops between two of them needs
         // to know which one was answered last, and the daemon's own log of its commands is not this
         // side's. The reason travels with the status, and a run that reads only this log needs it
         // too.
         let failure = match &status {
-            ProgramStatus::PrecopyFailed { failure, .. } => format!("{failure:?}"),
+            GenerationStatus::PrecopyFailed { failure, .. } => format!("{failure:?}"),
             _ => String::new(),
         };
         tracing::info!(
             status = status_name(&status),
             failure,
-            "answering the epoch's program layer"
+            "answering the epoch's generation layer"
         );
         self.report(status);
     }

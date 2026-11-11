@@ -1,7 +1,7 @@
 //! The numerical ABI an operator's launch code is written in: element types, shapes, strides and
 //! borrowed tensor views.
 //!
-//! These are the types a kernel program's parameters are made of. They
+//! These are the types a kernel package's parameters are made of. They
 //! live in `ops` because `ops` depends on `platform` alone and both `ops` and `nn` need them; `nn`
 //! re-exports them. Everything here is plain data: no storage is owned, no allocation happens and
 //! nothing synchronizes. A view borrows device memory its owner keeps alive until the stream work
@@ -84,7 +84,7 @@ pub const MAX_RANK: usize = 6;
 /// An element type.
 ///
 /// The numbering is part of the package ABI: a package's C header carries the same values, so a
-/// kernel program reads the element type the operator launched it with. Do not renumber.
+/// kernel package reads the element type the operator launched it with. Do not renumber.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i64)]
 pub enum DType {

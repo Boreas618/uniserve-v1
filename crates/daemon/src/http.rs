@@ -135,7 +135,7 @@ pub async fn serve(
     Daemon::advance_epochs(Arc::clone(&updates), awake)
         .context("starting the epoch layer's thread")?;
     // The daemon's channel down to the main processes, which the epoch's
-    // first program switch commands through.
+    // first package switch commands through.
     let commands = daemon
         .lock()
         .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?

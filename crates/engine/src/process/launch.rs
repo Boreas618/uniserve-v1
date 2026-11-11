@@ -13,11 +13,11 @@ use worker::control::Control;
 /// The epoch as this node takes it at start.
 ///
 /// The daemon fixes the epoch with a [`proto::config::EngineConfig`] and
-/// fills its operators and its scheduling interface with programs; the
-/// main process never receives program content, only the programs' names, and it
-/// resolves their modules from the Program Server itself.
+/// fills its operators and its scheduling interface with packages; the
+/// main process never receives package content, only the packages' names, and it
+/// resolves their modules from the Build Server itself.
 pub(crate) struct Epoch {
-    /// The program revision the daemon numbered for the generation that serves
+    /// The package revision the daemon numbered for the generation that serves
     /// once this node switches over. Zero until the daemon's first `Precopy` names the
     /// number it prepares: the number is the daemon's and this process never invents one.
     pub generation: u64,
@@ -47,7 +47,7 @@ pub(super) fn read_engine_args(path: &Path) -> Result<EngineArgs> {
 ///
 /// The daemon has two interfaces and they are two sockets with two vocabularies: the request one
 /// carries the epoch's requests, their events and the metrics, and this one carries the supervision
-/// frames - the storage claim, the program-layer reports, and every command the daemon sends an
+/// frames - the storage claim, the generation reports, and every command the daemon sends an
 /// epoch. A frame of one sent on the other is unreadable at the far end, which is why the claim and
 /// the reports live here and not on the request connection.
 pub(super) struct ProcessInterface {
@@ -71,7 +71,7 @@ impl ProcessInterface {
         if engine == 0 {
             bail!(
                 "the launch file states engine 0, which names no main process: the daemon addresses \
-                 the epoch's program-layer commands by this number, so a process it started under \
+                 the epoch's generation commands by this number, so a process it started under \
                  none cannot be commanded"
             );
         }
@@ -88,7 +88,7 @@ impl ProcessInterface {
                     // process under, so a command it sends for engine N reaches this process and
                     // not whichever connection the daemon happened to accept Nth.
                     engine,
-                    // This is the process link: the one the daemon's program-layer commands
+                    // This is the process link: the one the daemon's generation commands
                     // travel down. The request link, on its own socket, states `REQUESTS`, so the
                     // two links of one engine are never confused for one another.
                     interface: proto::process::Interface::Process as i32,
@@ -253,11 +253,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The handshake with the daemon, which answers with the epoch this node serves.
 ///
-/// The daemon states that this build may serve the epoch, and, later, the program revision of the
+/// The daemon states that this build may serve the epoch, and, later, the package revision of the
 /// generation it prepares. The launch file states the rest of what the epoch starts from:
 /// this node's host identity, the process this one succeeds, the expert order and the profiling.
-/// The programs themselves never come through this interface: the daemon names them and this
-/// process resolves their modules from the Program Server.
+/// The packages themselves never come through this interface: the daemon names them and this
+/// process resolves their modules from the Build Server.
 pub(super) fn handshake(control: &mut Control, launch: &EngineArgs) -> Result<Epoch> {
     control.daemon_mut().send(&proto::request::wire::Hello {
         engine: launch.engine,
@@ -284,8 +284,8 @@ impl Epoch {
     ///
     /// When the launch states no host identity.
     pub(super) fn of(launch: &EngineArgs) -> Result<Self> {
-        // The epoch's programs and the generation that serves at start are not in the launch file:
-        // the programs arrive as the daemon's first `Precopy` and the generation number
+        // The epoch's packages and the generation that serves at start are not in the launch file:
+        // the packages arrive as the daemon's first `Precopy` and the generation number
         // is the daemon's own. Until it states one, this process serves generation zero, whose
         // `Precopy` names the daemon's next number.
         //

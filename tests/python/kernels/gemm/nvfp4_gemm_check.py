@@ -13,8 +13,8 @@ decoding as well as its contraction.
                          [--output bf16] [--layout linear] [--seed 7] [--cpu-only]
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory with ``module.so``. Run it on
-the GPU host with the Program Server's own environment
-(``crates/program-server/python/.venv/bin/python``), which has torch. Without a GPU,
+the GPU host with the Build Server's own environment
+(``crates/build-server/python/.venv/bin/python``), which has torch. Without a GPU,
 ``--cpu-only`` checks everything about this script that does not need a device: the call
 structure's size and field offsets, the two scale layouts, and the reference arithmetic against
 an independent element-by-element computation.

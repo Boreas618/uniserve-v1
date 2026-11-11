@@ -11,7 +11,7 @@ import cutlass
 import cutlass.cute as cute
 import route_gemm as kernels
 from cutlass.cute.runtime import make_ptr
-from uniserve_program_server import cute_dsl as driver
+from uniserve_build_server import cute_dsl as driver
 
 #: The element types the kernel serves, by the operator's name.
 DTYPES = {"bf16": cutlass.BFloat16}

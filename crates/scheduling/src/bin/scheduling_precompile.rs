@@ -1,8 +1,8 @@
 //! `scheduling-precompile`: a policy package's raw wasm32 module, in the
-//! precompiled form the Program Server serves (§5.1, §5.2, §5.3).
+//! precompiled form the Build Server serves (§5.1, §5.2, §5.3).
 //!
-//! A policy package declares `[module] form = wasm32 precompiled`; the Program
-//! Server builds the program with this binary, and the engine loads the result
+//! A policy package declares `[module] form = wasm32 precompiled`; the Build
+//! Server builds the package with this binary, and the engine loads the result
 //! with the same `wasmtime::Config` it precompiled under — a precompiled module
 //! carries wasmtime's artifact format and configuration, so any other producer
 //! makes a module the main process rejects.
@@ -14,7 +14,7 @@
 //!
 //! `--version` prints `scheduling-precompile <wasmtime version>`; the last
 //! whitespace-separated token is the version a package's `[toolchain]` must
-//! declare, so the Program Server reads it from the binary it will build with.
+//! declare, so the Build Server reads it from the binary it will build with.
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -1,4 +1,4 @@
-# The audio_activation operator's Triton backend: design 5.2's program package.
+# The audio_activation operator's Triton backend: design 5.2's package.
 #
 # One cubin per descriptor: the BigVGAN decoder's activation block as one program — the
 # replicate pad, the transposed convolution that upsamples, the crop, SnakeBeta and the

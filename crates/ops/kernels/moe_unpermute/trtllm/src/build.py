@@ -120,7 +120,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     staging = out / "objects"
     staging.mkdir(exist_ok=True)
-    # The nvcc the Program Server checked against this package's declared version.
+    # The nvcc the Build Server checked against this package's declared version.
     compiler = os.environ["UNISERVE_NVCC"]
 
     objects = []

@@ -35,7 +35,7 @@ use crate::descriptor::Key;
 use crate::fp4::ScaleLayout;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -245,7 +245,7 @@ impl NativeCall for GatherCall {
 pub struct GatherGemm;
 
 impl Op for GatherGemm {
-    const NAME: &'static str = proto::program::operator::GATHER_GEMM;
+    const NAME: &'static str = proto::module::operator::GATHER_GEMM;
 
     type Descriptor = GatherGemmDescriptor;
     type Args<'a> = GatherGemmArgs;
@@ -392,7 +392,7 @@ impl Op for GatherGemm {
 pub struct RouteGemm;
 
 impl Op for RouteGemm {
-    const NAME: &'static str = proto::program::operator::ROUTE_GEMM;
+    const NAME: &'static str = proto::module::operator::ROUTE_GEMM;
 
     type Descriptor = RouteGemmDescriptor;
     type Args<'a> = RouteGemmArgs;
@@ -925,7 +925,7 @@ impl NativeCall for RouteNvfp4Call {
 pub struct GatherGemmNvfp4;
 
 impl Op for GatherGemmNvfp4 {
-    const NAME: &'static str = proto::program::operator::GATHER_GEMM_NVFP4;
+    const NAME: &'static str = proto::module::operator::GATHER_GEMM_NVFP4;
 
     type Descriptor = GatherGemmNvfp4Descriptor;
     type Args<'a> = GatherGemmNvfp4Args;
@@ -1393,7 +1393,7 @@ pub struct RouteGemmNvfp4Args {
 pub struct RouteGemmNvfp4;
 
 impl Op for RouteGemmNvfp4 {
-    const NAME: &'static str = proto::program::operator::ROUTE_GEMM_NVFP4;
+    const NAME: &'static str = proto::module::operator::ROUTE_GEMM_NVFP4;
 
     type Descriptor = RouteGemmNvfp4Descriptor;
     type Args<'a> = RouteGemmNvfp4Args;

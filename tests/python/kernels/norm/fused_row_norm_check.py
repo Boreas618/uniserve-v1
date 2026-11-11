@@ -11,7 +11,7 @@ the row's root mean square and the layer form by its mean and variance, adding t
 bias afterwards. The RMS form also writes the updated residual back into `hidden`; the layer
 form leaves the residual unchanged, which its arguments say in as many words ("unchanged by
 the launch"). The same file is kept in both packages, byte for byte, and a test in
-`crates/program-server/tests/it/packages.rs` holds the copies together.
+`crates/build-server/tests/it/packages.rs` holds the copies together.
 
 Cases: the deployed geometry, the `update_bias` and `absmax` flags on, a residual that
 cancels the update exactly (the RMS of zero, and a layer output that is nothing but the bias —

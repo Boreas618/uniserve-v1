@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the `route_gemm` module on a device and check the FC2 product it writes.
 
-    crates/program-server/python/.venv/bin/python route_check.py <module_dir> [--tokens N]
+    crates/build-server/python/.venv/bin/python route_check.py <module_dir> [--tokens N]
 
 `<module_dir>` is what `resolve` hands a runner: the directory holding `module.so`. The module is
 compiled for one descriptor of the fixture —

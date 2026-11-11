@@ -16,7 +16,7 @@ use ops::conv::{
     Args, Conv1d as Conv1dOp, Conv3d as Conv3dOp, ConvTranspose1d as ConvTranspose1dOp, Descriptor,
 };
 use ops::frame::{self, channels_last_strides};
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -270,12 +270,7 @@ impl<const N: usize> Convolution<N> {
     /// The output extent of `input` `[n, c, spatial…]` along the `N` spatial axes, torch's rule:
     /// `(l + 2p − d(k − 1) − 1) / s + 1` for a convolution and `(l − 1)s − 2p + d(k − 1) + 1` for a
     /// transposed one.
-    fn output_shape(
-        &self,
-        owner: &'static str,
-        input: Operand,
-        transposed: bool,
-    ) -> Result<Shape> {
+    fn output_shape(&self, owner: &'static str, input: Operand, transposed: bool) -> Result<Shape> {
         let dims = input.shape.dims();
         if dims.len() != N + 2 || dims[1] != u64::from(self.spec.in_channels) {
             return Err(Error::shape(
@@ -388,11 +383,7 @@ pub struct Conv3d {
 /// **The filter is not part of the order.** A checkpoint stores a convolution's weight
 /// `[out, in, kd, kh, kw]` packed, the KCRS form cuDNN's filter descriptor wants, and PyTorch's
 /// `channels_last_3d` is a memory format of *activations*.
-fn channels_last_storage(
-    owner: &'static str,
-    operand: &'static str,
-    view: Operand,
-) -> Result<()> {
+fn channels_last_storage(owner: &'static str, operand: &'static str, view: Operand) -> Result<()> {
     if view.shape.rank() != 5 {
         return Err(Error::shape(
             owner,
@@ -684,7 +675,7 @@ impl ResnetBlock3d {
 #[cfg(test)]
 mod tests {
     use super::{channels_last_storage, channels_last_strides};
-    use ops::tensor::{DType, DevicePtr, Shape, Strides, Operand};
+    use ops::tensor::{DType, DevicePtr, Operand, Shape, Strides};
 
     /// The encoder's first convolution's operand: 3 channels, 19 frames, 258 x 258 pixels.
     fn operand(strides: Strides) -> Operand {

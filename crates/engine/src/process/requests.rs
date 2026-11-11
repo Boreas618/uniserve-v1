@@ -201,7 +201,7 @@ impl MainProcess {
     /// Routes a request to the scheduler that serves it: the rank the routing policy's `route`
     /// decision names (`scheduler::Router::route`, whose documentation states which instance
     /// decides, how a node of one scheduler routes, and how a failed decision is retried by the
-    /// previous program). A refusal no previous program could answer is the update's failure
+    /// previous package). A refusal no previous package could answer is the update's failure
     /// (`Err` carries both).
     pub(super) fn route(
         &mut self,
@@ -367,13 +367,13 @@ impl MainProcess {
     }
 
     /// A command to the whole main process: shutdown, drain, park or promote,
-    /// and the program-layer commands a single-rank node receives directly.
+    /// and the generation commands a single-rank node receives directly.
     pub(super) fn engine_command(
         &mut self,
         front: usize,
         command: proto::request::wire::EngineCommand,
     ) -> Result<Option<UpdateFailure>> {
-        // The epoch's lifecycle - Park, Promote, Serve, Drain, Pause, the program layer's
+        // The epoch's lifecycle - Park, Promote, Serve, Drain, Pause, the generation layer's
         // stages - arrives on the process connection and is applied by the driver. On this
         // connection the epoch owns exactly one command, `Shutdown`: every request finishes as
         // aborted and the owners close in the order they need (`close`).

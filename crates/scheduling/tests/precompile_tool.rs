@@ -1,5 +1,5 @@
 //! `scheduling-precompile` is how a policy package becomes the artifact the
-//! Program Server stores (design §5.2, §5.3): the package's `[toolchain]`
+//! Build Server stores (design §5.2, §5.3): the package's `[toolchain]`
 //! declares the version this binary reports, and the main process loads what it
 //! wrote with an engine built the same way.
 //!
@@ -13,7 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-/// The tool the Program Server runs, built by this test's `cargo`.
+/// The tool the Build Server runs, built by this test's `cargo`.
 const TOOL: &str = env!("CARGO_BIN_EXE_scheduling-precompile");
 
 /// The eight bytes of an empty core module: the magic and the version.
@@ -39,7 +39,7 @@ fn workspace(name: &str) -> PathBuf {
 }
 
 /// The version a package's `[toolchain]` must declare is the last whitespace
-/// token of `--version`: that is what the Program Server reads to compare a
+/// token of `--version`: that is what the Build Server reads to compare a
 /// package against the toolchain it will build it with.
 #[test]
 fn version_reports_the_wasmtime_the_package_must_declare() {

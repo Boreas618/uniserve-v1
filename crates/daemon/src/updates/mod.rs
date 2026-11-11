@@ -33,14 +33,14 @@ pub(crate) mod trial;
 pub(crate) mod warming;
 
 /// The update a change would collide with (§7.2: one update at a time): the
-/// switch a driver runs, or the program update on probation, whose epoch
+/// switch a driver runs, or the generation update on probation, whose epoch
 /// record is what decides who serves. Both layers' entries refuse through this
 /// one decision, so the sentence an operator reads does not depend on which
 /// layer asked.
-pub(crate) fn in_flight(running: bool, program: bool) -> Option<&'static str> {
-    match (running, program) {
+pub(crate) fn in_flight(running: bool, package: bool) -> Option<&'static str> {
+    match (running, package) {
         (true, _) => Some("an epoch switch is running"),
-        (false, true) => Some("a program update is on probation"),
+        (false, true) => Some("a generation update is on probation"),
         (false, false) => None,
     }
 }

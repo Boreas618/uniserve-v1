@@ -6,7 +6,7 @@ value.
 """
 
 import vocab_unpad as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The gathered logits' dtype.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}

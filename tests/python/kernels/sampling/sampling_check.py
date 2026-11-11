@@ -9,7 +9,7 @@ One script covers the chain because the chain is one path — the logits row is 
 penalized, filtered, drawn from and reported — and because a defect in any step builds
 cleanly, produces fluent nonsense, and gets attributed to the model. The same file is kept
 in each operator's package, byte for byte, and a test in
-`crates/program-server/tests/it/packages.rs` holds the copies together.
+`crates/build-server/tests/it/packages.rs` holds the copies together.
 
 Operators, in the order the data meets them:
 

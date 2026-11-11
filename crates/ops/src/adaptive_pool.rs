@@ -27,7 +27,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, Operand};
+use crate::tensor::{DType, Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -77,7 +77,7 @@ pub struct Args {
 pub struct AdaptivePool;
 
 impl Op for AdaptivePool {
-    const NAME: &'static str = proto::program::operator::ADAPTIVE_POOL;
+    const NAME: &'static str = proto::module::operator::ADAPTIVE_POOL;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

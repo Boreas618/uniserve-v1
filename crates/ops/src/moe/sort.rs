@@ -29,7 +29,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -239,7 +239,7 @@ impl NativeCall for Call {
 pub struct MoeSort;
 
 impl Op for MoeSort {
-    const NAME: &'static str = proto::program::operator::MOE_SORT;
+    const NAME: &'static str = proto::module::operator::MOE_SORT;
 
     type Descriptor = Descriptor;
     type Args<'a> = SortArgs;

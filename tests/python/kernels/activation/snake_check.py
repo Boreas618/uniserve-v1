@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `snake`'s kernel and check the decoder's periodic activation, on the CPU.
 
-    TRITON_INTERPRET=1 crates/program-server/python/.venv/bin/python snake_check.py [--package DIR]
+    TRITON_INTERPRET=1 crates/build-server/python/.venv/bin/python snake_check.py [--package DIR]
 
 The operator is one line of the H3 audio VAE, its Snake activation:
 

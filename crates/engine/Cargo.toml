@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 # A node's main process for one epoch: its control thread, its schedulers,
-# one executor per device and its blocking pool, and the program-layer
+# one executor per device and its blocking pool, and the generation
 # update between them. It dispatches by computational capability and names no
 # concrete model: the executable hands it the model families it serves.
 [dependencies]
@@ -16,7 +16,7 @@ ipc.workspace = true
 nn.workspace = true
 ops.workspace = true
 platform.workspace = true
-program-server.workspace = true
+build-server.workspace = true
 proto.workspace = true
 scheduler.workspace = true
 serde_json.workspace = true
@@ -29,8 +29,8 @@ worker.workspace = true
 # A test states the serving a family it resolves names.
 processing.workspace = true
 tempfile.workspace = true
-# A test states the arguments a deployment pinned on a program, which are a TOML table
-# (`proto::program::Program`).
+# A test states the arguments a deployment pinned on a package, which are a TOML table
+# (`proto::module::Package`).
 toml.workspace = true
 
 [lints]

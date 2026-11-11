@@ -1,0 +1,41 @@
+[package]
+name = "build-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The Build Server: the object model, module store, compile queue, package
+# manifest and protobuf protocol of design section 6, its client (the daemon
+# prepares package revisions with it, the main process resolves them), and the
+# `uniserve build-server` command. Sources and toolchains compile a package
+#  with the Build Server's own Python environment under `python/`.
+#
+# The package revisions, slots and phases it serves are `proto::module`'s, which the
+# daemon, the main process and the kernel library name them with (design 5.1,
+# 5.2); the server links no part of the computation library.
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+prost.workspace = true
+# The module vocabulary: package revisions, slots and phases (`proto::module`).
+proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+service.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# `check_packages` states the element types of the kernel library's descriptors.
+ops.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
+[lints]
+workspace = true

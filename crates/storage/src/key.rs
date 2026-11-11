@@ -16,8 +16,8 @@
 //! A KV page has one key at every level of the cache: the device prefix
 //! cache (L1) indexes it by the key the chain gives it, the host page pools
 //! (L2) hold it under the same key, and the KV storage (L3) keeps it under
-//! that key with the rank's KV-head range. A key carries no program's
-//! backend name or revision: replacing a kernel program keeps the
+//! that key with the rank's KV-head range. A key carries no package's
+//! backend name or revision: replacing a kernel package keeps the
 //! mathematical content, so derived state keeps hitting. A change of
 //! mathematics, precision or format is a build-config change, which changes
 //! the identity a seed is computed from and so every key.
@@ -118,7 +118,7 @@ pub fn page_key(parent: &Key, group: u32, modality: u8, tokens: &[u32]) -> Key {
 
 /// The key a weight is retained under, from its canonical text
 /// (`nn::WeightKey`'s): every file's identity, the element type, the layout
-/// name and the region, and nothing about which program reads it.
+/// name and the region, and nothing about which kernel reads it.
 pub fn weight(canonical: &str) -> Key {
     let mut digest = Digest::new(b"uniserve-retained-weight");
     digest.text(canonical);

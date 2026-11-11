@@ -26,7 +26,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -119,7 +119,7 @@ pub struct ActAndMulArgs {
 pub struct ActAndMul;
 
 impl Op for ActAndMul {
-    const NAME: &'static str = proto::program::operator::ACT_AND_MUL;
+    const NAME: &'static str = proto::module::operator::ACT_AND_MUL;
 
     type Descriptor = ActAndMulDescriptor;
     type Args<'a> = ActAndMulArgs;
@@ -320,7 +320,7 @@ pub struct ValueFirstSwigluArgs {
 pub struct ValueFirstSwiglu;
 
 impl Op for ValueFirstSwiglu {
-    const NAME: &'static str = proto::program::operator::VALUE_FIRST_SWIGLU;
+    const NAME: &'static str = proto::module::operator::VALUE_FIRST_SWIGLU;
 
     type Descriptor = ValueFirstSwigluDescriptor;
     type Args<'a> = ValueFirstSwigluArgs;
@@ -508,7 +508,7 @@ pub struct SwigluArgs {
 pub struct Swiglu;
 
 impl Op for Swiglu {
-    const NAME: &'static str = proto::program::operator::SWIGLU;
+    const NAME: &'static str = proto::module::operator::SWIGLU;
 
     type Descriptor = SwigluDescriptor;
     type Args<'a> = SwigluArgs;
@@ -686,7 +686,7 @@ pub struct SiluArgs {
 pub struct Silu;
 
 impl Op for Silu {
-    const NAME: &'static str = proto::program::operator::SILU;
+    const NAME: &'static str = proto::module::operator::SILU;
 
     type Descriptor = SiluDescriptor;
     type Args<'a> = SiluArgs;

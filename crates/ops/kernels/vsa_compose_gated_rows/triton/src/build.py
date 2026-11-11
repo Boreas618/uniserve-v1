@@ -2,8 +2,8 @@
 
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
-dimensions give, and the compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+dimensions give, and the compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The row block, the tile, the head count, the width and the members' slots are baked in: the kernel
 selects a member's payload slot from the compiled slot table, so the table is part of the module. The
@@ -11,7 +11,7 @@ six strides and the member interval are launch words.
 """
 
 import vsa_compose_gated_rows as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The floating dtypes a row may have, in the descriptor's vocabulary.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}

@@ -1,4 +1,4 @@
-# The `fixture` policy package: the program layer's delivery test publishes and
+# The `fixture` policy package: the generation layer's delivery test publishes and
 # precompiles it, and the mechanism instantiates it like any policy (design
 # §4.4, §5.2, §5.3). It fills the scheduling policy with the arrival-order body.
 op = "scheduling"

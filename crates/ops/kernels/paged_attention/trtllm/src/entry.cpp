@@ -7,7 +7,7 @@
 // artifact's generated kernel table for the call's configuration, and
 // `fmhaKernels.cuh` loads the chosen cubin through `getCubin`. The module
 // publishes the cubins its descriptors can select beside itself, under
-// `cubins/`, and answers that call from its own directory: the Program Server
+// `cubins/`, and answers that call from its own directory: the Build Server
 // hands a resolved module to the process, so a path compiled in at build time
 // would point at the build host. The manifest records each cubin's sha256, which
 // is what the installer verified when the module arrived; this loader opens the

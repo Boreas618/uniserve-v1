@@ -4,51 +4,51 @@
 //! An epoch is one configuration executed: its main processes on every node,
 //! their communicators, graphs and the storage they create
 //! The leader's daemon keeps one [`EpochRecord`] per
-//! epoch: the [`proto::config::EngineConfig`] it was built from, the programs that fill its
-//! operators and its scheduling interface, the programs a probation keeps as
+//! epoch: the [`proto::config::EngineConfig`] it was built from, the modules that fill its
+//! operators and its scheduling interface, the modules a probation keeps as
 //! the previous generation, and its [`Status`].
 //!
 //! A configuration change is routed mechanically by comparing the records
-//! (§7.2): with the build config unchanged and only the filled programs
-//! different, the programs move inside the serving main process (§7.3); with
+//! (§7.2): with the build config unchanged and only the filled modules
+//! different, the modules move inside the serving main process (§7.3); with
 //! a different build config, a new epoch is built (§7.4); a change of the
 //! daemon's or the frontend's own options, or of their executables, is a
 //! hot restart (§7.5). Nothing about a change is declared by the change
 //! itself.
 //!
-//! The values are the daemon's own, not the wire's: [`Program`] is
-//! `crates/program-server`'s type, which the programs swarm defines, and the
-//! daemon records the wire form ([`crate::proto`]'s `process::Program`)
+//! The values are the daemon's own, not the wire's: [`PackageRevision`] is
+//! `crates/build-server`'s type, which the modules swarm defines, and the
+//! daemon records the wire form ([`crate::proto`]'s `process::PackageRevision`)
 //! until that crate lands.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-pub use proto::program::{PhaseKind, Program, ProgramSlot};
+pub use proto::module::{ModuleSlot, PackageRevision, PhaseKind};
 // The operators the configuration selects a backend for are named by the
-// program vocabulary (`proto::program::operator`), whose names each
-// operator's `Op::NAME` is: the daemon, the Program Server and the main
+// module vocabulary (`proto::module::operator`), whose names each
+// operator's `Op::NAME` is: the daemon, the Build Server and the main
 // process cannot disagree about a slot's name.
-use proto::program::operator;
+use proto::module::operator;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::options::ServerArgs;
 
-/// The key an epoch's programs are stored under: the operator, and the
-/// phase when the configuration fills it per phase (§5.2). Programs and
-/// slots are `proto::program`'s types, which the daemon, the main
-/// process and the Program Server all name programs with (§5.1).
-pub type KernelKey = ProgramSlot;
+/// The key an epoch's modules are stored under: the operator, and the
+/// phase when the configuration fills it per phase (§5.2). Modules and
+/// slots are `proto::module`'s types, which the daemon, the main
+/// process and the Build Server all name modules with (§5.1).
+pub type KernelKey = ModuleSlot;
 
-/// One program as the process interface's wire form: its parameters as the
+/// One package as the process interface's wire form: its parameters as the
 /// TOML text of each value, so a main process of another build reads each
 /// back as the value it was (§5.1).
-pub fn program_to_wire(program: &Program) -> proto::process::Program {
-    proto::process::Program {
-        backend: program.backend.clone(),
-        revision: program.revision,
-        arguments: program
+pub fn package_to_wire(package: &PackageRevision) -> proto::process::PackageRevision {
+    proto::process::PackageRevision {
+        backend: package.backend.clone(),
+        revision: package.revision,
+        arguments: package
             .arguments
             .iter()
             .map(|(key, value)| (key.clone(), value.to_string()))
@@ -56,9 +56,12 @@ pub fn program_to_wire(program: &Program) -> proto::process::Program {
     }
 }
 
-/// One operator's program as the `Precopy` command states it (§7.3 step 2).
-pub fn kernel_to_wire(slot: &KernelKey, program: &Program) -> proto::process::KernelProgram {
-    proto::process::KernelProgram {
+/// One operator's package as the `Precopy` command states it (§7.3 step 2).
+pub fn kernel_to_wire(
+    slot: &KernelKey,
+    package: &PackageRevision,
+) -> proto::process::KernelPackage {
+    proto::process::KernelPackage {
         op: slot.op.clone(),
         phase: slot.phase.map(|phase| {
             let phase = match phase {
@@ -69,15 +72,15 @@ pub fn kernel_to_wire(slot: &KernelKey, program: &Program) -> proto::process::Ke
             };
             phase as i32
         }),
-        program: Some(program_to_wire(program)),
+        package: Some(package_to_wire(package)),
     }
 }
 
 /// Where an epoch is in its life (§7.3, §7.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// Its main processes prepare the next generation of programs while the
-    /// serving epoch runs (the program layer's precopy), or they start as
+    /// Its main processes prepare the next generation of modules while the
+    /// serving epoch runs (the generation layer's precopy), or they start as
     /// standbys that map storage read-only and park (the epoch layer's
     /// precopy).
     Precopy,
@@ -95,21 +98,21 @@ pub enum Status {
 pub struct EpochRecord {
     /// What built the epoch.
     pub config: proto::config::EngineConfig,
-    /// The kernel program that fills each operator, or each phase of one;
+    /// The kernel package that fills each operator, or each phase of one;
     /// a phase of `None` covers every phase of its operator (§5.2).
-    pub kernels: BTreeMap<KernelKey, Program>,
-    /// The scheduling program.
-    pub policy: Program,
-    /// The programs a probation keeps as the previous generation: a revert
+    pub kernels: BTreeMap<KernelKey, PackageRevision>,
+    /// The scheduling policy package.
+    pub policy: PackageRevision,
+    /// The modules a probation keeps as the previous generation: a revert
     /// and a restart during the probation use them, and a commit empties
     /// them (§7.3).
-    pub previous_kernels: BTreeMap<KernelKey, Program>,
-    /// The previous scheduling program, kept until the next commit.
-    pub previous_policy: Option<Program>,
+    pub previous_kernels: BTreeMap<KernelKey, PackageRevision>,
+    /// The previous scheduling policy package, kept until the next commit.
+    pub previous_policy: Option<PackageRevision>,
     /// Where the epoch is in its life.
     pub status: Status,
     /// The MODEL generation: the number the epoch's own main processes gave
-    /// the programs they execute, read from their `Parked`, `Promoted` or
+    /// the modules they execute, read from their `Parked`, `Promoted` or
     /// launch report and never invented here (§2.5, §7.4). It is not a
     /// process's identity: that is [`ManagedProcess::generation`], the
     /// launch generation, allocated by [`Epochs::next_generation`].
@@ -151,7 +154,7 @@ pub struct ManagedProcess {
     /// which the daemon allocates ([`Epochs::next_generation`]) and the
     /// process names in its launch file and its reports. It is not the
     /// model generation ([`EpochRecord::generation`]), which the main
-    /// process numbers for the programs it executes; 0 until launched.
+    /// process numbers for the modules it executes; 0 until launched.
     pub generation: u64,
     /// Where it is.
     pub state: ProcessState,
@@ -316,10 +319,10 @@ impl Update {
 }
 
 /// One phase of an update, as the daemon's event log names it (§7.2, §7.3):
-/// the program layer's steps and the probation's end.
+/// the generation layer's steps and the probation's end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-    /// The new generation's programs are being prepared in the serving main
+    /// The new generation's modules are being prepared in the serving main
     /// processes (§7.3 step 2).
     Precopy,
     /// Every main process prepared them.
@@ -338,7 +341,7 @@ pub enum Phase {
     Reverted,
     /// The generation the probation kept is gone (§7.3 step 6).
     Purged,
-    /// A main process could not prepare the new generation's programs; the
+    /// A main process could not prepare the new generation's modules; the
     /// serving one is untouched (§7.3 step 2).
     PrecopyFailed,
     /// A scheduling policy failed and the main process reinstantiated the
@@ -364,15 +367,15 @@ impl Phase {
     }
 }
 
-/// A program-layer update in flight, as the daemon keeps it between the
+/// A generation update in flight, as the daemon keeps it between the
 /// request that started it and the one that ends its probation (§7.3 steps
 /// 2-6): the update, the epoch it moves, and every main process with the
 /// generation it prepared.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProgramUpdate {
+pub struct GenerationUpdate {
     /// The update, in its probation.
     pub update: Update,
-    /// The epoch whose programs it moves.
+    /// The epoch whose modules it moves.
     pub epoch: u64,
     /// The main processes that prepared a generation: the node they run on,
     /// the engine number their reports carry, and the generation each of
@@ -380,7 +383,7 @@ pub struct ProgramUpdate {
     pub prepared: Vec<PreparedProcess>,
 }
 
-/// One main process that prepared a generation of a program update.
+/// One main process that prepared a generation of a generation update.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedProcess {
     pub host: String,
@@ -403,10 +406,10 @@ pub struct Epochs {
     /// The last launch generation allocated per worker group and rank.
     generations: Mutex<BTreeMap<(String, u64), u64>>,
     /// The daemon's command channel to its main processes (`supervision::
-    /// ProcessCommands`), which the program layer commands through.
+    /// ProcessCommands`), which the generation layer commands through.
     commands: Mutex<Option<crate::supervision::ProcessCommands>>,
-    /// The program-layer update in flight: its probation's record (§7.3).
-    program: Mutex<Option<ProgramUpdate>>,
+    /// The generation update in flight: its probation's record (§7.3).
+    package: Mutex<Option<GenerationUpdate>>,
     /// The epoch the frontend was last told to serve (§7.4): a daemon that holds its frontend in
     /// this process follows it by moving its hold onto the target's engine.
     served: tokio::sync::watch::Sender<u64>,
@@ -486,52 +489,52 @@ impl Epochs {
     }
 
     /// Why `target` may not be applied without `force` (§7.2, §7.3 step 4):
-    /// the last update reverted from the same programs and the same build
+    /// the last update reverted from the same modules and the same build
     /// after a failure.
     ///
-    /// The comparison is the programs', revisions included, because those
-    /// are what a reverted program-layer update was: applying the same
+    /// The comparison is the modules', revisions included, because those
+    /// are what a reverted generation update was: applying the same
     /// configuration again selects the same revisions, so the refusal is
     /// about the change and not about how it was asked for. The build is what
-    /// a reverted epoch update was, whose programs most often did not change,
+    /// a reverted epoch update was, whose modules most often did not change,
     /// so another build is another change.
     pub fn unavailable(&self, target: &Epoch) -> Option<Failure> {
         let update = locked(&self.update);
         let update = update.as_ref()?;
         let failure = update.unavailable()?;
-        (update.target.programs == target.programs
+        (update.target.modules == target.modules
             && update.target.engine.build_hash() == target.engine.build_hash())
         .then(|| failure.clone())
     }
 
-    /// Records that epoch `epoch` now executes `programs`, keeping what it
+    /// Records that epoch `epoch` now executes `modules`, keeping what it
     /// executed before as the probation's previous generation (§7.3 steps
-    /// 2-4). The record's status stays what it was: the programs are in the
+    /// 2-4). The record's status stays what it was: the modules are in the
     /// main process, the probation is the update's.
-    pub fn precopied(&self, epoch: u64, programs: FilledPrograms) {
+    pub fn precopied(&self, epoch: u64, modules: ModuleSet) {
         let mut records = locked(&self.records);
         let Some(record) = records.get_mut(&epoch) else {
-            // The programs are already in the main process, so an epoch with no
+            // The modules are already in the main process, so an epoch with no
             // record serves them under a record that says nothing about them: the
             // probation would read as a serving epoch that kept no previous
             // generation, which is the same sentence an actual revert fault makes.
             tracing::error!(
                 epoch,
-                "a pre copy finished for an epoch with no record: the programs serve and the \
+                "a pre copy finished for an epoch with no record: the modules serve and the \
                  record does not name the generation they replaced"
             );
             return;
         };
-        record.previous_kernels = std::mem::replace(&mut record.kernels, programs.kernels);
-        record.previous_policy = Some(std::mem::replace(&mut record.policy, programs.policy));
-        // The new programs serve while the previous generation is kept as
+        record.previous_kernels = std::mem::replace(&mut record.kernels, modules.kernels);
+        record.previous_policy = Some(std::mem::replace(&mut record.policy, modules.policy));
+        // The new modules serve while the previous generation is kept as
         // the last resort (§7.3 step 4).
         if record.status == Status::Serving {
             record.status = Status::Probation;
         }
     }
 
-    /// Records that epoch `epoch`'s new programs are what serves and the
+    /// Records that epoch `epoch`'s new modules are what serves and the
     /// previous generation is no longer kept (§7.3 step 5).
     pub fn committed(&self, epoch: u64) {
         let mut records = locked(&self.records);
@@ -563,7 +566,7 @@ impl Epochs {
         };
         if record.previous_kernels.is_empty() && record.previous_policy.is_none() {
             // A revert with nothing kept is the state this record's reader reports
-            // as "the epoch on probation kept no previous kernel programs to
+            // as "the epoch on probation kept no previous kernel packages to
             // revert to"; it is the daemon's own inconsistency, never a no-op.
             tracing::error!(
                 epoch,
@@ -582,7 +585,7 @@ impl Epochs {
     }
 
     /// Records epoch `epoch` as serving the `deployment` this node installed
-    /// at startup: its build config and programs and the generation its main
+    /// at startup: its build config and modules and the generation its main
     /// processes numbered (§7.4). The epoch is recorded under the number its launch gave it,
     /// as a switch's target and an adopted epoch are numbered. The daemon
     /// records nothing it did not install, so this is called with what the
@@ -594,8 +597,8 @@ impl Epochs {
             epoch,
             EpochRecord {
                 config: deployment.engine.clone(),
-                kernels: deployment.programs.kernels.clone(),
-                policy: deployment.programs.policy.clone(),
+                kernels: deployment.modules.kernels.clone(),
+                policy: deployment.modules.policy.clone(),
                 previous_kernels: BTreeMap::new(),
                 previous_policy: None,
                 status: Status::Serving,
@@ -606,27 +609,27 @@ impl Epochs {
     }
 
     /// Gives the epochs the daemon's command channel to its main processes,
-    /// once, when the daemon starts (§2.3): the program layer commands
+    /// once, when the daemon starts (§2.3): the generation layer commands
     /// through it and reads its reports.
     pub fn supervise(&self, commands: crate::supervision::ProcessCommands) {
         *locked(&self.commands) = Some(commands);
     }
 
-    /// Hands the serving epoch's programs to a main process that joined it
+    /// Hands the serving epoch's modules to a main process that joined it
     /// after the epoch was installed — the process a relaunch starts — and
     /// switches it to them (§2.5, §7.5).
     ///
-    /// A main process starts with no programs: it resolves no kernel itself,
+    /// A main process starts with no modules: it resolves no kernel itself,
     /// and its first request fails every operator it was never given. The
-    /// first start installs them through the same switch (`Leader::install_programs`);
-    /// a relaunched process has to be given the very programs its predecessor
+    /// first start installs them through the same switch (`Leader::install_modules`);
+    /// a relaunched process has to be given the very modules its predecessor
     /// ran, because the epoch they belong to is already serving and nothing
     /// else sends them.
     ///
     /// # Errors
     ///
     /// Fails when no epoch serves, when the daemon has no channel to its main
-    /// processes, and when a process refuses the programs or does not answer.
+    /// processes, and when a process refuses the modules or does not answer.
     pub fn hand_to(
         &self,
         processes: Vec<crate::engine::control::EpochProcess>,
@@ -642,27 +645,27 @@ impl Epochs {
             reason: "the daemon executes no epoch".to_owned(),
             device: None,
         })?;
-        let programs = FilledPrograms {
+        let modules = ModuleSet {
             kernels: record.kernels.clone(),
             policy: record.policy.clone(),
         };
-        self.hand_programs(processes, config, &programs, commands)
+        self.hand_modules(processes, config, &modules, commands)
     }
 
-    /// Gives an epoch switch's target `programs`, as [`Self::hand_to`] gives a joining process the
+    /// Gives an epoch switch's target `modules`, as [`Self::hand_to`] gives a joining process the
     /// serving epoch's: the target parks before any `Precopy` names a generation, and a promotion
     /// refuses a process that holds none.
     ///
     /// # Errors
     ///
     /// Fails when the daemon has no channel to its main processes, and when the process refuses
-    /// the programs or does not answer.
+    /// the modules or does not answer.
     pub fn hand_target(
         &self,
         host: &str,
         engine: u64,
         config: &crate::options::ServerArgs,
-        programs: &FilledPrograms,
+        modules: &ModuleSet,
     ) -> Result<(), Failure> {
         let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
             kind: "no_command_channel".to_owned(),
@@ -673,27 +676,27 @@ impl Epochs {
             host: host.to_owned(),
             engine,
         };
-        self.hand_programs(vec![process], config, programs, commands)
+        self.hand_modules(vec![process], config, modules, commands)
     }
 
-    /// Switches `processes`, every main process of one engine, to `programs` together: the ranks
+    /// Switches `processes`, every main process of one engine, to `modules` together: the ranks
     /// of a worker group that spans hosts warm up their collectives together.
-    fn hand_programs(
+    fn hand_modules(
         &self,
         processes: Vec<crate::engine::control::EpochProcess>,
         config: &crate::options::ServerArgs,
-        programs: &FilledPrograms,
+        modules: &ModuleSet,
         commands: crate::supervision::ProcessCommands,
     ) -> Result<(), Failure> {
-        let record = programs.clone();
+        let record = modules.clone();
         let deployment =
-            Epoch::with_programs(config.clone(), programs.clone()).map_err(|error| Failure {
+            Epoch::with_modules(config.clone(), modules.clone()).map_err(|error| Failure {
                 kind: "invalid_config".to_owned(),
                 reason: format!("{error:#}"),
                 device: None,
             })?;
         let engines: Vec<u64> = processes.iter().map(|process| process.engine).collect();
-        let mut switch = crate::engine::control::ProgramSwitch::new(
+        let mut switch = crate::engine::control::GenerationSwitch::new(
             &commands,
             processes,
             Update::new(0, deployment),
@@ -705,31 +708,31 @@ impl Epochs {
             engines = ?engines,
             kernels = record.kernels.len(),
             policy = %record.policy.backend,
-            "the joining main process took the epoch's programs"
+            "the joining main process took the epoch's modules"
         );
         Ok(())
     }
 
-    /// The program-layer update in flight, if there is one.
-    pub fn program_update(&self) -> Option<ProgramUpdate> {
-        locked(&self.program).clone()
+    /// The generation update in flight, if there is one.
+    pub fn generation_update(&self) -> Option<GenerationUpdate> {
+        locked(&self.package).clone()
     }
 
-    /// Whether a program-layer update is on probation: the main processes
+    /// Whether a generation update is on probation: the main processes
     /// execute its generation, and the epoch keeps the generation that served
     /// before it as the last resort until it is committed or reverted (§7.3
     /// step 4).
-    pub fn program_in_flight(&self) -> bool {
-        self.program_update()
-            .is_some_and(|program| program.update.state == UpdateState::Probation)
+    pub fn generation_in_flight(&self) -> bool {
+        self.generation_update()
+            .is_some_and(|package| package.update.state == UpdateState::Probation)
     }
 
-    /// Applies `update`, a program-layer change a routing decision prepared,
-    /// to the main processes `processes`: their programs are prepared
+    /// Applies `update`, a generation change a routing decision prepared,
+    /// to the main processes `processes`: their modules are prepared
     /// (`Precopy`), they switch to the generation each numbered, and the
-    /// epoch's record takes the new programs as the probation's (§7.3 steps
-    /// 2-4). The probation lasts until [`Self::commit_programs`] or
-    /// [`Self::revert_programs`].
+    /// epoch's record takes the new modules as the probation's (§7.3 steps
+    /// 2-4). The probation lasts until [`Self::commit_generation`] or
+    /// [`Self::revert_generation`].
     ///
     /// Refuses an update a revert marked unavailable unless `force` asks for
     /// it anyway (§7.2).
@@ -740,7 +743,7 @@ impl Epochs {
     /// refused precopy changes nothing, and a fault, a stalled job,
     /// non-finite logits or a policy revert fails the update with its own
     /// account.
-    pub fn apply_programs(
+    pub fn apply_generation(
         &self,
         update: Update,
         processes: Vec<crate::engine::control::EpochProcess>,
@@ -750,10 +753,10 @@ impl Epochs {
         // reverted as a whole. A second change applied now would replace the
         // epoch's last resort with the generation the first update has not
         // proven yet, so it waits for the commit or the revert.
-        if self.program_in_flight() {
+        if self.generation_in_flight() {
             return Err(Failure {
                 kind: "in_flight".to_owned(),
-                reason: "a program-layer update is on probation: it is committed or reverted \
+                reason: "a generation update is on probation: it is committed or reverted \
                          before another change is applied"
                     .to_owned(),
                 device: None,
@@ -781,14 +784,14 @@ impl Epochs {
                 device: failure.device,
             });
         }
-        let programs = update.target.programs.clone();
+        let modules = update.target.modules.clone();
         let mut switch =
-            crate::engine::control::ProgramSwitch::new(&commands, processes, update.clone());
-        switch.precopy(&programs.kernels, &programs.policy)?;
+            crate::engine::control::GenerationSwitch::new(&commands, processes, update.clone());
+        switch.precopy(&modules.kernels, &modules.policy)?;
         switch.switchover()?;
         // The generation the main processes execute is the epoch's now; the
         // probation keeps what it executed before as its last resort.
-        self.precopied(epoch, programs);
+        self.precopied(epoch, modules);
         let prepared = switch
             .processes()
             .iter()
@@ -801,7 +804,7 @@ impl Epochs {
             .collect();
         let mut update = switch.update().clone();
         update.state = UpdateState::Probation;
-        *locked(&self.program) = Some(ProgramUpdate {
+        *locked(&self.package) = Some(GenerationUpdate {
             update: update.clone(),
             epoch,
             prepared,
@@ -810,27 +813,27 @@ impl Epochs {
         Ok(())
     }
 
-    /// Ends the program-layer probation in favour of the generation that
+    /// Ends the generation probation in favour of the generation that
     /// executes: every main process commits it and purges what it no longer
     /// runs (§7.3 steps 5-6), and the epoch's record keeps no previous
     /// generation.
     ///
-    /// Answers `Ok(false)` when the update in flight is not a program-layer
+    /// Answers `Ok(false)` when the update in flight is not a generation
     /// one, so a caller that also has epoch-layer updates asks and falls
     /// through.
     ///
     /// # Errors
     ///
     /// Fails with the first failure of the commit, leaving the probation
-    /// standing for [`Self::revert_programs`].
-    pub fn commit_programs(&self) -> anyhow::Result<bool> {
-        let Some(program) = self.program_update() else {
+    /// standing for [`Self::revert_generation`].
+    pub fn commit_generation(&self) -> anyhow::Result<bool> {
+        let Some(package) = self.generation_update() else {
             return Ok(false);
         };
         let commands = locked(&self.commands)
             .clone()
             .ok_or_else(|| anyhow::anyhow!("the daemon has no channel to its main processes"))?;
-        let processes: Vec<_> = program
+        let processes: Vec<_> = package
             .prepared
             .iter()
             .map(|prepared| crate::engine::control::EpochProcess {
@@ -838,45 +841,45 @@ impl Epochs {
                 engine: prepared.engine,
             })
             .collect();
-        let generations: Vec<u64> = program
+        let generations: Vec<u64> = package
             .prepared
             .iter()
             .map(|prepared| prepared.generation)
             .collect();
-        let mut switch = crate::engine::control::ProgramSwitch::resuming(
+        let mut switch = crate::engine::control::GenerationSwitch::resuming(
             &commands,
             processes,
-            program.update.clone(),
+            package.update.clone(),
             generations,
         );
         if let Err(failure) = switch.commit().and_then(|()| switch.purge()) {
-            anyhow::bail!("committing the program update: {}", failure.reason);
+            anyhow::bail!("committing the generation update: {}", failure.reason);
         }
         // The epoch keeps serving: what the commit purges is the previous
-        // *generation* of programs in every main process, not the epoch.
-        self.committed(program.epoch);
+        // *generation* of modules in every main process, not the epoch.
+        self.committed(package.epoch);
         *locked(&self.update) = Some(switch.update().clone());
-        *locked(&self.program) = None;
+        *locked(&self.package) = None;
         Ok(true)
     }
 
     /// Returns every main process to the generation it served before the
-    /// program-layer update, with `reason` (§7.3 step 5), so the update is
+    /// generation update, with `reason` (§7.3 step 5), so the update is
     /// unavailable with its first failure until it is applied with `force`
     /// (§7.2).
     ///
-    /// Answers `Ok(false)` when the update in flight is not a program-layer
+    /// Answers `Ok(false)` when the update in flight is not a generation
     /// one.
     ///
     /// # Errors
     ///
     /// Fails when a main process does not answer the revert. The epochs'
     /// records are the previous generation's either way.
-    pub fn revert_programs(&self, reason: &str) -> anyhow::Result<bool> {
-        self.revert_programs_because(reason, None)
+    pub fn revert_generation(&self, reason: &str) -> anyhow::Result<bool> {
+        self.revert_generation_because(reason, None)
     }
 
-    /// Reverts the program-layer update on probation because a main process
+    /// Reverts the generation update on probation because a main process
     /// failed, and records that failure as the update's first one (§7.3
     /// step 4): a main process that exits, a worker it can no longer use, a
     /// stuck job, a non-finite logit or a policy error all end the probation in
@@ -886,32 +889,32 @@ impl Epochs {
     /// Answers whether an update was on probation to revert. A process that
     /// cannot be told is logged, not returned: what serves is the previous
     /// generation either way, and the report moves nothing.
-    pub fn program_failure(&self, failure: Failure) -> bool {
-        if !self.program_in_flight() {
+    pub fn generation_failure(&self, failure: Failure) -> bool {
+        if !self.generation_in_flight() {
             return false;
         }
         let reason = format!("{}: {}", failure.kind, failure.reason);
-        if let Err(error) = self.revert_programs_because(&reason, Some(failure)) {
-            tracing::warn!(%error, "reverting the program update after a failure");
+        if let Err(error) = self.revert_generation_because(&reason, Some(failure)) {
+            tracing::warn!(%error, "reverting the generation update after a failure");
         }
         true
     }
 
-    /// [`Self::revert_programs`], with the failure that caused an automatic
+    /// [`Self::revert_generation`], with the failure that caused an automatic
     /// revert recorded as the update's first one when the processes did not
     /// produce one themselves.
-    fn revert_programs_because(
+    fn revert_generation_because(
         &self,
         reason: &str,
         cause: Option<Failure>,
     ) -> anyhow::Result<bool> {
-        let Some(program) = self.program_update() else {
+        let Some(package) = self.generation_update() else {
             return Ok(false);
         };
         let commands = locked(&self.commands)
             .clone()
             .ok_or_else(|| anyhow::anyhow!("the daemon has no channel to its main processes"))?;
-        let processes: Vec<_> = program
+        let processes: Vec<_> = package
             .prepared
             .iter()
             .map(|prepared| crate::engine::control::EpochProcess {
@@ -919,19 +922,19 @@ impl Epochs {
                 engine: prepared.engine,
             })
             .collect();
-        let generations: Vec<u64> = program
+        let generations: Vec<u64> = package
             .prepared
             .iter()
             .map(|prepared| prepared.generation)
             .collect();
-        let mut switch = crate::engine::control::ProgramSwitch::resuming(
+        let mut switch = crate::engine::control::GenerationSwitch::resuming(
             &commands,
             processes,
-            program.update.clone(),
+            package.update.clone(),
             generations,
         );
         let outcome = switch.revert(reason);
-        self.reverted(program.epoch);
+        self.reverted(package.epoch);
         let mut update = switch.update().clone();
         // The failure that made the revert automatic is the update's first one
         // unless a process reported one of its own while it was being told.
@@ -939,9 +942,9 @@ impl Epochs {
             update.fail(cause);
         }
         *locked(&self.update) = Some(update);
-        *locked(&self.program) = None;
+        *locked(&self.package) = None;
         if let Err(failure) = outcome {
-            anyhow::bail!("reverting the program update: {}", failure.reason);
+            anyhow::bail!("reverting the generation update: {}", failure.reason);
         }
         Ok(true)
     }
@@ -992,7 +995,7 @@ impl Epochs {
 
     /// The epochs and the process table as `GET /admin/config` reports
     /// them: one array entry per epoch, ascending by number, with the
-    /// programs in the form the daemon records, and one entry per process
+    /// modules in the form the daemon records, and one entry per process
     /// the daemon manages.
     pub fn report(&self) -> Value {
         let epochs = locked(&self.records)
@@ -1011,29 +1014,29 @@ impl Epochs {
     }
 }
 
-/// One epoch record as JSON: its number, the build config, the programs by
+/// One epoch record as JSON: its number, the build config, the modules by
 /// operator and phase, the previous generation, and the status, as the
 /// design names them.
 fn record_report(epoch: u64, record: &EpochRecord) -> Value {
     let kernels = record
         .kernels
         .iter()
-        .map(|(slot, program)| {
+        .map(|(slot, package)| {
             serde_json::json!({
                 "op": slot.op,
                 "phase": slot.phase.map(PhaseKind::as_str),
-                "program": program_report(program),
+                "package": package_report(package),
             })
         })
         .collect::<Vec<_>>();
     let previous = record
         .previous_kernels
         .iter()
-        .map(|(slot, program)| {
+        .map(|(slot, package)| {
             serde_json::json!({
                 "op": slot.op,
                 "phase": slot.phase.map(PhaseKind::as_str),
-                "program": program_report(program),
+                "package": package_report(package),
             })
         })
         .collect::<Vec<_>>();
@@ -1041,9 +1044,9 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
         "epoch": epoch,
         "engine_config": serde_json::to_value(&record.config).unwrap_or(Value::Null),
         "kernels": kernels,
-        "policy": program_report(&record.policy),
+        "policy": package_report(&record.policy),
         "previous_kernels": previous,
-        "previous_policy": record.previous_policy.as_ref().map(program_report),
+        "previous_policy": record.previous_policy.as_ref().map(package_report),
         "generation": record.generation,
         "status": match record.status {
             Status::Precopy => "precopy",
@@ -1054,12 +1057,12 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
     })
 }
 
-/// One program as JSON: its backend, revision and parameters.
-fn program_report(program: &Program) -> Value {
+/// One package as JSON: its backend, revision and parameters.
+fn package_report(package: &PackageRevision) -> Value {
     serde_json::json!({
-        "backend": program.backend,
-        "revision": program.revision,
-        "arguments": program.arguments,
+        "backend": package.backend,
+        "revision": package.revision,
+        "arguments": package.arguments,
     })
 }
 
@@ -1088,53 +1091,53 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The operator names the epoch record keys its kernel programs by (§5.1,
+/// The operator names the epoch record keys its kernel packages by (§5.1,
 /// §5.2), of the operators whose backend a configuration selects. They must
 /// equal `crates/ops`'s `Op::NAME` of the same operator, which the model and
-/// sched swarms write, so a mismatch is a wrong Program Server lookup and
+/// sched swarms write, so a mismatch is a wrong Build Server lookup and
 /// shows up at prepare; they are stated once here for that reason.
 ///
 /// The complete slot set is `crates/ops`'s operator names. The rest are
-/// filled by the epoch's programs like any other slot and need no entry
+/// filled by the epoch's modules like any other slot and need no entry
 /// here: their backend is not a configuration field, so this module names
 /// only the operators the configuration selects a backend for. The
-/// scheduling interface is not an operator at all: its program is the epoch
+/// scheduling interface is not an operator at all: its package is the epoch
 /// record's `policy` field.
-/// The programs a configuration fills, by operator and phase, and the
+/// The modules a configuration fills, by operator and phase, and the
 /// scheduling interface's (§5.1, §5.2).
 ///
 /// The backends and parameters come from the configuration; the revisions
 /// come from `prepare`, which selects each package's latest revision at the
-/// upstream Program Server (§5.1). A program's `revision` is zero until it
+/// upstream Build Server (§5.1). A package's `revision` is zero until it
 /// was prepared. An operator whose backend the configuration does not state,
 /// or leaves at `auto`, is absent: the deployment names nothing for it, and
-/// the Program Server selects its package for each of its descriptor keys
+/// the Build Server selects its package for each of its descriptor keys
 /// among the packages that cover them, by manifest priority (§6.3).
 #[derive(Debug, Clone, PartialEq)]
-pub struct FilledPrograms {
-    /// The kernel program that fills each operator, or each phase of one.
-    pub kernels: BTreeMap<KernelKey, Program>,
-    /// The scheduling program.
-    pub policy: Program,
+pub struct ModuleSet {
+    /// The kernel package that fills each operator, or each phase of one.
+    pub kernels: BTreeMap<KernelKey, PackageRevision>,
+    /// The scheduling policy package.
+    pub policy: PackageRevision,
 }
 
-impl FilledPrograms {
-    /// The programs `config` fills, without the revisions `prepare` selects.
+impl ModuleSet {
+    /// The modules `config` fills, without the revisions `prepare` selects.
     pub fn of(config: &ServerArgs) -> Self {
         let mut kernels = BTreeMap::new();
-        let attention = attention_programs(config);
+        let attention = attention_packages(config);
         kernels.extend(attention);
         // The exchange slot is filled only when the deployment spreads its
         // experts over ranks. At one rank the model's MoE block takes its local
         // arm and launches no exchange at all (`nn::Moe::forward` routes
         // through `forward_expert_parallel` only when an expert lives on
-        // another rank), so a slot filled here would pin a program no call
-        // reaches — and, worse, the Program Server would refuse the epoch for a
+        // another rank), so a slot filled here would pin a package no call
+        // reaches — and, worse, the Build Server would refuse the epoch for a
         // package nothing runs.
         if config.moe_config.expert_parallel {
             kernels.insert(
                 KernelKey::all(operator::EXPERT_EXCHANGE),
-                Program {
+                PackageRevision {
                     backend: word(&config.moe_config.exchange),
                     revision: 0,
                     arguments: toml::Table::new(),
@@ -1147,11 +1150,11 @@ impl FilledPrograms {
             .filter(|backend| *backend != AUTO_BACKEND)
         {
             // The grouped expert GEMM is two operators, gather and route,
-            // and one program backend fills both (§9).
+            // and one package backend fills both (§9).
             for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
                 kernels.insert(
                     KernelKey::all(operator),
-                    Program {
+                    PackageRevision {
                         backend: backend.clone(),
                         revision: 0,
                         arguments: toml::Table::new(),
@@ -1161,7 +1164,7 @@ impl FilledPrograms {
         }
         Self {
             kernels,
-            policy: Program {
+            policy: PackageRevision {
                 backend: word(&config.scheduler_config.policy),
                 revision: 0,
                 arguments: policy_arguments(config),
@@ -1171,14 +1174,14 @@ impl FilledPrograms {
 }
 
 /// The backend name `auto`: a backend option the deployment leaves to the
-/// Program Server's selection, which names no slot of its own.
+/// Build Server's selection, which names no slot of its own.
 const AUTO_BACKEND: &str = "auto";
 
-/// The attention operator's programs: one entry for every phase when the
+/// The attention operator's modules: one entry for every phase when the
 /// per-phase backends agree, or one entry per phase when they differ (§5.2).
-/// A phase left at `auto` names no program: the Program Server selects its
+/// A phase left at `auto` names no package: the Build Server selects its
 /// keys' packages.
-fn attention_programs(config: &ServerArgs) -> Vec<(KernelKey, Program)> {
+fn attention_packages(config: &ServerArgs) -> Vec<(KernelKey, PackageRevision)> {
     let prefill = config
         .prefill_attention_backend
         .clone()
@@ -1187,7 +1190,7 @@ fn attention_programs(config: &ServerArgs) -> Vec<(KernelKey, Program)> {
         .decode_attention_backend
         .clone()
         .unwrap_or_else(|| config.attention_backend.clone());
-    let program = |backend: String| Program {
+    let package = |backend: String| PackageRevision {
         backend,
         revision: 0,
         arguments: toml_arguments(&config.flashinfer_config),
@@ -1196,7 +1199,7 @@ fn attention_programs(config: &ServerArgs) -> Vec<(KernelKey, Program)> {
         if prefill == AUTO_BACKEND {
             return Vec::new();
         }
-        return vec![(KernelKey::all(operator::PAGED_ATTENTION), program(prefill))];
+        return vec![(KernelKey::all(operator::PAGED_ATTENTION), package(prefill))];
     }
     [(PhaseKind::Prefill, prefill), (PhaseKind::Decode, decode)]
         .into_iter()
@@ -1204,13 +1207,13 @@ fn attention_programs(config: &ServerArgs) -> Vec<(KernelKey, Program)> {
         .map(|(phase, backend)| {
             (
                 KernelKey::phase(operator::PAGED_ATTENTION, phase),
-                program(backend),
+                package(backend),
             )
         })
         .collect()
 }
 
-/// The scheduling program's parameters: the values §7.7 assigns to the
+/// The scheduling policy package's parameters: the values §7.7 assigns to the
 /// scheduling policy, which decides with them inside the build config's
 /// bounds (§4.4).
 fn policy_arguments(config: &ServerArgs) -> toml::Table {
@@ -1279,7 +1282,7 @@ fn policy_arguments(config: &ServerArgs) -> toml::Table {
     toml_arguments(&arguments)
 }
 
-/// `value`'s fields as the TOML table a program's arguments carry (§5.1).
+/// `value`'s fields as the TOML table a package's arguments carry (§5.1).
 /// Values the field's serialization leaves out, such as an unset option, are
 /// absent.
 fn toml_arguments<T: Serialize>(value: &T) -> toml::Table {
@@ -1290,7 +1293,7 @@ fn toml_arguments<T: Serialize>(value: &T) -> toml::Table {
 }
 
 /// The word a vocabulary value is named by, as the configuration spells it
-/// (`fcfs`, `deepep`): its serialized form, which is also the program
+/// (`fcfs`, `deepep`): its serialized form, which is also the package
 /// backend's name (§5.1).
 fn word<T: Serialize>(value: &T) -> String {
     match toml::Value::try_from(value) {
@@ -1305,9 +1308,9 @@ fn word<T: Serialize>(value: &T) -> String {
 pub enum Layer {
     /// Nothing changed: the update does nothing.
     None,
-    /// Only the filled programs changed: they move inside the serving main
+    /// Only the filled modules changed: they move inside the serving main
     /// process (§7.3).
-    Program,
+    Generation,
     /// The build config changed: a new epoch is built (§7.4).
     Epoch,
     /// The daemon's or the frontend's own options changed, or their
@@ -1317,7 +1320,7 @@ pub enum Layer {
 }
 
 /// A deployment as the daemon routes a change between: its configuration,
-/// the build config it builds a main process from, and the programs it
+/// the build config it builds a main process from, and the modules it
 /// fills.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Epoch {
@@ -1325,14 +1328,14 @@ pub struct Epoch {
     pub config: ServerArgs,
     /// What it builds the epoch's engines from, resolved once from `config`.
     pub engine: proto::config::EngineConfig,
-    /// The filled programs; the deployment a change is compared against
+    /// The filled modules; the deployment a change is compared against
     /// carries the revisions `prepare` selected, and the target's are
     /// prepared before the comparison.
-    pub programs: FilledPrograms,
+    pub modules: ModuleSet,
 }
 
 impl Epoch {
-    /// The deployment `config` describes, with the programs it fills and
+    /// The deployment `config` describes, with the modules it fills and
     /// without the revisions `prepare` selects.
     ///
     /// # Errors
@@ -1340,36 +1343,36 @@ impl Epoch {
     /// Fails when the configuration does not resolve into an engine configuration
     /// ([`ServerArgs::engine_config`]): its deployment file does not read or place.
     pub fn of(config: ServerArgs) -> anyhow::Result<Self> {
-        let programs = FilledPrograms::of(&config);
-        Self::with_programs(config, programs)
+        let modules = ModuleSet::of(&config);
+        Self::with_modules(config, modules)
     }
 
-    /// The deployment `config` describes, with the programs `prepare` selected for it.
+    /// The deployment `config` describes, with the modules `prepare` selected for it.
     ///
     /// # Errors
     ///
     /// Fails as [`Self::of`] does.
-    pub fn with_programs(config: ServerArgs, programs: FilledPrograms) -> anyhow::Result<Self> {
+    pub fn with_modules(config: ServerArgs, modules: ModuleSet) -> anyhow::Result<Self> {
         Ok(Self {
             engine: config.engine_config()?,
             config,
-            programs,
+            modules,
         })
     }
 }
 
 /// Which layer `next` moves `previous` on (§7.2), mechanically: the
 /// host layer when the options the daemon or the frontend read alone
-/// differ, the epoch layer when the build config differs, the program layer
-/// when only the filled programs differ, and nothing otherwise. Nothing
+/// differ, the epoch layer when the build config differs, the generation layer
+/// when only the filled modules differ, and nothing otherwise. Nothing
 /// about a change is declared by the change itself.
 pub fn layer(previous: &Epoch, next: &Epoch) -> Layer {
     if host_layer_differ(&previous.config, &next.config) {
         Layer::Host
     } else if previous.engine.build_hash() != next.engine.build_hash() {
         Layer::Epoch
-    } else if previous.programs != next.programs {
-        Layer::Program
+    } else if previous.modules != next.modules {
+        Layer::Generation
     } else {
         Layer::None
     }
@@ -1394,9 +1397,9 @@ mod tests {
     use crate::engine::stand_in::Seen;
     use crate::options::SchedulerConfig;
 
-    /// A program of backend `backend` at revision 1 with no parameters.
-    fn program(backend: &str) -> Program {
-        Program {
+    /// A package of backend `backend` at revision 1 with no parameters.
+    fn package(backend: &str) -> PackageRevision {
+        PackageRevision {
             backend: backend.to_owned(),
             revision: 1,
             arguments: toml::Table::new(),
@@ -1408,8 +1411,8 @@ mod tests {
         let config = ServerArgs::default();
         EpochRecord {
             config: config.engine_config().expect("the configuration resolves"),
-            kernels: BTreeMap::from([(KernelKey::all("rms_norm"), program("triton"))]),
-            policy: program("fcfs"),
+            kernels: BTreeMap::from([(KernelKey::all("rms_norm"), package("triton"))]),
+            policy: package("fcfs"),
             previous_kernels: BTreeMap::new(),
             previous_policy: None,
             status: Status::Serving,
@@ -1418,12 +1421,12 @@ mod tests {
     }
 
     /// A main process that joins the serving epoch after it was installed — the
-    /// process a relaunch starts — is handed the epoch's own programs and
+    /// process a relaunch starts — is handed the epoch's own modules and
     /// switched to them. A process that starts with none waits for a
-    /// program-layer command nothing sends, and answers 503 to every request,
+    /// generation command nothing sends, and answers 503 to every request,
     /// so the epoch layer is what gives it them (§2.5, §7.5).
     #[test]
-    fn a_joining_main_process_takes_the_epochs_own_programs() {
+    fn a_joining_main_process_takes_the_epochs_own_modules() {
         use crate::engine::stand_in::{Answer, Seen, main_processes_recording};
 
         let (commands, seen, carried) = main_processes_recording(vec![(9, Answer::Serves(12))]);
@@ -1440,7 +1443,7 @@ mod tests {
                 }],
                 &config,
             )
-            .expect("the epoch's programs reached the joining process");
+            .expect("the epoch's modules reached the joining process");
         assert_eq!(
             *seen.lock().unwrap(),
             vec![
@@ -1448,7 +1451,7 @@ mod tests {
                 (9, Seen::Switchover(12)),
                 (9, Seen::Commit)
             ],
-            "the joining process prepares, switches to and commits the epoch's programs"
+            "the joining process prepares, switches to and commits the epoch's modules"
         );
         let carried = carried.lock().unwrap();
         assert_eq!(carried.len(), 1);
@@ -1459,8 +1462,8 @@ mod tests {
         assert_eq!(
             carried[0].1.revisions,
             vec![("rms_norm".to_owned(), 1)],
-            "the revision the epoch installed, not the zero a program carries before a \
-             Program Server selects one: a name at revision zero is one the store never built"
+            "the revision the epoch installed, not the zero a package carries before a \
+             Build Server selects one: a name at revision zero is one the store never built"
         );
         assert_eq!(carried[0].1.policy, "fcfs");
 
@@ -1482,7 +1485,7 @@ mod tests {
     }
 
     /// Another checkpoint's weights are other keys, so only a new epoch reads them: a change of
-    /// the model's files that fell to the program layer would answer an update that moved nothing.
+    /// the model's files that fell to the generation layer would answer an update that moved nothing.
     #[test]
     fn a_change_of_the_models_files_is_an_epoch_change() {
         let serving = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
@@ -1499,12 +1502,12 @@ mod tests {
         );
     }
 
-    /// A program-layer update in flight is the epoch's probation: the record
-    /// names the programs the main processes took, the previous generation is
+    /// A generation update in flight is the epoch's probation: the record
+    /// names the modules the main processes took, the previous generation is
     /// kept, and a commit ends the probation without the epoch stopping
     /// (§7.3 steps 4-6).
     #[test]
-    fn a_program_update_serves_from_the_generation_it_switched_to_until_it_is_committed() {
+    fn a_package_update_serves_from_the_generation_it_switched_to_until_it_is_committed() {
         use crate::engine::stand_in::{Answer, Seen, main_processes, process};
 
         let (commands, seen) =
@@ -1515,41 +1518,41 @@ mod tests {
         epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
-        // A change that moves only the programs: one operator's backend.
+        // A change that moves only the modules: one operator's backend.
         let mut target = serving.clone();
-        let mut programs = FilledPrograms::of(&config);
-        programs
+        let mut modules = ModuleSet::of(&config);
+        modules
             .policy
             .arguments
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        target.programs = programs.clone();
+        target.modules = modules.clone();
         let update = Update::new(1, target);
         epochs
-            .apply_programs(
+            .apply_generation(
                 update,
                 vec![process("rank-0", 7), process("rank-1", 8)],
                 false,
             )
-            .expect("both main processes took the programs");
+            .expect("both main processes took the modules");
 
         // The epoch is on probation from the generation the update switched
         // to, and the record names what executes.
-        let program = epochs.program_update().expect("the update is in flight");
-        assert_eq!(program.update.number, 1);
-        assert_eq!(program.update.state, UpdateState::Probation);
-        assert_eq!(program.epoch, 3);
-        let prepared: Vec<u64> = program.prepared.iter().map(|p| p.generation).collect();
+        let package = epochs.generation_update().expect("the update is in flight");
+        assert_eq!(package.update.number, 1);
+        assert_eq!(package.update.state, UpdateState::Probation);
+        assert_eq!(package.epoch, 3);
+        let prepared: Vec<u64> = package.prepared.iter().map(|p| p.generation).collect();
         assert_eq!(prepared, vec![11, 12]);
         let serving_epoch = epochs.get(3).expect("the epoch is recorded");
         assert_eq!(serving_epoch.status, Status::Probation);
-        assert_eq!(serving_epoch.policy, programs.policy);
+        assert_eq!(serving_epoch.policy, modules.policy);
         assert!(serving_epoch.previous_policy.is_some());
 
         assert!(
             epochs
-                .commit_programs()
+                .commit_generation()
                 .expect("both main processes committed"),
-            "a program-layer update is committed here"
+            "a generation update is committed here"
         );
         let serving_epoch = epochs.get(3).expect("the epoch is recorded");
         assert_eq!(serving_epoch.status, Status::Serving);
@@ -1558,7 +1561,7 @@ mod tests {
             serving_epoch.previous_kernels.is_empty(),
             "a commit keeps no previous generation"
         );
-        assert!(epochs.program_update().is_none());
+        assert!(epochs.generation_update().is_none());
 
         // Each process was commanded in the protocol's order, and the
         // generation each switched to is the one it numbered itself.
@@ -1583,7 +1586,7 @@ mod tests {
     /// failure that caused it until it is applied with `force` (§7.2, §7.3
     /// step 4).
     #[test]
-    fn a_main_process_failure_during_probation_reverts_the_program_update() {
+    fn a_main_process_failure_during_probation_reverts_the_package_update() {
         use crate::engine::stand_in::{Answer, Seen, main_processes, process};
 
         let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
@@ -1594,20 +1597,20 @@ mod tests {
         epochs.supervise(commands);
 
         let mut target = serving.clone();
-        let mut programs = FilledPrograms::of(&config);
-        programs
+        let mut modules = ModuleSet::of(&config);
+        modules
             .policy
             .arguments
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        target.programs = programs.clone();
+        target.modules = modules.clone();
         epochs
-            .apply_programs(
+            .apply_generation(
                 Update::new(1, target.clone()),
                 vec![process("rank-0", 7)],
                 false,
             )
             .expect("the update switches over");
-        assert!(epochs.program_in_flight());
+        assert!(epochs.generation_in_flight());
 
         let failure = Failure {
             kind: "illegal_address".to_owned(),
@@ -1615,7 +1618,7 @@ mod tests {
             device: Some(0),
         };
         assert!(
-            epochs.program_failure(failure.clone()),
+            epochs.generation_failure(failure.clone()),
             "a failure during probation reverts the update"
         );
 
@@ -1623,9 +1626,9 @@ mod tests {
         // update is unavailable for the failure that caused the revert.
         let record = epochs.get(3).expect("the epoch is recorded");
         assert_eq!(record.status, Status::Serving);
-        assert_eq!(record.policy, serving.programs.policy);
+        assert_eq!(record.policy, serving.modules.policy);
         assert!(record.previous_policy.is_none());
-        assert!(epochs.program_update().is_none());
+        assert!(epochs.generation_update().is_none());
         assert_eq!(
             epochs
                 .update()
@@ -1635,7 +1638,7 @@ mod tests {
         );
         assert_eq!(epochs.unavailable(&target), Some(failure));
         assert!(
-            !epochs.program_failure(Failure {
+            !epochs.generation_failure(Failure {
                 kind: "policy_error".to_owned(),
                 reason: "no probation to end".to_owned(),
                 device: None,
@@ -1651,11 +1654,11 @@ mod tests {
     }
 
     /// One update is one operation with one probation (§7.2): a second
-    /// program-layer change waits for the first to be committed or reverted,
+    /// generation change waits for the first to be committed or reverted,
     /// so the epoch's last resort stays the generation that served before the
     /// first began (§7.3 steps 4 and 5).
     #[test]
-    fn a_second_program_update_waits_for_the_first_ones_probation() {
+    fn a_second_package_update_waits_for_the_first_ones_probation() {
         use crate::engine::stand_in::{Answer, main_processes, process};
 
         let (commands, _seen) = main_processes(vec![(7, Answer::Serves(11))]);
@@ -1666,14 +1669,14 @@ mod tests {
         epochs.supervise(commands);
 
         let mut first = serving.clone();
-        let mut programs = FilledPrograms::of(&config);
-        programs
+        let mut modules = ModuleSet::of(&config);
+        modules
             .policy
             .arguments
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        first.programs = programs;
+        first.modules = modules;
         epochs
-            .apply_programs(Update::new(1, first), vec![process("rank-0", 7)], false)
+            .apply_generation(Update::new(1, first), vec![process("rank-0", 7)], false)
             .expect("the first update switches over");
         let last_resort = epochs
             .get(3)
@@ -1686,14 +1689,14 @@ mod tests {
         );
 
         let mut second = serving.clone();
-        let mut programs = FilledPrograms::of(&config);
-        programs
+        let mut modules = ModuleSet::of(&config);
+        modules
             .policy
             .arguments
             .insert("max_batch".to_owned(), toml::Value::Integer(4));
-        second.programs = programs;
+        second.modules = modules;
         let failure = epochs
-            .apply_programs(Update::new(2, second), vec![process("rank-0", 7)], false)
+            .apply_generation(Update::new(2, second), vec![process("rank-0", 7)], false)
             .expect_err("an update on probation is not replaced");
         assert_eq!(failure.kind, "in_flight");
 
@@ -1701,7 +1704,7 @@ mod tests {
         // last resort is still the generation that served before it.
         assert_eq!(
             epochs
-                .program_update()
+                .generation_update()
                 .expect("the first update is in flight")
                 .update
                 .number,
@@ -1720,7 +1723,7 @@ mod tests {
     /// in the epoch's record, and the update stays unavailable with its first
     /// failure until it is applied with `force` (§7.2, §7.3 step 5).
     #[test]
-    fn a_reverted_program_update_leaves_the_previous_programs_serving() {
+    fn a_reverted_package_update_leaves_the_previous_modules_serving() {
         use crate::engine::stand_in::{Answer, main_processes, process};
 
         let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
@@ -1731,26 +1734,26 @@ mod tests {
         epochs.supervise(commands);
 
         let mut target = serving.clone();
-        let mut programs = FilledPrograms::of(&config);
-        programs
+        let mut modules = ModuleSet::of(&config);
+        modules
             .policy
             .arguments
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        target.programs = programs;
+        target.modules = modules;
         epochs
-            .apply_programs(Update::new(2, target), vec![process("rank-0", 7)], false)
-            .expect("the main process took the programs");
+            .apply_generation(Update::new(2, target), vec![process("rank-0", 7)], false)
+            .expect("the main process took the modules");
         assert!(
             epochs
-                .revert_programs("a trial refused it")
+                .revert_generation("a trial refused it")
                 .expect("the revert was answered")
         );
 
         let serving_epoch = epochs.get(3).expect("the epoch is recorded");
         assert_eq!(serving_epoch.status, Status::Serving);
         assert_eq!(
-            serving_epoch.policy, serving.programs.policy,
-            "the previous programs serve again"
+            serving_epoch.policy, serving.modules.policy,
+            "the previous modules serve again"
         );
         let reverted = seen.lock().unwrap().clone();
         assert!(
@@ -1777,23 +1780,23 @@ mod tests {
         epochs.supervise(commands);
 
         let mut target = serving.clone();
-        let mut programs = FilledPrograms::of(&config);
-        programs
+        let mut modules = ModuleSet::of(&config);
+        modules
             .policy
             .arguments
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        target.programs = programs;
+        target.modules = modules;
 
         let processes = || vec![process("rank-0", 7), process("rank-1", 8)];
         epochs
-            .apply_programs(Update::new(1, target.clone()), processes(), false)
+            .apply_generation(Update::new(1, target.clone()), processes(), false)
             .expect("the first application is taken");
         // The revert a failure causes, which is the one §7.2 makes the update
         // unavailable with (§7.3 step 4): the failure is recorded as the
         // update's first one, and the reason the refusal quotes is its
         // account.
         assert!(
-            epochs.program_failure(Failure {
+            epochs.generation_failure(Failure {
                 kind: "policy_reverted".to_owned(),
                 reason: "the policy refused a decision".to_owned(),
                 device: None,
@@ -1802,7 +1805,7 @@ mod tests {
         );
 
         let refused = epochs
-            .apply_programs(Update::new(1, target.clone()), processes(), false)
+            .apply_generation(Update::new(1, target.clone()), processes(), false)
             .expect_err("a reverted update is unavailable");
         assert_eq!(refused.kind, "unavailable");
         assert!(
@@ -1810,25 +1813,25 @@ mod tests {
             "{}",
             refused.reason
         );
-        assert!(epochs.program_update().is_none());
+        assert!(epochs.generation_update().is_none());
         let mut another_checkpoint = target.config.clone();
         another_checkpoint.model = Some("another checkpoint".to_owned());
-        let another_build = Epoch::with_programs(another_checkpoint, target.programs.clone())
+        let another_build = Epoch::with_modules(another_checkpoint, target.modules.clone())
             .expect("the configuration resolves");
         assert!(
             epochs.unavailable(&another_build).is_none(),
-            "the same programs on another build are another change"
+            "the same modules on another build are another change"
         );
 
         epochs
-            .apply_programs(Update::new(1, target), processes(), true)
+            .apply_generation(Update::new(1, target), processes(), true)
             .expect("force applies it anyway");
-        assert!(epochs.program_update().is_some());
+        assert!(epochs.generation_update().is_some());
     }
 
     /// A refused precopy changes nothing that serves, and an update in flight
     /// is what a commit finds: with none, a commit answers that it is not a
-    /// program-layer update, so a caller falls through to the epoch path.
+    /// generation update, so a caller falls through to the epoch path.
     #[test]
     fn a_refused_precopy_records_no_probation_and_a_commit_falls_through() {
         use crate::engine::stand_in::{Answer, main_processes, process};
@@ -1842,23 +1845,23 @@ mod tests {
         let serving = Epoch::of(config.clone()).expect("the configuration resolves");
         epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
-        assert!(!epochs.commit_programs().expect("nothing to commit"));
+        assert!(!epochs.commit_generation().expect("nothing to commit"));
 
         let mut target = serving.clone();
-        let mut programs = FilledPrograms::of(&config);
-        programs
+        let mut modules = ModuleSet::of(&config);
+        modules
             .policy
             .arguments
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        target.programs = programs;
+        target.modules = modules;
         let failure = epochs
-            .apply_programs(Update::new(3, target), vec![process("rank-0", 7)], false)
+            .apply_generation(Update::new(3, target), vec![process("rank-0", 7)], false)
             .expect_err("a refused precopy fails the update");
         assert_eq!(failure.kind, "precopy_failed");
-        assert!(epochs.program_update().is_none());
+        assert!(epochs.generation_update().is_none());
         let serving_epoch = epochs.get(3).expect("the epoch is recorded");
         assert_eq!(serving_epoch.status, Status::Serving);
-        assert_eq!(serving_epoch.policy, serving.programs.policy);
+        assert_eq!(serving_epoch.policy, serving.modules.policy);
     }
 
     /// The process table reports what the daemon attached: every process it
@@ -1915,13 +1918,13 @@ mod tests {
             ..Default::default()
         };
         config.scheduler_config.chunked_prefill_size = None;
-        let programs = FilledPrograms::of(&config);
+        let modules = ModuleSet::of(&config);
         assert_eq!(
-            programs.policy.arguments["max_num_batched_tokens"],
+            modules.policy.arguments["max_num_batched_tokens"],
             toml::Value::Integer(8192)
         );
         assert_eq!(
-            programs.policy.arguments["chunked_prefill_size"],
+            modules.policy.arguments["chunked_prefill_size"],
             toml::Value::Integer(8192),
             "an unstated chunk is the deployment's own token bound"
         );
@@ -1929,9 +1932,9 @@ mod tests {
         // A stated chunk above the bound is stated, not clamped: the
         // mechanism's `BadLimits` is the refusal.
         config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(16384);
-        let programs = FilledPrograms::of(&config);
+        let modules = ModuleSet::of(&config);
         assert_eq!(
-            programs.policy.arguments["chunked_prefill_size"],
+            modules.policy.arguments["chunked_prefill_size"],
             toml::Value::Integer(16384)
         );
 
@@ -1948,14 +1951,14 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             NonZeroU32::new(8).unwrap(),
         ]);
-        let programs = FilledPrograms::of(&config);
+        let modules = ModuleSet::of(&config);
         assert_eq!(
-            programs.policy.arguments["max_num_batched_tokens"],
+            modules.policy.arguments["max_num_batched_tokens"],
             toml::Value::Integer(512),
             "an unstated budget is the largest shape the captured graphs bound a batch to"
         );
         assert_eq!(
-            programs.policy.arguments["chunked_prefill_size"],
+            modules.policy.arguments["chunked_prefill_size"],
             toml::Value::Integer(512),
             "and an unstated chunk is that same bound"
         );
@@ -1971,9 +1974,9 @@ mod tests {
             NonZeroU32::new(4).unwrap(),
             NonZeroU32::new(8).unwrap(),
         ]);
-        let programs = FilledPrograms::of(&config);
+        let modules = ModuleSet::of(&config);
         assert_eq!(
-            programs.policy.arguments["max_batch"],
+            modules.policy.arguments["max_batch"],
             toml::Value::Integer(8),
             "an unstated batch is the largest decode graph the deployment captured"
         );
@@ -1983,32 +1986,32 @@ mod tests {
             .as_mut()
             .unwrap()
             .push(NonZeroU32::new(16).unwrap());
-        let programs = FilledPrograms::of(&config);
+        let modules = ModuleSet::of(&config);
         assert_eq!(
-            programs.policy.arguments["max_batch"],
+            modules.policy.arguments["max_batch"],
             toml::Value::Integer(16),
             "and it moves with the catalog a new epoch captures"
         );
         // A batch the deployment states below the catalog keeps its own value.
         config.scheduler_config.max_batch = NonZeroUsize::new(4).unwrap();
-        let programs = FilledPrograms::of(&config);
+        let modules = ModuleSet::of(&config);
         assert_eq!(
-            programs.policy.arguments["max_batch"],
+            modules.policy.arguments["max_batch"],
             toml::Value::Integer(4)
         );
 
         // A deployment that states no token bound and no catalog states no
         // limit, and the mechanism's ceilings are the workers' own.
         let config = ServerArgs::default();
-        let programs = FilledPrograms::of(&config);
+        let modules = ModuleSet::of(&config);
         assert!(
-            !programs
+            !modules
                 .policy
                 .arguments
                 .contains_key("max_num_batched_tokens")
         );
         assert!(
-            !programs
+            !modules
                 .policy
                 .arguments
                 .contains_key("chunked_prefill_size")
@@ -2018,11 +2021,11 @@ mod tests {
     /// Which layer a change moves on is decided by what it moves, never by
     /// the change itself (§7.2, §7.7): the host layer for the options the
     /// daemon or the frontend read alone, the epoch layer for the values
-    /// that build a main process, the program layer for the backends and
-    /// parameters of the programs, nothing for no change.
+    /// that build a main process, the generation layer for the backends and
+    /// parameters of the modules, nothing for no change.
     ///
     /// This test is also the rule's enforcement: a value that leaks from the
-    /// program layer's lists into [`proto::config::EngineConfig::of`], or out of it, fails
+    /// generation layer's lists into [`proto::config::EngineConfig::of`], or out of it, fails
     /// here by name.
     #[test]
     fn a_change_is_routed_by_what_it_moves() {
@@ -2085,9 +2088,9 @@ mod tests {
                 |config: &mut ServerArgs| config.profiling_config.graph_pc_sampling = true,
             ),
         ];
-        // The program backends (§7.7 backend row) and the program parameters
+        // The package backends (§7.7 backend row) and the package parameters
         // (§7.7 parameter row).
-        let program: Vec<Case> = vec![
+        let package: Vec<Case> = vec![
             ("scheduler_config.policy", |config: &mut ServerArgs| {
                 config.scheduler_config.policy = proto::request::SchedulingPolicy::Priority
             }),
@@ -2144,18 +2147,18 @@ mod tests {
                 "{what} builds a new epoch"
             );
         }
-        for (what, change) in &program {
+        for (what, change) in &package {
             let next = Epoch::of(set(*change)).expect("the configuration resolves");
             assert_eq!(
                 layer(&base, &next),
-                Layer::Program,
-                "{what} moves the programs"
+                Layer::Generation,
+                "{what} moves the modules"
             );
         }
 
-        // The attention program's arguments are a program change of a
+        // The attention package's arguments are a package change of a
         // deployment that names its attention backend. One left at `auto`
-        // names no attention program, so they move nothing there.
+        // names no attention package, so they move nothing there.
         fn named(config: &mut ServerArgs) {
             config.attention_backend = "trtllm".to_owned();
         }
@@ -2165,14 +2168,14 @@ mod tests {
             config.flashinfer_config.workspace_size = 1 << 30;
         }))
         .expect("the configuration resolves");
-        assert_eq!(layer(&named_base, &workspace), Layer::Program);
+        assert_eq!(layer(&named_base, &workspace), Layer::Generation);
 
-        // The exchange is a program only where experts are spread over ranks:
+        // The exchange is a package only where experts are spread over ranks:
         // a single-rank deployment's MoE block takes its local arm and launches
         // no exchange at all (`nn::Moe::forward` routes through
         // `forward_expert_parallel` only when an expert lives on another rank),
         // so the setting moves nothing there — and filling the slot anyway
-        // would pin a program no call reaches.
+        // would pin a package no call reaches.
         let exchange_only = set(|config: &mut ServerArgs| {
             config.moe_config.exchange = proto::request::ExpertExchange::DeepEp
         });
@@ -2193,17 +2196,17 @@ mod tests {
                 &Epoch::of(spread).expect("the configuration resolves"),
                 &Epoch::of(spread_exchanged).expect("the configuration resolves")
             ),
-            Layer::Program,
-            "in an expert-parallel deployment the exchange moves the programs"
+            Layer::Generation,
+            "in an expert-parallel deployment the exchange moves the modules"
         );
 
         // Only the epoch layer's values build the main process: the host
-        // layer's and the program layer's leave the build config equal
+        // layer's and the generation layer's leave the build config equal
         // (§7.7).
         for (what, change) in host_frontend
             .iter()
             .chain(host_daemon.iter())
-            .chain(program.iter())
+            .chain(package.iter())
         {
             assert_eq!(
                 set(*change)
@@ -2225,36 +2228,36 @@ mod tests {
             );
         }
 
-        // A program's revision is a program-layer change: the same backend
-        // and parameters at a newly installed revision move the programs.
+        // A package's revision is a generation change: the same backend
+        // and parameters at a newly installed revision move the modules.
         let mut installed = named_base.clone();
-        for program in installed.programs.kernels.values_mut() {
-            program.revision = 3;
+        for package in installed.modules.kernels.values_mut() {
+            package.revision = 3;
         }
         assert_eq!(
             layer(&named_base, &installed),
-            Layer::Program,
+            Layer::Generation,
             "a new revision"
         );
     }
 
-    /// The programs a configuration fills are keyed by the operators the
+    /// The modules a configuration fills are keyed by the operators the
     /// design names, with the attention operator split by phase only when
     /// its per-phase fields state different backends (§5.2), and the
-    /// scheduling program carries the values that only inform its decisions
+    /// scheduling policy package carries the values that only inform its decisions
     /// (§7.7).
     #[test]
-    fn the_filled_programs_name_the_operators_and_phases() {
+    fn the_filled_modules_name_the_operators_and_phases() {
         let config = ServerArgs::default();
-        let programs = FilledPrograms::of(&config);
+        let modules = ModuleSet::of(&config);
 
-        // One attention program for every phase, and no expert exchange for a
+        // One attention package for every phase, and no expert exchange for a
         // deployment whose experts all live on one rank: the model's MoE block
         // takes its local arm and launches no exchange, so the slot is absent
-        // rather than filled with a program nothing calls (§5.1, §9). No
+        // rather than filled with a package nothing calls (§5.1, §9). No
         // grouped expert GEMM either, until the configuration names one.
         // The default attention backend is `auto`: the deployment names no
-        // attention program, and the Program Server selects its packages.
+        // attention package, and the Build Server selects its packages.
         for operator in [
             operator::PAGED_ATTENTION,
             operator::EXPERT_EXCHANGE,
@@ -2262,7 +2265,7 @@ mod tests {
             operator::ROUTE_GEMM,
         ] {
             assert!(
-                !programs.kernels.contains_key(&KernelKey::all(operator)),
+                !modules.kernels.contains_key(&KernelKey::all(operator)),
                 "an operator the configuration does not fill is absent"
             );
         }
@@ -2272,17 +2275,17 @@ mod tests {
         // names.
         let mut parallel = ServerArgs::default();
         parallel.moe_config.expert_parallel = true;
-        let programs = FilledPrograms::of(&parallel);
+        let modules = ModuleSet::of(&parallel);
         assert_eq!(
-            programs.kernels[&KernelKey::all(operator::EXPERT_EXCHANGE)].backend,
+            modules.kernels[&KernelKey::all(operator::EXPERT_EXCHANGE)].backend,
             "alltoall"
         );
 
-        // The scheduling program's backend is the policy's name, and its
+        // The scheduling policy package's backend is the policy's name, and its
         // parameters are the values §7.7 assigns to it, as TOML strings.
-        assert_eq!(programs.policy.backend, "fcfs");
+        assert_eq!(modules.policy.backend, "fcfs");
         assert_eq!(
-            programs.policy.arguments["max_batch"],
+            modules.policy.arguments["max_batch"],
             toml::Value::Integer(128)
         );
         let scheduler = SchedulerConfig {
@@ -2296,21 +2299,21 @@ mod tests {
             ..Default::default()
         };
         stated.speculative_config.expected_speedup = Some(2.5);
-        let programs = FilledPrograms::of(&stated);
+        let modules = ModuleSet::of(&stated);
         assert_eq!(
-            programs.policy.arguments["chunked_prefill_size"],
+            modules.policy.arguments["chunked_prefill_size"],
             toml::Value::Integer(2048)
         );
         assert_eq!(
-            programs.policy.arguments["max_queued_requests"],
+            modules.policy.arguments["max_queued_requests"],
             toml::Value::Integer(16)
         );
         assert_eq!(
-            programs.policy.arguments["max_num_batched_tokens"],
+            modules.policy.arguments["max_num_batched_tokens"],
             toml::Value::Integer(4096)
         );
         assert_eq!(
-            programs.policy.arguments["expected_speedup"],
+            modules.policy.arguments["expected_speedup"],
             toml::Value::Float(2.5)
         );
 
@@ -2321,17 +2324,17 @@ mod tests {
             decode_attention_backend: Some("trtllm".to_owned()),
             ..Default::default()
         };
-        let programs = FilledPrograms::of(&split);
+        let modules = ModuleSet::of(&split);
         let prefill =
-            &programs.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Prefill)];
+            &modules.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Prefill)];
         let decode =
-            &programs.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Decode)];
+            &modules.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Decode)];
         assert_eq!(
             (prefill.backend.as_str(), decode.backend.as_str()),
             ("fa4", "trtllm")
         );
         assert!(
-            !programs
+            !modules
                 .kernels
                 .contains_key(&KernelKey::all(operator::PAGED_ATTENTION)),
             "a per-phase fill covers no whole operator"
@@ -2345,13 +2348,13 @@ mod tests {
             attention_backend: "fa4".to_owned(),
             ..Default::default()
         };
-        let programs = FilledPrograms::of(&one);
+        let modules = ModuleSet::of(&one);
         assert_eq!(
-            programs.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
+            modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
             "fa4"
         );
         assert!(
-            !programs.kernels.contains_key(&KernelKey::phase(
+            !modules.kernels.contains_key(&KernelKey::phase(
                 operator::PAGED_ATTENTION,
                 PhaseKind::Prefill
             )),
@@ -2362,40 +2365,40 @@ mod tests {
             decode_attention_backend: Some("fa4".to_owned()),
             ..Default::default()
         };
-        let programs = FilledPrograms::of(&agreed);
+        let modules = ModuleSet::of(&agreed);
         assert_eq!(
-            programs.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
+            modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
             "fa4",
             "phases that agree collapse to the operator's slot"
         );
 
-        // A stated grouped expert GEMM program fills both of its operators.
+        // A stated grouped expert GEMM package fills both of its operators.
         let moe = ServerArgs {
             moe_runner_backend: Some("cutlass".to_owned()),
             ..Default::default()
         };
-        let programs = FilledPrograms::of(&moe);
+        let modules = ModuleSet::of(&moe);
         for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
             assert_eq!(
-                programs.kernels[&KernelKey::all(operator)].backend,
+                modules.kernels[&KernelKey::all(operator)].backend,
                 "cutlass"
             );
         }
     }
 
     /// A backend option left at `auto` names no slot, whichever phase it is
-    /// for: the Program Server selects that operator's packages, and a phase
-    /// the deployment does name keeps its program.
+    /// for: the Build Server selects that operator's packages, and a phase
+    /// the deployment does name keeps its package.
     #[test]
-    fn a_backend_left_at_auto_names_no_program() {
+    fn a_backend_left_at_auto_names_no_package() {
         let mut config = ServerArgs {
             decode_attention_backend: Some("triton".to_owned()),
             moe_runner_backend: Some("auto".to_owned()),
             ..Default::default()
         };
-        let programs = FilledPrograms::of(&config);
+        let modules = ModuleSet::of(&config);
         assert_eq!(
-            programs.kernels.keys().cloned().collect::<Vec<_>>(),
+            modules.kernels.keys().cloned().collect::<Vec<_>>(),
             vec![KernelKey::phase(
                 operator::PAGED_ATTENTION,
                 PhaseKind::Decode
@@ -2404,9 +2407,9 @@ mod tests {
 
         config.attention_backend = "trtllm".to_owned();
         config.decode_attention_backend = None;
-        let programs = FilledPrograms::of(&config);
+        let modules = ModuleSet::of(&config);
         assert_eq!(
-            programs.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
+            modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
             "trtllm"
         );
     }
@@ -2556,7 +2559,7 @@ mod tests {
         }
     }
 
-    /// Programs are recorded per operator and, where the configuration fills
+    /// Modules are recorded per operator and, where the configuration fills
     /// one per phase, per phase; the epoch that serves is the one of the
     /// highest number that is serving or on probation.
     #[test]
@@ -2569,7 +2572,7 @@ mod tests {
         second.status = Status::Precopy;
         second.kernels.insert(
             KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Decode),
-            program("trtllm"),
+            package("trtllm"),
         );
         epochs.record(2, second);
         assert_eq!(
@@ -2593,7 +2596,7 @@ mod tests {
         assert_eq!(entries[1]["status"], Value::from("precopy"));
         assert_eq!(entries[1]["kernels"][0]["phase"], Value::from("decode"));
         assert_eq!(
-            entries[1]["kernels"][0]["program"]["backend"],
+            entries[1]["kernels"][0]["package"]["backend"],
             Value::from("trtllm")
         );
     }

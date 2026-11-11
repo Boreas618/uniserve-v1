@@ -23,7 +23,7 @@
 
 use ops::logits::{self, LogitsGather};
 use ops::rows::{self, Mode, Rows};
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -70,12 +70,7 @@ impl IndexRows {
     /// # Errors
     ///
     /// Indices of another rank, an arena that cannot hold the output, or the operator's refusal.
-    pub fn gather(
-        &self,
-        f: &Forward,
-        source: Operand,
-        indices: Operand,
-    ) -> Result<Operand> {
+    pub fn gather(&self, f: &Forward, source: Operand, indices: Operand) -> Result<Operand> {
         const OWNER: &str = "IndexRows::gather";
         let count = flat(OWNER, &indices)?;
         let out = f.empty(source.dtype, Shape::new(&[count, source.last()]))?;

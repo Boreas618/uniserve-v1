@@ -115,7 +115,7 @@ fn check_strides(name: &'static str, strides: &[i64; RANK], extents: &[u64; RANK
 pub struct CopyBlock;
 
 impl Op for CopyBlock {
-    const NAME: &'static str = proto::program::operator::COPY_BLOCK;
+    const NAME: &'static str = proto::module::operator::COPY_BLOCK;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args<'a>;

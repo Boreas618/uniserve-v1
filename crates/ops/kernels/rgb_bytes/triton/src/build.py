@@ -11,7 +11,7 @@ module serves every clip. The output is always ``u8`` and is never in the key.
 """
 
 import rgb_bytes as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: Triton's element type for each element type the operator accepts, as the
 #: signature spells a pointer to it.

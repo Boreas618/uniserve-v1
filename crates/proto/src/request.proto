@@ -398,7 +398,7 @@ message Configure {
 message Scheduling {
   // The mechanism's limits: what the engine's schedulers admit and how they
   // assemble a step. The scheduling policy's own name and parameters are its
-  // program's (§5.1, §7.7), not this message's.
+  // package's (§5.1, §7.7), not this message's.
   uint32 max_batch = 2;
   // Absent for the engine's default.
   optional uint32 max_num_batched_tokens = 3;

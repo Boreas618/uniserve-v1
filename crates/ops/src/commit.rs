@@ -42,7 +42,7 @@ use crate::tensor::{DType, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-use proto::program::commit::COMMIT_FIELDS;
+use proto::module::commit::COMMIT_FIELDS;
 
 /// One compilation of `slot_commit`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -126,7 +126,7 @@ pub struct CommitArgs {
 pub struct SlotCommit;
 
 impl Op for SlotCommit {
-    const NAME: &'static str = proto::program::operator::SLOT_COMMIT;
+    const NAME: &'static str = proto::module::operator::SLOT_COMMIT;
 
     type Descriptor = CommitDescriptor;
     type Args<'a> = CommitArgs;
@@ -339,12 +339,7 @@ impl Op for SlotCommit {
 }
 
 /// Check a view's element type against the descriptor.
-fn check_type(
-    operator: &'static str,
-    name: &str,
-    view: &Operand,
-    expected: DType,
-) -> Result<()> {
+fn check_type(operator: &'static str, name: &str, view: &Operand, expected: DType) -> Result<()> {
     if view.dtype != expected {
         return Err(Error::argument(
             operator,

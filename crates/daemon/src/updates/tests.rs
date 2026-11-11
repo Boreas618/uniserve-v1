@@ -21,9 +21,7 @@ use proto::process::{self, command, report};
 use serde_json::Value;
 
 use super::in_flight;
-use crate::epoch::{
-    Epoch, EpochRecord, Epochs, Failure, FilledPrograms, Status, Update, UpdateState,
-};
+use crate::epoch::{Epoch, EpochRecord, Epochs, Failure, ModuleSet, Status, Update, UpdateState};
 use crate::leader::UpdateError;
 use crate::options::{PreviousEpoch, ServerArgs};
 use crate::supervision::stand_in::{self, Nodes, Refusals};
@@ -82,7 +80,7 @@ impl Deployment {
         // the epoch layer's.
         let mut config = previous.config.clone();
         config.worker_config.executable = "/opt/other-uniserve".into();
-        let target = Epoch::with_programs(config, previous.programs.clone())
+        let target = Epoch::with_modules(config, previous.modules.clone())
             .expect("the configuration resolves");
         Self {
             driver: Driver::new(Arc::clone(&epochs), Box::new(roster)),
@@ -111,7 +109,7 @@ impl Deployment {
     }
 
     /// Applies the target as the update entry does: the epoch arm starts the
-    /// switch, and the daemon hands the target its programs. Returns the
+    /// switch, and the daemon hands the target its modules. Returns the
     /// switch's first report.
     fn apply(&self) -> Value {
         let applied = self
@@ -122,7 +120,7 @@ impl Deployment {
         let Applied::Epoch(report) = applied else {
             panic!("an epoch change reports the switch, not {applied:?}");
         };
-        self.driver.await_programs(&self.host);
+        self.driver.await_modules(&self.host);
         report
     }
 
@@ -138,7 +136,7 @@ impl Deployment {
         self.driver.advance();
     }
 
-    /// The daemon handed the parked target its programs.
+    /// The daemon handed the parked target its modules.
     fn hand(&self) {
         self.driver.handed(&self.host);
     }
@@ -149,7 +147,7 @@ impl Deployment {
             CHILD,
             report::Kind::Promoted(process::Promoted {
                 generation: SPAWNED,
-                program_generation: 0,
+                module_generation: 0,
             }),
         );
         self.driver.advance();
@@ -179,7 +177,7 @@ impl Deployment {
             PREVIOUS,
             report::Kind::Promoted(process::Promoted {
                 generation: PREVIOUS,
-                program_generation: 0,
+                module_generation: 0,
             }),
         );
         self.driver.advance();
@@ -270,8 +268,8 @@ impl Deployment {
 fn serving_record(deployment: &Epoch) -> EpochRecord {
     EpochRecord {
         config: deployment.engine.clone(),
-        kernels: deployment.programs.kernels.clone(),
-        policy: deployment.programs.policy.clone(),
+        kernels: deployment.modules.kernels.clone(),
+        policy: deployment.modules.policy.clone(),
         previous_kernels: Default::default(),
         previous_policy: None,
         status: Status::Serving,
@@ -294,7 +292,7 @@ fn start() -> Start {
             requests: "unix:/run/requests.sock".to_owned(),
             processes: "unix:/run/processes.sock".to_owned(),
             engine: 0,
-            program_server: "/run/programs.sock".to_owned(),
+            build_server: "/run/modules.sock".to_owned(),
             devices: vec![0],
             group: "engine".to_owned(),
             rank: 0,
@@ -323,16 +321,16 @@ fn a_second_update_is_refused_by_the_one_in_flight() {
     assert_eq!(in_flight(true, false), Some("an epoch switch is running"));
     assert_eq!(
         in_flight(false, true),
-        Some("a program update is on probation")
+        Some("a generation update is on probation")
     );
     assert_eq!(in_flight(true, true), Some("an epoch switch is running"));
 }
 
 /// Front's order, end to end: the target is started and its storage claimed,
-/// it parks, it is promoted only once the daemon handed it its programs, the
+/// it parks, it is promoted only once the daemon handed it its modules, the
 /// frontend serves it and the previous epoch drains, the trial begins after
-/// the drain, and a commit stops the previous epoch, purges its programs and
-/// retires its storage. The revisions the Program Servers selected stay in
+/// the drain, and a commit stops the previous epoch, purges its modules and
+/// retires its storage. The revisions the Build Servers selected stay in
 /// the target's record through every phase that writes it.
 #[test]
 fn an_epoch_switch_serves_the_target_and_a_commit_retires_the_previous_epoch() {
@@ -358,14 +356,14 @@ fn an_epoch_switch_serves_the_target_and_a_commit_retires_the_previous_epoch() {
     assert_eq!(deployment.epoch(TARGET)["status"], "precopy");
     assert_eq!(deployment.process(SPAWNED), "starting");
 
-    let mut programs = FilledPrograms {
-        kernels: deployment.target.programs.kernels.clone(),
-        policy: deployment.target.programs.policy.clone(),
+    let mut modules = ModuleSet {
+        kernels: deployment.target.modules.kernels.clone(),
+        policy: deployment.target.modules.policy.clone(),
     };
-    programs.policy.revision = 3;
-    deployment.driver.pin(&programs);
+    modules.policy.revision = 3;
+    deployment.driver.pin(&modules);
 
-    // A parked child waits for its programs: no promotion before the daemon
+    // A parked child waits for its modules: no promotion before the daemon
     // handed them.
     deployment.park();
     assert_eq!(
@@ -589,7 +587,7 @@ fn a_target_that_faults_before_it_serves_is_abandoned() {
     assert_eq!(deployment.nodes.stops(), vec![Some(SPAWNED)]);
     assert_eq!(deployment.epoch(TARGET)["status"], "purged");
 
-    // The programs arriving afterwards promote nothing.
+    // The modules arriving afterwards promote nothing.
     deployment.hand();
     assert!(deployment.nodes.sent().is_empty());
     assert_eq!(deployment.served(), 0);
@@ -824,7 +822,7 @@ fn a_revert_relaunches_a_previous_epoch_whose_processes_were_stopped() {
     assert_eq!(deployment.status()["phase"], "abandoned");
 }
 
-/// A change of nothing, of the host layer or of the programs alone is not the
+/// A change of nothing, of the host layer or of the modules alone is not the
 /// epoch layer's: `apply` falls through to its other path, and no process is
 /// started and no record written.
 #[test]
@@ -834,12 +832,12 @@ fn a_change_of_another_layer_starts_no_switch() {
 
     let mut logged = previous.config.clone();
     logged.logging_config.log_requests = true;
-    let host = Epoch::with_programs(logged, previous.programs.clone())
-        .expect("the configuration resolves");
-    let mut program = previous.clone();
-    program.programs.policy.revision += 1;
+    let host =
+        Epoch::with_modules(logged, previous.modules.clone()).expect("the configuration resolves");
+    let mut package = previous.clone();
+    package.modules.policy.revision += 1;
 
-    for target in [previous, &host, &program] {
+    for target in [previous, &host, &package] {
         let applied = deployment
             .driver
             .apply(previous, target, deployment.change(), false)
@@ -920,7 +918,7 @@ fn one_switch_runs_at_a_time() {
 }
 
 /// A commit, a rollback or a trial's failure with no switch running does
-/// nothing and says so, so the entry can fall through to the program layer's
+/// nothing and says so, so the entry can fall through to the generation layer's
 /// probation.
 #[test]
 fn no_switch_means_no_decision() {

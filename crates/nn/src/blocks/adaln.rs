@@ -23,7 +23,7 @@
 //! interval, so the block exposes its two modulated stages beside the whole forward. Each stage's
 //! intermediates are reserved from the forward's arena and handed back before it returns.
 
-use ops::{DType, DevicePtr, Shape, Strides, Operand};
+use ops::{DType, DevicePtr, Operand, Shape, Strides};
 
 use crate::error::{Error, Result};
 use crate::family::Split;

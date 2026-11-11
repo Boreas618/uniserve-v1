@@ -19,7 +19,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, Shape, Strides, Operand};
+use crate::tensor::{DType, Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -346,7 +346,7 @@ fn to_i64(value: u64) -> Result<i64> {
 pub struct Conv3d;
 
 impl Op for Conv3d {
-    const NAME: &'static str = proto::program::operator::CONV3D;
+    const NAME: &'static str = proto::module::operator::CONV3D;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -395,7 +395,7 @@ impl Op for Conv3d {
 pub struct Conv1d;
 
 impl Op for Conv1d {
-    const NAME: &'static str = proto::program::operator::CONV1D;
+    const NAME: &'static str = proto::module::operator::CONV1D;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -442,7 +442,7 @@ impl Op for Conv1d {
 pub struct ConvTranspose1d;
 
 impl Op for ConvTranspose1d {
-    const NAME: &'static str = proto::program::operator::CONV_TRANSPOSE1D;
+    const NAME: &'static str = proto::module::operator::CONV_TRANSPOSE1D;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

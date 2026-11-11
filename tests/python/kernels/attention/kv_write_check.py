@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `kv_write`'s kernel and check the paged-cache scatter, on the CPU.
 
-    TRITON_INTERPRET=1 crates/program-server/python/.venv/bin/python kv_write_check.py [--package DIR]
+    TRITON_INTERPRET=1 crates/build-server/python/.venv/bin/python kv_write_check.py [--package DIR]
 
 The operator scatters one row per token into the page slot the scheduler assigned it:
 

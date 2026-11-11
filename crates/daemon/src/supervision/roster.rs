@@ -229,7 +229,7 @@ impl ProcessRoster {
         let Some(launch) = self.launches.get(&generation) else {
             return;
         };
-        // §7.3 step 4: a failure a main process reports during a program-layer
+        // §7.3 step 4: a failure a main process reports during a generation
         // probation ends that probation in favour of the generation that served
         // before. The revert commands the processes and waits for their
         // answers, which arrive on the channel this thread reads, so it runs on
@@ -237,9 +237,9 @@ impl ProcessRoster {
         if let Some(failure) = crate::epoch::Failure::of_report(&report) {
             let epochs = Arc::clone(&self.epochs);
             std::thread::Builder::new()
-                .name("program-revert".into())
+                .name("generation-revert".into())
                 .spawn(move || {
-                    epochs.program_failure(failure);
+                    epochs.generation_failure(failure);
                 })
                 .ok();
         }
@@ -267,9 +267,9 @@ impl ProcessRoster {
         let generation = exit.generation;
         // A main process of the update in flight that exits ends the probation
         // (§7.3 step 4), on a thread of its own for the reason above.
-        if let Some(program) = self.epochs.program_update()
-            && program.update.state == crate::epoch::UpdateState::Probation
-            && program
+        if let Some(package) = self.epochs.generation_update()
+            && package.update.state == crate::epoch::UpdateState::Probation
+            && package
                 .prepared
                 .iter()
                 .any(|prepared| prepared.generation == generation)
@@ -283,9 +283,9 @@ impl ProcessRoster {
                 device: None,
             };
             std::thread::Builder::new()
-                .name("program-revert".into())
+                .name("generation-revert".into())
                 .spawn(move || {
-                    epochs.program_failure(failure);
+                    epochs.generation_failure(failure);
                 })
                 .ok();
         }
@@ -530,8 +530,8 @@ impl Roster for ProcessRoster {
                 self.builds.insert(engine, greeting.build);
             }
         }
-        // A caller that awaits the answers to the commands it sent (a program switch outside an
-        // epoch change: the epoch's installation, a handover of its programs) reads the reports
+        // A caller that awaits the answers to the commands it sent (a package switch outside an
+        // epoch change: the epoch's installation, a handover of its modules) reads the reports
         // itself; draining them here would take its answers away.
         let mut drained = Vec::new();
         while !self.link.commands.awaited()
@@ -583,7 +583,7 @@ mod tests {
             requests: "unix:/run/requests.sock".to_owned(),
             processes: "unix:/run/processes.sock".to_owned(),
             engine: 1,
-            program_server: "/run/programs.sock".to_owned(),
+            build_server: "/run/modules.sock".to_owned(),
             devices: vec![0],
             group: "engine".to_owned(),
             rank: 0,

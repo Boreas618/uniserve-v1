@@ -20,7 +20,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, Operand};
+use crate::tensor::{DType, Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -29,7 +29,7 @@ pub const COPY_BLOCK: u32 = 1024;
 
 /// What one compilation of a block copy is: the storage's shape, its strides and the tile.
 ///
-/// The shape and the strides are compile-time values of the kernel program, because the reference
+/// The shape and the strides are compile-time values of the kernel package, because the reference
 /// kernel unrolls the trailing axes' address arithmetic and normalizes the element count once.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BlockShape {
@@ -62,12 +62,7 @@ impl fmt::Display for BlockShape {
 
 impl BlockShape {
     /// Check the launch against the compiled variant and the index vector.
-    fn check(
-        &self,
-        operator: &'static str,
-        field: &Operand,
-        blocks: &Operand,
-    ) -> Result<u64> {
+    fn check(&self, operator: &'static str, field: &Operand, blocks: &Operand) -> Result<u64> {
         field.require_shape(operator, self.shape)?;
         if field.strides != self.strides {
             return Err(Error::argument(
@@ -136,7 +131,7 @@ pub struct SnapshotArgs {
 pub struct CacheBlockSnapshot;
 
 impl Op for CacheBlockSnapshot {
-    const NAME: &'static str = proto::program::operator::CACHE_BLOCK_SNAPSHOT;
+    const NAME: &'static str = proto::module::operator::CACHE_BLOCK_SNAPSHOT;
 
     type Descriptor = SnapshotDescriptor;
     type Args<'a> = SnapshotArgs;
@@ -221,7 +216,7 @@ pub struct ScatterArgs {
 pub struct CacheBlockScatter;
 
 impl Op for CacheBlockScatter {
-    const NAME: &'static str = proto::program::operator::CACHE_BLOCK_SCATTER;
+    const NAME: &'static str = proto::module::operator::CACHE_BLOCK_SCATTER;
 
     type Descriptor = ScatterDescriptor;
     type Args<'a> = ScatterArgs;

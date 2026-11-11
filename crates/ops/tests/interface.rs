@@ -1,4 +1,4 @@
-//! The behaviour of the operator interface that a caller — the engine's loader, a program package's
+//! The behaviour of the operator interface that a caller — the engine's loader, a package's
 //! author, the worker's shadow harness — observes and relies on:
 //!
 //! - descriptor keys are canonical text, because they are the last segment of a module's path;
@@ -406,33 +406,33 @@ fn modulation_keys_separate_every_compiled_variant() {
 
 #[test]
 fn an_operator_is_found_by_the_name_its_programs_are_filed_under() {
-    // A program layer's packages name their operators as text; the worker resolves one to the
+    // A generation layer's packages name their operators as text; the worker resolves one to the
     // static name a generation is keyed by, and gets nothing when this build has no such operator.
     assert_eq!(
-        proto::program::operator::named("rms_norm"),
+        proto::module::operator::named("rms_norm"),
         Some(<ops::norm::RmsNorm as ops::Op>::NAME)
     );
     assert_eq!(
-        proto::program::operator::named(<ops::gemm::Gemm as ops::Op>::NAME),
+        proto::module::operator::named(<ops::gemm::Gemm as ops::Op>::NAME),
         Some(<ops::gemm::Gemm as ops::Op>::NAME),
         "an operator's own name resolves to itself, not to a prefix or a neighbour"
     );
-    assert_eq!(proto::program::operator::named("no_such_operator"), None);
-    assert_eq!(proto::program::operator::named(""), None);
+    assert_eq!(proto::module::operator::named("no_such_operator"), None);
+    assert_eq!(proto::module::operator::named(""), None);
     assert_eq!(
-        proto::program::operator::named("gemm_prefill"),
+        proto::module::operator::named("gemm_prefill"),
         None,
         "a descriptor is not a name"
     );
 
     // Every name the build lists is a real operator name, and no name is listed twice: the list is
     // what a package's coverage is checked against.
-    let mut names: Vec<&'static str> = proto::program::operator::ALL.to_vec();
+    let mut names: Vec<&'static str> = proto::module::operator::ALL.to_vec();
     let listed = names.len();
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), listed, "an operator name is listed once");
-    for name in proto::program::operator::ALL {
+    for name in proto::module::operator::ALL {
         assert!(!name.is_empty());
         assert!(
             name.chars()
@@ -440,7 +440,7 @@ fn an_operator_is_found_by_the_name_its_programs_are_filed_under() {
             "{name} is not a program directory name"
         );
         assert_eq!(
-            proto::program::operator::named(name),
+            proto::module::operator::named(name),
             Some(*name),
             "{name} resolves to itself"
         );

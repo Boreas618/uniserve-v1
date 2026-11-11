@@ -1,8 +1,8 @@
-# The causal_conv1d operator's Triton backend: design 5.2's program package.
+# The causal_conv1d operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # One program convolves `block` channels of one row of a batch, continuing from
 # the row's request slot's last `width − 1` inputs and leaving its own there

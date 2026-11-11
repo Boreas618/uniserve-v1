@@ -29,7 +29,7 @@ wasmtime = { version = "50.0.1", default-features = false, features = [
     "wat",
 ] }
 
-# The Program Server's precompiler: a policy package's raw wasm32 module, in
+# The Build Server's precompiler: a policy package's raw wasm32 module, in
 # the precompiled form the engine loads.
 [[bin]]
 name = "scheduling-precompile"

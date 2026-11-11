@@ -9,7 +9,7 @@ count is compiled in.
 """
 
 import top_k as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The logits' dtype.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "f32": "fp32", "fp32": "fp32"}

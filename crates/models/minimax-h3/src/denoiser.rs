@@ -42,7 +42,7 @@ use nn::blocks::{ModulationTable, RowModulation};
 use nn::capability::{ConditionRole, VideoRequest};
 use nn::diffusion::{TimestepTable, TimestepTableSpec};
 use nn::family::{SequenceSplit, Split};
-use nn::{DType, Forward, Shape, Operand, WeightLoader};
+use nn::{DType, Forward, Operand, Shape, WeightLoader};
 use proto::video::{LatentShape, Layout};
 
 use crate::attention::Visibility;

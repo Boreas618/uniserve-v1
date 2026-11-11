@@ -11,7 +11,7 @@
 //! This module owns the connections and the waiting, not the meaning of what
 //! arrives. The messages' types are the daemon's append-only Protobuf
 //! ([`proto`]); the engine's main process (`engine::process`, whose `update`
-//! module holds the program-layer update) decides what a message does.
+//! module holds the generation update) decides what a message does.
 //! Keeping the transport here lets that driver stay clear of poll loops and
 //! socket addresses, and lets a test drive the loop with a socket pair.
 

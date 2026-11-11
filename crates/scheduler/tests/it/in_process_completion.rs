@@ -64,10 +64,10 @@ fn text_request(id: u64, prompt: usize, max_tokens: usize) -> GenerationRequest 
     }
 }
 
-/// The `fcfs` program, instantiated for the capacity this pool was built for:
+/// The `fcfs` package, instantiated for the capacity this pool was built for:
 /// a policy declares its own limits and the mechanism refuses a declaration
 /// above the ceilings the ranks were started for.
-fn policy_program(pool: &testkit::FakeBatches) -> scheduler::PolicyProgram {
+fn policy_package(pool: &testkit::FakeBatches) -> scheduler::PolicyPackage {
     // A pool's capacity is the rank's own statement: what the launch built it
     // for, which the policy's declaration must not exceed.
     let rank = pool
@@ -76,7 +76,7 @@ fn policy_program(pool: &testkit::FakeBatches) -> scheduler::PolicyProgram {
         .and_then(|pool| pool.ranks.first())
         .expect("the pool states its ranks");
     let ceilings = scheduler::ceilings_of(BatchCapacity::of(rank));
-    scheduler::PolicyProgram {
+    scheduler::PolicyPackage {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: scheduler::Parameters {
@@ -97,7 +97,7 @@ fn policy_program(pool: &testkit::FakeBatches) -> scheduler::PolicyProgram {
 fn install(handle: &SchedulerHandle, pool: &testkit::FakeBatches) {
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    answer(handle.precopy_policy(policy_program(pool), source)).expect("the policy is precopied");
+    answer(handle.precopy_policy(policy_package(pool), source)).expect("the policy is precopied");
     answer(handle.stage(Stage::Switchover)).expect("the policy serves");
 }
 
@@ -278,7 +278,7 @@ fn a_policy_stage_applies_after_a_request_ended() {
     // switchover asks for a boundary with nothing in flight.
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    answer(handle.precopy_policy(policy_program(&serving), source))
+    answer(handle.precopy_policy(policy_package(&serving), source))
         .expect("the next policy is precopied");
     answer(handle.stage(Stage::Switchover)).expect("the next policy serves");
     handle.shutdown();
@@ -292,7 +292,7 @@ fn a_policy_stage_applies_after_a_request_ended() {
 /// admitted and never restated is one whose phase the policy never learns, so
 /// no policy — `fcfs` included — can plan the work that would prefilled it, and
 /// the epoch dispatches nothing while requests queue behind it. This case
-/// states the mechanism's half: one text request, the real `fcfs` program, and
+/// states the mechanism's half: one text request, the real `fcfs` package, and
 /// a batch handed to the worker with no other help.
 #[test]
 fn an_admitted_request_is_prefilled_on_the_next_step() {

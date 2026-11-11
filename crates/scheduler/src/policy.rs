@@ -1,4 +1,4 @@
-//! The scheduling policy a scheduler thread runs, and the program-layer switch
+//! The scheduling policy a scheduler thread runs, and the generation switch
 //! that replaces it in place (§4.4, §7.3).
 //!
 //! The mechanism asks the policy for one decision at each decision point and
@@ -19,8 +19,8 @@
 //! which record the previous policy as the epoch's current one.
 //!
 //! Both instances — each scheduler thread's and the control thread's
-//! [`Router`] — come from one program and switch together (§4.4: "两者是同一个
-//! program，一起换代"). The router's instance answers `route` from the arriving
+//! [`Router`] — come from one package and switch together (§4.4: "两者是同一个
+//! package，一起换代"). The router's instance answers `route` from the arriving
 //! request's view and the ranks' views alone; it is told no events.
 
 use std::path::{Path, PathBuf};
@@ -38,36 +38,36 @@ use scheduling::guest::wire::Call;
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
 use serde::{Deserialize, Serialize};
 
-/// A policy program's identity and arguments (§5.1): the backend the
-/// configuration names, the revision the Program Server numbered the package
+/// A policy package's identity and arguments (§5.1): the backend the
+/// configuration names, the revision the Build Server numbered the package
 /// under, and the arguments that shape its decisions.
 ///
-/// The arguments are part of the program — a policy's parameters are not the
-/// mechanism's configuration (§4.4) — so a change of either is a new program
-/// and a new program-layer generation (§7.2).
+/// The arguments are part of the package — a policy's parameters are not the
+/// mechanism's configuration (§4.4) — so a change of either is a new package
+/// and a new generation generation (§7.2).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PolicyProgram {
+pub struct PolicyPackage {
     /// The backend's name, as `scheduler_config.policy` spells it.
     pub backend: String,
-    /// The revision the Program Server numbered the package's install (§5.1).
+    /// The revision the Build Server numbered the package's install (§5.1).
     pub revision: u32,
     /// The policy's arguments, from the deployment configuration (§7.7).
     pub arguments: Parameters,
     /// The arguments as the daemon stated them, one TOML value each, which is
-    /// what the Program Server resolves the module with: the server fills the
+    /// what the Build Server resolves the module with: the server fills the
     /// package's defaults for the ones the deployment leaves out.
     pub stated: std::collections::BTreeMap<String, String>,
 }
 
-impl PolicyProgram {
-    /// The program a daemon's `Precopy` states (§7.3 step 2, §5.1): the
+impl PolicyPackage {
+    /// The package a daemon's `Precopy` states (§7.3 step 2, §5.1): the
     /// backend, the revision, and the policy's arguments as the TOML text of
     /// each configured value.
     ///
     /// The parameter names are the policy's own (§4.4, §7.7): this build knows
     /// the ones [`Parameters`] declares, and an argument it does not know is
-    /// refused rather than ignored, because the program's arguments are the
-    /// program and serving under fewer of them is not serving under it.
+    /// refused rather than ignored, because the package's arguments are the
+    /// package and serving under fewer of them is not serving under it.
     pub fn from_arguments(
         backend: impl Into<String>,
         revision: u32,
@@ -96,7 +96,7 @@ impl PolicyProgram {
                 other => {
                     return Err(PolicyError::Load {
                         message: format!(
-                            "the {backend} policy program states `{other}`, which this build's \
+                            "the {backend} policy package states `{other}`, which this build's \
                              policy arguments do not name"
                         ),
                     });
@@ -111,41 +111,43 @@ impl PolicyProgram {
         })
     }
 
-    /// The program as the Program Server names it (§5.1): the backend, the
+    /// The package as the Build Server names it (§5.1): the backend, the
     /// revision, and the stated arguments as TOML.
-    pub fn to_server_program(&self) -> Result<proto::program::Program, PolicyError> {
+    pub fn to_package_revision(&self) -> Result<proto::module::PackageRevision, PolicyError> {
         let mut arguments = toml::Table::new();
         for (name, value) in &self.stated {
             arguments.insert(name.clone(), argument::<toml::Value>(value, name)?);
         }
-        Ok(proto::program::Program {
+        Ok(proto::module::PackageRevision {
             backend: self.backend.clone(),
             revision: self.revision,
             arguments,
         })
     }
 
-    /// The program a daemon's `Precopy` states for the scheduling policy
-    /// (§7.3 step 2): its `program` field, as the process interface carries it.
+    /// The package a daemon's `Precopy` states for the scheduling policy
+    /// (§7.3 step 2): its `package` field, as the process interface carries it.
     ///
-    /// The wire form is the Program Server's own `Program` — a backend, a
-    /// revision and the arguments as TOML text — so nothing about a program is
+    /// The wire form is the Build Server's own `PackageRevision` — a backend, a
+    /// revision and the arguments as TOML text — so nothing about a package is
     /// decided here: a name the interface does not have is refused, as it is by
     /// [`Self::from_arguments`].
-    pub fn from_program(program: &proto::process::Program) -> Result<Self, PolicyError> {
-        let arguments: std::collections::BTreeMap<String, String> = program
+    pub fn from_package_revision(
+        package: &proto::process::PackageRevision,
+    ) -> Result<Self, PolicyError> {
+        let arguments: std::collections::BTreeMap<String, String> = package
             .arguments
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
-        Self::from_arguments(program.backend.clone(), program.revision, &arguments)
+        Self::from_arguments(package.backend.clone(), package.revision, &arguments)
     }
 }
 
-/// One configured argument of a program, parsed as the type the policy
+/// One configured argument of a package, parsed as the type the policy
 /// parameter has.
 ///
-/// The program states each argument as TOML text of the value itself — `2048`,
+/// The package states each argument as TOML text of the value itself — `2048`,
 /// `2.5` — so it is parsed as a TOML value and turned into the parameter's type,
 /// not read as a document.
 fn argument<T: serde::de::DeserializeOwned>(value: &str, name: &str) -> Result<T, PolicyError> {
@@ -232,48 +234,48 @@ pub(crate) fn process_engine() -> Result<&'static Engine, PolicyError> {
 /// it but not below it (`scheduling`'s check of the policy's limits).
 pub const PREFETCH_FLOOR_TOKENS: u32 = 256;
 
-/// Where the switch resolves a policy program's module (§5.1, §5.3).
+/// Where the switch resolves a policy package's module (§5.1, §5.3).
 ///
-/// The daemon's commands and the epoch record name a program by backend,
+/// The daemon's commands and the epoch record name a package by backend,
 /// revision and arguments, never by content: the content comes from the
-/// Program Server, through this source.
+/// Build Server, through this source.
 pub trait PolicySource: Send + Sync {
-    /// The module bytes of `program`: the artifact the Program Server
+    /// The module bytes of `package`: the artifact the Build Server
     /// precompiled for this host, or the wasm32 binary when it has none.
-    fn bytes(&self, program: &PolicyProgram) -> Result<Vec<u8>, PolicyError>;
+    fn bytes(&self, package: &PolicyPackage) -> Result<Vec<u8>, PolicyError>;
 }
 
-/// The Program Server's client, as the source of a policy's module (§5.3,
+/// The Build Server's client, as the source of a policy's module (§5.3,
 /// §7.3 step 2).
 ///
-/// The daemon names a program by backend, revision and arguments, never by
-/// content: this asks the host's Program Server to `resolve` it — the store's
+/// The daemon names a package by backend, revision and arguments, never by
+/// content: this asks the host's Build Server to `resolve` it — the store's
 /// copy, or a build of it when the store misses it — under the `scheduling`
-/// operator's single descriptor ([`program_server::manifest::POLICY_DESCRIPTOR`]).
+/// operator's single descriptor ([`build_server::manifest::POLICY_DESCRIPTOR`]).
 ///
 /// The key it resolves under is the store's wasm target, not a CPU triple: a
 /// policy is one artifact per revision, written at install for
-/// [`program_server::manifest::WASM_TARGET`], and it belongs to the whole
+/// [`build_server::manifest::WASM_TARGET`], and it belongs to the whole
 /// architecture rather than to one CPU (§5.3). The host's precompile triple is
 /// wasmtime's business and lives in [`Engine::new`].
 ///
 /// One connection is kept and reused: a precopy is the only caller, and it
 /// runs on a thread of its own, so the lock is never held across a step.
 #[derive(Debug)]
-pub struct ProgramSource {
+pub struct ModuleSource {
     socket: PathBuf,
-    target: program_server::Target,
-    client: std::sync::Mutex<Option<program_server::Client>>,
+    target: build_server::Target,
+    client: std::sync::Mutex<Option<build_server::Client>>,
 }
 
-/// The operator a scheduling policy's program fills (§5.2).
+/// The operator a scheduling policy's package fills (§5.2).
 const POLICY_OP: &str = "scheduling";
 
-impl ProgramSource {
-    /// A source that resolves programs through the Program Server listening on
+impl ModuleSource {
+    /// A source that resolves packages through the Build Server listening on
     /// `socket`, under the store's key for a scheduling policy.
     ///
-    /// The key is [`program_server::manifest::WASM_TARGET`] and nothing finer.
+    /// The key is [`build_server::manifest::WASM_TARGET`] and nothing finer.
     /// Asking for the host's precompile triple instead named a path no install
     /// writes and no policy package declares, so the resolve could not read the
     /// artifact the install built; a host that cannot precompile a module still
@@ -281,7 +283,7 @@ impl ProgramSource {
     pub fn connect(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
-            target: program_server::Target::new(program_server::manifest::WASM_TARGET),
+            target: build_server::Target::new(build_server::manifest::WASM_TARGET),
             client: std::sync::Mutex::new(None),
         }
     }
@@ -292,30 +294,28 @@ impl ProgramSource {
     }
 
     /// The store key every resolve of this source asks for.
-    pub fn target(&self) -> &program_server::Target {
+    pub fn target(&self) -> &build_server::Target {
         &self.target
     }
 
     /// With `self`'s connection open, for the caller to resolve through.
     fn with_client<T>(
         &self,
-        ask: impl FnOnce(&mut program_server::Client) -> Result<T, PolicyError>,
+        ask: impl FnOnce(&mut build_server::Client) -> Result<T, PolicyError>,
     ) -> Result<T, PolicyError> {
         let mut client = crate::lock(&self.client);
         if client.is_none() {
             *client = Some(
-                program_server::Client::connect(&self.socket).map_err(|error| {
-                    PolicyError::Load {
-                        message: format!(
-                            "cannot reach the Program Server at {}: {error}",
-                            self.socket.display()
-                        ),
-                    }
+                build_server::Client::connect(&self.socket).map_err(|error| PolicyError::Load {
+                    message: format!(
+                        "cannot reach the Build Server at {}: {error}",
+                        self.socket.display()
+                    ),
                 })?,
             );
         }
         let client = client.as_mut().ok_or_else(|| PolicyError::Load {
-            message: "the Program Server connection was closed".to_owned(),
+            message: "the Build Server connection was closed".to_owned(),
         })?;
         let answer = ask(client);
         if answer.is_err() {
@@ -327,62 +327,62 @@ impl ProgramSource {
     }
 }
 
-impl PolicySource for ProgramSource {
-    fn bytes(&self, program: &PolicyProgram) -> Result<Vec<u8>, PolicyError> {
-        let server_program = program.to_server_program()?;
-        // The Program Server builds a policy module its store does not hold, and it streams what it
+impl PolicySource for ModuleSource {
+    fn bytes(&self, package: &PolicyPackage) -> Result<Vec<u8>, PolicyError> {
+        let package_revision = package.to_package_revision()?;
+        // The Build Server builds a policy module its store does not hold, and it streams what it
         // is doing to the callback below. Discarding that account left a 300-second wait that named
         // no step; a resolve is the one step of a precopy that compiles, so it is printed with the
         // target it asked for - the daemon's prepare and this engine's resolve must name the same
         // one, or the store the daemon filled is not the store this resolve reads.
         let started = Instant::now();
         tracing::info!(
-            backend = %program.backend,
-            revision = program.revision,
+            backend = %package.backend,
+            revision = package.revision,
             target = %self.target,
-            "resolving the policy program for this host's target"
+            "resolving the policy package for this host's target"
         );
         let module = self.with_client(|client| {
             client
                 .resolve(
                     POLICY_OP,
-                    &server_program,
+                    &package_revision,
                     &self.target,
-                    program_server::manifest::POLICY_DESCRIPTOR,
+                    build_server::manifest::POLICY_DESCRIPTOR,
                     &mut |progress| {
                         tracing::info!(
                             target = %self.target,
                             path = %progress.path,
                             state = ?progress.state,
-                            "the Program Server is building this policy's module"
+                            "the Build Server is building this policy's module"
                         );
                     },
                 )
                 .map_err(|error| PolicyError::Load {
                     message: format!(
-                        "the Program Server did not resolve the {}/{} policy for {}: {error}",
-                        program.backend, program.revision, self.target
+                        "the Build Server did not resolve the {}/{} policy for {}: {error}",
+                        package.backend, package.revision, self.target
                     ),
                 })
         })?;
         tracing::info!(
-            backend = %program.backend,
-            revision = program.revision,
+            backend = %package.backend,
+            revision = package.revision,
             target = %self.target,
             ms = started.elapsed().as_millis() as u64,
             files = module.files.len(),
-            "the policy program resolved"
+            "the policy package resolved"
         );
         let mut file = module
             .files
             .into_iter()
-            .find(|file| file.name == program_server::source::MODULE_WASM)
+            .find(|file| file.name == build_server::source::MODULE_WASM)
             .ok_or_else(|| PolicyError::Load {
                 message: format!(
                     "the {}/{} policy's module carries no {}",
-                    program.backend,
-                    program.revision,
-                    program_server::source::MODULE_WASM
+                    package.backend,
+                    package.revision,
+                    build_server::source::MODULE_WASM
                 ),
             })?
             .file;
@@ -390,7 +390,7 @@ impl PolicySource for ProgramSource {
         std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| PolicyError::Load {
             message: format!(
                 "cannot read the {}/{} policy module: {error}",
-                program.backend, program.revision
+                package.backend, package.revision
             ),
         })?;
         Ok(bytes)
@@ -414,7 +414,7 @@ impl PolicyBytes {
 }
 
 impl PolicySource for PolicyBytes {
-    fn bytes(&self, _program: &PolicyProgram) -> Result<Vec<u8>, PolicyError> {
+    fn bytes(&self, _package: &PolicyPackage) -> Result<Vec<u8>, PolicyError> {
         Ok(self.bytes.clone())
     }
 }
@@ -499,11 +499,11 @@ pub enum Stage {
 /// the scheduler thread keeps the serving policy throughout, and neither thread
 /// borrows the other's slot.
 pub struct Candidate {
-    program: PolicyProgram,
+    package: PolicyPackage,
     module: PolicyModule,
     instance: PolicyInstance,
     /// The guest calls the trial made, which the counters carry once the
-    /// candidate is adopted. A trial leaves the program as it found it, so the
+    /// candidate is adopted. A trial leaves the package as it found it, so the
     /// candidate serves on a second instance and the trialled one's counters
     /// are read here before it is dropped.
     trial: TrialCost,
@@ -608,7 +608,7 @@ impl Cost {
 
     /// A trial's calls are counted when its candidate is adopted: they are
     /// calls the epoch's policy made, whether or not it goes on serving under
-    /// that program.
+    /// that package.
     ///
     /// The trialled instance is the record, not a count taken beside it: its
     /// instantiation, the limits it read and every decision the trial asked
@@ -629,9 +629,9 @@ impl Cost {
 }
 
 impl Candidate {
-    /// The program the candidate was loaded from.
-    pub fn program(&self) -> &PolicyProgram {
-        &self.program
+    /// The package the candidate was loaded from.
+    pub fn package(&self) -> &PolicyPackage {
+        &self.package
     }
 }
 
@@ -650,8 +650,8 @@ pub struct PolicyReverted {
     /// control thread's route instance. The control thread names the scheduler
     /// it took a report from.
     pub scheduler: Option<usize>,
-    /// The program that failed.
-    pub program: PolicyProgram,
+    /// The package that failed.
+    pub package: PolicyPackage,
     /// Why it failed (§4.4's list: a trap, fuel, bad limits, an invalid
     /// decision, or starvation).
     pub reason: String,
@@ -777,15 +777,15 @@ pub fn arrival_view(arrival: &Arrival) -> RequestView {
 pub struct PolicySlot {
     engine: Engine,
     ceilings: Limits,
-    /// The program the serving instance was instantiated from.
-    program: PolicyProgram,
+    /// The package the serving instance was instantiated from.
+    package: PolicyPackage,
     /// The serving instance's module, kept so the next switchover can retain it.
     module: PolicyModule,
     /// The serving instance.
     instance: PolicyInstance,
-    /// The module and program of the policy a revert puts back. `None` before
+    /// The module and package of the policy a revert puts back. `None` before
     /// the first switchover and after a revert: no older policy exists then.
-    previous: Option<(PolicyProgram, PolicyModule)>,
+    previous: Option<(PolicyPackage, PolicyModule)>,
     /// The instance, module and state a precopy prepared, put in by the
     /// switchover.
     candidate: Option<Candidate>,
@@ -812,7 +812,7 @@ impl PolicySlot {
         Self {
             engine: engine.clone(),
             ceilings,
-            program: candidate.program,
+            package: candidate.package,
             module: candidate.module,
             instance: candidate.instance,
             previous: None,
@@ -823,7 +823,7 @@ impl PolicySlot {
         }
     }
 
-    /// Loads `program`'s module from `source` and instantiates it on `state`
+    /// Loads `package`'s module from `source` and instantiates it on `state`
     /// (§7.3: a policy put in by a switch from another policy).
     ///
     /// The policy's limits are read once here and checked against `ceilings`; a
@@ -832,17 +832,17 @@ impl PolicySlot {
     pub fn install(
         engine: &Engine,
         source: &dyn PolicySource,
-        program: PolicyProgram,
+        package: PolicyPackage,
         state: &TrialState,
         ceilings: &Limits,
     ) -> Result<Self, PolicyError> {
-        let init = init_of(&program, state);
-        let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
+        let init = init_of(&package, state);
+        let module = PolicyModule::load(engine, &source.bytes(&package)?)?;
         let instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
         Ok(Self {
             engine: engine.clone(),
             ceilings: *ceilings,
-            program,
+            package,
             module,
             instance,
             previous: None,
@@ -860,9 +860,9 @@ impl PolicySlot {
         &self.state
     }
 
-    /// The program the slot serves now.
-    pub fn program(&self) -> &PolicyProgram {
-        &self.program
+    /// The package the slot serves now.
+    pub fn package(&self) -> &PolicyPackage {
+        &self.package
     }
 
     /// The policy's limits, as declared at instantiation and checked against
@@ -916,7 +916,7 @@ impl PolicySlot {
         self.cost.usage(&self.instance)
     }
 
-    /// §7.3 step 2: instantiate `program` on `state` and ask it every decision
+    /// §7.3 step 2: instantiate `package` on `state` and ask it every decision
     /// of §4.4 once, executing nothing.
     ///
     /// An answer that does not decode, a trap, fuel exhaustion, limits outside
@@ -931,7 +931,7 @@ impl PolicySlot {
     pub fn prepare(
         engine: &Engine,
         source: &dyn PolicySource,
-        program: PolicyProgram,
+        package: PolicyPackage,
         state: TrialState,
         ceilings: &Limits,
         validators: &dyn Validators,
@@ -944,13 +944,13 @@ impl PolicySlot {
             call,
         } = state;
         let init = Instantiation {
-            parameters: program.arguments.clone(),
+            parameters: package.arguments.clone(),
             state: snapshot,
         };
         // Three blocking steps and one trial, timed separately: a wait that names none of them
         // cannot be told from a hang, and the resolve is the only one that compiles.
         let resolving = Instant::now();
-        let bytes = source.bytes(&program)?;
+        let bytes = source.bytes(&package)?;
         let resolve = resolving.elapsed();
         let loading = Instant::now();
         let module = PolicyModule::load(engine, &bytes)?;
@@ -978,9 +978,9 @@ impl PolicySlot {
             validators.place(call, replicas, index)?;
         }
 
-        // A trial must leave a stateful program as it found it. The calls the
-        // trial made are its own, and a program that decides from its own call
-        // history has spent them: serving must start from the program's `init`
+        // A trial must leave a stateful package as it found it. The calls the
+        // trial made are its own, and a package that decides from its own call
+        // history has spent them: serving must start from the package's `init`
         // on this boundary's state, not from what the trial left behind. The
         // candidate is therefore a second instance of the same module on that
         // state, and the trialled one is dropped with the cost it counted.
@@ -989,8 +989,8 @@ impl PolicySlot {
             fuel: instance.fuel_consumed(),
         };
         tracing::info!(
-            backend = %program.backend,
-            revision = program.revision,
+            backend = %package.backend,
+            revision = package.revision,
             resolve_ms = resolve.as_millis() as u64,
             load_ms = load.as_millis() as u64,
             instantiate_ms = instantiate.as_millis() as u64,
@@ -1000,7 +1000,7 @@ impl PolicySlot {
         );
         let instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
         Ok(Candidate {
-            program,
+            package,
             module,
             instance,
             trial,
@@ -1022,14 +1022,14 @@ impl PolicySlot {
     pub fn precopy(
         &mut self,
         source: &dyn PolicySource,
-        program: PolicyProgram,
+        package: PolicyPackage,
         state: TrialState,
         validators: &dyn Validators,
     ) -> Result<(), PolicyError> {
         let candidate = Self::prepare(
             &self.engine,
             source,
-            program,
+            package,
             state,
             &self.ceilings,
             validators,
@@ -1101,19 +1101,19 @@ impl PolicySlot {
                 "a switchover arrived without a policy prepared by a precopy",
             ));
         };
-        let init = init_of(&candidate.program, state);
+        let init = init_of(&candidate.package, state);
         let instance =
             candidate
                 .module
                 .instantiate(&init.state, &init.parameters, &self.ceilings)?;
-        let replaced_program = std::mem::replace(&mut self.program, candidate.program);
+        let replaced_package = std::mem::replace(&mut self.package, candidate.package);
         let replaced_module = std::mem::replace(&mut self.module, candidate.module);
         let replaced = std::mem::replace(&mut self.instance, instance);
         self.state = init.state;
         self.cost.replace(&replaced);
         // §7.3 step 5: the replaced module stays until the next precopy, which
         // replaces it; committing therefore keeps it, and a revert finds it.
-        self.previous = Some((replaced_program, replaced_module));
+        self.previous = Some((replaced_package, replaced_module));
         Ok(())
     }
 
@@ -1129,15 +1129,15 @@ impl PolicySlot {
     /// policy to serve under.
     fn revert(&mut self, state: &TrialState) -> Result<(), PolicyError> {
         self.candidate = None;
-        let Some((program, module)) = self.previous.take() else {
+        let Some((package, module)) = self.previous.take() else {
             return Err(PolicyError::invalid(
                 Call::Init,
                 "the failed policy has no previous policy module to revert to",
             ));
         };
-        let init = init_of(&program, state);
+        let init = init_of(&package, state);
         let instance = module.instantiate(&init.state, &init.parameters, &self.ceilings)?;
-        let _ = std::mem::replace(&mut self.program, program);
+        let _ = std::mem::replace(&mut self.package, package);
         let _ = std::mem::replace(&mut self.module, module);
         let replaced = std::mem::replace(&mut self.instance, instance);
         self.state = init.state;
@@ -1160,7 +1160,7 @@ impl PolicySlot {
     ) -> Result<PolicyReverted, PolicyError> {
         let report = PolicyReverted {
             scheduler: None,
-            program: self.program.clone(),
+            package: self.package.clone(),
             reason: error.to_string(),
             fatal: false,
         };
@@ -1169,10 +1169,10 @@ impl PolicySlot {
     }
 }
 
-/// The instantiation message of `program` on `state`.
-fn init_of(program: &PolicyProgram, state: &TrialState) -> Instantiation {
+/// The instantiation message of `package` on `state`.
+fn init_of(package: &PolicyPackage, state: &TrialState) -> Instantiation {
     Instantiation {
-        parameters: program.arguments.clone(),
+        parameters: package.arguments.clone(),
         state: state.snapshot.clone(),
     }
 }
@@ -1219,9 +1219,9 @@ impl Validators for RouteTrial {
 ///
 /// Routing is decided on the engine's control thread, before any scheduler
 /// holds the request, so the instance that answers it is the control thread's
-/// own: an instance of the epoch's policy program, prepared, switched over,
+/// own: an instance of the epoch's policy package, prepared, switched over,
 /// committed and reverted with the schedulers' instances, so all of them run
-/// one program (§4.4: "两者是同一个 program，一起换代"). It is the only
+/// one package (§4.4: "两者是同一个 package，一起换代"). It is the only
 /// instance asked `route`; a scheduler's instance never is.
 ///
 /// The route instance is instantiated on the ranks alone and told no events:
@@ -1229,7 +1229,7 @@ impl Validators for RouteTrial {
 /// requests the rank holds and whether its scheduler lives), which the control
 /// thread counts from the requests it routed. A decision that names a rank
 /// outside the ranks offered, or one whose scheduler stopped, is refused as the
-/// policy's failure (`mechanism::validate_route`); the previous program then
+/// policy's failure (`mechanism::validate_route`); the previous package then
 /// routes, and the request is refused when none can.
 pub struct Router {
     /// The serving instance, `None` until the epoch's first switchover.
@@ -1246,7 +1246,7 @@ pub struct RouteRefusal {
     /// Why no rank was named.
     pub reason: String,
     /// The policy failure the refusal reverted, when a serving policy failed;
-    /// `fatal` when no previous program could take over.
+    /// `fatal` when no previous package could take over.
     pub reverted: Option<Box<PolicyReverted>>,
 }
 
@@ -1273,14 +1273,14 @@ impl Router {
         }
     }
 
-    /// §7.3 step 2 for the route instance: loads `program` and instantiates
+    /// §7.3 step 2 for the route instance: loads `package` and instantiates
     /// it on `ranks`, executing nothing.
     ///
     /// A static function, so the module's compilation runs on a thread of
     /// the caller's choosing; [`Self::adopt`] keeps the answer.
     pub fn prepare(
         source: &dyn PolicySource,
-        program: PolicyProgram,
+        package: PolicyPackage,
         ranks: &[RankView],
         ceilings: &Limits,
     ) -> Result<Candidate, PolicyError> {
@@ -1288,7 +1288,7 @@ impl Router {
         PolicySlot::prepare(
             engine,
             source,
-            program,
+            package,
             Self::state(ranks),
             ceilings,
             &RouteTrial,
@@ -1345,7 +1345,7 @@ impl Router {
         }
     }
 
-    /// §7.3 step 4: the previous program routes again, instantiated on
+    /// §7.3 step 4: the previous package routes again, instantiated on
     /// `ranks`; a prepared candidate is dropped.
     pub fn revert(&mut self, ranks: &[RankView]) -> Result<(), PolicyError> {
         self.candidate = None;
@@ -1363,10 +1363,10 @@ impl Router {
             .map_or_else(PolicyUsage::default, PolicySlot::usage)
     }
 
-    /// The program the serving instance runs, `None` before the first
+    /// The package the serving instance runs, `None` before the first
     /// switchover.
-    pub fn program(&self) -> Option<&PolicyProgram> {
-        self.slot.as_ref().map(PolicySlot::program)
+    pub fn package(&self) -> Option<&PolicyPackage> {
+        self.slot.as_ref().map(PolicySlot::package)
     }
 
     /// `route`: the index of the rank in `ranks` that serves `arrival`.
@@ -1375,9 +1375,9 @@ impl Router {
     /// no policy. A request that resumes a stored cache is routed to the rank
     /// recorded for it by the policy itself (`RequestView::cache_rank`), and
     /// the answer is checked like any other. An answer that names no live rank
-    /// offered fails the policy: the previous program is instantiated on
+    /// offered fails the policy: the previous package is instantiated on
     /// `ranks` and routes this request and later ones. When no previous
-    /// program can take over, the request is refused and the refusal's
+    /// package can take over, the request is refused and the refusal's
     /// `reverted` is fatal: the update failed.
     pub fn route(&mut self, arrival: &Arrival, ranks: &[RankView]) -> Result<usize, RouteRefusal> {
         if ranks.len() <= 1 {
@@ -1388,11 +1388,11 @@ impl Router {
             Err(refusal) => refusal,
         };
         match refusal.reverted {
-            // The previous program serves again: it routes this request.
+            // The previous package serves again: it routes this request.
             Some(reverted) if !reverted.fatal => {
                 tracing::warn!(
-                    backend = %reverted.program.backend,
-                    revision = reverted.program.revision,
+                    backend = %reverted.package.backend,
+                    revision = reverted.package.revision,
                     reason = %reverted.reason,
                     "the routing policy failed and the previous policy routes again"
                 );
@@ -1430,12 +1430,12 @@ impl Router {
         let reverted = match slot.fail(&error, &Self::state(ranks)) {
             Ok(report) => report,
             Err(fatal) => {
-                // No previous program can route: the epoch has no router.
-                let program = slot.program().clone();
+                // No previous package can route: the epoch has no router.
+                let package = slot.package().clone();
                 self.slot = None;
                 PolicyReverted {
                     scheduler: None,
-                    program,
+                    package,
                     reason: format!("{error}; no previous policy can take over: {fatal}"),
                     fatal: true,
                 }
@@ -1471,9 +1471,9 @@ mod tests {
         PolicyBytes::new(toy_module(toy))
     }
 
-    /// The program the tests install.
-    fn program(backend: &str, revision: u32) -> PolicyProgram {
-        PolicyProgram {
+    /// The package the tests install.
+    fn package(backend: &str, revision: u32) -> PolicyPackage {
+        PolicyPackage {
             backend: backend.to_owned(),
             revision,
             arguments: Parameters::default(),
@@ -1481,7 +1481,7 @@ mod tests {
         }
     }
 
-    /// A plan that names one request, so two programs' answers differ.
+    /// A plan that names one request, so two packages' answers differ.
     fn plan_of(request: u64) -> Plan {
         Plan {
             refill: vec![RequestId(request)],
@@ -1626,12 +1626,12 @@ mod tests {
         }
     }
 
-    /// A slot serving `toy` as program `a`.
+    /// A slot serving `toy` as package `a`.
     fn slot(toy: &Toy) -> PolicySlot {
         PolicySlot::install(
             &Engine::new().expect("an engine"),
             &source(toy),
-            program("a", 1),
+            package("a", 1),
             &state(),
             &ceilings(),
         )
@@ -1641,7 +1641,7 @@ mod tests {
     /// Switches `slot` to `toy` at a boundary, as a daemon's precopy,
     /// switchover and commit do.
     fn switch_to(slot: &mut PolicySlot, toy: &Toy) {
-        slot.precopy(&source(toy), program("b", 2), state(), &Checks::default())
+        slot.precopy(&source(toy), package("b", 2), state(), &Checks::default())
             .expect("the candidate passes its precopy");
         slot.request(Stage::Switchover);
         slot.boundary(&state()).expect("the switchover applies");
@@ -1650,7 +1650,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_serves_the_limits_its_program_declares() {
+    fn a_slot_serves_the_limits_its_package_declares() {
         let declared = Limits {
             max_batch: 3,
             ..fitting_limits()
@@ -1660,7 +1660,7 @@ mod tests {
             ..Toy::default()
         });
         assert_eq!(slot.limits().max_batch, 3);
-        assert_eq!(slot.program().backend, "a");
+        assert_eq!(slot.package().backend, "a");
     }
 
     #[test]
@@ -1675,7 +1675,7 @@ mod tests {
                 limits: too_large,
                 ..Toy::default()
             }),
-            program("a", 1),
+            package("a", 1),
             &state(),
             &ceilings(),
         );
@@ -1698,14 +1698,14 @@ mod tests {
                 plan: plan_of(2),
                 ..Toy::default()
             }),
-            program("b", 2),
+            package("b", 2),
             state(),
             &ceilings(),
             &Checks::default(),
         )
         .expect("the candidate passes its precopy");
-        assert_eq!(candidate.program().backend, "b");
-        assert_eq!(slot.program().backend, "a");
+        assert_eq!(candidate.package().backend, "b");
+        assert_eq!(slot.package().backend, "a");
         assert_eq!(
             slot.dispatch(&Room::default()).expect("an answer").refill,
             plan_of(1).refill
@@ -1718,7 +1718,7 @@ mod tests {
                 .expect("the boundary applies")
                 .is_none()
         );
-        assert_eq!(slot.program().backend, "b");
+        assert_eq!(slot.package().backend, "b");
         assert_eq!(
             slot.dispatch(&Room::default()).expect("an answer").refill,
             plan_of(2).refill
@@ -1738,7 +1738,7 @@ mod tests {
             };
             let prepared = slot.precopy(
                 &source(&candidate),
-                program("b", 2),
+                package("b", 2),
                 state(),
                 &Checks::default(),
             );
@@ -1759,7 +1759,7 @@ mod tests {
         };
         let prepared = slot.precopy(
             &source(&candidate),
-            program("b", 2),
+            package("b", 2),
             state(),
             &Checks::default(),
         );
@@ -1777,7 +1777,7 @@ mod tests {
         let mut slot = slot(&Toy::default());
         let refused_plan = slot.precopy(
             &source(&Toy::default()),
-            program("b", 2),
+            package("b", 2),
             state(),
             &Checks {
                 refuse_plan: true,
@@ -1793,7 +1793,7 @@ mod tests {
         ));
         let refused_route = slot.precopy(
             &source(&Toy::default()),
-            program("b", 2),
+            package("b", 2),
             state(),
             &Checks {
                 refuse_route: true,
@@ -1826,7 +1826,7 @@ mod tests {
                 plan: plan_of(2),
                 ..Toy::default()
             }),
-            program("b", 2),
+            package("b", 2),
             state(),
             &Checks::default(),
         )
@@ -1836,7 +1836,7 @@ mod tests {
             slot.dispatch(&Room::default()).expect("an answer").refill,
             plan_of(1).refill
         );
-        assert_eq!(slot.program().backend, "a");
+        assert_eq!(slot.package().backend, "a");
 
         slot.request(Stage::Switchover);
         assert!(
@@ -1848,7 +1848,7 @@ mod tests {
             slot.dispatch(&Room::default()).expect("an answer").refill,
             plan_of(2).refill
         );
-        assert_eq!(slot.program().backend, "b");
+        assert_eq!(slot.package().backend, "b");
 
         // The commit keeps the replaced policy, so a later failure reverts.
         slot.request(Stage::Commit);
@@ -1863,12 +1863,12 @@ mod tests {
                 &state(),
             )
             .expect("the previous policy is kept");
-        assert_eq!(report.program.backend, "b");
+        assert_eq!(report.package.backend, "b");
         assert_eq!(
             slot.dispatch(&Room::default()).expect("an answer").refill,
             plan_of(1).refill
         );
-        assert_eq!(slot.program().backend, "a");
+        assert_eq!(slot.package().backend, "a");
     }
 
     #[test]
@@ -1920,7 +1920,7 @@ mod tests {
                 .expect("the boundary applies")
                 .is_none()
         );
-        assert_eq!(slot.program().backend, "a");
+        assert_eq!(slot.package().backend, "a");
         assert_eq!(
             slot.dispatch(&Room::default()).expect("an answer").refill,
             plan_of(1).refill
@@ -1928,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn a_program_is_built_from_the_arguments_the_daemon_states() {
+    fn a_package_is_built_from_the_arguments_the_daemon_states() {
         let arguments = [
             ("chunked_prefill_size".to_owned(), "2048".to_owned()),
             ("max_batch".to_owned(), "16".to_owned()),
@@ -1936,21 +1936,21 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let program =
-            PolicyProgram::from_arguments("fcfs", 3, &arguments).expect("the arguments parse");
-        assert_eq!(program.backend, "fcfs");
-        assert_eq!(program.revision, 3);
-        assert_eq!(program.arguments.chunked_prefill_size, Some(2048));
-        assert_eq!(program.arguments.max_batch, Some(16));
-        assert_eq!(program.arguments.expected_speedup, Some(2.5));
+        let package =
+            PolicyPackage::from_arguments("fcfs", 3, &arguments).expect("the arguments parse");
+        assert_eq!(package.backend, "fcfs");
+        assert_eq!(package.revision, 3);
+        assert_eq!(package.arguments.chunked_prefill_size, Some(2048));
+        assert_eq!(package.arguments.max_batch, Some(16));
+        assert_eq!(package.arguments.expected_speedup, Some(2.5));
     }
 
     #[test]
-    fn the_program_a_precopy_states_is_the_program_the_policy_runs() {
-        // The wire form is the Program Server's `Program`: a name, a revision,
-        // and each argument as its TOML text. Nothing about the program is
+    fn the_package_a_precopy_states_is_the_package_the_policy_runs() {
+        // The wire form is the Build Server's `PackageRevision`: a name, a revision,
+        // and each argument as its TOML text. Nothing about the package is
         // decided by the mechanism on the way.
-        let stated = proto::process::Program {
+        let stated = proto::process::PackageRevision {
             backend: "priority".to_owned(),
             revision: 7,
             arguments: [
@@ -1960,22 +1960,22 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        let program = PolicyProgram::from_program(&stated).expect("the program parses");
-        assert_eq!(program.backend, "priority");
-        assert_eq!(program.revision, 7);
-        assert_eq!(program.arguments.max_batch, Some(32));
+        let package = PolicyPackage::from_package_revision(&stated).expect("the package parses");
+        assert_eq!(package.backend, "priority");
+        assert_eq!(package.revision, 7);
+        assert_eq!(package.arguments.max_batch, Some(32));
         assert_eq!(
-            program.arguments.timeout,
+            package.arguments.timeout,
             Some(scheduling::guest::time::Nanos(5))
         );
     }
 
     #[test]
-    fn a_program_argument_this_build_does_not_name_is_refused() {
+    fn a_package_argument_this_build_does_not_name_is_refused() {
         let arguments = [("chunked_prefill_size_v2".to_owned(), "2048".to_owned())]
             .into_iter()
             .collect();
-        let built = PolicyProgram::from_arguments("fcfs", 3, &arguments);
+        let built = PolicyPackage::from_arguments("fcfs", 3, &arguments);
         assert!(matches!(built, Err(PolicyError::Load { .. })));
     }
 
@@ -2015,7 +2015,7 @@ mod tests {
             route,
             ..Toy::default()
         };
-        let prepared = Router::prepare(&source(&toy(1)), program("a", 1), &ranks, &ceilings())
+        let prepared = Router::prepare(&source(&toy(1)), package("a", 1), &ranks, &ceilings())
             .expect("the candidate prepares");
         router.adopt(prepared);
         router
@@ -2023,9 +2023,9 @@ mod tests {
             .expect("the switchover installs it");
         assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
 
-        // A program that names a rank it was not offered fails, and the
-        // program before it routes the request and those after it.
-        let prepared = Router::prepare(&source(&toy(5)), program("b", 2), &ranks, &ceilings())
+        // A package that names a rank it was not offered fails, and the
+        // package before it routes the request and those after it.
+        let prepared = Router::prepare(&source(&toy(5)), package("b", 2), &ranks, &ceilings())
             .expect("the candidate prepares");
         router.adopt(prepared);
         router
@@ -2034,10 +2034,10 @@ mod tests {
         assert_eq!(
             router
                 .route(&arrival, &ranks)
-                .expect("the previous program routes"),
+                .expect("the previous package routes"),
             1
         );
-        assert_eq!(router.program().map(|p| p.backend.as_str()), Some("a"));
+        assert_eq!(router.package().map(|p| p.backend.as_str()), Some("a"));
         assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
 
         // A node of one scheduler routes every request there and asks no policy.
@@ -2045,18 +2045,18 @@ mod tests {
     }
 
     #[test]
-    fn a_program_resolves_with_the_arguments_the_deployment_stated() {
-        // The Program Server resolves a program by backend, revision and the
+    fn a_package_resolves_with_the_arguments_the_deployment_stated() {
+        // The Build Server resolves a package by backend, revision and the
         // arguments that were stated; it fills the package's defaults for the
         // rest, so the source carries exactly what the daemon named.
         let arguments = std::collections::BTreeMap::from([
             ("max_batch".to_owned(), "16".to_owned()),
             ("timeout".to_owned(), "5000000000".to_owned()),
         ]);
-        let built = PolicyProgram::from_arguments("fcfs", 7, &arguments)
+        let built = PolicyPackage::from_arguments("fcfs", 7, &arguments)
             .expect("the arguments are the policy's");
         let server = built
-            .to_server_program()
+            .to_package_revision()
             .expect("the arguments are TOML values");
         assert_eq!(server.backend, "fcfs");
         assert_eq!(server.revision, 7);
@@ -2074,10 +2074,10 @@ mod tests {
         // store's wasm target (`Manifest::builds_for` answers that key and no
         // other for a package with no kernel), so a source that named a CPU
         // triple asked for a path no install writes and no package declares.
-        let source = ProgramSource::connect("/tmp/none.sock");
+        let source = ModuleSource::connect("/tmp/none.sock");
         assert_eq!(
             source.target().as_str(),
-            program_server::manifest::WASM_TARGET
+            build_server::manifest::WASM_TARGET
         );
         assert_eq!(source.socket(), std::path::Path::new("/tmp/none.sock"));
     }
@@ -2090,7 +2090,7 @@ mod tests {
 /// rather than anywhere the deployment's configuration could be blamed.
 #[cfg(test)]
 mod shipped_packages {
-    use super::PolicyProgram;
+    use super::PolicyPackage;
 
     #[test]
     fn every_package_states_arguments_this_build_reads() {
@@ -2098,7 +2098,7 @@ mod shipped_packages {
         for package in [
             "crates/scheduling/policies/fcfs/package.toml",
             "crates/scheduling/policies/priority/package.toml",
-            "crates/ops/program-fixtures/policy/package.toml",
+            "crates/ops/package-fixtures/policy/package.toml",
         ] {
             let path = root.join(package);
             let text = std::fs::read_to_string(&path)
@@ -2130,7 +2130,7 @@ mod shipped_packages {
             {
                 arguments.insert(name.clone(), value.to_string());
             }
-            PolicyProgram::from_arguments(backend, 0, &arguments)
+            PolicyPackage::from_arguments(backend, 0, &arguments)
                 .unwrap_or_else(|error| panic!("{package}: {error}"));
         }
     }

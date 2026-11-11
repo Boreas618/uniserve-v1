@@ -8,9 +8,9 @@
 //!
 //! ## Tuning constants
 //!
-//! A few operator descriptors carry a constant that belongs to the kernel program rather than to
+//! A few operator descriptors carry a constant that belongs to the kernel package rather than to
 //! the model's geometry: the row tile a normalization loads, the tokens one embedding program
-//! handles, the launch variant. The design gives those constants to the program package (tile
+//! handles, the launch variant. The design gives those constants to the package (tile
 //! constants are package content, and a program's arguments come from the epoch's program record),
 //! while `load_model` here has no program record to read. Following a uniform rule per operator
 //! keeps the descriptor canonical and every launch path the same until the program arguments are
@@ -81,7 +81,7 @@ pub use transpose::Transpose;
 pub use ulysses::{Interval, UlyssesAttention, UlyssesSpec};
 pub use vsa::{Branches, VsaAttention, VsaSpec, VsaTables};
 
-/// The constants a layer's operator descriptor carries and the program package owns.
+/// The constants a layer's operator descriptor carries and the package owns.
 ///
 /// See the module documentation: one place, one rule, until the program arguments reach loading.
 pub mod launch {

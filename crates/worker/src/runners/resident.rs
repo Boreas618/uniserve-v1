@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 
 use nn::KvPlanes;
-use ops::{DType, DevicePtr, Shape, Strides, Operand};
+use ops::{DType, DevicePtr, Operand, Shape, Strides};
 use platform::{Buffer, PoolKind, Stream};
 
 use crate::arena::Pools;

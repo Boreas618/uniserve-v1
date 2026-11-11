@@ -1,4 +1,4 @@
-# The tile_stitch operator's Triton backend: design 5.2's program package.
+# The tile_stitch operator's Triton backend: design 5.2's package.
 #
 # One module per descriptor: a clip's decoded tiles from their tokens into its raster, with the seam
 # blends and the crop on the way. The element type, the channels and the patch are compiled; the

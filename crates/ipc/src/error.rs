@@ -29,10 +29,10 @@ pub enum EncodingError {
     /// example a message of another type or of another build.
     #[error("worker message encoding error: decoding a message")]
     Decode(#[source] rmp_serde::decode::Error),
-    /// A program could not cross the wire: an argument is not the TOML value
+    /// A package could not cross the wire: an argument is not the TOML value
     /// its slot states, or a field the wire form requires is absent.
-    #[error("program wire error: {what}")]
-    Program {
+    #[error("package wire error: {what}")]
+    PackageRevision {
         /// What the wire form could not carry.
         what: Cow<'static, str>,
     },

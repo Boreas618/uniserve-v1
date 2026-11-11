@@ -39,7 +39,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand, row_writable};
+use crate::tensor::{DType, Operand, Shape, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -214,7 +214,7 @@ impl Args {
 pub struct Unpatchify;
 
 impl Op for Unpatchify {
-    const NAME: &'static str = proto::program::operator::UNPATCHIFY_VIDEO;
+    const NAME: &'static str = proto::module::operator::UNPATCHIFY_VIDEO;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

@@ -26,7 +26,7 @@ max_num_batched_tokens = 8192
 prefetch_min_tokens = 256
 
 # The package's build script: it compiles the crate to wasm32 and writes the raw
-# module the Program Server precompiles (design §5.2, §6.2).
+# module the Build Server precompiles (design §5.2, §6.2).
 [source]
 kind = "wasm"
 files = ["Cargo.toml", "src/lib.rs", "src/build.py"]

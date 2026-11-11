@@ -1,6 +1,6 @@
 //! Descriptor keys: the canonical text of the parameter values one compilation covers.
 //!
-//! A descriptor is the set of values a kernel program bakes into a module, and its `Display` is the
+//! A descriptor is the set of values a kernel package bakes into a module, and its `Display` is the
 //! key: `dtype_bf16_head_dim_128_page_64`. That text is the last segment of
 //! the module's path, so it has to be canonical: the same values must give
 //! the same bytes on every host and in every build. Two rules keep it so:

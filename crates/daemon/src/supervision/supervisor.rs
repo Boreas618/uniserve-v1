@@ -20,7 +20,7 @@
 //!
 //! A main process starts from a launch file, which the spawn carries
 //! (`Spawn::launch`): the daemon of the node it runs on states its own node's
-//! Program Server in it and writes it to its own runtime directory, so the
+//! Build Server in it and writes it to its own runtime directory, so the
 //! leader starts a main process on any node of the deployment the same way.
 //!
 //! A worker group's first rank serves the group's collective store. The
@@ -157,10 +157,10 @@ pub(crate) struct Supervisor {
     children: HashMap<Key, Supervised>,
     reservations: HashMap<u64, Reservation>,
     next_reservation: u64,
-    /// This node's Program Server, which a main process started here resolves its modules from:
+    /// This node's Build Server, which a main process started here resolves its modules from:
     /// it is started on the first such spawn when it does not serve yet, and its socket is the one
     /// the launch file names. `None` keeps the socket the launch states.
-    program_server: Option<program_server::command::Settings>,
+    build_server: Option<build_server::command::Settings>,
 }
 
 /// A daemon's lifeline: both ends of the pipe, close-on-exec in the
@@ -200,18 +200,15 @@ impl Supervisor {
             children: HashMap::new(),
             reservations: HashMap::new(),
             next_reservation: 1,
-            program_server: None,
+            build_server: None,
         })
     }
 
-    /// States this node's Program Server, which the main processes started here resolve their
+    /// States this node's Build Server, which the main processes started here resolve their
     /// modules from.
     #[must_use]
-    pub(crate) fn with_program_server(
-        mut self,
-        settings: program_server::command::Settings,
-    ) -> Self {
-        self.program_server = Some(settings);
+    pub(crate) fn with_build_server(mut self, settings: build_server::command::Settings) -> Self {
+        self.build_server = Some(settings);
         self
     }
 
@@ -222,10 +219,10 @@ impl Supervisor {
             serde_json::from_slice(&spawn.launch).map_err(|error| {
                 format!("reading the launch of engine {}: {error}", spawn.generation)
             })?;
-        if let Some(settings) = &self.program_server {
-            let socket = crate::engine::control::ensure_program_server(settings)
-                .map_err(|error| format!("starting this node's Program Server: {error:#}"))?;
-            launch.program_server = socket.display().to_string();
+        if let Some(settings) = &self.build_server {
+            let socket = crate::engine::control::ensure_build_server(settings)
+                .map_err(|error| format!("starting this node's Build Server: {error:#}"))?;
+            launch.build_server = socket.display().to_string();
         }
         crate::engine::launch::write(
             &crate::options::runtime_directory(),

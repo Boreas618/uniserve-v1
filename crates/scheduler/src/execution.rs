@@ -914,8 +914,8 @@ impl Scheduler {
             Ok(report) => {
                 tracing::warn!(
                     scheduler = ?report.scheduler,
-                    backend = %report.program.backend,
-                    revision = report.program.revision,
+                    backend = %report.package.backend,
+                    revision = report.package.revision,
                     reason = %report.reason,
                     "the policy failed; serving on under the previous one"
                 );

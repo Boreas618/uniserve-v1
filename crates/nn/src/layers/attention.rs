@@ -15,8 +15,8 @@
 use ops::attention::dense::{DenseArgs, DenseAttention as DenseOp, DenseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention as PagedOp, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvWrite, KvWriteScaled};
-use ops::{DType, Shape, Operand};
-use proto::program::PhaseKind;
+use ops::{DType, Operand, Shape};
+use proto::module::PhaseKind;
 
 use crate::capability::{KvGroup, KvLayer, TokenBatch};
 #[cfg(any(doc, test))]

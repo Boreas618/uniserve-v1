@@ -5,7 +5,7 @@
 """
 
 import add_rms_norm as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The floating dtypes an activation row, its residual and its outputs may have.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}

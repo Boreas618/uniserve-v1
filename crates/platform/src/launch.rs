@@ -1,6 +1,6 @@
 //! Loaded kernels, their launch configuration, and per-function attributes.
 //!
-//! A kernel program's module carries the launch configuration its metadata
+//! A kernel package's module carries the launch configuration its metadata
 //! declares (Triton's `num_warps`, `shared`, `num_ctas`, `launch_pdl` and
 //! `launch_cooperative_grid`); the operator computes only the grid. This
 //! module turns that configuration into one `cuLaunchKernelEx` call, so a

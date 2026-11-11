@@ -28,7 +28,7 @@ use nn::capability::{
 };
 use nn::{Forward, Result};
 use ops::logits::{GatherArgs, GatherDescriptor, LogitsGather};
-use ops::{DType, Op, Shape, Operand};
+use ops::{DType, Op, Operand, Shape};
 use platform::{Allocator, Budget, Device, DeviceId, PoolKind, Stream};
 use proto::video::{LatentShape, Layout};
 use worker::arena::Pools;
@@ -541,7 +541,7 @@ fn a_denoiser_records_the_openings_its_conditions_admit() {
     );
 }
 
-/// The device bench of nn's integration tests: one GPU and the Program Server that builds the
+/// The device bench of nn's integration tests: one GPU and the Build Server that builds the
 /// kernels a generation holds.
 #[path = "../../nn/tests/support/mod.rs"]
 mod support;
@@ -660,7 +660,7 @@ impl Denoiser for Copying {
 /// would find no kernel), and the captured graphs' launches are the recorded keys less those of the
 /// forwards the runner issues eagerly, which no graph holds.
 #[test]
-#[ignore = "requires a CUDA device and a Program Server (UNISERVE_PROGRAM_SERVER_SOCKET)"]
+#[ignore = "requires a CUDA device and a Build Server (UNISERVE_BUILD_SERVER_SOCKET)"]
 fn a_denoiser_captures_exactly_the_programs_its_walk_records() {
     let shape = DenoiserShape {
         stack: DType::BF16,

@@ -39,7 +39,7 @@ use nn::layers::{
     Rounding, Spectrum,
 };
 use nn::weights::Scope;
-use nn::{DType, Forward, Shape, Operand};
+use nn::{DType, Forward, Operand, Shape};
 
 use crate::config::{Config, Mixer, TextConfig};
 use crate::{Error, Result};

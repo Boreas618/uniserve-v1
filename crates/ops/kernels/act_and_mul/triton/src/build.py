@@ -2,8 +2,8 @@
 
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
-dimensions give, and the compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+dimensions give, and the compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The element count one launch walks, the gate and value row strides, the row width, the activation,
 the 64-bit addressing and the two flags are all in the key, because each one changes what the module
@@ -12,7 +12,7 @@ in.
 """
 
 import act_and_mul as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The floating dtypes the gates, the values and the output may have, as Triton spells them in an
 #: argument signature.

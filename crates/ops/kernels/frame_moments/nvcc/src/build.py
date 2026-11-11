@@ -5,7 +5,7 @@ The module is this package's kernel compiled with nvcc into a shared object expo
 descriptor of this package compiles the same object; the descriptor name is what the store keys the
 revision by.
 
-The Program Server runs this script with its own Python environment, its working directory the
+The Build Server runs this script with its own Python environment, its working directory the
 package root, and `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and
 `UNISERVE_OUT` in the environment; `--package`, `--descriptor`, `--target` and `--out` name
 the same values on the command line.
@@ -54,7 +54,7 @@ def main():
     """Compile the kernel for one descriptor into ``module.so``."""
     package, descriptor, target, out = arguments()
     out.mkdir(parents=True, exist_ok=True)
-    # The nvcc the Program Server checked against this package's declared version.
+    # The nvcc the Build Server checked against this package's declared version.
     compiler = os.environ["UNISERVE_NVCC"]
 
     # No fast math: the arithmetic is PyTorch's, and its expressions must round as

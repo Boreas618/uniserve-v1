@@ -11,7 +11,7 @@ while the arithmetic does not.
 """
 
 import transpose as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: Triton's element type for each element type the operator accepts.
 POINTERS = {"f16": "*fp16", "bf16": "*bf16", "f32": "*fp32"}

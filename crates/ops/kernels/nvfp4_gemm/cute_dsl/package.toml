@@ -1,4 +1,4 @@
-# The nvfp4_gemm operator's CuTe DSL backend: design 5.2's program package.
+# The nvfp4_gemm operator's CuTe DSL backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py`.

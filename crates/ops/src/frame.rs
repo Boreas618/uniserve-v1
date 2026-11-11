@@ -24,7 +24,7 @@ use std::mem::{offset_of, size_of};
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, Operand};
+use crate::tensor::{DType, Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -111,7 +111,7 @@ pub struct FramePadArgs {
 pub struct FramePad;
 
 impl Op for FramePad {
-    const NAME: &'static str = proto::program::operator::FRAME_PAD;
+    const NAME: &'static str = proto::module::operator::FRAME_PAD;
 
     type Descriptor = FramePadDescriptor;
     type Args<'a> = FramePadArgs;
@@ -427,7 +427,7 @@ pub struct FrameMomentsArgs {
 pub struct FrameMoments;
 
 impl Op for FrameMoments {
-    const NAME: &'static str = proto::program::operator::FRAME_MOMENTS;
+    const NAME: &'static str = proto::module::operator::FRAME_MOMENTS;
 
     type Descriptor = FrameMomentsDescriptor;
     type Args<'a> = FrameMomentsArgs;
@@ -683,7 +683,7 @@ pub struct FrameNormPadArgs {
 pub struct FrameNormPad;
 
 impl Op for FrameNormPad {
-    const NAME: &'static str = proto::program::operator::FRAME_NORM_PAD;
+    const NAME: &'static str = proto::module::operator::FRAME_NORM_PAD;
 
     type Descriptor = FrameNormPadDescriptor;
     type Args<'a> = FrameNormPadArgs;

@@ -27,7 +27,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, DevicePtr, Shape, Operand};
+use crate::tensor::{DType, DevicePtr, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -111,7 +111,7 @@ impl TopkSoftmax {
 }
 
 impl Op for TopkSoftmax {
-    const NAME: &'static str = proto::program::operator::TOPK_SOFTMAX;
+    const NAME: &'static str = proto::module::operator::TOPK_SOFTMAX;
 
     type Descriptor = TopkDescriptor;
     type Args<'a> = TopkArgs;

@@ -12,7 +12,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -55,7 +55,7 @@ pub struct GatherArgs {
 pub struct LogitsGather;
 
 impl Op for LogitsGather {
-    const NAME: &'static str = proto::program::operator::LOGITS_GATHER;
+    const NAME: &'static str = proto::module::operator::LOGITS_GATHER;
 
     type Descriptor = GatherDescriptor;
     type Args<'a> = GatherArgs;
@@ -167,7 +167,7 @@ pub struct UnpadArgs {
 pub struct VocabUnpad;
 
 impl Op for VocabUnpad {
-    const NAME: &'static str = proto::program::operator::VOCAB_UNPAD;
+    const NAME: &'static str = proto::module::operator::VOCAB_UNPAD;
 
     type Descriptor = UnpadDescriptor;
     type Args<'a> = UnpadArgs;

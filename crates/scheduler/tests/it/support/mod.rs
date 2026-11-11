@@ -74,7 +74,7 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
 
 use ipc::{CallKind, ForwardMode, MainProcessInfo, MediaCall};
 use scheduler::{GenerationFeatures, GenerationLimits};
-use scheduler::{Parameters, PolicyProgram, Scheduler, SchedulerConfig, SpecialTokenIds, Worker};
+use scheduler::{Parameters, PolicyPackage, Scheduler, SchedulerConfig, SpecialTokenIds, Worker};
 use testkit::EndOfText;
 
 /// Builds a scheduler over the simulated worker `worker`, whose model limits
@@ -191,10 +191,10 @@ pub(crate) fn generation_limits(calls: &[CallKind]) -> GenerationLimits {
 
 /// The policy module every integration test's epoch serves with.
 ///
-/// A deployed epoch takes its policy from the Program Server; a test epoch has
+/// A deployed epoch takes its policy from the Build Server; a test epoch has
 /// none, and a scheduler with no policy decides nothing — no plan, no
 /// admission, no batch — so an epoch that submits a request must be given one.
-/// The module is the `fcfs` program this tree builds for
+/// The module is the `fcfs` package this tree builds for
 /// `wasm32-unknown-unknown`, the one that reproduces the rules the tests were
 /// written against: `testkit::packaged_module` builds it on first use, and a
 /// module named by `SCHED_POLICY_WASM` is read instead.
@@ -215,7 +215,7 @@ pub(crate) fn install_policy_stating(
     stated: Parameters,
 ) {
     let ceilings = scheduler::ceilings_of(capacity);
-    let program = PolicyProgram {
+    let package = PolicyPackage {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: Parameters {
@@ -231,7 +231,7 @@ pub(crate) fn install_policy_stating(
     };
     let source = scheduler::PolicyBytes::new(policy_module());
     scheduler
-        .install_policy(program, &source)
+        .install_policy(package, &source)
         .unwrap_or_else(|error| panic!("the fcfs policy is installed: {error}"));
 }
 
@@ -246,7 +246,7 @@ pub(crate) fn install_policy_on(
     capacity: scheduler::BatchCapacity,
 ) {
     let ceilings = scheduler::ceilings_of(capacity);
-    let program = PolicyProgram {
+    let package = PolicyPackage {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: Parameters {
@@ -263,7 +263,7 @@ pub(crate) fn install_policy_on(
     let source: std::sync::Arc<dyn scheduler::PolicySource + Send + Sync> =
         std::sync::Arc::new(scheduler::PolicyBytes::new(policy_module()));
     handle
-        .precopy_policy(program, source)
+        .precopy_policy(package, source)
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the scheduler answers a precopy")
         .expect("the fcfs policy is precopied");

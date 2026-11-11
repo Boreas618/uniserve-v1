@@ -3,7 +3,7 @@
 //! The mechanism measures time with one monotonic clock per process; a policy
 //! only compares instants and durations, never reads a clock of its own (a
 //! policy that did would make the same decisions untestable and would let a
-//! randomized policy diverge from its program's seed). Both are nanoseconds of
+//! randomized policy diverge from its package's seed). Both are nanoseconds of
 //! that clock since the process started.
 
 use serde::{Deserialize, Serialize};

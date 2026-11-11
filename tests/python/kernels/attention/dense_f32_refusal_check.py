@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that a dense-attention module **refuses** the calls it was not built for — no GPU needed.
 
-    crates/program-server/python/.venv/bin/python refusal_check.py <causal module dir> <dense module dir>
+    crates/build-server/python/.venv/bin/python refusal_check.py <causal module dir> <dense module dir>
 
 Each module bakes two of its descriptor's fields into itself: the mask (`UNISERVE_CAUSAL`) and the
 sequence layout (`UNISERVE_SEQUENCES`). A module built causal and called dense would mask the future

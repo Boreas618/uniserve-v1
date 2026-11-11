@@ -1,8 +1,8 @@
-# The snake operator's Triton backend: design 5.2's program package.
+# The snake operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # The key is the one `Descriptor`'s `Display` prints, e.g.
 # `dtype_bf16_channels_512_block_1024_pdl_false`. The channel count is the parameter

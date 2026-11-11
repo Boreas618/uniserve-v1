@@ -7,7 +7,7 @@ is the direction, the hidden width, the routes per token, the expert count, the
 transport's capacity, the group size and the activation type; the kernels read
 them at launch, so every descriptor of this package compiles the same object.
 
-The Program Server runs this script with its own Python environment, its working
+The Build Server runs this script with its own Python environment, its working
 directory the package root, and `UNISERVE_OP`, `UNISERVE_BACKEND`,
 `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE`, `UNISERVE_OUT` and
 `MAX_JOBS` in the environment.
@@ -64,7 +64,7 @@ def main():
     """Compile the exchange for one descriptor into ``module.so``."""
     package, descriptor, target, out = arguments()
     out.mkdir(parents=True, exist_ok=True)
-    # The nvcc the Program Server checked against this package's declared version.
+    # The nvcc the Build Server checked against this package's declared version.
     compiler = os.environ["UNISERVE_NVCC"]
 
     command = [

@@ -6,7 +6,7 @@ the row width and the chunk count are launch values.
 """
 
 import top_logprobs as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The widest chunk a program holds in registers with its ids.
 MAX_TILE = 8192

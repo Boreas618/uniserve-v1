@@ -7,7 +7,7 @@ FlashInfer calls `Gemm2::Runner` -- compiled out of the FlashInfer
 distribution's data tree against the pinned `trtllm-gen-bmm` artifact, with this
 package's C entry in front of it and the artifact's cubins published beside the
 module under `cubins/`. The steps are the routed products' shared build,
-`uniserve_program_server.trtllm.build_routed_gemm`; the kernels it selects are
+`uniserve_build_server.trtllm.build_routed_gemm`; the kernels it selects are
 the ones the manifest's `[parameters.selected]` options and the descriptor's
 tile and cluster name.
 
@@ -15,7 +15,7 @@ A descriptor is the operator's: hidden, intermediate, experts, top, dtype,
 scale, layout, tile, cluster.
 """
 
-from uniserve_program_server import trtllm
+from uniserve_build_server import trtllm
 
 #: The eltwise activation each of the operator's activations is, in the
 #: artifact's own enumeration (`gemm::EltwiseActType`). This product is linear,

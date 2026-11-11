@@ -2,9 +2,9 @@
 //! call, launch it, shadow it, and say how far two implementations of it may differ.
 //!
 //! An operator is a Rust type, not a trait object and not a name in a table. Its Rust signature is
-//! the interface a kernel program fills: the package implements what [`Op::launch`] launches, and a
+//! the interface a kernel package fills: the package implements what [`Op::launch`] launches, and a
 //! change of signature is a change of the crate. The trait is
-//! defined once here so that the catalogue of operators, the program packages and the
+//! defined once here so that the catalogue of operators, the packages and the
 //! loaders all describe the same thing.
 
 use std::fmt::Display;
@@ -116,7 +116,7 @@ pub trait Call {
 /// Where a launching forward sends its calls, when the runtime routes them itself.
 ///
 /// The runtime installs a route on a forward to launch some calls otherwise than once with the
-/// current generation's program: a program update's paired execution launches a replaced
+/// current generation's program: a generation update's paired execution launches a replaced
 /// operator's new and previous programs over the same inputs. A forward without a route, and every
 /// call a route declines, launches the current program once.
 pub trait Route {

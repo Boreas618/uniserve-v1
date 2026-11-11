@@ -8,7 +8,7 @@
 //!
 //! This module is the handle every other thread holds. The scheduling mechanism submits a batch and
 //! gets a [`Submission`] it can wait on; the control thread reads the watchdog and probes the
-//! device's context for a sticky error (2.4); the program-layer update sends `precopy`,
+//! device's context for a sticky error (2.4); the generation update sends `precopy`,
 //! `switchover` and `purge`, which take effect at batch boundaries (7.3).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,7 +48,7 @@ pub struct Worker {
     pools: Arc<std::sync::Mutex<Pools>>,
     /// What the device has done since it started, for the metrics report (7.3).
     counters: Arc<SharedCounters>,
-    /// The operators the last program-layer update could not compare, each with its reason
+    /// The operators the last generation update could not compare, each with its reason
     /// (7.3 step 2): the runners on this device write it as they prepare and shadow a generation,
     /// and the control thread reports it when the precopy finishes. Empty is a fact - every
     /// operator the update replaced was compared.
@@ -198,7 +198,7 @@ impl Worker {
     /// canvas), so there is one store per process and every device attaches the same one.
     ///
     /// From this call on the calling thread issues no device work for this device: everything
-    /// reaches the device through [`Worker::submit`], the program-layer calls, and the storage
+    /// reaches the device through [`Worker::submit`], the generation calls, and the storage
     /// owners' recorded jobs.
     /// Opens the device's one pool set, before anything that allocates on the device exists.
     ///
@@ -371,7 +371,7 @@ impl Worker {
         &self.copy_stream
     }
 
-    /// The operators the last program-layer update could not compare, each with its reason (7.3
+    /// The operators the last generation update could not compare, each with its reason (7.3
     /// step 2), in the order the device's runners recorded them.
     ///
     /// Read by the control thread when a precopy finishes, so the update's answer states what it
@@ -1402,7 +1402,7 @@ impl Device {
     /// Performs a runner's jobs in order, each on the runner that returned it.
     ///
     /// The answer is the output of the jobs that produced one; a job list with no output (every
-    /// program-layer command) answers empty.
+    /// generation command) answers empty.
     fn perform(&mut self, label: &str, jobs: Vec<Job>) -> Result<BatchOutput> {
         let mut output = BatchOutput::default();
         let last = jobs.len().saturating_sub(1);

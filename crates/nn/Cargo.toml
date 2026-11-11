@@ -13,7 +13,7 @@ publish = false
 ops = { path = "../ops" }
 # A family states what request processing serves of it beside what execution loads.
 processing.workspace = true
-# The phase vocabulary of a program's selection key (`proto::program::PhaseKind`).
+# The phase vocabulary of a program's selection key (`proto::module::PhaseKind`).
 proto.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -27,10 +27,10 @@ safetensors = "0.8.0"
 [dev-dependencies]
 tempfile.workspace = true
 # The device cases (`tests/reference.rs`, `tests/support/device.rs`) run layers on a device: they
-# allocate and copy through `platform` and ask a running Program Server for the kernels their
+# allocate and copy through `platform` and ask a running Build Server for the kernels their
 # forwards name.
 platform.workspace = true
-program-server.workspace = true
+build-server.workspace = true
 
 [lints]
 workspace = true

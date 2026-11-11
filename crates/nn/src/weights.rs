@@ -15,7 +15,7 @@
 //! Retained weights are keyed by exactly four inputs: the identity of every checkpoint file whose
 //! bytes produced the weight, the element type the weight has after conversion, the layout name,
 //! and the weight's region in its logical tensor. No program name or revision enters the key: a
-//! program-layer update keeps every retained weight. A change of dtype, quantization, layout or
+//! generation update keeps every retained weight. A change of dtype, quantization, layout or
 //! checkpoint therefore changes the key, and a change of an operator's program does not.
 //!
 //! ## Publishing
@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ops::fp4::ScaleLayout;
 use ops::values::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use ops::{DType, Shape, Operand};
+use ops::{DType, Operand, Shape};
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};

@@ -931,7 +931,7 @@ pub struct ParallelConfig {
 ///
 /// The leader daemon resolves it once from the serving options and hands the same value to every
 /// engine process of the epoch. Any change to it is a new epoch, except a change to a value that
-/// selects a program's backend or is a program's parameter, which the program layer applies in
+/// selects a package's backend or is a package's parameter, which the generation layer applies in
 /// place; [`EngineConfig::build_hash`] tells the two apart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -955,12 +955,12 @@ pub struct EngineConfig {
     /// it samples, so it is a property of the captured graphs and a request asking for more is
     /// refused. Zero reports no candidate.
     pub max_logprobs: u32,
-    /// The attention program's backend, and the ones that fill prompt processing and one decoding
+    /// The attention package's backend, and the ones that fill prompt processing and one decoding
     /// token when they differ.
     pub attention_backend: String,
     pub prefill_attention_backend: Option<String>,
     pub decode_attention_backend: Option<String>,
-    /// The grouped expert GEMM program's backend.
+    /// The grouped expert GEMM package's backend.
     pub moe_runner_backend: Option<String>,
     pub device: DeviceConfig,
     pub scheduler: SchedulerConfig,
@@ -979,10 +979,10 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     /// The identity of the build this configuration makes: two configurations whose hashes differ
-    /// need a new epoch, and two whose hashes agree differ at most in what the program layer
+    /// need a new epoch, and two whose hashes agree differ at most in what the generation layer
     /// changes in place (§7.7).
     ///
-    /// Every value enters it except those §7.7 assigns elsewhere: the program backends (attention,
+    /// Every value enters it except those §7.7 assigns elsewhere: the package backends (attention,
     /// the grouped expert GEMM, the expert exchange); the scheduling policy's parameters (the
     /// scheduler section, the batched token budget, the speculative cost figures); the probes'
     /// switches, which change at a step boundary; and the media section, which the frontend reads.
@@ -1046,15 +1046,15 @@ pub struct EngineArgs {
     pub requests: String,
     /// The daemon's process interface, `unix:<path>` or `<host>:<port>`: the
     /// supervision frames this process claims its storage with and reports to,
-    /// and the one place a program-layer command can reach it. A different
+    /// and the one place a generation command can reach it. A different
     /// vocabulary from `requests`, not a second address of the same one.
     pub processes: String,
     /// The identity the daemon started this process under: the engine number,
     /// or the launch generation in the epoch-switch path, where that is the
     /// only allocator.
     pub engine: u64,
-    /// The Program Server's socket.
-    pub program_server: String,
+    /// The Build Server's socket.
+    pub build_server: String,
     /// The devices this rank serves, as CUDA ordinals.
     pub devices: Vec<u32>,
     /// This rank's worker group, which keys its storage claims.
@@ -1133,7 +1133,7 @@ impl EngineArgs {
             requests: String::new(),
             processes: String::new(),
             engine: 0,
-            program_server: String::new(),
+            build_server: String::new(),
             devices: Vec::new(),
             group: String::new(),
             rank: 0,

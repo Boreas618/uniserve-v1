@@ -18,8 +18,8 @@ compares the output with the eager composition the operator replaces:
                              [--single-pixel] [--epsilon 1e-6] [--cpu-only]
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory with ``module.so``. Run it on the
-GPU host with the Program Server's own environment
-(``crates/program-server/python/.venv/bin/python``), which has torch. Without a device,
+GPU host with the Build Server's own environment
+(``crates/build-server/python/.venv/bin/python``), which has torch. Without a device,
 ``--cpu-only`` checks the call structure and the entry's refusal on the host.
 
 **What is checked, and what is not.** The moments the call carries are computed here by torch and

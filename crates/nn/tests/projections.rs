@@ -15,7 +15,7 @@ use nn::layers::{
 };
 use nn::quantization::{Declaration, KvCache, Scheme};
 use nn::weights::RetainedWeights;
-use nn::{Checkpoint, DType, DevicePtr, Shape, Operand, WeightKey, WeightLoader};
+use nn::{Checkpoint, DType, DevicePtr, Operand, Shape, WeightKey, WeightLoader};
 
 /// The format's name for an element type.
 fn dtype_name(dtype: DType) -> &'static str {

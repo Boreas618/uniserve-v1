@@ -11,7 +11,7 @@ import cutlass
 import cutlass.cute as cute
 import gather_gemm as kernels
 from cutlass.cute.runtime import make_ptr
-from uniserve_program_server import cute_dsl as driver
+from uniserve_build_server import cute_dsl as driver
 
 #: The gated activations the kernel class implements, by the operator's name.
 ACTIVATIONS = {"silu": "silu", "gelu_tanh": "gelu_tanh"}

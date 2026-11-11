@@ -11,7 +11,7 @@ the field's units per column are launch words.
 """
 
 import cache_copy_region as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: Triton's element type for each stored type the operator accepts, and its byte width. An FP8 pool
 #: is addressed as bytes: Triton's signature table has no pointer to a float8, so the kernel bitcasts

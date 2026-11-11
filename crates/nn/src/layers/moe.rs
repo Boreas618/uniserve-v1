@@ -37,7 +37,7 @@ use ops::moe::grouped::{
 };
 use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
-use ops::{DType, DevicePtr, Shape, Operand};
+use ops::{DType, DevicePtr, Operand, Shape};
 
 use crate::error::{Error, Result};
 use crate::family::Split;

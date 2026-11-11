@@ -12,7 +12,7 @@
 //! - [`report`]: the schedulers' statistics an engine reports to its daemon.
 //! - [`profile`]: the profiling sessions the leader daemon starts on the
 //!   workers, JSON in worker hooks.
-//! - [`program`]: the programs an epoch fills its operators with, the phases
+//! - [`module`]: the package revisions an epoch fills its operators with, the phases
 //!   and slots they fill, and the operators a build has.
 //!
 //! Each connection opens with a hello exchange that compares
@@ -23,8 +23,8 @@ pub mod catalog;
 pub mod config;
 mod connection;
 mod media;
+pub mod module;
 pub mod profile;
-pub mod program;
 pub mod report;
 pub mod request;
 mod shared_memory;

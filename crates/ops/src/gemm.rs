@@ -26,7 +26,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::{self, DevicePtr, Stream};
-use crate::tensor::{DType, Shape, Strides, Operand};
+use crate::tensor::{DType, Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -230,7 +230,7 @@ impl Gemm {
 }
 
 impl Op for Gemm {
-    const NAME: &'static str = proto::program::operator::GEMM;
+    const NAME: &'static str = proto::module::operator::GEMM;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

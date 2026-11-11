@@ -339,7 +339,7 @@ fn the_message_is_written_into_the_module() {
     assert_eq!(message[0], b'[');
 }
 
-/// An artifact outlives the engine that made it: the Program Server
+/// An artifact outlives the engine that made it: the Build Server
 /// precompiles a policy with one engine, a scheduler thread loads it with
 /// another built by `Engine::new()`, and the target `new` pins is what makes
 /// the two agree (a module from a differently targeted engine does not load).
@@ -627,7 +627,7 @@ fn a_precompiled_module_round_trips() {
     let toy = Toy::new().reply(Call::Dispatch.export(), &plan);
     let text = toy.wat();
 
-    // The Program Server compiles and precompiles for this host and serves the
+    // The Build Server compiles and precompiles for this host and serves the
     // artifact; the main process loads it (§5.3, §6.2).
     let artifact = engine.precompile(text.as_bytes()).unwrap();
     let module = engine.module(&artifact).unwrap();

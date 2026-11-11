@@ -226,12 +226,7 @@ impl Patchify {
     ///
     /// A raster that is not whole patches, too few tokens or tokens of another width, an arena that
     /// cannot hold the raster, or the operator's refusal.
-    pub fn inverse(
-        &self,
-        f: &Forward,
-        tokens: Operand,
-        raster: ops::Shape,
-    ) -> Result<Operand> {
+    pub fn inverse(&self, f: &Forward, tokens: Operand, raster: ops::Shape) -> Result<Operand> {
         let [frames, height, width] = self.grid(raster)?;
         let count = u64::from(frames) * u64::from(height) * u64::from(width);
         if tokens.shape.rank() != 2

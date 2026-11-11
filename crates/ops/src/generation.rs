@@ -1,14 +1,14 @@
 //! One generation of loaded kernels.
 //!
-//! A runner holds the generation it is serving and, during a program-layer update, the one it is
+//! A runner holds the generation it is serving and, during a generation update, the one it is
 //! switching to. A generation is immutable: a switchover builds the
 //! next one from the current one plus the kernels of the operators whose program changed, so every
 //! operator whose program did not change keeps its `Arc<Kernel>` — the same loaded module, not a
 //! second copy — and the modules of a replaced generation unload when the last `Arc` to them drops.
 //!
 //! A generation is keyed by (operator name, descriptor key). The operator name is the crate-level
-//! name a kernel program fills, the descriptor key is the canonical text of the values one
-//! compilation covers, and together they are the module's path under the program server's store.
+//! name a kernel package fills, the descriptor key is the canonical text of the values one
+//! compilation covers, and together they are the module's path under the build server's store.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,7 +41,7 @@ impl KernelEntry {
 
 /// The kernels one runner may launch, indexed by (operator, descriptor key).
 ///
-/// Built once and then read-only; a program-layer update builds the successor with [`Self::replace`]
+/// Built once and then read-only; a generation update builds the successor with [`Self::replace`]
 /// and hands it to the runner at a batch boundary.
 pub struct Generation {
     number: u64,

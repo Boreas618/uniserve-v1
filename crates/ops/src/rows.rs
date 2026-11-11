@@ -28,7 +28,7 @@
 //! instruction per scatter on every launch to detect a table a refusal upstream already makes
 //! unrepresentable.
 //!
-//! The program is a kernel program: one thread per (row, element) of the source, the row taken from
+//! The program is a kernel package: one thread per (row, element) of the source, the row taken from
 //! the second axis and the element block from the third, so a row's elements are never split across
 //! two blocks that could race on the same destination row. Parameters, in order: `source`,
 //! `destination`, `indices`, `count` (u32), `columns` (u32), `block` (u32), the PDL flag.
@@ -41,7 +41,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, Operand};
+use crate::tensor::{DType, Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -105,7 +105,7 @@ pub struct Args {
 pub struct Rows;
 
 impl Op for Rows {
-    const NAME: &'static str = proto::program::operator::ROWS;
+    const NAME: &'static str = proto::module::operator::ROWS;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

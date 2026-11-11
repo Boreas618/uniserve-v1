@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `rope_apply`'s kernel and check the rotation alone, on the CPU.
 
-    crates/program-server/python/.venv/bin/python rope_apply_check.py [--package DIR]
+    crates/build-server/python/.venv/bin/python rope_apply_check.py [--package DIR]
 
 The tables arrive already evaluated — one unit pair per turned feature and token — so the call costs
 only the rotation of each head's leading `ROTATED` channels:

@@ -22,7 +22,7 @@
 //! final `tanh` or clamp is the caller's: a PCM step clamps as it quantizes.
 
 use ops::activation1d::{self, Activation1d as Activation1dOp};
-use ops::{DType, Shape, Operand};
+use ops::{DType, Operand, Shape};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;

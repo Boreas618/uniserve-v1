@@ -89,7 +89,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, DevicePtr, Shape, Operand};
+use crate::tensor::{DType, DevicePtr, Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -423,7 +423,7 @@ impl NativeCall for Call {
 pub struct PagedAttention;
 
 impl Op for PagedAttention {
-    const NAME: &'static str = proto::program::operator::PAGED_ATTENTION;
+    const NAME: &'static str = proto::module::operator::PAGED_ATTENTION;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

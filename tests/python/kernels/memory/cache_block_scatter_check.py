@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `cache_block_scatter` on Triton's interpreter and check the blocks it writes.
 
-    crates/program-server/python/.venv/bin/python scatter_check.py [--package DIR]
+    crates/build-server/python/.venv/bin/python scatter_check.py [--package DIR]
 
 A state bank stores each field block-major: axis 0 selects a block and the trailing axes are the
 block's own, **at the field's own strides** — one manifest cell's blocks start 2048 elements apart

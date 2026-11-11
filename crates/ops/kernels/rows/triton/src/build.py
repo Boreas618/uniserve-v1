@@ -10,7 +10,7 @@ differs between them — and `columns` is the row width the program addresses wi
 """
 
 import rows as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The element types the rows are stored in.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}

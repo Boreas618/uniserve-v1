@@ -9,8 +9,8 @@ compares the module's output with exact attention computed in torch.
     python dense_check.py <module_dir> [--batch 8] [--len 3000] [--query-len 512]
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory holding
-``module.so``. Run it on the GB200 with the Program Server's own environment
-(``crates/program-server/python/.venv/bin/python``), which has torch.
+``module.so``. Run it on the GB200 with the Build Server's own environment
+(``crates/build-server/python/.venv/bin/python``), which has torch.
 
 The module is compiled for the representative problem its manifest's ``[parameters]``
 state (batch 8, 512 queries per launch); this check stays at that shape and varies only

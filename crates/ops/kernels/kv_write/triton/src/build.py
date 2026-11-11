@@ -10,7 +10,7 @@ arguments carry no scale tensors, so an FP8 cache has no correct write here yet.
 """
 
 import kv_write as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: Element types the keys, the values and the cache share here.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}

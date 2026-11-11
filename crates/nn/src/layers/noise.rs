@@ -14,7 +14,7 @@
 //!   must draw from `(seed, index)` whatever the buffer's shape is.
 
 use ops::noise::{self, KeySource, NoiseKind, PhiloxNoise as NoiseOp};
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;

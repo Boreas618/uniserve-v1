@@ -333,6 +333,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-server"
+version = "2.0.0"
+dependencies = [
+ "clap",
+ "libc",
+ "ops",
+ "prost",
+ "prost-build",
+ "proto",
+ "protox",
+ "serde",
+ "serde_json",
+ "service",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -899,6 +920,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "build-server",
  "bytes",
  "clap",
  "frontend",
@@ -908,7 +930,6 @@ dependencies = [
  "libc",
  "platform",
  "processing",
- "program-server",
  "prometheus-client",
  "prost",
  "proto",
@@ -1159,13 +1180,13 @@ name = "engine"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "build-server",
  "crossbeam-channel",
  "ipc",
  "nn",
  "ops",
  "platform",
  "processing",
- "program-server",
  "proto",
  "scheduler",
  "serde_json",
@@ -2595,11 +2616,11 @@ dependencies = [
 name = "nn"
 version = "2.0.0"
 dependencies = [
+ "build-server",
  "memmap2",
  "ops",
  "platform",
  "processing",
- "program-server",
  "proto",
  "safetensors",
  "serde",
@@ -3037,27 +3058,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
-]
-
-[[package]]
-name = "program-server"
-version = "2.0.0"
-dependencies = [
- "clap",
- "libc",
- "ops",
- "prost",
- "prost-build",
- "proto",
- "protox",
- "serde",
- "serde_json",
- "service",
- "sha2",
- "tempfile",
- "thiserror",
- "toml",
- "tracing",
 ]
 
 [[package]]
@@ -3681,11 +3681,11 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "build-server",
  "crossbeam-channel",
  "ipc",
  "libc",
  "png",
- "program-server",
  "proto",
  "scheduler",
  "scheduling",
@@ -4701,6 +4701,7 @@ name = "uniserve"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "build-server",
  "clap",
  "daemon",
  "engine",
@@ -4710,7 +4711,6 @@ dependencies = [
  "nn",
  "platform",
  "processing",
- "program-server",
  "qwen3",
  "rustix",
  "serde",
@@ -5697,6 +5697,7 @@ name = "worker"
 version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
+ "build-server",
  "bytemuck",
  "crossbeam-channel",
  "indexmap 2.14.0",
@@ -5708,7 +5709,6 @@ dependencies = [
  "nvtx",
  "ops",
  "platform",
- "program-server",
  "proto",
  "rusqlite",
  "rustix",

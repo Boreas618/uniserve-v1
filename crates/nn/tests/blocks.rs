@@ -8,7 +8,7 @@
 use nn::blocks::{GateUp, GatedMlp, GatedMlpSpec};
 use nn::family::Split;
 use nn::layers::Rounding;
-use nn::{Arena, Checkpoint, DType, Forward, Shape, Operand, WeightLoader};
+use nn::{Arena, Checkpoint, DType, Forward, Operand, Shape, WeightLoader};
 use ops::activation::Activation;
 
 /// Runs `walk` with a capture sink installed and answers the operators it reported, in order.

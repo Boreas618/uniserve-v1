@@ -169,33 +169,33 @@ pub struct ServerArgs {
     /// one it does not take.
     #[arg(skip)]
     pub mm_processor_kwargs: serde_json::Map<String, Value>,
-    /// Attention program (the paged-attention operator's backend) for every
+    /// Attention package (the paged-attention operator's backend) for every
     /// attention call, by the name the ranks' attention registry gives it;
     /// `auto` selects a native kernel per call.
     #[arg(skip)]
     pub attention_backend: String,
-    /// The attention program that fills prompt processing; unset takes
+    /// The attention package that fills prompt processing; unset takes
     /// `attention_backend` (`prefill_attention_backend`).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(skip)]
     pub prefill_attention_backend: Option<String>,
-    /// The attention program that fills one decoding token; unset takes
+    /// The attention package that fills one decoding token; unset takes
     /// `attention_backend` (`decode_attention_backend`, §5.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(skip)]
     pub decode_attention_backend: Option<String>,
-    /// The grouped expert GEMM program (`moe_runner_backend`, §5.1, §9);
+    /// The grouped expert GEMM package (`moe_runner_backend`, §5.1, §9);
     /// unset lets the daemon resolve it when it prepares the epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(skip)]
     pub moe_runner_backend: Option<String>,
-    /// This host's Program Server (`program_config`): the socket the daemon
-    /// prepares an epoch's programs at (§5.1, §6.3), the Program Server's
+    /// This host's Build Server (`build_config`): the socket the daemon
+    /// prepares an epoch's modules at (§5.1, §6.3), the Build Server's
     /// default socket when unset, and the settings it starts the host's
-    /// Program Server with when none serves there. A host-layer value: the
+    /// Build Server with when none serves there. A host-layer value: the
     /// daemon reads it alone, and a change of it is a hot restart.
     #[arg(skip)]
-    pub program_config: program_server::command::Settings,
+    pub build_config: build_server::command::Settings,
     /// Concurrently resident requests, clamped to what the workers hold.
     #[arg(long, default_value_t = ServerArgs::default().max_running_requests)]
     pub max_running_requests: NonZeroUsize,
@@ -342,7 +342,7 @@ impl Default for ServerArgs {
             prefill_attention_backend: None,
             decode_attention_backend: None,
             moe_runner_backend: None,
-            program_config: program_server::command::Settings::default(),
+            build_config: build_server::command::Settings::default(),
             max_running_requests: positive(128),
             max_num_batched_tokens: None,
             // vLLM's default, which clients asking for `top_logprobs` expect to be served.
@@ -445,9 +445,9 @@ pub fn daemon_options_differ(current: &ServerArgs, target: &ServerArgs) -> bool 
         || current.video_job_config != target.video_job_config
         || current.migration_config != target.migration_config
         || current.mm_processor_kwargs != target.mm_processor_kwargs
-        // This host's Program Server: the daemon reads it alone, and an
-        // epoch's programs are prepared against it (§5.1).
-        || current.program_config != target.program_config
+        // This host's Build Server: the daemon reads it alone, and an
+        // epoch's modules are prepared against it (§5.1).
+        || current.build_config != target.build_config
 }
 
 /// How the deployment moves to a new configuration in another epoch
@@ -854,7 +854,7 @@ impl ServerArgs {
             executable: self.worker_config.executable.clone(),
             join_timeout: crate::supervision::JOIN_TIMEOUT,
             devices,
-            program_server: self.program_config.clone(),
+            build_server: self.build_config.clone(),
         }
     }
 }

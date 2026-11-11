@@ -34,7 +34,7 @@ pub use vision::VisionTower;
 pub use vl::Qwen3VlModel;
 
 use nn::layers::{Access, Copy};
-use nn::{Forward, Shape, Operand};
+use nn::{Forward, Operand, Shape};
 
 /// What this crate can fail with.
 #[derive(Debug, thiserror::Error)]

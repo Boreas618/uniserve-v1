@@ -1,0 +1,279 @@
+// The Build Server's wire protocol (design section 6.3).
+//
+// A connection speaks one length-delimited Protobuf frame at a time, in both
+// directions: a `Request` from the client, then the server's `ServerMessage`
+// frames for it, ending with the one that answers it. A `resolve` answer
+// carries its module files as descriptors with `SCM_RIGHTS`, attached to the
+// frame that names them, in the order the frame lists them.
+//
+// The schema is append-only: a field is never renumbered, retyped or removed,
+// and a new kind of request or answer is a new field of `Request` or
+// `ServerMessage`. A client and a server of different builds therefore speak
+// every message they share.
+
+syntax = "proto3";
+
+package uniserve.build_server;
+
+// One request of a client. The server answers each request on its connection
+// in the order it received it.
+message Request {
+  oneof request {
+    Install install = 1;
+    Prepare prepare = 2;
+    Resolve resolve = 3;
+    List list = 4;
+    Cover cover = 5;
+  }
+}
+
+// Install one package from a directory of the server host's
+// filesystem (design section 6.3). Only the upstream Build Server accepts
+// it; every other one refuses and names the upstream's location.
+message Install {
+  // The package directory, as the server host sees it.
+  string package = 1;
+}
+
+// The identity of an installed package.
+message Package {
+  string op = 1;
+  string backend = 2;
+  // The revision this package was installed as: one more than the revisions
+  // of the same operator and backend installed before it.
+  uint32 revision = 3;
+}
+
+// Which phase of an operator a package revision fills. `ALL` fills every phase of the
+// operator with one package revision (design section 5.2).
+enum Phase {
+  PHASE_ALL = 0;
+  PHASE_PREFILL = 1;
+  PHASE_DECODE = 2;
+  // The phases of a diffusion computation: the encoding pass that turns
+  // inputs into latents, and the denoising loop that turns latents into
+  // outputs (design section 5.1: a package revision fills one phase of an operator).
+  PHASE_ENCODE = 3;
+  PHASE_DENOISE = 4;
+}
+
+// A package revision named by its backend and arguments: the server selects the
+// backend's latest installed revision (design section 5.1).
+message Backend {
+  string backend = 1;
+  // The package revision's arguments as a TOML table, so their types survive.
+  string arguments = 2;
+}
+
+// A package revision named by revision: the server uses exactly this one.
+message PackageRevision {
+  string backend = 1;
+  uint32 revision = 2;
+  string arguments = 3;
+}
+
+// One operator of an epoch and the package revision that fills it.
+message PackageRequest {
+  string op = 1;
+  Phase phase = 2;
+  oneof selector {
+    Backend backend = 3;
+    PackageRevision package = 4;
+  }
+  // The backend whose part of the operator's descriptors the slot holds, when
+  // several packages divide them; empty when the slot holds them all.
+  string part = 5;
+}
+
+// The descriptors one slot's package revision must cover (design section 4.2): the
+// slot is the operator, its phase and its part, exactly as the package revision
+// request that fills it names them.
+message Descriptors {
+  string op = 1;
+  // Descriptor keys, in the canonical form the operator's `Display` gives.
+  repeated string keys = 2;
+  Phase phase = 3;
+  string part = 4;
+}
+
+// Ask the server to select the package revisions of a set of operators and to build
+// every module of their descriptors that is not in the store yet (design
+// section 6.3). The server reports each build as a `Progress` frame and ends
+// with `Prepared` once every module is committed, or with `Refused`.
+message Prepare {
+  // The targets to build for: architectures such as `sm_100a`, or GPU models
+  // for a package that compiles the GPU's SM count into its binary.
+  repeated string targets = 1;
+  repeated PackageRequest packages = 2;
+  repeated Descriptors descriptors = 3;
+}
+
+// A package revision the server selected.
+message Chosen {
+  string op = 1;
+  Phase phase = 2;
+  PackageRevision package = 3;
+  string part = 4;
+}
+
+// Ask for one module (design sections 5.3 and 6.3): the module of the
+// operator's package revision for a target and a descriptor key.
+message Resolve {
+  string op = 1;
+  PackageRevision package = 2;
+  string target = 3;
+  string descriptor = 4;
+}
+
+// List the installed packages, their revisions and their modules.
+message List {}
+
+// Ask which installed package is selected for each of an operator's
+// descriptor keys (design section 6.3). The candidates are each backend's
+// latest installed revision that builds for every target, or the revision a
+// named backend states; a key goes to the first candidate whose manifest
+// covers it, in this order: the backend the deployment names for the key's
+// phase, then the manifest's `priority`, highest first, then the backend whose
+// name sorts first. The server answers with `Coverage`; nothing is built.
+message Cover {
+  string op = 1;
+  // The targets the keys' modules are built for, such as `sm_100a`.
+  repeated string targets = 2;
+  // Descriptor keys, in the canonical form the operator's `Display` gives.
+  repeated string keys = 3;
+  // The backends the deployment names for the operator; none leaves the
+  // selection to the manifests' priorities.
+  repeated Named named = 4;
+}
+
+// A backend a deployment names for an operator, in every phase (`ALL`) or in
+// one: it is preferred for the keys of that phase whenever it covers them.
+message Named {
+  Phase phase = 1;
+  string backend = 2;
+  // The revision to use; zero names the backend's latest installed revision.
+  uint32 revision = 3;
+}
+
+// The form of a compiled module (design section 5.3).
+enum ModuleForm {
+  MODULE_FORM_UNSPECIFIED = 0;
+  // A cubin with a metadata JSON: loaded with `cuLibraryLoadData` and
+  // launched with `cuLaunchKernelEx`.
+  MODULE_FORM_CUBIN = 1;
+  // A native library with a C ABI: loaded with `dlopen` and called through
+  // the entry its package declares.
+  MODULE_FORM_NATIVE = 2;
+  // A wasm32 module precompiled for this host's CPU, which wasmtime loads:
+  // a scheduling policy (design section 5.3). A flat blob, with neither
+  // launch metadata nor a C entry.
+  MODULE_FORM_WASM = 3;
+  // An executable, stored as it is and run as its own process: it is
+  // not loaded into the main process (design section 5.1).
+  MODULE_FORM_EXECUTABLE = 4;
+}
+
+// The state of one module's build.
+enum BuildState {
+  BUILD_STATE_UNSPECIFIED = 0;
+  BUILD_STATE_QUEUED = 1;
+  BUILD_STATE_BUILDING = 2;
+  BUILD_STATE_COMMITTED = 3;
+  BUILD_STATE_FAILED = 4;
+}
+
+// One build of a module, as it progresses.
+message Progress {
+  string op = 1;
+  string backend = 2;
+  uint32 revision = 3;
+  string target = 4;
+  string descriptor = 5;
+  BuildState state = 6;
+  // On a failure, the build's log.
+  string detail = 7;
+  // The digest of the revision's build inputs, which names the module in the store.
+  string inputs = 8;
+}
+
+// One file of a module, passed as a descriptor attached to this frame.
+message ModuleFile {
+  // The file's name inside the module's directory.
+  string name = 1;
+  uint64 size = 2;
+}
+
+message Installed {
+  Package package = 1;
+}
+
+message Prepared {
+  repeated Chosen packages = 1;
+}
+
+message Resolved {
+  ModuleForm form = 1;
+  repeated ModuleFile files = 2;
+  // Superseded by `entries`; no longer sent. Kept so the schema stays
+  // append-only.
+  string entry = 3;
+  // A native module's C entry symbols by role (design section 4.2): `launch`
+  // launches the kernel, and the other roles are lifecycle entries with the
+  // same calling convention around it.
+  map<string, string> entries = 5;
+  // The name of the metadata JSON among the files, for a cubin module: the
+  // launch metadata the main process reads (design section 5.3).
+  string metadata = 4;
+}
+
+message ListedModule {
+  string target = 1;
+  string descriptor = 2;
+  ModuleForm form = 3;
+}
+
+message ListedPackage {
+  string op = 1;
+  string backend = 2;
+  uint32 revision = 3;
+  repeated ListedModule modules = 4;
+}
+
+message Listing {
+  repeated ListedPackage packages = 1;
+}
+
+// The keys of a `Cover` one package was chosen for.
+message Covered {
+  Package package = 1;
+  repeated string keys = 2;
+}
+
+// The answer to `Cover`: every requested key appears exactly once, either in
+// the package chosen for it or in `uncovered`. Packages are listed in the
+// server's selection order.
+message Coverage {
+  repeated Covered covered = 1;
+  // The keys no installed package of the operator covers for the targets.
+  repeated string uncovered = 2;
+}
+
+// The server does not answer the request. `upstream` is set when the request
+// needed the upstream Build Server this one is not.
+message Refused {
+  string reason = 1;
+  string upstream = 2;
+}
+
+// One message of the server on a connection.
+message ServerMessage {
+  oneof message {
+    Progress progress = 1;
+    Installed installed = 2;
+    Prepared prepared = 3;
+    Resolved resolved = 4;
+    Listing listing = 5;
+    Refused refused = 6;
+    Coverage coverage = 7;
+  }
+}

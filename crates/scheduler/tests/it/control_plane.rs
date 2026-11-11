@@ -1796,9 +1796,9 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
     handle.abort(RequestId(1));
     let first_waiter = scheduled(&mut low);
     let second_waiter = scheduled(&mut high);
-    // The serving program is `fcfs`, which admits by arrival and reads no
+    // The serving package is `fcfs`, which admits by arrival and reads no
     // priority: the request that arrived first is served first, whatever its
-    // priority states. A policy that orders by priority is a different program;
+    // priority states. A policy that orders by priority is a different package;
     // this case states that the limit changed in place and the queue moved on.
     assert!(
         first_waiter < second_waiter,

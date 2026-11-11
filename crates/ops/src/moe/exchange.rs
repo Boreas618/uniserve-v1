@@ -36,7 +36,7 @@ use std::sync::Arc;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, DevicePtr, Shape, Operand};
+use crate::tensor::{DType, DevicePtr, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -611,7 +611,7 @@ fn check(status: i32, entry: &str, error: &[u8; 512]) -> Result<()> {
 pub struct ExpertExchange;
 
 impl Op for ExpertExchange {
-    const NAME: &'static str = proto::program::operator::EXPERT_EXCHANGE;
+    const NAME: &'static str = proto::module::operator::EXPERT_EXCHANGE;
 
     type Descriptor = Descriptor;
     type Args<'a> = ExchangeArgs;

@@ -5,7 +5,7 @@
 //! adds to them: [`Workers`], its [`Batches`] over a node's devices, and the [`Jobs`] a runner asks
 //! its device worker to issue for a batch.
 //!
-//! A submission is one or more jobs because a program-layer update interleaves work with serving:
+//! A submission is one or more jobs because a generation update interleaves work with serving:
 //! a batch is a `Replay` of its bucket's graph, a precopy is the `Capture`/`Rebind` jobs of the
 //! buckets a changed operator uses, and switchover and purge are submissions of their own so they
 //! land on a batch boundary (7.3).

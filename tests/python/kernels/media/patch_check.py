@@ -12,7 +12,7 @@ the operator's own definition from ``crates/ops/src/patch.rs``, written out in t
 One direction, because the operator has one: the inverse raster is ``unpatchify_video``, whose own
 check covers it.
 
-Run it where Triton is installed (the Program Server's own environment):
+Run it where Triton is installed (the Build Server's own environment):
 
     TRITON_INTERPRET=1 python patch_arithmetic.py [--channels 24] [--frames 3]
 

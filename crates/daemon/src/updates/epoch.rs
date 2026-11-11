@@ -2,7 +2,7 @@
 //! what `apply` calls when `epoch::layer` answers [`Layer::Epoch`].
 //!
 //! The arm decides nothing the other layers own. It answers `Ok(None)` for a
-//! change of the host layer, of the programs alone, or of nothing, so `apply`
+//! change of the host layer, of the modules alone, or of nothing, so `apply`
 //! falls through to the path that handles those; only an epoch change builds
 //! the target's [`EpochRecord`] and starts a [`Switch`].
 //!
@@ -66,7 +66,7 @@ pub(crate) struct EpochChange {
 /// Runs the epoch layer of a change into `running`, or says the change is
 /// another layer's.
 ///
-/// Returns `Ok(None)` when `epoch::layer` answers `Host`, `Program` or
+/// Returns `Ok(None)` when `epoch::layer` answers `Host`, `PackageRevision` or
 /// `None`, so the caller takes its other path; `Ok(Some(Applied::Planned))`
 /// under `dry_run`, having started nothing and written nothing; and
 /// `Ok(Some(Applied::Epoch))` with the switch's first report once the
@@ -86,7 +86,7 @@ pub(crate) fn epoch_arm(
 ) -> Result<Option<Applied>, UpdateError> {
     match layer(previous, target) {
         Layer::Epoch => {}
-        Layer::Host | Layer::Program | Layer::None => return Ok(None),
+        Layer::Host | Layer::Generation | Layer::None => return Ok(None),
     }
     if running.is_some() {
         return Err(UpdateError::InProgress);
@@ -133,8 +133,8 @@ pub(crate) fn epoch_arm(
     Ok(Some(Applied::Epoch(report)))
 }
 
-/// The target epoch's record: what builds it and which programs fill it,
-/// keeping the serving epoch's programs as the previous generation a revert
+/// The target epoch's record: what builds it and which modules fill it,
+/// keeping the serving epoch's modules as the previous generation a revert
 /// and a restart use (§7.3).
 ///
 /// The serving record must exist: an epoch the daemon cannot describe cannot
@@ -152,15 +152,15 @@ fn record(
     })?;
     let mut record = serving.clone();
     record.config = target.engine.clone();
-    record.kernels = target.programs.kernels.clone();
-    record.policy = target.programs.policy.clone();
+    record.kernels = target.modules.kernels.clone();
+    record.policy = target.modules.policy.clone();
     record.previous_kernels = serving.kernels;
     record.previous_policy = Some(serving.policy);
     record.status = Status::Precopy;
     // The target's own generation is set only by a child's report (M904);
     // the previous epoch's names another process.
     record.generation = None;
-    // The record is the serving one with the target's build and programs, so
+    // The record is the serving one with the target's build and modules, so
     // that a field added to `EpochRecord` needs no change here. The target's
     // own launch generation is not part of the record yet; when it is added,
     // it is cleared here rather than inherited — a generation is set only from

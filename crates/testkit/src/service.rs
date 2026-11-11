@@ -44,7 +44,7 @@ use scheduler::EventRx;
 use scheduler::SchedulerHandle;
 use scheduler::{
     Arrival, BatchCapacity, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    PolicyProgram, PolicySource, PolicyUsage, Router, SchedulerConfig, SchedulerStatsReporter,
+    PolicyPackage, PolicySource, PolicyUsage, Router, SchedulerConfig, SchedulerStatsReporter,
     ceilings_of,
 };
 use scheduling::guest::view::RankView;
@@ -157,15 +157,15 @@ impl Routing {
     }
 
     /// §7.3 steps 2 and 3 on the control thread for the epoch's starting
-    /// policy: prepares the route instance of `program` and puts it in.
+    /// policy: prepares the route instance of `package` and puts it in.
     fn install_route(
         &self,
         source: &dyn PolicySource,
-        program: PolicyProgram,
+        package: PolicyPackage,
     ) -> Result<(), String> {
         let ranks = self.ranks();
         let mut router = lock(&self.route);
-        let candidate = Router::prepare(source, program, &ranks, &router.ceilings())
+        let candidate = Router::prepare(source, package, &ranks, &router.ceilings())
             .map_err(|error| error.to_string())?;
         router.adopt(candidate);
         router.switchover(&ranks).map_err(|error| error.to_string())
@@ -369,12 +369,12 @@ pub fn serve_requests(
 /// that owns the engine's connection itself and sends no commands — the
 /// daemon library's in-process client is one — names the same installation
 /// here, and the engine serves its requests under it from the first one. The
-/// program's decisions are what the control thread routes by; the schedulers
+/// package's decisions are what the control thread routes by; the schedulers
 /// carry the policy their own installation gave them.
 pub struct EpochPolicy {
-    /// The program the route decisions follow, with its parameters.
-    pub program: PolicyProgram,
-    /// The module the program's decisions are instantiated from.
+    /// The package the route decisions follow, with its parameters.
+    pub package: PolicyPackage,
+    /// The module the package's decisions are instantiated from.
     pub module: Arc<dyn PolicySource + Send + Sync>,
 }
 
@@ -426,7 +426,7 @@ fn serve(
     // from it, and without one every request is refused as unroutable.
     if let Some(policy) = start {
         routing
-            .install_route(policy.module.as_ref(), policy.program)
+            .install_route(policy.module.as_ref(), policy.package)
             .map_err(|reason| {
                 anyhow::anyhow!("the epoch's starting policy was not installed: {reason}")
             })?;

@@ -7,7 +7,7 @@ runtime values: the grid is the pages the cache has.
 """
 
 import kv_write_scaled as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: Element types the source may have. The cache is E4M3 in every descriptor, which
 #: is what this operator is for; a full-precision cache is `kv_write`.

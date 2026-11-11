@@ -10,8 +10,8 @@ use nn::layers::Gain;
 use nn::{
     Activation, AdaptiveAvgPool2d, Arena, CausalPad, Conv3d, ConvSpec, DType, DevicePtr, Epilogue,
     Forward, GateBias, GatedActivation, GroupNorm, Halves, KvGroup, KvPlanes, KvView, LayerNorm,
-    Linear, Modulation, Residual, ResidualStream, RmsNorm, Rounding, Scale, Shape, Snake,
-    Operand, Weight,
+    Linear, Modulation, Operand, Residual, ResidualStream, RmsNorm, Rounding, Scale, Shape, Snake,
+    Weight,
 };
 use ops::gemm::WeightOrder;
 

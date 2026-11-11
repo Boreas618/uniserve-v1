@@ -10,7 +10,7 @@ from the call structure, so the descriptor decides only what a compilation canno
 * the tensor-map layout, which this package always takes as strided rows and heads
   (`VSA_BHSD`), because the operator's call addresses rows and heads through strides.
 
-The Program Server runs this script with its own Python environment, its working directory the
+The Build Server runs this script with its own Python environment, its working directory the
 package root, and `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and
 `UNISERVE_OUT` in the environment; `--package`, `--descriptor`, `--target` and `--out` name
 the same values on the command line.
@@ -74,7 +74,7 @@ def main():
     """Compile the kernel for one descriptor into ``module.so``."""
     package, descriptor, target, out = arguments()
     out.mkdir(parents=True, exist_ok=True)
-    # The nvcc the Program Server checked against this package's declared version.
+    # The nvcc the Build Server checked against this package's declared version.
     compiler = os.environ["UNISERVE_NVCC"]
     block = block_of(descriptor)
 

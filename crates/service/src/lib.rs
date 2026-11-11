@@ -1,6 +1,6 @@
 //! Host services: the servers a host runs once per serving user.
 //!
-//! The Storage Server and the Program Server are host services. Each listens
+//! The Storage Server and the Build Server are host services. Each listens
 //! on a Unix socket in a directory only its user can enter
 //! ([`runtime_directory`]), so only that user's processes connect, and
 //! outlives the processes that use it. Every file of a service sits beside

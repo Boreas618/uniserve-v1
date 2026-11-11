@@ -3,11 +3,11 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel
 function, its argument signature in the order the operator launches them, the
 compile-time values the descriptor gives, and the compilation options. The
-Program Server's Triton source drives ``uniserve_program_server.triton`` with it.
+Build Server's Triton source drives ``uniserve_build_server.triton`` with it.
 """
 
 import sigmoid_gated_add as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The floating dtypes of the target, the update and the gate, as Triton spells them in an
 #: argument signature.

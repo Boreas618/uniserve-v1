@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 
 use ipc::TimingCounters;
 use nn::capability::{Conditioning, Denoiser, Latents, Step, VideoRequest, WarmRequest};
-use ops::{DType, Shape, Operand};
+use ops::{DType, Operand, Shape};
 use platform::DeviceId;
 use proto::video::{LatentShape, Layout};
 

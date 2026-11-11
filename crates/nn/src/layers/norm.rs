@@ -31,7 +31,7 @@ use ops::frame::{self, FrameMoments, FrameNormPad};
 use ops::modulation::{self, ModulatedRmsNorm};
 use ops::norm::{self, AddRmsNorm, LayerNorm as LayerNormOp, RmsNorm as RmsNormOp};
 use ops::residual::{self, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm};
-use ops::{DType, Shape, Operand};
+use ops::{DType, Operand, Shape};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;

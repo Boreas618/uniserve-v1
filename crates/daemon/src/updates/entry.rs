@@ -5,8 +5,8 @@
 //! their executable, the parallel ranks, the deployment file, the model's
 //! files, the rank layout, the KV cache's options — is `proto::config::EngineConfig`'s, and
 //! the epoch layer switches to a new epoch (§7.4, [`crate::updates::switch`]).
-//! What they execute — the programs — is the program layer's, prepared
-//! against every host's Program Server before the processes switch to them
+//! What they execute — the modules — is the generation layer's, prepared
+//! against every host's Build Server before the processes switch to them
 //! (§7.2). Everything else is this daemon's own: its options change in a hot
 //! restart (§7.5), and the scheduling limits change in place at the engine's
 //! next step boundary, within the batch its workers were started for.
@@ -103,10 +103,10 @@ fn switches_probes_only(served: &EngineConfig, target: &EngineConfig) -> bool {
     switched == comparable(target)
 }
 
-/// The parts of `config` a replica compares: all of it but what the program
-/// layer owns (§7.7), the program backends, the scheduling policy, the expert
+/// The parts of `config` a replica compares: all of it but what the generation
+/// layer owns (§7.7), the package backends, the scheduling policy, the expert
 /// exchange and the speculative cost figures. A change reaches a replica only
-/// once the program layer has answered for those.
+/// once the generation layer has answered for those.
 fn comparable(config: &EngineConfig) -> EngineConfig {
     let mut comparable = config.clone();
     comparable.attention_backend = String::new();
@@ -166,7 +166,7 @@ impl Leader {
         let (target, _stated, update) = resolve(&current, &request)?;
         // A target that reverted with a failure is unavailable until it is
         // applied with `force` (§7.2, §7.3 step 4), whichever layer would
-        // apply it: the epoch layer's switch and the program layer both end
+        // apply it: the epoch layer's switch and the generation layer both end
         // by recording the update here.
         let resolved_target = crate::leader::deployment(&target)?;
         if !request.force
@@ -183,13 +183,13 @@ impl Leader {
             replicas[0].available(&target, request.force)?;
         }
         // One update at a time (§7.2, §7.4), whichever layer the change is
-        // the other's: while a switch runs or a program update is on
+        // the other's: while a switch runs or a generation update is on
         // probation, the `served` spec and the records this entry would read
         // belong to that update. A dry run answers without touching them.
         if !request.dry_run
             && let Some(update) = crate::updates::in_flight(
                 self.updates.running(),
-                self.epochs().program_update().is_some(),
+                self.epochs().generation_update().is_some(),
             )
         {
             return Err(UpdateError::Refused(format!(
@@ -205,11 +205,11 @@ impl Leader {
         {
             return Ok(applied);
         }
-        // The program layer (§7.2): only what the serving epoch's processes
-        // execute differs, and the programs are prepared against every host's
-        // Program Server before the processes switch to them. A program-layer
-        // update is named by the epoch it executes in; the program layer
-        // answers `None` when the programs a configuration selects do not
+        // The generation layer (§7.2): only what the serving epoch's processes
+        // execute differs, and the modules are prepared against every host's
+        // Build Server before the processes switch to them. A generation
+        // update is named by the epoch it executes in; the generation layer
+        // answers `None` when the modules a configuration selects do not
         // differ, and what remains is the daemon's own options and the
         // scheduling limits.
         let epoch = self
@@ -218,11 +218,11 @@ impl Leader {
             .serving()
             .map_or(0, |(epoch, _)| epoch);
         if let Some(update) = self
-            .apply_programs(epoch, &target, &update, request.force, request.dry_run)
+            .apply_generation(epoch, &target, &update, request.force, request.dry_run)
             .await?
         {
-            return Ok(Applied::Program(serde_json::json!({
-                "change": "program",
+            return Ok(Applied::Generation(serde_json::json!({
+                "change": "generation",
                 "epoch": epoch,
                 "update": update.number,
             })));
@@ -246,7 +246,7 @@ impl Leader {
                     return Ok(applied);
                 }
                 Applied::Planned(report) | Applied::InPlace(report) => reports.push(report),
-                applied @ (Applied::Epoch(_) | Applied::Program(_)) => return Ok(applied),
+                applied @ (Applied::Epoch(_) | Applied::Generation(_)) => return Ok(applied),
                 Applied::Unchanged => {}
             }
         }
@@ -269,7 +269,7 @@ impl Leader {
     /// processes which differ in what they build is a switch between epochs,
     /// and the two deployments alone decide it. It
     /// answers `Ok(None)` when the change is another layer's — the host path,
-    /// the programs, or nothing.
+    /// the modules, or nothing.
     ///
     /// The change this builds is the switch's whole input: the serving epoch
     /// and its launch generation, the epoch the target becomes, one spawn
@@ -337,7 +337,7 @@ impl Leader {
         // The previous epoch's processes are addressed by their LAUNCH
         // generation — `Drain`, `Stop` and `Purge` take it — never by the
         // record's `generation`, which is the model generation the main process
-        // numbers for its programs (`EpochRecord`, `ManagedProcess`). The
+        // numbers for its modules (`EpochRecord`, `ManagedProcess`). The
         // authority for that number is the client itself: it is the engine this
         // daemon started or adopted, so it is the process those commands must
         // reach. The process table is no substitute — it holds no row for the
@@ -432,9 +432,9 @@ impl Leader {
             spawn_generation,
             keeps: update.previous_epoch,
         };
-        let programs = next.programs.clone();
-        let servers = self.program_servers(target);
-        let leader = self.program_leader_host(target, &servers);
+        let modules = next.modules.clone();
+        let servers = self.build_servers(target);
+        let leader = self.build_leader_host(target, &servers);
         // A session does not cross epochs (`docs/profiling.md`): its ranks write their files while
         // the epoch still executes, before the switch parks it.
         if !dry_run {
@@ -442,14 +442,14 @@ impl Leader {
         }
         let applied = self.updates.apply(&previous, &next, change, dry_run);
         if let (Ok(_), Some(args)) = (&applied, joining) {
-            self.updates.await_programs(&target.host_identity);
+            self.updates.await_modules(&target.host_identity);
             replicas[0].follow_switch(
                 Arc::clone(control),
                 Arc::clone(&self.updates),
                 crate::leader::SwitchTarget {
                     args,
                     config: target.clone(),
-                    programs,
+                    modules,
                     servers,
                     leader,
                     engine: spawn_generation,
@@ -771,7 +771,7 @@ impl Replica {
                 serde_json::json!({ "in_place": ["the fence probes"] }),
             ));
         }
-        // A scheduling limit is a parameter of the policy program, so the program layer above has
+        // A scheduling limit is a parameter of the policy package, so the generation layer above has
         // moved the schedulers to it (§7.7) or found they run it already. What is left is the
         // record of it here: the arguments the next apply compares with.
         if in_place {
@@ -787,7 +787,7 @@ impl Replica {
         // layer owns what the main processes are built from (the executable,
         // the parallel ranks, the deployment file, the model's files, the
         // rank layout and the KV cache's options, all of them `proto::config::EngineConfig`),
-        // the program layer what they execute, and this one the daemon's own
+        // the generation layer what they execute, and this one the daemon's own
         // options and the scheduling limits, in place. A change that fits
         // none of them would have needed a successor epoch, which this
         // daemon no longer runs: it is refused by name here rather than
@@ -851,10 +851,10 @@ mod tests {
     }
 
     /// A change of the scheduling limits alone, within the batch the workers were started for, is
-    /// in place, and a value the program layer owns does not stand in its way: the program layer
+    /// in place, and a value the generation layer owns does not stand in its way: the generation layer
     /// answered for it before the change reached the replica.
     #[test]
-    fn a_scheduling_change_is_in_place_beside_what_the_program_layer_owns() {
+    fn a_scheduling_change_is_in_place_beside_what_the_package_layer_owns() {
         let mut served = config();
         served.scheduler.max_batch = std::num::NonZeroUsize::new(8).unwrap();
         served.max_running_requests = std::num::NonZeroUsize::new(8).unwrap();

@@ -61,7 +61,7 @@ use super::{Mask, address, head_stride, row_stride, to_i64};
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -332,7 +332,7 @@ impl NativeCall for DenseCall {
 pub struct DenseAttention;
 
 impl Op for DenseAttention {
-    const NAME: &'static str = proto::program::operator::DENSE_ATTENTION;
+    const NAME: &'static str = proto::module::operator::DENSE_ATTENTION;
 
     type Descriptor = DenseDescriptor;
     type Args<'a> = DenseArgs;

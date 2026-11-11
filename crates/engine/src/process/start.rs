@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::update::HotUpdate;
 use anyhow::{Context as _, Result, bail};
-use program_server::Client;
+use build_server::Client;
 use proto::config::EngineArgs;
 use worker::blocking::{BlockingKind, ThreadPool};
 use worker::control::{Control, Endpoints};
@@ -21,7 +21,7 @@ use super::ranks::{Backing, LoadedRank, Meeting, load_ranks};
 use super::reports::{announce, state_failure};
 use super::serve::Wait;
 use super::{MainProcess, Peers};
-use crate::programs::modules::ModuleWork;
+use crate::modules::load::ModuleWork;
 use crate::rank::ModelRunner;
 
 impl MainProcess {
@@ -30,7 +30,7 @@ impl MainProcess {
     ///
     /// The epoch's configuration is resolved against this process's launch first
     /// ([`ModelRunner`]), because three of the things the main process needs are the
-    /// node's rather than the epoch's: which devices it serves, where its Program
+    /// node's rather than the epoch's: which devices it serves, where its Build
     /// Server is, and what those devices measure.
     pub(super) fn start(launch: &EngineArgs, catalogue: &nn::family::Catalogue) -> Result<Self> {
         let build = &launch.engine_config;
@@ -67,7 +67,7 @@ impl MainProcess {
         }
         let epoch = handshake(&mut control, launch)?;
         // The daemon's launch path blocks until this process states what it is, and it
-        // sends the epoch's first program-layer command only once it has. `Starting` goes out
+        // sends the epoch's first generation command only once it has. `Starting` goes out
         // before the model load, which is minutes long, so the daemon's log and the caller's show a
         // process that is alive rather than one that vanished after the storage claim; the
         // `Ready`/`Standby` at the end of `start` is what lets the epoch begin.
@@ -100,13 +100,13 @@ impl MainProcess {
             .context("a main process starts on the connection it opened")?;
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
-        // the program-layer reports, and every command of the program layer - travels on this one.
+        // the generation reports, and every command of the generation layer - travels on this one.
         let mut process = ProcessInterface::connect(
             &launch.processes,
             &launch.engine_config.deployment,
             launch.engine,
         )?;
-        // Every command of the program layer arrives on this socket, and a stage waits for the
+        // Every command of the generation layer arrives on this socket, and a stage waits for the
         // command before it: the control thread sleeps on it as it does on the request socket.
         connected.watch_process(Some(process.connection.descriptor()));
 
@@ -146,7 +146,7 @@ impl MainProcess {
         // would over-commit the device by exactly the model's size.
         let blocking = ThreadPool::new(model_runner.blocking_limits());
         let modules = blocking.lane::<ModuleWork>(BlockingKind::ModuleLoad)?;
-        let programs = Arc::new(Mutex::new(Client::connect(model_runner.program_server())?));
+        let packages = Arc::new(Mutex::new(Client::connect(model_runner.build_server())?));
 
         // The watchdog exists before any device command: `start`'s own commands
         // are bounded by the same stall bound as every command the control thread
@@ -236,7 +236,7 @@ impl MainProcess {
                 //
                 // The warmup is not here: the epoch's first generation holds no kernel until the
                 // daemon's precopy fills it - and a precopy that names no kernel (the startup
-                // switch) fills it from the store's built programs - so there is no bucket to warm
+                // switch) fills it from the store's built packages - so there is no bucket to warm
                 // yet. It runs at the first switchover, which is the boundary the first request is
                 // served at.
                 let shadow = worker.set_shadow()?;
@@ -445,7 +445,7 @@ impl MainProcess {
             modules,
             update,
             watchdog,
-            programs,
+            packages,
             precopy: None,
             warming: Vec::new(),
             announced_at: None,
@@ -463,7 +463,7 @@ impl MainProcess {
             router,
             route_prepared: None,
             targets: model_runner.targets().to_vec(),
-            program_server: model_runner.program_server().to_path_buf(),
+            build_server: model_runner.build_server().to_path_buf(),
             process,
             stopping: false,
             streams: Vec::new(),
@@ -517,12 +517,12 @@ impl MainProcess {
     /// its promotion on: it is sent after `start` has mapped the weights, opened the memory and
     /// started the runners, and *before* the epoch's first generation has been warmed - a warmup
     /// belongs to the first switchover, and a standby's own generation reaches it when the daemon
-    /// sends the epoch's programs.
+    /// sends the epoch's packages.
     fn park_standby(&mut self) -> Result<()> {
         self.serving = false;
         // The launch generation, which is what `Parked` states: the daemon files a report by it
         // (`supervision/roster.rs:236-244` reads `launch_of(engine, parked.generation)`), and the
-        // program generation is zero here - a standby parks before any `Precopy` names one - so a
+        // module generation is zero here - a standby parks before any `Precopy` names one - so a
         // report stating that would name a launch that does not exist and be dropped. The `Park`
         // command states the same number for the same reason.
         self.send_report(proto::process::Report {

@@ -30,7 +30,7 @@
 //! indexed by the caller's step table. Every evaluation then launches against the same buffers, so
 //! one captured graph serves the whole trajectory; only the step table's index changes per replay.
 
-use ops::{DType, Shape, Strides, Operand};
+use ops::{DType, Operand, Shape, Strides};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;

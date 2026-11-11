@@ -5,7 +5,7 @@ dependent-launch flag. The row count stays a runtime value.
 """
 
 import logits_gather as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The hidden state's dtype, and the gathered row's.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32", "i32": "i32"}

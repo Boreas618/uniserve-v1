@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build one scheduling policy's wasm32 module.
 
-The Program Server runs this in the package root as the package's `[source]
+The Build Server runs this in the package root as the package's `[source]
 script` (design §5.2, §6.2): the script writes the raw module, and the server
 then precompiles it with `scheduling-precompile` into the artifact the main
 process loads.

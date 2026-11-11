@@ -27,7 +27,7 @@ use crate::{Error, Result, lock};
 /// The kinds of blocking host work of §2.4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BlockingKind {
-    /// Resolving a program's modules at the Program Server and loading them
+    /// Resolving a program's modules at the Build Server and loading them
     /// into kernels.
     ModuleLoad,
     /// Encoding, muxing and reading media.

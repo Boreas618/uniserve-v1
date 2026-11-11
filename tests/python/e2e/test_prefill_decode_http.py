@@ -51,7 +51,7 @@ from tests.python.e2e.http_helpers import (
     worker_executable,
     written_deployment,
 )
-from tests.python.e2e.program_server import remote_program_server
+from tests.python.e2e.build_server import remote_build_server
 
 # The module's cases share two GPUs: the undivided reference serves on the
 # first, and the one-host prefill/decode deployment on both.
@@ -287,7 +287,7 @@ def test_a_prefill_group_hands_requests_to_a_decode_group_on_another_host(
     )
     with (
         _runtime(tmp_path) as runtime,
-        remote_program_server(FOLLOWER) as follower_programs,
+        remote_build_server(FOLLOWER) as follower_modules,
         second_host(
             FOLLOWER,
             tmp_path / "follower.log",
@@ -295,7 +295,7 @@ def test_a_prefill_group_hands_requests_to_a_decode_group_on_another_host(
             devices=FOLLOWER_DEVICE,
             env={"LD_LIBRARY_PATH": library_path},
             leader_log=log,
-            arguments=("--set", f"program_config.socket={follower_programs}"),
+            arguments=("--set", f"build_config.socket={follower_modules}"),
         ),
         server_process(
             command,

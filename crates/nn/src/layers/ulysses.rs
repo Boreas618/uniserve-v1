@@ -20,7 +20,7 @@
 //! attention `A` is any layer the model composes over the head-split rows; this layer owns the
 //! projections around it.
 
-use ops::{DType, Shape, Strides, Operand};
+use ops::{DType, Operand, Shape, Strides};
 
 use crate::error::{Error, Result};
 use crate::family::{Projection, Split};

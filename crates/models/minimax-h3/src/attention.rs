@@ -29,7 +29,7 @@ use nn::layers::{
     DenseAttention, DenseSpec, Factors, Gains, Rotary, UlyssesAttention, UlyssesSpec, Varlen,
 };
 use nn::weights::{Weight, WeightLoader};
-use nn::{Forward, Shape, Operand};
+use nn::{Forward, Operand, Shape};
 
 use crate::attention_sparse::Sparse;
 use crate::config::{AttentionKind, TransformerConfig};

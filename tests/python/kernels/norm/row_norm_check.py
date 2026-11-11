@@ -9,7 +9,7 @@
 One script covers both operators because they are one row reduction with one difference —
 `add_rms_norm` sums `x + residual` first, writes that sum back out as the new residual, and
 normalizes the sum. The same file is kept in each operator's package, byte for byte, and a
-test in `crates/program-server/tests/it/packages.rs` holds them together.
+test in `crates/build-server/tests/it/packages.rs` holds them together.
 
 The cases are what a masked row reduction can get wrong: the shapes the fixture's keys
 name, a width far below the tile where almost every lane is masked, a row whose values are

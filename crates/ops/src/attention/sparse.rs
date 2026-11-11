@@ -68,7 +68,7 @@ use super::{address, head_stride, row_stride, to_i64};
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -294,7 +294,7 @@ impl NativeCall for SparseCall {
 pub struct SparseAttention;
 
 impl Op for SparseAttention {
-    const NAME: &'static str = proto::program::operator::SPARSE_ATTENTION;
+    const NAME: &'static str = proto::module::operator::SPARSE_ATTENTION;
 
     type Descriptor = SparseDescriptor;
     type Args<'a> = SparseArgs;

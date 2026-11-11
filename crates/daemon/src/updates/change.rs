@@ -67,10 +67,10 @@ pub enum Applied {
     /// The epoch layer's switch runs on trial: the target's main processes
     /// serve while the previous epoch is parked (§7.4).
     Epoch(serde_json::Value),
-    /// The program layer's update runs on trial inside the serving epoch: its
-    /// processes switched to the target's programs and are on probation
+    /// The generation layer's update runs on trial inside the serving epoch: its
+    /// processes switched to the target's modules and are on probation
     /// (§7.2, §7.3).
-    Program(serde_json::Value),
+    Generation(serde_json::Value),
 }
 
 /// Resolves `request` against the serving configuration `current`: the target

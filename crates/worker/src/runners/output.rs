@@ -13,7 +13,7 @@ use nn::capability::PixelNorm;
 use nn::layers::launch::PDL;
 use ops::pcm::{self, PcmInterleave as PcmInterleaveOp};
 use ops::rgb::{self, CHANNELS, RgbBytes as RgbBytesOp};
-use ops::{DType, Shape, Operand};
+use ops::{DType, Operand, Shape};
 use platform::DeviceId;
 
 use crate::runners::columns::{Column, encode_f32};

@@ -1,4 +1,4 @@
-# The position_interpolate operator's Triton backend: design 5.2's program package.
+# The position_interpolate operator's Triton backend: design 5.2's package.
 #
 # A learned [in_side², channels] position table resampled to another grid: the caller hands four tap
 # indices (i32) and four FP32 weights per output point, and the program gathers four table rows and

@@ -30,7 +30,7 @@ use ops::fp4::{
 };
 use ops::fp8::{Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor};
 use ops::gemm::{self, Descriptor, Epilogue, Gemm, WeightOrder};
-use ops::{DType, Shape, Operand};
+use ops::{DType, Operand, Shape};
 
 use crate::error::{Error, Result};
 use crate::family::Split;
@@ -106,7 +106,7 @@ struct Packed {
     alpha: Weight,
 }
 
-/// The tile an `fp8_gemm` program covers: one program set serves every projection.
+/// The tile an `fp8_gemm` program covers: one module set serves every projection.
 const FP8_TILE: (u32, u32, u32) = (64, 128, 128);
 
 /// The representation a projection's weight is held in.
@@ -932,11 +932,7 @@ impl QkvLinear {
     /// # Errors
     ///
     /// As [`Linear::forward`].
-    pub fn forward(
-        &self,
-        f: &Forward,
-        input: Operand,
-    ) -> Result<(Operand, Operand, Operand)> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<(Operand, Operand, Operand)> {
         Ok((
             self.query.forward(f, input)?,
             self.key.forward(f, input)?,

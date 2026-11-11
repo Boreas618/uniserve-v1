@@ -242,12 +242,7 @@ impl Group {
     /// Gather `send` from every rank into `recv`, rank-major.
     ///
     /// `recv` holds `ranks` times `send`'s elements, in rank order.
-    pub(crate) fn all_gather(
-        &self,
-        send: Operand,
-        recv: Operand,
-        stream: &Stream,
-    ) -> Result<()> {
+    pub(crate) fn all_gather(&self, send: Operand, recv: Operand, stream: &Stream) -> Result<()> {
         let (count, expected, dtype) = gathered(send, recv, self.ranks)?;
         let bytes = dtype.bytes();
         self.issue()?
@@ -268,12 +263,7 @@ impl Group {
     ///
     /// `send` and `recv` are the whole buffers, `ranks` blocks each, and NCCL's `count` is one
     /// block's elements.
-    pub(crate) fn all_to_all(
-        &self,
-        send: Operand,
-        recv: Operand,
-        stream: &Stream,
-    ) -> Result<()> {
+    pub(crate) fn all_to_all(&self, send: Operand, recv: Operand, stream: &Stream) -> Result<()> {
         let (elements, dtype) = exchanged(send, recv, self.ranks)?;
         let ranks = usize::try_from(self.ranks).unwrap_or(usize::MAX);
         let bytes = dtype.bytes() * elements;
@@ -435,5 +425,5 @@ impl Issue {
 /// The NCCL element type of an operator ABI element type.
 ///
 /// The mapping is `ops`': an element type is named once, in the crate that owns the ABI, so a
-/// collective and a kernel program cannot disagree about what `bf16` means.
+/// collective and a kernel package cannot disagree about what `bf16` means.
 pub use ops::collective_type;

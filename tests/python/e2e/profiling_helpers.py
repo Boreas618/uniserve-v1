@@ -39,10 +39,10 @@ PROMPT = (
 
 @contextmanager
 def serve(
-    tmp_path: Path, options: Sequence[str], program_server: Path
+    tmp_path: Path, options: Sequence[str], build_server: Path
 ) -> Iterator[str]:
-    """Serve Qwen3 under ``options`` (``--set`` assignments), its programs from
-    the host's ``program_server``, until the block ends; yields the base URL.
+    """Serve Qwen3 under ``options`` (``--set`` assignments), its modules from
+    the host's ``build_server``, until the block ends; yields the base URL.
     """  # noqa: D205
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -59,7 +59,7 @@ def serve(
         "--worker-executable",
         str(worker_executable()),
         "--set",
-        f"program_config.socket={program_server}",
+        f"build_config.socket={build_server}",
     ]
     for option in options:
         command += ["--set", option]

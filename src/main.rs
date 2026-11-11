@@ -2,9 +2,9 @@
 //!
 //! `main` parses the command line and runs its command: `serve` (a node's
 //! daemon, and on the leader the application, [`serve`]), `engine` (a node's
-//! main process for one epoch), `programs` (a deployment's recorded key list,
-//! [`programs`]), and the host services `storage-server` and
-//! `program-server`, whose commands are their crates' own. `serve` installs
+//! main process for one epoch), `keys` (a deployment's recorded key list,
+//! [`keys`]), and the host services `storage-server` and
+//! `build-server`, whose commands are their crates' own. `serve` installs
 //! tracing and builds the Tokio runtime; its module hands the resolved
 //! configuration to `daemon::serve` with a cancellation token that fires on
 //! Ctrl-C or SIGTERM. The host services run before any thread exists,
@@ -14,7 +14,7 @@
 //! executable's own: every command that starts threads takes them from here.
 
 mod cli;
-mod programs;
+mod keys;
 mod serve;
 
 use std::env;
@@ -118,7 +118,7 @@ fn main() -> Result<std::process::ExitCode> {
     };
     match cli.command {
         Command::Serve(args) => serve::run(*args, &command_matches(), &cli.log),
-        Command::Programs(args) => programs::run(*args, &command_matches(), &cli.log),
+        Command::Keys(args) => keys::run(*args, &command_matches(), &cli.log),
         Command::Engine { launch } => {
             follow_lifeline(lifeline);
             logging::init(
@@ -132,22 +132,22 @@ fn main() -> Result<std::process::ExitCode> {
         Command::StorageServer(args) => {
             storage_server::command::run(*args).map(|()| std::process::ExitCode::SUCCESS)
         }
-        Command::ProgramServer(args) => program_server::command::run(*args, &host_targets)
+        Command::BuildServer(args) => build_server::command::run(*args, &host_targets)
             .map(|()| std::process::ExitCode::SUCCESS)
             .map_err(anyhow::Error::new),
     }
 }
 
-/// The architecture target of each device of this host, read from the driver: what a Program
+/// The architecture target of each device of this host, read from the driver: what a Build
 /// Server this executable runs builds for when no `--target` names one.
-fn host_targets() -> std::result::Result<Vec<program_server::Target>, String> {
+fn host_targets() -> std::result::Result<Vec<build_server::Target>, String> {
     let count = platform::DeviceId::count()
         .map_err(|error| format!("counting this host's devices: {error}"))?;
     (0..count)
         .map(|ordinal| {
             platform::DeviceId(ordinal)
                 .compute_capability()
-                .map(program_server::Target::arch)
+                .map(build_server::Target::arch)
                 .map_err(|error| format!("reading device {ordinal}'s architecture: {error}"))
         })
         .collect()

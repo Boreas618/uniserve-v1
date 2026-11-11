@@ -85,7 +85,7 @@ pub struct Args {
 pub struct CrossFade;
 
 impl Op for CrossFade {
-    const NAME: &'static str = proto::program::operator::CROSS_FADE;
+    const NAME: &'static str = proto::module::operator::CROSS_FADE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

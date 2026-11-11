@@ -12,7 +12,7 @@ crossbeam-channel.workspace = true
 ipc.workspace = true
 proto.workspace = true
 scheduling.workspace = true
-program-server.workspace = true
+build-server.workspace = true
 png = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

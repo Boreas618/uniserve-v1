@@ -258,7 +258,7 @@ use nn::layers::{
     Spectrum, Varlen,
 };
 use nn::weights::{Weight, WeightLoader};
-use nn::{DType, DecodedMedia, Decoder, Shape, Operand};
+use nn::{DType, DecodedMedia, Decoder, Operand, Shape};
 use ops::gemm::WeightOrder;
 
 /// The element type of the decoder's projections and of the rows they read and write, and the type

@@ -6,7 +6,7 @@ butterfly width of the renormalization (the top-k width rounded up to a power of
 two). One warp routes one token, so the module declares four warps and no
 dynamic shared memory.
 
-The Program Server runs this script with the package, descriptor, target and
+The Build Server runs this script with the package, descriptor, target and
 output directory in `UNISERVE_PACKAGE`, `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`
 and `UNISERVE_OUT`; a direct run passes the same four as flags.
 """
@@ -93,7 +93,7 @@ def declared_value(declared, rest):
     whole. A constraint table (``{ multiple = 16 }``, ``{ bits = 32 }``,
     ``{ separator = "x" }``) reads the text up to the next ``_``, which no
     integer, extent tuple or float bit pattern holds, and admits it when it
-    meets the constraint, as the Program Server's manifest does.
+    meets the constraint, as the Build Server's manifest does.
     """
     if isinstance(declared, list):
         return next(
@@ -162,7 +162,7 @@ def main():
         raise SystemExit(f"scale {fields['scale']!r} has no storage kind")
 
     out.mkdir(parents=True, exist_ok=True)
-    # The nvcc the Program Server checked against this package's declared version.
+    # The nvcc the Build Server checked against this package's declared version.
     compiler = os.environ["UNISERVE_NVCC"]
     command = [
         compiler,

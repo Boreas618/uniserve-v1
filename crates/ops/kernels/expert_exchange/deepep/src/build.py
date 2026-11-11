@@ -1,13 +1,13 @@
 """The deepep package's compile script: one descriptor -> one module.
 
 The descriptor fixes every template argument of DeepEP's kernels, so this
-compiles them here, and a serving host compiles nothing. The Program Server runs
+compiles them here, and a serving host compiles nothing. The Build Server runs
 this script with its working directory the package root and
 `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and `UNISERVE_OUT`
 in the environment.
 
 DeepEP's kernels and the NCCL device API they are built against are pinned
-sources (`uniserve_program_server.fetch`'s `deepep` and `nccl` pins): the
+sources (`uniserve_build_server.fetch`'s `deepep` and `nccl` pins): the
 compile includes them from their verified cache directories.
 """
 
@@ -18,7 +18,7 @@ import subprocess
 import sys
 import sysconfig
 
-from uniserve_program_server import fetch, package
+from uniserve_build_server import fetch, package
 
 SOURCES = ["src/exchange.cu"]
 

@@ -1,4 +1,4 @@
-# The sparse_attention operator's SM100 backend: design 5.2's program package.
+# The sparse_attention operator's SM100 backend: design 5.2's package.
 #
 # One native module per descriptor: Video Sparse Attention, attention over the key
 # blocks a caller selected (`ops::attention::sparse::SparseCall`, 704 bytes). The kernel

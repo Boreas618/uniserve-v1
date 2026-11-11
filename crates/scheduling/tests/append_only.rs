@@ -6,7 +6,7 @@
 //! kind's name is never reused for a different meaning.
 //!
 //! The mechanism runs in the main process and each policy is a module the
-//! Program Server builds, so a policy older than the mechanism it runs under is
+//! Build Server builds, so a policy older than the mechanism it runs under is
 //! the normal case after an upgrade, not an accident. These cases state the two
 //! directions of that promise on the encoding itself, which is the only thing
 //! both sides share.

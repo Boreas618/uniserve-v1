@@ -1,10 +1,10 @@
-//! A device bench: one GPU, its stream, and the Program Server that builds and resolves the
+//! A device bench: one GPU, its stream, and the Build Server that builds and resolves the
 //! kernels a forward launches.
 //!
 //! A case runs its forward through [`Bench::run`]: a recording forward names the programs it
-//! launches, the Program Server prepares and resolves every one not yet installed, and a launching
+//! launches, the Build Server prepares and resolves every one not yet installed, and a launching
 //! forward runs it on the device. The device is `CUDA_VISIBLE_DEVICES`' first and the server the
-//! one whose socket `UNISERVE_PROGRAM_SERVER_SOCKET` names; a case that needs neither does not
+//! one whose socket `UNISERVE_BUILD_SERVER_SOCKET` names; a case that needs neither does not
 //! open a bench.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -12,13 +12,13 @@ use std::io::Read as _;
 use std::os::fd::AsRawFd as _;
 use std::path::Path;
 
-use nn::{Arena, Backing, DType, DevicePtr, Forward, Shape, Operand, Weight};
+use build_server::{
+    Client, Descriptors, ModuleForm, PackageRequest, PrepareRequest, Selector, Target,
+};
+use nn::{Arena, Backing, DType, DevicePtr, Forward, Operand, Shape, Weight};
 use ops::{Generation, KernelEntry};
 use platform::{DeviceAllocation, DeviceId, Stream};
-use program_server::{
-    Client, Descriptors, ModuleForm, PrepareRequest, ProgramRequest, Selector, Target,
-};
-use proto::program::ProgramSlot;
+use proto::module::ModuleSlot;
 
 use super::{Outcome, encode};
 
@@ -37,7 +37,7 @@ impl ops::capture::Sink for Launches {
     }
 }
 
-/// One device, its stream, the Program Server that supplies its kernels, and every buffer a
+/// One device, its stream, the Build Server that supplies its kernels, and every buffer a
 /// case allocated, freed when the bench drops.
 pub(crate) struct Bench {
     device: platform::Device,
@@ -55,9 +55,9 @@ pub(crate) struct Bench {
 
 impl Bench {
     pub(crate) fn open() -> Outcome<Self> {
-        let socket = std::env::var_os("UNISERVE_PROGRAM_SERVER_SOCKET").ok_or(
-            "UNISERVE_PROGRAM_SERVER_SOCKET names no Program Server: start one with \
-             `uniserve program-server serve` (see this file's header)",
+        let socket = std::env::var_os("UNISERVE_BUILD_SERVER_SOCKET").ok_or(
+            "UNISERVE_BUILD_SERVER_SOCKET names no Build Server: start one with \
+             `uniserve build-server serve` (see this file's header)",
         )?;
         let device = platform::Device::new(DEVICE)?;
         let stream = Stream::new(DEVICE)?;
@@ -111,12 +111,7 @@ impl Bench {
     }
 
     /// A device tensor holding `bytes`.
-    pub(crate) fn upload(
-        &mut self,
-        dtype: DType,
-        dims: &[u64],
-        bytes: &[u8],
-    ) -> Outcome<Operand> {
+    pub(crate) fn upload(&mut self, dtype: DType, dims: &[u64], bytes: &[u8]) -> Outcome<Operand> {
         let view = self.tensor(dtype, dims)?;
         if view.byte_len()? != bytes.len() as u64 {
             return Err(format!("{} bytes for a {dtype} tensor of {dims:?}", bytes.len()).into());
@@ -165,7 +160,7 @@ impl Bench {
         Ok(bytes)
     }
 
-    /// Runs `walk` on the device: a recording forward names its programs, the Program Server
+    /// Runs `walk` on the device: a recording forward names its programs, the Build Server
     /// prepares and resolves the ones not yet installed, and a launching forward runs it. Answers
     /// what the launching walk answered: tensors it reserved from the bench's arena, which no later
     /// run overwrites.
@@ -195,7 +190,7 @@ impl Bench {
 
     /// A kernel generation numbered `number` holding exactly the programs `keys` names, by
     /// operator name and descriptor key: each one the bench has not installed yet is prepared and
-    /// resolved at the Program Server first.
+    /// resolved at the Build Server first.
     pub(crate) fn generation(
         &mut self,
         number: u64,
@@ -204,7 +199,7 @@ impl Bench {
         let mut missing: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
         let mut wanted = Vec::new();
         for (operator, keys) in keys {
-            let operator = proto::program::operator::named(operator)
+            let operator = proto::module::operator::named(operator)
                 .ok_or_else(|| format!("{operator} is no operator of this build"))?;
             for key in keys {
                 if !self.kernels.contains_key(&(operator, key.clone())) {
@@ -224,7 +219,7 @@ impl Bench {
 
     /// Prepares every missing program and installs each key's module into this device.
     fn install(&mut self, missing: &BTreeMap<&'static str, BTreeSet<String>>) -> Outcome {
-        let mut programs = Vec::new();
+        let mut packages = Vec::new();
         for operator in missing.keys() {
             let backend = match self.backends.get(*operator).map(Vec::as_slice) {
                 Some([only]) => only.clone(),
@@ -236,8 +231,8 @@ impl Bench {
                 }
                 None => return Err(format!("the store has no package of {operator}").into()),
             };
-            programs.push(ProgramRequest {
-                slot: ProgramSlot::all(*operator),
+            packages.push(PackageRequest {
+                slot: ModuleSlot::all(*operator),
                 selector: Selector::Latest {
                     backend,
                     arguments: Default::default(),
@@ -246,23 +241,23 @@ impl Bench {
         }
         let request = PrepareRequest {
             targets: vec![self.target.clone()],
-            programs,
+            packages,
             descriptors: missing
                 .iter()
                 .map(|(operator, keys)| Descriptors {
-                    slot: ProgramSlot::all(*operator),
+                    slot: ModuleSlot::all(*operator),
                     keys: keys.iter().cloned().collect(),
                 })
                 .collect(),
         };
         let prepared = self.client.prepare(&request, &mut |_| {})?;
-        for chosen in prepared.programs {
-            let operator = proto::program::operator::named(&chosen.slot.op)
+        for chosen in prepared.packages {
+            let operator = proto::module::operator::named(&chosen.slot.op)
                 .ok_or_else(|| format!("{} is no operator of this build", chosen.slot.op))?;
             for key in missing.get(operator).into_iter().flatten() {
                 let module = self.client.resolve(
                     operator,
-                    &chosen.program,
+                    &chosen.package,
                     &self.target,
                     key,
                     &mut |_| {},
@@ -280,9 +275,9 @@ fn load(
     device: &platform::Device,
     operator: &str,
     key: &str,
-    module: program_server::Module,
+    module: build_server::Module,
 ) -> Outcome<KernelEntry> {
-    let read = |file: &program_server::ModuleFile| -> Outcome<Vec<u8>> {
+    let read = |file: &build_server::ModuleFile| -> Outcome<Vec<u8>> {
         let mut bytes = Vec::with_capacity(file.size as usize);
         (&file.file).read_to_end(&mut bytes)?;
         Ok(bytes)
@@ -319,7 +314,7 @@ fn load(
         ModuleForm::Native => {
             let symbol = module
                 .entries
-                .get(program_server::manifest::LAUNCH_ENTRY)
+                .get(build_server::manifest::LAUNCH_ENTRY)
                 .ok_or("a native module states no launch entry")?;
             // The library is the file that defines the entry; it is loaded where the store
             // keeps it, which the handle the server sent still names.

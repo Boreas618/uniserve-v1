@@ -1,4 +1,4 @@
-# The conv1d operator's cudnn backend: design 5.2's program package.
+# The conv1d operator's cudnn backend: design 5.2's package.
 #
 # One native module per descriptor. The module is the convolution itself, through
 # cuDNN 9's backend API: an engine per shape, chosen once (`tuning/engines.json`

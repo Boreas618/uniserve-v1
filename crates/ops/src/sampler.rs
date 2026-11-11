@@ -1,8 +1,8 @@
 //! Sampling: shaping the logits of a request, choosing among its candidates, and reading back the
 //! selected values.
 //!
-//! The steps are separate operators because each is one kernel program and each is replaced on its
-//! own during a program-layer update; the `Sampler` layer calls them in this order:
+//! The steps are separate operators because each is one kernel package and each is replaced on its
+//! own during a generation update; the `Sampler` layer calls them in this order:
 //!
 //! 1. `logits_shape` applies the request's logit adjustments, then its penalties, and divides by its
 //!    temperature. The adjustments come first, in vLLM's order (allowed set, bad words and the
@@ -47,11 +47,11 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-use proto::program::sampler::PARAMETER_COLUMNS;
+use proto::module::sampler::PARAMETER_COLUMNS;
 
 /// One compilation of `logits_shape`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -118,7 +118,7 @@ pub const fn ban_words(vocabulary: u32) -> u32 {
 pub struct LogitsShape;
 
 impl Op for LogitsShape {
-    const NAME: &'static str = proto::program::operator::LOGITS_SHAPE;
+    const NAME: &'static str = proto::module::operator::LOGITS_SHAPE;
 
     type Descriptor = ShapeDescriptor;
     type Args<'a> = ShapeArgs;
@@ -300,7 +300,7 @@ pub struct TopKArgs {
 pub struct TopK;
 
 impl Op for TopK {
-    const NAME: &'static str = proto::program::operator::TOP_K;
+    const NAME: &'static str = proto::module::operator::TOP_K;
 
     type Descriptor = TopKDescriptor;
     type Args<'a> = TopKArgs;
@@ -440,7 +440,7 @@ pub struct FilterArgs {
 pub struct FilterCandidates;
 
 impl Op for FilterCandidates {
-    const NAME: &'static str = proto::program::operator::FILTER_CANDIDATES;
+    const NAME: &'static str = proto::module::operator::FILTER_CANDIDATES;
 
     type Descriptor = FilterDescriptor;
     type Args<'a> = FilterArgs;
@@ -553,7 +553,7 @@ pub struct InverseCdfArgs {
 pub struct InverseCdf;
 
 impl Op for InverseCdf {
-    const NAME: &'static str = proto::program::operator::INVERSE_CDF;
+    const NAME: &'static str = proto::module::operator::INVERSE_CDF;
 
     type Descriptor = InverseCdfDescriptor;
     type Args<'a> = InverseCdfArgs;
@@ -673,7 +673,7 @@ pub struct ArgMaxArgs {
 pub struct ArgMax;
 
 impl Op for ArgMax {
-    const NAME: &'static str = proto::program::operator::ARGMAX;
+    const NAME: &'static str = proto::module::operator::ARGMAX;
 
     type Descriptor = ArgMaxDescriptor;
     type Args<'a> = ArgMaxArgs;
@@ -761,7 +761,7 @@ pub struct LogSoftmaxArgs {
 pub struct LogSoftmax;
 
 impl Op for LogSoftmax {
-    const NAME: &'static str = proto::program::operator::LOG_SOFTMAX;
+    const NAME: &'static str = proto::module::operator::LOG_SOFTMAX;
 
     type Descriptor = LogSoftmaxDescriptor;
     type Args<'a> = LogSoftmaxArgs;
@@ -857,7 +857,7 @@ pub struct LogprobArgs {
 pub struct LogprobGather;
 
 impl Op for LogprobGather {
-    const NAME: &'static str = proto::program::operator::LOGPROB_GATHER;
+    const NAME: &'static str = proto::module::operator::LOGPROB_GATHER;
 
     type Descriptor = LogprobDescriptor;
     type Args<'a> = LogprobArgs;
@@ -984,7 +984,7 @@ pub struct TopLogprobsArgs {
 pub struct TopLogprobs;
 
 impl Op for TopLogprobs {
-    const NAME: &'static str = proto::program::operator::TOP_LOGPROBS;
+    const NAME: &'static str = proto::module::operator::TOP_LOGPROBS;
 
     type Descriptor = TopLogprobsDescriptor;
     type Args<'a> = TopLogprobsArgs;
@@ -1149,7 +1149,7 @@ pub struct OrderArgs {
 pub struct CandidateOrder;
 
 impl Op for CandidateOrder {
-    const NAME: &'static str = proto::program::operator::CANDIDATE_ORDER;
+    const NAME: &'static str = proto::module::operator::CANDIDATE_ORDER;
 
     type Descriptor = OrderDescriptor;
     type Args<'a> = OrderArgs;

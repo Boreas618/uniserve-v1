@@ -93,12 +93,7 @@ impl PatchEmbed {
     /// # Errors
     ///
     /// As [`Patchify::inverse`].
-    pub fn unpatchify(
-        &self,
-        f: &Forward,
-        tokens: Operand,
-        raster: ops::Shape,
-    ) -> Result<Operand> {
+    pub fn unpatchify(&self, f: &Forward, tokens: Operand, raster: ops::Shape) -> Result<Operand> {
         self.patchify.inverse(f, tokens, raster)
     }
 }

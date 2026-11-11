@@ -33,7 +33,7 @@ use crate::capability::{
     CausalLm, Decoder, Denoiser, Encoder, KvView, MediaFormat, Splicer, TokenBatch, Vision,
     WarmPrompt, WarmRequest,
 };
-use crate::{Checkpoint, DType, Forward, Result, Operand, WeightLoader};
+use crate::{Checkpoint, DType, Forward, Operand, Result, WeightLoader};
 
 /// One model family a build serves: what execution loads of its checkpoints, beside how they
 /// declare it and what request processing serves ([`processing::Family`]).

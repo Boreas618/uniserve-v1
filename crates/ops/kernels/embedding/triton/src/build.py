@@ -6,7 +6,7 @@ flag. The token count stays a runtime value.
 """
 
 import embedding as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The vocabulary weight's dtype, and the output row's.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}

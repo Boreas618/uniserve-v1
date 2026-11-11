@@ -37,7 +37,7 @@ use nn::capability::{
 };
 use ops::{DType, Operand};
 use platform::DeviceId;
-use proto::program::PhaseKind;
+use proto::module::PhaseKind;
 
 use crate::arena::Pools;
 use crate::batch::{Job, Jobs, answered};

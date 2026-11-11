@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `vsa_compose_gated_rows` on a device and check it bit for bit against the operator's steps.
 
-    crates/program-server/python/.venv/bin/python compose_check.py [--package DIR] [--device cuda]
+    crates/build-server/python/.venv/bin/python compose_check.py [--package DIR] [--device cuda]
 
 **This check needs a GPU**: the kernel pins its rounding with inline PTX (`mul.rn.f32`,
 `add.rn.f32`), which exists so the compiler cannot contract the multiply into the sum, and

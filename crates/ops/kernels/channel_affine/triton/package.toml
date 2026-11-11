@@ -1,4 +1,4 @@
-# The channel_affine operator's Triton backend: design 5.2's program package.
+# The channel_affine operator's Triton backend: design 5.2's package.
 #
 # One cubin per descriptor: `out = x · scale[c] + shift[c]` over a contiguous
 # `[batch, channels, positions]` view, the product and the sum each one IEEE

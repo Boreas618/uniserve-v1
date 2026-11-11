@@ -1,16 +1,16 @@
 //! The policy source a test epoch installs.
 //!
-//! A deployed epoch takes its policy from the Program Server; a test epoch has none, and a
+//! A deployed epoch takes its policy from the Build Server; a test epoch has none, and a
 //! scheduler with no policy decides nothing — no plan, no admission, no batch — so an epoch that
 //! submits a request must be given a module. [`packaged_policy`] is that source: the real `fcfs`
-//! program this tree builds, with the arguments that make its declared limits fit the capacity the
+//! package this tree builds, with the arguments that make its declared limits fit the capacity the
 //! caller's epoch was built for. It installs through the same precopy and switchover a deployment
 //! uses, so a caller's fixtures exercise the mechanism rather than a stand-in for it, and there is
 //! no second policy in the tree to keep honest.
 
-use scheduler::{BatchCapacity, Limits, Parameters, PolicyProgram, ceilings_of};
+use scheduler::{BatchCapacity, Limits, Parameters, PolicyPackage, ceilings_of};
 
-/// The arguments that state `limits` as a program's parameters: every limit a deployment can
+/// The arguments that state `limits` as a package's parameters: every limit a deployment can
 /// state.
 fn parameters_of(limits: Limits) -> Parameters {
     Parameters {
@@ -24,20 +24,20 @@ fn parameters_of(limits: Limits) -> Parameters {
     }
 }
 
-/// The `fcfs` policy module this tree builds, and the program that names it: the source a caller
+/// The `fcfs` policy module this tree builds, and the package that names it: the source a caller
 /// installs through the real precopy and switchover.
 ///
-/// The program is [`packaged_program`]`(capacity)`, so the limits it declares fit any fixture's
+/// The package is [`packaged_revision`]`(capacity)`, so the limits it declares fit any fixture's
 /// build config and the mechanism's check of a policy's limits against the ceilings cannot refuse
 /// it. The module is [`packaged_module`].
-pub fn packaged_policy(capacity: BatchCapacity) -> (PolicyProgram, Vec<u8>) {
-    (packaged_program(capacity), packaged_module())
+pub fn packaged_policy(capacity: BatchCapacity) -> (PolicyPackage, Vec<u8>) {
+    (packaged_revision(capacity), packaged_module())
 }
 
-/// The program `fcfs` revision one runs under for an epoch of `capacity`: arguments that state
+/// The package `fcfs` revision one runs under for an epoch of `capacity`: arguments that state
 /// [`ceilings_of`]`(capacity)`, the ceilings the mechanism checks a policy's declaration against.
-pub fn packaged_program(capacity: BatchCapacity) -> PolicyProgram {
-    PolicyProgram {
+pub fn packaged_revision(capacity: BatchCapacity) -> PolicyPackage {
+    PolicyPackage {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: parameters_of(ceilings_of(capacity)),
@@ -122,19 +122,19 @@ mod tests {
     }
 
     #[test]
-    fn the_packaged_program_states_limits_the_build_config_allows() {
-        let program = packaged_program(capacity());
-        assert_eq!(program.backend, "fcfs", "the module is this tree's fcfs");
-        assert_eq!(program.revision, 1);
+    fn the_packaged_package_states_limits_the_build_config_allows() {
+        let package = packaged_revision(capacity());
+        assert_eq!(package.backend, "fcfs", "the module is this tree's fcfs");
+        assert_eq!(package.revision, 1);
         assert!(
-            program.stated.is_empty(),
-            "no argument is stated, so a Program Server resolves none for it"
+            package.stated.is_empty(),
+            "no argument is stated, so a Build Server resolves none for it"
         );
 
         // The arguments state the ceilings themselves, so the limits the module declares are the
         // ones the mechanism checks a policy against and cannot be refused for an epoch of this
         // capacity.
-        let limits = Limits::from_parameters(&program.arguments);
+        let limits = Limits::from_parameters(&package.arguments);
         let ceilings = ceilings_of(capacity());
         assert_eq!(limits.max_batch, ceilings.max_batch);
         assert_eq!(
@@ -149,8 +149,8 @@ mod tests {
     #[test]
     fn an_epoch_built_for_fewer_calls_states_fewer() {
         // `fcfs`'s own default declares 128 calls, which a test epoch built for two would be
-        // refused for: the program's arguments are what make the declaration fit.
-        let small = packaged_program(BatchCapacity {
+        // refused for: the package's arguments are what make the declaration fit.
+        let small = packaged_revision(BatchCapacity {
             max_batch: 2,
             max_num_batched_tokens: 64,
         });
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(
             Limits::from_parameters(&small.arguments).max_batch,
             2,
-            "the module declares what this program states, not the package default"
+            "the module declares what this package states, not the package default"
         );
     }
 }

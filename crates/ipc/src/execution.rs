@@ -18,8 +18,8 @@
 //!   implements over its devices.
 //!
 //! Everything here is host data and host synchronization: no device, no kernel, no model. The
-//! commit table's and the sampler's columns are the program vocabulary's
-//! (`proto::program::{commit, sampler}`), and a denoising step's latent layout is the video
+//! commit table's and the sampler's columns are the module vocabulary's
+//! (`proto::module::{commit, sampler}`), and a denoising step's latent layout is the video
 //! vocabulary's (`proto::video::Layout`).
 
 use std::fmt;
@@ -260,7 +260,7 @@ pub struct CallOutput {
     /// has none, which is not the same as a failure.
     pub tokens: Vec<u32>,
     /// The slot's committed count for a text call; a latent trajectory reports its own step here
-    /// once `slot_commit` (`proto::program::commit`) gains a per-slot step column, and until then this field is the commit
+    /// once `slot_commit` (`proto::module::commit`) gains a per-slot step column, and until then this field is the commit
     /// count for every call kind.
     ///
     /// It is read from the commit table's sampling position, which a text slot advances once per
@@ -333,7 +333,7 @@ pub struct RowState {
 ///
 /// The mechanism learns it from the batch's [`Submission`], builds the next step's input ids from
 /// the tokens, and folds the timing into the statistics of the calls' domain. A step that samples
-/// nothing (a chunk of a prefill that ends no prompt, a warmup, a program-layer command) completes
+/// nothing (a chunk of a prefill that ends no prompt, a warmup, a generation command) completes
 /// with no call and nothing measured.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BatchOutput {
@@ -763,14 +763,14 @@ pub struct BatchColumns {
     pub input_ids: Vec<i32>,
     /// `[rows]` the sampler's slot view: the runner's per-slot sampling state.
     pub slots: Vec<i32>,
-    /// `rows x proto::program::sampler::PARAMETER_COLUMNS` f32 request parameters, row-major.
+    /// `rows x proto::module::sampler::PARAMETER_COLUMNS` f32 request parameters, row-major.
     pub parameters: Vec<f32>,
     /// `[rows]` where each row's draw lies: its request's Philox stream and the logical position
     /// of the token it samples (`crate::philox`). The runner turns each into the row's uniform
     /// before the replay, so a sampled token depends on its request's seed and position alone. A
     /// greedy row and a row that samples nothing carry one too; its draw is never read.
     pub draws: Vec<crate::philox::DrawAddress>,
-    /// `slot_commit` (`proto::program::commit`)'s column table, column-major `[columns][rows]` i64; a negative commit slot
+    /// `slot_commit` (`proto::module::commit`)'s column table, column-major `[columns][rows]` i64; a negative commit slot
     /// belongs to a padded row and keeps its token state.
     pub commit: Vec<i64>,
     /// The KV page size in tokens, the same number the policy sees in `Room`.
@@ -1186,7 +1186,7 @@ impl BatchColumns {
         // through.
         let rows = self.rows();
         let calls = self.calls();
-        let parameters = proto::program::sampler::PARAMETER_COLUMNS as usize;
+        let parameters = proto::module::sampler::PARAMETER_COLUMNS as usize;
         for (name, actual, expected) in [
             ("positions", self.rows.positions.len(), tokens),
             ("slot_mapping", self.rows.slot_mapping.len(), tokens),
@@ -1199,7 +1199,7 @@ impl BatchColumns {
             (
                 "commit",
                 self.commit.len(),
-                proto::program::commit::COMMIT_FIELDS * calls,
+                proto::module::commit::COMMIT_FIELDS * calls,
             ),
         ] {
             if actual != expected {

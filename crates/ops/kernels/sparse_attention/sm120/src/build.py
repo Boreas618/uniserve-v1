@@ -1,7 +1,7 @@
 """The sparse_attention sm120 package's compile script: one descriptor -> one module.
 
 The kernel is FlashInfer's SM120 CuTe DSL block-sparse forward pass, so the module is produced the
-way the FA4 packages' are: `uniserve_program_server.cute_dsl` compiles the kernel through ``bsa_sm120.BsaCompiler`` and
+way the FA4 packages' are: `uniserve_build_server.cute_dsl` compiles the kernel through ``bsa_sm120.BsaCompiler`` and
 exports it to C, then links the exported launcher with this package's entry unit (which fills the
 generated structs from the operator's call) and the CuTe DSL runtime.
 
@@ -11,7 +11,7 @@ parameters rather than its dimensions.
 """
 
 from bsa_sm120 import NAME, BsaCompiler
-from uniserve_program_server import cute_dsl as driver
+from uniserve_build_server import cute_dsl as driver
 
 #: The entry the module exports, which the package's `[module.entries]` names.
 ENTRY = "uniserve_sparse_attention"

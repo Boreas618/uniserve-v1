@@ -1,4 +1,4 @@
-# The copy_block operator's Triton backend: design 5.2's program package.
+# The copy_block operator's Triton backend: design 5.2's package.
 #
 # One module per descriptor, and the descriptor is the two element types: the four extents and both
 # stride vectors are launch words, because a clip's tile geometry changes per request and a program

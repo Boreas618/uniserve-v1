@@ -43,6 +43,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.python.e2e.build_server import (
+    build_server as running_build_server,
+)
 from tests.python.e2e.http_helpers import (
     QWEN3_UPDATED_CHECKPOINT,
     admin,
@@ -65,9 +68,6 @@ from tests.python.e2e.http_helpers import (
     wait_until,
     worker_executable,
 )
-from tests.python.e2e.program_server import (
-    program_server as running_program_server,
-)
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
@@ -75,7 +75,7 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 # that engines start in about a minute, and a small device KV cache.
 OPTIONS = (
     "dtype=bfloat16",
-    # The attention program the deployment's paged attention executes, as a
+    # The attention package the deployment's paged attention executes, as a
     # package name (one of the store's packages, ``KEYS``). ``auto`` names no
     # package, so the deployment names the backend design 9's default choice
     # picks for this shape: trtllm-gen.
@@ -104,38 +104,38 @@ PROMPT = (
 )
 
 
-#: The socket of the module's Program Server, which every deployment of this
-#: file names as ``program_config.socket``. Set by :func:`program_server`.
-PROGRAM_SERVER: Path | None = None
+#: The socket of the module's Build Server, which every deployment of this
+#: file names as ``build_config.socket``. Set by :func:`build_server`.
+BUILD_SERVER: Path | None = None
 
 
 @pytest.fixture(scope="module", autouse=True)
-def program_server(tmp_path_factory: pytest.TempPathFactory):
-    """The host's Program Server, with the deployment's programs installed.
+def build_server(tmp_path_factory: pytest.TempPathFactory):
+    """The host's Build Server, with the deployment's modules installed.
 
     Autouse and module-scoped because every deployment of this file needs it:
-    the daemon's leader resolves each epoch's programs at this server.
+    the daemon's leader resolves each epoch's modules at this server.
     """
-    global PROGRAM_SERVER
-    with running_program_server(tmp_path_factory) as socket:
-        PROGRAM_SERVER = socket
+    global BUILD_SERVER
+    with running_build_server(tmp_path_factory) as socket:
+        BUILD_SERVER = socket
         try:
             yield socket
         finally:
-            PROGRAM_SERVER = None
+            BUILD_SERVER = None
 
 
-def program_server_option() -> list[str]:
-    """The command-line option that gives a deployment its programs' server.
+def build_server_option() -> list[str]:
+    """The command-line option that gives a deployment its modules' server.
 
     Every deployment serves a scheduling policy, and a policy's module comes
-    from this host's Program Server (design 6.1); without the option the daemon
-    starts a Program Server of its own on the default socket, which holds none
+    from this host's Build Server (design 6.1); without the option the daemon
+    starts a Build Server of its own on the default socket, which holds none
     of the module's packages.
     """
-    if PROGRAM_SERVER is None:
-        pytest.fail("the module's Program Server is not running")
-    return ["--set", f"program_config.socket={PROGRAM_SERVER}"]
+    if BUILD_SERVER is None:
+        pytest.fail("the module's Build Server is not running")
+    return ["--set", f"build_config.socket={BUILD_SERVER}"]
 
 
 def _pool_gib(runtime: Path) -> float:
@@ -405,7 +405,7 @@ def _node(runtime: Path, device: str, log: Path) -> Iterator[tuple[str, int]]:
             "127.0.0.1",
             "--port",
             str(port),
-            *program_server_option(),
+            *build_server_option(),
         ],
         log,
         env={"CUDA_VISIBLE_DEVICES": device, "XDG_RUNTIME_DIR": str(runtime)},
@@ -555,7 +555,7 @@ def _serving(
         str(worker_executable()),
         "--set",
         f"kv_cache_config.host_gib={HOST_GIB}",
-        *program_server_option(),
+        *build_server_option(),
     ]
     for option in options:
         command += ["--set", option]
@@ -720,7 +720,7 @@ def test_a_serving_deployment_answers_its_admin_api(
         streaming.start()
         wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
         update = _apply(base_url, "scheduler_config.max_batch=4")
-        assert update["change"] == "program", update
+        assert update["change"] == "generation", update
         committed = admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
         before_update = len(read)
@@ -924,7 +924,7 @@ def _restart_while_streaming(
     # so here, in seconds and with its own body, instead of as a stream that
     # produced no token in five minutes — a silence the two paths share and
     # that therefore names neither. A refusal is the likelier failure (a
-    # relaunched process that was not handed the epoch's programs answers 503
+    # relaunched process that was not handed the epoch's modules answers 503
     # until it times out), and `raise_for_status` keeps the status but not the
     # body, so the refusal's own `detail` is raised here as well.
     probe = "Count from 1 to 3, separated by commas."
@@ -1010,13 +1010,13 @@ def _restart_while_streaming(
     assert successor != old_daemon
     before_restart = [len(read) for read in reads]
 
-    # The successor serves the same deployment, so it holds the same programs'
+    # The successor serves the same deployment, so it holds the same modules'
     # server: a deployment reaches its scheduling policy only through it, and
     # the successor reads the configuration the old process served rather than
     # a command line of its own (design 7.5).
     inherited = tomllib.loads(admin_config(base_url)["config"])
-    assert inherited["program_config"]["socket"] == str(PROGRAM_SERVER), (
-        f"the successor did not inherit the programs' server: {inherited}"
+    assert inherited["build_config"]["socket"] == str(BUILD_SERVER), (
+        f"the successor did not inherit the modules' server: {inherited}"
     )
 
     # New requests are served while the old daemon finishes its streams.
@@ -1098,11 +1098,11 @@ def _restart_while_streaming(
     )
     reply = _chat(base_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
-    # A scheduling limit is a parameter of the policy program, so it reaches the
-    # serving epoch as a program update; `max_running_requests` is build config
+    # A scheduling limit is a parameter of the policy package, so it reaches the
+    # serving epoch as a generation update; `max_running_requests` is build config
     # and would switch the epoch.
     update = _apply(base_url, "scheduler_config.max_batch=4")
-    assert update["change"] == "program", update
+    assert update["change"] == "generation", update
     committed = admin(base_url, "config/commit")
     assert committed.status_code == 200, committed.text
 
@@ -1692,7 +1692,7 @@ def test_a_lost_main_process_is_relaunched_without_a_standby(
 ):
     """The same loss with no standby beside the serving process.
 
-    The daemon launches a replacement and hands it the epoch's own programs and
+    The daemon launches a replacement and hands it the epoch's own modules and
     the requests in flight: the count migrates to the new process, which answers
     the next request as the lost one did.
     """
@@ -2158,16 +2158,16 @@ def test_a_regression_of_the_epoch_on_trial_reverts_it(
         _assert_whole(streaming, streamed)
 
 
-def test_a_program_update_past_a_threshold_reverts_in_its_epoch(
+def test_a_package_update_past_a_threshold_reverts_in_its_epoch(
     tmp_path: Path, runtime: Path
 ):
-    """A program-layer update stands the same trial as an epoch switch.
+    """A generation update stands the same trial as an epoch switch.
 
     The serving epoch computes a stream before the update and a trickle after
     it, so its token throughput falls past the threshold. The update reverts in
     the same main process, with the threshold as its failure.
     """
-    name = "qwen3-live-program-trial"
+    name = "qwen3-live-package-trial"
     log = tmp_path / "server.log"
     with _serve(runtime, log, name) as base_url:
         streaming, streamed = _start_count(base_url, name)
@@ -2178,7 +2178,7 @@ def test_a_program_update_past_a_threshold_reverts_in_its_epoch(
             "update_config.rollback.throughput_regression=0.5",
             f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
         )
-        assert result["change"] == "program", result
+        assert result["change"] == "generation", result
         _assert_whole(streaming, streamed)
 
         def reverted() -> bool:
@@ -2650,12 +2650,12 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
         assert update["phase"] == "abandoned", update
 
 
-def test_program_updates_under_a_request_keep_its_stream_whole(
+def test_package_updates_under_a_request_keep_its_stream_whole(
     tmp_path: Path, runtime: Path
 ):
     """In-place switches under a request leave its stream as a run without them.
 
-    A program update reaches a process that serves: its switchover captures
+    A generation update reaches a process that serves: its switchover captures
     nothing a batch of the running request can be mistaken for, so every token
     the request computes is the one its stream delivers. The count crosses as
     many switches as fit under it, each one committed.
@@ -2670,7 +2670,7 @@ def test_program_updates_under_a_request_keep_its_stream_whole(
                 switches += 1
                 size = 4 if switches % 2 else 8
                 result = _apply(base_url, f"scheduler_config.max_batch={size}")
-                assert result["change"] == "program", result
+                assert result["change"] == "generation", result
                 committed = admin(base_url, "config/commit")
                 assert committed.status_code == 200, committed.text
                 time.sleep(0.5)

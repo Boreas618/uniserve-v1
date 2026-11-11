@@ -1,7 +1,7 @@
-//! Native kernel libraries: the `.so` form of a kernel program's module
+//! Native kernel libraries: the `.so` form of a kernel package's module
 //! (`ops::Kernel::Native`).
 //!
-//! A kernel program whose source needs host code — CuTe DSL's `export_to_c`,
+//! A kernel package whose source needs host code — CuTe DSL's `export_to_c`,
 //! FlashInfer's launch code and planner, the cuDNN frontend — is compiled to
 //! a shared object with a C ABI, with its cubin embedded. This process
 //! `dlopen`s that object and calls the entry point the package declares,
@@ -14,7 +14,7 @@
 //! and resolves the symbol with the type the caller declares.
 //!
 //! The library stays loaded while anything holds it and is closed when the
-//! last owner drops it; the order a program-layer purge follows (destroy or
+//! last owner drops it; the order a generation purge follows (destroy or
 //! rebind the graphs that call it first) is the owner's rule, not this
 //! module's.
 //!
@@ -33,7 +33,7 @@ use crate::{Error, Result};
 /// A native kernel library loaded from `path` with `dlopen`.
 ///
 /// The library is opened local to this process (`RTLD_LOCAL`), so its
-/// symbols stay out of the process's global namespace: two kernel programs
+/// symbols stay out of the process's global namespace: two kernel packages
 /// may export the same entry point without seeing each other's.
 pub struct NativeLibrary {
     library: Library,
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn a_declared_entry_point_resolves_to_a_callable_function() {
-        // `strlen` is a C entry point like a kernel program's host code: a
+        // `strlen` is a C entry point like a kernel package's host code: a
         // known symbol with a declared signature.
         type Strlen = unsafe extern "C" fn(*const std::ffi::c_char) -> usize;
 

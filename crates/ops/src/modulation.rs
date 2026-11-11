@@ -28,7 +28,7 @@ use std::fmt;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -125,7 +125,7 @@ fn scaled_output(output: DType) -> bool {
 }
 
 impl Op for ModulatedRmsNorm {
-    const NAME: &'static str = proto::program::operator::MODULATED_RMS_NORM;
+    const NAME: &'static str = proto::module::operator::MODULATED_RMS_NORM;
 
     type Descriptor = ModulatedRmsNormDescriptor;
     type Args<'a> = Args;
@@ -393,7 +393,7 @@ pub struct GatedResidualArgs {
 pub struct GatedResidual;
 
 impl Op for GatedResidual {
-    const NAME: &'static str = proto::program::operator::GATED_RESIDUAL;
+    const NAME: &'static str = proto::module::operator::GATED_RESIDUAL;
 
     type Descriptor = GatedResidualDescriptor;
     type Args<'a> = GatedResidualArgs;

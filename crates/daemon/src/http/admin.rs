@@ -148,7 +148,7 @@ impl Admin {
         })
     }
 
-    /// The node's epoch records, which the admin reports and the program-layer
+    /// The node's epoch records, which the admin reports and the generation
     /// operations move.
     pub(crate) fn epochs(&self) -> &crate::epoch::Epochs {
         &self.epochs
@@ -560,15 +560,15 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
             dry_run: body.dry_run,
             force: body.force,
         };
-        // The program layer is tried first, and only on a target resolved
+        // The generation layer is tried first, and only on a target resolved
         // against the serving configuration: a change that fills other
-        // programs moves the main processes in place, and the epoch path would
+        // modules moves the main processes in place, and the epoch path would
         // answer `none` for it because its build config is unchanged (§7.2,
         // §7.3).
-        if let Some(program) =
-            Box::pin(program_update(&admin, &leader, &request, body.dry_run)).await?
+        if let Some(package) =
+            Box::pin(generation_update(&admin, &leader, &request, body.dry_run)).await?
         {
-            return Ok(program);
+            return Ok(package);
         }
         // The change's future holds the model files it resolves.
         match Box::pin(leader.apply(request)).await {
@@ -612,7 +612,9 @@ fn applied_result(
         Ok(Applied::InPlace(plan)) => Ok(json!({ "change": "in_place", "plan": plan })),
         Ok(Applied::Planned(plan)) => Ok(json!({ "change": "planned", "plan": plan })),
         Ok(Applied::Epoch(report)) => Ok(json!({ "change": "epoch", "epoch": report })),
-        Ok(Applied::Program(report)) => Ok(json!({ "change": "program", "program": report })),
+        Ok(Applied::Generation(report)) => {
+            Ok(json!({ "change": "generation", "generation": report }))
+        }
         Ok(Applied::Daemon { .. }) => Err((
             StatusCode::CONFLICT,
             "the daemon's own options changed again after its hot restart".to_owned(),
@@ -660,35 +662,35 @@ async fn commit(State(state): State<AdminState>) -> Response {
     let leader = Arc::clone(&state.leader);
     let admin = Arc::clone(&state.admin);
     run(&state.admin, "commit", true, async move {
-        // A program-layer probation ends first: its commit and purge are the
+        // A generation probation ends first: its commit and purge are the
         // main processes', and the epoch keeps no previous generation
-        // afterwards (§7.3 steps 5-6). Only when no program-layer update is in
+        // afterwards (§7.3 steps 5-6). Only when no generation update is in
         // flight does the configuration's own commit run.
         // The update the probation belongs to is the one this operation ends,
         // numbered when it was applied — not this operation's own number.
         let epochs = Arc::clone(&leader.epochs());
-        let probation = epochs.program_update();
-        if let Some(program) = probation {
-            let number = program.update.number;
-            match leader.commit_programs(number).await {
+        let probation = epochs.generation_update();
+        if let Some(package) = probation {
+            let number = package.update.number;
+            match leader.commit_generation(number).await {
                 Ok(true) => {
-                    program_phase(
+                    generation_phase(
                         &admin,
                         &epochs,
                         Phase::Committed,
-                        program.epoch,
-                        &program.update,
+                        package.epoch,
+                        &package.update,
                     );
-                    program_phase(
+                    generation_phase(
                         &admin,
                         &epochs,
                         Phase::Purged,
-                        program.epoch,
-                        &program.update,
+                        package.epoch,
+                        &package.update,
                     );
                     return Ok(json!({
-                        "change": "program",
-                        "epoch": program.epoch,
+                        "change": "generation",
+                        "epoch": package.epoch,
                         "state": "committed",
                     }));
                 }
@@ -711,14 +713,14 @@ async fn commit(State(state): State<AdminState>) -> Response {
     .await
 }
 
-/// Applies a change at the program layer, answering what it did, or `None`
+/// Applies a change at the generation layer, answering what it did, or `None`
 /// when the change moves nothing there and the epoch path decides it (§7.2).
 ///
 /// The layer is decided on the target resolved against the serving
-/// configuration, and nothing is compared before the target's programs are
-/// prepared at every host's Program Server: a newly installed revision at an
-/// unchanged configuration is a program-layer change.
-async fn program_update(
+/// configuration, and nothing is compared before the target's modules are
+/// prepared at every host's Build Server: a newly installed revision at an
+/// unchanged configuration is a generation change.
+async fn generation_update(
     admin: &Arc<Admin>,
     leader: &Arc<Leader>,
     request: &ApplyRequest,
@@ -732,10 +734,10 @@ async fn program_update(
         // The change itself is refused; the epoch path answers it the same way.
         return Ok(None);
     };
-    // A change the epoch or host layer outranks is not the program layer's,
-    // and deciding that here keeps a host-layer change from needing a Program
-    // Server at all: only `None` and `Program` reach the prepare below, the
-    // first because a prepared program reveals what the config alone cannot.
+    // A change the epoch or host layer outranks is not the generation layer's,
+    // and deciding that here keeps a host-layer change from needing a Build
+    // Server at all: only `None` and `PackageRevision` reach the prepare below, the
+    // first because a prepared package reveals what the config alone cannot.
     let (Ok(previous), Ok(next)) = (
         crate::epoch::Epoch::of(current.clone()),
         crate::epoch::Epoch::of(target.clone()),
@@ -752,7 +754,7 @@ async fn program_update(
     let epochs = leader.epochs();
     let number = admin.running_number();
     let planned = match leader
-        .apply_programs(number, &target, &options, request.force, true)
+        .apply_generation(number, &target, &options, request.force, true)
         .await
     {
         Ok(Some(planned)) => planned,
@@ -761,14 +763,14 @@ async fn program_update(
     };
     if dry_run {
         return Ok(Some(json!({
-            "change": "program",
-            "plan": programs_report(&planned.target.programs),
+            "change": "generation",
+            "plan": modules_report(&planned.target.modules),
         })));
     }
     let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
-    program_phase(admin, &epochs, Phase::Precopy, epoch, &planned);
+    generation_phase(admin, &epochs, Phase::Precopy, epoch, &planned);
     match leader
-        .apply_programs(number, &target, &options, request.force, false)
+        .apply_generation(number, &target, &options, request.force, false)
         .await
     {
         Ok(Some(update)) => {
@@ -780,10 +782,10 @@ async fn program_update(
                 Phase::Switched,
                 Phase::Probation,
             ] {
-                program_phase(admin, &epochs, phase, epoch, &update);
+                generation_phase(admin, &epochs, phase, epoch, &update);
             }
             Ok(Some(json!({
-                "change": "program",
+                "change": "generation",
                 "epoch": epoch,
                 "state": "probation",
                 "update": update.number,
@@ -791,7 +793,7 @@ async fn program_update(
         }
         Ok(None) => Err((
             StatusCode::CONFLICT,
-            "the program-layer change moved nothing after it was planned: the \
+            "the generation change moved nothing after it was planned: the \
              deployment changed while this operation ran"
                 .to_owned(),
         )),
@@ -799,7 +801,7 @@ async fn program_update(
     }
 }
 
-/// Reports a program layer that could not take the target's programs and
+/// Reports a generation layer that could not take the target's modules and
 /// answers why: what serves is untouched (§7.3 step 2).
 fn refused_precopy(
     admin: &Arc<Admin>,
@@ -813,15 +815,15 @@ fn refused_precopy(
         number,
         Phase::PrecopyFailed,
         epoch,
-        [("change", json!("program")), ("reason", json!(reason))],
+        [("change", json!("generation")), ("reason", json!(reason))],
     );
     (update_status(error), format!("precopy failed: {reason}"))
 }
 
-/// Reports one phase of a program-layer update on the event log: the phase,
+/// Reports one phase of a generation update on the event log: the phase,
 /// the update and the epoch it moves, the change it is, the generation that
-/// executes and the programs it carries (`data`).
-fn program_phase(
+/// executes and the modules it carries (`data`).
+fn generation_phase(
     admin: &Arc<Admin>,
     epochs: &crate::epoch::Epochs,
     phase: Phase,
@@ -837,32 +839,32 @@ fn program_phase(
         phase,
         epoch,
         [
-            ("change", json!("program")),
+            ("change", json!("generation")),
             ("generation", generation),
-            ("programs", programs_report(&update.target.programs)),
+            ("modules", modules_report(&update.target.modules)),
         ],
     );
 }
 
-/// The programs an update carries, by operator and revision, as an event's
-/// `data.programs` names them (§7.3).
-fn programs_report(programs: &crate::epoch::FilledPrograms) -> serde_json::Value {
-    let kernels = programs
+/// The modules an update carries, by operator and revision, as an event's
+/// `data.modules` names them (§7.3).
+fn modules_report(modules: &crate::epoch::ModuleSet) -> serde_json::Value {
+    let kernels = modules
         .kernels
         .iter()
-        .map(|(slot, program)| {
+        .map(|(slot, package)| {
             json!({
                 "op": slot.op,
-                "backend": program.backend,
-                "revision": program.revision,
+                "backend": package.backend,
+                "revision": package.revision,
             })
         })
         .collect::<Vec<_>>();
     json!({
         "kernels": kernels,
         "policy": {
-            "backend": programs.policy.backend,
-            "revision": programs.policy.revision,
+            "backend": modules.policy.backend,
+            "revision": modules.policy.revision,
         },
     })
 }
@@ -893,34 +895,34 @@ async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> R
         let reason = body
             .reason
             .unwrap_or_else(|| "the operator rolled the trial back".to_owned());
-        // A program-layer probation returns to the generation before it first,
+        // A generation probation returns to the generation before it first,
         // with the reason the operator gave (§7.3 step 5); the configuration's
-        // own rollback runs only when no program-layer update is in flight.
+        // own rollback runs only when no generation update is in flight.
         // The update the probation belongs to is the one this operation ends,
         // numbered when it was applied — not this operation's own number.
         let epochs = leader.epochs();
-        let probation = epochs.program_update();
-        if let Some(program) = probation {
-            let number = program.update.number;
-            match leader.rollback_programs(number, &reason).await {
+        let probation = epochs.generation_update();
+        if let Some(package) = probation {
+            let number = package.update.number;
+            match leader.rollback_generation(number, &reason).await {
                 Ok(true) => {
-                    program_phase(
+                    generation_phase(
                         &admin,
                         &epochs,
                         Phase::Reverted,
-                        program.epoch,
-                        &program.update,
+                        package.epoch,
+                        &package.update,
                     );
-                    program_phase(
+                    generation_phase(
                         &admin,
                         &epochs,
                         Phase::Purged,
-                        program.epoch,
-                        &program.update,
+                        package.epoch,
+                        &package.update,
                     );
                     return Ok(json!({
-                        "change": "program",
-                        "epoch": program.epoch,
+                        "change": "generation",
+                        "epoch": package.epoch,
                         "state": "reverted",
                     }));
                 }

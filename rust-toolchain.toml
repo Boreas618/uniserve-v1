@@ -1,6 +1,6 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
-# Scheduling policies are WebAssembly modules: the Program Server installs one
+# Scheduling policies are WebAssembly modules: the Build Server installs one
 # built for this target, and the scheduler's tests build the fcfs policy for it.
 targets = ["wasm32-unknown-unknown"]

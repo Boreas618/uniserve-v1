@@ -11,7 +11,7 @@ There is no element-type dimension: both operands are FP32, the type `vsa_prepar
 """
 
 import vsa_scores as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The pooled rows are FP32 by construction — `vsa_prepare_tiles` pools each tile's per-head means
 #: as the accumulation its pooling runs in — so the operand type is the operator's, not a

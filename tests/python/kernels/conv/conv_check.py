@@ -35,8 +35,8 @@ half-precision module given ``--tf32 true`` must refuse, because it has no such 
 to make, while an FP32 module withholds the permission by being served an engine that
 does not narrow its inputs.
 
-Run it with the Program Server's environment
-(``crates/program-server/python/.venv/bin/python``), which has torch.
+Run it with the Build Server's environment
+(``crates/build-server/python/.venv/bin/python``), which has torch.
 """
 
 import argparse

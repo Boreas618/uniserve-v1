@@ -152,7 +152,7 @@ enum Experts {
 struct Adapter {
     keys: Vec<[u8; 32]>,
     /// Each tensor's region, by its name in the adapter's file. Nothing reads them until a kernel
-    /// program of the epoch does; a slot's tensors are what such a program is handed.
+    /// package of the epoch does; a slot's tensors are what such a package is handed.
     regions: BTreeMap<String, nn::Backing>,
 }
 

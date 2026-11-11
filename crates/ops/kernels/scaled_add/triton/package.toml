@@ -1,4 +1,4 @@
-# The scaled_add operator's Triton backend: design 5.2's program package.
+# The scaled_add operator's Triton backend: design 5.2's package.
 #
 # One cubin per descriptor: a diffusion solver's Euler step, `target ← β · target + α ·
 # source`, in place on the target. The two operands keep their own element types — a BF16

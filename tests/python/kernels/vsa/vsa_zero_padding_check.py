@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `vsa_zero_padding` and check it against the operator's masking, on the CPU.
 
-    TRITON_INTERPRET=1 crates/program-server/python/.venv/bin/python padding_check.py [--package DIR]
+    TRITON_INTERPRET=1 crates/build-server/python/.venv/bin/python padding_check.py [--package DIR]
 
 The operator's whole claim is an absence with a boundary: the rows a tile has past its valid size
 read as zeros, and the rows inside it are not touched. Both halves are checked, because a kernel

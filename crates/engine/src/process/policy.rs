@@ -1,5 +1,5 @@
-//! The scheduling policy's half of the program-layer update: every scheduler prepares, switches,
-//! commits or reverts the update's policy program on its own thread, and the control thread reads
+//! The scheduling policy's half of the generation update: every scheduler prepares, switches,
+//! commits or reverts the update's policy package on its own thread, and the control thread reads
 //! each scheduler's answer to a switchover, so a switchover that installs no policy fails the
 //! update. A policy whose token limit exceeds this rank's captured
 //! prefill buckets is refused with where each figure came from ([`limit_refusal`]).
@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ipc::UpdateFailure;
-use proto::program::Program;
-use scheduler::{PolicyProgram, PolicySource, ProgramSource};
+use proto::module::PackageRevision;
+use scheduler::{ModuleSource, PolicyPackage, PolicySource};
 
 use super::{MainProcess, answer};
 use crate::rank::buckets::PrefillBound;
@@ -41,7 +41,7 @@ pub(super) const TOKEN_LIMIT: &str = "max_num_batched_tokens";
 /// The mechanism's own words are `max_num_batched_tokens is 8192, above the build config's 512`,
 /// and every figure in them is right and none of them is actionable: `512` is this rank's
 /// catalogue of captured prefill buckets rather than a name, and `8192` is a figure no one in the
-/// deployment chose when the policy's program names none. The refusal itself is the mechanism's
+/// deployment chose when the policy's package names none. The refusal itself is the mechanism's
 /// and is not changed here - what is added is where each figure came from, and the two changes
 /// that would satisfy it.
 ///
@@ -69,7 +69,7 @@ pub(super) fn limit_refusal(error: &str, stated: Option<&str>, catalogue: Prefil
         "the build's default catalogue, which this deployment's launch file does not state"
     };
 
-    // Whose figure the policy's is: a program that names no such argument states none, and the
+    // Whose figure the policy's is: a package that names no such argument states none, and the
     // policy then applies its own default - the number nobody in this deployment chose.
     let source_of_policy = match stated {
         Some(value) => format!("the deployment states {TOKEN_LIMIT} = {value}"),
@@ -93,17 +93,17 @@ pub(super) fn limit_refusal(error: &str, stated: Option<&str>, catalogue: Prefil
 }
 
 impl MainProcess {
-    /// The precopy's policy half: every scheduler prepares the update's policy program on its own
-    /// state, from the module the Program Server resolves under the store's wasm key, and answers on
+    /// The precopy's policy half: every scheduler prepares the update's policy package on its own
+    /// state, from the module the Build Server resolves under the store's wasm key, and answers on
     /// a channel the serve pass polls.
     ///
     /// The build runs on the scheduler's own blocking thread, never here: a policy's module is
     /// compiled the first time it is asked for, and the control thread never waits on a job.
     pub(super) fn request_policy(
         &mut self,
-        policy: &Program,
+        policy: &PackageRevision,
     ) -> Result<Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>> {
-        let program = PolicyProgram::from_arguments(
+        let package = PolicyPackage::from_arguments(
             policy.backend.clone(),
             policy.revision,
             &policy
@@ -112,8 +112,8 @@ impl MainProcess {
                 .map(|(name, value)| (name.clone(), value.to_string()))
                 .collect(),
         )
-        .map_err(|error| anyhow::anyhow!("the update's policy program: {error}"))?;
-        let source = Arc::new(ProgramSource::connect(&self.program_server));
+        .map_err(|error| anyhow::anyhow!("the update's policy package: {error}"))?;
+        let source = Arc::new(ModuleSource::connect(&self.build_server));
         let source: Arc<dyn PolicySource + Send + Sync> = source;
         let mut answers = Vec::with_capacity(self.schedulers.len() + 1);
         // A node with several schedulers routes by the policy, so the control thread's route
@@ -124,13 +124,13 @@ impl MainProcess {
             let (prepared, candidate) = crossbeam_channel::bounded(1);
             let ranks = self.ranks();
             let ceilings = self.router.ceilings();
-            let program = program.clone();
+            let package = package.clone();
             let source = Arc::clone(&source);
             std::thread::Builder::new()
                 .name("route-precopy".to_owned())
                 .spawn(move || {
                     let built =
-                        scheduler::Router::prepare(source.as_ref(), program, &ranks, &ceilings);
+                        scheduler::Router::prepare(source.as_ref(), package, &ranks, &ceilings);
                     let _ = match built {
                         Ok(built) => {
                             let _ = prepared.send(built);
@@ -146,16 +146,16 @@ impl MainProcess {
         // scheduler's blocking thread and prints its own target and spans, and without this line a
         // log cannot tell a precopy that began from one whose command was never sent.
         tracing::info!(
-            backend = %program.backend,
-            revision = program.revision,
+            backend = %package.backend,
+            revision = package.revision,
             schedulers = self.schedulers.len(),
-            socket = %self.program_server.display(),
+            socket = %self.build_server.display(),
             "this precopy's policy preparation has begun"
         );
         answers.extend(
             self.schedulers
                 .iter()
-                .map(|scheduler| scheduler.precopy_policy(program.clone(), Arc::clone(&source))),
+                .map(|scheduler| scheduler.precopy_policy(package.clone(), Arc::clone(&source))),
         );
         Ok(answers)
     }
@@ -284,7 +284,7 @@ impl MainProcess {
         }
     }
 
-    /// A precopy that failed discards its policy candidate, so the next update's program is the only
+    /// A precopy that failed discards its policy candidate, so the next update's package is the only
     /// one that can serve.
     pub(super) fn discard_policy(&mut self) {
         self.router.discard();

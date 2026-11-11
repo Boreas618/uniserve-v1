@@ -7,7 +7,7 @@
 //! with contents that change per evaluation.
 
 use ops::gemm::WeightOrder;
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;

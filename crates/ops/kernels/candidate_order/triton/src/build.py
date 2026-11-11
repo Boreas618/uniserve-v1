@@ -6,7 +6,7 @@ width to the program, which walks the row in tiles of the package's block.
 """
 
 import candidate_order as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The candidate value: probabilities or shaped logits, permuted unchanged.
 VALUES = {"f32": "fp32"}

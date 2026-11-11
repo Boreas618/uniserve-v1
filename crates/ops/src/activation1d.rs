@@ -43,7 +43,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -162,7 +162,7 @@ pub struct Args {
 pub struct Activation1d;
 
 impl Op for Activation1d {
-    const NAME: &'static str = proto::program::operator::AUDIO_ACTIVATION;
+    const NAME: &'static str = proto::module::operator::AUDIO_ACTIVATION;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

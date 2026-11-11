@@ -3,11 +3,11 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel
 function, its argument signature, the compile-time values the descriptor
 dimension and the package parameters give, and the compilation options. The
-Program Server's Triton source drives ``uniserve_program_server.triton`` with it.
+Build Server's Triton source drives ``uniserve_build_server.triton`` with it.
 """
 
 import rms_norm as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The floating dtypes a row, its weight and its output may have, as Triton
 #: spells them in an argument signature.

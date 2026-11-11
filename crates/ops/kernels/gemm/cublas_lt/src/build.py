@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile the gemm cuBLASLt module for one descriptor.
 
-The Program Server runs this script in the package's root with the build's
+The Build Server runs this script in the package's root with the build's
 environment (design 5.2):
 
     UNISERVE_DESCRIPTOR   the descriptor key, e.g.
@@ -78,11 +78,11 @@ def main() -> int:
     output = pathlib.Path(os.environ["UNISERVE_OUT"]) / "module.so"
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    # The nvcc the Program Server checked against this package's declared version.
+    # The nvcc the Build Server checked against this package's declared version.
     nvcc = os.environ.get("UNISERVE_NVCC")
     if not nvcc:
         print(
-            "UNISERVE_NVCC names no nvcc: the Program Server passes the one it checked",
+            "UNISERVE_NVCC names no nvcc: the Build Server passes the one it checked",
             file=sys.stderr,
         )
         return 1

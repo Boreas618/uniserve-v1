@@ -32,7 +32,7 @@ use nn::{Forward, StateLayer, StateView};
 use ops::block_copy::{
     BlockShape, COPY_BLOCK, CacheBlockScatter, CacheBlockSnapshot, ScatterArgs, SnapshotArgs,
 };
-use ops::{DType, DevicePtr, Shape, Strides, Operand};
+use ops::{DType, DevicePtr, Operand, Shape, Strides};
 use platform::{Buffer, DeviceId, PoolKind};
 
 use crate::arena::Pools;

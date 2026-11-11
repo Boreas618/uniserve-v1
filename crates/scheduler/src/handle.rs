@@ -460,7 +460,7 @@ pub struct Submission {
 pub enum StageAnswer {
     /// A handle's `stage`, answered with the step it applied at.
     Step(crossbeam_channel::Sender<Result<StageApplied, String>>),
-    /// An engine or program-layer command, answered with whether it applied.
+    /// An engine or generation command, answered with whether it applied.
     Applied(crossbeam_channel::Sender<Result<(), String>>),
 }
 
@@ -515,14 +515,14 @@ pub struct Counters {
     pub device_ns: u64,
 }
 
-/// The policy programs one scheduler holds (§7.3): the one serving, and the
+/// The policy packages one scheduler holds (§7.3): the one serving, and the
 /// candidate a precopy prepared for the next switchover.
 #[derive(Debug, Clone, Default)]
-pub struct PolicyPrograms {
-    /// The program the serving policy was instantiated from.
-    pub running: Option<crate::PolicyProgram>,
-    /// The program a precopy prepared, waiting for the switchover.
-    pub prepared: Option<crate::PolicyProgram>,
+pub struct PolicyPackages {
+    /// The package the serving policy was instantiated from.
+    pub running: Option<crate::PolicyPackage>,
+    /// The package a precopy prepared, waiting for the switchover.
+    pub prepared: Option<crate::PolicyPackage>,
 }
 
 pub enum Command {
@@ -610,11 +610,11 @@ pub enum Command {
     DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::GroupCache>, String>>),
     /// Accepted prefixes of running requests that can move to another epoch.
     DescribeRequests(crossbeam_channel::Sender<Vec<proto::request::wire::RequestPrefix>>),
-    /// §7.3 step 2: prepares `program`'s policy on this scheduler's state,
+    /// §7.3 step 2: prepares `package`'s policy on this scheduler's state,
     /// without putting it in. The load and the instantiation run on a blocking
     /// thread; the answer says whether a candidate was prepared.
     PrecopyPolicy {
-        program: crate::PolicyProgram,
+        package: crate::PolicyPackage,
         source: std::sync::Arc<dyn crate::PolicySource + Send + Sync>,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
@@ -624,10 +624,10 @@ pub enum Command {
         stage: crate::Stage,
         answer: StageAnswer,
     },
-    /// One command of the program-layer update (§2.3, §7.3), applied as far as
+    /// One command of the generation update (§2.3, §7.3), applied as far as
     /// one scheduler applies it: a stage, at the boundary its command names.
-    ProgramCommand {
-        command: ipc::ProgramCommand,
+    GenerationCommand {
+        command: ipc::GenerationCommand,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// One of the epoch's engine commands, applied as far as one scheduler
@@ -649,10 +649,10 @@ pub enum Command {
     Counters {
         answer: crossbeam_channel::Sender<Counters>,
     },
-    /// The program the slot serves and the one a precopy prepared, for the
+    /// The package the slot serves and the one a precopy prepared, for the
     /// handle the control thread holds (§7.3).
-    PolicyPrograms {
-        answer: crossbeam_channel::Sender<PolicyPrograms>,
+    PolicyPackages {
+        answer: crossbeam_channel::Sender<PolicyPackages>,
     },
     /// §7.3 step 2's failure: the precopied generation is dropped and the
     /// serving policy kept.
@@ -1075,18 +1075,18 @@ impl CommandSender {
         described
     }
 
-    /// Prepares `program`'s policy on this scheduler's state without putting it
+    /// Prepares `package`'s policy on this scheduler's state without putting it
     /// in (§7.3 step 2); the answer arrives when the blocking thread is done.
     pub fn precopy_policy(
         &self,
-        program: crate::PolicyProgram,
+        package: crate::PolicyPackage,
         source: std::sync::Arc<dyn crate::PolicySource + Send + Sync>,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, done) = crossbeam_channel::bounded(1);
         self.refuse_into(
             &answer,
             self.send(Command::PrecopyPolicy {
-                program,
+                package,
                 source,
                 answer: answer.clone(),
             })
@@ -1154,14 +1154,14 @@ impl CommandSender {
         self.stage_applied(crate::Stage::Purge)
     }
 
-    /// One command of the program-layer update, answered when this scheduler
+    /// One command of the generation update, answered when this scheduler
     /// applied it (§2.3, §7.3).
-    pub fn program_command(
+    pub fn generation_command(
         &self,
-        command: ipc::ProgramCommand,
+        command: ipc::GenerationCommand,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::ProgramCommand { command, answer });
+        let _ = self.send(Command::GenerationCommand { command, answer });
         done
     }
 
@@ -1192,11 +1192,11 @@ impl CommandSender {
         counters
     }
 
-    /// The serving program and the prepared one (§7.3).
-    pub fn policy_programs(&self) -> crossbeam_channel::Receiver<PolicyPrograms> {
-        let (answer, programs) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::PolicyPrograms { answer });
-        programs
+    /// The serving package and the prepared one (§7.3).
+    pub fn policy_packages(&self) -> crossbeam_channel::Receiver<PolicyPackages> {
+        let (answer, packages) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::PolicyPackages { answer });
+        packages
     }
 
     /// A request-path command, translated to the scheduler command that

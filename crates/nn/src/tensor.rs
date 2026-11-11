@@ -11,7 +11,7 @@
 
 use crate::{Error, Result};
 
-pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, Operand};
+pub use ops::{DType, DevicePtr, MAX_RANK, Operand, Shape, Strides};
 
 /// The device storage a borrowed view is carved from.
 ///

@@ -1,8 +1,8 @@
-# The rms_norm operator's Triton backend: design 5.2's program package.
+# The rms_norm operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # One program normalizes one contiguous row in FP32 statistics and rounds once.
 # `columns` is a launch value and `tile` the program's row block, so one module

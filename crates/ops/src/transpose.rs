@@ -114,7 +114,7 @@ fn matrix(view: &Operand, name: &str, dtype: DType) -> Result<(u64, u64)> {
 }
 
 impl Op for Transpose {
-    const NAME: &'static str = proto::program::operator::TRANSPOSE;
+    const NAME: &'static str = proto::module::operator::TRANSPOSE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

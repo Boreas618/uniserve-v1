@@ -33,7 +33,7 @@
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::descriptor::Float;
 use ops::vsa::{self, MAX_MEMBERS, VsaZeroPadding};
-use ops::{DType, Shape, Operand};
+use ops::{DType, Operand, Shape};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -583,12 +583,7 @@ impl VsaAttention {
     /// `[heads, query tiles, tiles]` FP32 tensor read by [`Self::select`]. One dot product per
     /// (query tile, key tile) and head — no scale and no softmax, because the selection only
     /// compares and the attention scales its own products.
-    fn scores(
-        &self,
-        f: &Forward,
-        pooled_query: Operand,
-        pooled_key: Operand,
-    ) -> Result<Operand> {
+    fn scores(&self, f: &Forward, pooled_query: Operand, pooled_key: Operand) -> Result<Operand> {
         if pooled_query.shape.rank() != 3 {
             return Err(Error::shape(
                 "VsaAttention",
@@ -671,12 +666,7 @@ impl VsaAttention {
     /// Every refusal the layer can raise lives here rather than behind `&Forward`, because a
     /// `Forward` needs a live stream and context and no host test can build one; the layer's own
     /// test asserts these, and [`Self::compress`] calls this first so the two cannot drift.
-    fn check_compress(
-        &self,
-        scores: Operand,
-        values: Operand,
-        sizes: Operand,
-    ) -> Result<()> {
+    fn check_compress(&self, scores: Operand, values: Operand, sizes: Operand) -> Result<()> {
         if self.max_tiles == 0 {
             return Err(Error::shape(
                 "VsaAttention",

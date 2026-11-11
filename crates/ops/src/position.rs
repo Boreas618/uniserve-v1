@@ -35,7 +35,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, Operand};
+use crate::tensor::{DType, Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -91,7 +91,7 @@ pub struct Args {
 pub struct PositionInterpolate;
 
 impl Op for PositionInterpolate {
-    const NAME: &'static str = proto::program::operator::POSITION_INTERPOLATE;
+    const NAME: &'static str = proto::module::operator::POSITION_INTERPOLATE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

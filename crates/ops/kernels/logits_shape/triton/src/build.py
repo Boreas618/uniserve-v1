@@ -7,7 +7,7 @@ count stays a runtime value.
 """
 
 import logits_shape as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The input logits' dtype; the shaped logits are FP32 in every case.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}

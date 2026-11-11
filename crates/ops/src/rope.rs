@@ -13,14 +13,14 @@
 //! `rotated` dimensions of each head, in either the half-split pairing (`x[i]` against
 //! `x[i + d/2]`, GPT-NeoX) or the interleaved pairing (`x[2i]` against `x[2i+1]`).
 //! A model that rotates several axes with different factors (multimodal position embeddings) is a
-//! further descriptor value and another kernel program, added with the model that needs it.
+//! further descriptor value and another kernel package, added with the model that needs it.
 
 use std::fmt;
 
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{DType, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -182,7 +182,7 @@ pub struct FactorsArgs {
 pub struct RotaryFactors;
 
 impl Op for RotaryFactors {
-    const NAME: &'static str = proto::program::operator::ROTARY_FACTORS;
+    const NAME: &'static str = proto::module::operator::ROTARY_FACTORS;
 
     type Descriptor = FactorsDescriptor;
     type Args<'a> = FactorsArgs;
@@ -515,7 +515,7 @@ pub struct QkNormRopeArgs {
 pub struct QkNormRope;
 
 impl Op for QkNormRope {
-    const NAME: &'static str = proto::program::operator::QK_NORM_ROPE;
+    const NAME: &'static str = proto::module::operator::QK_NORM_ROPE;
 
     type Descriptor = QkNormRopeDescriptor;
     type Args<'a> = QkNormRopeArgs;
@@ -755,7 +755,7 @@ pub struct RopeApplyArgs {
 pub struct RopeApply;
 
 impl Op for RopeApply {
-    const NAME: &'static str = proto::program::operator::ROPE_APPLY;
+    const NAME: &'static str = proto::module::operator::ROPE_APPLY;
 
     type Descriptor = RopeApplyDescriptor;
     type Args<'a> = RopeApplyArgs;

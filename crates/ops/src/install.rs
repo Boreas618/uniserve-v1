@@ -1,6 +1,6 @@
-//! Installing one module of a program layer by operator name.
+//! Installing one module of a generation layer by operator name.
 //!
-//! A program layer arrives as modules keyed by operator name and descriptor key, and the worker's
+//! A generation layer arrives as modules keyed by operator name and descriptor key, and the worker's
 //! precopy has to turn each one into a kernel of a generation without knowing any operator's type.
 //! This is that entry: it takes the operator's name, the descriptor key the module was compiled
 //! for, and the module's image or path, and hands back the loaded kernel inside a [`KernelEntry`]
@@ -18,7 +18,7 @@ use crate::kernel::{CubinMetadata, Kernel};
 use crate::platform::NativeLibrary;
 use crate::{Result, platform};
 
-/// One module of a program layer, as the package delivered it.
+/// One module of a generation layer, as the package delivered it.
 pub enum Module<'a> {
     /// A cubin, fatbin or PTX image, with its Triton metadata as JSON when the package carries it,
     /// and the symbol to resolve.
@@ -50,7 +50,7 @@ pub fn install(
     descriptor_key: &str,
     module: Module<'_>,
 ) -> Result<Option<KernelEntry>> {
-    let Some(name) = proto::program::operator::named(operator) else {
+    let Some(name) = proto::module::operator::named(operator) else {
         return Ok(None);
     };
     let kernel = load(device, module)?;

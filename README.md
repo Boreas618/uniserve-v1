@@ -2,7 +2,7 @@
 
 UniServe serves FastH3 8-Step text-to-video-with-audio and keyframe-conditioned generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 and MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers every deployment, precision and option. The same guide covers the base MiniMax-H3 checkpoint's text-to-video, keyframe and reference requests and FastH3 OmniRef reference requests.
 
-UniServe is a Rust serving system. Rust owns the control and data planes and the numerical computation alike: HTTP admission, scheduling, the main processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. No serving process carries a Python interpreter: Python appears in the Program Server alone, as the compiler of Triton and CuTe DSL kernel programs, and in the evaluation client `uniserve_eval`.
+UniServe is a Rust serving system. Rust owns the control and data planes and the numerical computation alike: HTTP admission, scheduling, the main processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. No serving process carries a Python interpreter: Python appears in the Build Server alone, as the compiler of Triton and CuTe DSL kernel packages, and in the evaluation client `uniserve_eval`.
 
 The executable serves two model families, Qwen3-MoE (chat) and MiniMax-H3 (video generation), each registered once in `src/main.rs`. A server resolves its checkpoint to the family that claims the class it declares, serves exactly that model and exposes one served-model identity.
 
@@ -32,7 +32,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The executable links a shared FFmpeg 8.1.2 with libx264, which `crates/media/native/build.sh` builds from the FFmpeg source into the prefix it is given (it needs gcc, make, nasm, pkg-config, zlib and patchelf; [the media crate](crates/media/README.md) describes the runtime), and every build finds it through `UNISERVE_FFMPEG_DIR`. The sync builds the `uniserve` executable, and the `gpu` extra installs the NCCL and CUPTI libraries serving loads. The Program Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/program-server/python` creates; it compiles the kernel programs with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The executable links a shared FFmpeg 8.1.2 with libx264, which `crates/media/native/build.sh` builds from the FFmpeg source into the prefix it is given (it needs gcc, make, nasm, pkg-config, zlib and patchelf; [the media crate](crates/media/README.md) describes the runtime), and every build finds it through `UNISERVE_FFMPEG_DIR`. The sync builds the `uniserve` executable, and the `gpu` extra installs the NCCL and CUPTI libraries serving loads. The Build Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python` creates; it compiles the kernel packages with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
 
@@ -189,7 +189,7 @@ For decision-session replay, give every row of a JSON Lines workload a non-empty
 The [architecture guide](docs/architecture.md) describes how the daemons, the engine process and the executors divide the work, how a main process's threads divide it, and how a request travels through them.
 
 ```text
-src/                    The root package, `uniserve`: the command line, logging, the `serve` and `programs` commands, and `main.rs`, which dispatches every command and registers the model families
+src/                    The root package, `uniserve`: the command line, logging, the `serve` and `keys` commands, and `main.rs`, which dispatches every command and registers the model families
 crates/engine/          The main process of a node and epoch: its control thread, schedulers, executors and blocking pool, and the catalogue that resolves a checkpoint to its model family
 crates/proto/           The interfaces across builds: the request interface and the process interface (Protobuf), and the video condition vocabulary
 crates/ipc/             The batch the scheduler submits and the worker serves, scheduler-to-main-process messages, rank channels and the launch descriptor
@@ -198,7 +198,7 @@ crates/storage/         The Storage Server's protocol and client
 crates/storage-server/  The Storage Server, its Mooncake connector and its Transfer Server
 crates/nixl/            NIXL agents with the UCX backend, loaded at runtime
 crates/platform/        The CUDA boundary: driver, virtual memory, device memory and allocator, streams, events, graphs, kernels and NCCL
-crates/ops/             The interface between Rust and kernel programs: operators, their descriptors and descriptor keys, launch code and every kernel, one package per operator and backend under `kernels/`
+crates/ops/             The interface between Rust and kernel packages: operators, their descriptors and descriptor keys, launch code and every kernel, one package per operator and backend under `kernels/`
 crates/nn/              The shared computation library: tensor views, the borrowed forward, numerical layers and blocks, diffusion, tiling and vocoder computation, weight loading, the capability traits models implement and the model family contract execution loads models through
 crates/processing/      The request-side model contract: a family's chat profile or video processor, which checks and plans model-agnostic video requests, and the family-neutral frame, canvas, cover-crop and resampling rules
 crates/models/          The concrete models, each a crate that implements both contracts
@@ -210,7 +210,7 @@ crates/daemon/          The node's daemon: process supervision and the Storage S
 crates/frontend/        The application layer: the OpenAI-compatible API, input processing (templates, tokenization, media) and output processing (detokenization, parsers, response bodies), over the served checkpoint's tokenizer, files and family profile
 crates/service/         Host services: the per-user socket, its owner lock, a detached start and the start of an absent service
 crates/media/           H.264/AAC output encoding and MP4 muxing, conditional media reading and host resamplers
-crates/program-server/  The Program Server: compiles programs, keeps them and hands them out; one host service per host and user
+crates/build-server/  The Build Server: builds packages into modules, keeps them and hands them out; one host service per host and user
 crates/manager/         `uniserve-manager`: an optional multi-node manager, a client of each node's `/admin`
 uniserve_eval/          Serving evaluator, profiles, and request workloads
 configs/                Deployment files: H3 (`minimax_h3/`) and dedicated experts (`afd/`)

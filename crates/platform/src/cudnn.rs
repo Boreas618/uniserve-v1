@@ -61,7 +61,7 @@
 //! convolution's bias in a separate pass, so the caller adds it, and cuDNN's
 //! backend convolution descriptor has no group field, so a grouped
 //! convolution (the audio decoder's depthwise alias-free resamplers, which
-//! design §9 fuses into kernel programs) is not served by this binding.
+//! design §9 fuses into kernel packages) is not served by this binding.
 //!
 //! # Alignment
 //!

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `weighted_rms_norm`'s two programs and check them against the operator's own formula.
 
-    crates/program-server/python/.venv/bin/python weighted_rms_norm_check.py [--package DIR]
+    crates/build-server/python/.venv/bin/python weighted_rms_norm_check.py [--package DIR]
 
 One program normalizes one contiguous row and applies its learned scale, with the mean square
 reduced in FP32 and one rounding into the output type:

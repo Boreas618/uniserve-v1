@@ -1,4 +1,4 @@
-# The silu operator's Triton backend: design 5.2's program package.
+# The silu operator's Triton backend: design 5.2's package.
 #
 # One cubin per descriptor: the plain sigmoid linear unit, `out = x / (1 + exp(−x))` over a
 # contiguous `[rows, columns]` buffer. One formula, so one program — the element type and the

@@ -18,7 +18,7 @@ The second host is named by the two-host variables of the suite
 (docs/testing.md, Two hosts): ``UNISERVE_H3_FOLLOWER``, an ssh destination with
 this checkout at the same path, and ``UNISERVE_H3_LEADER_ADDRESS``, this host's
 address as the second reaches it. Without them the test is skipped. The second
-host's main process resolves its modules from a Program Server the test starts
+host's main process resolves its modules from a Build Server the test starts
 there with the packages this host's holds.
 """
 
@@ -47,7 +47,7 @@ from tests.python.e2e.http_helpers import (
     wait_until,
     worker_executable,
 )
-from tests.python.e2e.program_server import remote_program_server
+from tests.python.e2e.build_server import remote_build_server
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
@@ -181,14 +181,14 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
             "XDG_RUNTIME_DIR": str(runtime),
         }
         with (
-            remote_program_server(FOLLOWER) as follower_programs,
+            remote_build_server(FOLLOWER) as follower_modules,
             second_host(
                 FOLLOWER,
                 tmp_path / "follower.log",
                 address,
                 arguments=(
                     "--set",
-                    f"program_config.socket={follower_programs}",
+                    f"build_config.socket={follower_modules}",
                 ),
             ),
             server_process(command, base_url, log, timeout_s=1800, env=env),
