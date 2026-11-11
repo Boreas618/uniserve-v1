@@ -347,7 +347,7 @@ fn new_call(request: &GenerationRequest, kind: CallKind) -> Call {
     call
 }
 
-/// Plans a context prefill: prompt tokens `start..end` and the vision
+/// Outputs a context prefill: prompt tokens `start..end` and the vision
 /// `blocks` of the input images between them, which write `block_tokens` cache
 /// tokens together, with a sampled-token output when this call ends the prompt
 /// and the request `samples` from its prompt, unless the context ends with a
@@ -413,7 +413,7 @@ pub(super) fn plan_prompt(
     finish_plan(request, call, prompt_positions)
 }
 
-/// Plans denoising step `step` of the canvas-generating `request`'s block
+/// Outputs denoising step `step` of the canvas-generating `request`'s block
 /// `block`, the number of blocks already committed to its context, under the
 /// deployment's `canvas` sampling.
 ///
@@ -439,7 +439,7 @@ pub(super) fn plan_canvas_step(
     Ok(call)
 }
 
-/// Plans the commit of a stopped block's `tokens` to the context of the
+/// Outputs the commit of a stopped block's `tokens` to the context of the
 /// canvas-generating `request`: a prefill that writes them into the prefix cache, as causal
 /// prompt, and samples nothing. Fails with `EmptyCanvasCommit` for an empty
 /// block.
@@ -457,7 +457,7 @@ pub(super) fn plan_canvas_commit(
     finish_plan(request, call, 0)
 }
 
-/// Plans a sampled continuation; relay inputs leave host token values empty.
+/// Outputs a sampled continuation; relay inputs leave host token values empty.
 ///
 /// The call is a decode whose input is `input_token`, or nothing when
 /// `relay_input` continues from the predecessor's device-resident token.
@@ -478,7 +478,7 @@ pub(super) fn plan_decode(
     finish_plan(request, call, 0)
 }
 
-/// Plans the verification of a speculating request's next step: its
+/// Outputs the verification of a speculating request's next step: its
 /// committed `input_token` followed by `drafts`, the drafts its drafter
 /// proposed, of which the call commits the accepted prefix and the token
 /// after it, at most one more than their count; with no drafts it decodes
@@ -513,7 +513,7 @@ pub(crate) fn verify_drafts(call: &Call) -> &[u32] {
     }
 }
 
-/// Plans a refill of the speculating `request`'s draft cache over `tokens`,
+/// Outputs a refill of the speculating `request`'s draft cache over `tokens`,
 /// which its cache holds from position `start` on: the target model
 /// evaluates them again, from the state checkpoint at `start`, and the
 /// drafter writes their draft cache entries, the last reading `lookahead`,
@@ -536,7 +536,7 @@ pub(super) fn plan_refill(
     finish_plan(request, call, 0)
 }
 
-/// Plans the cache write of a latent input-image block, retaining an exact
+/// Outputs the cache write of a latent input-image block, retaining an exact
 /// token count only when the encoder supplies one.
 ///
 /// The call is a prefill that reads `feature` and may write up to the
@@ -1068,7 +1068,7 @@ pub(crate) struct TokenState {
     /// finishes.
     pub(super) encoder_cache_pins: Vec<EncoderCachePin>,
     /// The image encoding the request looked up in the host encoder pools
-    /// and plans next (`Scheduler::encoding_ready`), until its call is
+    /// and schedules next (`Scheduler::encoding_ready`), until its call is
     /// registered with the output it reads or writes.
     pub(super) host_encoding: Option<super::encodings::Encoding>,
     /// Request-local encoder outputs outside the encoder cache, freed by
@@ -1277,18 +1277,18 @@ mod tests {
     fn a_chunked_prompt_is_scored_at_every_position_but_its_first() {
         let mut asking = request(10);
         asking.sampling.return_prompt_logprobs = true;
-        let plan = |request: &GenerationRequest, start, end| {
+        let output = |request: &GenerationRequest, start, end| {
             plan_prompt(request, start, end, Vec::new(), 0, None, true).expect("a prompt range")
         };
         let scored = |call: &Call| {
             call.prompt_scores
                 .map(|scores| scores.targets(&call.input_token_ids).collect::<Vec<_>>())
         };
-        let first = plan(&asking, 0, 4);
-        let second = plan(&asking, 4, 10);
+        let first = output(&asking, 0, 4);
+        let second = output(&asking, 4, 10);
         assert_eq!(scored(&first), Some(vec![1, 2, 3, 4]));
         assert_eq!(scored(&second), Some(vec![5, 6, 7, 8, 9]));
-        assert_eq!(scored(&plan(&request(10), 0, 10)), None);
+        assert_eq!(scored(&output(&request(10), 0, 10)), None);
     }
 
     /// A prompt longer than one batch's budget is split, and only the chunk that ends it draws. The
@@ -1299,19 +1299,19 @@ mod tests {
     #[test]
     fn only_the_chunk_that_ends_a_prompt_samples() {
         let request = request(700);
-        let plan = |start, end| {
+        let output = |start, end| {
             plan_prompt(&request, start, end, Vec::new(), 0, None, true).expect("a prompt range")
         };
         assert!(
-            plan(0, 512).token_output.is_none(),
+            output(0, 512).token_output.is_none(),
             "a chunk before the end draws nothing"
         );
         assert!(
-            plan(512, 700).token_output.is_some(),
+            output(512, 700).token_output.is_some(),
             "the last chunk draws the first token"
         );
         assert!(
-            plan(0, 700).token_output.is_some(),
+            output(0, 700).token_output.is_some(),
             "a whole prompt is its own last chunk"
         );
     }

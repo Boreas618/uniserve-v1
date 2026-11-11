@@ -27,12 +27,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use scheduling::guest::decision::{Plan, Room, Shortage, Victim};
+use scheduling::guest::decision::{DispatchOutput, Room, Shortage, Victim};
 use scheduling::guest::event::Event;
 pub use scheduling::guest::limits::{Limits, Parameters};
 use scheduling::guest::policy::Instantiation;
 use scheduling::guest::view::{
-    CallView, RankView, ReplicaView, RequestState, RequestView, Snapshot,
+    CallView, RankView, ReplicaView, RequestStatus, RequestView, Snapshot,
 };
 use scheduling::guest::wire::Call;
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
@@ -433,8 +433,8 @@ pub struct TrialState {
     pub snapshot: Snapshot,
     /// The step's room, for `dispatch`.
     pub room: Room,
-    /// The shortage the mechanism faces, for `reclaim`; `None` skips the call,
-    /// as the mechanism calls `reclaim` only when something is short.
+    /// The shortage the mechanism faces, for `preempt`; `None` skips the call,
+    /// as the mechanism calls `preempt` only when something is short.
     pub shortage: Option<Shortage>,
     /// A queued request and the ranks, for `route`; `None` skips the call.
     pub arrival: Option<(RequestView, Vec<RankView>)>,
@@ -451,9 +451,9 @@ pub struct TrialState {
 /// will judge it once it serves. They are grouped here so the switch can run
 /// them on a candidate; the mechanism implements this for its own validators.
 pub trait Validators {
-    /// Whether `plan` names only objects that exist and are selectable, and
+    /// Whether `output` names only objects that exist and are selectable, and
     /// fits the step's hard limits.
-    fn plan(&self, plan: &Plan) -> Result<(), PolicyError>;
+    fn output(&self, output: &DispatchOutput) -> Result<(), PolicyError>;
 
     /// Whether every victim is evictable for `shortage`, and legal for it.
     fn victims(&self, shortage: &Shortage, victims: &[Victim]) -> Result<(), PolicyError>;
@@ -744,7 +744,7 @@ impl Arrival {
 pub fn arrival_view(arrival: &Arrival) -> RequestView {
     RequestView {
         id: scheduling::guest::ids::RequestId(arrival.id.0),
-        state: RequestState::Queued,
+        state: RequestStatus::Waiting,
         phase: None,
         priority: arrival.priority,
         arrived_at: arrival.arrived_at,
@@ -877,16 +877,16 @@ impl PolicySlot {
         cost.call(instance, |instance| instance.observe(events))
     }
 
-    /// `dispatch`: this step's plan (§4.4).
-    pub fn dispatch(&mut self, room: &Room) -> Result<Plan, PolicyError> {
+    /// `dispatch`: this step's output (§4.4).
+    pub fn dispatch(&mut self, room: &Room) -> Result<DispatchOutput, PolicyError> {
         let (instance, cost) = (&mut self.instance, &mut self.cost);
         cost.call(instance, |instance| instance.dispatch(room))
     }
 
-    /// `reclaim`: which objects to free, in order, for a shortage (§4.4).
-    pub fn reclaim(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
+    /// `preempt`: which objects to free, in order, for a shortage (§4.4).
+    pub fn preempt(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
         let (instance, cost) = (&mut self.instance, &mut self.cost);
-        cost.call(instance, |instance| instance.reclaim(shortage))
+        cost.call(instance, |instance| instance.preempt(shortage))
     }
 
     /// `route`: the rank that serves a request that has just arrived (§4.4).
@@ -963,10 +963,10 @@ impl PolicySlot {
         // Every decision of §4.4's table once, on the state that exists now and
         // without executing any of it. The calls are the trial's cost, counted
         // once the candidate is adopted; `TrialCost` records them below.
-        let plan = instance.dispatch(&room)?;
-        validators.plan(&plan)?;
+        let output = instance.dispatch(&room)?;
+        validators.output(&output)?;
         if let Some(shortage) = &shortage {
-            let victims = instance.reclaim(shortage)?;
+            let victims = instance.preempt(shortage)?;
             validators.victims(shortage, &victims)?;
         }
         if let Some((request, ranks)) = &arrival {
@@ -1179,13 +1179,13 @@ fn init_of(program: &PolicyProgram, state: &TrialState) -> Instantiation {
 
 /// The mechanism's validation of the control thread's only decision.
 ///
-/// The route instance answers `route` alone: a plan, victims and a placement
+/// The route instance answers `route` alone: a dispatch output, victims and a placement
 /// are a scheduler thread's decisions, judged there. A route decision must name
 /// a rank that was offered and is alive.
 pub struct RouteTrial;
 
 impl Validators for RouteTrial {
-    fn plan(&self, _plan: &Plan) -> Result<(), PolicyError> {
+    fn output(&self, _plan: &DispatchOutput) -> Result<(), PolicyError> {
         Ok(())
     }
 
@@ -1460,7 +1460,7 @@ mod tests {
     use scheduling::guest::decision::{Shortage, Storage};
     use scheduling::guest::ids::RequestId;
     use scheduling::guest::time::Nanos;
-    use scheduling::guest::view::{RankView, RequestClass, RequestState};
+    use scheduling::guest::view::{RankView, RequestClass, RequestStatus};
 
     use super::*;
 
@@ -1476,7 +1476,7 @@ mod tests {
             arrival: Some((
                 RequestView {
                     id: RequestId(7),
-                    state: RequestState::Queued,
+                    state: RequestStatus::Waiting,
                     phase: None,
                     priority: 0,
                     arrived_at: Nanos(0),

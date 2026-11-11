@@ -9,7 +9,7 @@
 //! artifact — and the mechanism keeps *its own rules*: the
 //! stop conditions are evaluated here from the sampled token
 //! (`OutputSender::und_token_outcome`), and the call's budget, cache window and
-//! sampling rows are the plan's.
+//! sampling rows are the output's.
 //!
 //! [`BatchReport::from_output`] and [`CallCompletion::from_output`] fill these
 //! types at the edge of the mechanism from `ipc::execution::BatchOutput`, the

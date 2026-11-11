@@ -331,9 +331,9 @@ impl Scheduler {
     }
 
     /// Resumes a parked scheduler: it admits and executes again. When it
-    /// `reclaim`s, the epoch it lent cache units to at its park writes none
+    /// takes them back, the epoch it lent cache units to at its park writes none
     /// of them any more, and the pool allocates them again.
-    pub(super) fn resume(&mut self, reclaim: bool) -> Result<(), String> {
+    pub(super) fn resume(&mut self, take_back: bool) -> Result<(), String> {
         if matches!(self.lifecycle, crate::Lifecycle::Parking(_)) {
             return Err("the scheduler is still parking".to_owned());
         }
@@ -341,11 +341,11 @@ impl Scheduler {
             self.lifecycle = crate::Lifecycle::Serving;
             tracing::info!("the parked scheduler resumes");
         }
-        if reclaim && let Some(cache) = self.storage.cache() {
-            let reclaimed = cache.pool().reclaim();
-            if reclaimed > 0 {
+        if take_back && let Some(cache) = self.storage.cache() {
+            let taken_back = cache.pool().take_back();
+            if taken_back > 0 {
                 tracing::info!(
-                    units = reclaimed,
+                    units = taken_back,
                     "took back the cache units lent to the successor epoch"
                 );
             }
@@ -361,7 +361,7 @@ impl Scheduler {
     /// holds a page of `index` under a private continuation alias. The
     /// successor maps them writable and allocates their units on trial, so
     /// the pool forgets their pages and allocates none of their units until
-    /// it reclaims them ([`Self::resume`]). Returns their units.
+    /// it takes them back ([`Self::resume`]). Returns their units.
     fn lend_cache(&self, index: &[IndexedPage]) -> Vec<std::ops::Range<u32>> {
         let Some(cache) = self.storage.cache() else {
             return Vec::new();

@@ -67,7 +67,7 @@ use scheduling::guest::ids::{
 use scheduling::guest::time::Nanos;
 use scheduling::guest::view::{
     CallView, EncodingView, PageView, PhaseKind, PhaseView, ReplicaView, RequestClass,
-    RequestState as Standing, RequestView, Snapshot,
+    RequestStatus as Standing, RequestView, Snapshot,
 };
 
 use super::*;
@@ -114,7 +114,7 @@ pub const fn phase_id(kind: PhaseKind) -> PhaseId {
 }
 
 /// The phase kind an id names; `None` for an id this epoch has no phase for,
-/// which no `Plan` may name.
+/// which no `DispatchOutput` may name.
 pub(crate) fn phase_kind(id: PhaseId) -> Option<PhaseKind> {
     PHASES.iter().copied().find(|kind| phase_id(*kind) == id)
 }
@@ -151,7 +151,7 @@ pub(crate) fn call_phase_id(kind: CallKind) -> PhaseId {
 
 /// The call kind that runs a phase, when the phase is a call.
 ///
-/// A refill is a prefill call the mechanism plans for a decoding request, so it
+/// A refill is a prefill call the mechanism schedules for a decoding request, so it
 /// answers `Forward(Prefill)`; `Other` runs nothing.
 pub(crate) fn phase_call(kind: PhaseKind) -> Option<CallKind> {
     Some(match kind {
@@ -420,11 +420,11 @@ pub(crate) fn room(scheduler: &Scheduler, step: u64) -> Room {
     }
 }
 
-/// The storage the mechanism finds short right now, for `reclaim`.
+/// The storage the mechanism finds short right now, for `preempt`.
 ///
-/// The mechanism knows the shortfall when executing a plan hits it: the last
+/// The mechanism knows the shortfall when executing a dispatch output hits it: the last
 /// assembly noted each request it could not grow with the units its growth
-/// needed. A step after an assembly that hit none has nothing to reclaim.
+/// needed. A step after an assembly that hit none has nothing to preempt.
 pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
     if scheduler.starved.is_empty() {
         return None;
@@ -469,7 +469,7 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
 fn next_phase(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> Option<PhaseId> {
     let kind = scheduler.token_next_call(id)?;
     let phase = match kind {
-        // A refill chunk is the policy's decision alone (`Plan::refill`), and
+        // A refill chunk is the policy's decision alone (`DispatchOutput::refill`), and
         // the mechanism builds its call: the request's phase is the serving
         // phase it needs next, and its draft gap appears in `refill_tokens`.
         // `PhaseKind::Refill` stays in the phase table as the kind of the call
@@ -477,7 +477,7 @@ fn next_phase(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> Optio
         // Only a request whose context is fully ingested can be refilled:
         // before that, a prefill call is the chunk that writes the rest of
         // the prompt, and naming it a decode hides that chunk from the
-        // policy (the built call then differs from the plan and is dropped).
+        // policy (the built call then differs from the output and is dropped).
         CallKind::Forward(ForwardMode::Prefill)
             if refill_gap(scheduler, state).is_some()
                 && scheduler
@@ -576,7 +576,7 @@ fn reservation_units(scheduler: &Scheduler, state: &TokenState) -> u64 {
 /// or `None` when there is none.
 ///
 /// A fact, not a judgement: whether a refill is worth its cost is the policy's
-/// to decide (`Plan::refill`). Both `refill_tokens` and the `Refill` phase read
+/// to decide (`DispatchOutput::refill`). Both `refill_tokens` and the `Refill` phase read
 /// it here.
 fn refill_gap(scheduler: &Scheduler, state: &TokenState) -> Option<u32> {
     if !scheduler.speculates() {
@@ -686,8 +686,8 @@ pub(crate) fn request(
 /// by the mechanism until it leaves.
 const fn standing(status: &RequestStatus) -> Standing {
     match status {
-        RequestStatus::Waiting => Standing::Queued,
-        RequestStatus::Running | RequestStatus::Finished(_) => Standing::Resident,
+        RequestStatus::Waiting => Standing::Waiting,
+        RequestStatus::Running | RequestStatus::Finished(_) => Standing::Running,
     }
 }
 
@@ -1035,7 +1035,7 @@ fn candidate_facts<'a>(
                 kinds: worker_phases(main_process_info),
                 resident_requests: resident_requests(&scheduler.dispatch, worker),
                 // The worker reports whether a worker's queue has room, not
-                // how many rows that is; a plan may submit one call's worth.
+                // how many rows that is; a dispatch output may submit one call's worth.
                 capacity: u32::from(epoch.has_capacity(worker)),
                 holds_request: holds_request(
                     &scheduler.dispatch,
@@ -1134,8 +1134,8 @@ pub(crate) fn view_of(
 /// The live state a step's validators read: this moment's snapshot, with the
 /// admission queue in the mechanism's own order.
 ///
-/// The validators read a `Plan`'s names against it, so it is built at the step
-/// the plan belongs to and rebuilt after `reclaim` changes the state.
+/// The validators read a `DispatchOutput`'s names against it, so it is built at the step
+/// the output belongs to and rebuilt after `preempt` changes the state.
 pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -> Live<'static> {
     let mut live = Live::of(&snapshot(scheduler, step, recorded));
     // The told sets are the recorder's, owned here because this state outlives

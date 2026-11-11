@@ -1312,11 +1312,11 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
         .map(|slot| slot.handle.retire(resume.retire.clone()));
     // An epoch the resume retires writes none of the engine's storage any
     // more: each scheduler takes back the cache units it lent it.
-    let reclaim = !resume.retire.is_empty();
+    let preempt = !resume.retire.is_empty();
     let answers: Vec<_> = routing
         .slots
         .iter()
-        .map(|slot| slot.handle.resume(reclaim))
+        .map(|slot| slot.handle.resume(preempt))
         .collect();
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()
@@ -1897,7 +1897,7 @@ mod tests {
 
     use super::*;
     use proto::request::GenerationRequest;
-    use scheduling::guest::view::RequestState;
+    use scheduling::guest::view::RequestStatus;
 
     fn generation(prompt: Vec<u32>, max_und_tokens: usize) -> GenerationRequest {
         GenerationRequest {
@@ -1946,7 +1946,7 @@ mod tests {
         let request = Request::Generation(Box::new(generation(vec![1, 2, 3, 4], 64)));
         let arrival = Arrival::of(RequestId(7), &request, Some(2));
         let view = scheduler::arrival_view(&arrival);
-        assert_eq!(view.state, RequestState::Queued);
+        assert_eq!(view.state, RequestStatus::Waiting);
         assert_eq!(view.class, scheduling::guest::view::RequestClass::Token);
         assert_eq!(view.priority, 3);
         assert_eq!(view.prompt_tokens, 4);

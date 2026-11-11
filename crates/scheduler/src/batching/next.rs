@@ -159,7 +159,7 @@ impl Scheduler {
                 );
                 if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
                     // The request stays where it is for this step, and the pass
-                    // stays non-token behind it. A plan the mechanism cannot
+                    // stays non-token behind it. A dispatch output the mechanism cannot
                     // build is a stall the rest of the epoch cannot see, so it
                     // is named at `warn`: a policy that keeps asking for a
                     // verification the cache has no room for would otherwise
@@ -305,7 +305,7 @@ impl Scheduler {
         }
     }
 
-    /// Plans the next context-ingest call within `budget` tokens.
+    /// Outputs the next context-ingest call within `budget` tokens.
     ///
     /// The context is the prompt with the blocks of its input images at their
     /// positions: each encoder of an image writes one block, in encoder order.
@@ -532,7 +532,7 @@ impl Scheduler {
     /// encoded in order ahead of the context prefill that writes them, while
     /// their image lies within the long-prefill threshold of the scheduled
     /// prompt cursor. The walk stops at a latent block past that cursor,
-    /// which the chunk before it does not reach. A request plans nothing
+    /// which the chunk before it does not reach. A request schedules nothing
     /// while its encode is in flight, so the encode's completion identifies
     /// its block by the same walk.
     pub(crate) fn next_context_encode(

@@ -45,11 +45,11 @@ pub struct Snapshot {
 /// Where a request stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-pub enum RequestState {
+pub enum RequestStatus {
     /// Waiting for admission.
-    Queued,
+    Waiting,
     /// Admitted and the mechanism serves it.
-    Resident,
+    Running,
     /// Ended; its output events may still be retained.
     Finished,
     /// A state this policy does not know.
@@ -70,11 +70,11 @@ pub enum RequestClass {
     Unknown,
 }
 
-/// The request features design §4.4 names, and the ones a `Plan` needs.
+/// The request features design §4.4 names, and the ones a `DispatchOutput` needs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RequestView {
     pub id: RequestId,
-    pub state: RequestState,
+    pub state: RequestStatus,
     /// The phase of the request's next call, `None` when it has none ready.
     #[serde(default)]
     pub phase: Option<PhaseId>,
@@ -197,7 +197,7 @@ pub enum PhaseKind {
     // Background work.
     LatentPrepare,
     /// A draft-cache refill: a prefill-class chunk of a decoding request
-    /// (design §4.4, `Plan::refill`).
+    /// (design §4.4, `DispatchOutput::refill`).
     Refill,
     /// A phase kind this policy does not know.
     #[default]
@@ -242,7 +242,7 @@ impl PhaseKind {
 
     /// The id this kind is numbered with, which "appended, never renumbered" protects: a new kind
     /// takes the next unused id, and the id of a removed kind is never given to another. A rank's
-    /// plan, a policy's `Plan` and a batch's phase are all numbered here, so this is the one table
+    /// output, a policy's `DispatchOutput` and a batch's phase are all numbered here, so this is the one table
     /// they can agree on.
     ///
     /// Ids 7, 8, 9, 18 and 19 are reserved: they numbered kinds that no longer exist (19 was the

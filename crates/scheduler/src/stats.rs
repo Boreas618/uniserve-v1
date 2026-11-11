@@ -119,7 +119,7 @@ pub struct DomainStats {
     /// Cumulative calls skipped by a false predicate.
     pub predicated_calls: AtomicU64,
     /// Cumulative calls that returned an error status or whose credit was
-    /// reclaimed after an execution failure.
+    /// returned after an execution failure.
     pub error_calls: AtomicU64,
     /// Cumulative submissions rejected by worker backpressure.
     pub backpressure_events: AtomicU64,
@@ -249,17 +249,17 @@ pub struct WorkerStats {
     pub text_decode_position_relay_hits: AtomicU64,
     /// Cumulative decode rows that required a host-supplied position.
     pub text_decode_position_relay_misses: AtomicU64,
-    /// Cumulative FlashInfer decode-plan constructions.
+    /// Cumulative FlashInfer decode-output constructions.
     pub flashinfer_decode_plan_calls: AtomicU64,
-    /// Cumulative FlashInfer decode-plan cache reuses.
+    /// Cumulative FlashInfer decode-output cache reuses.
     pub flashinfer_decode_plan_reuses: AtomicU64,
-    /// Cumulative rows included in FlashInfer decode plans.
+    /// Cumulative rows included in FlashInfer decode schedules.
     pub flashinfer_decode_plan_rows: AtomicU64,
-    /// Cumulative page-table indices included in FlashInfer decode plans.
+    /// Cumulative page-table indices included in FlashInfer decode schedules.
     pub flashinfer_decode_plan_indices: AtomicU64,
-    /// Cumulative graph-compatible FlashInfer decode-plan constructions.
+    /// Cumulative graph-compatible FlashInfer decode-output constructions.
     pub flashinfer_decode_graph_plan_calls: AtomicU64,
-    /// Cumulative graph-compatible FlashInfer decode-plan reuses.
+    /// Cumulative graph-compatible FlashInfer decode-output reuses.
     pub flashinfer_decode_graph_plan_reuses: AtomicU64,
     /// Cumulative rows processed by speculative verification.
     pub spec_verify_rows: AtomicU64,

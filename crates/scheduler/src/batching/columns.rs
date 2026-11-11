@@ -9,7 +9,7 @@
 //!
 //! The columns this module fills are the ones the calls themselves state:
 //!
-//! - **rows**: one `BatchRow` per call, contiguous in plan order, with the
+//! - **rows**: one `BatchRow` per call, contiguous in output order, with the
 //!   request slot the call's rows belong to, its [`RowKind`] and its rows;
 //! - **positions**: each call's query tokens start at its own logical position;
 //! - **slot_mapping**: one absolute slot per token through the call's block
@@ -657,7 +657,7 @@ pub(crate) fn columns(
         // Every restore precedes the forward and every checkpoint follows it.
         state_copies: restores.into_iter().chain(keeps).collect(),
         // A batch none of whose calls drafts states none, as a deployment that does not
-        // speculate plans.
+        // speculate schedules.
         drafts: if drafts
             .iter()
             .all(|draft| *draft == ipc::DraftWork::default())

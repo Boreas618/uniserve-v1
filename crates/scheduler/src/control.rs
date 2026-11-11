@@ -136,8 +136,8 @@ impl Scheduler {
             Command::Stop(request_id) => self.mark_stopped(request_id),
             Command::Abort(id) => self.mark_cancelled(id, true),
             Command::Park { lend, answer } => self.park(answer, lend),
-            Command::Resume { reclaim, answer } => {
-                let _ = answer.send(self.resume(reclaim));
+            Command::Resume { take_back, answer } => {
+                let _ = answer.send(self.resume(take_back));
             }
             Command::Promote {
                 cache,

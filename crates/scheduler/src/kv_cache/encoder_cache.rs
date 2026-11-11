@@ -53,7 +53,7 @@ pub(crate) struct EncoderCacheManager {
     budget: usize,                       // max cached entries
     entries: HashMap<EncoderKey, Entry>, // content key -> entry
     // `invalidate_buffers` removes entries from lookup immediately, but a
-    // worker-side tensor cannot be reclaimed while an in-flight request still
+    // worker-side tensor cannot be released while an in-flight request still
     // holds a reference. Those entries remain here until their final pin is
     // released. Inserting the identical product under the same hash, while no
     // active entry holds that hash, reactivates the retired entry with its
@@ -103,7 +103,7 @@ impl EncoderCacheManager {
     ///
     /// Every active entry whose product lives in one of `buffers` leaves
     /// lookup and counts as an eviction. Unpinned entries are returned for
-    /// reclaim; pinned ones move to the retired set and are returned by the
+    /// release; pinned ones move to the retired set and are returned by the
     /// `release` that drops their last pin, unless an `insert` of the same
     /// product reactivates them first.
     pub(crate) fn invalidate_buffers(
@@ -114,17 +114,17 @@ impl EncoderCacheManager {
             .entries
             .extract_if(|_, entry| buffers.contains(&entry.product.buffer_id()))
             .collect::<Vec<_>>();
-        let mut reclaimable = Vec::new();
+        let mut releasable = Vec::new();
         for (hash, entry) in revoked {
             self.evictable.remove(&entry.lru);
             self.stats.evictions += 1;
             if entry.ref_cnt == 0 {
-                reclaimable.push(entry.product);
+                releasable.push(entry.product);
             } else {
                 self.retired.entry(hash).or_default().push(entry);
             }
         }
-        reclaimable
+        releasable
     }
 
     /// Returns and advances the cache recency counter.
@@ -236,7 +236,7 @@ impl EncoderCacheManager {
                 }
                 // Concurrent misses compute equivalent output. Preserve the
                 // existing entry and its references; a distinct redundant
-                // product is returned for the caller to reclaim.
+                // product is returned for the caller to release.
                 return (existing_product != product).then_some(product);
             }
         }
@@ -316,7 +316,7 @@ impl EncoderCacheManager {
     }
 
     /// Releases a reference. Active entries become evictable at zero references;
-    /// retired entries are removed and return their worker handle for reclaim.
+    /// retired entries are removed and return their worker handle for release.
     ///
     /// The pin is matched by both `hash` and `product`, so a request that
     /// pinned a since-invalidated product releases the retired entry, not an

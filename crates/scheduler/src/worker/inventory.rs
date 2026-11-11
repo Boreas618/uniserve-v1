@@ -1,6 +1,6 @@
 //! What the mechanism learns of the pools a worker serves (4.2, 7.3).
 //!
-//! [`WorkerInfo`] is what the scheduler plans against: each pool's capabilities, the capacities
+//! [`WorkerInfo`] is what the scheduler schedules against: each pool's capabilities, the capacities
 //! the engine launched it with, each rank's host pools in launch order, and the codec pairing that
 //! keeps a media unit on the host that decoded it. A deployment launched as processes derives those
 //! values from the ranks' startup reports; a deployment served in process derives them from what its

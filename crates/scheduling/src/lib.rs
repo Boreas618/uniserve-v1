@@ -10,7 +10,7 @@
 //!
 //! This crate is the host side of that boundary: it loads the policy's wasm32
 //! module and runs it in the scheduler thread under wasmtime, with a fuel budget
-//! on every call. The interface itself — [`Policy`], `Plan`, `Room`, `Event` and
+//! on every call. The interface itself — [`Policy`], `DispatchOutput`, `Room`, `Event` and
 //! the views — lives in `crates/scheduling/guest` together with the wire
 //! encoding, because the policy crates are compiled against the same types. The
 //! default policies are `fcfs` and `priority` of `crates/scheduling/policies`.

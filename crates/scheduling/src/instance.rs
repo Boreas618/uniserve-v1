@@ -12,7 +12,7 @@
 //! it, or traps, fails the call: the instance is not used again, and the
 //! mechanism instantiates the policy it keeps from the module (§7.3).
 
-use scheduling_guest::decision::{Plan, Room, Shortage, Victim};
+use scheduling_guest::decision::{DispatchOutput, Room, Shortage, Victim};
 use scheduling_guest::event::Event;
 use scheduling_guest::limits::{Limits, Parameters};
 use scheduling_guest::policy::Instantiation;
@@ -110,7 +110,7 @@ struct Exports {
     init: TypedFunc<(u32, u32), u64>,
     observe: TypedFunc<(u32, u32), u64>,
     dispatch: TypedFunc<(u32, u32), u64>,
-    reclaim: TypedFunc<(u32, u32), u64>,
+    preempt: TypedFunc<(u32, u32), u64>,
     route: TypedFunc<(u32, u32), u32>,
     place: TypedFunc<(u32, u32), u32>,
     limits: TypedFunc<(), u64>,
@@ -126,7 +126,7 @@ impl Exports {
             init: bind(store, instance, Call::Init.export())?,
             observe: bind(store, instance, Call::Observe.export())?,
             dispatch: bind(store, instance, Call::Dispatch.export())?,
-            reclaim: bind(store, instance, Call::Reclaim.export())?,
+            preempt: bind(store, instance, Call::Preempt.export())?,
             route: bind(store, instance, Call::Route.export())?,
             place: bind(store, instance, Call::Place.export())?,
             limits: bind(store, instance, Call::Limits.export())?,
@@ -139,7 +139,7 @@ impl Exports {
             Call::Init => Some(&self.init),
             Call::Observe => Some(&self.observe),
             Call::Dispatch => Some(&self.dispatch),
-            Call::Reclaim => Some(&self.reclaim),
+            Call::Preempt => Some(&self.preempt),
             Call::Route | Call::Place | Call::Limits => None,
         }
     }
@@ -284,8 +284,8 @@ impl PolicyInstance {
         })
     }
 
-    /// `dispatch`: this step's plan.
-    pub fn dispatch(&mut self, room: &Room) -> Result<Plan, PolicyError> {
+    /// `dispatch`: this step's output.
+    pub fn dispatch(&mut self, room: &Room) -> Result<DispatchOutput, PolicyError> {
         self.run(Call::Dispatch, |policy| {
             let message = encode(Call::Dispatch, room)?;
             let reply = policy.send(Call::Dispatch, &message)?;
@@ -293,13 +293,13 @@ impl PolicyInstance {
         })
     }
 
-    /// `reclaim`: which objects to free, in order, for a shortage. An empty
+    /// `preempt`: which objects to free, in order, for a shortage. An empty
     /// answer frees nothing.
-    pub fn reclaim(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
-        self.run(Call::Reclaim, |policy| {
-            let message = encode(Call::Reclaim, shortage)?;
-            match policy.send(Call::Reclaim, &message)? {
-                Some(reply) => decode(Call::Reclaim, Some(reply)),
+    pub fn preempt(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
+        self.run(Call::Preempt, |policy| {
+            let message = encode(Call::Preempt, shortage)?;
+            match policy.send(Call::Preempt, &message)? {
+                Some(reply) => decode(Call::Preempt, Some(reply)),
                 None => Ok(Vec::new()),
             }
         })
@@ -512,7 +512,7 @@ fn encode<T: serde::Serialize>(call: Call, message: &T) -> Result<Vec<u8>, Polic
 /// Decodes a reply of the call's type; `None` is the empty reply.
 ///
 /// A decision whose answer carries something (`dispatch`, `limits`) must
-/// answer; `reclaim` may answer nothing, which frees nothing.
+/// answer; `preempt` may answer nothing, which frees nothing.
 fn decode<T: serde::de::DeserializeOwned>(
     call: Call,
     reply: Option<Vec<u8>>,

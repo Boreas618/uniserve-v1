@@ -307,8 +307,8 @@ impl Scheduler {
 
         // Encoder-cache entries backed by invalidated buffers leave lookup;
         // those no consumer still pins are freed.
-        let reclaimable = self.storage.encoder_cache.invalidate_buffers(&buffers);
-        self.free_buffers(reclaimable.into_iter().map(|product| product.buffer_id()));
+        let releasable = self.storage.encoder_cache.invalidate_buffers(&buffers);
+        self.free_buffers(releasable.into_iter().map(|product| product.buffer_id()));
 
         // Strip affected requests' calls and admissions from queued batches
         // and retire them together with the calls the failure named. A batch
@@ -345,7 +345,7 @@ impl Scheduler {
                 );
                 return;
             };
-            self.reclaim_domain_credit(inflight.call.kind, true);
+            self.return_domain_credit(inflight.call.kind, true);
         }
         for batch in pending {
             if batch.requests.is_empty() && batch.commands.is_empty() {

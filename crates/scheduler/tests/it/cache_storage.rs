@@ -511,8 +511,8 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the scheduler answers")
         .unwrap();
-    let plan: serde_json::Value = serde_json::from_str(&reports[0]).unwrap();
-    assert_eq!(plan["segments_kept"], 6);
+    let output: serde_json::Value = serde_json::from_str(&reports[0]).unwrap();
+    assert_eq!(output["segments_kept"], 6);
 
     // The room is there: nothing more is given back.
     assert!(
@@ -589,15 +589,21 @@ fn room_accounts_for_each_devices_allocation_and_dedicated_experts() {
     ));
 
     let reports = resize(&handle, request(100)).unwrap();
-    let plans = reports
+    let schedules = reports
         .iter()
         .map(|report| serde_json::from_str::<serde_json::Value>(report).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(plans.len(), 2);
-    assert!(plans.iter().all(|plan| plan["feasible"] == true));
-    let attention = plans.iter().find(|plan| plan["bytes"] == 1_500).unwrap();
+    assert_eq!(schedules.len(), 2);
+    assert!(schedules.iter().all(|output| output["feasible"] == true));
+    let attention = schedules
+        .iter()
+        .find(|output| output["bytes"] == 1_500)
+        .unwrap();
     assert_eq!(attention["segments_kept"], 6);
-    let experts = plans.iter().find(|plan| plan["bytes"] == 100).unwrap();
+    let experts = schedules
+        .iter()
+        .find(|output| output["bytes"] == 100)
+        .unwrap();
     assert_eq!(experts["segments_held"], 0);
     let mut served = handle.submit(request_of(2, 8, 2)).unwrap();
     assert!(matches!(
@@ -733,11 +739,11 @@ fn a_parked_epoch_lends_the_segments_no_request_in_flight_continues_from() {
         std::iter::from_fn(|| waiting.try_recv().ok()).all(|event| !event.is_terminal()),
         "the request ended within the units the epoch kept"
     );
-    let reclaimed = handle
+    let preempted = handle
         .resume(true)
         .recv_timeout(Duration::from_secs(10))
         .expect("the scheduler answers");
-    assert!(reclaimed.is_ok(), "{reclaimed:?}");
+    assert!(preempted.is_ok(), "{preempted:?}");
     assert!(matches!(
         terminal(&mut waiting),
         Some(Event::Finished { .. })

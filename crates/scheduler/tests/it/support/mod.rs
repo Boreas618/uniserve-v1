@@ -166,7 +166,7 @@ pub(crate) fn generation_limits(calls: &[CallKind]) -> GenerationLimits {
 /// The policy module every integration test's epoch serves with.
 ///
 /// A deployed epoch takes its policy from the Program Server; a test epoch has
-/// none, and a scheduler with no policy decides nothing — no plan, no
+/// none, and a scheduler with no policy decides nothing — no output, no
 /// admission, no batch — so an epoch that submits a request must be given one.
 /// The module is the `fcfs` program this tree builds for
 /// `wasm32-unknown-unknown`, the one that reproduces the rules the tests were

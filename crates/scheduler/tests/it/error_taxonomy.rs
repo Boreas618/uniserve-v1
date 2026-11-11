@@ -32,7 +32,7 @@ use scheduler::{
 use scheduling::guest::Nanos;
 use scheduling::guest::PhaseId;
 use scheduling::guest::RequestId;
-use scheduling::guest::decision::{Plan, Work};
+use scheduling::guest::decision::{DispatchOutput, Work};
 use scheduling::guest::limits::Limits;
 use scheduling::guest::wire::Call;
 
@@ -40,7 +40,7 @@ use crate::support;
 
 /// Where a toy keeps its reply buffers.
 const MESSAGE: u32 = 4096;
-const PLAN: u32 = 8192;
+const OUTPUT: u32 = 8192;
 const LIMITS: u32 = 12288;
 const VICTIMS: u32 = 16384;
 
@@ -57,8 +57,8 @@ enum Observe {
 /// What a toy's `dispatch` does.
 #[derive(Clone, Copy)]
 enum Dispatch {
-    Plan,
-    /// Answers the same plan once and an empty one afterwards.
+    Decides,
+    /// Answers the same output once and an empty one afterwards.
     ///
     /// A real policy names only queued requests, so a program that admits a
     /// request and keeps naming it on later dispatches states an admission of a
@@ -72,7 +72,7 @@ enum Dispatch {
     /// hand-written WebAssembly; the follow-up is a test policy compiled the
     /// way `fcfs` is, so a fixture can decide admission the way a deployment
     /// does.
-    PlanOnce,
+    DecidesOnce,
     /// Runs until the fuel is gone, which §4.4 counts as a failed call.
     Burns,
 }
@@ -81,7 +81,7 @@ enum Dispatch {
 /// calls that can fail fail the way the case needs.
 struct Toy {
     limits: Limits,
-    plan: Plan,
+    output: DispatchOutput,
     observe: Observe,
     dispatch: Dispatch,
 }
@@ -97,14 +97,14 @@ impl Toy {
                 prefetch_min_tokens: 256,
                 ..Limits::default()
             },
-            plan: Plan::default(),
+            output: DispatchOutput::default(),
             observe: Observe::Answers,
-            dispatch: Dispatch::Plan,
+            dispatch: Dispatch::Decides,
         }
     }
 
     fn wasm(&self) -> Vec<u8> {
-        let plan = serde_json::to_string(&self.plan).expect("a plan is JSON");
+        let output = serde_json::to_string(&self.output).expect("a dispatch output is JSON");
         let limits = serde_json::to_string(&self.limits).expect("limits are JSON");
         let observe = match self.observe {
             Observe::Answers => {
@@ -117,19 +117,19 @@ impl Toy {
             }
         };
         let dispatch = match self.dispatch {
-            Dispatch::Plan => format!(
+            Dispatch::Decides => format!(
                 "(func (export \"{}\") (param i32 i32) (result i64) i64.const {})",
                 Call::Dispatch.export(),
-                packed(PLAN, plan.len())
+                packed(OUTPUT, output.len())
             ),
-            Dispatch::PlanOnce => format!(
+            Dispatch::DecidesOnce => format!(
                 "(func (export \"{}\") (param i32 i32) (result i64) \
                  (if (global.get $admits) \
                    (then (global.set $admits (i32.const 0)) \
                          (return (i64.const {})))) \
                  (i64.const {}))",
                 Call::Dispatch.export(),
-                packed(PLAN, plan.len()),
+                packed(OUTPUT, output.len()),
                 packed(VICTIMS, 2)
             ),
             Dispatch::Burns => format!(
@@ -139,7 +139,7 @@ impl Toy {
         };
         let source = format!(
             "(module (memory (export \"memory\") 1) (global $admits (mut i32) (i32.const 1)) \
-             (data (i32.const {PLAN}) \"{plan}\") \
+             (data (i32.const {OUTPUT}) \"{output}\") \
              (data (i32.const {LIMITS}) \"{limits}\") \
              (data (i32.const {VICTIMS}) \"[]\") \
              (func (export \"sched_alloc\") (param i32) (result i32) i32.const {MESSAGE}) \
@@ -148,15 +148,15 @@ impl Toy {
              {observe} \
              {dispatch} \
              (func (export \"{limits_call}\") (result i64) i64.const {limits_answer}) \
-             (func (export \"{reclaim_call}\") (param i32 i32) (result i64) i64.const {reclaim_answer}) \
+             (func (export \"{preempt_call}\") (param i32 i32) (result i64) i64.const {preempt_reply}) \
              (func (export \"{route_call}\") (param i32 i32) (result i32) i32.const 0) \
              (func (export \"{place_call}\") (param i32 i32) (result i32) i32.const 0))",
-            plan = escape(&plan),
+            output = escape(&output),
             limits = escape(&limits),
             limits_call = Call::Limits.export(),
             limits_answer = packed(LIMITS, limits.len()),
-            reclaim_call = Call::Reclaim.export(),
-            reclaim_answer = packed(VICTIMS, 2),
+            preempt_call = Call::Preempt.export(),
+            preempt_reply = packed(VICTIMS, 2),
             route_call = Call::Route.export(),
             place_call = Call::Place.export(),
         );
@@ -167,16 +167,16 @@ impl Toy {
 /// A work entry naming request 1 — the request the invalid-decision case
 /// submits first — in a phase this epoch does not have.
 ///
-/// The request must exist in the state the trial judges: a plan naming a
+/// The request must exist in the state the trial judges: a dispatch output naming a
 /// request that was never submitted is refused for that, which is a different
 /// decision from the one the case is about.
-fn unknown_phase() -> Plan {
-    Plan {
+fn unknown_phase() -> DispatchOutput {
+    DispatchOutput {
         // The request is the scheduler's resident when the trial judges the
-        // plan, so no admission is stated and the work is judged against the
+        // output, so no admission is stated and the work is judged against the
         // resident view: the refusal that follows is the phase's and not the
-        // request's. A plan that admitted it instead would have its work
-        // judged on the admission this plan makes (§4.4), which exempts the
+        // request's. A dispatch output that admitted it instead would have its work
+        // judged on the admission this output makes (§4.4), which exempts the
         // work from every check this case exists to state.
         admit: Vec::new(),
         work: vec![Work {
@@ -184,7 +184,7 @@ fn unknown_phase() -> Plan {
             phase: PhaseId(999),
             tokens: 4,
         }],
-        ..Plan::default()
+        ..DispatchOutput::default()
     }
 }
 
@@ -445,17 +445,17 @@ fn limits_over_the_build_ceiling_fail_the_policy() {
 #[test]
 fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     // The serving program admits the request and gives it no work, so the
-    // state the trial judges holds it as a resident and the refused plan's
+    // state the trial judges holds it as a resident and the refused output's
     // work is judged against that view.
     let mut admitting = Toy::idle();
-    admitting.plan = Plan {
+    admitting.output = DispatchOutput {
         admit: vec![scheduling::guest::RequestId(1)],
-        ..Plan::default()
+        ..DispatchOutput::default()
     };
     // It admits once: naming the resident request again on the next dispatch
     // would be a refused admission, which is a different failure from the one
     // this case states.
-    admitting.dispatch = Dispatch::PlanOnce;
+    admitting.dispatch = Dispatch::DecidesOnce;
     // A program may admit only a queued request (§4.4), and the trial of the
     // first program runs before this request exists. So the epoch serves an
     // idle program first, the request arrives, and the admitting program is
@@ -479,7 +479,7 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     stepped_past(&epoch, epoch.step());
     let reason = epoch
         .refuse(Toy {
-            plan: unknown_phase(),
+            output: unknown_phase(),
             ..Toy::idle()
         })
         .to_lowercase();
@@ -487,7 +487,7 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
         reason.contains("phase") || reason.contains("not one of this epoch"),
         "the reason names the refused decision: {reason}"
     );
-    // Nothing of the refused plan ran, and nothing of it serves: the program
+    // Nothing of the refused output ran, and nothing of it serves: the program
     // that answers the next decision is the one that was already serving.
     assert_eq!(epoch.serving_revision(), Some(2));
     epoch.no_failure();
@@ -502,11 +502,11 @@ fn starving(admit: Vec<RequestId>, timeout: Nanos) -> Toy {
             timeout,
             ..Toy::idle().limits
         },
-        plan: Plan {
+        output: DispatchOutput {
             admit,
-            ..Plan::default()
+            ..DispatchOutput::default()
         },
-        dispatch: Dispatch::PlanOnce,
+        dispatch: Dispatch::DecidesOnce,
         ..Toy::idle()
     }
 }
@@ -531,7 +531,7 @@ fn text_request(id: u64, prompt: usize, tokens: usize) -> GenerationRequest {
 
 #[test]
 fn a_starved_request_with_nothing_else_resident_ends_the_epoch() {
-    // One millisecond of starvation: the request is admitted by the plan and never given work, and
+    // One millisecond of starvation: the request is admitted by the output and never given work, and
     // §4.4's watchdog is the mechanism's, not the policy's, so a policy that answers every call
     // correctly still starves it.
     //
@@ -574,7 +574,7 @@ fn a_starved_request_fails_alone_while_the_epoch_serves() {
         .submit(text_request(2, 8, 4))
         .expect("the second request is submitted");
     stepped_past(&epoch, epoch.step());
-    // `PlanOnce` admits request 1 alone and gives it no work, so request 2 stays queued: the
+    // `DispatchOnce` admits request 1 alone and gives it no work, so request 2 stays queued: the
     // mechanism's starvation rule watches residents, so request 1 is the one that starves.
     epoch
         .install("fcfs", 2, starving(vec![RequestId(1)], Nanos(1_000_000)))

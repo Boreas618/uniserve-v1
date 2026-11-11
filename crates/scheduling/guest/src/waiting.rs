@@ -147,12 +147,12 @@ mod tests {
     use super::*;
     use crate::ids::PhaseId;
     use crate::time::Nanos;
-    use crate::view::{RequestClass, RequestState};
+    use crate::view::{RequestClass, RequestStatus};
 
     fn view(id: u64, priority: i32, arrived: u64) -> RequestView {
         RequestView {
             id: RequestId(id),
-            state: RequestState::Queued,
+            state: RequestStatus::Waiting,
             phase: None,
             priority,
             arrived_at: Nanos(arrived),

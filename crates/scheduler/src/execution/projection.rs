@@ -532,7 +532,7 @@ impl Scheduler {
     ///
     /// The request's event journal must hold, besides `OUTPUT_TERMINAL_RESERVE`
     /// events kept for its terminal output, the `output_bound` of every
-    /// in-flight call plus that of the call it plans next. Returns `false`
+    /// in-flight call plus that of the call it schedules next. Returns `false`
     /// for a request that is not running or whose journal is closed.
     pub(crate) fn output_window_ready(&self, id: RequestId) -> bool {
         let Some(state) = self.requests.tokens(&id) else {

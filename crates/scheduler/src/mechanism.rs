@@ -7,7 +7,7 @@
 //! - The policy itself (`scheduler/policy.rs`'s `PolicySlot`): the live instance,
 //!   its previous module and the switch. It is the mechanism's whole view of the
 //!   policy; nothing here reaches past it.
-//! - The validators ([`validate_plan`], [`validate_victims`],
+//! - The validators ([`validate_output`], [`validate_victims`],
 //!   [`validate_route`], [`validate_place`]): every answer is checked against the live state and
 //!   the step's hard limits before it is executed. A decision that names
 //!   something that does not exist, does not fit or cannot be chosen is the
@@ -27,12 +27,12 @@ use scheduling::PolicyError;
 
 use crate::policy::Validators;
 use crate::views::{Recorded, RecordedTable};
-use scheduling::guest::decision::{Plan, Room, Shortage, Storage, Victim, Work};
+use scheduling::guest::decision::{DispatchOutput, Room, Shortage, Storage, Victim, Work};
 use scheduling::guest::event::Event;
 use scheduling::guest::wire::Call;
 use scheduling::guest::{
     CallView, EncodingId, EncodingView, Nanos, PageId, PageView, PhaseId, PhaseKind, PhaseView,
-    RankView, ReplicaView, RequestId, RequestState, RequestView, Snapshot,
+    RankView, ReplicaView, RequestId, RequestStatus, RequestView, Snapshot,
 };
 
 /// The mechanism's validators, against the state at one moment (`policy.rs`'s
@@ -53,8 +53,8 @@ impl<'a> Checked<'a> {
 }
 
 impl Validators for Checked<'_> {
-    fn plan(&self, plan: &Plan) -> Result<(), PolicyError> {
-        validate_plan(plan, self.room, self.live)
+    fn output(&self, output: &DispatchOutput) -> Result<(), PolicyError> {
+        validate_output(output, self.room, self.live)
     }
 
     fn victims(&self, shortage: &Shortage, victims: &[Victim]) -> Result<(), PolicyError> {
@@ -66,7 +66,7 @@ impl Validators for Checked<'_> {
             Ok(()) => Ok(()),
             Err(VictimError::Invalid(error)) => Err(error),
             Err(VictimError::Vanished(message)) => Err(PolicyError::Malformed {
-                call: Call::Reclaim,
+                call: Call::Preempt,
                 message,
             }),
         }
@@ -183,7 +183,7 @@ impl Live<'_> {
     fn queued(&self, id: RequestId) -> bool {
         self.requests
             .get(&id)
-            .is_some_and(|view| view.state == RequestState::Queued)
+            .is_some_and(|view| view.state == RequestStatus::Waiting)
     }
 }
 
@@ -200,64 +200,71 @@ fn decodes(kind: PhaseKind) -> bool {
     )
 }
 
-/// Checks one step's plan against the live state and the room it was offered
+/// Checks one step's output against the live state and the room it was offered
 /// (design §4.4).
 ///
-/// A plan is valid when it names only live objects and fits what the mechanism
+/// A dispatch output is valid when it names only live objects and fits what the mechanism
 /// offered: the step's token and call budgets, the prefill budget while an
 /// epoch warms, the graph tiers, and the phase each request can run next.
 ///
-/// One request has at most one piece of work in a step: the mechanism plans one
+/// One request has at most one piece of work in a step: the mechanism schedules one
 /// call per request per step, because a request's next call depends on the
 /// previous one's result. It is a mechanism limit, not a policy's choice, so a
-/// plan that names a request twice is rejected here. A plan that fits is still executed
-/// conservatively: work that does not fit the free storage after `reclaim`
+/// output that names a request twice is rejected here. A dispatch output that fits is still executed
+/// conservatively: work that does not fit the free storage after `preempt`
 /// waits for the next step, which is the mechanism's hard limit and not a
 /// policy failure.
-pub(crate) fn validate_plan(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), PolicyError> {
-    validate_admission(plan, live)?;
-    validate_after_admission(plan, room, live)
+pub(crate) fn validate_output(
+    output: &DispatchOutput,
+    room: &Room,
+    live: &Live<'_>,
+) -> Result<(), PolicyError> {
+    validate_admission(output, live)?;
+    validate_after_admission(output, room, live)
 }
 
-/// Checks the plan's work and its retirement against the state the mechanism
-/// holds once the plan's admission has been applied.
+/// Checks the output's work and its retirement against the state the mechanism
+/// holds once the output's admission has been applied.
 ///
-/// A step applies a plan's admission before it checks the rest, so that one
-/// plan can both admit a request and run it (§4.4); the work then names a
+/// A step applies a dispatch output's admission before it checks the rest, so that one
+/// output can both admit a request and run it (§4.4); the work then names a
 /// resident request and nothing else. The admission itself is checked against
 /// the queue the policy was given, before it is applied — see
 /// [`validate_admission`].
 pub(crate) fn validate_after_admission(
-    plan: &Plan,
+    output: &DispatchOutput,
     room: &Room,
     live: &Live<'_>,
 ) -> Result<(), PolicyError> {
-    validate_work(plan, room, live)?;
-    validate_release(plan, live)?;
+    validate_work(output, room, live)?;
+    validate_release(output, live)?;
     Ok(())
 }
 
 /// Admission names queued requests, and never the same one twice or both
 /// admitted and rejected.
 ///
-/// The order is the policy's: the mechanism admits in the plan's order and
+/// The order is the policy's: the mechanism admits in the output's order and
 /// stops at the first request its hard limits refuse, which is how `fcfs`
 /// reproduces first-come-first-served while a policy that reorders the queue
 /// gets its own order. Membership is all that is validated here.
-/// Checks a plan's admission against the queue the policy was dispatched on.
+/// Checks a dispatch output's admission against the queue the policy was dispatched on.
 ///
 /// Applying admission removes the named requests from the queue, so this is the
-/// one check that must run before it: a plan read against the state after its
+/// one check that must run before it: a dispatch output read against the state after its
 /// own admission would name requests the mechanism no longer queues.
-pub(crate) fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
+pub(crate) fn validate_admission(
+    output: &DispatchOutput,
+    live: &Live<'_>,
+) -> Result<(), PolicyError> {
     // §4.4 puts the slot limit in the mechanism's *stop*, not in a refusal:
     // `Scheduler::admit` admits in the queue's order until the first
     // request that cannot be placed, and it and those after it stay queued. A
-    // plan that names more requests than there are slots free is exactly what
+    // output that names more requests than there are slots free is exactly what
     // `fcfs` states - it names every queued request - so refusing it here would
     // stop every loaded epoch.
     let mut admitted = BTreeSet::new();
-    for id in &plan.admit {
+    for id in &output.admit {
         if !live.queued(*id) {
             return Err(invalid(
                 Call::Dispatch,
@@ -273,7 +280,7 @@ pub(crate) fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), Pol
     }
 
     let mut rejected = BTreeSet::new();
-    for id in &plan.reject {
+    for id in &output.reject {
         if !live.queued(*id) {
             return Err(invalid(
                 Call::Dispatch,
@@ -296,13 +303,13 @@ pub(crate) fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), Pol
     Ok(())
 }
 
-fn validate_work(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), PolicyError> {
-    if plan.work.len() > room.call_budget {
+fn validate_work(output: &DispatchOutput, room: &Room, live: &Live<'_>) -> Result<(), PolicyError> {
+    if output.work.len() > room.call_budget {
         return Err(invalid(
             Call::Dispatch,
             format!(
-                "the plan asks for {} calls, the step offers {}",
-                plan.work.len(),
+                "the output asks for {} calls, the step offers {}",
+                output.work.len(),
                 room.call_budget
             ),
         ));
@@ -315,13 +322,13 @@ fn validate_work(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), Policy
     // on one component, so the graph tier bounds the group, not the step.
     let mut groups: Vec<((u32, PhaseKind), u64)> = Vec::new();
 
-    // A request the plan admits is resident for the work the same plan gives
+    // A request the output admits is resident for the work the same output gives
     // it: the step applies admission before the work, which is what lets one
-    // plan both admit and run a request (§4.4). The trial runs the same check
-    // on one state and never applies anything, so it reads the plan's own
+    // output both admit and run a request (§4.4). The trial runs the same check
+    // on one state and never applies anything, so it reads the output's own
     // admission as the residency the live step will have made.
-    let admitted: BTreeSet<RequestId> = plan.admit.iter().copied().collect();
-    for work in &plan.work {
+    let admitted: BTreeSet<RequestId> = output.admit.iter().copied().collect();
+    for work in &output.work {
         validate_work_entry(work, live, &admitted)?;
         if !seen.insert(work.request) {
             return Err(invalid(
@@ -351,7 +358,7 @@ fn validate_work(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), Policy
         return Err(invalid(
             Call::Dispatch,
             format!(
-                "the plan charges {tokens} tokens, the step offers {}",
+                "the output charges {tokens} tokens, the step offers {}",
                 room.token_budget
             ),
         ));
@@ -362,7 +369,7 @@ fn validate_work(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), Policy
         return Err(invalid(
             Call::Dispatch,
             format!(
-                "the plan's prefill work charges {prefill_tokens} tokens, the epoch may still write {budget}"
+                "the output's prefill work charges {prefill_tokens} tokens, the epoch may still write {budget}"
             ),
         ));
     }
@@ -387,21 +394,22 @@ fn validate_work_entry(
     admitted: &BTreeSet<RequestId>,
 ) -> Result<(), PolicyError> {
     let request = live.request(work.request)?;
-    let by_this_plan = request.state != RequestState::Resident && admitted.contains(&work.request);
-    if request.state != RequestState::Resident && !by_this_plan {
+    let by_this_output =
+        request.state != RequestStatus::Running && admitted.contains(&work.request);
+    if request.state != RequestStatus::Running && !by_this_output {
         return Err(invalid(
             Call::Dispatch,
             format!("{} is not resident", work.request.0),
         ));
     }
-    // A request the plan itself admits has no phase in this state: the phase it
+    // A request the output itself admits has no phase in this state: the phase it
     // serves next is the mechanism's to compute once the request is resident,
     // and a step applies admission before it checks the work. So the phase is
     // compared where the mechanism's own answer exists — against the state
     // admission left (`validate_after_admission` on the live step) — and not
-    // here, where a queued view's `None` would refuse every plan that admits
+    // here, where a queued view's `None` would refuse every output that admits
     // and runs a request in one step.
-    if !by_this_plan && request.phase != Some(work.phase) {
+    if !by_this_output && request.phase != Some(work.phase) {
         return Err(invalid(
             Call::Dispatch,
             format!(
@@ -421,16 +429,16 @@ fn validate_work_entry(
             format!("{} is given no tokens to run", work.request.0),
         ));
     }
-    if by_this_plan {
-        // A request this plan admits has no resident view yet, so the work's
+    if by_this_output {
+        // A request this output admits has no resident view yet, so the work's
         // own bounds cannot be checked against it: a queued view states no
         // prompt length and no prefilled count, and a prefill chunk or a decode
-        // charge measured against those zeros would refuse every plan that
+        // charge measured against those zeros would refuse every output that
         // admits a request and runs it in one step (§4.4). The live step
         // applies the admission before it checks the rest, so that is where
         // these bounds are decided — `validate_after_admission` on the state
         // admission left — and the trial, which applies nothing, reads the
-        // same rule from the plan's own admission.
+        // same rule from the output's own admission.
         return Ok(());
     }
     let Some(phase) = live.phases.get(&work.phase) else {
@@ -444,13 +452,13 @@ fn validate_work_entry(
             return Err(invalid(
                 Call::Dispatch,
                 format!(
-                    "{} is given refill work: a refill is named by `plan.refill`, not by `work`",
+                    "{} is given refill work: a refill is named by `output.refill`, not by `work`",
                     work.request.0
                 ),
             ));
         }
         PhaseKind::Prefill => {
-            // The mechanism states the charge of the call it will plan: a
+            // The mechanism states the charge of the call it will schedule: a
             // prompt chunk is sized by the policy against what is left, and a
             // structural write (a close cache, a feedback state, a block's
             // commit) is one position with nothing left to size.
@@ -475,7 +483,7 @@ fn validate_work_entry(
                 return Err(invalid(
                     Call::Dispatch,
                     format!(
-                        "{}'s {:?} call is charged {charge} tokens by the mechanism, the plan says {}",
+                        "{}'s {:?} call is charged {charge} tokens by the mechanism, the output says {}",
                         work.request.0, phase.kind, work.tokens
                     ),
                 ));
@@ -485,9 +493,9 @@ fn validate_work_entry(
     Ok(())
 }
 
-fn validate_release(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
+fn validate_release(output: &DispatchOutput, live: &Live<'_>) -> Result<(), PolicyError> {
     let mut pages = BTreeSet::new();
-    for id in &plan.offload {
+    for id in &output.offload {
         let page = live.page(*id)?;
         if page.on_host {
             return Err(invalid(
@@ -513,9 +521,9 @@ fn validate_release(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
     }
 
     let mut prefetched = BTreeSet::new();
-    for id in &plan.prefetch {
+    for id in &output.prefetch {
         let request = live.request(*id)?;
-        if request.state != RequestState::Resident {
+        if request.state != RequestStatus::Running {
             return Err(invalid(
                 Call::Dispatch,
                 format!("prefetch names {}, which is not resident", id.0),
@@ -536,9 +544,9 @@ fn validate_release(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
     }
 
     let mut refilled = BTreeSet::new();
-    for id in &plan.refill {
+    for id in &output.refill {
         let request = live.request(*id)?;
-        if request.state != RequestState::Resident {
+        if request.state != RequestStatus::Running {
             return Err(invalid(
                 Call::Dispatch,
                 format!("refill names {}, which is not resident", id.0),
@@ -586,7 +594,7 @@ pub(crate) fn validate_victims(
     //    holds: the mechanism let go of it between the observation the policy
     //    answered from and this call. Nothing of the step can do that today -
     //    `admit` is the only thing that changes storage between `observe`
-    //    and `reclaim`, and it frees nothing - so the case is unreachable, and
+    //    and `preempt`, and it frees nothing - so the case is unreachable, and
     //    its path exists to catch the mechanism, not the policy: a free it made
     //    without recording it is a broken invariant, and the epoch stops naming
     //    that, never as a policy's wrong decision.
@@ -606,7 +614,7 @@ pub(crate) fn validate_victims(
     let mut seen: Vec<Victim> = Vec::new();
     for victim in victims {
         if seen.contains(victim) {
-            return Err(invalid(Call::Reclaim, format!("{victim:?} is freed twice")).into());
+            return Err(invalid(Call::Preempt, format!("{victim:?} is freed twice")).into());
         }
         seen.push(*victim);
         match (shortage.kind, victim) {
@@ -616,7 +624,7 @@ pub(crate) fn validate_victims(
                 };
                 if view.on_host {
                     return Err(invalid(
-                        Call::Reclaim,
+                        Call::Preempt,
                         format!(
                             "page {} is on the host, it frees no device units",
                             view.id.0
@@ -626,7 +634,7 @@ pub(crate) fn validate_victims(
                 }
                 if !view.evictable {
                     return Err(invalid(
-                        Call::Reclaim,
+                        Call::Preempt,
                         format!(
                             "page {} is still continued from and cannot be freed",
                             view.id.0
@@ -639,13 +647,13 @@ pub(crate) fn validate_victims(
                 let Some(view) = told_request(live, *request, Storage::KvUnits)? else {
                     continue;
                 };
-                if view.state != RequestState::Resident || !view.migratable {
+                if view.state != RequestStatus::Running || !view.migratable {
                     return Err(invalid(
-                        Call::Reclaim,
+                        Call::Preempt,
                         format!(
                             "{} cannot be ended as migratable: it is {} and {} migratable",
                             view.id.0,
-                            if view.state == RequestState::Resident {
+                            if view.state == RequestStatus::Running {
                                 "resident"
                             } else {
                                 "not resident"
@@ -662,7 +670,7 @@ pub(crate) fn validate_victims(
                 };
                 if !view.on_host {
                     return Err(invalid(
-                        Call::Reclaim,
+                        Call::Preempt,
                         format!("page {} is not on the host", view.id.0),
                     )
                     .into());
@@ -671,7 +679,7 @@ pub(crate) fn validate_victims(
             (Storage::EncoderEntries, Victim::Encoding(entry)) => {
                 if !live.told_encodings.contains(entry) {
                     return Err(invalid(
-                        Call::Reclaim,
+                        Call::Preempt,
                         format!(
                             "encoder entry {} was never shown to the policy, so evicting it is \
                              not a decision it was given the state for",
@@ -682,7 +690,7 @@ pub(crate) fn validate_victims(
                 }
                 if !live.encodings.contains_key(entry) {
                     return Err(VictimError::Vanished(format!(
-                        "encoder entry {} was shown to the policy and is gone before the reclaim",
+                        "encoder entry {} was shown to the policy and is gone before the preemption",
                         entry.0
                     )));
                 }
@@ -690,7 +698,7 @@ pub(crate) fn validate_victims(
             (Storage::Other, _) => {}
             (kind, victim) => {
                 return Err(invalid(
-                    Call::Reclaim,
+                    Call::Preempt,
                     format!("{victim:?} frees nothing of a {kind:?} shortage"),
                 )
                 .into());
@@ -713,7 +721,7 @@ fn told_page(
 ) -> Result<Option<PageView>, VictimError> {
     if !live.told_pages.contains(&page) {
         return Err(invalid(
-            Call::Reclaim,
+            Call::Preempt,
             format!(
                 "page {} was never shown to the policy, so freeing it is not a decision it was \
                  given the state for",
@@ -725,7 +733,7 @@ fn told_page(
     let Some(view) = live.pages.get(&page) else {
         return Err(VictimError::Vanished(format!(
             "page {} was shown to the policy for a {kind:?} shortage and is gone before the \
-             reclaim, which the mechanism did not record",
+             preempt, which the mechanism did not record",
             page.0
         )));
     };
@@ -740,7 +748,7 @@ fn told_request(
 ) -> Result<Option<RequestView>, VictimError> {
     if !live.told_requests.contains(&request) {
         return Err(invalid(
-            Call::Reclaim,
+            Call::Preempt,
             format!(
                 "request {} was never shown to the policy, so ending it is not a decision it \
                  was given the state for",
@@ -752,7 +760,7 @@ fn told_request(
     let Some(view) = live.requests.get(&request) else {
         return Err(VictimError::Vanished(format!(
             "request {} was shown to the policy for a {kind:?} shortage and is gone before the \
-             reclaim, which the mechanism did not record",
+             preempt, which the mechanism did not record",
             request.0
         )));
     };
@@ -770,7 +778,7 @@ pub(crate) enum VictimError {
     /// The policy's decision is invalid: it names an object it was never
     /// shown, or one the mechanism's rules forbid taking.
     Invalid(PolicyError),
-    /// An object the policy was told about is gone before the reclaim: the
+    /// An object the policy was told about is gone before the preemption: the
     /// mechanism freed it without recording that it did.
     Vanished(String),
 }
@@ -950,7 +958,7 @@ impl Recorder {
         }
     }
 
-    /// The page identities the policy has been told about: what a `reclaim` is
+    /// The page identities the policy has been told about: what a `preempt` is
     /// judged against.
     pub(crate) fn announced_pages(&self) -> &BTreeSet<PageId> {
         &self.announced_pages
@@ -995,7 +1003,7 @@ impl Recorder {
     }
 
     pub(crate) fn record(&mut self, event: Event) {
-        // What the policy is told of the cache, kept as it is told: the `reclaim`
+        // What the policy is told of the cache, kept as it is told: the `preempt`
         // validators judge a victim against this and not against the mechanism's
         // table, which may have moved on since.
         match &event {
@@ -1031,7 +1039,7 @@ impl Recorder {
             }
             Event::Admitted { request } => {
                 if let Some(view) = self.told.get_mut(request) {
-                    view.state = RequestState::Resident;
+                    view.state = RequestStatus::Running;
                 }
             }
             Event::Finished { request, .. } => {
@@ -1144,7 +1152,7 @@ impl Recorder {
 /// within `limits().timeout` is the policy's failure, exactly as sched_ext
 /// treats a runnable task its scheduler did not run within `timeout_ms`. The
 /// mechanism decides when a request advanced (one completed call it put in a
-/// plan); the policy cannot move the deadline, only its own `timeout`.
+/// output); the policy cannot move the deadline, only its own `timeout`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Watchdog {
     /// When each resident request last advanced, or was admitted.
@@ -1184,7 +1192,7 @@ impl Watchdog {
             let Some(request) = live.requests.get(id) else {
                 continue;
             };
-            if request.state != RequestState::Resident || request.waiting_transfer {
+            if request.state != RequestStatus::Running || request.waiting_transfer {
                 continue;
             }
             if now.0.saturating_sub(since.0) > timeout.0 {
@@ -1203,7 +1211,7 @@ mod tests {
 
     use scheduling::guest::{ComponentId, RequestClass, Room, Storage};
 
-    fn request(id: u64, state: RequestState) -> RequestView {
+    fn request(id: u64, state: RequestStatus) -> RequestView {
         RequestView {
             id: RequestId(id),
             state,
@@ -1260,7 +1268,7 @@ mod tests {
     ///
     /// A case that adds a page or a request to the live state after building it
     /// calls this once more: an identity the fixture holds and the policy was
-    /// never told of is exactly what the reclaim refuses, which is not what
+    /// never told of is exactly what the preemption refuses, which is not what
     /// such a case is about.
     fn tell_everything(live: &mut Live<'_>) {
         live.told_pages = std::borrow::Cow::Owned(live.pages.keys().copied().collect());
@@ -1280,8 +1288,8 @@ mod tests {
         }
     }
 
-    fn plan(work: Vec<Work>) -> Plan {
-        Plan {
+    fn output(work: Vec<Work>) -> DispatchOutput {
+        DispatchOutput {
             admit: Vec::new(),
             reject: Vec::new(),
             work,
@@ -1295,40 +1303,40 @@ mod tests {
     fn admission_names_only_queued_requests_and_never_twice() {
         let live = live(
             vec![
-                request(1, RequestState::Queued),
-                request(2, RequestState::Queued),
-                request(3, RequestState::Resident),
+                request(1, RequestStatus::Waiting),
+                request(2, RequestStatus::Waiting),
+                request(3, RequestStatus::Running),
             ],
             &[],
         );
         // Any order of queued requests is legal; the order is the policy's.
-        let mut p = plan(Vec::new());
+        let mut p = output(Vec::new());
         p.admit = vec![RequestId(2), RequestId(1)];
-        validate_plan(&p, &room(), &live).expect("a policy may reorder the queue");
+        validate_output(&p, &room(), &live).expect("a policy may reorder the queue");
 
         p.admit = vec![RequestId(2), RequestId(2)];
-        let error = validate_plan(&p, &room(), &live).expect_err("twice");
+        let error = validate_output(&p, &room(), &live).expect_err("twice");
         assert!(format!("{error}").contains("twice"));
 
         p.admit = vec![RequestId(3)];
-        let error = validate_plan(&p, &room(), &live).expect_err("not queued");
+        let error = validate_output(&p, &room(), &live).expect_err("not queued");
         assert!(format!("{error}").contains("not queued"));
 
         p.admit = vec![RequestId(1)];
         p.reject = vec![RequestId(1)];
-        let error = validate_plan(&p, &room(), &live).expect_err("both");
+        let error = validate_output(&p, &room(), &live).expect_err("both");
         assert!(format!("{error}").contains("both admitted and rejected"));
 
         p.reject.clear();
-        validate_plan(&p, &room(), &live).expect("admit in order");
+        validate_output(&p, &room(), &live).expect("admit in order");
     }
 
     #[test]
     fn work_runs_the_phase_the_request_is_at_and_what_the_mechanism_charges() {
-        let mut decoding = request(1, RequestState::Resident);
+        let mut decoding = request(1, RequestStatus::Running);
         decoding.phase = Some(PhaseId(1));
         decoding.next_tokens = 1;
-        let mut prefilling = request(2, RequestState::Resident);
+        let mut prefilling = request(2, RequestStatus::Running);
         prefilling.phase = Some(PhaseId(0));
         prefilling.prompt_tokens = 100;
         prefilling.prefilled_tokens = 40;
@@ -1338,42 +1346,42 @@ mod tests {
         );
 
         // The prefill may write what is left of the prompt and not a token more.
-        let mut p = plan(vec![Work {
+        let mut p = output(vec![Work {
             request: RequestId(2),
             phase: PhaseId(0),
             tokens: 60,
         }]);
-        validate_plan(&p, &room(), &live).expect("the rest of the prompt");
+        validate_output(&p, &room(), &live).expect("the rest of the prompt");
         p.work[0].tokens = 61;
-        let error = validate_plan(&p, &room(), &live).expect_err("past the prompt");
+        let error = validate_output(&p, &room(), &live).expect_err("past the prompt");
         assert!(format!("{error}").contains("prompt tokens left"));
 
         // A decode step is charged what the mechanism charges, not what a
         // policy would like.
-        let mut p = plan(vec![Work {
+        let mut p = output(vec![Work {
             request: RequestId(1),
             phase: PhaseId(1),
             tokens: 4,
         }]);
-        let error = validate_plan(&p, &room(), &live).expect_err("wrong charge");
+        let error = validate_output(&p, &room(), &live).expect_err("wrong charge");
         assert!(format!("{error}").contains("charged 1 tokens"));
         p.work[0].tokens = 1;
         // ... and the phase must be the one the request is at.
         p.work[0].phase = PhaseId(0);
-        let error = validate_plan(&p, &room(), &live).expect_err("wrong phase");
+        let error = validate_output(&p, &room(), &live).expect_err("wrong phase");
         assert!(format!("{error}").contains("next phase"));
 
         // A request that is not resident cannot be given work.
-        let mut queued = request(3, RequestState::Queued);
+        let mut queued = request(3, RequestStatus::Waiting);
         queued.phase = Some(PhaseId(1));
         let mut live = live.clone();
         live.requests.to_mut().insert(queued.id, queued);
-        let p = plan(vec![Work {
+        let p = output(vec![Work {
             request: RequestId(3),
             phase: PhaseId(1),
             tokens: 1,
         }]);
-        let error = validate_plan(&p, &room(), &live).expect_err("queued");
+        let error = validate_output(&p, &room(), &live).expect_err("queued");
         assert!(format!("{error}").contains("not resident"));
     }
 
@@ -1382,13 +1390,13 @@ mod tests {
         let mut live = live(
             vec![
                 {
-                    let mut r = request(1, RequestState::Resident);
+                    let mut r = request(1, RequestStatus::Running);
                     r.phase = Some(PhaseId(0));
                     r.prompt_tokens = 1000;
                     r
                 },
                 {
-                    let mut r = request(2, RequestState::Resident);
+                    let mut r = request(2, RequestStatus::Running);
                     r.phase = Some(PhaseId(0));
                     r.prompt_tokens = 1000;
                     r
@@ -1398,7 +1406,7 @@ mod tests {
         );
         let mut r = room();
         r.token_budget = 100;
-        let p = plan(vec![
+        let p = output(vec![
             Work {
                 request: RequestId(1),
                 phase: PhaseId(0),
@@ -1410,23 +1418,23 @@ mod tests {
                 tokens: 60,
             },
         ]);
-        let error = validate_plan(&p, &r, &live).expect_err("over the step");
+        let error = validate_output(&p, &r, &live).expect_err("over the step");
         assert!(format!("{error}").contains("120 tokens"));
 
         // A warming epoch bounds the prefill work separately.
         r.token_budget = 1000;
         r.prefill_tokens = Some(80);
-        let error = validate_plan(&p, &r, &live).expect_err("over the prefill budget");
+        let error = validate_output(&p, &r, &live).expect_err("over the prefill budget");
         assert!(format!("{error}").contains("may still write 80"));
 
         r.prefill_tokens = None;
         r.call_budget = 1;
-        let error = validate_plan(&p, &r, &live).expect_err("over the calls");
+        let error = validate_output(&p, &r, &live).expect_err("over the calls");
         assert!(format!("{error}").contains("2 calls"));
 
         // A request gets one piece of work in a step.
         r.call_budget = 8;
-        let p = plan(vec![
+        let p = output(vec![
             Work {
                 request: RequestId(1),
                 phase: PhaseId(0),
@@ -1438,7 +1446,7 @@ mod tests {
                 tokens: 10,
             },
         ]);
-        let error = validate_plan(&p, &r, &live).expect_err("twice");
+        let error = validate_output(&p, &r, &live).expect_err("twice");
         assert!(format!("{error}").contains("two pieces of work"));
         live.requests.to_mut().clear();
     }
@@ -1477,21 +1485,21 @@ mod tests {
             },
         );
 
-        let mut p = plan(Vec::new());
+        let mut p = output(Vec::new());
         p.offload = vec![PageId(1)];
-        let error = validate_plan(&p, &room(), &live).expect_err("continued from");
+        let error = validate_output(&p, &room(), &live).expect_err("continued from");
         assert!(format!("{error}").contains("still continued from"));
 
         p.offload = vec![PageId(2)];
-        let error = validate_plan(&p, &room(), &live).expect_err("already on the host");
+        let error = validate_output(&p, &room(), &live).expect_err("already on the host");
         assert!(format!("{error}").contains("already on the host"));
 
         p.offload = vec![PageId(3), PageId(3)];
-        let error = validate_plan(&p, &room(), &live).expect_err("twice");
+        let error = validate_output(&p, &room(), &live).expect_err("twice");
         assert!(format!("{error}").contains("twice"));
 
         p.offload = vec![PageId(3)];
-        validate_plan(&p, &room(), &live).expect("a free device page");
+        validate_output(&p, &room(), &live).expect("a free device page");
     }
 
     #[test]
@@ -1499,12 +1507,12 @@ mod tests {
         let mut live = live(
             vec![
                 {
-                    let mut r = request(1, RequestState::Resident);
+                    let mut r = request(1, RequestStatus::Running);
                     r.migratable = false;
                     r
                 },
                 {
-                    let mut r = request(2, RequestState::Resident);
+                    let mut r = request(2, RequestStatus::Running);
                     r.migratable = true;
                     r
                 },
@@ -1580,35 +1588,36 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_may_run_what_it_admits() {
-        // §4.4: the step applies admission before the work, so one plan may both
+    fn an_output_may_run_what_it_admits() {
+        // §4.4: the step applies admission before the work, so one output may both
         // admit a request and give it work. The trial checks the same rule on
-        // one state and applies nothing, so it reads the plan's own admission as
+        // one state and applies nothing, so it reads the output's own admission as
         // the residency the live step will have made; without that, a mid-flight
-        // install whose first plan admits and runs a request could never pass
+        // install whose first output admits and runs a request could never pass
         // probation.
         // A queued view states no prompt length and no prefilled count: the run
         // reported exactly that, "a 4-token prefill chunk with 0 prompt tokens
-        // left". The plan admits the request and runs its first chunk anyway,
+        // left". The output admits the request and runs its first chunk anyway,
         // because the step applies admission before it checks the work, so a
         // tree that measures the chunk against the queued view refuses this
-        // plan and fails here.
-        let queued = request(1, RequestState::Queued);
+        // output and fails here.
+        let queued = request(1, RequestStatus::Waiting);
         let live = live(vec![queued], &[(0, PhaseKind::Prefill)]);
         let work = Work {
             request: RequestId(1),
             phase: PhaseId(0),
             tokens: 4,
         };
-        let admitting = Plan {
+        let admitting = DispatchOutput {
             admit: vec![RequestId(1)],
-            ..plan(vec![work])
+            ..output(vec![work])
         };
-        validate_plan(&admitting, &room(), &live).expect("a plan may run what it admits");
+        validate_output(&admitting, &room(), &live)
+            .expect("a dispatch output may run what it admits");
         // The same work without the admission names a request that is not
         // running, which stays a refused decision.
-        let refused = plan(vec![work]);
-        let error = validate_plan(&refused, &room(), &live).expect_err("not resident");
+        let refused = output(vec![work]);
+        let error = validate_output(&refused, &room(), &live).expect_err("not resident");
         assert!(format!("{error}").contains("not resident"));
     }
 
@@ -1641,7 +1650,7 @@ mod tests {
     #[test]
     fn a_victim_the_policy_was_shown_and_is_gone_is_the_mechanisms_defect() {
         // Nothing of a step frees a page between the observation the policy
-        // answered from and the reclaim, so this state means the mechanism let
+        // answered from and the preemption, so this state means the mechanism let
         // go of a told object without recording it: an invariant of its own,
         // named as such and never as the policy's wrong decision.
         let live = live(Vec::new(), &[]);
@@ -1673,7 +1682,7 @@ mod tests {
                 alive: false,
             },
         ];
-        let request = request(9, RequestState::Queued);
+        let request = request(9, RequestStatus::Waiting);
         validate_route(&request, &ranks, 0).expect("the live rank");
         let error = validate_route(&request, &ranks, 1).expect_err("dead");
         assert!(format!("{error}").contains("not alive"));
@@ -1722,7 +1731,7 @@ mod tests {
     #[test]
     fn the_recorder_tells_one_update_per_change_and_none_for_an_unchanged_view() {
         let mut recorder = Recorder::default();
-        let mut arrived = request(1, RequestState::Queued);
+        let mut arrived = request(1, RequestStatus::Waiting);
         arrived.prompt_tokens = 100;
         arrived.phase = Some(PhaseId(0));
         recorder.record(Event::Arrived {
@@ -1765,13 +1774,13 @@ mod tests {
     fn the_watchdog_finds_a_resident_request_that_stopped_advancing_but_not_a_waiting_one() {
         let mut live = live(
             vec![
-                request(1, RequestState::Resident),
+                request(1, RequestStatus::Running),
                 {
-                    let mut r = request(2, RequestState::Resident);
+                    let mut r = request(2, RequestStatus::Running);
                     r.waiting_transfer = true;
                     r
                 },
-                request(3, RequestState::Resident),
+                request(3, RequestStatus::Running),
             ],
             &[],
         );
@@ -1796,7 +1805,7 @@ mod tests {
             .to_mut()
             .get_mut(&RequestId(1))
             .expect("live")
-            .state = RequestState::Finished;
+            .state = RequestStatus::Finished;
         assert_eq!(watchdog.starved(&live, Nanos(2_000_000_000), timeout), None);
         watchdog.finished(RequestId(3));
         assert_eq!(
@@ -1806,13 +1815,13 @@ mod tests {
     }
 
     struct Static {
-        plan: Plan,
+        output: DispatchOutput,
         failures: usize,
     }
 
     impl Static {
-        fn dispatch(&mut self, _room: &Room) -> Result<Plan, PolicyError> {
-            Ok(self.plan.clone())
+        fn dispatch(&mut self, _room: &Room) -> Result<DispatchOutput, PolicyError> {
+            Ok(self.output.clone())
         }
 
         fn fail(
@@ -1832,29 +1841,32 @@ mod tests {
     #[test]
     fn a_static_policy_goes_through_the_same_validators_the_live_path_does() {
         let live = live(
-            vec![request(1, RequestState::Queued), {
-                let mut r = request(2, RequestState::Resident);
+            vec![request(1, RequestStatus::Waiting), {
+                let mut r = request(2, RequestStatus::Running);
                 r.phase = Some(PhaseId(1));
                 r.next_tokens = 1;
                 r
             }],
             &[(0, PhaseKind::Prefill), (1, PhaseKind::Decode)],
         );
-        let mut plan = plan(vec![Work {
+        let mut output = output(vec![Work {
             request: RequestId(2),
             phase: PhaseId(1),
             tokens: 1,
         }]);
-        plan.admit = vec![RequestId(1)];
-        let mut policy = Static { plan, failures: 0 };
+        output.admit = vec![RequestId(1)];
+        let mut policy = Static {
+            output,
+            failures: 0,
+        };
 
         // A good answer validates and executes; the failed one is the policy's.
-        let decision = policy.dispatch(&room()).expect("the fixed plan");
-        validate_plan(&decision, &room(), &live).expect("a valid plan");
+        let decision = policy.dispatch(&room()).expect("the fixed output");
+        validate_output(&decision, &room(), &live).expect("a valid output");
 
-        policy.plan.work[0].tokens = 9;
-        let decision = policy.dispatch(&room()).expect("the fixed plan");
-        let error = validate_plan(&decision, &room(), &live).expect_err("an invalid plan");
+        policy.output.work[0].tokens = 9;
+        let decision = policy.dispatch(&room()).expect("the fixed output");
+        let error = validate_output(&decision, &room(), &live).expect_err("an invalid output");
         let report = policy.fail(&error, &TrialState::default());
         assert_eq!(policy.failures, 1);
         assert!(

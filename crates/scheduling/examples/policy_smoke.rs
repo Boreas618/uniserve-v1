@@ -28,8 +28,8 @@ use std::process::ExitCode;
 
 use scheduling::guest::wire;
 use scheduling::guest::{
-    CallView, Duration, Event, Limits, Parameters, Plan, RankView, ReplicaView, RequestId,
-    RequestView, Room, Shortage, Snapshot, Storage,
+    CallView, DispatchOutput, Duration, Event, Limits, Parameters, RankView, ReplicaView,
+    RequestId, RequestView, Room, Shortage, Snapshot, Storage,
 };
 use scheduling::{Engine, PolicyInstance};
 use serde::de::DeserializeOwned;
@@ -153,9 +153,9 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
         }
         let mut room = step_room.clone();
         room.step = u64::from(step);
-        let plan = policy.dispatch(&room)?;
+        let output = policy.dispatch(&room)?;
         if step == 1 {
-            print_plan(&plan);
+            print_plan(&output);
         }
         // Step 1's `observe` ran above, outside the loop; later steps observe
         // the one event a quiet step carries.
@@ -175,12 +175,12 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
     }
 
     let before = Meter::of(&policy);
-    let victims = policy.reclaim(&Shortage {
+    let victims = policy.preempt(&Shortage {
         kind: Storage::KvUnits,
         need: 1,
     })?;
-    println!("reclaim: {} victims", victims.len());
-    before.report(&policy, "reclaim");
+    println!("preempt: {} victims", victims.len());
+    before.report(&policy, "preempt");
 
     let ranks: Vec<RankView> = decode(br#"[{"index":0,"in_flight":1},{"index":1,"in_flight":0}]"#)?;
     let before = Meter::of(&policy);
@@ -221,9 +221,9 @@ fn snapshot() -> Result<Snapshot, Box<dyn Error>> {
         br#"{
             "step": 0,
             "requests": [
-                {"id":1,"state":{"state":"queued"},"class":{"class":"token"},
+                {"id":1,"state":{"state":"waiting"},"class":{"class":"token"},
                  "prompt_tokens":128,"phase":1},
-                {"id":2,"state":{"state":"queued"},"class":{"class":"token"},
+                {"id":2,"state":{"state":"waiting"},"class":{"class":"token"},
                  "prompt_tokens":64,"phase":1}
             ],
             "phases": [{"id":1,"kind":{"kind":"prefill"},"block":0}],
@@ -291,18 +291,18 @@ impl Meter {
     }
 }
 
-/// Prints what a step's plan asks for.
-fn print_plan(plan: &Plan) {
+/// Prints what a step's output asks for.
+fn print_plan(output: &DispatchOutput) {
     println!(
         "dispatch: admit {} reject {} work {} offload {} prefetch {} refill {}",
-        plan.admit.len(),
-        plan.reject.len(),
-        plan.work.len(),
-        plan.offload.len(),
-        plan.prefetch.len(),
-        plan.refill.len()
+        output.admit.len(),
+        output.reject.len(),
+        output.work.len(),
+        output.offload.len(),
+        output.prefetch.len(),
+        output.refill.len()
     );
-    for work in &plan.work {
+    for work in &output.work {
         println!(
             "  work request {} phase {} tokens {}",
             work.request.0, work.phase.0, work.tokens

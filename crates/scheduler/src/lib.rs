@@ -115,8 +115,8 @@ pub use proto::config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
 };
-/// The phases the scheduler plans with, and the id each is numbered with: a rank's plan, a policy's
-/// `Plan` and a batch's phase must all use this table, so it is exported from where the scheduler
+/// The phases the scheduler schedules with, and the id each is numbered with: a rank's output, a policy's
+/// `DispatchOutput` and a batch's phase must all use this table, so it is exported from where the scheduler
 /// keeps it rather than restated by whoever needs a phase id.
 pub use scheduling::guest::view::{PhaseKind, RankView};
 pub use stats::{
@@ -461,8 +461,8 @@ pub struct Scheduler {
     /// (`Scheduler::resize_cache`).
     resizing: Option<cache_storage::PendingResize>,
     /// The running requests the latest assembly could not grow, each with the
-    /// cache units its growth needed. The next step's reclaim reads them before
-    /// its assembly notes them again (`Scheduler::reclaim_shortage`,
+    /// cache units its growth needed. The next step's preemption reads them before
+    /// its assembly notes them again (`Scheduler::preempt_shortage`,
     /// `Scheduler::recompute_starved`), and admission waits while any is here.
     starved: Vec<(RequestId, usize)>,
     /// The workers gave back the cache and graph storage: the scheduler
@@ -613,7 +613,7 @@ pub(crate) const MAX_VERIFY_DRAFTS: usize = 16;
 /// add to its request's event journal.
 ///
 /// `Scheduler::output_window_ready` charges this for every in-flight call and
-/// for the call the request plans next.
+/// for the call the request schedules next.
 fn output_bound(kind: CallKind) -> usize {
     match kind {
         CallKind::Forward(ForwardMode::Prefill) | CallKind::Forward(ForwardMode::Decode) => 4,

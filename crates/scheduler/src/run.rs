@@ -321,9 +321,9 @@ impl Scheduler {
             ));
         }
         // The queue keeps no order of its own: the waiting requests are a
-        // membership set, and each step's admission order is its plan's
+        // membership set, and each step's admission order is its output's
         // `admit` list (design §4.4). A new `policy` therefore reorders
-        // nothing — the next plan does.
+        // nothing — the next output does.
         let graph_tiers = std::mem::take(&mut self.config.graph_tiers);
         self.config = SchedulerConfig {
             policy: Default::default(),

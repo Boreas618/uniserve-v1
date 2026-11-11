@@ -48,7 +48,7 @@ pub mod wire;
 pub use abi::*;
 pub use arrival::Arrival;
 pub use budget::{Shares, Step, prefill_chunk, work_tokens};
-pub use decision::{Inflight, Plan, Room, Shortage, Storage, Victim, Work};
+pub use decision::{Inflight, DispatchOutput, Room, Shortage, Storage, Victim, Work};
 pub use event::{End, Event};
 pub use ids::{ComponentId, EncodingId, PageId, PhaseId, RequestId};
 pub use limits::{Limits, Parameters};
@@ -58,6 +58,6 @@ pub use policy::{Instantiation, Policy};
 pub use time::{Duration, Nanos};
 pub use view::{
     CallView, EncodingView, PageView, PhaseClass, PhaseKind, PhaseView, RankView, ReplicaView,
-    RequestClass, RequestState, RequestView, Snapshot,
+    RequestClass, RequestStatus, RequestView, Snapshot,
 };
 pub use waiting::{ArrivalOrder, Order, PriorityOrder, Waiting};

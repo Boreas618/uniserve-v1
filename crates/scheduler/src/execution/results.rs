@@ -379,7 +379,7 @@ impl Scheduler {
     ) -> Option<(Call, InflightInput)> {
         let inflight = self.inflight.pop_pending_call(request_key, call_id)?;
         self.requests.mark(request_key.request_id);
-        self.reclaim_domain_credit(inflight.call.kind, false);
+        self.return_domain_credit(inflight.call.kind, false);
         Some((inflight.call, inflight.input))
     }
 
@@ -423,7 +423,7 @@ impl Scheduler {
     ///    settle its lifecycle command receipts.
     /// 3. Queue and apply: hold each completion until
     ///    `Inflight::take_ready_completions` releases it in request-local
-    ///    dependency order, then reclaim resources and resolve the public
+    ///    dependency order, then release resources and resolve the public
     ///    effects in lifecycle priority and arrival order.
     pub(crate) fn apply_result(&mut self, report: BatchReport) {
         let result_batch_id = report.batch_id;

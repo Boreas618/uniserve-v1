@@ -21,7 +21,7 @@
 //! writing the entries of their own positions ([`DraftCache::tail`]); a
 //! refill evaluates the target model again over the positions before them,
 //! in chunks of the prefill budget a step leaves idle, when the refill
-//! policy finds it worth its cost (`Plan::refill`).
+//! policy finds it worth its cost (`DispatchOutput::refill`).
 //! Once the refill reaches the entries the request wrote itself, its draft
 //! cache is complete and it speculates.
 //!
@@ -80,7 +80,7 @@ impl MeasuredStep {
 /// What the epoch measures of speculation, as moving averages over recent
 /// observations: the speedup a speculating request gets and the cost of a
 /// refilled token, in decode steps, which the refill policy weighs
-/// (`Plan::refill`).
+/// (`DispatchOutput::refill`).
 ///
 /// A verification carrying drafts commits `s` tokens on average; the
 /// worker's step takes `v` with drafts and `d` without, and `p` per prompt
@@ -246,7 +246,7 @@ impl Scheduler {
             .min(remaining);
         let proposals = &state.draft.proposals[..count];
         let bans = |drafts: &[u32]| {
-            crate::batching::plan::suppressed_tokens(
+            crate::batching::next::suppressed_tokens(
                 &state.req.sampling,
                 &self.special_tokens.eos,
                 &state.generated_token_ids,
@@ -377,7 +377,7 @@ impl Scheduler {
             .then_some(state.draft.valid as usize)
     }
 
-    /// Plans the next chunk of `id`'s refill within `budget` tokens.
+    /// Outputs the next chunk of `id`'s refill within `budget` tokens.
     ///
     /// The chunk evaluates the request's tokens from the end of its valid
     /// draft cache, where its state tables keep a checkpoint (or from the

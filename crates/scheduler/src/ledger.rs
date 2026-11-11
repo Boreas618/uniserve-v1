@@ -20,7 +20,7 @@ use storage::LedgerEntry;
 
 /// One device's room for the device storage a profiling session holds:
 /// what its ledger and its free storage leave, and the tail segments the KV
-/// cache gives back to make the rest. Reported per GPU by the change's plan
+/// cache gives back to make the rest. Reported per GPU by the change's output
 /// and refusal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct Room {

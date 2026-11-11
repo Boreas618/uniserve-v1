@@ -5,7 +5,7 @@
 //! encoding and muxing, host task pools, tracked by the media occupancy
 //! ([`Occupancy`]); `plan_media_call` builds one call with its products,
 //! buffer bindings, latent pages and reading components, and
-//! `assemble_batch` plans a media call of the step's plan onto the batch of its
+//! `assemble_batch` schedules a media call of the step's output onto the batch of its
 //! phase and component.
 
 use super::*;

@@ -215,7 +215,7 @@ struct PoolInner {
     borrowed: Vec<std::ops::Range<u32>>,
     /// The units this epoch lent its successor at its park
     /// (`BlockPool::lend`), which the successor may write: never queued or
-    /// allocated until the epoch takes them back (`BlockPool::reclaim`).
+    /// allocated until the epoch takes them back (`BlockPool::take_back`).
     lent: Vec<std::ops::Range<u32>>,
 }
 
@@ -593,7 +593,7 @@ impl BlockPool {
         }
         inner.withdrawn = end;
         for unit in from..end {
-            // A lent unit waits for its reclaim, wherever it lies.
+            // A lent unit waits to be taken back, wherever it lies.
             if inner.meta[unit as usize].ref_cnt > 0
                 || inner.lent.iter().any(|lent| lent.contains(&unit))
             {
@@ -684,7 +684,7 @@ impl BlockPool {
     /// Lends the units `ranges` to the epoch that succeeds this one, at the
     /// park: the successor may write them, so the pool forgets the pages
     /// they hold and allocates none of them until it takes them back
-    /// ([`Self::reclaim`]). Returns how many pages it forgot.
+    /// ([`Self::take_back`]). Returns how many pages it forgot.
     pub(crate) fn lend(&self, ranges: &[std::ops::Range<u32>]) -> usize {
         let mut inner = lock(&self.inner);
         let mut heads = Vec::new();
@@ -712,20 +712,20 @@ impl BlockPool {
     /// Takes back the units lent to the successor epoch ([`Self::lend`]),
     /// whose processes are gone: they return to allocation holding no page.
     /// Returns how many units it took back.
-    pub(crate) fn reclaim(&self) -> u32 {
+    pub(crate) fn take_back(&self) -> u32 {
         let mut inner = lock(&self.inner);
         let lent = std::mem::take(&mut inner.lent);
-        let mut reclaimed = 0;
+        let mut taken_back = 0;
         for unit in lent.into_iter().flatten() {
             let meta = &inner.meta[unit as usize];
             if meta.ref_cnt > 0 || meta.in_fq || unit >= inner.withdrawn {
                 continue;
             }
             inner.fq_push_back(unit);
-            reclaimed += 1;
+            taken_back += 1;
         }
         inner.recount();
-        reclaimed
+        taken_back
     }
 
     /// The published pages whose units the pool holds (none withdrawn), as
@@ -3105,7 +3105,7 @@ mod tests {
         Arc::new(ipc::MainProcessInfo::default().endpoint)
     }
 
-    /// A page the host was offered holds its key from then on, so a plan that names it again
+    /// A page the host was offered holds its key from then on, so a dispatch output that names it again
     /// takes nothing: taking it would pin it out of the free queue at every step.
     #[test]
     fn a_page_offered_to_the_host_is_not_offered_again() {
@@ -4416,7 +4416,7 @@ mod tests {
         assert!(pages.iter().all(|page| page.units()[0].0 < 8));
         assert!(pool.allocate(1, 1).is_none());
 
-        assert_eq!(pool.reclaim(), 8);
+        assert_eq!(pool.take_back(), 8);
         assert!(pool.lent().is_empty());
         assert_eq!(pool.free_units(), 8);
         assert_eq!(pool.usable_units(), 15);

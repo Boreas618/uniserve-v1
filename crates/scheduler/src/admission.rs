@@ -24,7 +24,7 @@ use super::*;
 use crate::kv_cache::{KvOffloadManager, PrefixScope};
 use crate::request::Request;
 use ipc::ForwardMode;
-use scheduling::guest::Plan;
+use scheduling::guest::DispatchOutput;
 use std::ops::ControlFlow;
 
 /// One product a video request reserves: its declared name, the component
@@ -912,16 +912,16 @@ impl Scheduler {
     /// waits: a token request for a slot, for the units of its first prefill
     /// chunk beyond its cached prefix, or for a ready prefill worker; a
     /// video request for its route and its output buffers.
-    pub(super) fn admit(&mut self, plan: &Plan) {
+    pub(super) fn admit(&mut self, output: &DispatchOutput) {
         // A closing scheduler admits nothing more, nor does one that sleeps.
         if self.draining || self.admission_sleeps() {
             return;
         }
-        for id in &plan.reject {
+        for id in &output.reject {
             self.reject_waiting(ipc::RequestId(id.0));
         }
         let named: HashSet<ipc::RequestId> =
-            plan.admit.iter().map(|id| ipc::RequestId(id.0)).collect();
+            output.admit.iter().map(|id| ipc::RequestId(id.0)).collect();
         self.waiting
             .make_contiguous()
             .sort_by_key(|id| !named.contains(id));
@@ -1547,7 +1547,7 @@ pub(super) enum HostHit {
 /// Starts the host KV cache looking for the pages a request can reuse beyond
 /// the device hit it already has, up to `limit` tokens of its prompt.
 ///
-/// Admission asks for the boundary it needs; a plan's `prefetch` asks again
+/// Admission asks for the boundary it needs; a dispatch output's `prefetch` asks again
 /// later, and the answer grows as host pages arrive. Reusable pages leave one
 /// prompt token to compute, as in the device cache.
 pub(super) fn host_prefix(

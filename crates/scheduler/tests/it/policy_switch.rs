@@ -29,9 +29,9 @@ use crate::support::toy::{Toy, toy_module};
 const ANSWER: Duration = Duration::from_secs(30);
 
 /// A toy policy program: limits that fit what the fake's pool was started
-/// for, and an empty plan.
+/// for, and an empty output.
 ///
-/// An empty plan asks for nothing, so a scheduler that serves under the toy
+/// An empty output asks for nothing, so a scheduler that serves under the toy
 /// makes no decision this test has to arrange state for; what the test reads is
 /// which program the scheduler serves, from the commands' answers.
 fn toy() -> Vec<u8> {
@@ -510,7 +510,7 @@ fn a_candidate_whose_decision_is_invalid_fails_the_precopy() {
     let epoch = Epoch::start();
     let admits_nobody = toy_module(&Toy {
         limits: fitting(),
-        plan: scheduling::guest::decision::Plan {
+        output: scheduling::guest::decision::DispatchOutput {
             admit: vec![scheduling::guest::ids::RequestId(999)],
             ..Default::default()
         },

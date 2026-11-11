@@ -61,7 +61,7 @@ pub enum Event {
     Updated { request: RequestView },
     /// A call of the request advanced: its phase ran and produced `tokens`
     /// tokens (or latent units, for a media phase). One event per completed
-    /// piece of work the policy put in a `Plan`.
+    /// piece of work the policy put in a `DispatchOutput`.
     Advanced {
         request: RequestId,
         phase: PhaseId,

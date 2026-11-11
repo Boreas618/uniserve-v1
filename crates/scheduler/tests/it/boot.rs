@@ -45,7 +45,7 @@ fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result
 fn launch() -> (proto::config::EngineArgs, SchedulerConfig) {
     let mut args = testkit::args("boot-model");
     args.engine_config.max_running_requests = std::num::NonZeroUsize::new(4).expect("positive");
-    // The budgets the pool below is built for, stated rather than left to a default: a plan may
+    // The budgets the pool below is built for, stated rather than left to a default: a dispatch output may
     // not exceed what the epoch was built for, so a budget tighter than the pool's would refuse
     // the very batch a request needs and read as "the policy served nothing".
     let limits = SchedulerConfig::of(&args.engine_config, 16, 512, vec![1, 8]);
@@ -188,7 +188,7 @@ fn the_serving_warmup_waits_for_admission_to_open() {
     install(&handle, &serving);
     // The policy serves and could form a batch from here on; the device's captures are still
     // running, so nothing may reach it. A warm-up started by the policy would have submitted its
-    // prefill by now: the scheduler plans a queued request at its next step.
+    // prefill by now: the scheduler schedules a queued request at its next step.
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         serving.submitted().is_empty(),

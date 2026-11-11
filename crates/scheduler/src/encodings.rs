@@ -132,7 +132,7 @@ impl Scheduler {
     /// Whether request `id`'s `encoding` may be planned now: its lookup in
     /// the host encoder pools resolved, or it has none. Starts the lookup
     /// when the request has not looked the encoding up yet, ending the
-    /// lookup of an encoding it no longer plans. The encoding is looked up
+    /// lookup of an encoding it no longer schedules. The encoding is looked up
     /// on the replica its call will run on, to which the request is bound
     /// now, when the pools serve its output there and the request's cache
     /// policy reads or writes cached outputs (`CachePolicy`); while that

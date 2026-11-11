@@ -44,8 +44,8 @@ pub(super) struct PendingResize {
 /// What a pending change does once its units are let go.
 enum Pending {
     /// The workers give back the segments from this one on; the change
-    /// answers with the plan of each device it made room on.
-    Room { from: u32, plan: Vec<String> },
+    /// answers with the output of each device it made room on.
+    Room { from: u32, output: Vec<String> },
     /// The workers sleep, once no request runs.
     Sleep,
     /// The workers rewrite the weights from the checkpoint at this path,
@@ -83,12 +83,12 @@ impl Scheduler {
         }
         let started = match change {
             CacheChange::MakeRoom { bytes, devices } => {
-                self.start_room(bytes, &devices).map(|(from, plan)| {
+                self.start_room(bytes, &devices).map(|(from, output)| {
                     from.map(|from| Pending::Room {
                         from,
-                        plan: plan.clone(),
+                        output: output.clone(),
                     })
-                    .ok_or(plan)
+                    .ok_or(output)
                 })
             }
             CacheChange::Sleep => Ok(self.start_sleep().ok_or_else(Vec::new)),
@@ -118,9 +118,9 @@ impl Scheduler {
                 });
                 self.poll_resize();
             }
-            // Nothing to give back: the change is done, with its plan.
-            Ok(Err(plan)) => {
-                let _ = answer.send(Ok(plan));
+            // Nothing to give back: the change is done, with its output.
+            Ok(Err(output)) => {
+                let _ = answer.send(Ok(output));
             }
             Err(error) => {
                 let _ = answer.send(Err(error));
@@ -246,7 +246,7 @@ impl Scheduler {
                         );
                     })
             }
-            Pending::Room { from, plan } => self
+            Pending::Room { from, output } => self
                 .run_operation(ipc::memory::ReleaseCache { from })
                 .map(|_| {
                     tracing::info!(
@@ -254,7 +254,7 @@ impl Scheduler {
                         units = self.storage.usable_units(),
                         "gave back the tail of the KV cache"
                     );
-                    plan
+                    output
                 }),
             Pending::Weights(path) => self.apply_weights(&path),
         };
@@ -443,7 +443,7 @@ impl Scheduler {
     /// books ([`room`]); the requests holding it run on. Returns the first
     /// segment to give back, `None` when every device has the room already
     /// (or the cache is not split into segments, which gives back nothing),
-    /// and each device's plan.
+    /// and each device's output.
     ///
     /// Fails, withdrawing nothing, when even the segments the cache cannot
     /// give back leave a device too little room: the error names every
@@ -490,17 +490,17 @@ impl Scheduler {
         if rooms.iter().any(|room| !room.feasible) {
             return Err(room_refusal(&rooms));
         }
-        let plans = rooms
+        let schedules = rooms
             .iter()
             .map(|room| serde_json::to_string(room).unwrap_or_default())
             .collect();
         if keep >= held {
-            return Ok((None, plans));
+            return Ok((None, schedules));
         }
         let unit = reports[0].first_unit(keep);
         self.offload_idle_from(unit);
         self.withdraw_from(unit, false);
-        Ok((Some(keep), plans))
+        Ok((Some(keep), schedules))
     }
 
     /// Holds every idle cached page a withdrawal from `unit` evicts and has
@@ -520,7 +520,7 @@ impl Scheduler {
 
     /// Offloads exactly the pages a policy named, by their device units.
     ///
-    /// A plan's `offload` list names units, not a range: asking the pool for
+    /// A dispatch output's `offload` list names units, not a range: asking the pool for
     /// everything idle from the first unit on would move pages the policy
     /// judged worth keeping.
     pub(super) fn offload_units(&mut self, units: &[u32]) -> usize {

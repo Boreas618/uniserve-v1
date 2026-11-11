@@ -1165,7 +1165,7 @@ impl Scheduler {
         }
 
         // Releasing the request's encoder pins may make cache products
-        // physically reclaimable by their owning worker.
+        // physically releasable by their owning worker.
         let mut free_encoder_products = std::mem::take(&mut st.transient_encoder_products);
         for pin in &st.encoder_cache_pins {
             if let Some(product) = self.storage.encoder_cache.release(pin.key, &pin.product) {

@@ -2,9 +2,9 @@
 //! call needs.
 //!
 //! A running request that could not get the units of its next call is
-//! starved ([`Scheduler::note_starved`]). The step's reclaim relieves it:
+//! starved ([`Scheduler::note_starved`]). The step's preemption relieves it:
 //! the policy names a victim that gives its units up and is recomputed
-//! (`Scheduler::reclaim_shortage`). Two states remain that the reclaim
+//! (`Scheduler::preempt_shortage`). Two states remain that the preemption
 //! does not reach, and this module ends them: a request whose sequence
 //! outgrew the whole cache ends with the cache-capacity finish
 //! ([`Scheduler::finish_outgrown`]), and when every running request starves
@@ -16,8 +16,8 @@ use crate::*;
 
 impl Scheduler {
     /// Notes that the running request `id` could not get the `needed` units
-    /// its next call needs, for the next step's reclaim
-    /// (`Scheduler::reclaim_shortage`), [`Self::recompute_starved`] and,
+    /// its next call needs, for the next step's preemption
+    /// (`Scheduler::preempt_shortage`), [`Self::recompute_starved`] and,
     /// while the tail is given back, [`Self::note_stuck_holder`].
     pub(crate) fn note_starved(&mut self, id: RequestId, needed: usize) {
         match self.starved.iter_mut().find(|(starved, _)| *starved == id) {
@@ -78,9 +78,9 @@ impl Scheduler {
     /// giving up its own units, and is not recomputed: one the cache cannot
     /// hold ends at its length ([`Self::finish_outgrown`]).
     ///
-    /// The step's reclaim is where a starved request is relieved: the policy
-    /// names the victim (`Scheduler::reclaim_shortage`). This breaks the one
-    /// state that reclaim would not reach, a policy that names no request.
+    /// The step's preemption is where a starved request is relieved: the policy
+    /// names the victim (`Scheduler::preempt_shortage`). This breaks the one
+    /// state that preemption would not reach, a policy that names no request.
     pub(crate) fn recompute_starved(&mut self, submitted: bool) {
         self.finish_outgrown();
         if self.starved.is_empty()

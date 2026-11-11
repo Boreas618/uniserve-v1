@@ -24,7 +24,7 @@
 //! message the export expects, which the mechanism reports as a malformed
 //! reply of that call.
 
-use crate::decision::{Plan, Room, Shortage, Victim};
+use crate::decision::{DispatchOutput, Room, Shortage, Victim};
 use crate::event::Event;
 use crate::limits::Limits;
 use crate::policy::Instantiation;
@@ -158,18 +158,18 @@ macro_rules! export_policy {
             // SAFETY: the mechanism's message buffer lives for this call.
             let bytes = unsafe { $crate::abi::message(ptr, len) };
             let room: $crate::Room = $crate::abi::room_message(bytes);
-            let plan: $crate::Plan =
+            let output: $crate::DispatchOutput =
                 policy(|policy| <$policy as $crate::Policy>::dispatch(policy, &room));
-            $crate::abi::dispatch_reply(&plan)
+            $crate::abi::dispatch_reply(&output)
         }
 
         #[unsafe(no_mangle)]
-        extern "C" fn sched_reclaim(ptr: u32, len: u32) -> u64 {
+        extern "C" fn sched_preempt(ptr: u32, len: u32) -> u64 {
             // SAFETY: the mechanism's message buffer lives for this call.
             let bytes = unsafe { $crate::abi::message(ptr, len) };
             let shortage: $crate::Shortage = $crate::abi::shortage_message(bytes);
             let victims: ::std::vec::Vec<$crate::Victim> =
-                policy(|policy| <$policy as $crate::Policy>::reclaim(policy, &shortage));
+                policy(|policy| <$policy as $crate::Policy>::preempt(policy, &shortage));
             $crate::abi::victims_reply(&victims)
         }
 
@@ -217,9 +217,9 @@ pub fn room_message(bytes: &[u8]) -> Room {
     read(bytes, "dispatch")
 }
 
-/// Decodes the message of `sched_reclaim`.
+/// Decodes the message of `sched_preempt`.
 pub fn shortage_message(bytes: &[u8]) -> Shortage {
-    read(bytes, "reclaim")
+    read(bytes, "preempt")
 }
 
 /// Decodes the message of `sched_route`, a `(RequestView, [RankView])` tuple
@@ -234,13 +234,13 @@ pub fn place_message(bytes: &[u8]) -> (CallView, Vec<ReplicaView>) {
 }
 
 /// Encodes the reply of `sched_dispatch`.
-pub fn dispatch_reply(plan: &Plan) -> u64 {
-    reply(plan, "dispatch")
+pub fn dispatch_reply(output: &DispatchOutput) -> u64 {
+    reply(output, "dispatch")
 }
 
-/// Encodes the reply of `sched_reclaim`.
+/// Encodes the reply of `sched_preempt`.
 pub fn victims_reply(victims: &[Victim]) -> u64 {
-    reply(&victims, "reclaim")
+    reply(&victims, "preempt")
 }
 
 /// Encodes the reply of `sched_limits`.

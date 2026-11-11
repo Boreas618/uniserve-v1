@@ -189,7 +189,7 @@ fn a_request_is_served_through_the_workers_own_batch_path() {
 /// request that does not fit one waits, and is admitted when a slot frees.
 ///
 /// §4.4's dispatch row puts the error on *work* put into the step, and gives
-/// `admit` the other rule in the same row: the mechanism admits in the plan's
+/// `admit` the other rule in the same row: the mechanism admits in the output's
 /// order, and the first request it cannot place, and those after it, stay
 /// queued. `fcfs` names every queued request, so a refusal here would stop every
 /// epoch that queues more than it can run at once; a stop serves them in turn.
@@ -294,7 +294,7 @@ fn a_policy_stage_applies_after_a_request_ended() {
 /// A policy's state is append-only: it learns a request from its arrival and
 /// nothing else about it unless the mechanism states it. A request that is
 /// admitted and never restated is one whose phase the policy never learns, so
-/// no policy — `fcfs` included — can plan the work that would prefilled it, and
+/// no policy — `fcfs` included — can schedule the work that would prefilled it, and
 /// the epoch dispatches nothing while requests queue behind it. This case
 /// states the mechanism's half: one text request, the real `fcfs` program, and
 /// a batch handed to the worker with no other help.

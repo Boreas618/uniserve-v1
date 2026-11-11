@@ -5,7 +5,7 @@
 //!
 //! This is the generation path: token requests in `running`.
 //! `Scheduler::schedule_batches` alternates it with the video media path.
-//! A pass plans each request's next call from its accepted state plus the
+//! A pass schedules each request's next call from its accepted state plus the
 //! calls still in flight (`scheduled_token_lengths`), so a successor can be
 //! planned before its predecessor resolves. Each planned call then reserves its storage, is
 //! registered as in flight, and joins the pass's batch for its phase and
@@ -15,7 +15,7 @@
 //! Token calls and media calls are planned in the same pass: a token call by
 //! the next-call planner, a media call of a video request by
 //! `plan_media_call`, which owns that flow's numerical extent, decoder ranges,
-//! and worker admission. The plan names both, so one policy decides the whole
+//! and worker admission. The output names both, so one policy decides the whole
 //! step.
 //!
 //! A pass's prefill calls, and likewise its decode calls, travel as one
@@ -27,13 +27,13 @@
 
 mod call;
 pub(crate) mod columns;
-pub(crate) mod plan;
+pub(crate) mod next;
 mod slots;
 
 use super::*;
 use crate::views;
 use ipc::{ForwardMode, MediaCall};
-use scheduling::guest::{PhaseId, PhaseKind, Plan};
+use scheduling::guest::{DispatchOutput, PhaseId, PhaseKind};
 
 /// Forward rows a pass may still add to its numerical calls, within the rows
 /// a worker stages per call: canvas rows across its token-denoising calls,
@@ -51,27 +51,28 @@ fn decode_capacity_target(pos: usize, spec_len: usize) -> usize {
 }
 
 impl Scheduler {
-    /// Executes one step's plan (design §4.4).
+    /// Executes one step's output (design §4.4).
     ///
-    /// The plan's work, in the policy's order, becomes this step's calls: the
-    /// order of the work list is the decision, and the mechanism plans each
+    /// The output's work, in the policy's order, becomes this step's calls: the
+    /// order of the work list is the decision, and the mechanism schedules each
     /// named phase of the named request, clipping it to its own hard limits
     /// (the pass's rows, the request's storage, the transfer capacity). A
-    /// request the plan refills gets a refill chunk after the planned work,
+    /// request the output refills gets a refill chunk after the planned work,
     /// which is a prefill call that writes the draft cache.
     ///
     /// A request whose call does not fit this step keeps nothing: the work that
-    /// does not fit waits for the next step, as a plan over the free storage
+    /// does not fit waits for the next step, as a dispatch output over the free storage
     /// does.
-    pub(super) fn assemble_plan(&mut self, plan: &Plan) -> Vec<ExecutionBatch> {
+    pub(super) fn assemble_output(&mut self, output: &DispatchOutput) -> Vec<ExecutionBatch> {
         let refill = views::phase_id(PhaseKind::Refill);
-        let mut work: Vec<(RequestId, PhaseId, Option<u32>)> = plan
+        let mut work: Vec<(RequestId, PhaseId, Option<u32>)> = output
             .work
             .iter()
             .map(|work| (RequestId(work.request.0), work.phase, Some(work.tokens)))
             .collect();
         work.extend(
-            plan.refill
+            output
+                .refill
                 .iter()
                 .map(|request| (RequestId(request.0), refill, None)),
         );
@@ -172,9 +173,9 @@ impl Scheduler {
     }
 
     /// Selects compatible call kinds within the step's token and sequence
-    /// budgets, in the plan's order.
+    /// budgets, in the output's order.
     ///
-    /// Walks the plan's work until `max_batch` calls are selected or the token
+    /// Walks the output's work until `max_batch` calls are selected or the token
     /// budget is spent. Every selected call is registered in flight before this
     /// returns. A failed call preparation returns no batches; most such
     /// failures latch engine-fatal first.
@@ -184,7 +185,7 @@ impl Scheduler {
     ) -> Vec<ExecutionBatch> {
         // One batch per (phase, component): a batch is one numerical call of one
         // phase on one component, so a rank receives a homogeneous group and
-        // the worker's phase column names it exactly. The plan's order is the
+        // the worker's phase column names it exactly. The output's order is the
         // order the first call of each pair was selected in.
         let mut kind_order: Vec<(PhaseId, String)> = Vec::new();
         // Each batch beside its calls' device layouts, index for index with
@@ -331,7 +332,7 @@ impl Scheduler {
             }
             // Build one call when its exact resident resources fit. A prefill
             // chunk draws on the prefill budget a warming epoch bounds, and its
-            // size is the plan's: the mechanism clips it only to what is left.
+            // size is the output's: the mechanism clips it only to what is left.
             let writes_prefix = batch_kind(kind) == BatchKind::Prefill;
             let mut call_budget = if writes_prefix {
                 budget.min(prefill_budget)
@@ -351,8 +352,8 @@ impl Scheduler {
             };
             if let Some(mut call) = planned {
                 if call.kind != kind {
-                    // The request's state moved past the phase the plan named:
-                    // the plan is executed as far as the state allows.
+                    // The request's state moved past the phase the output named:
+                    // the output is executed as far as the state allows.
                     continue;
                 }
                 // A generation request's own encoder call — an input image's
@@ -370,7 +371,7 @@ impl Scheduler {
                     }
                     occupancy.occupy(&demand, id);
                 }
-                // A context prefill plans within the pass's context rows;
+                // A context prefill schedules within the pass's context rows;
                 // otherwise it waits for a later pass, as a call without
                 // resources does below.
                 let prefill = call.kind == CallKind::Forward(ForwardMode::Prefill);
@@ -382,7 +383,7 @@ impl Scheduler {
                     }
                     continue;
                 }
-                let planned_us = crate::clock::now_monotonic_us();
+                let scheduled_us = crate::clock::now_monotonic_us();
 
                 // Only a call that obtains its storage is charged to the
                 // pass. A call that cannot run now leaves the budget to later
@@ -392,7 +393,7 @@ impl Scheduler {
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
                     self.record_domain_backpressure(call.kind);
                     // Planning a forward advanced `num_cache_units_sent` past its
-                    // fresh units; roll it back so the next plan declares them.
+                    // fresh units; roll it back so the next output declares them.
                     if let Some(state) = self.requests.tokens_mut(&id) {
                         state.num_cache_units_sent = state
                             .num_cache_units_sent
@@ -504,7 +505,7 @@ impl Scheduler {
                     call,
                     reserved_buffers,
                     admitted,
-                    planned_us,
+                    scheduled_us,
                     batch,
                     layouts,
                 );
@@ -860,7 +861,7 @@ impl Scheduler {
     /// Stamps a media batch with its computation and the facts the mechanism states per request
     /// (2.4, 4.5).
     ///
-    /// The call kind is the plan's - the phases this pass selected - and the extent is the
+    /// The call kind is the output's - the phases this pass selected - and the extent is the
     /// worker's own answer: `Batches::media` names the bucket its runner planned the computation
     /// into, and a batch captured for one canvas serves no other, so the mechanism asks instead of
     /// deriving. A computation the worker states no bucket for, or a request whose state this

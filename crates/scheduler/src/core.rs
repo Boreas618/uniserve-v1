@@ -424,7 +424,7 @@ impl SchedulerHandle {
     ///
     /// The caller is the owner of admission and calls this when it opens
     /// admission: the warm-up's requests are ordinary requests, so the
-    /// scheduler plans them into the device's captured buckets, and they may
+    /// scheduler schedules them into the device's captured buckets, and they may
     /// only reach it once every bucket a batch can replay has been captured -
     /// the same rule client requests are admitted under. A scheduler with no
     /// policy forms no batch, so admission also implies a serving policy.
@@ -767,10 +767,10 @@ impl SchedulerHandle {
     }
 
     /// Resumes a parked scheduler; the receiver gets whether it did. When
-    /// it `reclaim`s, the epoch it lent cache units to writes none of them
+    /// it takes them back, the epoch it lent cache units to writes none of them
     /// any more, and it takes them back.
-    pub fn resume(&self, reclaim: bool) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.resume(reclaim)
+    pub fn resume(&self, take_back: bool) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.resume(take_back)
     }
 
     /// Commits the scheduler's epoch, which succeeded another: its workers

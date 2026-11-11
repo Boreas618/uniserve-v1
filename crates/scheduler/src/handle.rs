@@ -576,9 +576,9 @@ pub enum Command {
         answer: crossbeam_channel::Sender<Result<crate::ParkedCache, String>>,
     },
     /// Resumes a parked scheduler, taking back the cache units it lent when
-    /// it `reclaim`s them, and answers whether it did.
+    /// it takes them back, and answers whether it did.
     Resume {
-        reclaim: bool,
+        take_back: bool,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Promotes a successor scheduler (`Scheduler::promote`): imports its
@@ -945,11 +945,11 @@ impl CommandSender {
     }
 
     /// Resumes a parked scheduler (`Command::Resume`), taking back the
-    /// cache units it lent when it `reclaim`s them; the receiver gets
+    /// cache units it lent when it takes them back; the receiver gets
     /// whether it did.
-    pub fn resume(&self, reclaim: bool) -> crossbeam_channel::Receiver<Result<(), String>> {
+    pub fn resume(&self, take_back: bool) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, resumed) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Resume { reclaim, answer });
+        let _ = self.send(Command::Resume { take_back, answer });
         resumed
     }
 

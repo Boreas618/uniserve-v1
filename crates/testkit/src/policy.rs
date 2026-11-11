@@ -1,7 +1,7 @@
 //! The policy source a test epoch installs.
 //!
 //! A deployed epoch takes its policy from the Program Server; a test epoch has none, and a
-//! scheduler with no policy decides nothing — no plan, no admission, no batch — so an epoch that
+//! scheduler with no policy decides nothing — no output, no admission, no batch — so an epoch that
 //! submits a request must be given a module. [`packaged_policy`] is that source: the real `fcfs`
 //! program this tree builds, with the arguments that make its declared limits fit the capacity the
 //! caller's epoch was built for. It installs through the same precopy and switchover a deployment

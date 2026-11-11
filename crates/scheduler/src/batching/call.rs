@@ -26,7 +26,7 @@ impl Scheduler {
         mut call: Call,
         reserved_buffers: Vec<BufferSpan>,
         admitted: bool,
-        planned_us: u64,
+        scheduled_us: u64,
         batch: &mut ExecutionBatch,
         layouts: &mut Vec<columns::CallLayout>,
     ) -> Option<()> {
@@ -383,7 +383,7 @@ impl Scheduler {
         self.register_inflight(
             call.clone(),
             InflightInput::Generation { image_cache },
-            submitted_us.saturating_sub(planned_us),
+            submitted_us.saturating_sub(scheduled_us),
         );
         // The runtime's buffer pool is one address space, so every rank of
         // the worker holds each span at the same offset.
@@ -475,7 +475,7 @@ impl Scheduler {
     /// first ([`Self::release_drafts`]).
     ///
     /// A refusal states the units the growth needed, one when the tables do
-    /// not say: what a reclaim must free for the request to go on.
+    /// not say: what a preemption must free for the request to go on.
     fn grow_request_tables(
         &mut self,
         id: RequestId,

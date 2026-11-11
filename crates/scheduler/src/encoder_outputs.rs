@@ -35,7 +35,7 @@
 //!   cache policy reads no cached output starts at the reservation, and one
 //!   that writes none computes a missing output without storing it.
 //!
-//! The scheduler plans an output's encoder calls only once its lookup
+//! The scheduler schedules an output's encoder calls only once its lookup
 //! resolved, so all of them import, or all compute. Like the host latent
 //! pools, the store connects as a head of its engine's epoch, so what an
 //! epoch on trial stores stays its own until its commit, and requests to the

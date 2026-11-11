@@ -29,7 +29,7 @@ use super::*;
 use crate::request::Request;
 use ipc::BufferId;
 use scheduling::PolicyError;
-use scheduling::guest::{Plan, Room};
+use scheduling::guest::{DispatchOutput, Room};
 
 pub(super) use media::Occupancy;
 
@@ -336,7 +336,7 @@ impl Scheduler {
                     self.inflight
                         .retire_call(batch.id, call.request_key, call.call_id)
                 {
-                    self.reclaim_domain_credit(pending.call.kind, true);
+                    self.return_domain_credit(pending.call.kind, true);
                 }
             }
             if let Some(pending) = self.inflight.pending_batches.get_mut(&batch.id) {
@@ -587,7 +587,7 @@ impl Scheduler {
     /// Executes one step of the policy (§4.4).
     ///
     /// The step is the mechanism's whole scheduling act: observe the events
-    /// since the previous step, ask for one plan on the room the mechanism has,
+    /// since the previous step, ask for one output on the room the mechanism has,
     /// validate it against the live state, and execute it. A decision the
     /// validators reject, a trap, or a starved request is a policy failure: the
     /// switch serves on under the previous policy, or the epoch stops.
@@ -598,20 +598,20 @@ impl Scheduler {
             return Vec::new();
         }
         let started = std::time::Instant::now();
-        let Some(plan) = self.policy_step() else {
+        let Some(output) = self.policy_step() else {
             return Vec::new();
         };
-        // What the policy gives up comes first: the plan was decided on the
+        // What the policy gives up comes first: the output was decided on the
         // state it saw, and freeing a victim makes room for the step's calls.
-        // The plan's own page decisions then run, so a prefetch's pins are in
+        // The output's own page decisions then run, so a prefetch's pins are in
         // flight by the time the calls are built.
-        self.reclaim_shortage();
+        self.preempt_shortage();
         // The assembly below notes the requests it cannot grow afresh, for the
-        // next step's admission and reclaim.
+        // next step's admission and preemption.
         self.starved.clear();
-        self.execute_plan_pages(&plan);
-        let batches = self.assemble_plan(&plan);
-        self.log_step(&plan, &batches);
+        self.execute_page_work(&output);
+        let batches = self.assemble_output(&output);
+        self.log_step(&output, &batches);
         self.end_step(started.elapsed());
         batches
     }
@@ -622,7 +622,7 @@ impl Scheduler {
     /// The mechanism decides that there is a shortage and owns every cache; the
     /// policy decides what to give up. A victim list that does not validate is
     /// a policy failure, like any other invalid decision.
-    fn reclaim_shortage(&mut self) {
+    fn preempt_shortage(&mut self) {
         // A request no victim could let grow is no shortage a policy can
         // relieve: it ends at the length the cache holds.
         self.finish_outgrown();
@@ -632,7 +632,7 @@ impl Scheduler {
         let Some(mut policy) = self.policy.take() else {
             return;
         };
-        let victims = match policy.reclaim(&shortage) {
+        let victims = match policy.preempt(&shortage) {
             Ok(victims) => victims,
             Err(error) => {
                 let _ = self.policy_failed(policy, error);
@@ -711,16 +711,16 @@ impl Scheduler {
         }
     }
 
-    /// Executes the page half of a validated plan (§4.4).
+    /// Executes the page half of a validated output (§4.4).
     ///
     /// The policy names pages to hand to the host KV cache and requests whose
     /// host hit should deepen; the mechanism owns the caches and moves exactly
     /// what it named, after validating that every name is a live, unreferenced
     /// device page. A move that the host cache cannot take leaves the pages
-    /// where they are: the plan asked, the limit refused, and no request is at
+    /// where they are: the output asked, the limit refused, and no request is at
     /// fault.
-    fn execute_plan_pages(&mut self, plan: &Plan) {
-        let units: Vec<u32> = plan
+    fn execute_page_work(&mut self, output: &DispatchOutput) {
+        let units: Vec<u32> = output
             .offload
             .iter()
             .filter_map(|page| views::unit_of(*page))
@@ -738,11 +738,11 @@ impl Scheduler {
                 tracing::debug!(
                     asked = units.len(),
                     moved,
-                    "the host KV cache took fewer pages than the plan offered"
+                    "the host KV cache took fewer pages than the output offered"
                 );
             }
         }
-        for request in &plan.prefetch {
+        for request in &output.prefetch {
             self.prefetch_host(ipc::RequestId(request.0));
         }
     }
@@ -753,7 +753,7 @@ impl Scheduler {
     /// beyond it: asking again after host pages arrive raises the boundary,
     /// and the answer is recorded so the next dispatch sees what the request
     /// can reuse. A request the mechanism cannot place, or whose host lookup
-    /// is still in flight, keeps what it had: the plan asked, the cache is not
+    /// is still in flight, keeps what it had: the output asked, the cache is not
     /// ready, and no request is at fault.
     fn prefetch_host(&mut self, id: ipc::RequestId) {
         // §4.4: the mechanism deepens a prefix hit only by at least the floor
@@ -788,14 +788,14 @@ impl Scheduler {
         }
     }
 
-    /// One step's plan: observe, dispatch, validate (§4.4).
+    /// One step's output: observe, dispatch, validate (§4.4).
     ///
     /// Nothing decides before the policy is installed: an epoch waits for its
     /// first `Switchover` (§7.3), and a scheduler with no slot schedules
     /// nothing. The slot is taken out of the scheduler for the calls and put
     /// back whatever they answer, so a failure can hand the mechanism's state
     /// to the switch without borrowing the scheduler the slot lives in.
-    fn policy_step(&mut self) -> Option<Plan> {
+    fn policy_step(&mut self) -> Option<DispatchOutput> {
         let mut policy = self.policy.take()?;
         self.step += 1;
         // The kernels this step's batches serve on, read once: a switchover
@@ -805,19 +805,19 @@ impl Scheduler {
         self.step_generation = generation;
         // The pages that appeared and went since the previous step, then
         // everything else that changed, in the order it happened, closed before
-        // this step's dispatch. The room, the live state, and the plan's checks
+        // this step's dispatch. The room, the live state, and the output's checks
         // are all read after it: a page announced now is a page this step's
-        // plan may name, so the validators must already see it.
+        // output may name, so the validators must already see it.
         self.pump_page_changes();
         // The requests whose view moved since the previous step are stated to
         // the policy here, as `Updated` events: a policy's state is
         // append-only, so a phase it is never told about is a phase it does not
         // have, and an admitted request it never hears of again is one it can
-        // never plan work for.
+        // never schedule work for.
         let _ = self.refresh_views();
         // The policy's knowledge and the mechanism's own must be the same: a
         // request the mechanism holds and the policy never heard of is one it
-        // cannot plan work for, and a request the policy still holds after the
+        // cannot schedule work for, and a request the policy still holds after the
         // mechanism ended it is one it offers in `admit` and the mechanism
         // refuses as "not queued" - a policy failure, which stops the epoch.
         #[cfg(debug_assertions)]
@@ -868,30 +868,30 @@ impl Scheduler {
         if let Err(error) = policy.observe(&events) {
             return self.policy_failed(policy, error);
         }
-        let plan = match policy.dispatch(&room) {
-            Ok(plan) => plan,
+        let output = match policy.dispatch(&room) {
+            Ok(output) => output,
             Err(error) => return self.policy_failed(policy, error),
         };
-        // The admission the plan states is checked against the queue the policy
-        // was given, and applied before the rest of the plan is checked: a
-        // request the plan admits is resident for the work the same plan gives
-        // it, which is what lets one plan both admit and run a request (§4.4).
+        // The admission the output states is checked against the queue the policy
+        // was given, and applied before the rest of the output is checked: a
+        // request the output admits is resident for the work the same output gives
+        // it, which is what lets one output both admit and run a request (§4.4).
         // Applying it first would make its own names unqueued.
         let live = self.live();
-        if let Err(error) = mechanism::validate_admission(&plan, &live) {
+        if let Err(error) = mechanism::validate_admission(&output, &live) {
             return self.policy_failed(policy, error);
         }
-        self.admit(&plan);
+        self.admit(&output);
         // The rest is read against the state admission has left: the admitted
         // requests' views moved, and the pages are the scheduler's own table
         // borrowed for the check (design §4.4).
         let _ = self.refresh_views();
         let live = self.live();
-        if let Err(error) = mechanism::validate_after_admission(&plan, &room, &live) {
+        if let Err(error) = mechanism::validate_after_admission(&output, &room, &live) {
             return self.policy_failed(policy, error);
         }
         self.policy = Some(policy);
-        Some(plan)
+        Some(output)
     }
 
     /// Asserts that the policy knows exactly the requests the mechanism holds.
@@ -928,7 +928,7 @@ impl Scheduler {
         for id in held.difference(&told) {
             debug_assert!(
                 false,
-                "the policy was never told of request {}: the mechanism holds it, so nothing can                          plan its work",
+                "the policy was never told of request {}: the mechanism holds it, so nothing can                          output its work",
                 id.0
             );
         }
@@ -991,7 +991,7 @@ impl Scheduler {
         &mut self,
         mut policy: policy::PolicySlot,
         error: PolicyError,
-    ) -> Option<Plan> {
+    ) -> Option<DispatchOutput> {
         let state = self.trial_state();
         match policy.fail(&error, &state) {
             Ok(report) => {
@@ -1029,10 +1029,10 @@ impl Scheduler {
     ///
     /// A step that serves nothing is the interesting one - a starvation is
     /// otherwise unfalsifiable - so the line names what was resident, what the
-    /// plan asked for, and how much of it became calls. The rows' classes are
+    /// output asked for, and how much of it became calls. The rows' classes are
     /// the calls' own kinds, which is what a refusal is about (a mixed phase or
     /// a mixed sampling class).
-    fn log_step(&self, plan: &Plan, batches: &[ExecutionBatch]) {
+    fn log_step(&self, output: &DispatchOutput, batches: &[ExecutionBatch]) {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
@@ -1042,8 +1042,8 @@ impl Scheduler {
                 step = self.step,
                 resident = self.running.len(),
                 queued = self.waiting.len(),
-                planned = plan.work.len() + plan.refill.len(),
-                admitted = plan.admit.len(),
+                planned = output.work.len() + output.refill.len(),
+                admitted = output.admit.len(),
                 in_flight =
                     self.inflight.pending_batches.len() + self.inflight.pending_submissions.len(),
                 "a scheduler step formed no batch"
@@ -1207,7 +1207,7 @@ impl Scheduler {
         }
         // What the policy was told is the recorder's own account of it: the
         // snapshot it was instantiated with, plus every page, encoder entry and
-        // request announced since, less what it was told is gone. A reclaim is
+        // request announced since, less what it was told is gone. A preemption is
         // judged against that, not against the mechanism's table, which may
         // have moved on since the policy last heard.
         live.told_pages = std::borrow::Cow::Borrowed(self.recorder.announced_pages());
@@ -1437,9 +1437,9 @@ impl Scheduler {
     /// Returns the credit a leaving call holds in its metrics domain, counting
     /// the call as failed when `failed` is set.
     ///
-    /// A reclaim with no active credit is logged as an accounting defect and
+    /// A return with no active credit is logged as an accounting defect and
     /// changes no counter.
-    pub(super) fn reclaim_domain_credit(&self, kind: ipc::CallKind, failed: bool) {
+    pub(super) fn return_domain_credit(&self, kind: ipc::CallKind, failed: bool) {
         let stats = self.stats.domains.get(kind);
         let active = stats.active_credits.load(Ordering::Relaxed);
         if active == 0 {
@@ -1453,13 +1453,13 @@ impl Scheduler {
         }
     }
 
-    /// Reclaims the domain credit of every in-flight call as failed.
+    /// Preempts the domain credit of every in-flight call as failed.
     ///
     /// Callers invoke it before `Inflight::clear_failed_calls` drops the
     /// calls whose credits it returns.
     pub(super) fn fail_inflight_domain_credits(&self) {
         for inflight in self.inflight.pending_calls.values().flatten() {
-            self.reclaim_domain_credit(inflight.call.kind, true);
+            self.return_domain_credit(inflight.call.kind, true);
         }
     }
 }

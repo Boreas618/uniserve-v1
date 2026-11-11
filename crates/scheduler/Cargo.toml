@@ -35,7 +35,7 @@ wat = "1"
 libc.workspace = true
 # Tests keep their Storage Servers' sockets and stores in temporary directories.
 tempfile.workspace = true
-# Tests state video requests as the frontend plans them.
+# Tests state video requests as the frontend schedules them.
 png.workspace = true
 
 [lints]
