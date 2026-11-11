@@ -1,0 +1,1164 @@
+//! The loading boundary's behaviour: a checkpoint read through its index, its file identities,
+//! the loader's conversion, fusion and key reuse, the packed fields of a calibrated export, and
+//! a meta load against a load that reads the payload.
+//!
+//! These tests write their own shards, header and payload, so they need no checkpoint and no
+//! device: weights are published to the CPU store, whose tensors hold what was published.
+
+// The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
+#![cfg(test)]
+
+mod support;
+
+use std::path::Path;
+
+use nn::quantization::{Nvfp4Names, ValueLayout};
+use nn::weights::PartBlock;
+use nn::{
+    Checkpoint, CpuWeights, DType, Device, Shape, Tensor, WeightKey, WeightLayout, WeightLoader,
+    WeightSource,
+};
+use ops::fp4::ScaleLayout;
+use support::{encode, f32_bytes, shard, values};
+
+/// Writes one shard holding BF16 tensors (name, extents, values) and returns its path.
+fn bf16_shard(directory: &Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> std::path::PathBuf {
+    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, shape, values)| {
+            (
+                *name,
+                DType::BF16,
+                shape.clone(),
+                encode(DType::BF16, values),
+            )
+        })
+        .collect();
+    shard(directory, "model.safetensors", &typed)
+}
+
+/// The whole of `tensor`, `shape` elements from its first.
+fn region(tensor: &str, shape: impl Into<Shape>) -> WeightSource {
+    WeightSource::Region {
+        tensor: tensor.to_owned(),
+        start: 0,
+        shape: shape.into(),
+    }
+}
+
+/// A plain load of `source` as `shape`, row-major, unpinned and not asked to hold a value.
+fn load(loader: &WeightLoader<'_>, source: &WeightSource, shape: impl Into<Shape>) -> Tensor {
+    loader
+        .load(
+            "weight",
+            source,
+            WeightLayout::ROW_MAJOR,
+            &shape.into(),
+            None,
+            false,
+        )
+        .unwrap()
+}
+
+/// The bytes of `tensor`, a U8 tensor.
+fn bytes(tensor: &Tensor) -> Vec<u8> {
+    tensor.flatten_all().unwrap().to_vec1().unwrap()
+}
+
+/// The key among `keys` whose text holds `piece`.
+fn key_of<'k>(keys: &'k [WeightKey], piece: &str) -> &'k WeightKey {
+    keys.iter()
+        .find(|key| key.to_string().contains(piece))
+        .unwrap_or_else(|| panic!("no key holds `{piece}`: {keys:#?}"))
+}
+
+// ---- Checkpoints ------------------------------------------------------------------------------
+
+#[test]
+fn a_checkpoint_is_read_through_its_index() {
+    let directory = tempfile::tempdir().unwrap();
+    let numbers = [1.0_f32, 2.0, 3.0, 4.0];
+    let first = shard(
+        directory.path(),
+        "model-00001-of-00002.safetensors",
+        &[(
+            "model.embed_tokens.weight",
+            DType::BF16,
+            vec![2, 2],
+            encode(DType::BF16, &numbers),
+        )],
+    );
+    let second = shard(
+        directory.path(),
+        "model-00002-of-00002.safetensors",
+        &[(
+            "lm_head.weight",
+            DType::BF16,
+            vec![2, 2],
+            encode(DType::BF16, &numbers),
+        )],
+    );
+    let index = format!(
+        r#"{{"metadata": {{}}, "weight_map": {{"model.embed_tokens.weight": "{}", "lm_head.weight": "{}"}}}}"#,
+        first.file_name().unwrap().to_string_lossy(),
+        second.file_name().unwrap().to_string_lossy(),
+    );
+    std::fs::write(directory.path().join("model.safetensors.index.json"), index).unwrap();
+
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    assert_eq!(checkpoint.len(), 2);
+    assert_eq!(checkpoint.files().len(), 2);
+
+    let located = checkpoint.locate("model.embed_tokens.weight").unwrap();
+    assert_eq!(
+        (located.dtype, located.shape.dims()),
+        (DType::BF16, &[2, 2][..])
+    );
+    assert_eq!(
+        checkpoint.read("model.embed_tokens.weight").unwrap(),
+        encode(DType::BF16, &numbers)
+    );
+    assert!(checkpoint.tensor("lm_head.weight").is_some());
+    assert!(checkpoint.tensor("absent").is_none());
+
+    // A file's identity is its device, inode and times, or the blob name of a cache; two files
+    // of one checkpoint have different identities.
+    let first_identity = checkpoint.identity("model.embed_tokens.weight").unwrap();
+    let second_identity = checkpoint.identity("lm_head.weight").unwrap();
+    assert_ne!(first_identity, second_identity);
+    assert!(first_identity.as_str().contains(':') || first_identity.as_str().starts_with("blob:"));
+}
+
+#[test]
+fn a_reading_names_the_tensors_a_load_never_asked_for() {
+    let directory = tempfile::tempdir().unwrap();
+    bf16_shard(
+        directory.path(),
+        &[
+            ("a", vec![2], vec![1.0, 2.0]),
+            ("b", vec![2], vec![3.0, 4.0]),
+            ("c", vec![2], vec![5.0, 6.0]),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    checkpoint.read("a").unwrap();
+    assert_eq!(
+        checkpoint.reading(),
+        (vec!["a".to_owned()], vec!["b".to_owned(), "c".to_owned()])
+    );
+
+    // Reading the rest completes it.
+    checkpoint.read("b").unwrap();
+    checkpoint.read("c").unwrap();
+    assert!(checkpoint.reading().1.is_empty());
+
+    // A pipeline root lists its stages' names qualified, and a stage that was not read whole.
+    let root = tempfile::tempdir().unwrap();
+    let (transformer, vae) = (root.path().join("transformer"), root.path().join("vae"));
+    std::fs::create_dir_all(&transformer).unwrap();
+    std::fs::create_dir_all(&vae).unwrap();
+    bf16_shard(&transformer, &[("weight", vec![2], vec![1.0, 2.0])]);
+    bf16_shard(&vae, &[("weight", vec![2], vec![3.0, 4.0])]);
+
+    let pipeline = Checkpoint::open(root.path()).unwrap();
+    assert!(pipeline.is_pipeline());
+    pipeline
+        .stage("transformer")
+        .unwrap()
+        .read("weight")
+        .unwrap();
+    assert_eq!(
+        pipeline.reading(),
+        (
+            vec!["transformer/weight".to_owned()],
+            vec!["vae/weight".to_owned()]
+        )
+    );
+}
+
+// ---- Dense loads ------------------------------------------------------------------------------
+
+#[test]
+fn a_region_is_converted_once_and_reused_by_its_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let numbers: Vec<f32> = (0..8).map(|index| index as f32).collect();
+    bf16_shard(directory.path(), &[("weight", vec![2, 4], numbers.clone())]);
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+
+    // The launch states FP32, so the BF16 tensor is converted, once.
+    let loader = WeightLoader::new(&checkpoint, &store, Some(DType::F32), None);
+    let first = load(&loader, &region("weight", (2, 4)), (2, 4));
+    assert_eq!((first.dtype(), first.dims()), (DType::F32, &[2, 4][..]));
+    assert_eq!(values(&first), numbers);
+    assert_eq!(store.keys().len(), 1);
+
+    // The same weight is served from retained storage by another loader: no second publish.
+    let loader = WeightLoader::new(&checkpoint, &store, Some(DType::F32), None);
+    let second = load(&loader, &region("weight", (2, 4)), (2, 4));
+    assert_eq!(values(&second), numbers);
+    assert_eq!(store.keys().len(), 1);
+
+    // The key names the file, the retained element type, the layout and the region.
+    let file = checkpoint.identity("weight").unwrap();
+    assert_eq!(
+        store.keys()[0].to_string(),
+        format!("{file}|f32|row_major|weight[0..8][2, 4]")
+    );
+
+    // A window of its rows is another region, and a pin another element type.
+    let rows = loader.root().get_rows((1, 4), "weight", 1).unwrap();
+    assert_eq!(values(&rows), numbers[4..]);
+    let pinned = loader
+        .root()
+        .to_dtype(DType::BF16)
+        .get((2, 4), "weight")
+        .unwrap();
+    assert_eq!(pinned.dtype(), DType::BF16);
+    assert_eq!(store.keys().len(), 3);
+}
+
+#[test]
+fn fused_parts_are_joined_in_the_order_the_operator_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let gate: Vec<f32> = (0..4).map(|index| 10.0 + index as f32).collect();
+    let up: Vec<f32> = (0..4).map(|index| 20.0 + index as f32).collect();
+    bf16_shard(
+        directory.path(),
+        &[
+            ("gate", vec![2, 2], gate.clone()),
+            ("up", vec![2, 2], up.clone()),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, Some(DType::F32), None);
+
+    // `up` before `gate`, as `WeightLayout::UP_GATE` declares.
+    let parts = vec!["up".to_owned(), "gate".to_owned()];
+    let fused = WeightSource::Parts {
+        parts: parts.clone(),
+        shape: Shape::from((4, 2)),
+        block: None,
+    };
+    let weight = loader
+        .load(
+            "experts.up_gate",
+            &fused,
+            WeightLayout::UP_GATE,
+            &Shape::from((4, 2)),
+            None,
+            false,
+        )
+        .unwrap();
+    assert_eq!(weight.dims(), [4, 2]);
+    assert_eq!(values(&weight), [up.clone(), gate.clone()].concat());
+    let key = store.keys()[0].to_string();
+    assert!(key.contains("|up_gate|up+gate[0..8][4, 2]"), "{key}");
+
+    // A rank's block of each part: the second column of both, under a key of its own.
+    let block = WeightSource::Parts {
+        parts,
+        shape: Shape::from((4, 1)),
+        block: Some(PartBlock {
+            start: 1,
+            rows: 2,
+            columns: 1,
+            row_stride: 2,
+        }),
+    };
+    let shard = loader
+        .load(
+            "experts.up_gate",
+            &block,
+            WeightLayout::UP_GATE,
+            &Shape::from((4, 1)),
+            None,
+            false,
+        )
+        .unwrap();
+    assert_eq!(values(&shard), [21.0, 23.0, 11.0, 13.0]);
+    assert!(
+        store
+            .keys()
+            .iter()
+            .any(|key| key.to_string().ends_with("up+gate[1..5][4, 1]|stride_2"))
+    );
+
+    // A layout that fuses projections cannot be produced from one region.
+    let single = loader.load(
+        "gate",
+        &region("gate", (2, 2)),
+        WeightLayout::UP_GATE,
+        &Shape::from((2, 2)),
+        None,
+        false,
+    );
+    assert!(single.is_err());
+    assert_eq!(store.keys().len(), 2);
+}
+
+#[test]
+fn a_strided_row_parallel_shard_gathers_its_columns() {
+    let directory = tempfile::tempdir().unwrap();
+    // Four rows of six elements: row r holds 6r .. 6r+5.
+    let numbers: Vec<f32> = (0..24).map(|value| value as f32).collect();
+    bf16_shard(directory.path(), &[("o_proj.weight", vec![4, 6], numbers)]);
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+
+    let columns = |first: u64| WeightSource::Strided {
+        tensor: "o_proj.weight".to_owned(),
+        start: first,
+        shape: Shape::from((4, 3)),
+        row_stride: 6,
+    };
+    let weight = load(&loader, &columns(0), (4, 3));
+    assert_eq!(
+        values(&weight),
+        [
+            0.0, 1.0, 2.0, 6.0, 7.0, 8.0, 12.0, 13.0, 14.0, 18.0, 19.0, 20.0
+        ],
+        "columns 0..2 of every row, rows contiguous"
+    );
+
+    // The same source reuses the retained weight; a second column block of the same extents is
+    // another key.
+    load(&loader, &columns(0), (4, 3));
+    assert_eq!(store.keys().len(), 1);
+    load(&loader, &columns(3), (4, 3));
+    assert_eq!(store.keys().len(), 2);
+}
+
+/// A tensor whose every stored byte is zero is a missing export, not a value, when the load
+/// asks for a value: the check reads the region the caller asked for, so a rank whose own block
+/// is zero is refused even when the rest of the matrix holds values.
+#[test]
+fn a_region_of_zeros_is_refused_when_the_load_asks_for_a_value() {
+    let directory = tempfile::tempdir().unwrap();
+    bf16_shard(
+        directory.path(),
+        &[
+            ("v_proj.weight", vec![2, 2], vec![0.0; 4]),
+            ("k_proj.weight", vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let asked = |loader: &WeightLoader<'_>, tensor: &str, nonzero: bool| {
+        loader.load(
+            tensor,
+            &region(tensor, (2, 2)),
+            WeightLayout::ROW_MAJOR,
+            &Shape::from((2, 2)),
+            None,
+            nonzero,
+        )
+    };
+
+    let text = asked(&loader, "v_proj.weight", true)
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("v_proj.weight"), "{text}");
+    assert!(
+        text.contains("every stored byte of the region is zero"),
+        "{text}"
+    );
+
+    // Without the question the same bytes load: a zero norm's scale and a zero bias are values.
+    asked(&loader, "v_proj.weight", false).unwrap();
+    asked(&loader, "k_proj.weight", true).unwrap();
+
+    // A meta loader reads no payload, so the zeros are not there for it to refuse.
+    let meta = WeightLoader::meta(&checkpoint, None, None);
+    asked(&meta, "v_proj.weight", true).unwrap();
+}
+
+#[test]
+fn a_weight_normalized_convolution_is_computed_once_at_load() {
+    let directory = tempfile::tempdir().unwrap();
+    bf16_shard(
+        directory.path(),
+        &[
+            // Two output channels of two elements: v = [[3, 4], [0, 1]].
+            ("conv.weight_v", vec![2, 2], vec![3.0, 4.0, 0.0, 1.0]),
+            // PyTorch keeps the gain as [channels, 1, 1].
+            ("conv.weight_g", vec![2, 1, 1], vec![5.0, 10.0]),
+            ("short.weight_v", vec![2, 2], vec![3.0, 4.0, 0.0, 1.0]),
+            ("short.weight_g", vec![3, 1, 1], vec![5.0, 10.0, 1.0]),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+
+    // v · g / ‖v‖ per channel: [3, 4] · 5/5 and [0, 1] · 10/1.
+    let weight = loader.root().pp("conv").weight_norm("weight").unwrap();
+    assert_eq!((weight.dtype(), weight.dims()), (DType::BF16, &[2, 2][..]));
+    assert_eq!(values(&weight), [3.0, 4.0, 0.0, 10.0]);
+
+    // A second load reuses the retained weight, under a key that names both sources.
+    loader.root().pp("conv").weight_norm("weight").unwrap();
+    assert_eq!(store.keys().len(), 1);
+    let key = store.keys()[0].to_string();
+    assert!(
+        key.contains("conv.weight__weight_norm+conv.weight_v+conv.weight_g"),
+        "{key}"
+    );
+
+    // A gain that is not one magnitude per output channel is refused before anything is read.
+    assert!(loader.root().pp("short").weight_norm("weight").is_err());
+    assert_eq!(store.keys().len(), 1);
+}
+
+// ---- Computed constants -----------------------------------------------------------------------
+
+/// A computed weight is named by what computed it, not by the label its model chose: two
+/// deployments that both call their fused output heads one name and compute different numbers
+/// are two weights.
+#[test]
+fn a_computed_weight_is_named_by_its_provenance_and_not_by_its_label_alone() {
+    let directory = tempfile::tempdir().unwrap();
+    bf16_shard(directory.path(), &[("weight", vec![1], vec![1.0])]);
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+
+    let (name, shape) = ("denoiser.video.student_heads.weight", Shape::from(2));
+    let (base, reference) = (f32_bytes(&[0.5, 0.25]), f32_bytes(&[1.0, 2.0]));
+    let constant = |bytes: &[u8], producer: &'static str| {
+        loader
+            .constant(name, DType::F32, &shape, bytes, producer)
+            .unwrap()
+    };
+
+    let first = constant(&base, "transformer");
+    let second = constant(&reference, "transformer_ref");
+    assert_eq!(values(&first), [0.5, 0.25]);
+    assert_eq!(values(&second), [1.0, 2.0]);
+    assert_eq!(store.keys().len(), 2);
+    assert!(
+        store.keys()[0]
+            .to_string()
+            .contains("|computed:transformer")
+    );
+    assert!(store.keys()[0].files.is_empty());
+
+    // The same numbers by the same class are one weight: a later load finds what the first
+    // published instead of computing it again.
+    constant(&base, "transformer");
+    assert_eq!(store.keys().len(), 2);
+
+    // The same numbers by another class are another weight: the producer is part of the
+    // provenance even when the bytes agree.
+    constant(&base, "transformer_ref");
+    assert_eq!(store.keys().len(), 3);
+
+    // A byte count that does not match the extents is refused before anything is published.
+    let short = loader.constant(name, DType::F32, &shape, &base[..4], "transformer");
+    assert!(short.is_err());
+    assert_eq!(store.keys().len(), 3);
+}
+
+#[test]
+fn a_builder_names_its_constants_by_its_module_path_and_encodes_their_type() {
+    let directory = tempfile::tempdir().unwrap();
+    bf16_shard(directory.path(), &[("weight", vec![1], vec![1.0])]);
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let vb = loader.root().pp("model").pp("rotary_emb");
+    assert_eq!(vb.path(), "model.rotary_emb");
+    assert_eq!(vb.name("inv_freq"), "model.rotary_emb.inv_freq");
+    assert!(!vb.contains("inv_freq") && loader.root().contains("weight"));
+
+    let table = vb
+        .constant("inv_freq", DType::BF16, 2, &[0.5, 0.25])
+        .unwrap();
+    assert_eq!(
+        (table.dtype(), values(&table)),
+        (DType::BF16, vec![0.5, 0.25])
+    );
+
+    // An index row and a table of zeros are CPU tensors published as they are.
+    let rows = vb
+        .constant_from("rows", &Tensor::arange(3_u32, 5, &Device::Cpu).unwrap())
+        .unwrap();
+    assert_eq!(rows.dtype(), DType::U32);
+    assert_eq!(rows.to_vec1::<u32>().unwrap(), [3, 4]);
+    let pad = vb
+        .constant_from(
+            "pad",
+            &Tensor::zeros((1, 3), DType::F32, &Device::Cpu).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(pad.dims(), [1, 3]);
+
+    // A value count that is not the shape's is refused.
+    assert!(vb.constant("short", DType::F32, 3, &[1.0]).is_err());
+
+    // A writable table is this load's own: it is published under no retained key.
+    let zeros = vb.writable_zeros("layers", DType::BF16, (2, 2)).unwrap();
+    assert_eq!(values(&zeros), [0.0; 4]);
+
+    let keys = store.keys();
+    assert_eq!(keys.len(), 3);
+    for (name, dtype) in [("inv_freq", "bf16"), ("rows", "u32"), ("pad", "f32")] {
+        let key = key_of(&keys, &format!("model.rotary_emb.{name}"));
+        // The producer of a module's constants is part of every stored key of one.
+        assert!(
+            key.to_string()
+                .starts_with(&format!("|{dtype}|row_major|model.rotary_emb.{name}[")),
+            "{key}"
+        );
+        assert!(
+            key.to_string().contains("|computed:nn::weights::Scope:"),
+            "{key}"
+        );
+    }
+}
+
+// ---- Calibrated NVFP4 fields ------------------------------------------------------------------
+
+/// A calibrated NVFP4 matrix is its two byte fields and its tensor scale, published under keys
+/// that name the scale layout; nothing is quantized at load.
+#[test]
+fn a_calibrated_nvfp4_matrix_is_loaded_as_its_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    // `[4, 64]` encoded: 32 bytes a row of packed pairs, four block scales a row.
+    let packed: Vec<u8> = (0..128).map(|byte| byte as u8).collect();
+    let scales: Vec<u8> = (0..16).map(|byte| 0x30 + byte).collect();
+    shard(
+        directory.path(),
+        "model.safetensors",
+        &[
+            ("w", DType::U8, vec![4, 32], packed.clone()),
+            ("w_scale", DType::U8, vec![4, 4], scales.clone()),
+            ("w_input", DType::F32, vec![1], f32_bytes(&[0.5])),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let fields = |layouts| {
+        loader.nvfp4(
+            &region("w", (4, 32)),
+            &region("w_scale", (4, 4)),
+            Some("w_input"),
+            Nvfp4Names::vllm(),
+            layouts,
+            0.25,
+        )
+    };
+
+    let linear = fields((ScaleLayout::Linear, ScaleLayout::Linear)).unwrap();
+    assert_eq!(
+        (linear.packed.dims(), linear.packed.dtype()),
+        (&[4, 32][..], DType::U8)
+    );
+    assert_eq!(bytes(&linear.packed), packed);
+    assert_eq!(bytes(&linear.scales), scales);
+    assert_eq!(
+        (linear.global_scale, linear.layout),
+        (0.25, ScaleLayout::Linear)
+    );
+
+    // The encoder's operand is the reciprocal of the calibrated activation scale.
+    assert_eq!(values(linear.input_scale.as_ref().unwrap()), [2.0]);
+
+    // The layout names the arrangement, so the fields never share a key with a plain region.
+    let keys = store.keys();
+    assert_eq!(key_of(&keys, "|w[").layout, WeightLayout::NVFP4_VALUES);
+    assert_eq!(
+        key_of(&keys, "|w_scale[").layout,
+        WeightLayout::NVFP4_SCALES_LINEAR
+    );
+    key_of(&keys, "w_input__nvfp4_input_scale");
+
+    // Asked in the product's 128x4 table, the same scales are permuted once: row `r`, column
+    // `c` of the linear table lands at `c + 16 r`, and the padding is zero.
+    let swizzled = fields((ScaleLayout::Linear, ScaleLayout::Swizzled128X4)).unwrap();
+    assert_eq!(swizzled.scales.dims(), [128, 4]);
+    let table = bytes(&swizzled.scales);
+    for row in 0..4 {
+        for column in 0..4 {
+            assert_eq!(table[column + 16 * row], scales[row * 4 + column]);
+        }
+    }
+    assert_eq!(table.iter().filter(|byte| **byte != 0).count(), 16);
+    key_of(
+        &store.keys(),
+        "nvfp4_scales_swizzled_128x4|w_scale__nvfp4_scales",
+    );
+
+    // Block scales are the shape their file's layout names; another layout's shape is refused,
+    // because the two arrangements index the same bytes differently.
+    let error = fields((ScaleLayout::Swizzled128X4, ScaleLayout::Swizzled128X4)).unwrap_err();
+    assert!(error.to_string().contains("swizzled_128x4"), "{error}");
+}
+
+/// A checkpoint opened in one export's spelling and written in the other's is refused by the
+/// spelling, not as a missing tensor.
+#[test]
+fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
+    let directory = tempfile::tempdir().unwrap();
+    shard(
+        directory.path(),
+        "model.safetensors",
+        &[
+            ("proj.weight_packed", DType::U8, vec![2, 8], vec![1; 16]),
+            ("proj.weight_scale", DType::U8, vec![2, 1], vec![0x38; 2]),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let fields = |names: Nvfp4Names| {
+        loader.nvfp4(
+            &region(&format!("proj.{}", names.values), (2, 8)),
+            &region(&format!("proj.{}", names.block_scale), (2, 1)),
+            None,
+            names,
+            (ScaleLayout::Linear, ScaleLayout::Linear),
+            1.0,
+        )
+    };
+
+    fields(Nvfp4Names::diffusers()).expect("the diffusers spelling names its packed values");
+    let error = fields(Nvfp4Names::vllm()).unwrap_err().to_string();
+    assert!(
+        error.contains("vLLM ModelOpt") && error.contains("packed E2M1 values"),
+        "{error}"
+    );
+}
+
+/// The shard of a stack of `experts` calibrated experts, `[2, 64]` each, with an `up` and a
+/// `gate` projection, block scales of `scale` elements and a tensor scale of `0.5 · (e + 1)`;
+/// returns the packed bytes in the order the stack reads them.
+fn stack_checkpoint(directory: &Path, experts: u8, scale: DType) -> (Checkpoint, Vec<u8>) {
+    let mut tensors: Vec<(String, DType, Vec<usize>, Vec<u8>)> = Vec::new();
+    let mut expected = Vec::new();
+
+    for expert in 0..experts {
+        for (index, projection) in ["up", "gate"].iter().enumerate() {
+            let stem = format!("experts.{expert}.{projection}_proj");
+            let packed: Vec<u8> = (0..64)
+                .map(|byte| byte as u8 + expert * 64 + index as u8)
+                .collect();
+            let scales: Vec<u8> = (0..8)
+                .map(|byte| 0x20 + byte as u8 + expert * 8 + index as u8)
+                .collect();
+
+            expected.extend_from_slice(&packed);
+            tensors.push((format!("{stem}.weight"), DType::U8, vec![2, 32], packed));
+            tensors.push((format!("{stem}.weight_scale"), scale, vec![2, 4], scales));
+            tensors.push((
+                format!("{stem}.weight_scale_2"),
+                DType::F32,
+                vec![1],
+                f32_bytes(&[0.5 * f32::from(expert + 1)]),
+            ));
+        }
+    }
+
+    let named: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+        .collect();
+    shard(directory, "model.safetensors", &named);
+    (Checkpoint::open(directory).unwrap(), expected)
+}
+
+/// An expert stack is its experts' encoded tensors concatenated in the operator's reading
+/// order, expert-major, up before gate, and its tensor scales one per expert **and
+/// projection**, published the other way round: one packed table per projection, which is what
+/// the batched-GEMM entry reads.
+#[test]
+fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let (checkpoint, expected) = stack_checkpoint(directory.path(), 2, DType::U8);
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let stack = |loader: &WeightLoader<'_>| {
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.up_gate",
+                "experts",
+                &["up_proj", "gate_proj"],
+                &[0, 1],
+                2,
+                Nvfp4Names::vllm(),
+                (ValueLayout::Plain, ScaleLayout::Linear),
+                false,
+            )
+            .unwrap()
+    };
+
+    let (loaded, scales) = stack(&loader);
+    assert_eq!(
+        (loaded.values.dims(), loaded.values.dtype()),
+        (&[2, 4, 32][..], DType::U8)
+    );
+    assert_eq!(bytes(&loaded.values), expected);
+    assert_eq!(loaded.scales.dims(), [2, 4, 4]);
+
+    // The scales as the loader read them are expert-major; the published table is one packed
+    // row per projection: up's two experts, then gate's.
+    assert_eq!(scales, [0.5, 0.5, 1.0, 1.0]);
+    assert_eq!(loaded.global_scale.dims(), [2, 2]);
+    assert_eq!(values(&loaded.global_scale), [0.5, 1.0, 0.5, 1.0]);
+
+    // A stack that encodes nothing multiplies by one, published so the encoder reads a tensor.
+    assert_eq!(values(&loaded.encode_scale), [1.0]);
+    assert!(loaded.input_scale.is_none());
+
+    let keys = store.keys();
+    assert_eq!(keys.len(), 4);
+    assert_eq!(
+        key_of(&keys, "layer.0.mlp.experts.up_gate__nvfp4_values").layout,
+        WeightLayout::NVFP4_VALUES
+    );
+    key_of(&keys, "layer.0.mlp.experts.up_gate__nvfp4_scales");
+    key_of(&keys, "layer.0.mlp.experts.up_gate__nvfp4_tensor_scales");
+    assert!(
+        key_of(&keys, "layer.0.mlp.experts.up_gate__nvfp4_encode_scale")
+            .to_string()
+            .contains("|computed:nn:")
+    );
+
+    // A second load of the same checkpoint publishes nothing: the four keys are held.
+    stack(&loader);
+    assert_eq!(store.keys().len(), 4);
+
+    // A redistribution's order is a load of the same checkpoint: slot 0 holds expert 1.
+    let (swapped, _) = loader
+        .nvfp4_stack(
+            "layer.0.mlp.experts.up_gate",
+            "experts",
+            &["up_proj", "gate_proj"],
+            &[1, 0],
+            2,
+            Nvfp4Names::vllm(),
+            (ValueLayout::Plain, ScaleLayout::Linear),
+            false,
+        )
+        .unwrap();
+    assert_eq!(bytes(&swapped.values)[..128], expected[128..]);
+}
+
+/// A stack keeps the checkpoint's own block-scale type, and a shuffled stack permutes its
+/// values' rows inside its shuffle blocks at load, under a layout name of its own.
+#[test]
+fn a_stack_keeps_its_scale_type_and_arranges_its_rows_at_load() {
+    let directory = tempfile::tempdir().unwrap();
+    let (checkpoint, _) = stack_checkpoint(directory.path(), 1, DType::F8E4M3);
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let stack = |values: ValueLayout| {
+        loader.nvfp4_stack(
+            "experts.up_gate",
+            "experts",
+            &["up_proj", "gate_proj"],
+            &[0],
+            1,
+            Nvfp4Names::vllm(),
+            (values, ScaleLayout::Swizzled128X4),
+            false,
+        )
+    };
+
+    let (plain, _) = stack(ValueLayout::Plain).unwrap();
+    assert_eq!(plain.scales.dtype(), DType::F8E4M3);
+    assert_eq!(
+        plain.scales.dims(),
+        [1, 128, 4],
+        "padded to the swizzled table"
+    );
+
+    // Four rows are not a whole sixteen-row shuffle block: the arrangement does not exist.
+    let error = stack(ValueLayout::Shuffled {
+        epilogue_tile_m: 64,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("16-row blocks"), "{error}");
+}
+
+/// A stack whose experts disagree on their extents is refused, not read as one stack.
+#[test]
+fn a_stack_needs_every_expert_to_agree_on_its_extents() {
+    let directory = tempfile::tempdir().unwrap();
+    let zeros = |count: usize| vec![0_u8; count];
+    shard(
+        directory.path(),
+        "model.safetensors",
+        &[
+            (
+                "experts.0.up_proj.weight",
+                DType::U8,
+                vec![2, 32],
+                zeros(64),
+            ),
+            (
+                "experts.0.up_proj.weight_scale",
+                DType::U8,
+                vec![2, 4],
+                zeros(8),
+            ),
+            (
+                "experts.0.up_proj.weight_scale_2",
+                DType::F32,
+                vec![1],
+                f32_bytes(&[1.0]),
+            ),
+            (
+                "experts.1.up_proj.weight",
+                DType::U8,
+                vec![4, 32],
+                zeros(128),
+            ),
+            (
+                "experts.1.up_proj.weight_scale",
+                DType::U8,
+                vec![4, 4],
+                zeros(16),
+            ),
+            (
+                "experts.1.up_proj.weight_scale_2",
+                DType::F32,
+                vec![1],
+                f32_bytes(&[1.0]),
+            ),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+
+    let error = loader
+        .nvfp4_stack(
+            "layer.0.mlp.experts.up",
+            "experts",
+            &["up_proj"],
+            &[0, 1],
+            2,
+            Nvfp4Names::vllm(),
+            (ValueLayout::Plain, ScaleLayout::Linear),
+            false,
+        )
+        .expect_err("two experts of different shapes are not one stack");
+    assert!(error.to_string().contains("against the stack's"), "{error}");
+    assert!(store.keys().is_empty());
+}
+
+// ---- Stages and policies ----------------------------------------------------------------------
+
+/// A pipeline's stages keep their indexes apart; one loader reborrows another checkpoint and
+/// keeps the store, so the two stages share the conversion path and its retained weights.
+#[test]
+fn a_loader_borrows_another_stage_s_checkpoint_and_keeps_the_store() {
+    let root = tempfile::tempdir().unwrap();
+    let (transformer, vae) = (root.path().join("transformer"), root.path().join("vae"));
+    std::fs::create_dir_all(&transformer).unwrap();
+    std::fs::create_dir_all(&vae).unwrap();
+    bf16_shard(&transformer, &[("weight", vec![2], vec![1.0, 2.0])]);
+    bf16_shard(&vae, &[("weight", vec![2], vec![1.0, 2.0])]);
+
+    let transformer = Checkpoint::open(&transformer).unwrap();
+    let vae = Checkpoint::open(&vae).unwrap();
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&transformer, &store, Some(DType::F32), None);
+
+    let first = load(&loader, &region("weight", 2), 2);
+    let second = load(&loader.reborrow(&vae).unwrap(), &region("weight", 2), 2);
+    assert_eq!((first.dtype(), second.dtype()), (DType::F32, DType::F32));
+
+    // Read again through the first loader: the store holds it, nothing is published a third
+    // time.
+    load(&loader, &region("weight", 2), 2);
+
+    // Same tensor name, same bytes, two stages: the keys differ by the file that holds them.
+    let keys = store.keys();
+    assert_eq!(keys.len(), 2);
+    assert_ne!(keys[0].files, keys[1].files);
+
+    // A policy that does not describe a stage is refused when the loader is borrowed for it:
+    // an encoded stage is not read at a stated floating-point type.
+    let encoded = root.path().join("encoded");
+    std::fs::create_dir_all(&encoded).unwrap();
+    shard(
+        &encoded,
+        "model.safetensors",
+        &[("weight", DType::F8E4M3, vec![2], vec![0x38; 2])],
+    );
+    let encoded = Checkpoint::open(&encoded).unwrap();
+    let refused = loader.reborrow(&encoded).err().unwrap();
+    assert!(matches!(refused, nn::Error::Policy { .. }), "{refused}");
+}
+
+// ---- Meta loads -------------------------------------------------------------------------------
+
+/// A dense checkpoint: a projection, a row-parallel matrix, two fusable parts and a
+/// weight-normalized pair, all BF16 with values in every byte.
+fn dense_checkpoint(directory: &Path) -> Checkpoint {
+    let numbers = |count: usize| (1..=count).map(|value| value as f32).collect::<Vec<_>>();
+    bf16_shard(
+        directory,
+        &[
+            ("proj.weight", vec![4, 8], numbers(32)),
+            ("rows.weight", vec![4, 8], numbers(32)),
+            ("experts.0.up", vec![2, 8], numbers(16)),
+            ("experts.0.gate", vec![2, 8], numbers(16)),
+            ("conv.weight_v", vec![2, 3, 1], numbers(6)),
+            ("conv.weight_g", vec![2, 1, 1], numbers(2)),
+        ],
+    );
+    Checkpoint::open(directory).unwrap()
+}
+
+/// Every kind of dense load, in one order: a pinned region, a strided column block, fused
+/// parts, a tensor-parallel block of each part, a weight-normalized weight and a computed
+/// constant; each as its element type and extents.
+fn dense_loads(loader: &WeightLoader<'_>) -> Vec<(DType, Vec<usize>)> {
+    let parts = vec!["experts.0.up".to_owned(), "experts.0.gate".to_owned()];
+    let fused = |shape: (usize, usize), block| {
+        loader
+            .load(
+                "experts.0.up_gate",
+                &WeightSource::Parts {
+                    parts: parts.clone(),
+                    shape: Shape::from(shape),
+                    block,
+                },
+                WeightLayout::UP_GATE,
+                &Shape::from(shape),
+                None,
+                false,
+            )
+            .unwrap()
+    };
+
+    let loaded = [
+        loader
+            .load(
+                "proj.weight",
+                &region("proj.weight", (4, 8)),
+                WeightLayout::ROW_MAJOR,
+                &Shape::from((4, 8)),
+                Some(DType::F32),
+                true,
+            )
+            .unwrap(),
+        load(
+            loader,
+            &WeightSource::Strided {
+                tensor: "rows.weight".to_owned(),
+                start: 4,
+                shape: Shape::from((4, 4)),
+                row_stride: 8,
+            },
+            (4, 4),
+        ),
+        fused((4, 8), None),
+        fused(
+            (4, 4),
+            Some(PartBlock {
+                start: 4,
+                rows: 2,
+                columns: 4,
+                row_stride: 8,
+            }),
+        ),
+        loader
+            .weight_norm("conv.weight", "conv.weight_v", "conv.weight_g", None)
+            .unwrap(),
+        loader
+            .constant(
+                "table",
+                DType::I32,
+                &Shape::from(2),
+                &[1, 0, 0, 0, 2, 0, 0, 0],
+                "test",
+            )
+            .unwrap(),
+    ];
+    loaded
+        .iter()
+        .map(|tensor| (tensor.dtype(), tensor.dims().to_vec()))
+        .collect()
+}
+
+/// A meta load of a dense checkpoint returns the element type and extents a load that reads
+/// the payload returns for every kind of source, as meta tensors, and reads no tensor of the
+/// checkpoint.
+#[test]
+fn a_meta_load_returns_what_a_load_of_the_payload_returns() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(directory.path());
+
+    let meta = WeightLoader::meta(&checkpoint, None, None);
+    let from_headers = dense_loads(&meta);
+    assert_eq!(
+        checkpoint.reading().0,
+        Vec::<String>::new(),
+        "a meta load reads no tensor"
+    );
+
+    let store = CpuWeights::new();
+    let from_payload = dense_loads(&WeightLoader::new(&checkpoint, &store, None, None));
+    assert_eq!(from_headers, from_payload);
+    assert_eq!(
+        from_headers,
+        [
+            (DType::F32, vec![4, 8]),
+            (DType::BF16, vec![4, 4]),
+            (DType::BF16, vec![4, 8]),
+            (DType::BF16, vec![4, 4]),
+            (DType::BF16, vec![2, 3, 1]),
+            (DType::I32, vec![2]),
+        ]
+    );
+
+    // A meta weight is a tensor of the meta device with no data to read, and a key asked for
+    // twice is the same tensor, as a retained store returns a key it holds.
+    let weight = load(&meta, &region("proj.weight", (4, 8)), (4, 8));
+    assert!(!matches!(weight.device(), Device::Cpu));
+    assert!(
+        weight.to_vec2::<f32>().is_err(),
+        "a meta tensor has no data"
+    );
+
+    let again = load(&meta, &region("proj.weight", (4, 8)), (4, 8));
+    let address = |tensor: &Tensor| backend::operand(tensor).unwrap().ptr.address();
+    assert_eq!(address(&weight), address(&again));
+    let other = load(&meta, &region("rows.weight", (4, 8)), (4, 8));
+    assert_ne!(address(&weight), address(&other));
+
+    // A loader borrowed for another checkpoint shares the meta tensors.
+    let borrowed = meta.reborrow(&checkpoint).unwrap();
+    let shared = load(&borrowed, &region("proj.weight", (4, 8)), (4, 8));
+    assert_eq!(address(&weight), address(&shared));
+}
+
+/// What the header contradicts is refused by a meta load with the other load's own refusal: a
+/// region past its tensor, parts of different tails, a gain of the wrong length and an expert
+/// stack whose block scales are not the linear table of its values.
+#[test]
+fn a_meta_load_refuses_what_the_header_contradicts() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(directory.path());
+    let store = CpuWeights::new();
+    let payload = WeightLoader::new(&checkpoint, &store, None, None);
+    let meta = WeightLoader::meta(&checkpoint, None, None);
+
+    let past = region("proj.weight", (8, 8));
+    let tails = WeightSource::Parts {
+        parts: vec!["experts.0.up".to_owned(), "conv.weight_v".to_owned()],
+        shape: Shape::from((4, 8)),
+        block: None,
+    };
+    for (source, shape, layout) in [
+        (&past, (8, 8), WeightLayout::ROW_MAJOR),
+        (&tails, (4, 8), WeightLayout::UP_GATE),
+    ] {
+        let refusal = |loader: &WeightLoader<'_>| {
+            loader
+                .load("weight", source, layout, &Shape::from(shape), None, false)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(refusal(&meta), refusal(&payload));
+    }
+
+    let gain = |loader: &WeightLoader<'_>| {
+        loader
+            .weight_norm("conv.weight", "conv.weight_v", "proj.weight", None)
+            .unwrap_err()
+            .to_string()
+    };
+    assert_eq!(gain(&meta), gain(&payload));
+
+    // A stack whose block scales are stated as wide as the packed values: the published table
+    // is the loader's to build, so the header alone refuses it.
+    let encoded = tempfile::tempdir().unwrap();
+    shard(
+        encoded.path(),
+        "model.safetensors",
+        &[
+            (
+                "experts.0.up_proj.weight",
+                DType::U8,
+                vec![2, 32],
+                vec![1; 64],
+            ),
+            (
+                "experts.0.up_proj.weight_scale",
+                DType::U8,
+                vec![2, 32],
+                vec![1; 64],
+            ),
+            (
+                "experts.0.up_proj.weight_scale_2",
+                DType::F32,
+                vec![1],
+                f32_bytes(&[1.0]),
+            ),
+        ],
+    );
+    let checkpoint = Checkpoint::open(encoded.path()).unwrap();
+    let stack = |loader: &WeightLoader<'_>| {
+        loader
+            .nvfp4_stack(
+                "experts.up",
+                "experts",
+                &["up_proj"],
+                &[0],
+                1,
+                Nvfp4Names::vllm(),
+                (ValueLayout::Plain, ScaleLayout::Linear),
+                false,
+            )
+            .expect_err("block scales of another table")
+            .to_string()
+    };
+    let store = CpuWeights::new();
+    let refused = stack(&WeightLoader::meta(&checkpoint, None, None));
+    assert_eq!(
+        refused,
+        stack(&WeightLoader::new(&checkpoint, &store, None, None))
+    );
+    assert!(refused.contains("linear"), "{refused}");
+}
+
+/// A meta load never sees a value: a tensor scale of zero, which a load of the payload refuses,
+/// is the placeholder of one.
+#[test]
+fn a_meta_load_reads_no_value() {
+    let directory = tempfile::tempdir().unwrap();
+    shard(
+        directory.path(),
+        "model.safetensors",
+        &[(
+            "proj.weight_scale_2",
+            DType::F32,
+            vec![1],
+            f32_bytes(&[0.0]),
+        )],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let store = CpuWeights::new();
+
+    let meta = WeightLoader::meta(&checkpoint, None, None);
+    assert_eq!(meta.tensor_scale("proj.weight_scale_2").unwrap(), 1.0);
+    assert!(checkpoint.reading().0.is_empty(), "no tensor was read");
+
+    let refused = WeightLoader::new(&checkpoint, &store, None, None)
+        .tensor_scale("proj.weight_scale_2")
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("not a positive number"),
+        "{refused}"
+    );
+}
