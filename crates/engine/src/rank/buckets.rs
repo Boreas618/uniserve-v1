@@ -178,6 +178,8 @@ pub(super) fn served_phases(buckets: &Buckets, verifies: bool) -> Vec<PhaseId> {
             // A join is no phase a scheduler plans: a peer opens the step, and the union wakes
             // this rank for it.
             Variant::ExpertJoin => scheduler::PhaseKind::Decode,
+            // A step of a diffusion language model over a block of tokens.
+            Variant::TokenDenoise => scheduler::PhaseKind::TokenDenoise,
         })
         .collect();
     // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill

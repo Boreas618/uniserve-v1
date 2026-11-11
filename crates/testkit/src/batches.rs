@@ -14,6 +14,8 @@
 //! - the token each call samples ([`Tokens`]) and the extent it leaves ([`Extent`]), or a whole
 //!   answer of its own ([`FakeBatches::answering`]);
 //! - the media computations it serves ([`FakeBatches::with_media`]);
+//! - the step limit of the blocks a diffusion language model denoises
+//!   ([`FakeBatches::with_block_steps`]), which a block stops within ([`block_stop_step`]);
 //! - when a batch completes: at once, or held until the case releases it
 //!   ([`FakeBatches::hold`], [`FakeBatches::release`]), which is how a case paces the mechanism
 //!   or leaves a batch stalled on the device;
@@ -28,7 +30,7 @@ use ipc::TimingCounters;
 use ipc::execution::{
     Batch, BatchId, BatchOutput, Batches, CallOutput, Computation, EpochOperation,
     Extent as MediaExtent, Fault, Inventory, Outcome, RowState, Submission, SubmissionId,
-    SubmissionState,
+    SubmissionState, Variant,
 };
 use ipc::philox::DrawAddress;
 
@@ -56,6 +58,17 @@ pub fn draw_token(draw: DrawAddress) -> u32 {
     mixed ^= mixed >> 31;
 
     SAMPLED + (mixed % u64::from(VOCABULARY)) as u32
+}
+
+/// The zero-based step at which the fake stops block `block` of the request whose Philox stream
+/// is `key`: one of a block's first three steps, within the deployment's `max_steps`.
+///
+/// A function of the stream and the block alone, as a device's convergence is of the request's
+/// draws, so a case computes where each block of a request stops, and a step queued behind the
+/// one that stopped its block is the same no-op wherever it runs.
+pub fn block_stop_step(key: u64, block: u32, max_steps: u32) -> u32 {
+    let third = (key.wrapping_add(u64::from(block)) % 3) as u32;
+    third.min(max_steps.saturating_sub(1))
 }
 
 /// Which token a call samples.
@@ -124,6 +137,8 @@ pub struct FakeBatches {
     end: Option<EndOfText>,
     /// How many tokens each request's text holds before it ends ([`FakeBatches::with_text_len`]).
     text_len: Option<u64>,
+    /// The most steps a block of tokens is denoised for ([`FakeBatches::with_block_steps`]).
+    block_steps: Option<u32>,
     /// The logical position of the first token the fake sampled on each request's Philox stream,
     /// by stream key: where its generated text begins.
     text_starts: Mutex<HashMap<u64, u64>>,
@@ -165,6 +180,7 @@ impl FakeBatches {
             media_answers: None,
             end: None,
             text_len: None,
+            block_steps: None,
             text_starts: Mutex::new(HashMap::new()),
             operate: None,
             submitted: Mutex::new(Vec::new()),
@@ -215,6 +231,16 @@ impl FakeBatches {
     #[must_use]
     pub fn with_text_len(mut self, tokens: u64) -> Self {
         self.text_len = Some(tokens);
+        self
+    }
+
+    /// Serves the token-denoising batches of a diffusion language model whose blocks run at most
+    /// `max_steps` steps: block `b` of a request stops at step [`block_stop_step`] and then holds
+    /// the request's text, [`draw_token`] at each of its logical positions, with [`crate::EOS`]
+    /// from the text's end on ([`Self::with_text_len`]).
+    #[must_use]
+    pub fn with_block_steps(mut self, max_steps: u32) -> Self {
+        self.block_steps = Some(max_steps);
         self
     }
 
@@ -329,6 +355,15 @@ impl FakeBatches {
             return media.answer(batch);
         }
 
+        if batch.shape.variant == Variant::TokenDenoise {
+            return match self.block_steps {
+                Some(max_steps) => Outcome::Success(self.denoised(batch, max_steps)),
+                None => Outcome::Failed(Arc::from(Box::<Fault>::from(
+                    "the fake serves no token denoising: no block step limit is stated".to_owned(),
+                ))),
+            };
+        }
+
         let mut output = completed_until(batch, self.tokens, self.extent, self.end);
         if let Some(text_len) = self.text_len {
             self.end_texts(batch, &mut output, text_len);
@@ -351,6 +386,64 @@ impl FakeBatches {
             if draw.position >= start + text_len {
                 call.tokens = vec![crate::EOS];
             }
+        }
+    }
+
+    /// A token-denoising `batch` completed: each call runs one step of its request's block.
+    ///
+    /// A step before the block's stopping step ([`block_stop_step`]) reports no token; the
+    /// stopping step reports the block's tokens; a step behind it finds the block stopped,
+    /// computes nothing and reports [`ipc::CallStatus::Predicated`].
+    fn denoised(&self, batch: &Batch, max_steps: u32) -> BatchOutput {
+        let rows = &batch.columns.rows;
+        let mut starts = lock(&self.text_starts);
+        let calls = (0..batch.calls.len())
+            .map(|index| {
+                let row = sampling_row(batch, index);
+                let seen = rows.seq_lens.get(row).copied().unwrap_or(0).max(0) as u32;
+                let state = RowState {
+                    step_index: 0,
+                    cache_computed_len: seen,
+                    cache_visible_len: seen,
+                };
+                let mut output = CallOutput::completed(batch.calls[index], Vec::new(), state);
+                let (Some(step), Some(draw)) = (
+                    batch.columns.block_steps.get(index).copied(),
+                    batch.columns.draws.get(row).copied(),
+                ) else {
+                    return output;
+                };
+                // The row's query is the block: its draw states the position after it.
+                let length = match (rows.query_offsets.get(row), rows.query_offsets.get(row + 1)) {
+                    (Some(start), Some(end)) => u64::try_from(end - start).unwrap_or(0),
+                    _ => 0,
+                };
+                let first = draw.position.saturating_sub(length);
+                let stop = block_stop_step(draw.key, step.block, max_steps);
+                if step.step > stop {
+                    output.status = ipc::CallStatus::Predicated;
+                } else if step.step == stop {
+                    // The request's text begins where its first block does.
+                    let text_start = *starts
+                        .entry(draw.key)
+                        .or_insert_with(|| first.saturating_sub(u64::from(step.block) * length));
+                    output.tokens = (first..first + length)
+                        .map(|position| match self.text_len {
+                            Some(text_len) if position >= text_start + text_len => crate::EOS,
+                            _ => draw_token(DrawAddress {
+                                key: draw.key,
+                                position,
+                            }),
+                        })
+                        .collect();
+                }
+                output
+            })
+            .collect();
+        BatchOutput {
+            calls,
+            timing: TimingCounters::default(),
+            forward_stats: None,
         }
     }
 

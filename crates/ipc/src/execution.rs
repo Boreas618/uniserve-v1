@@ -683,6 +683,9 @@ pub enum RowKind {
     Decode,
     /// Speculative verification rows: drafted tokens whose logits the model produces.
     Verify,
+    /// One denoising step over a block of tokens of a diffusion language model: one row per
+    /// call, which reads the cache and writes none.
+    Denoise,
 }
 
 /// The host columns of one batch, as the mechanism writes them and the worker uploads them.
@@ -808,6 +811,13 @@ pub struct BatchColumns {
     /// samples ([`FreshSlot`]), so a request's penalties count its own tokens - wherever it
     /// generated them - and never those of the slot's previous request.
     pub fresh_slots: Vec<FreshSlot>,
+    /// One entry per call of a [`Variant::TokenDenoise`] batch, and none for any other batch: the
+    /// block of its request the call denoises and the step it runs. The rank holds each slot's
+    /// block between steps; a step of a block that already stopped computes nothing and reports
+    /// [`crate::CallStatus::Predicated`], so the mechanism may queue a step behind the one in
+    /// flight without knowing whether that one stops the block.
+    #[serde(default)]
+    pub block_steps: Vec<crate::CanvasStep>,
 }
 
 /// One request slot a batch starts a request's sampling state on.
@@ -1247,6 +1257,34 @@ impl BatchColumns {
                 self.drafts.len()
             )));
         }
+        let denoises = shape.variant == Variant::TokenDenoise;
+        if self.block_steps.len() != if denoises { calls } else { 0 } {
+            return Err(ValidationError::message(format!(
+                "block_steps has {} entries, and a {} batch of {calls} calls states {}",
+                self.block_steps.len(),
+                shape.variant,
+                if denoises { "one per call" } else { "none" }
+            )));
+        }
+        if denoises
+            != self
+                .rows
+                .calls
+                .iter()
+                .any(|call| call.kind == RowKind::Denoise)
+            || (denoises
+                && self
+                    .rows
+                    .calls
+                    .iter()
+                    .any(|call| call.kind != RowKind::Denoise))
+        {
+            return Err(ValidationError::message(format!(
+                "a {} batch carries {} calls that denoise a block of tokens",
+                shape.variant,
+                if denoises { "other than" } else { "some" }
+            )));
+        }
         let adjustments = &self.adjustments;
         for (name, actual) in [
             ("biased", adjustments.biased.len()),
@@ -1379,6 +1417,10 @@ pub enum Variant {
     ConditionEncode,
     /// A rank's part in an expert step it has no tokens for: every expert layer, and nothing else.
     ExpertJoin,
+    /// One denoising step of a diffusion language model over each row's block of tokens
+    /// ([`BatchColumns::block_steps`]): the rows read their requests' cached context and write no
+    /// cache page, and the step that stops a block reports the block's tokens.
+    TokenDenoise,
 }
 
 impl Variant {
@@ -1402,6 +1444,7 @@ impl Variant {
             Self::MediaRead => "media_reading",
             Self::ConditionEncode => "condition_encoding",
             Self::ExpertJoin => "expert_join",
+            Self::TokenDenoise => "token_denoising",
         }
     }
 
@@ -1425,6 +1468,7 @@ impl Variant {
             Self::MediaRead => "media_read",
             Self::ConditionEncode => "condition_encode",
             Self::ExpertJoin => "expert_join",
+            Self::TokenDenoise => "token_denoise",
         }
     }
 

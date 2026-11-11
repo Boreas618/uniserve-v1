@@ -680,6 +680,7 @@ fn row_classes(rows: &BatchRows) -> String {
             RowKind::Prefill => "prefill",
             RowKind::Decode => "decode",
             RowKind::Verify => "verify",
+            RowKind::Denoise => "token denoising",
         };
         classes.push(format!(
             "rows {}..{} {kind}",
@@ -3773,6 +3774,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             // same, so the graph a serving batch with adjustments replays is this one.
             adjustments: ipc::execution::LogitAdjustments::default(),
             fresh_slots: Vec::new(),
+            block_steps: Vec::new(),
         };
         self.staging
             .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)
@@ -4387,6 +4389,7 @@ mod tests {
             vision: Vec::new(),
             adjustments: ipc::execution::LogitAdjustments::default(),
             fresh_slots: Vec::new(),
+            block_steps: Vec::new(),
         }
     }
 
@@ -4419,6 +4422,7 @@ mod tests {
             vision: Vec::new(),
             adjustments: ipc::execution::LogitAdjustments::default(),
             fresh_slots: Vec::new(),
+            block_steps: Vec::new(),
         }
     }
 
@@ -4555,6 +4559,7 @@ mod tests {
             vision: Vec::new(),
             adjustments: ipc::execution::LogitAdjustments::default(),
             fresh_slots: Vec::new(),
+            block_steps: Vec::new(),
         };
         columns.input_ids.truncate(count);
         staging.stage(

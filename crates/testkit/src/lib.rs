@@ -22,7 +22,8 @@ pub mod service;
 pub mod text;
 
 pub use batches::{
-    Accepted, Answer, Extent, FakeBatches, Operate, SAMPLED, Tokens, completed, draw_token,
+    Accepted, Answer, Extent, FakeBatches, Operate, SAMPLED, Tokens, block_stop_step, completed,
+    draw_token,
 };
 pub use media::Media;
 pub use policy::{packaged_module, packaged_policy, packaged_program};

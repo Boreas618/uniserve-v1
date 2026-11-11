@@ -1,40 +1,39 @@
-//! Block-diffusion text generation on the GPU-free simulator.
+//! Block-diffusion text generation over the fake at the batch interface.
 //!
-//! A canvas-generating request prefills its prompt without sampling, then
-//! generates text one block at a time: token-denoising steps run on the
-//! worker-resident canvas of the block until a step stops it and reports the
+//! A request of a deployment that generates in blocks prefills its prompt
+//! without sampling, then generates text one block at a time: token-denoising
+//! steps run on the block the rank holds until a step stops it and reports the
 //! block's tokens, which are published and, unless they end the request,
-//! committed to the context by a causal prefill before the next block
-//! starts. The simulator stops block `b` of request `r` at step
-//! `sim_canvas_stop_step(r, b, max_steps)` and fills it with the synthetic
-//! text `sim_text_token(r, i)` followed by EOS, so the expected output is
-//! known exactly. A step may be queued behind the one still in flight,
-//! predicated on its completion; behind the step that stops the block it is
-//! a no-op. Tests observe calls at the worker boundary, the protocol the
-//! worker consumes.
+//! committed to the context by a causal prefill before the next block starts.
+//! The fake stops block `b` of a request at step
+//! `testkit::block_stop_step(key, b, MAX_STEPS)` and fills it with the
+//! request's text, `testkit::draw_token` at each logical position, followed by
+//! EOS, so the expected output is known exactly. A step may be queued behind
+//! the one still in flight; behind the step that stops the block it computes
+//! nothing. Cases observe the events a request publishes and the batches the
+//! fake accepts.
 
 use crate::support;
+use crate::support::fake::Pacer;
 
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ipc::{Call, CallKind, ForwardMode};
+use ipc::execution::{Batch, BatchId, RowKind, Variant};
+use ipc::{CallKind, ForwardMode};
 use ipc::{CanvasSampling, RequestId, SamplingParams};
-use scheduler::{
-    BatchEvent, CommandSender, EventRx, ExecutionBatch, SchedulerConfig, SimEngine, SimWorker,
-    sim_canvas_stop_step, sim_text_token,
-};
-use scheduler::{
-    CachePolicy, Event, FinishReason, GenerationRequest, MultimodalInputs, RejectionKind,
-};
+use scheduler::{CachePolicy, Event, FinishReason, GenerationRequest, MultimodalInputs};
+use scheduler::{CommandSender, EventRx, RejectionKind, SchedulerConfig};
+use testkit::{Accepted, FakeBatches};
 
 /// Tokens of one block.
-const CANVAS: u32 = 16;
+const BLOCK: u32 = 16;
 /// Denoising steps a block runs at most.
 const MAX_STEPS: u32 = 4;
 /// The block-diffusion sampling the deployment is launched with.
 const SAMPLING: CanvasSampling = CanvasSampling {
-    canvas_length: CANVAS,
+    canvas_length: BLOCK,
     max_steps: MAX_STEPS,
     entropy_bound: 0.1,
     t_min: 0.4,
@@ -44,7 +43,7 @@ const SAMPLING: CanvasSampling = CanvasSampling {
 };
 
 /// A scheduler configuration of the deployment that generates `SAMPLING`
-/// canvases.
+/// blocks.
 fn config() -> SchedulerConfig {
     SchedulerConfig {
         canvas: Some(SAMPLING),
@@ -52,33 +51,20 @@ fn config() -> SchedulerConfig {
     }
 }
 
-/// A block-diffusion worker with 16-token cache pages whose synthetic text
-/// holds `text_len` tokens before EOS.
-fn worker(text_len: usize) -> SimEngine {
-    let mut sim = SimEngine::new();
-    sim.mut_info_for_test().supported_calls = vec![
-        CallKind::Forward(ForwardMode::Prefill),
-        CallKind::Forward(ForwardMode::TokenDenoising),
-    ];
-    sim.set_block_size(16);
-    sim.set_text_len(text_len);
-    sim.set_canvas_sampling(SAMPLING);
-    sim
-}
-
 /// A block-diffusion deployment over `testkit::FakeBatches`: one rank that
-/// prefills prompts and denoises canvases, with 16-token cache pages.
-///
-/// A token-denoising call has no device layout in the column writer, so a
-/// case over this fake observes what the mechanism decides before a canvas
-/// step: its start and a request's admission.
-fn canvas_fake() -> std::sync::Arc<dyn ipc::execution::Batches> {
-    let mut pool = support::pool("sim");
+/// prefills prompts and denoises blocks, with 16-token cache pages and
+/// `queue_depth` batches in flight and as many unresolved calls a request,
+/// whose requests' text holds `text_len` tokens before EOS.
+fn fake(text_len: u64, queue_depth: usize) -> Arc<FakeBatches> {
+    let mut pool = support::pool("model");
+    pool.layout.queue_depth = queue_depth;
     for rank in &mut pool.ranks {
         rank.supported_calls = vec![
             CallKind::Forward(ForwardMode::Prefill),
             CallKind::Forward(ForwardMode::TokenDenoising),
         ];
+        // A request may have as many calls unresolved as the device queues batches.
+        rank.max_unresolved_calls = queue_depth as u32;
         for group in rank
             .prefix_cache
             .iter_mut()
@@ -87,16 +73,21 @@ fn canvas_fake() -> std::sync::Arc<dyn ipc::execution::Batches> {
             group.block_size = 16;
         }
     }
-    std::sync::Arc::new(testkit::FakeBatches::new(vec![pool]))
+    Arc::new(
+        FakeBatches::new(vec![pool])
+            .with_text_len(text_len)
+            .with_block_steps(MAX_STEPS),
+    )
 }
 
-fn canvas_request(request_id: u64, prompt_len: u32, max_tokens: usize) -> GenerationRequest {
+fn block_request(request_id: u64, prompt_len: u32, max_tokens: usize) -> GenerationRequest {
     GenerationRequest {
         request_id: RequestId(request_id),
         prompt_token_ids: (0..prompt_len).map(|index| 1_000 + index).collect(),
         multimodal_inputs: MultimodalInputs::default(),
         sampling: SamplingParams {
-            seed: Some(7),
+            // Each request names a seed of its own, so each draws its own stream.
+            seed: Some(request_id),
             ..SamplingParams::default()
         },
         max_und_tokens: max_tokens,
@@ -110,26 +101,42 @@ fn canvas_request(request_id: u64, prompt_len: u32, max_tokens: usize) -> Genera
     }
 }
 
-/// A block-diffusion scheduler running on its own thread, with the batches
-/// its worker accepts.
+/// The Philox stream of request `id`, which states its id as its seed: what
+/// the fake's text and stopping steps follow. A seeded request's stream is a
+/// function of its seed alone.
+fn stream(id: u64) -> u64 {
+    ipc::philox::request_sampling_key(Some(id), 0, 0, 0)
+}
+
+/// Tokens `range` of the text of the request on stream `key` whose prompt
+/// holds `prompt` tokens.
+fn text(key: u64, prompt: u64, range: std::ops::Range<u64>) -> Vec<u32> {
+    range
+        .map(|index| {
+            testkit::draw_token(ipc::philox::DrawAddress {
+                key,
+                position: prompt + index,
+            })
+        })
+        .collect()
+}
+
+/// A block-diffusion scheduler over a fake, running on its own thread.
 struct Running {
+    fake: Arc<FakeBatches>,
     handle: CommandSender,
-    batches: crossbeam_channel::Receiver<BatchEvent>,
     thread: thread::JoinHandle<bool>,
 }
 
 impl Running {
-    fn start(sim: SimEngine, config: SchedulerConfig) -> Self {
-        let mut worker = SimWorker::new(sim);
-        let batches = worker.observe();
-        let scheduler =
-            support::scheduler_with(Box::new(worker), SimEngine::special_tokens(), config).unwrap();
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = CommandSender::new(tx);
-        let thread = thread::spawn(move || scheduler.run(rx));
+    fn start(fake: Arc<FakeBatches>, config: SchedulerConfig) -> Self {
+        let batches: Arc<dyn ipc::execution::Batches> = Arc::clone(&fake) as _;
+        let scheduler = support::fake::scheduler_over(batches, config, Default::default())
+            .expect("the fake serves block diffusion");
+        let (handle, thread) = support::fake::spawn(scheduler);
         Self {
+            fake,
             handle,
-            batches,
             thread,
         }
     }
@@ -138,23 +145,12 @@ impl Running {
         self.handle.submit(request).unwrap()
     }
 
-    /// Stops the scheduler and returns every batch it submitted, in order.
-    fn stop(self) -> Vec<ExecutionBatch> {
-        self.stop_events()
-            .into_iter()
-            .filter_map(|event| match event {
-                BatchEvent::Submitted(batch) => Some(batch),
-                BatchEvent::Resolved { .. } => None,
-            })
-            .collect()
-    }
-
-    /// Stops the scheduler and returns its worker's submissions and
-    /// resolutions, in order.
-    fn stop_events(self) -> Vec<BatchEvent> {
+    /// Stops the scheduler and returns every batch its fake accepted, in
+    /// order, each with the batches in flight when it was accepted.
+    fn stop(self) -> Vec<Accepted> {
         self.handle.shutdown();
         assert!(!self.thread.join().unwrap(), "the scheduler failed");
-        self.batches.try_iter().collect()
+        self.fake.accepted()
     }
 }
 
@@ -192,7 +188,7 @@ fn published_blocks(events: &[Event]) -> Vec<Vec<u32>> {
         !events
             .iter()
             .any(|event| matches!(event, Event::TextToken { .. })),
-        "canvas text is published by block: {events:?}"
+        "block text is published by block: {events:?}"
     );
     events
         .iter()
@@ -214,85 +210,107 @@ fn finish_of(events: &[Event]) -> (FinishReason, usize) {
     }
 }
 
-/// The calls of one request in submission order.
-fn calls_of(batches: &[ExecutionBatch], request: u64) -> Vec<(Call, crate::support::CallRows)> {
-    batches
+/// The denoising steps `batch` runs for the request on stream `key`: each
+/// step's block and step.
+fn steps_of(batch: &Batch, key: u64) -> Vec<(u32, u32)> {
+    if batch.shape.variant != Variant::TokenDenoise {
+        return Vec::new();
+    }
+    let columns = &batch.columns;
+    columns
+        .rows
+        .calls
         .iter()
-        .flat_map(|batch| {
-            batch
-                .requests
-                .iter()
-                .enumerate()
-                .map(move |(index, (call, _))| (call, crate::support::rows_of(batch, index)))
-        })
-        .filter(|(call, _)| call.request_key.request_id == RequestId(request))
-        .map(|(call, rows)| (call.clone(), rows))
+        .zip(&columns.block_steps)
+        .filter(|(call, _)| columns.draws[call.rows.start as usize].key == key)
+        .map(|(_, step)| (step.block, step.step))
         .collect()
 }
 
-fn text(request: u64, range: std::ops::Range<usize>) -> Vec<u32> {
-    range
-        .map(|index| sim_text_token(RequestId(request), index))
+/// The logical position each prefill call of `batch` starts at, for the
+/// request on stream `key`.
+fn prefill_starts(batch: &Batch, key: u64) -> Vec<u32> {
+    let columns = &batch.columns;
+    columns
+        .rows
+        .calls
+        .iter()
+        .filter(|call| {
+            call.kind == RowKind::Prefill && columns.draws[call.rows.start as usize].key == key
+        })
+        .map(|call| {
+            let first_token = columns.rows.query_offsets[call.rows.start as usize] as usize;
+            columns.rows.positions[first_token] as u32
+        })
         .collect()
+}
+
+/// The accepted batch running step `step` of block `block` of the request on
+/// stream `key`.
+fn step_batch(accepted: &[Accepted], key: u64, block: u32, step: u32) -> &Accepted {
+    accepted
+        .iter()
+        .find(|accepted| steps_of(&accepted.batch, key).contains(&(block, step)))
+        .unwrap_or_else(|| panic!("block {block} ran no step {step}"))
+}
+
+/// The place of batch `id` in the order the fake accepted batches.
+fn order(accepted: &[Accepted], id: BatchId) -> usize {
+    accepted
+        .iter()
+        .position(|accepted| accepted.batch.id == id)
+        .expect("the batch was accepted")
 }
 
 /// With room for two batches in flight, each step of a block is queued
-/// before the step it follows resolves, predicated on that step's
-/// completion. The step behind the one that stops the block is a no-op, and
-/// the commit is queued behind it; the published text is unchanged.
+/// before the step it follows completes. The step behind the one that stops
+/// the block computes nothing; the published text is unchanged.
 #[test]
 fn a_blocks_steps_are_queued_behind_the_step_in_flight() {
-    let mut sim = worker(40);
-    sim.set_queue_depth(2);
-    sim.set_results_on_wait(true);
-    let running = Running::start(sim, config());
-    let answer = events(running.submit(canvas_request(5, 24, 1_000)));
-    let history = running.stop_events();
+    let fake = fake(40, 2);
+    let pacer = Pacer::start(&fake, Duration::from_millis(20));
+    let running = Running::start(fake, config());
+    let key = stream(5);
+    let answer = events(running.submit(block_request(5, 24, 1_000)));
+    drop(pacer);
+    let accepted = running.stop();
 
     assert_eq!(
         published_blocks(&answer),
-        vec![text(5, 0..16), text(5, 16..32), text(5, 32..40)]
+        vec![
+            text(key, 24, 0..16),
+            text(key, 24, 16..32),
+            text(key, 24, 32..40)
+        ]
     );
     assert_eq!(finish_of(&answer), (FinishReason::Eos, 41));
 
-    // Each canvas step with its batch's submission and resolution indices.
-    let mut submitted = std::collections::HashMap::new();
-    let mut resolved = std::collections::HashMap::new();
-    let mut steps = Vec::new();
-    for (index, event) in history.iter().enumerate() {
-        match event {
-            BatchEvent::Submitted(batch) => {
-                submitted.insert(batch.id, index);
-                for (call, _) in &batch.requests {
-                    if let Some(step) = call.canvas {
-                        steps.push((batch.id, step.block, step.step, call.predicate.is_some()));
-                    }
-                }
-            }
-            BatchEvent::Resolved { batch_id } => {
-                resolved.insert(*batch_id, index);
-            }
-        }
-    }
     for block in 0..3u32 {
-        let stop = sim_canvas_stop_step(RequestId(5), block, MAX_STEPS);
-        let block_steps: Vec<_> = steps.iter().filter(|step| step.1 == block).collect();
+        let stop = testkit::block_stop_step(key, block, MAX_STEPS);
+        let steps: Vec<(&Accepted, u32)> = accepted
+            .iter()
+            .flat_map(|accepted| {
+                steps_of(&accepted.batch, key)
+                    .into_iter()
+                    .filter(|step| step.0 == block)
+                    .map(move |step| (accepted, step.1))
+            })
+            .collect();
         // Every step up to the stopping one runs, in order, and at most one
         // more is queued behind it within the step limit.
         let expected_last = (stop + 1).min(MAX_STEPS - 1);
         assert_eq!(
-            block_steps.iter().map(|step| step.2).collect::<Vec<_>>(),
+            steps.iter().map(|step| step.1).collect::<Vec<_>>(),
             (0..=expected_last).collect::<Vec<_>>(),
             "block {block}"
         );
-        for pair in block_steps.windows(2) {
-            let (previous, next) = (pair[0], pair[1]);
-            assert!(next.3, "a queued step carries its predicate");
+        for pair in steps.windows(2) {
+            let (previous, next) = (&pair[0], &pair[1]);
             assert!(
-                submitted[&next.0] < resolved[&previous.0],
+                next.0.in_flight.contains(&previous.0.batch.id),
                 "step {} of block {block} waited for step {}",
-                next.2,
-                previous.2
+                next.1,
+                previous.1
             );
         }
     }
@@ -300,58 +318,44 @@ fn a_blocks_steps_are_queued_behind_the_step_in_flight() {
 
 /// With room for two batches in flight, each block's first step is queued
 /// behind the prefill that completes its context, the prompt's last chunk
-/// or the previous block's commit, before that prefill resolves; the
+/// or the previous block's commit, before that prefill completes; the
 /// published text is unchanged.
 #[test]
 fn a_blocks_first_step_is_queued_behind_the_prefill_before_it() {
-    let mut sim = worker(40);
-    sim.set_queue_depth(2);
-    sim.set_results_on_wait(true);
-    let running = Running::start(sim, config());
-    let answer = events(running.submit(canvas_request(6, 24, 1_000)));
-    let history = running.stop_events();
+    let fake = fake(40, 2);
+    let pacer = Pacer::start(&fake, Duration::from_millis(20));
+    let running = Running::start(fake, config());
+    let key = stream(6);
+    let answer = events(running.submit(block_request(6, 24, 1_000)));
+    drop(pacer);
+    let accepted = running.stop();
 
     assert_eq!(
         published_blocks(&answer),
-        vec![text(6, 0..16), text(6, 16..32), text(6, 32..40)]
+        vec![
+            text(key, 24, 0..16),
+            text(key, 24, 16..32),
+            text(key, 24, 32..40)
+        ]
     );
     assert_eq!(finish_of(&answer), (FinishReason::Eos, 41));
 
-    // Each call with its batch, in submission order, and the index of each
-    // batch's resolution.
-    let mut calls = Vec::new();
-    let mut submitted = std::collections::HashMap::new();
-    let mut resolved = std::collections::HashMap::new();
-    for (index, event) in history.iter().enumerate() {
-        match event {
-            BatchEvent::Submitted(batch) => {
-                submitted.insert(batch.id, index);
-                calls.extend(
-                    batch
-                        .requests
-                        .iter()
-                        .map(|(call, _)| (batch.id, call.clone())),
-                );
-            }
-            BatchEvent::Resolved { batch_id } => {
-                resolved.insert(*batch_id, index);
-            }
-        }
-    }
     let mut first_steps = 0;
-    for (position, (batch, call)) in calls.iter().enumerate() {
-        if call.canvas.is_none_or(|step| step.step != 0) {
+    for (position, step) in accepted.iter().enumerate() {
+        let Some((block, _)) = steps_of(&step.batch, key)
+            .into_iter()
+            .find(|step| step.1 == 0)
+        else {
             continue;
-        }
-        let (prefill_batch, _) = calls[..position]
+        };
+        let prefill = accepted[..position]
             .iter()
             .rev()
-            .find(|(_, earlier)| earlier.kind == CallKind::Forward(ForwardMode::Prefill))
-            .unwrap();
+            .find(|earlier| !prefill_starts(&earlier.batch, key).is_empty())
+            .expect("a prefill precedes every block");
         assert!(
-            submitted[batch] < resolved[prefill_batch],
-            "step zero of block {} waited for the prefill before it",
-            call.canvas.unwrap().block
+            step.in_flight.contains(&prefill.batch.id),
+            "step zero of block {block} waited for the prefill before it"
         );
         first_steps += 1;
     }
@@ -359,78 +363,51 @@ fn a_blocks_first_step_is_queued_behind_the_prefill_before_it() {
 }
 
 /// With room for two batches in flight, a stopped block's commit is queued
-/// as soon as the step that stopped the block resolves: behind the no-op
-/// step still in flight, which the commit does not wait for, so it carries
-/// no predicate. The next block starts from step zero behind the commit, and
-/// the published text is unchanged.
+/// as soon as the step that stopped the block completes: behind the step
+/// still in flight that computes nothing, which the commit does not wait
+/// for. The next block starts from step zero behind the commit, and the
+/// published text is unchanged.
 #[test]
-fn a_blocks_commit_is_queued_behind_its_no_op_step() {
-    let mut sim = worker(40);
-    sim.set_queue_depth(2);
-    sim.set_results_on_wait(true);
-    let running = Running::start(sim, config());
-    let answer = events(running.submit(canvas_request(7, 24, 1_000)));
-    let history = running.stop_events();
+fn a_blocks_commit_is_queued_behind_the_step_that_computes_nothing() {
+    let fake = fake(40, 2);
+    let pacer = Pacer::start(&fake, Duration::from_millis(20));
+    let running = Running::start(fake, config());
+    let key = stream(7);
+    let answer = events(running.submit(block_request(7, 24, 1_000)));
+    drop(pacer);
+    let accepted = running.stop();
 
     assert_eq!(
         published_blocks(&answer),
-        vec![text(7, 0..16), text(7, 16..32), text(7, 32..40)]
+        vec![
+            text(key, 24, 0..16),
+            text(key, 24, 16..32),
+            text(key, 24, 32..40)
+        ]
     );
     assert_eq!(finish_of(&answer), (FinishReason::Eos, 41));
 
-    // Each call with its batch, in submission order, and the index of each
-    // batch's submission and resolution.
-    let mut calls = Vec::new();
-    let mut submitted = std::collections::HashMap::new();
-    let mut resolved = std::collections::HashMap::new();
-    for (index, event) in history.iter().enumerate() {
-        match event {
-            BatchEvent::Submitted(batch) => {
-                submitted.insert(batch.id, index);
-                calls.extend(
-                    batch
-                        .requests
-                        .iter()
-                        .map(|(call, _)| (batch.id, call.clone())),
-                );
-            }
-            BatchEvent::Resolved { batch_id } => {
-                resolved.insert(*batch_id, index);
-            }
-        }
-    }
-    let step_batch = |block: u32, step: u32| {
-        calls
-            .iter()
-            .find(|(_, call)| {
-                call.canvas
-                    .is_some_and(|at| (at.block, at.step) == (block, step))
-            })
-            .map(|(batch, _)| *batch)
-            .unwrap_or_else(|| panic!("block {block} ran no step {step}"))
-    };
-    let commits: Vec<_> = calls
+    // A commit is a prefill that starts at or after the prompt's end.
+    let commits: Vec<&Accepted> = accepted
         .iter()
-        .filter(|(_, call)| {
-            call.kind == CallKind::Forward(ForwardMode::Prefill)
-                && call.coordinates.cache_visible_len >= 24
+        .filter(|accepted| {
+            prefill_starts(&accepted.batch, key)
+                .iter()
+                .any(|start| *start >= 24)
         })
         .collect();
     assert_eq!(commits.len(), 2);
-    for (block, (commit_batch, commit)) in (0u32..).zip(commits) {
-        let stop = sim_canvas_stop_step(RequestId(7), block, MAX_STEPS);
-        assert!(stop + 1 < MAX_STEPS, "block {block} queues a no-op step");
-        let no_op_batch = step_batch(block, stop + 1);
+    for (block, commit) in (0u32..).zip(commits) {
+        let stop = testkit::block_stop_step(key, block, MAX_STEPS);
+        assert!(stop + 1 < MAX_STEPS, "block {block} queues a step behind");
+        let behind = step_batch(&accepted, key, block, stop + 1);
         assert!(
-            submitted[commit_batch] < resolved[&no_op_batch],
-            "the commit of block {block} waited for the no-op step behind step {stop}"
+            commit.in_flight.contains(&behind.batch.id),
+            "the commit of block {block} waited for the step behind step {stop}"
         );
+        let next = step_batch(&accepted, key, block + 1, 0);
         assert!(
-            commit.predicate.is_none(),
-            "the commit of block {block} runs whatever the no-op step reports"
-        );
-        assert!(
-            submitted[&step_batch(block + 1, 0)] > submitted[commit_batch],
+            order(&accepted, next.batch.id) > order(&accepted, commit.batch.id),
             "block {} starts behind the commit of block {block}",
             block + 1
         );
@@ -438,32 +415,51 @@ fn a_blocks_commit_is_queued_behind_its_no_op_step() {
 }
 
 /// A request whose last block stops before its step limit publishes its
-/// terminal event once that step resolves, while the no-op step queued
-/// behind it is still running; only the request's retirement waits for it.
+/// terminal event once that step completes, while the step queued behind it
+/// is still on the device; only the request's retirement waits for it.
 #[test]
-fn the_terminal_event_does_not_wait_for_the_no_op_step() {
-    let mut sim = worker(1_000);
-    sim.set_queue_depth(2);
-    sim.set_results_on_wait(true);
-    let release = sim.hold_predicated_batches();
-    let running = Running::start(sim, config());
+fn the_terminal_event_does_not_wait_for_the_step_behind_it() {
+    let fake = fake(1_000, 2);
+    fake.hold();
+    let running = Running::start(Arc::clone(&fake), config());
+    let key = stream(8);
+    let stop = testkit::block_stop_step(key, 0, MAX_STEPS);
     // One block: the completion limit ends the request at the block's end.
-    let receiver = running.submit(canvas_request(8, 24, CANVAS as usize));
-    let answer = events_within(receiver, Duration::from_secs(5));
-    drop(release);
-    let batches = running.stop();
+    let mut receiver = running.submit(block_request(8, 24, BLOCK as usize));
 
-    assert_eq!(published_blocks(&answer), vec![text(8, 0..16)]);
+    // Every batch completes in order but the step behind the stopping one,
+    // which stays on the device.
+    let mut answer = Vec::new();
+    let mut released = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(answer.last(), Some(Event::Finished { .. })) {
+        assert!(Instant::now() < deadline, "no terminal event: {answer:?}");
+        while let Ok(event) = receiver.try_recv() {
+            answer.push(event);
+        }
+        if let Some(next) = fake.accepted().get(released)
+            && !steps_of(&next.batch, key).contains(&(0, stop + 1))
+        {
+            fake.release(1);
+            released += 1;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fake.held(), 1, "the step behind is still on the device");
+    fake.resume();
+    let accepted = running.stop();
+
+    assert_eq!(published_blocks(&answer), vec![text(key, 24, 0..16)]);
     assert_eq!(finish_of(&answer), (FinishReason::MaxTokens, 16));
-    let stop = sim_canvas_stop_step(RequestId(8), 0, MAX_STEPS);
-    let steps: Vec<_> = calls_of(&batches, 8)
+    let steps: Vec<u32> = accepted
         .iter()
-        .filter_map(|(call, _)| call.canvas.map(|step| step.step))
+        .flat_map(|accepted| steps_of(&accepted.batch, key))
+        .map(|step| step.1)
         .collect();
     assert_eq!(
         steps,
         (0..=stop + 1).collect::<Vec<_>>(),
-        "a no-op step was queued behind the step that stopped the block"
+        "a step was queued behind the step that stopped the block"
     );
 }
 
@@ -471,21 +467,20 @@ fn the_terminal_event_does_not_wait_for_the_no_op_step() {
 /// follows.
 #[test]
 fn the_completion_limit_truncates_inside_a_block() {
-    let running = Running::start(worker(1_000), config());
-    let answer = events(running.submit(canvas_request(2, 8, 20)));
-    let batches = running.stop();
+    let running = Running::start(fake(1_000, 1), config());
+    let key = stream(2);
+    let answer = events(running.submit(block_request(2, 8, 20)));
+    let accepted = running.stop();
 
     assert_eq!(
         published_blocks(&answer),
-        vec![text(2, 0..16), text(2, 16..20)]
+        vec![text(key, 8, 0..16), text(key, 8, 16..20)]
     );
     assert_eq!(finish_of(&answer), (FinishReason::MaxTokens, 20));
-    let commits = calls_of(&batches, 2)
-        .into_iter()
-        .filter(|(call, _)| {
-            call.kind == CallKind::Forward(ForwardMode::Prefill)
-                && call.coordinates.cache_visible_len > 0
-        })
+    let commits = accepted
+        .iter()
+        .flat_map(|accepted| prefill_starts(&accepted.batch, key))
+        .filter(|start| *start >= 8)
         .count();
     assert_eq!(commits, 1, "only the first block is committed");
 }
@@ -494,11 +489,12 @@ fn the_completion_limit_truncates_inside_a_block() {
 /// when the request includes stop tokens in its output.
 #[test]
 fn a_stop_token_ends_the_request_inside_its_block() {
-    let running = Running::start(worker(1_000), config());
-    let mut excluded = canvas_request(3, 8, 1_000);
-    excluded.stop_token_ids = vec![sim_text_token(RequestId(3), 21)];
-    let mut included = canvas_request(4, 8, 1_000);
-    included.stop_token_ids = vec![sim_text_token(RequestId(4), 5)];
+    let running = Running::start(fake(1_000, 1), config());
+    let (excluded_key, included_key) = (stream(3), stream(4));
+    let mut excluded = block_request(3, 8, 1_000);
+    excluded.stop_token_ids = text(excluded_key, 8, 21..22);
+    let mut included = block_request(4, 8, 1_000);
+    included.stop_token_ids = text(included_key, 8, 5..6);
     included.include_stop_token = true;
     let excluded_answer = events(running.submit(excluded));
     let included_answer = events(running.submit(included));
@@ -506,43 +502,41 @@ fn a_stop_token_ends_the_request_inside_its_block() {
 
     assert_eq!(
         published_blocks(&excluded_answer),
-        vec![text(3, 0..16), text(3, 16..21)]
+        vec![text(excluded_key, 8, 0..16), text(excluded_key, 8, 16..21)]
     );
     assert_eq!(finish_of(&excluded_answer).0, FinishReason::Stop);
-    assert_eq!(published_blocks(&included_answer), vec![text(4, 0..6)]);
+    assert_eq!(
+        published_blocks(&included_answer),
+        vec![text(included_key, 8, 0..6)]
+    );
     assert_eq!(finish_of(&included_answer).0, FinishReason::Stop);
 }
 
-/// A canvas step and a block commit each need a whole canvas of one step's
-/// token budget, so a deployment whose canvas is longer than the budget
+/// A denoising step and a block commit each need a whole block of one step's
+/// token budget, so a deployment whose block is longer than the budget
 /// fails to start.
 #[test]
-fn a_canvas_beyond_the_step_budget_fails_to_start() {
+fn a_block_beyond_the_step_budget_fails_to_start() {
     let config = SchedulerConfig {
         max_num_batched_tokens: 8,
         chunked_prefill_size: std::num::NonZeroUsize::new(8),
         ..config()
     };
-    let error = support::fake::scheduler_over(canvas_fake(), config, Default::default())
+    let error = support::fake::scheduler_over(fake(40, 1), config, Default::default())
         .err()
-        .expect("a 16-token canvas exceeds an 8-token step budget");
+        .expect("a 16-token block exceeds an 8-token step budget");
     assert!(error.to_string().contains("step budget"), "{error}");
 }
 
-/// A canvas-generating request names the seed its draws follow.
+/// A request of a deployment that generates in blocks names the seed its
+/// draws follow.
 #[test]
-fn an_unseeded_canvas_request_is_refused() {
-    let scheduler =
-        support::fake::scheduler_over(canvas_fake(), config(), Default::default()).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = CommandSender::new(tx);
-    let mut request = canvas_request(6, 8, 64);
+fn an_unseeded_block_request_is_refused() {
+    let running = Running::start(fake(40, 1), config());
+    let mut request = block_request(6, 8, 64);
     request.sampling.seed = None;
-    let events_rx = handle.submit(request).unwrap();
-    let thread = thread::spawn(move || scheduler.run(rx));
-    let answer = events(events_rx);
-    handle.shutdown();
-    assert!(!thread.join().unwrap(), "the scheduler failed");
+    let answer = events(running.submit(request));
+    running.stop();
 
     assert!(
         matches!(
@@ -561,64 +555,62 @@ fn an_unseeded_canvas_request_is_refused() {
 /// next step is ready at every pass.
 #[test]
 fn a_waiting_prompt_is_prefilled_while_a_block_denoises() {
-    let mut sim = worker(1_000);
-    sim.set_queue_depth(1);
-    sim.set_results_on_wait(true);
     let config = SchedulerConfig {
         max_num_batched_tokens: 64,
         chunked_prefill_size: std::num::NonZeroUsize::new(64),
         ..config()
     };
-    // Both requests are queued before the scheduler starts, so the first
-    // pass prefills the short prompt and the start of the long one. Request
-    // 2's block stops at its third step, and it generates one block.
-    let generating = canvas_request(2, 16, CANVAS as usize);
-    assert_eq!(sim_canvas_stop_step(RequestId(2), 0, MAX_STEPS), 2);
-    let waiting = canvas_request(3, 200, CANVAS as usize);
-    let mut worker = SimWorker::new(sim);
-    let observed = worker.observe();
-    let scheduler =
-        support::scheduler_with(Box::new(worker), SimEngine::special_tokens(), config).unwrap();
+    // The generating request's block stops at its third step, and it
+    // generates one block.
+    let generating_id = (1u64..)
+        .find(|id| testkit::block_stop_step(stream(*id), 0, MAX_STEPS) == 2)
+        .expect("some request's first block stops at its third step");
+    let waiting_id = generating_id + 1;
+    let (generating_key, waiting_key) = (stream(generating_id), stream(waiting_id));
+
+    // Both requests are waiting before the scheduler starts, so the first
+    // pass prefills the short prompt and the start of the long one.
+    let fake = fake(1_000, 1);
+    let batches: Arc<dyn ipc::execution::Batches> = Arc::clone(&fake) as _;
+    let scheduler = support::fake::scheduler_over(batches, config, Default::default()).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
-    let generating_events = handle.submit(generating).unwrap();
-    let waiting_events = handle.submit(waiting).unwrap();
+    let generating_events = handle
+        .submit(block_request(generating_id, 16, BLOCK as usize))
+        .unwrap();
+    let waiting_events = handle
+        .submit(block_request(waiting_id, 200, BLOCK as usize))
+        .unwrap();
     let thread = thread::spawn(move || scheduler.run(rx));
     assert_eq!(
         published_blocks(&events(generating_events)),
-        vec![text(2, 0..16)]
+        vec![text(generating_key, 16, 0..16)]
     );
     assert_eq!(
         published_blocks(&events(waiting_events)),
-        vec![text(3, 0..16)]
+        vec![text(waiting_key, 200, 0..16)]
     );
     handle.shutdown();
     assert!(!thread.join().unwrap());
 
-    // The index of the first submitted batch that holds a call matching
-    // `select`.
-    let batches: Vec<ExecutionBatch> = observed
-        .try_iter()
-        .filter_map(|event| match event {
-            BatchEvent::Submitted(batch) => Some(batch),
-            BatchEvent::Resolved { .. } => None,
+    let accepted = fake.accepted();
+    // The batch whose prefill reaches the end of the long prompt: its last
+    // row sees all 200 prompt tokens.
+    let prompt_done = accepted
+        .iter()
+        .position(|accepted| {
+            let columns = &accepted.batch.columns;
+            columns.rows.calls.iter().any(|call| {
+                call.kind == RowKind::Prefill
+                    && columns.draws[call.rows.start as usize].key == waiting_key
+                    && columns.rows.seq_lens[call.rows.end as usize - 1] == 200
+            })
         })
-        .collect();
-    let first = |select: &dyn Fn(&Call) -> bool| {
-        batches
-            .iter()
-            .position(|batch| batch.requests.iter().any(|(call, _)| select(call)))
-            .unwrap()
-    };
-    let prompt_done = first(&|call: &Call| {
-        call.request_key.request_id == RequestId(3)
-            && call.kind == CallKind::Forward(ForwardMode::Prefill)
-            && call.coordinates.cache_visible_len + call.input_token_ids.len() as u32 == 200
-    });
-    let block_stopped = first(&|call: &Call| {
-        call.request_key.request_id == RequestId(2)
-            && call.canvas.is_some_and(|step| step.step == 2)
-    });
+        .expect("the long prompt is prefilled");
+    let block_stopped = order(
+        &accepted,
+        step_batch(&accepted, generating_key, 0, 2).batch.id,
+    );
     assert!(
         prompt_done < block_stopped,
         "the long prompt finished prefilling in batch {prompt_done}, after the block \

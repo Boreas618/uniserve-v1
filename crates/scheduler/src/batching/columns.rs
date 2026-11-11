@@ -143,16 +143,16 @@ impl CallLayout {
 /// token batch does not carry.
 ///
 /// A media call's numerical extent is its own (`worker`'s media runners), and
-/// a transfer moves bytes: neither is a token row. `ForwardMode::TokenDenoising`
-/// likewise runs on the diffusion LM's canvas rather than on token rows, so it
-/// is not a token batch of this shape either — the media fold's batch is the
-/// one that carries it (`M521`, `M708` question 4).
+/// a transfer moves bytes: neither is a token row. A token-denoising call is
+/// one row over its request's block: it reads the request's cached context
+/// and writes no page.
 const fn row_kind(kind: CallKind) -> Option<RowKind> {
     match kind {
         CallKind::Forward(ForwardMode::Prefill) => Some(RowKind::Prefill),
         CallKind::Forward(ForwardMode::Decode) => Some(RowKind::Decode),
         CallKind::Forward(ForwardMode::Verify) => Some(RowKind::Verify),
-        _ => None,
+        CallKind::Forward(ForwardMode::TokenDenoising) => Some(RowKind::Denoise),
+        CallKind::Media(_) => None,
     }
 }
 
@@ -347,7 +347,13 @@ pub(crate) fn columns(
         // before the token it precedes.
         let first = call.coordinates.logical_position;
         let batch_token = u32::try_from(input_ids.len()).ok()?;
-        let context = Context::of(first, inputs, &call.vision_inputs, batch_token)?;
+        let context = if kind == RowKind::Denoise {
+            // The rank holds the block's tokens between its steps, so the row states the
+            // block's positions and no id: the embedding reads the resident block.
+            Context::block(first, tokens_of_call)?
+        } else {
+            Context::of(first, inputs, &call.vision_inputs, batch_token)?
+        };
         if usize::try_from(tokens_of_call).ok()? != context.ids.len() {
             return None;
         }
@@ -373,16 +379,23 @@ pub(crate) fn columns(
             .get(index)?
             .iter()
             .find(|table| table.group_id == 0)?;
-        let mapped = slots::slot_mapping_where(
-            table,
-            block_size,
-            cache_first..cache_first.checked_add(tokens_of_call)?,
-            |position| {
-                let offset = usize::try_from(position - cache_first).unwrap_or(usize::MAX);
-                writes.get(offset).copied().unwrap_or(false)
-            },
-        );
-        rows.slot_mapping.extend(mapped?);
+        if kind == RowKind::Denoise {
+            // A block lies past the request's cached context and is never written: no page
+            // of the table holds it.
+            rows.slot_mapping
+                .extend(std::iter::repeat_n(-1, tokens_of_call as usize));
+        } else {
+            let mapped = slots::slot_mapping_where(
+                table,
+                block_size,
+                cache_first..cache_first.checked_add(tokens_of_call)?,
+                |position| {
+                    let offset = usize::try_from(position - cache_first).unwrap_or(usize::MAX);
+                    writes.get(offset).copied().unwrap_or(false)
+                },
+            );
+            rows.slot_mapping.extend(mapped?);
+        }
 
         for row in &call_rows.rows {
             rows.seq_lens.push(i32::try_from(row.seq_len).ok()?);
@@ -515,15 +528,22 @@ pub(crate) fn columns(
         // a verification always do, and a prompt chunk does only when it is the
         // chunk that ends the prompt. `consumer_slots` is the worker's, filled
         // after this runs, so the mechanism's own answer is `token_output`.
-        let sampled = call.token_output.is_some();
+        //
+        // A denoising step installs no sampled token: the step that stops its block reports
+        // the block's tokens, which a later prefill commits to the cache.
+        let sampled = call.token_output.is_some() && kind != RowKind::Denoise;
         if matches!(kind, RowKind::Decode | RowKind::Verify) && !sampled {
+            return None;
+        }
+        if (kind == RowKind::Denoise) != call.canvas.is_some() {
             return None;
         }
         let mode = match kind {
             RowKind::Decode => commit::mode::DECODE,
             RowKind::Verify => commit::mode::VERIFY,
             RowKind::Prefill if sampled => commit::mode::EXPLICIT,
-            RowKind::Prefill => commit::mode::CACHE,
+            // A denoising step states the cache extent it reads, which it leaves as it is.
+            RowKind::Prefill | RowKind::Denoise => commit::mode::CACHE,
         };
         let explicit = mode == commit::mode::EXPLICIT;
         let verify = mode == commit::mode::VERIFY;
@@ -533,7 +553,7 @@ pub(crate) fn columns(
         // would write past its block table is a planning fault, not a clamp.
         let committed = match kind {
             RowKind::Decode => 1,
-            RowKind::Verify => 0,
+            RowKind::Verify | RowKind::Denoise => 0,
             RowKind::Prefill => call_rows
                 .rows
                 .iter()
@@ -558,7 +578,8 @@ pub(crate) fn columns(
         };
         // Every prefill states its cache extent, sampled or not; a decode and a
         // verification advance it on the device.
-        cells[commit::column::CACHE_LENGTH] = if matches!(kind, RowKind::Prefill) {
+        cells[commit::column::CACHE_LENGTH] = if matches!(kind, RowKind::Prefill | RowKind::Denoise)
+        {
             i64::from(length)
         } else {
             0
@@ -597,6 +618,15 @@ pub(crate) fn columns(
         for (column, value) in cells.iter().enumerate() {
             commit[column * row_count + row] = *value;
         }
+    }
+
+    // A batch denoises blocks or it does not: one batch is one phase.
+    let block_steps: Vec<ipc::CanvasStep> = requests
+        .iter()
+        .filter_map(|(call, _)| call.canvas)
+        .collect();
+    if !block_steps.is_empty() && block_steps.len() != requests.len() {
+        return None;
     }
 
     rows.query_offsets = slots::query_offsets(&queries)?;
@@ -658,6 +688,7 @@ pub(crate) fn columns(
             fresh_slots.dedup_by_key(|fresh| fresh.slot);
             fresh_slots
         },
+        block_steps,
     })
 }
 
@@ -676,6 +707,21 @@ struct Context {
 }
 
 impl Context {
+    /// The rows of a denoising step over a block of `tokens` tokens at logical position `first`:
+    /// the block's positions, and no id.
+    fn block(first: u32, tokens: u32) -> Option<Self> {
+        let end = first.checked_add(tokens)?;
+        Some(Self {
+            ids: vec![0; tokens as usize],
+            positions: (first..end)
+                .map(i32::try_from)
+                .collect::<Result<_, _>>()
+                .ok()?,
+            vision: Vec::new(),
+            end,
+        })
+    }
+
     /// The rows of a call at logical position `first` whose input tokens are `inputs` and whose
     /// image blocks are `blocks`, the call's first row being the batch's token `batch_token`.
     ///
@@ -748,7 +794,9 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> ipc::execution::Shape {
         .calls
         .iter()
         .any(|call| matches!(call.kind, RowKind::Prefill));
-    let variant = if prefill && columns.targets.iter().any(|target| *target >= 0) {
+    let variant = if !columns.block_steps.is_empty() {
+        Variant::TokenDenoise
+    } else if prefill && columns.targets.iter().any(|target| *target >= 0) {
         // Scoring projects every token of the bucket, so only a batch that scores pays for it.
         Variant::PrefillScored
     } else if prefill {
