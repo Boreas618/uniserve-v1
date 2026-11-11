@@ -6,6 +6,8 @@ pub mod checkpoint;
 pub mod collective;
 pub mod config;
 pub mod error;
+pub mod functional;
+pub mod modules;
 pub mod profiler;
 pub mod quantization;
 pub mod var_builder;
