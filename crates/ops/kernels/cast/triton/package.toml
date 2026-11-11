@@ -1,0 +1,46 @@
+# The cast operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# `out[i] = convert(x[i])` over an input read through its strides, into a
+# contiguous output of another element type: low bits between integers, a
+# truncation toward zero from a float into an integer, a rounding to nearest
+# even into a float. The two element types and the number of axes the call
+# traverses are compiled in; the shape and the strides are launch words. The key
+# is the one `Descriptor`'s `Display` prints, e.g.
+# `input_f32_output_bf16_rank_1_block_1024_pdl_false`.
+#
+# The two types differ: a conversion from a type to itself moves elements, which
+# is `copy_strided`, and the compile script refuses it.
+#
+# `src/strided.py` links the address arithmetic every tensor primitive shares,
+# under `kernels/tensor/triton/src/`; an installation copies the file the link
+# names.
+
+op = "cast"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/cast.py", "src/strided.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { input = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], output = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
+
+[parameters]

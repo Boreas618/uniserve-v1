@@ -66,6 +66,7 @@
 //! | [`elementwise::ElementwiseUnary`] | `elementwise_unary` | [`elementwise`] |
 //! | [`elementwise::ElementwiseBinary`] | `elementwise_binary` | [`elementwise`] |
 //! | [`elementwise::ElementwiseWhere`] | `elementwise_where` | [`elementwise`] |
+//! | [`cast::Cast`] | `cast` | [`cast`] |
 //!
 //! ## Descriptor keys
 //!
@@ -95,6 +96,7 @@ pub mod block_copy;
 #[cfg(test)]
 pub mod call_layout_check;
 pub mod capture;
+pub mod cast;
 pub mod channel_affine;
 pub mod commit;
 pub mod conv;

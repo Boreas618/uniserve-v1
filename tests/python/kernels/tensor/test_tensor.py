@@ -22,6 +22,7 @@ CHECKS = (
     "elementwise_unary_check.py",
     "elementwise_binary_check.py",
     "elementwise_where_check.py",
+    "cast_check.py",
 )
 
 
