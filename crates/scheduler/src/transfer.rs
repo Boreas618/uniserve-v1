@@ -1,11 +1,11 @@
-//! The prefill/decode hand-off: a request prefilled on a group that only
+//! The prefill/decode transfer: a request prefilled on a group that only
 //! prefills (`WorkerGroupRole::Prefill`) continues on a decode group, whose
 //! device cache receives the request's pages straight from the prefill
 //! group's.
 //!
 //! Every group of a deployment indexes one unit space: a unit the scheduler
 //! allocated to a request is that request's in every group's pool. A
-//! hand-off therefore copies the request's units from each prefill rank's
+//! transfer therefore copies the request's units from each prefill rank's
 //! planes into the same units of the decode rank of the same rank index, and
 //! the decode group reads them where the prefill group wrote them. Each rank
 //! reports where the Storage Server retains its planes, run by run
@@ -20,7 +20,7 @@
 //!
 //! The scheduler holds the transfer contexts of the GPUs of its groups on
 //! each host for as long as it serves (`Request::OpenTransfer`), so a
-//! hand-off pays for no context creation. Units are copied only once the
+//! transfer pays for no context creation. Units are copied only once the
 //! call that wrote them was accepted, so their device work completed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -33,7 +33,7 @@ use crate::host_pages::{Purpose, Servers};
 use crate::worker::WorkerGroupId;
 use crate::{CallKind, ForwardMode, RequestKey, Scheduler};
 
-/// One rank's planes, as a hand-off addresses them.
+/// One rank's planes, as a transfer addresses them.
 struct RankPlanes {
     /// The host the rank runs on.
     host: String,
@@ -46,14 +46,14 @@ struct RankPlanes {
 
 /// What a request to a server was for.
 enum Asked {
-    /// The transfer task of `request`'s hand-off, submitted on connection
+    /// The transfer task of `request`'s transfer, submitted on connection
     /// `client`.
     Transfer { request: RequestId, client: usize },
     /// A session holding the transfer contexts of a host's GPUs.
     Session,
 }
 
-/// One hand-off in flight.
+/// One transfer in flight.
 struct Copy {
     /// The tasks submitted, and those that ended.
     tasks: usize,
@@ -64,9 +64,9 @@ struct Copy {
     spans: usize,
 }
 
-/// How a hand-off ended.
+/// How a transfer ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HandOffEnd {
+pub(crate) enum TransferStatus {
     /// Every unit landed in the decode group's planes: `bytes` in `spans`
     /// spans, in `micros` microseconds from the submission to the last task's
     /// end.
@@ -80,19 +80,19 @@ pub(crate) enum HandOffEnd {
     Failed(String),
 }
 
-/// The scheduler's hand-offs between its prefill and decode groups.
-pub(crate) struct HandOffs {
+/// The scheduler's transfers between its prefill and decode groups.
+pub(crate) struct Transfers {
     servers: Servers<Asked>,
     ranks: HashMap<WorkerGroupId, Vec<RankPlanes>>,
     copies: HashMap<RequestId, Copy>,
     /// The request of each task in flight, by connection and task.
     tasks: HashMap<(usize, u64), RequestId>,
-    ended: Vec<(RequestId, HandOffEnd)>,
+    ended: Vec<(RequestId, TransferStatus)>,
 }
 
-impl HandOffs {
+impl Transfers {
     /// Connect to this host's Storage Server, at `socket`, as a head of
-    /// `epoch` of `deployment`, for the hand-offs between the groups of
+    /// `epoch` of `deployment`, for the transfers between the groups of
     /// `ranks` (each rank's host and cache report, by group); the engine runs
     /// on `host`. Every group's ranks must report the runs of their planes.
     ///
@@ -107,7 +107,7 @@ impl HandOffs {
         ranks: &BTreeMap<WorkerGroupId, Vec<(String, Option<PrefixCacheInfo>)>>,
     ) -> anyhow::Result<Self> {
         let mut servers =
-            Servers::connect(socket, deployment, epoch, "the prefill/decode hand-off")?;
+            Servers::connect(socket, deployment, epoch, "the prefill/decode transfer")?;
         let mut planes = HashMap::new();
         let mut gpus: BTreeMap<usize, BTreeSet<[u8; 16]>> = BTreeMap::new();
         for (worker, reports) in ranks {
@@ -158,7 +158,7 @@ impl HandOffs {
     }
 
     /// Copy `request`'s `units` from `source`'s planes into `destination`'s,
-    /// rank by rank. Returns the reason when the hand-off cannot start: the
+    /// rank by rank. Returns the reason when the transfer cannot start: the
     /// groups' ranks or planes differ, or no task could be submitted.
     pub(crate) fn start(
         &mut self,
@@ -177,7 +177,7 @@ impl HandOffs {
         };
         if sources.len() != destinations.len() {
             return Err(format!(
-                "worker group {} has {} ranks and {} has {}: a hand-off copies between equal ranks",
+                "worker group {} has {} ranks and {} has {}: a transfer copies between equal ranks",
                 source.0,
                 sources.len(),
                 destination.0,
@@ -216,7 +216,7 @@ impl HandOffs {
                 &transfer,
                 Purpose::Store(Asked::Transfer { request, client }),
             ) {
-                copy.failed = Some("a hand-off's transfer could not be submitted".to_owned());
+                copy.failed = Some("a transfer's copy task could not be submitted".to_owned());
                 break;
             }
             copy.tasks += 1;
@@ -224,8 +224,8 @@ impl HandOffs {
         if copy.tasks == 0 {
             // Nothing to copy (no unit), or nothing submitted.
             let end = match copy.failed {
-                Some(reason) => HandOffEnd::Failed(reason),
-                None => HandOffEnd::Complete {
+                Some(reason) => TransferStatus::Failed(reason),
+                None => TransferStatus::Complete {
                     bytes: 0,
                     spans: 0,
                     micros: 0,
@@ -244,8 +244,8 @@ impl HandOffs {
         self.servers.descriptors()
     }
 
-    /// Take the servers' responds and events, and the hand-offs that ended.
-    pub(crate) fn poll(&mut self) -> Vec<(RequestId, HandOffEnd)> {
+    /// Take the servers' responds and events, and the transfers that ended.
+    pub(crate) fn poll(&mut self) -> Vec<(RequestId, TransferStatus)> {
         let (events, responses) = self.servers.take();
         for (purpose, reply) in responses {
             match (purpose, reply) {
@@ -255,7 +255,7 @@ impl HandOffs {
                 (Asked::Transfer { request, .. }, other) => {
                     self.task_ended(
                         request,
-                        Some(format!("the hand-off's transfer was refused: {other:?}")),
+                        Some(format!("the transfer's copy task was refused: {other:?}")),
                     );
                 }
                 (Asked::Session, Reply::TransferOpened { .. }) => {}
@@ -273,7 +273,7 @@ impl HandOffs {
             };
             let failure = match end {
                 TransferEnd::Complete => None,
-                TransferEnd::Cancelled => Some("the hand-off's transfer was cancelled".to_owned()),
+                TransferEnd::Cancelled => Some("the transfer's copy task was cancelled".to_owned()),
                 TransferEnd::Failed { message } => Some(message),
             };
             self.task_ended(request, failure);
@@ -281,7 +281,7 @@ impl HandOffs {
         std::mem::take(&mut self.ended)
     }
 
-    /// One task of `request`'s hand-off ended, failed with the reason when
+    /// One task of `request`'s transfer ended, failed with the reason when
     /// one is given.
     fn task_ended(&mut self, request: RequestId, failure: Option<String>) {
         let Some(copy) = self.copies.get_mut(&request) else {
@@ -298,8 +298,8 @@ impl HandOffs {
             return;
         };
         let end = match copy.failed {
-            Some(reason) => HandOffEnd::Failed(reason),
-            None => HandOffEnd::Complete {
+            Some(reason) => TransferStatus::Failed(reason),
+            None => TransferStatus::Complete {
                 bytes: copy.bytes,
                 spans: copy.spans,
                 micros: copy.started.elapsed().as_micros() as u64,
@@ -396,25 +396,25 @@ fn span(
 }
 
 impl Scheduler {
-    /// Start the hand-off of every request whose prompt its prefill group
+    /// Start the transfer of every request whose prompt its prefill group
     /// completed and whose calls there were all accepted, and move on those
-    /// whose hand-off ended: a request whose units landed decodes on its
+    /// whose transfer ended: a request whose units landed decodes on its
     /// decode group; one whose copy failed fails. Returns whether a request
     /// moved on.
-    pub(crate) fn poll_hand_offs(&mut self) -> bool {
-        let ended = match self.hand_offs.as_mut() {
-            Some(hand_offs) => hand_offs.poll(),
+    pub(crate) fn poll_transfers(&mut self) -> bool {
+        let ended = match self.transfers.as_mut() {
+            Some(transfers) => transfers.poll(),
             None if self.dispatch.prefill_groups.is_empty() => return false,
-            // Prefill groups without a hand-off: a request that completed its
-            // prompt there cannot continue (`Scheduler::enable_hand_off`).
+            // Prefill groups without a transfer: a request that completed its
+            // prompt there cannot continue (`Scheduler::enable_transfer`).
             None => Vec::new(),
         };
         let ready: Vec<RequestId> = self
             .requests
             .running_tokens()
             .filter(|(id, _, state)| {
-                state.phase == crate::generation::GenerationPhase::HandOff
-                    && state.hand_off == crate::generation::HandOff::None
+                state.phase == crate::generation::GenerationPhase::TransferState
+                    && state.transfer == crate::generation::TransferState::None
                     && state.failure.is_none()
                     && self
                         .inflight
@@ -426,14 +426,14 @@ impl Scheduler {
             .collect();
         let mut progressed = !ended.is_empty();
         for id in ready {
-            progressed |= self.start_hand_off(id);
+            progressed |= self.start_transfer(id);
         }
         for (id, end) in ended {
             let Some(state) = self.requests.tokens_mut(&id) else {
                 continue;
             };
             match end {
-                HandOffEnd::Complete {
+                TransferStatus::Complete {
                     bytes,
                     spans,
                     micros,
@@ -443,20 +443,20 @@ impl Scheduler {
                         bytes,
                         spans,
                         micros,
-                        "handed a request's KV cache to its decode group"
+                        "given a request's KV cache to its decode group"
                     );
-                    state.hand_off = crate::generation::HandOff::Copied;
+                    state.transfer = crate::generation::TransferState::Copied;
                     state.phase = crate::generation::GenerationPhase::DecodeUnd;
                     // The token the prefill group sampled lies in a product of
                     // its own devices, which the decode group cannot read: the
                     // first decode there takes the committed token from the host.
                     state.latest_token = None;
                 }
-                HandOffEnd::Failed(reason) => {
-                    state.hand_off = crate::generation::HandOff::None;
+                TransferStatus::Failed(reason) => {
+                    state.transfer = crate::generation::TransferState::None;
                     self.fail_after_inflight(
                         id,
-                        format!("the KV cache hand-off to the decode group failed: {reason}"),
+                        format!("the KV cache transfer to the decode group failed: {reason}"),
                     );
                 }
             }
@@ -467,7 +467,7 @@ impl Scheduler {
     /// Place `id`'s decode on a decode group and copy its units there from
     /// its prefill group. Returns whether the request moved on: its copy
     /// started, or it failed.
-    fn start_hand_off(&mut self, id: RequestId) -> bool {
+    fn start_transfer(&mut self, id: RequestId) -> bool {
         let Some(state) = self.requests.tokens(&id) else {
             return false;
         };
@@ -495,19 +495,19 @@ impl Scheduler {
         ) else {
             return false;
         };
-        let started = match self.hand_offs.as_mut() {
-            Some(hand_offs) => hand_offs.start(id, &source, &destination, &units),
+        let started = match self.transfers.as_mut() {
+            Some(transfers) => transfers.start(id, &source, &destination, &units),
             None => Err("the scheduler reaches no Storage Server to copy it with".to_owned()),
         };
         match started {
             Ok(()) => {
                 if let Some(state) = self.requests.tokens_mut(&id) {
-                    state.hand_off = crate::generation::HandOff::Copying;
+                    state.transfer = crate::generation::TransferState::Copying;
                 }
             }
             Err(reason) => self.fail_after_inflight(
                 id,
-                format!("the KV cache cannot be handed to the decode group: {reason}"),
+                format!("the KV cache cannot be given to the decode group: {reason}"),
             ),
         }
         true
@@ -539,7 +539,7 @@ mod tests {
         }
     }
 
-    /// A hand-off copies every unit's bytes of each field once, in one span
+    /// A transfer copies every unit's bytes of each field once, in one span
     /// per run of consecutive units both ranks hold in one run, at the
     /// offsets each rank's run states; a prefill rank of another host is read
     /// through its Storage Server.

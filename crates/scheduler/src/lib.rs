@@ -51,11 +51,11 @@ mod clock;
 mod core;
 mod encoder_cache;
 mod encoder_outputs;
-mod hand_off;
 mod handle;
 mod host_pages;
 mod kv_cache;
 mod trajectories;
+mod transfer;
 mod warmup;
 mod worker;
 
@@ -139,11 +139,11 @@ use execution::VideoState;
 pub(crate) mod generation;
 pub(crate) mod graph;
 mod inflight;
-mod ledger;
 mod mechanism;
 pub(crate) mod output;
 mod policy;
 mod preemption;
+mod quota;
 mod request;
 mod run;
 mod speculation;
@@ -433,9 +433,9 @@ pub struct Scheduler {
     /// The host encoder pools of the video encoders, when they serve their
     /// worker groups (`Scheduler::enable_encoder_store`).
     encoder_outputs: Option<crate::encoder_outputs::EncoderStore>,
-    /// The hand-offs from the prefill groups to the decode groups, when the
-    /// deployment has prefill groups (`Scheduler::enable_hand_off`).
-    hand_offs: Option<crate::hand_off::HandOffs>,
+    /// The transfers from the prefill groups to the decode groups, when the
+    /// deployment has prefill groups (`Scheduler::enable_transfer`).
+    transfers: Option<crate::transfer::Transfers>,
     /// Set while an operation waits for the batches in flight to complete
     /// (`Scheduler::drain_batches`, `Scheduler::flush_offloads` and the
     /// commands that drain before they act): the scheduler admits and

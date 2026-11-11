@@ -49,11 +49,11 @@ impl Scheduler {
             return;
         }
 
-        // Output storage the worker could not claim fails the call rather
+        // Output storage the worker could not open fails the call rather
         // than dropping its completion, so request-local ordering still sees
         // the call return.
-        // The claim moves into the pending completion, which keeps its storage
-        // alive while the result waits; the record keeps an empty claim.
+        // The opened storage moves into the pending completion, which keeps its storage
+        // alive while the result waits; the record keeps none.
         let media = match std::mem::replace(&mut record.media, Ok(None)) {
             Ok(media) => media,
             Err(error) => {

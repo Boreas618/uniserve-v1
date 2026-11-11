@@ -2,7 +2,7 @@
 //!
 //! The scheduler owns the logical allocation of worker-side storage: it
 //! chooses request rows, cache pages, latent pages, and buffer byte spans, and
-//! workers use the addresses they are handed. Allocations follow a request
+//! workers use the addresses they are given. Allocations follow a request
 //! from admission (`RequestAllocations`, `MediaAllocations`) through
 //! retirement: a finished request registered with its workers parks its
 //! allocations in a `RetiringRequest` until its `Finish` command is
@@ -291,7 +291,7 @@ impl MediaStorage {
                     }
                 }
                 // A rank with no pool keeps its products in its own process: it backs nothing here,
-                // so a reservation books no bytes and binds no span on it.
+                // so a reservation reserves no bytes and binds no span on it.
                 holding.retain(|rank| {
                     rank_bytes
                         .get(*rank as usize)
@@ -359,7 +359,7 @@ impl MediaAllocations {
     /// Releases the request rows, keeping the declared results the worker
     /// still holds.
     ///
-    /// A row is the scheduler's capacity, so it is handed back as soon as the
+    /// A row is the scheduler's capacity, so it is given back as soon as the
     /// `Finish` that closes it has been submitted; a tensor is a span the
     /// worker writes and reads until it has seen that `Finish`, so it stays in
     /// the record until the acknowledgement releases it.

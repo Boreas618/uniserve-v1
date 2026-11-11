@@ -1,4 +1,4 @@
-//! Media bytes handed between processes through POSIX shared storage.
+//! Media bytes given between processes through POSIX shared storage.
 //!
 //! Generated artifacts travel from a worker to the engine: a model worker
 //! publishes finished media bytes through [`MediaSource`] and reports its

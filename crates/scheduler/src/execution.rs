@@ -46,7 +46,7 @@ fn batch_products(batch: &ExecutionBatch) -> impl Iterator<Item = BufferId> + '_
 const IDLE_STEPS: usize = 16;
 
 impl Scheduler {
-    /// Releases the batches formed and not yet handed out whose devices have
+    /// Releases the batches formed and not yet given out whose devices have
     /// a slot free, in order, preserving order at every shared destination
     /// and after every product a batch reads.
     ///
@@ -59,7 +59,7 @@ impl Scheduler {
     /// storage work with no layout to hand out.
     ///
     /// Returns whether any batch was released or settled, or `true` after a
-    /// failure, which is handed to `on_worker_error` and ends the pass.
+    /// failure, which is given to `on_worker_error` and ends the pass.
     fn release(
         &mut self,
         blocked_workers: &mut HashSet<crate::WorkerGroupId>,
@@ -121,7 +121,7 @@ impl Scheduler {
                 continue;
             }
             // The `Finish` commands this batch carries close the slots of the
-            // requests they name once it is handed out: batches reach a rank in
+            // requests they name once it is given out: batches reach a rank in
             // the order they are released, so no later `Start` can name a slot
             // before the worker has seen its close.
             let finishing: Vec<RequestKey> = batch
@@ -395,7 +395,7 @@ impl Scheduler {
         // by one policy and executed under another (design §7.3).
         self.apply_policy_stage();
         progressed |= self.poll_kv_offload();
-        progressed |= self.poll_hand_offs();
+        progressed |= self.poll_transfers();
         progressed |= self.poll_trajectories();
         progressed |= self
             .encoder_outputs
@@ -883,7 +883,7 @@ impl Scheduler {
     /// epoch when there is none to serve under.
     ///
     /// The state the previous policy is instantiated on is the mechanism's at
-    /// this moment, built here and handed over owned: the slot lives inside the
+    /// this moment, built here and given over owned: the slot lives inside the
     /// scheduler, so the mechanism cannot lend it a borrow of the scheduler.
     pub(super) fn policy_failed(
         &mut self,
@@ -1133,7 +1133,7 @@ impl Scheduler {
     /// state it was never told.
     pub(super) fn seed_from_policy(&mut self) {
         // The epoch's page table is read once, here, so every later step costs
-        // what changed: the policy was handed the same table in its snapshot.
+        // what changed: the policy was given the same table in its snapshot.
         self.pages = views::page_index(self);
         self.pages_seeded = true;
         // The instance was instantiated on a snapshot and has never been

@@ -1,7 +1,7 @@
 //! An epoch that succeeds a running one, over the in-process pool.
 //!
 //! The launched path states the same events with two deployments: a successor
-//! starts beside the running epoch under the same claim, is promoted with the
+//! starts beside the running epoch under the same lease, is promoted with the
 //! running epoch's prefix cache index once it parks, commits once the running
 //! epoch closed, and continues a request the running one generated part of.
 //! Here both epochs are handles over `testkit::FakeBatches`, which completes every

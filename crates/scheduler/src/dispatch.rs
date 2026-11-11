@@ -6,8 +6,8 @@
 //! stage, its later calls for that stage stay there. A request's
 //! decode calls stay on the replica that took its first decode-stage call,
 //! which is its prefill replica unless that replica only prefills
-//! (`WorkerGroupRole::Prefill`): then its cache is handed off to a decode
-//! replica (`crate::hand_off`).
+//! (`WorkerGroupRole::Prefill`): then its cache is transferred to a decode
+//! replica (`crate::transfer`).
 
 use super::*;
 use ipc::ForwardMode;
@@ -31,7 +31,7 @@ pub(super) struct Dispatch {
     /// requests decode on the scheduler's decode groups.
     pub(super) prefill_groups: HashSet<crate::WorkerGroupId>,
     /// The groups that decode only (`WorkerGroupRole::Decode`): a request
-    /// reaches them by its hand-off, never with its prompt.
+    /// reaches them by its transfer, never with its prompt.
     pub(super) decode_groups: HashSet<crate::WorkerGroupId>,
 }
 
@@ -137,7 +137,7 @@ impl Dispatch {
     ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
         // A decode-stage call runs on a replica that decodes, and every other
         // call (a prompt's prefill) on one that is not a decode group: a
-        // request reaches a decode group by its hand-off.
+        // request reaches a decode group by its transfer.
         let candidates = self
             .stage_candidates(epoch, kind, stage)
             .filter(|(id, _, _)| {

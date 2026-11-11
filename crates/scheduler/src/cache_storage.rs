@@ -22,7 +22,7 @@
 //! rewrites the weights while the workers sleep, so that the cache's storage
 //! holds the new checkpoint as it loads.
 
-use super::ledger::{growable, room, room_refusal};
+use super::quota::{growable, room, room_refusal};
 use super::*;
 use crate::handle::CacheChange;
 use crate::kv_cache::PageRef;
@@ -391,7 +391,7 @@ impl Scheduler {
     }
 
     /// The segments each worker that holds the cache reports, which agree
-    /// on their segments and the ones they hold, with its device's ledger;
+    /// on their segments and the ones they hold, with its device's usage;
     /// `None` when the cache is not split into segments. A worker that
     /// holds no cache, such as an expert worker, reports none and is left
     /// out.
@@ -401,7 +401,7 @@ impl Scheduler {
 
     /// Every worker's storage report: those of the workers that hold the
     /// cache, which agree on their segments and the ones they hold, and
-    /// those of the others (an expert worker's, with its GPU's ledger when
+    /// those of the others (an expert worker's, with its GPU's usage when
     /// it keeps storage at the Storage Server). `None` when the cache is not
     /// split into segments.
     fn storage_reports(&mut self) -> Result<Option<StorageReports>, String> {
@@ -438,16 +438,16 @@ impl Scheduler {
             .map_or(1, |index| index + 1)
     }
 
-    /// Withdraws the tail past what leaves every device's ledger room for
+    /// Withdraws the tail past what leaves every device's usage room for
     /// the requested device storage beside everything it
-    /// books ([`room`]); the requests holding it run on. Returns the first
+    /// reserves ([`room`]); the requests holding it run on. Returns the first
     /// segment to give back, `None` when every device has the room already
     /// (or the cache is not split into segments, which gives back nothing),
     /// and each device's output.
     ///
     /// Fails, withdrawing nothing, when even the segments the cache cannot
     /// give back leave a device too little room: the error names every
-    /// device's bytes and ledger entries.
+    /// device's bytes and usage entries.
     fn start_room(
         &mut self,
         bytes: u64,
@@ -464,9 +464,9 @@ impl Scheduler {
         let floor = reports.first().map_or(0, |first| self.kept_floor(first));
         let requested = |report: &CacheStorageReport| {
             report
-                .ledger
+                .usage
                 .as_ref()
-                .and_then(|ledger| devices.get(&ledger.gpu))
+                .and_then(|usage| devices.get(&usage.gpu))
                 .copied()
                 .unwrap_or(bytes)
         };
@@ -694,12 +694,12 @@ impl Scheduler {
         responses(&results)
     }
 
-    /// Creates as many of the given-back segments as every device's ledger
+    /// Creates as many of the given-back segments as every device's usage
     /// has room for within its quota, beside everything the deployment's
     /// epochs and the Transfer Server hold there (and its free storage
     /// holds, beside processes outside the deployment), and returns their
     /// units to allocation: what a previous epoch released is the
-    /// successor's on the ledger at once.
+    /// successor's on the usage at once.
     fn grow_cache(&mut self) -> Result<Vec<String>, String> {
         let Some(reports) = self.cache_storage()? else {
             return Ok(Vec::new());

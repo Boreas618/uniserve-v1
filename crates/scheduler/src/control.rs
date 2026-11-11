@@ -48,7 +48,7 @@ fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
 ///
 /// The ask is kept until it is responded: a refused shadow submission responds to it
 /// at once with the worker's reason, and a submitted one responds to it when its
-/// step has ended, so a response never claims a pass that has not run.
+/// step has ended, so a response never states a pass that has not run.
 pub(super) struct ShadowPass {
     /// The epoch generation whose operators the shadow pass runs.
     pub(super) generation: u64,
@@ -85,7 +85,7 @@ impl Scheduler {
     /// channel. Running requests finish immediately rather than waiting for
     /// their in-flight calls, and batches assembled but not yet submitted are
     /// dropped. Events still journaled behind a full channel, including these
-    /// terminal events, are handed to their receivers, since no later flush
+    /// terminal events, are given to their receivers, since no later flush
     /// will deliver them.
     pub(super) fn abort_all_requests(&mut self) {
         self.release_held_for_index();
@@ -107,7 +107,7 @@ impl Scheduler {
 
         // Every running request has now retired its journal, so the retained
         // journals hold all output the control loop can no longer deliver.
-        self.output.hand_off_retired();
+        self.output.transfer_retired();
     }
 
     /// Applies one command; returns true on shutdown.
@@ -166,7 +166,7 @@ impl Scheduler {
             Command::PublishEpoch(response) | Command::Retire { response, .. } => {
                 let _ = response.send(Ok(()));
             }
-            Command::KeepWeights { response, .. } | Command::Ledgers(response) => {
+            Command::KeepWeights { response, .. } | Command::Usage(response) => {
                 let _ = response.send(Ok(Vec::new()));
             }
             Command::DescribeCache(response) => {
@@ -394,7 +394,7 @@ impl Scheduler {
     }
 
     /// Records that a batch of this step was submitted as a shadow pass: the
-    /// ask gets its response when the step ends, so a response never claims a pass
+    /// ask gets its response when the step ends, so a response never states a pass
     /// that has not run.
     pub(super) fn note_shadowed(&mut self, shape: Option<ipc::execution::Shape>) {
         if let Some(pass) = self.shadow_pass.as_mut() {

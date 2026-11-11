@@ -60,7 +60,7 @@ impl ForwardMode {}
 /// Serde represents a kind by its inner enum's snake_case name alone
 /// (`untagged`), which round-trips only while the names of [`ForwardMode`]
 /// and [`MediaCall`] stay disjoint. A request's KV cache reaches another
-/// worker group by the scheduler's device-direct hand-off, not by a call.
+/// worker group by the scheduler's device-direct transfer, not by a call.
 /// `cache_export` named a removed transfer kind and is not reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(untagged)]

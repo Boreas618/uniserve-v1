@@ -38,7 +38,7 @@ pub(super) struct InflightCall {
 /// Completion held until earlier request calls are applied.
 pub(super) struct PendingCompletion {
     pub(super) record: CallCompletion,
-    /// Claimed media storage stays alive while its result waits or is discarded.
+    /// Opened media storage stays alive while its result waits or is discarded.
     pub(super) media: Option<Arc<SharedMedia>>,
     /// Engine-wide arrival order (`Inflight::next_arrival`), used to order
     /// ready completions of equal priority.
@@ -99,10 +99,10 @@ fn query_tokens(call: &ipc::Call) -> u64 {
 
 /// Owns submitted identities and their lifetime through ordered reconciliation.
 pub(super) struct Inflight {
-    /// Batches formed and not yet handed out, in order: their devices had no
+    /// Batches formed and not yet given out, in order: their devices had no
     /// slot free.
     pub(super) pending_submissions: VecDeque<ExecutionBatch>,
-    /// The shadow copies of the batches handed out by the current pass, each
+    /// The shadow copies of the batches given out by the current pass, each
     /// with the token shape it compares, which the pass submits after them.
     pub(super) pending_shadows: Vec<(ipc::execution::Batch, Option<ipc::execution::Shape>)>,
     /// Last issued batch id; ids start at 1, so a call id with batch zero has

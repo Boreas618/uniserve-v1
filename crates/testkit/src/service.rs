@@ -13,8 +13,8 @@
 //! naming the scheduler, and forwards its events. A request that resumes a
 //! cache this stand-in recorded goes back to the scheduler that stored it.
 //! Each scheduler's statistics go to the daemon once a second. The storage
-//! ledgers are refused as an engine refuses them: each node's daemon reads
-//! them over its claim.
+//! usage are refused as an engine refuses them: each node's daemon reads
+//! them over its lease.
 //!
 //! A request's events flow under credit: the engine sends at most
 //! [`EVENT_WINDOW`] beyond those the daemon's consumer took (`Consumed`), so
@@ -49,9 +49,9 @@ use scheduler::{
 };
 use scheduling::guest::view::RankView;
 
-/// What the stand-in responds to a command over the deployment's storage ledgers or transfer budgets,
-/// as an engine process does (`engine::process::requests::LEDGERS`).
-const LEDGERS: &str = "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
+/// What the stand-in responds to a command over the deployment's storage usage or transfer budgets,
+/// as an engine process does (`engine::process::requests::USAGE`).
+const USAGE: &str = "the storage usage and transfer budgets are read by each node's daemon over its lease, not \
      by an epoch's main process";
 
 /// How often each scheduler's statistics are reported.
@@ -622,15 +622,15 @@ fn read_requests(
                     warm_cache(warm, front, routing);
                 }
                 Some(wire::engine_command::Kind::DescribeStorage(describe)) => {
-                    // As an engine process responds to it: the storage ledgers and the transfer
-                    // budgets are each node's daemon's, read over its claim, and an epoch's main
-                    // process holds no claim of the deployment's.
+                    // As an engine process responds to it: the storage usage and the transfer
+                    // budgets are each node's daemon's, read over its lease, and an epoch's main
+                    // process holds no lease of the deployment's.
                     routing.send(
                         front,
                         Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
                             id: describe.id,
                             results: Vec::new(),
-                            error: LEDGERS.to_owned(),
+                            error: USAGE.to_owned(),
                         })),
                     );
                 }
@@ -1017,9 +1017,9 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
     }
     // The epochs that keep their weights alone release the rest of their
     // storage on every node first, and move their weights to host storage when
-    // asked (the deployment's claims cover every node, so the first
+    // asked (the deployment's leases cover every node, so the first
     // scheduler asks), on a thread of its own: the change then finds it on
-    // each GPU's ledger. The response carries each node's report of the
+    // each GPU's usage. The response carries each node's report of the
     // weights kept, wrapped as `{"kept": ...}`, before the schedulers'.
     let (id, epochs, to_host, cache_keys) = (
         resize.id,
@@ -1243,7 +1243,7 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
         tracing::info!("the engine parks already");
     }
     tracing::info!("the engine parks");
-    // A scheduler that stopped on a fatal failure responds to no park: it handed
+    // A scheduler that stopped on a fatal failure responds to no park: it given
     // its requests back, or ended them, as it stopped, and its thread then
     // closes its workers, which the park does not wait for.
     let responses: Vec<_> = routing
@@ -1617,7 +1617,7 @@ fn forward_events(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                handed = incoming.recv() => match handed {
+                received = incoming.recv() => match received {
                     Some(stream) => {
                         let routing = Arc::clone(routing);
                         tasks.spawn(async move { forward(stream, &routing).await });
@@ -1713,7 +1713,7 @@ async fn forward(stream: Stream, routing: &Routing) {
             // need, not to keep an epoch alive for a reader that is gone. The
             // grace is the takeover's own window, and a request released this way
             // says so, because the alternative reading - a consumer that is
-            // merely slow - is a handoff that lost tokens instead.
+            // merely slow - is a backlog that lost tokens instead.
             let grace = tokio::time::sleep(CONSUMER_GRACE);
             tokio::pin!(grace);
             tokio::select! {

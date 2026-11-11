@@ -120,10 +120,10 @@ fn logprob_result_bytes(
     Ok(Some(bytes))
 }
 
-/// Where a request's prefill/decode hand-off stands.
+/// Where a request's prefill/decode transfer stands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) enum HandOff {
-    /// No hand-off is under way.
+pub(crate) enum TransferState {
+    /// No transfer is under way.
     #[default]
     None,
     /// Its units are being copied into the decode group's planes.
@@ -152,10 +152,10 @@ pub(crate) enum GenerationPhase {
     /// Move the request's KV cache from the prefill group that prefilled its
     /// prompt to a decode group (`WorkerGroupRole::Decode`): the Storage
     /// Server's Transfer Server copies the request's units from the prefill
-    /// group's device planes into the decode group's (`crate::hand_off`),
-    /// and no call runs meanwhile (`TokenState::hand_off`). The decode
+    /// group's device planes into the decode group's (`crate::transfer`),
+    /// and no call runs meanwhile (`TokenState::transfer`). The decode
     /// group then decodes the request from its committed token on.
-    HandOff,
+    TransferState,
     /// Decode understanding (text) tokens.
     DecodeUnd,
     /// Run one denoising step of a block-generating request's current block
@@ -1018,9 +1018,9 @@ pub(crate) struct TokenState {
     /// Committed token the next decode continues from.
     pub(super) next_token: u32,
     pub(super) num_generated_tokens: usize,
-    /// Where the request's hand-off from its prefill group to a decode group
-    /// stands (`GenerationPhase::HandOff`).
-    pub(super) hand_off: HandOff,
+    /// Where the request's transfer from its prefill group to a decode group
+    /// stands (`GenerationPhase::TransferState`).
+    pub(super) transfer: TransferState,
     /// Whether the current epoch is registered with its execution workers.
     pub(super) worker_registered: bool,
     /// Whether the request's slot holds the request's recurrent state at its
@@ -1033,7 +1033,7 @@ pub(crate) struct TokenState {
     /// penalty counts started from zero and its bias row
     /// (`batching::columns::adjusts_logits`). False until the request's first
     /// token batch on a worker group clears the counts and installs the row,
-    /// and again after a hand-off moves the request to the decode group. A
+    /// and again after a transfer moves the request to the decode group. A
     /// preempted or migrated request is admitted again as a new state, so its
     /// slot starts again.
     pub(crate) sampling_on_device: bool,

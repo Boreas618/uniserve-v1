@@ -36,7 +36,7 @@
 //!
 //! - `Room::graph_tiers` is the mechanism's: it holds the build config's
 //!   captured tiers, which the mechanism fills in the `Room` that [`room`]
-//!   builds with none. (`Room::warming` is read here, from the claimed precopy
+//!   builds with none. (`Room::warming` is read here, from the prepared precopy
 //!   pages.)
 //! - `Snapshot::ranks` and a trial's `arrival` need the ranks' load, which the
 //!   control thread's router holds and a scheduler does not: a scheduler knows
@@ -621,9 +621,9 @@ fn cached_pages(state: &TokenState) -> u32 {
 }
 
 /// Whether a running request waits for a transfer right now: its KV cache is being copied to its
-/// decode group by the device-direct hand-off.
+/// decode group by the device-direct transfer.
 fn waiting_transfer(state: &TokenState) -> bool {
-    state.hand_off == crate::generation::HandOff::Copying
+    state.transfer == crate::generation::TransferState::Copying
 }
 
 /// The view of a token request the scheduler holds.

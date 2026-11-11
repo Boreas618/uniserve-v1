@@ -889,7 +889,7 @@ pub(crate) fn advanced_tokens(call: &ipc::Call) -> u32 {
 /// cache pages (§4.4): the mechanism records one event per change it makes, and
 /// an `Updated` only for a request whose scheduling-relevant view moved since
 /// the policy was last told. The list is closed before the step's `dispatch`
-/// and handed over once, by `observe`.
+/// and given over once, by `observe`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Recorder {
     /// Events since the last `observe`.
@@ -1768,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_finds_a_resident_request_that_stopped_advancing_but_not_a_waiting_one() {
+    fn the_watchdog_finds_a_running_request_that_stopped_advancing_but_not_a_waiting_one() {
         let mut live = live(
             vec![
                 request(1, RequestStatus::Running),

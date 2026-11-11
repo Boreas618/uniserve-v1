@@ -194,7 +194,7 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
             batch.media.as_ref().is_some_and(|media| {
                 media.computation.call == MediaCall::Muxing
                     && (0..media.inputs.len())
-                        .any(|row| media.request(row).is_ok_and(|staged| staged.handed == 0))
+                        .any(|row| media.request(row).is_ok_and(|staged| staged.rounds == 0))
             })
         })
     };

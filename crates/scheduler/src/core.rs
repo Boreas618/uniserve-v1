@@ -272,16 +272,16 @@ impl SchedulerHandle {
             .any(|group| group.role == WorkerGroupRole::Prefill)
         {
             scheduler
-                .enable_hand_off(
+                .enable_transfer(
                     &storage::default_socket(),
                     &engine.deployment,
                     args.epoch,
                     &args.host,
                 )
-                .context("connecting the prefill/decode hand-off")?;
+                .context("connecting the prefill/decode transfer")?;
         }
         // A scheduler with a host tier keeps its storages under the
-        // deployment's name, where its claim is; one without keeps them in a
+        // deployment's name, where its lease is; one without keeps them in a
         // scope of its own, so two engine processes of one deployment on a node
         // never contest one scope.
         let host_tier = kv_cache.prefix_caching && kv_cache.host_tier;
@@ -309,7 +309,7 @@ impl SchedulerHandle {
         }
         // Denoising ranks that map host latent pools report them: a
         // preempted video request's trajectory is stored there.
-        // Both pools are the deployment's, mapped by its ranks under its claim, so the stores reach
+        // Both pools are the deployment's, mapped by its ranks under its lease, so the stores reach
         // them under the deployment's name whether or not this scheduler keeps a host KV tier.
         scheduler.enable_trajectory_store(
             &storage::default_socket(),
@@ -727,7 +727,7 @@ impl SchedulerHandle {
         self.commands.take_policy_report()
     }
 
-    /// Publishes the committed epoch's immutable pages on every claimed node.
+    /// Publishes the committed epoch's immutable pages on every leased node.
     pub fn publish_epoch(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.publish_epoch()
     }
@@ -742,13 +742,13 @@ impl SchedulerHandle {
     }
 
     /// Ends the storage of `epochs` on the nodes of the scheduler's workers,
-    /// which the deployment's claims cover; the receiver gets whether it did.
+    /// which the deployment's leases cover; the receiver gets whether it did.
     pub fn retire(&self, epochs: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.retire(epochs)
     }
 
     /// Keeps the weights alone of `epochs` on the nodes of the scheduler's
-    /// workers, which the deployment's claims cover, in host storage when
+    /// workers, which the deployment's leases cover, in host storage when
     /// `to_host`; the receiver gets each node's report.
     pub fn keep_weights(
         &self,
@@ -759,11 +759,11 @@ impl SchedulerHandle {
         self.commands.keep_weights(epochs, to_host, cache_keys)
     }
 
-    /// Reads the storage ledgers of the nodes of the scheduler's workers,
-    /// which the deployment's claims cover; the receiver gets each node's
+    /// Reads the storage usage of the nodes of the scheduler's workers,
+    /// which the deployment's leases cover; the receiver gets each node's
     /// as JSON.
-    pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        self.commands.ledgers()
+    pub fn usage(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+        self.commands.usage()
     }
 
     /// Resumes a parked scheduler; the receiver gets whether it did. When

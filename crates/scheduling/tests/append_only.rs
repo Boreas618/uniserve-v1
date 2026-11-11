@@ -59,7 +59,7 @@ fn a_field_the_host_does_not_know_does_not_hide_the_ones_it_does() {
 /// default: a response built against the older revision still means what it
 /// said.
 #[test]
-fn an_answer_that_omits_a_later_field_means_its_default() {
+fn an_output_that_omits_a_later_field_means_its_default() {
     // A policy that predates `prefetch` and `refill` says nothing about them,
     // which is "no deepening, no refill".
     let output: DispatchOutput = decode(r#"{"admit":[],"reject":[2],"work":[]}"#);

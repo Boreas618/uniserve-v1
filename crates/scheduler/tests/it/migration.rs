@@ -168,7 +168,7 @@ fn parking_ends_running_and_queued_requests_as_migratable() {
         .expect("the scheduler parked")
         .expect("the scheduler parked without an error");
     // The running request published the pages of its prompt and the tokens
-    // it generated, which a successor imports; it is the one request handed
+    // it generated, which a successor imports; it is the one request given
     // over with a state, and held the units its pages took. A page it
     // published and its own continuation of that page are two entries of
     // the index over the same units.

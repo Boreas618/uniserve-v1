@@ -11,7 +11,7 @@
 //!
 //! | Operation | What every rank does | Reply |
 //! | --- | --- | --- |
-//! | [`CacheStorage`] | reports its KV cache segments and its GPU's ledger | [`CacheStorageReport`] |
+//! | [`CacheStorage`] | reports its KV cache segments and its GPU's usage | [`CacheStorageReport`] |
 //! | [`ReleaseCache`] | gives back its cache segments from one on | [`Held`] |
 //! | [`RestoreCache`] | creates given-back segments again | [`Held`] |
 //! | [`Sleep`] | gives back every segment and its graph storage | nothing |
@@ -88,7 +88,7 @@ operations! {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheStorage;
 
-/// What a rank reports of its KV cache storage and its GPU's ledger.
+/// What a rank reports of its KV cache storage and its GPU's usage.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CacheStorageReport {
     /// The segments of each cache plane, in unit order; empty when the
@@ -108,15 +108,15 @@ pub struct CacheStorageReport {
     /// The rank's host.
     #[serde(default)]
     pub host: String,
-    /// The rank's scope and epoch, which name its entries in the ledger.
+    /// The rank's scope and epoch, which name its entries in the usage.
     #[serde(default)]
     pub scope: Option<storage::Scope>,
     #[serde(default)]
     pub epoch: Option<u64>,
-    /// The deployment's ledger of the cache's GPU; `None` for a rank that
+    /// The deployment's usage of the cache's GPU; `None` for a rank that
     /// keeps its storage itself, which no other epoch shares.
     #[serde(default)]
-    pub ledger: Option<storage::GpuLedger>,
+    pub usage: Option<storage::GpuLedger>,
 }
 
 impl CacheStorageReport {
@@ -129,12 +129,12 @@ impl CacheStorageReport {
             .sum()
     }
 
-    /// The device bytes of segment `index`: what the ledger books for it,
+    /// The device bytes of segment `index`: what the usage counts for it,
     /// or its units' bytes for a segment not created.
     pub fn segment_bytes(&self, index: usize) -> u64 {
         let segment = &self.segments[index];
-        let booked = self.ledger.as_ref().map_or(0, |ledger| {
-            ledger.bytes(|entry| {
+        let reserved = self.usage.as_ref().map_or(0, |usage| {
+            usage.bytes(|entry| {
                 entry.item == storage::Item::CacheSegment
                     && entry.scope == self.scope
                     && entry.segment
@@ -144,8 +144,8 @@ impl CacheStorageReport {
                         })
             })
         });
-        if booked > 0 {
-            booked
+        if reserved > 0 {
+            reserved
         } else {
             u64::from(segment.units) * self.unit_bytes
         }

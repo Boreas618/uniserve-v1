@@ -423,8 +423,8 @@ impl PolicySource for PolicyBytes {
 /// decisions, as the mechanism holds it at one moment (§4.4).
 ///
 /// It is owned so it can be built on the scheduler thread at a step boundary
-/// and handed to a blocking thread for a precopy, and so a revert instantiates
-/// the previous policy on the state it is handed rather than on a capture taken
+/// and given to a blocking thread for a precopy, and so a revert instantiates
+/// the previous policy on the state it is given rather than on a capture taken
 /// when the failing policy was installed. The mechanism builds it; the switch
 /// only reads it.
 #[derive(Clone, Debug, Default)]
@@ -926,7 +926,7 @@ impl PolicySlot {
     /// judged by what will judge it live.
     ///
     /// A static function so it runs on a blocking thread and its [`Candidate`]
-    /// is handed back to the scheduler thread, which keeps the serving slot
+    /// is given back to the scheduler thread, which keeps the serving slot
     /// throughout.
     pub fn prepare(
         engine: &Engine,

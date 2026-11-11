@@ -1091,7 +1091,7 @@ mod tests {
         );
     }
 
-    /// A request that starts on a slot with tokens already generated - handed over from its
+    /// A request that starts on a slot with tokens already generated - given over from its
     /// prefill group, migrated, or admitted again - starts its slot's penalty counts at them, so its
     /// penalties count what a slot it held from its first token would; a request whose penalties
     /// count nothing starts at zero, as one that generated nothing does.

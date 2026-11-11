@@ -223,8 +223,8 @@ impl Scheduler {
                     generation::prepare_decode(request, input_token, relay_input, sampling_state)
                 })
             }
-            // The hand-off copies the request's cache with no call.
-            Phase::HandOff => None,
+            // The transfer copies the request's cache with no call.
+            Phase::TransferState => None,
             Phase::IngestState => self.next_context_call(id, budget, rows.context),
             Phase::Block => {
                 // One step of the request's block is one read-only block row

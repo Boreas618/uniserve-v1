@@ -7,8 +7,8 @@ use storage::manifest::cache::{Operation, Page, Prefix, Snapshot};
 #[derive(Default)]
 pub(super) struct Warming {
     leased: Vec<PageRef>,
-    /// The pages this precopy claimed for the requests it resumes from a stored
-    /// cache, in claim order: `Room.warming` reads them through
+    /// The pages this precopy took for the requests it resumes from a stored
+    /// cache, in the order they were taken: `Room.warming` reads them through
     /// [`Warming::reserved`].
     pub(super) reserved: Vec<Reserved>,
     pub(super) prefill_tokens: Option<usize>,
@@ -17,7 +17,7 @@ pub(super) struct Warming {
     host_tokens: HashMap<RequestId, u32>,
 }
 
-/// One claimed page of a precopy: the stored page, the request it serves, and
+/// One taken page of a precopy: the stored page, the request it serves, and
 /// where it goes.
 pub(super) struct Reserved {
     pub(super) page: Page,
@@ -32,7 +32,7 @@ pub(super) struct Reserved {
 impl Warming {
     /// Admission has acquired every usable page into the request's ordinary
     /// block tables, so the warming reservation no longer pins those units.
-    pub(super) fn claimed(&mut self, resume: proto::request::CacheResume) {
+    pub(super) fn took(&mut self, resume: proto::request::CacheResume) {
         self.reserved.retain(|page| page.resume != resume);
     }
 }

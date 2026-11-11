@@ -49,14 +49,14 @@ pub(crate) struct VideoState {
     /// until their encode round retires them.
     pub(crate) decoded_units: BTreeMap<u32, (u32, TensorRef)>,
     /// Encoded media units by the cursor of the round that produced them,
-    /// until the muxer is handed them.
+    /// until the muxer is given them.
     pub(crate) encoded_units: BTreeMap<u32, (u32, TensorRef)>,
     /// Media unit count of each encode round that has completed and not yet
-    /// been handed to the muxer, by the round's cursor.
+    /// been given to the muxer, by the round's cursor.
     pub(crate) encoded_ready: BTreeMap<u32, u32>,
-    /// Media units handed to the muxer so far; the next round it takes
+    /// Media units given to the muxer so far; the next round it takes
     /// starts here.
-    pub(crate) handed_units: u32,
+    pub(crate) muxed_units: u32,
     /// Encoded products carried by the muxing call in flight, retired with it.
     pub(crate) muxing_inputs: Vec<TensorRef>,
     pub(crate) audio: Option<TensorRef>,
@@ -106,7 +106,7 @@ impl VideoState {
             decoded_units: BTreeMap::new(),
             encoded_units: BTreeMap::new(),
             encoded_ready: BTreeMap::new(),
-            handed_units: 0,
+            muxed_units: 0,
             muxing_inputs: Vec::new(),
             audio: None,
             admission: None,
@@ -230,7 +230,7 @@ impl Scheduler {
     /// the contiguous run that starts where the units it holds end.
     fn ready_encode_rounds(state: &VideoState) -> Vec<u32> {
         let mut rounds = Vec::new();
-        let mut cursor = state.handed_units;
+        let mut cursor = state.muxed_units;
         while let Some(units) = state.encoded_ready.get(&cursor) {
             rounds.push(cursor);
             cursor += units;
@@ -392,9 +392,9 @@ impl Scheduler {
         // once every unit and the audio track are in. It waits for completed
         // writes, never just their scheduled counts.
         if graph.pending(MediaCall::Muxing) {
-            let next_round_ready = state.encoded_ready.contains_key(&state.handed_units);
+            let next_round_ready = state.encoded_ready.contains_key(&state.muxed_units);
             let everything_in =
-                graph.done(MediaCall::AudioEncoding) && state.handed_units == sampling.video_units;
+                graph.done(MediaCall::AudioEncoding) && state.muxed_units == sampling.video_units;
             if next_round_ready || everything_in {
                 ready.push(MediaCall::Muxing);
             }
@@ -880,7 +880,7 @@ impl Scheduler {
     ///
     /// A video decode round occupies its stage's whole capacity
     /// (`stage_units`) unless the track has fewer units left; an audio
-    /// decode round always claims the whole capacity. The capacity counts as
+    /// decode round always takes the whole capacity. The capacity counts as
     /// one when the stage is not measured in media units or the request
     /// is not yet placed on it.
     pub(crate) fn call_units(&self, state: &VideoState, media_call: MediaCall) -> u32 {
@@ -1072,7 +1072,7 @@ impl Scheduler {
                 ]
             }
             // The muxer takes the completed encode rounds that follow the
-            // last it was handed, in media unit order; the final call
+            // last it was given, in media unit order; the final call
             // carries none.
             MediaCall::Muxing => Self::ready_encode_rounds(state)
                 .into_iter()
@@ -1299,7 +1299,7 @@ impl Scheduler {
                         .encoded_units
                         .remove(&cursor)
                         .ok_or("a ready encode round has its product")?;
-                    state.handed_units += units;
+                    state.muxed_units += units;
                     state.muxing_inputs.push(product);
                 }
             }

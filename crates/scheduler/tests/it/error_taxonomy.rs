@@ -384,7 +384,7 @@ fn a_trap_in_observe_fails_the_policy() {
         "the reason names the failed call: {reason}"
     );
     // The program before the trapping one responds to the next decision: its
-    // layout is the one handed over, and the failed program's is not.
+    // layout is the one given over, and the failed program's is not.
     assert_eq!(epoch.serving_revision(), Some(1));
     assert!(
         epoch
@@ -530,7 +530,7 @@ fn text_request(id: u64, prompt: usize, tokens: usize) -> GenerationRequest {
 }
 
 #[test]
-fn a_starved_request_with_nothing_else_resident_ends_the_epoch() {
+fn a_starved_request_with_nothing_else_running_ends_the_epoch() {
     // One millisecond of starvation: the request is admitted by the output and never given work, and
     // §4.4's watchdog is the mechanism's, not the policy's, so a policy that responds to every call
     // correctly still starves it.

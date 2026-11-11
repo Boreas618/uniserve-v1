@@ -30,7 +30,7 @@
 //!   The workers copy the predecessor's cache flags and scales of the units
 //!   its pages hold (`EpochOperation::AdoptCache`), and the pool adopts the
 //!   pages at their own units, except those this epoch wrote meanwhile;
-//!   the requests the predecessor handed over wait for it, and continue
+//!   the requests the predecessor given over wait for it, and continue
 //!   from those pages.
 //! - **Commit** (the successor, once the predecessor is gone): its workers
 //!   take the segments they mapped read-only (`uniserve.take_cache`), and its
@@ -422,9 +422,9 @@ impl Scheduler {
     /// each, the last they continue. The limit is the units its own
     /// segments hold free, those of the segments the predecessor lent, and
     /// those of the segments it has yet to create that every device's
-    /// storage ledger has room for: the quota less everything booked, the
+    /// storage usage has room for: the quota less everything reserved, the
     /// predecessor's kept storage included, and, when the predecessor's
-    /// processes exit at the promotion (it `grows`), with what they booked
+    /// processes exit at the promotion (it `grows`), with what they reserved
     /// transferred to this epoch. The epoch has no more until its commit
     /// gives it the predecessor's segments, and the requests would wait for
     /// it.
@@ -472,7 +472,7 @@ impl Scheduler {
             Some(reports) => {
                 let fit = reports
                     .iter()
-                    .map(|report| super::ledger::growable(report, grows))
+                    .map(|report| super::quota::growable(report, grows))
                     .min()
                     .unwrap_or(0);
                 let first = &reports[0];
@@ -488,8 +488,8 @@ impl Scheduler {
         if needed > free {
             return Err(format!(
                 "the successor epoch's KV cache holds {free} free units within its storage \
-                 ledgers until its commit ({own_free} in its own segments, {lent} in the \
-                 segments its predecessor lent, {growable} in the segments the ledgers have \
+                 quotas until its commit ({own_free} in its own segments, {lent} in the \
+                 segments its predecessor lent, {growable} in the segments the quotas have \
                  room for), and the {} requests in flight need {needed}{}{}",
                 parked.requests,
                 if parked.reserving > 0 {

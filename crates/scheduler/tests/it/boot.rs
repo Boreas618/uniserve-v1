@@ -8,7 +8,7 @@
 //! inventory is the only statement of what it serves, and one request served
 //! through it to a token the pool itself sampled.
 //!
-//! The pool stands in for the worker only: it is handed the mechanism's batch
+//! The pool stands in for the worker only: it is given the mechanism's batch
 //! and responds to its calls. What the boot derives — the group, the budgets, the
 //! cache geometry, the tokenizer's bounds — is the code under test.
 
@@ -162,7 +162,7 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
     );
     assert!(
         !serving.submitted().is_empty(),
-        "the worker was handed the work the facts' budgets admit"
+        "the worker was given the work the facts' budgets admit"
     );
 }
 

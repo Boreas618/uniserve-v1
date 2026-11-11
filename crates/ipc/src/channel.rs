@@ -356,7 +356,7 @@ impl Wake {
 struct LocalWake {
     /// Non-blocking end the owner polls and drains.
     reader: UnixStream,
-    /// The firing end, shared with every [`Wake`] handed out.
+    /// The firing end, shared with every [`Wake`] given out.
     wake: Wake,
 }
 

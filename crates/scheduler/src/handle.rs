@@ -175,7 +175,7 @@ impl std::fmt::Debug for CommandWaker {
 
 /// Events a closing sender hands to its receiver, shared by the two ends of
 /// one request's event channel.
-type Handoff = Arc<Mutex<VecDeque<Event>>>;
+type Backlog = Arc<Mutex<VecDeque<Event>>>;
 
 /// Maximum number of generation events buffered for one request consumer.
 ///
@@ -224,7 +224,7 @@ type Server = Arc<std::sync::OnceLock<CommandWaker>>;
 #[derive(Clone)]
 pub struct EventTx {
     inner: mpsc::Sender<Event>,
-    handoff: Handoff,
+    backlog: Backlog,
     server: Server,
 }
 
@@ -241,7 +241,7 @@ impl EventTx {
         }
         // The events are in place before this sender drops, so a receiver
         // that observes the closed channel also observes them.
-        lock(&self.handoff).extend(events);
+        lock(&self.backlog).extend(events);
     }
 
     /// States what wakes the scheduler that now serves the request: its
@@ -280,11 +280,11 @@ impl EventTx {
 /// polling.
 ///
 /// After the channel closes and drains, the receiver yields the events its
-/// sender handed over on closing (`EventTx::close_with`), and only then
+/// sender given over on closing (`EventTx::close_with`), and only then
 /// reports the stream closed.
 pub struct EventRx {
     inner: mpsc::Receiver<Event>,
-    handoff: Handoff,
+    backlog: Backlog,
     server: Server,
     cancellation: Option<EventCancellation>,
     /// Text tokens of the received `TextToken` and `TextTokens` events.
@@ -310,12 +310,12 @@ struct EventCancellation {
 impl EventRx {
     /// Receives the next event and advances the received token count.
     ///
-    /// Returns `None` once the channel is closed and empty and every handed
+    /// Returns `None` once the channel is closed and empty and every given
     /// over event has been yielded, which also runs the completion callback.
     pub async fn recv(&mut self) -> Option<Event> {
         let event = match self.inner.recv().await {
             Some(event) => Some(event),
-            None => self.take_handoff(),
+            None => self.take_backlog(),
         };
         match event.as_ref() {
             Some(event) => {
@@ -331,12 +331,12 @@ impl EventRx {
 
     /// Attempts to receive an event without waiting.
     ///
-    /// Reports `Disconnected` only after every handed over event has been
+    /// Reports `Disconnected` only after every given over event has been
     /// yielded.
     pub fn try_recv(&mut self) -> Result<Event, mpsc::error::TryRecvError> {
         let event = match self.inner.try_recv() {
             Err(mpsc::error::TryRecvError::Disconnected) => self
-                .take_handoff()
+                .take_backlog()
                 .ok_or(mpsc::error::TryRecvError::Disconnected),
             event => event,
         };
@@ -354,9 +354,9 @@ impl EventRx {
         }
     }
 
-    /// Removes the next event a closed sender handed over.
-    fn take_handoff(&self) -> Option<Event> {
-        lock(&self.handoff).pop_front()
+    /// Removes the next event a closed sender given over.
+    fn take_backlog(&self) -> Option<Event> {
+        lock(&self.backlog).pop_front()
     }
 
     /// Updates the received token count and completion state for a received
@@ -442,17 +442,17 @@ impl Drop for EventRx {
 
 fn event_channel(cancellation: Option<EventCancellation>) -> (EventTx, EventRx) {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER_CAPACITY);
-    let handoff = Handoff::default();
+    let backlog = Backlog::default();
     let server = Server::default();
     (
         EventTx {
             inner: tx,
-            handoff: Arc::clone(&handoff),
+            backlog: Arc::clone(&backlog),
             server: Arc::clone(&server),
         },
         EventRx {
             inner: rx,
-            handoff,
+            backlog,
             server,
             cancellation,
             text_tokens_received: 0,
@@ -605,7 +605,7 @@ pub enum Command {
     /// Commits a successor scheduler (`Scheduler::commit`), and responds
     /// with what each worker reported.
     Commit(crossbeam_channel::Sender<Result<Vec<String>, String>>),
-    /// Publishes the committed epoch's immutable pages on every claimed node.
+    /// Publishes the committed epoch's immutable pages on every leased node.
     PublishEpoch(crossbeam_channel::Sender<Result<(), String>>),
     /// Ends the storage of other epochs on the nodes of the scheduler's
     /// workers (`Worker::retire`), and responds whether it did.
@@ -613,9 +613,9 @@ pub enum Command {
         epochs: Vec<u64>,
         response: crossbeam_channel::Sender<Result<(), String>>,
     },
-    /// Reads the storage ledgers of the nodes of the scheduler's workers
-    /// (`Worker::ledgers`), and responds with each node's.
-    Ledgers(crossbeam_channel::Sender<Result<Vec<String>, String>>),
+    /// Reads the storage usage of the nodes of the scheduler's workers
+    /// (`Worker::usage`), and responds with each node's.
+    Usage(crossbeam_channel::Sender<Result<Vec<String>, String>>),
     /// Keeps the weights alone of other epochs on the nodes of the
     /// scheduler's workers, in host storage when `to_host`
     /// (`Worker::keep_weights`), and responds with each node's report.
@@ -787,10 +787,10 @@ pub enum CacheChange {
     /// Restores what a sleep gave back.
     Wake,
     /// Creates as many of the given-back segments as each device's storage
-    /// ledger has room for.
+    /// usage has room for.
     Grow,
-    /// Gives back the tail of the cache until each device's storage ledger
-    /// has room for `bytes` beside everything it books, with per-GPU values
+    /// Gives back the tail of the cache until each device's storage usage
+    /// has room for `bytes` beside everything it reserves, with per-GPU values
     /// from `devices` overriding that amount; tail holders continue running.
     /// Fails, changing nothing, when even the segments the cache cannot
     /// give back leave too little room.
@@ -991,7 +991,7 @@ impl CommandSender {
         inherited
     }
 
-    /// Publishes the committed epoch's immutable pages on every claimed node.
+    /// Publishes the committed epoch's immutable pages on every leased node.
     pub fn publish_epoch(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (response, published) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::PublishEpoch(response));
@@ -1025,11 +1025,11 @@ impl CommandSender {
         kept
     }
 
-    /// Reads the storage ledgers of the nodes of the scheduler's workers
-    /// (`Command::Ledgers`); the receiver gets each node's.
-    pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
+    /// Reads the storage usage of the nodes of the scheduler's workers
+    /// (`Command::Usage`); the receiver gets each node's.
+    pub fn usage(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (response, read) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Ledgers(response));
+        let _ = self.send(Command::Usage(response));
         read
     }
 

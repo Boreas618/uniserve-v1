@@ -54,8 +54,8 @@ pub(crate) struct CallCompletion {
     pub draft_token_ids: Vec<u32>,
     /// A video latent preparation's per-rank page layout.
     pub latent_layouts: Vec<RankLatentLayout>,
-    /// The immutable storage the device published, claimed by the mechanism —
-    /// or its claim's error, which belongs to the request that asked for it.
+    /// The immutable storage the device published, taken by the mechanism —
+    /// or the error of opening it, which belongs to the request that asked for it.
     pub media: Result<Option<Arc<SharedMedia>>, SharedMediaError>,
 }
 
@@ -68,8 +68,8 @@ impl CallCompletion {
     /// The mechanism names the call: the worker numbers a batch's calls by
     /// their index, so the pair comes from the batch that was submitted. A host
     /// call publishes its artifact into a POSIX shared-memory object and names
-    /// it, and that name is claimed here — the mapping is what the mechanism
-    /// delivers, and claiming it is what unlinks the name.
+    /// it, and that name is taken here — the mapping is what the mechanism
+    /// delivers, and taking it is what unlinks the name.
     ///
     /// Two things the device reports differently from a worker, both stated
     /// rather than filled in: a call has no timing of its own (the batch
@@ -99,25 +99,25 @@ impl CallCompletion {
             draft_token_ids: output.draft_token_ids,
             latent_layouts: output.latent_layouts,
             media: match output.media_output.as_ref() {
-                Some(published) => claim(published),
+                Some(published) => open(published),
                 None => Ok(None),
             },
         }
     }
 }
 
-/// Claims the artifact an in-process host call published.
+/// Opens the artifact an in-process host call published.
 ///
 /// The worker's media stage copies the mux's bytes into a shared-memory object and relinquishes
 /// it (`ipc::MediaSource::into_locator`), which states the object's name and its exact length; the
-/// claim is the mechanism's, and it is the call that unlinks the name and maps the bytes.
+/// opening is the mechanism's, and it is the call that unlinks the name and maps the bytes.
 ///
 /// # Safety
 ///
 /// The publisher writes nothing after it relinquishes the object and never resizes it, which is the
-/// requirement `SharedMedia::open` states. The mechanism is the only claimer of a name the worker
+/// requirement `SharedMedia::open` states. The mechanism is the only opener of a name the worker
 /// published for one completion.
-fn claim(published: &ipc::MediaOutput) -> Result<Option<Arc<SharedMedia>>, SharedMediaError> {
+fn open(published: &ipc::MediaOutput) -> Result<Option<Arc<SharedMedia>>, SharedMediaError> {
     let ipc::ArtifactHandle::PosixShm { name } = &published.handle;
     // SAFETY: see this function's requirement - the bytes are written before the publisher
     // relinquishes the object and no process modifies it while the mapping lives.

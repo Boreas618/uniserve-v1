@@ -240,7 +240,7 @@ impl OutputSender {
     /// channels, so each journal's pending events, including the terminal
     /// event, move to the receiver, which yields them after the channel's
     /// buffered events (`EventTx::close_with`).
-    pub(super) fn hand_off_retired(&mut self) {
+    pub(super) fn transfer_retired(&mut self) {
         for (_, output) in self.retired.drain() {
             output.event_tx.close_with(output.journal);
         }
@@ -425,11 +425,11 @@ impl Scheduler {
                 // A request prefilled on a prefill group hands its cache to
                 // a decode group first; the decode there continues from the
                 // committed token, which leaves no device token to relay.
-                let hand_off = self.decodes_elsewhere(id);
+                let transfer = self.decodes_elsewhere(id);
                 if let Some(st) = self.requests.tokens_mut(&id) {
                     st.next_token = tok;
-                    if hand_off {
-                        st.phase = Phase::HandOff;
+                    if transfer {
+                        st.phase = Phase::TransferState;
                         st.latest_token = None;
                     } else {
                         st.phase = Phase::DecodeUnd;

@@ -294,7 +294,7 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     // The boundary belongs to the stage that took it: a second one is refused
     // with the waiting stage's name, so the first caller's response is not lost.
     let refused = response(epoch.handle.commit_policy())
-        .expect_err("a stage waits for the boundary already claimed");
+        .expect_err("a stage waits for the boundary already taken");
     assert!(
         refused.contains("switchover"),
         "the refusal names the stage that owns the boundary: {refused}"

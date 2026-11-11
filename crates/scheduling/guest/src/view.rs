@@ -246,7 +246,7 @@ impl PhaseKind {
     /// they can agree on.
     ///
     /// Ids 7, 8, 9, 18 and 19 are reserved: they numbered kinds that no longer exist (19 was the
-    /// cache export, superseded by the scheduler's device-direct hand-off).
+    /// cache export, superseded by the scheduler's device-direct transfer).
     ///
     /// [`PhaseKind::Other`] is a policy-side placeholder for a kind a policy does not know: it has
     /// no phase of its own, so its id is `u32::MAX`.

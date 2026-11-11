@@ -901,7 +901,7 @@ fn a_completion_agrees_with_its_status() {
 }
 
 #[test]
-fn a_batch_output_answers_each_call_of_its_batch_once() {
+fn a_batch_output_states_each_call_of_its_batch_once() {
     let batch = token_batch();
 
     let mut foreign = batch_output();

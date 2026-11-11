@@ -802,7 +802,7 @@ impl DataPlane {
                     host: rank.host.clone(),
                     scope: Some(rank.storage.scope().clone()),
                     epoch: Some(rank.storage.epoch()),
-                    ledger: Some(ledger),
+                    usage: Some(ledger),
                 })
             })
             .collect()

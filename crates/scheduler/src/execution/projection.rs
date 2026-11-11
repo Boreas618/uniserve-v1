@@ -179,7 +179,7 @@ impl Scheduler {
                 if self.config.block_sampling.is_some() {
                     Phase::Block
                 } else if self.decodes_elsewhere(id) {
-                    Phase::HandOff
+                    Phase::TransferState
                 } else {
                     Phase::DecodeUnd
                 }
@@ -414,8 +414,8 @@ impl Scheduler {
         self.inflight.pending_calls.get(&id)?.back()?;
         Some(match self.next_generation_phase(id)? {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
-            // The hand-off copies the request's cache with no call.
-            Phase::HandOff => return None,
+            // The transfer copies the request's cache with no call.
+            Phase::TransferState => return None,
             Phase::Block => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitBlock => CallKind::Forward(ForwardMode::Prefill),
             Phase::IngestState => return None,
@@ -450,7 +450,7 @@ impl Scheduler {
 
     /// Whether the request's prompt was prefilled on a group that does not
     /// decode (`WorkerGroupRole::Prefill`): it decodes on a decode group,
-    /// to which `Phase::HandOff` moves its KV cache.
+    /// to which `Phase::TransferState` moves its KV cache.
     pub(crate) fn decodes_elsewhere(&self, id: RequestId) -> bool {
         let Some(state) = self.requests.tokens(&id) else {
             return false;

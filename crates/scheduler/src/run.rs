@@ -239,7 +239,7 @@ impl Scheduler {
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             trajectories: None,
             encoder_outputs: None,
-            hand_offs: None,
+            transfers: None,
             draining: false,
             awaiting_index: None,
             held_for_index: Vec::new(),
@@ -356,7 +356,7 @@ impl Scheduler {
     }
 
     /// The worker groups that decode only (`WorkerGroupRole::Decode`), which
-    /// take requests by their hand-off alone.
+    /// take requests by their transfer alone.
     pub(crate) fn set_decode_groups(
         &mut self,
         groups: impl IntoIterator<Item = crate::WorkerGroupId>,
@@ -366,13 +366,13 @@ impl Scheduler {
 
     /// Hand requests off from the prefill groups to the decode groups through
     /// this host's Storage Server, at `socket`, as a head of `epoch` of
-    /// `deployment`, on host `host` (`crate::hand_off`).
+    /// `deployment`, on host `host` (`crate::transfer`).
     ///
     /// # Errors
     ///
     /// Fails when a Storage Server cannot be reached or a rank reports no
     /// retained cache planes.
-    pub(crate) fn enable_hand_off(
+    pub(crate) fn enable_transfer(
         &mut self,
         socket: &std::path::Path,
         deployment: &str,
@@ -380,7 +380,7 @@ impl Scheduler {
         host: &str,
     ) -> anyhow::Result<()> {
         let ranks = self.worker.info().rank_caches.clone();
-        self.hand_offs = Some(crate::hand_off::HandOffs::connect(
+        self.transfers = Some(crate::transfer::Transfers::connect(
             socket, deployment, epoch, host, &ranks,
         )?);
         Ok(())
@@ -807,7 +807,7 @@ impl Scheduler {
             }
             let progressed = self.step() || handled;
             // An update's shadow pass gets its response once the step that ran it has
-            // ended (§7.3 step 2): the response never claims a comparison the
+            // ended (§7.3 step 2): the response never states a comparison the
             // step has not finished.
             self.settle_shadow();
             if !self.failed() && !progressed {
@@ -1040,9 +1040,9 @@ impl Scheduler {
                     .flat_map(crate::encoder_outputs::EncoderStore::descriptors),
             )
             .chain(
-                self.hand_offs
+                self.transfers
                     .iter()
-                    .flat_map(crate::hand_off::HandOffs::descriptors),
+                    .flat_map(crate::transfer::Transfers::descriptors),
             )
             .collect();
         self.worker.wait(deadline, &connections);

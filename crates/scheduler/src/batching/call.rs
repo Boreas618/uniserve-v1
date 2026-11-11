@@ -200,9 +200,9 @@ impl Scheduler {
             };
             let fresh_count = u64::from(call.bounds.max_cache_units);
             let declared = state.num_cache_units_sent;
-            // A handed-off request's first call is its first on the decode group.
-            let handed_off = state.hand_off == generation::HandOff::Copied;
-            state.hand_off = generation::HandOff::None;
+            // A given-off request's first call is its first on the decode group.
+            let transferred = state.transfer == generation::TransferState::Copied;
+            state.transfer = generation::TransferState::None;
             let (Some(request_pool_idx), Some(allocation)) =
                 (state.request_pool_idx(), state.prefix_cache_mut())
             else {
@@ -219,15 +219,15 @@ impl Scheduler {
             // Admission (or re-admission) declares every table again, with
             // every allocated page fresh; pages acquired from the prefix
             // cache already hold computed keys and values and are never fresh.
-            // A handed-off request's first call declares them to the decode
-            // group, which has seen none, with no fresh unit: the hand-off
+            // A given-off request's first call declares them to the decode
+            // group, which has seen none, with no fresh unit: the transfer
             // copied every unit's pages there.
-            if admitted || handed_off {
+            if admitted || transferred {
                 allocation.clear_sent();
             }
             let fresh_since = if admitted {
                 Some(0)
-            } else if handed_off {
+            } else if transferred {
                 None
             } else {
                 (fresh_count > 0).then(|| declared.saturating_sub(fresh_count))

@@ -3079,7 +3079,7 @@ mod tests {
     /// An admission that leaves before its pins get their responses holds none of
     /// the pages they pin once the responses arrive, and the pages stay.
     #[test]
-    fn pins_answered_after_their_admission_left_are_released() {
+    fn pins_resolved_after_their_admission_left_are_released() {
         let server = Running::start();
         let (_worker, pools) = worker_pools(&server, &[3]);
         let cache = report(vec![cache_group(None)], &pools, &[3]);

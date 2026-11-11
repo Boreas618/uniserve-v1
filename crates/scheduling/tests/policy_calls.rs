@@ -243,7 +243,7 @@ fn policy(engine: &Engine, toy: Toy) -> PolicyInstance {
 }
 
 #[test]
-fn every_decision_reaches_its_export_and_answers() {
+fn every_decision_reaches_its_export_and_returns() {
     let engine = engine();
     let output = DispatchOutput {
         work: vec![Work {
@@ -297,7 +297,7 @@ fn preempt_may_name_nobody() {
 }
 
 #[test]
-fn an_answer_with_a_field_the_host_does_not_know_still_decodes() {
+fn an_output_with_a_field_the_host_does_not_know_still_decodes() {
     let engine = engine();
     // The views and decisions are append-only lists: a policy built against a
     // later interface writes fields this host does not know, and its response
@@ -322,7 +322,7 @@ fn an_answer_with_a_field_the_host_does_not_know_still_decodes() {
 #[test]
 fn the_message_is_written_into_the_module() {
     let engine = engine();
-    // The toy responds with the first byte of the message it was handed, so the
+    // The toy responds with the first byte of the message it was given, so the
     // host must have written that message at the pointer the module returned.
     // The route message is the interface's `(RequestView, &[RankView])` tuple
     // (the guest decodes a tuple too), and a tuple encodes as a JSON sequence:
@@ -446,7 +446,7 @@ fn a_decision_that_traps_fails_and_ends_the_instance() {
 }
 
 #[test]
-fn an_answer_that_does_not_decode_is_malformed() {
+fn an_output_that_does_not_decode_is_malformed() {
     let engine = engine();
     let toy = Toy::new().raw_reply(Call::Dispatch.export(), b"not a dispatch output");
     let mut policy = policy(&engine, toy);

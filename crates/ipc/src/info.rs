@@ -32,7 +32,7 @@ pub struct PrefixCacheInfo {
     pub page_pools: Vec<HostPoolInfo>,
     /// Where the bytes of every unit lie in the rank's retained device
     /// storage, run by run, for copies between processes (a prefill/decode
-    /// hand-off); empty for planes not retained at a Storage Server.
+    /// transfer); empty for planes not retained at a Storage Server.
     #[serde(default)]
     pub plane_runs: Vec<CachePlaneRun>,
     /// Units `1..=scratch_units` the rank's warmup lends to its startup

@@ -446,19 +446,19 @@ impl Scheduler {
                     .unwrap_or_default();
                 let engine_id = self.engine_id;
                 let mut admitted = false;
-                // A handed-off request's first call admits it on the decode
+                // A given-off request's first call admits it on the decode
                 // group, with the token it generated on the prefill group,
                 // which its penalties count.
-                let hand_off = self
+                let transfer = self
                     .requests
                     .tokens(&id)
-                    .is_some_and(|st| st.hand_off == generation::HandOff::Copied);
+                    .is_some_and(|st| st.transfer == generation::TransferState::Copied);
                 if let Some(st) = self.requests.tokens_mut(&id)
-                    && (!st.worker_registered || hand_off)
+                    && (!st.worker_registered || transfer)
                 {
                     let request_key = RequestKey::new(engine_id, id, st.request_epoch);
                     let mut generated_token_ids = st.req.generated_token_ids.clone();
-                    if hand_off {
+                    if transfer {
                         generated_token_ids.push(st.next_token);
                         // The decode group's slot holds none of the request's sampling state yet:
                         // its first token batch there starts it.
@@ -487,7 +487,7 @@ impl Scheduler {
                         self.invariant_broken("a running request forms a valid worker admission");
                         return Vec::new();
                     };
-                    if !hand_off {
+                    if !transfer {
                         st.worker_registered = true;
                         // Admission is the first request-state dependency.
                         st.last_state_call_id = CallId::default();
@@ -707,7 +707,7 @@ impl Scheduler {
             inputs.push(tokens);
             on_device.push(state.state_on_device);
             // A slot that does not hold the request's sampling state starts it at the tokens the
-            // request accepted so far: a decode group's first batch after a hand-off, and a
+            // request accepted so far: a decode group's first batch after a transfer, and a
             // migrated or preempted request's first batch after its admission, continue penalty
             // counts the request began elsewhere.
             fresh.push((!state.sampling_on_device).then_some(state.generated_token_ids.as_slice()));
@@ -972,7 +972,7 @@ impl Scheduler {
                     width: 0,
                     height: 0,
                     frames: 0,
-                    handed: 0,
+                    rounds: 0,
                     unit: 0,
                 });
                 continue;
@@ -993,7 +993,7 @@ impl Scheduler {
                 width: state.request.sampling.width,
                 height: state.request.sampling.height,
                 frames: state.request.sampling.num_frames,
-                handed: u32::try_from(call.inputs.len()).unwrap_or(u32::MAX),
+                rounds: u32::try_from(call.inputs.len()).unwrap_or(u32::MAX),
                 unit: placed.decode.as_ref().map_or(0, |range| range.cursor),
             });
         }
@@ -1148,8 +1148,8 @@ impl Scheduler {
             // kind and built under another and is dropped unnamed.
             Phase::DecodeUnd if self.speculates() => CallKind::Forward(ForwardMode::Verify),
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
-            // The hand-off copies the request's cache with no call.
-            Phase::HandOff => return None,
+            // The transfer copies the request's cache with no call.
+            Phase::TransferState => return None,
             Phase::Block => CallKind::Forward(ForwardMode::TokenDenoising),
             Phase::CommitBlock => CallKind::Forward(ForwardMode::Prefill),
         })

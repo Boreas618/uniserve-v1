@@ -822,7 +822,7 @@ pub struct BatchColumns {
 
 /// One request slot a batch starts a request's sampling state on.
 ///
-/// A request does not always start on a worker with nothing generated: a request handed from its
+/// A request does not always start on a worker with nothing generated: a request given from its
 /// prefill group to a decode group generated its first token on the prefill group, and a migrated
 /// or preempted request generated its tokens before it was admitted again. Its penalties count
 /// those tokens all the same, so the slot's counts start at the request's history rather than at
@@ -1049,7 +1049,7 @@ impl MediaColumns {
 /// - **0**, the conditioning blob, byte for byte as `DiffusionRequest::conditioning` holds it;
 /// - **1**, sixty bytes little-endian: `step: u32`, `steps: u32`, `seed: u64`, `width: u32`,
 ///   `height: u32`, `frames: u32`, then the identity - `engine_id: u64`, `request_id: u64`,
-///   `request_epoch: u64` - and `handed: u32` and `unit: u32`.
+///   `request_epoch: u64` - and `given: u32` and `unit: u32`.
 ///
 /// Little-endian and fixed width so that a worker and an engine of different architectures read one
 /// record, and so that a runner reads offsets rather than a parser.
@@ -1083,7 +1083,7 @@ pub struct StagedRequest {
     pub frames: u32,
     /// The encoded rounds this call hands over, which only a muxing call states: the final muxing
     /// call hands none, and that is what makes it the one that finishes the artifact.
-    pub handed: u32,
+    pub rounds: u32,
     /// The first timeline unit a unit-measured call covers: the clip a video decode is. Zero for
     /// every other call.
     pub unit: u32,
@@ -1102,7 +1102,7 @@ impl StagedRequest {
         record.extend_from_slice(&self.request.engine_id.to_le_bytes());
         record.extend_from_slice(&self.request.request_id.0.to_le_bytes());
         record.extend_from_slice(&self.request.request_epoch.to_le_bytes());
-        record.extend_from_slice(&self.handed.to_le_bytes());
+        record.extend_from_slice(&self.rounds.to_le_bytes());
         record.extend_from_slice(&self.unit.to_le_bytes());
         vec![self.conditioning.clone(), record]
     }
@@ -1120,7 +1120,7 @@ impl StagedRequest {
             // The refusal names the **shape**, not the width it expects: the width is
             // `PARAMETER_BYTES`, which every column this record gains moves by a field, and a
             // refusal that prints it states a fact about the build rather than about what was
-            // handed over. What the reader needs is which record this is and what arrived.
+            // given over. What the reader needs is which record this is and what arrived.
             return Err(ValidationError::message(format!(
                 "a media request's parameter record is step, steps, seed, width, height, frames, \
                  the request's three identities, the rounds it hands over and its first unit; this \
@@ -1152,14 +1152,14 @@ impl StagedRequest {
             width: word(16),
             height: word(20),
             frames: word(24),
-            handed: word(52),
+            rounds: word(52),
             unit: word(56),
         })
     }
 }
 
 /// The width of a staged request's parameter record: `step`, `steps`, `seed`, `width`, `height` and
-/// `frames`, then the request's identity (`engine_id`, `request_id`, `request_epoch`), then `handed`
+/// `frames`, then the request's identity (`engine_id`, `request_id`, `request_epoch`), then `given`
 /// and `unit`.
 const PARAMETER_BYTES: usize = (4 + 4 + 8 + 4 + 4 + 4) + (8 + 8 + 8) + 4 + 4;
 
@@ -1730,7 +1730,7 @@ pub trait Batches: Send + Sync {
 
     /// The devices `batch` runs on, each by its place among [`Batches::device_count`] devices.
     ///
-    /// A device runs the batches it is handed from a queue of its own, and the launch's
+    /// A device runs the batches it is given from a queue of its own, and the launch's
     /// `queue_depth` bounds that queue, as the capacity reservation holds each device's in-flight calls
     /// by it. A mechanism that counted every batch of a rank against one bound would hold one
     /// device's clip behind another device's, so it counts the devices a batch takes. A worker of
@@ -1868,7 +1868,7 @@ pub struct PoolLayout {
 /// completed on the device (the worker thread waits on its own stream's work before reporting a
 /// job, and with it the submission). A serving submission completes with the step's
 /// [`BatchOutput`] — the tokens its sampling rows sampled; every other submission completes with an
-/// empty one. The scheduler thread waits on the submission of a step at the next step's hand-off,
+/// empty one. The scheduler thread waits on the submission of a step at the next step's transfer,
 /// never on the device itself.
 pub struct Submission {
     id: SubmissionId,
@@ -2068,7 +2068,7 @@ mod joined_tests {
     /// A batch a group runs together has ended when every rank's part ended, and the rank that
     /// failed decides the response: the others' output lacks its part.
     #[test]
-    fn a_joined_submission_waits_for_every_rank_and_answers_a_peers_failure() {
+    fn a_joined_submission_waits_for_every_rank_and_returns_a_peers_failure() {
         let (pending, state) = Submission::pending(SubmissionId(2));
         let joined = done(1).joined(vec![pending]);
         assert!(joined.outcome().is_none(), "a peer has not ended");
@@ -2197,7 +2197,7 @@ mod media_tests {
             width: 768,
             height: 512,
             frames: 121,
-            handed: 0,
+            rounds: 0,
         };
         let row = staged.encode();
         assert_eq!(row.len(), 2, "a staged request is two buffers");

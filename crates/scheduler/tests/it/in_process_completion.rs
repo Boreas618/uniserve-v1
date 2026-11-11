@@ -2,7 +2,7 @@
 //!
 //! `in_process.rs` states what `SchedulerHandle::over_batches` refuses; this
 //! states what it does. The pool here is `ipc::execution::Batches` and responds
-//! every batch it is handed with the mechanism's own values — one
+//! every batch it is given with the mechanism's own values — one
 //! `CallOutput::completed` per call it was given, and the batch's timing — so
 //! the whole path runs: the policy admits, the mechanism assembles columns and
 //! a shape, the arm states them to the worker and files the report it gets
@@ -10,7 +10,7 @@
 //!
 //! What the stub does not stand in for: the device. A real worker captures
 //! graphs, stages columns into its arena and derives the token from the model;
-//! this one is handed the mechanism's batch and responds to it. Everything between
+//! this one is given the mechanism's batch and responds to it. Everything between
 //! those two points is the code under test.
 
 use std::sync::Arc;
@@ -297,7 +297,7 @@ fn a_policy_stage_applies_after_a_request_ended() {
 /// no policy — `fcfs` included — can schedule the work that would prefilled it, and
 /// the epoch dispatches nothing while requests queue behind it. This case
 /// states the mechanism's half: one text request, the real `fcfs` program, and
-/// a batch handed to the worker with no other help.
+/// a batch given to the worker with no other help.
 #[test]
 fn an_admitted_request_is_prefilled_on_the_next_step() {
     let serving = Arc::new(crate::support::positional(vec![crate::support::pool(
@@ -322,8 +322,8 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
     while serving.submitted().is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
-    let handed = serving.submitted();
-    let first = handed.first().expect("the pool was handed a batch");
+    let submitted = serving.submitted();
+    let first = submitted.first().expect("the pool was given a batch");
     assert_eq!(
         first.shape.rows, 1,
         "the batch is the one request's, not a full bucket's"
@@ -335,13 +335,13 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
     );
     // The prefill comes first in submission order: the request's prompt is
     // written before any token of it is decoded.
-    let decoded_first = handed
+    let decoded_first = submitted
         .iter()
         .position(|batch| batch.shape.variant.name().starts_with("decode"));
     assert!(
         decoded_first.is_none_or(|index| index > 0),
-        "a decode was handed before the prefill: {:?}",
-        handed
+        "a decode was given before the prefill: {:?}",
+        submitted
             .iter()
             .map(|batch| batch.shape.variant.name())
             .collect::<Vec<_>>()
