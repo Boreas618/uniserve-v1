@@ -245,6 +245,7 @@ impl OutputProcessor {
                     let saturate = |count: usize| u32::try_from(count).unwrap_or(u32::MAX);
                     outputs.push(RequestOutput::Finished {
                         reason: finished.reason,
+                        stop_reason: finished.stop_reason,
                         usage: RequestUsage {
                             prompt_tokens: saturate(finished.prompt_tokens),
                             output_tokens: saturate(finished.output_tokens),

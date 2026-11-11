@@ -18,16 +18,19 @@ use proto::handoff::TextDecode;
 use proto::request::{Event, PositionLogprobs, RejectionKind};
 use tracing::{Level, debug, trace};
 
-use super::logprobs::{DecodedLogprobs, decode_logprobs, decode_prompt_logprobs};
+use super::logprobs::{decode_logprobs, decode_prompt_logprobs};
 use crate::output::events::{FinishReason, PromptInfo, StopReason};
 use crate::output::text::error::Error;
 use crate::tokenizer::{DynTokenizer, IncrementalDecoder};
+use proto::handoff::DecodedLogprobs;
 
 /// How a decoded request finished, with its token counts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finished {
     /// Why the request finished.
     pub reason: FinishReason,
+    /// The stop token or string that matched, when one did.
+    pub stop_reason: Option<StopReason>,
     /// Prompt tokens submitted to the engine.
     pub prompt_tokens: usize,
     /// Generated tokens.
@@ -350,12 +353,12 @@ impl DecodeStream {
                     events.push(start);
                 }
                 self.ensure_output_ready_from(&events, "the terminal event")?;
-                let Some(reason) = FinishReason::from_engine(reason, stop_reason) else {
+                if reason == FinishReason::Error {
                     events.push(DecodedTextEvent::Failed {
                         message: "engine execution failed".to_owned(),
                     });
                     return Ok(Decoded::new(events));
-                };
+                }
 
                 // Release the decoder's holdback untruncated: a stop-string
                 // match would have ended the stream in `consume_tokens`.
@@ -376,6 +379,7 @@ impl DecodeStream {
                 });
                 events.push(DecodedTextEvent::Done(Finished {
                     reason,
+                    stop_reason,
                     prompt_tokens,
                     output_tokens: completion_tokens,
                 }));
@@ -483,7 +487,8 @@ impl DecodeStream {
                 logprobs: decoded_logprobs,
             });
             events.push(DecodedTextEvent::Done(Finished {
-                reason: FinishReason::Stop(Some(StopReason::String(stop_string))),
+                reason: FinishReason::Stop,
+                stop_reason: Some(StopReason::String(stop_string)),
                 prompt_tokens: prompt_token_ids.len(),
                 output_tokens: self.output_tokens,
             }));
@@ -501,19 +506,8 @@ impl DecodeStream {
     /// The decoder's state, for a successor process (design §7.5.1).
     pub fn state(&self) -> proto::handoff::Decode {
         use proto::handoff;
-        let decoder = self.decoder.state();
         handoff::Decode {
-            decoder: Some(handoff::IncrementalDecode {
-                ids: decoder.ids,
-                prefix: decoder.prefix,
-                prefix_index: decoder.prefix_index as u64,
-                cumulative_output: decoder.cumulative_output,
-                output_index: decoder.output_index as u64,
-                prompt_seeded: decoder.prompt_seeded,
-                pending_since_emit: decoder.pending_since_emit as u64,
-                skip_special_tokens: decoder.skip_special_tokens,
-                min_bytes_to_buffer: decoder.min_bytes_to_buffer as u64,
-            }),
+            decoder: Some(self.decoder.state()),
             stop_strings: self.options.stop_strings.clone(),
             prompt_positions: self
                 .prompt_positions
@@ -556,20 +550,7 @@ impl DecodeStream {
             return Err(Error::EmptyPromptTokenIds { request_id });
         }
         let decoder = match &state.decoder {
-            Some(decoder) => IncrementalDecoder::resume(
-                crate::tokenizer::IncrementalDecodeState {
-                    ids: decoder.ids.clone(),
-                    prefix: decoder.prefix.clone(),
-                    prefix_index: decoder.prefix_index as usize,
-                    cumulative_output: decoder.cumulative_output.clone(),
-                    output_index: decoder.output_index as usize,
-                    prompt_seeded: decoder.prompt_seeded,
-                    pending_since_emit: decoder.pending_since_emit as usize,
-                    skip_special_tokens: decoder.skip_special_tokens,
-                    min_bytes_to_buffer: decoder.min_bytes_to_buffer as usize,
-                },
-                Arc::clone(&tokenizer),
-            ),
+            Some(decoder) => IncrementalDecoder::resume(decoder, Arc::clone(&tokenizer)),
             None => tokenizer.create_decode_stream(
                 &prompt_token_ids,
                 options.skip_special_tokens,

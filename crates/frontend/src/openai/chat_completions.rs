@@ -32,6 +32,10 @@ use axum::routing::post;
 use axum::{Extension, Router};
 use itertools::Itertools as _;
 use proto::handoff;
+use proto::handoff::assistant_block::Block;
+use proto::handoff::{
+    DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
+};
 use serde_json::Value;
 use tracing::{debug, error};
 use tracing_futures::Instrument as _;
@@ -40,11 +44,8 @@ use crate::body::{Opening, Session};
 use crate::openai::error::{bail_server_error, server_error};
 use crate::openai::run::{ChatBodySink, GenerationRun};
 use crate::openai::{ApiError, RequestId, Server, ValidatedJson, check_model_served};
-use crate::output::chat::{AssistantBlockKind, AssistantContentBlock, AssistantMessage};
-use crate::output::text::{
-    DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
-};
-use crate::output::{FinishReason, RequestOutput, StopReason};
+use crate::output::chat::AssistantBlockKind;
+use crate::output::{FinishReason, RequestOutput, RequestUsage, StopReason, finish_reason_name};
 use crate::protocol::{
     AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse, ChatLogProbs,
@@ -150,12 +151,17 @@ pub fn chat_response(
     collector: &ChatCollector,
     options: &handoff::ChatResponseOptions,
 ) -> Result<ChatCompletionResponse, ApiError> {
-    let Some((reason, usage)) = collector.finished.clone() else {
+    let Some((reason, stop_reason, usage)) = collector.finished.clone() else {
         return Err(server_error!(
             "chat completion stream closed before terminal finish event"
         ));
     };
-    let message = &collector.message;
+    let blocks = || {
+        collector
+            .blocks
+            .iter()
+            .filter_map(|block| block.block.as_ref())
+    };
     let handoff::ChatResponseOptions {
         requested_logprobs,
         top_logprobs,
@@ -166,25 +172,41 @@ pub fn chat_response(
         ..
     } = *options;
 
-    let stop_reason = stop_reason_value(&reason);
-    let saw_tool_calls = message.tool_calls().next().is_some();
-    let reasoning = message.reasoning();
+    let stop_reason = stop_reason_value(stop_reason.as_ref());
+    // The message's visible text, its reasoning and its tool calls, each the
+    // concatenation of its blocks in order.
+    let text: String = blocks()
+        .filter_map(|block| match block {
+            Block::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let reasoning: String = blocks()
+        .filter_map(|block| match block {
+            Block::Reasoning(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let reasoning = Some(reasoning).filter(|text| !text.is_empty());
+    let tool_calls = blocks()
+        .filter_map(|block| match block {
+            Block::ToolCall(call) => Some(ToolCall {
+                id: call.id.clone(),
+                tool_type: "function".to_string(),
+                function: FunctionCallResponse {
+                    name: call.name.clone(),
+                    arguments: Some(call.arguments.clone()),
+                },
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let saw_tool_calls = !tool_calls.is_empty();
     // Output logprobs and token IDs cover the complete generated token stream.
     // When reasoning is hidden, omit them rather than leaking hidden reasoning
     // tokens through per-token metadata.
     let include_output_metadata = include_reasoning || reasoning.is_none();
     let finish_reason = openai_finish_reason(&reason, saw_tool_calls).to_string();
-    let tool_calls = message
-        .tool_calls()
-        .map(|call| ToolCall {
-            id: call.id.clone(),
-            tool_type: "function".to_string(),
-            function: FunctionCallResponse {
-                name: call.name.clone(),
-                arguments: Some(call.arguments.clone()),
-            },
-        })
-        .collect::<Vec<_>>();
     let logprobs = if requested_logprobs && include_output_metadata {
         Some(decoded_logprobs_to_openai_chat(
             collector.logprobs.as_ref().ok_or_else(|| {
@@ -219,7 +241,7 @@ pub fn chat_response(
             index: 0,
             message: ChatCompletionMessage {
                 role: AssistantRole,
-                content: Some(message.text()).filter(|text| !text.is_empty()),
+                content: Some(text).filter(|text| !text.is_empty()),
                 tool_calls: Some(tool_calls).filter(|calls| !calls.is_empty()),
                 reasoning: if include_reasoning { reasoning } else { None },
             },
@@ -244,14 +266,17 @@ pub fn chat_response(
 /// response has.
 #[derive(Default)]
 pub struct ChatCollector {
-    message: AssistantMessage,
+    /// The closed blocks of the assistant message, in order.
+    blocks: Vec<handoff::AssistantBlock>,
     prompt_token_ids: Vec<u32>,
-    prompt_logprobs: Option<crate::output::text::DecodedPromptLogprobs>,
+    prompt_logprobs: Option<DecodedPromptLogprobs>,
     /// Output logprobs concatenated across `TokenDelta` updates; `None` when
     /// no update carried any.
     logprobs: Option<DecodedLogprobs>,
     token_ids: Vec<u32>,
-    finished: Option<(FinishReason, crate::output::RequestUsage)>,
+    /// The request's terminal output: why it finished, the stop token or
+    /// string that matched, and what it consumed.
+    finished: Option<(FinishReason, Option<StopReason>, RequestUsage)>,
 }
 
 impl ChatCollector {
@@ -285,13 +310,22 @@ impl ChatCollector {
                         .extend(delta_logprobs.positions.iter().cloned());
                 }
             }
-            RequestOutput::OutputBlockEnd { block, .. } => self.message.push_block(block.clone()),
-            RequestOutput::ToolCallEnd { call, .. } => {
-                self.message
-                    .push_block(AssistantContentBlock::ToolCall(call.clone()));
+            RequestOutput::OutputBlockEnd { block, .. } => {
+                self.blocks.push(handoff::AssistantBlock {
+                    block: Some(block.clone()),
+                });
             }
-            RequestOutput::Finished { reason, usage } => {
-                self.finished = Some((reason.clone(), usage.clone()));
+            RequestOutput::ToolCallEnd { call, .. } => {
+                self.blocks.push(handoff::AssistantBlock {
+                    block: Some(Block::ToolCall(call.clone())),
+                });
+            }
+            RequestOutput::Finished {
+                reason,
+                stop_reason,
+                usage,
+            } => {
+                self.finished = Some((reason.clone(), stop_reason.clone(), usage.clone()));
             }
             RequestOutput::Rejected { kind, message } => {
                 return Err(ApiError::rejected(*kind, message.clone()));
@@ -317,40 +351,19 @@ impl ChatCollector {
         let finish_reason = self
             .finished
             .as_ref()
-            .map(|(reason, _)| reason.as_str().to_owned())
+            .map(|(reason, _, _)| finish_reason_name(reason).to_owned())
             .unwrap_or_default();
         handoff::ChatCollection {
-            blocks: self
-                .message
-                .content
-                .iter()
-                .map(|block| match block {
-                    AssistantContentBlock::Text { text } => handoff::AssistantBlock {
-                        block: Some(handoff::assistant_block::Block::Text(text.clone())),
-                    },
-                    AssistantContentBlock::Reasoning { text } => handoff::AssistantBlock {
-                        block: Some(handoff::assistant_block::Block::Reasoning(text.clone())),
-                    },
-                    AssistantContentBlock::ToolCall(call) => handoff::AssistantBlock {
-                        block: Some(handoff::assistant_block::Block::ToolCall(
-                            handoff::ToolCall {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                arguments: call.arguments.clone(),
-                            },
-                        )),
-                    },
-                })
-                .collect(),
+            blocks: self.blocks.clone(),
             prompt_token_ids: self.prompt_token_ids.clone(),
             // The logprobs the response already collected are the response:
             // the collector concatenated them as each update carried them, and
             // no later update repeats an earlier position (§7.5.1 step 3).
-            prompt_logprobs: self.prompt_logprobs.as_ref().map(handoff_prompt_logprobs),
-            logprobs: self.logprobs.as_ref().map(handoff_logprobs),
+            prompt_logprobs: self.prompt_logprobs.clone(),
+            logprobs: self.logprobs.clone(),
             token_ids: self.token_ids.clone(),
             finish_reason,
-            usage: self.finished.as_ref().map(|(_, usage)| handoff::Usage {
+            usage: self.finished.as_ref().map(|(_, _, usage)| handoff::Usage {
                 prompt_tokens: usage.prompt_tokens,
                 output_tokens: usage.output_tokens,
             }),
@@ -360,105 +373,12 @@ impl ChatCollector {
 
     /// Takes over a state this collector produced.
     pub fn resume(&mut self, state: &handoff::ChatCollection) {
-        let mut message = AssistantMessage::default();
-        for block in &state.blocks {
-            match block.block.as_ref() {
-                Some(handoff::assistant_block::Block::Text(text)) => {
-                    message.push_block(AssistantContentBlock::Text { text: text.clone() });
-                }
-                Some(handoff::assistant_block::Block::Reasoning(text)) => {
-                    message.push_block(AssistantContentBlock::Reasoning { text: text.clone() });
-                }
-                Some(handoff::assistant_block::Block::ToolCall(call)) => {
-                    message.push_block(AssistantContentBlock::ToolCall(
-                        crate::output::chat::AssistantToolCall {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                        },
-                    ));
-                }
-                None => {}
-            }
-        }
-        self.message = message;
+        self.blocks.clone_from(&state.blocks);
         self.prompt_token_ids.clone_from(&state.prompt_token_ids);
-        self.prompt_logprobs = state.prompt_logprobs.as_ref().map(decoded_prompt_logprobs);
-        self.logprobs = state.logprobs.as_ref().map(decoded_logprobs);
+        self.prompt_logprobs.clone_from(&state.prompt_logprobs);
+        self.logprobs.clone_from(&state.logprobs);
         self.token_ids.clone_from(&state.token_ids);
         self.finished = None;
-    }
-}
-
-/// The generated-token logprobs a handoff carries (§7.5.1 step 3).
-fn handoff_logprobs(logprobs: &DecodedLogprobs) -> handoff::DecodedLogprobs {
-    handoff::DecodedLogprobs {
-        positions: logprobs.positions.iter().map(handoff_position).collect(),
-    }
-}
-
-/// One position's decoded candidates, as the handoff carries them.
-fn handoff_position(position: &DecodedPositionLogprobs) -> handoff::DecodedPositionLogprobs {
-    handoff::DecodedPositionLogprobs {
-        entries: position
-            .entries
-            .iter()
-            .map(|entry| handoff::DecodedTokenLogprob {
-                token_id: entry.token_id,
-                token: entry.token.clone(),
-                logprob: entry.logprob,
-                rank: entry.rank,
-            })
-            .collect(),
-    }
-}
-
-/// The prompt logprobs a handoff carries, as [`handoff_logprobs`].
-fn handoff_prompt_logprobs(logprobs: &DecodedPromptLogprobs) -> handoff::DecodedPromptLogprobs {
-    handoff::DecodedPromptLogprobs {
-        first_token_id: logprobs.first_token_id,
-        first_token: logprobs.first_token.clone(),
-        scored_positions: logprobs
-            .scored_positions
-            .iter()
-            .map(handoff_position)
-            .collect(),
-    }
-}
-
-/// The generated-token logprobs a collector resumes with.
-fn decoded_logprobs(state: &handoff::DecodedLogprobs) -> DecodedLogprobs {
-    DecodedLogprobs {
-        positions: state.positions.iter().map(decoded_position).collect(),
-    }
-}
-
-/// One position's decoded candidates, as a resumed collector holds them.
-fn decoded_position(position: &handoff::DecodedPositionLogprobs) -> DecodedPositionLogprobs {
-    DecodedPositionLogprobs {
-        entries: position
-            .entries
-            .iter()
-            .map(|entry| DecodedTokenLogprob {
-                token_id: entry.token_id,
-                token: entry.token.clone(),
-                logprob: entry.logprob,
-                rank: entry.rank,
-            })
-            .collect(),
-    }
-}
-
-/// The prompt logprobs a collector resumes with.
-fn decoded_prompt_logprobs(state: &handoff::DecodedPromptLogprobs) -> DecodedPromptLogprobs {
-    DecodedPromptLogprobs {
-        first_token_id: state.first_token_id,
-        first_token: state.first_token.clone(),
-        scored_positions: state
-            .scored_positions
-            .iter()
-            .map(decoded_position)
-            .collect(),
     }
 }
 
@@ -676,7 +596,11 @@ impl ChatStreamEmitter {
             RequestOutput::ToolCallEnd { .. } => {
                 debug!("ending current tool call");
             }
-            RequestOutput::Finished { reason, usage } => {
+            RequestOutput::Finished {
+                reason,
+                stop_reason,
+                usage,
+            } => {
                 if let Some(pending_chunk) = self.pending_chunk.as_mut()
                     && let Some(chunk) = pending_chunk.take_chunk(
                         &self.response.request_id,
@@ -691,6 +615,7 @@ impl ChatStreamEmitter {
                     &self.response.response_model,
                     self.response.created,
                     reason,
+                    stop_reason.as_ref(),
                     self.saw_tool_calls,
                 ));
                 if self.response.include_usage {
@@ -1022,9 +947,10 @@ fn final_chunk(
     response_model: &str,
     created: u64,
     reason: &FinishReason,
+    stop_reason: Option<&StopReason>,
     saw_tool_calls: bool,
 ) -> ChatCompletionStreamResponse {
-    let stop_reason = stop_reason_value(reason);
+    let stop_reason = stop_reason_value(stop_reason);
     let finish_reason = openai_finish_reason(reason, saw_tool_calls);
 
     debug!(
@@ -1047,20 +973,20 @@ fn final_chunk(
 /// A stop after any tool call reports `tool_calls`, and a repetition stop
 /// reports `stop`.
 fn openai_finish_reason(reason: &FinishReason, saw_tool_calls: bool) -> &'static str {
-    match reason {
-        FinishReason::Stop(_) if saw_tool_calls => "tool_calls",
-        FinishReason::Stop(_) | FinishReason::Repetition => "stop",
-        reason => reason.as_str(),
+    match finish_reason_name(reason) {
+        "stop" if saw_tool_calls => "tool_calls",
+        "repetition" => "stop",
+        name => name,
     }
 }
 
 /// Returns the `stop_reason` response value: the matched stop token ID or
-/// stop string, or `None` for a stop without one and every other reason.
-fn stop_reason_value(reason: &FinishReason) -> Option<Value> {
+/// stop string, or `None` for a finish without one.
+fn stop_reason_value(reason: Option<&StopReason>) -> Option<Value> {
     match reason {
-        FinishReason::Stop(Some(StopReason::Token(id))) => Some(serde_json::json!(id)),
-        FinishReason::Stop(Some(StopReason::String(text))) => Some(serde_json::json!(text)),
-        _ => None,
+        Some(StopReason::Token(id)) => Some(serde_json::json!(id)),
+        Some(StopReason::String(text)) => Some(serde_json::json!(text)),
+        None => None,
     }
 }
 
@@ -1188,10 +1114,11 @@ mod tests {
     use super::ChatCollector;
     use super::ChatStreamEmitter;
     use super::chat_response;
-    use crate::output::chat::{AssistantBlockKind, AssistantContentBlock};
-    use crate::output::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
+    use crate::output::chat::AssistantBlockKind;
     use crate::output::{FinishReason, PromptInfo, RequestOutput, RequestUsage};
     use crate::protocol::ChatCompletionStreamResponse;
+    use proto::handoff::assistant_block::Block;
+    use proto::handoff::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
 
     /// Single-candidate logprobs for one generated token.
     fn logprobs(token_id: u32) -> Option<DecodedLogprobs> {
@@ -1230,9 +1157,7 @@ mod tests {
             }),
             Ok(RequestOutput::OutputBlockEnd {
                 index: 0,
-                block: AssistantContentBlock::Reasoning {
-                    text: "think".to_string(),
-                },
+                block: Block::Reasoning("think".to_string()),
             }),
             Ok(RequestOutput::OutputBlockStart {
                 index: 1,
@@ -1246,7 +1171,8 @@ mod tests {
                 logprobs: logprobs(11),
             }),
             Ok(RequestOutput::Finished {
-                reason: FinishReason::Stop(None),
+                reason: FinishReason::Stop,
+                stop_reason: None,
                 usage: RequestUsage::default(),
             }),
         ]

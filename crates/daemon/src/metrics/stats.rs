@@ -492,7 +492,9 @@ impl RequestOutcome {
             } => {
                 self.queue_us = Some(((scheduled_at - queued_at).max(0.0) * 1e6) as u64);
             }
-            RequestOutput::Finished { reason, usage } => self.record(reason.as_str(), Some(usage)),
+            RequestOutput::Finished { reason, usage, .. } => {
+                self.record(frontend::output::finish_reason_name(reason), Some(usage));
+            }
             RequestOutput::Failed { .. } => self.record("error", None),
             RequestOutput::Rejected { .. } => self.recorded = true,
             _ => {}

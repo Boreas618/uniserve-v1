@@ -455,15 +455,24 @@ message TokenLogprob {
   uint32 rank = 3;
 }
 
-// One decoded token candidate and its logprob metadata.
+// One decoded token candidate and its logprob metadata. Output processing
+// produces these from the engine's token-identifier candidates, a response
+// collects them, and a handoff carries what a response collected.
 message DecodedTokenLogprob {
+  // The candidate's vocabulary token identifier.
   uint32 token_id = 1;
+  // The candidate decoded in isolation, so the string can differ from the
+  // token's contribution to the fully decoded text.
   string token = 2;
+  // The candidate's log probability.
   float logprob = 3;
+  // The candidate's one-based competition rank at its position; tied log
+  // probabilities share a rank.
   uint32 rank = 4;
 }
 
-// One position's decoded token candidates.
+// One position's decoded token candidates, in the engine's order. At a
+// generated position the first entry is the sampled token.
 message DecodedPositionLogprobs {
   repeated DecodedTokenLogprob entries = 1;
 }
@@ -473,7 +482,9 @@ message DecodedLogprobs {
   repeated DecodedPositionLogprobs positions = 1;
 }
 
-// Per-position prompt logprobs.
+// Per-position prompt logprobs. The first prompt token has no left context to
+// score against, so it is stated apart: `scored_positions[i]` is the prompt
+// token at position `i + 1`.
 message DecodedPromptLogprobs {
   uint32 first_token_id = 1;
   string first_token = 2;

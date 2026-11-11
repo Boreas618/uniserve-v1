@@ -10,11 +10,11 @@ use futures::future::BoxFuture;
 
 use frontend::body::{Opening, Session};
 use frontend::events::Events;
-use frontend::input::video::{ProcessedVideo, VideoGenerationRequest};
+use frontend::input::video::ProcessedVideo;
 use frontend::input::{AdapterSelection, Processor, ServeError};
 use frontend::openai::{ApiError, Server};
 use frontend::output::{OutputProcessor, RequestOutputStream};
-use frontend::protocol::ChatCompletionRequest;
+use frontend::protocol::{ChatCompletionRequest, VideoGenerationRequest};
 
 use crate::http::handoff::Handoff;
 use crate::http::stream::{HandedBody, ResponseStream, attach};

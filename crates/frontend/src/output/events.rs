@@ -1,14 +1,17 @@
-//! The events of a serving stream ([`RequestOutput`]), why a request
-//! finished ([`FinishReason`]), and what it consumed ([`RequestUsage`]).
+//! The deltas of a request's response ([`RequestOutput`]), the name a
+//! finish reason is reported under ([`finish_reason_name`]), and what a
+//! request consumed ([`RequestUsage`]).
 
 use std::sync::Arc;
 
 use proto::request::{ArtifactEvent, RejectionKind};
 
-pub use proto::request::StopReason;
+pub use proto::request::{FinishReason, StopReason};
 
-use crate::output::chat::{AssistantBlockKind, AssistantContentBlock, AssistantToolCall};
-use crate::output::text::{DecodedLogprobs, DecodedPromptLogprobs};
+use crate::output::chat::AssistantBlockKind;
+use proto::handoff::ToolCall;
+use proto::handoff::assistant_block::Block;
+use proto::handoff::{DecodedLogprobs, DecodedPromptLogprobs};
 
 /// The prompt the engine generates from.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,53 +22,20 @@ pub struct PromptInfo {
     pub logprobs: Option<DecodedPromptLogprobs>,
 }
 
-/// Why a request finished, in vLLM's vocabulary.
-///
-/// A request the engine fails ends with [`RequestOutput::Failed`] instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FinishReason {
-    /// A normal stop: an end-of-sequence token, a stop token or string, or
-    /// the end of the model's own output. Carries the stop token or string
-    /// that matched, when one did.
-    Stop(Option<StopReason>),
-    /// The generation-length limit.
-    Length,
-    /// The request was cancelled or aborted before it finished.
-    Abort,
-    /// Repetition detection ended generation.
-    Repetition,
-    /// The sequence reached the length the engine's whole KV cache holds.
-    CacheCapacity,
-}
-
-impl FinishReason {
-    /// Maps the engine's finish reason and stop cause; `None` for an engine
-    /// error, which fails the request.
-    pub fn from_engine(
-        reason: proto::request::FinishReason,
-        stop_reason: Option<StopReason>,
-    ) -> Option<Self> {
-        use proto::request::FinishReason as Engine;
-        Some(match reason {
-            Engine::Completed | Engine::Eos | Engine::Stop => Self::Stop(stop_reason),
-            Engine::MaxTokens => Self::Length,
-            Engine::Cancelled | Engine::Aborted => Self::Abort,
-            Engine::Repetition => Self::Repetition,
-            Engine::CacheCapacity => Self::CacheCapacity,
-            Engine::Error => return None,
-        })
-    }
-
-    /// The reason's name: `stop`, `length`, `abort`, `repetition` or
-    /// `cache_capacity`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Stop(_) => "stop",
-            Self::Length => "length",
-            Self::Abort => "abort",
-            Self::Repetition => "repetition",
-            Self::CacheCapacity => "cache_capacity",
-        }
+/// The name a finished request is reported under, in vLLM's vocabulary:
+/// `stop` for an end-of-sequence token, a stop token or string, or the end of
+/// the model's own output; `length` for the generation-length limit; `abort`
+/// for a cancelled or aborted request; `repetition`; `cache_capacity` for a
+/// sequence that reached the length the engine's whole KV cache holds; and
+/// `error` for a request the engine failed.
+pub fn finish_reason_name(reason: &FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Completed | FinishReason::Eos | FinishReason::Stop => "stop",
+        FinishReason::MaxTokens => "length",
+        FinishReason::Cancelled | FinishReason::Aborted => "abort",
+        FinishReason::Repetition => "repetition",
+        FinishReason::CacheCapacity => "cache_capacity",
+        FinishReason::Error => "error",
     }
 }
 
@@ -145,7 +115,7 @@ pub enum RequestOutput {
         /// Zero-based content-block index.
         index: usize,
         /// The complete block.
-        block: AssistantContentBlock,
+        block: Block,
     },
     /// A function-tool call opened.
     ToolCallStart {
@@ -168,7 +138,7 @@ pub enum RequestOutput {
         /// Zero-based tool-call index.
         index: usize,
         /// The complete call.
-        call: AssistantToolCall,
+        call: ToolCall,
     },
     /// Latest diffusion progress: the engine-reported phase and the number
     /// of completed denoising steps.
@@ -180,10 +150,13 @@ pub enum RequestOutput {
     },
     /// Immutable generated media retained through response delivery.
     Artifact(ArtifactEvent),
-    /// The request finished.
+    /// The request finished. The engine's `Error` is never a finish: such a
+    /// request ends with `Failed`.
     Finished {
         /// Why it finished.
         reason: FinishReason,
+        /// The stop token or string that matched, when one did.
+        stop_reason: Option<StopReason>,
         /// What it consumed and produced.
         usage: RequestUsage,
     },

@@ -270,7 +270,7 @@ impl From<VideoStreamError> for ApiError {
 /// `input_references` field, whose index the message states.
 fn video_param(param: &str) -> Option<&'static str> {
     let field = param.split(['[', '.']).next().unwrap_or(param);
-    crate::input::video::request_field(field).map(|(name, _)| name)
+    crate::protocol::request_field(field).map(|(name, _)| name)
 }
 
 #[cfg(test)]

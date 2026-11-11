@@ -1,7 +1,7 @@
 //! Qwen2.5 marker configuration for the JSON tool-call parser.
 
 use super::{JsonToolCallConfig, JsonToolCallParser};
-use crate::output::tools::{Result, Tool, ToolParser, ToolParserOutput};
+use crate::output::tools::{Result, ToolParser, ToolParserOutput};
 
 /// The newlines belong to the delimiters, as in the format the Qwen3 chat
 /// template instructs and SGLang's Qwen detector matches, so a bare
@@ -34,12 +34,18 @@ pub struct Qwen25ToolParser {
     inner: JsonToolCallParser,
 }
 
+impl Default for Qwen25ToolParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Qwen25ToolParser {
     /// Creates a Qwen2.5 tool parser.
     ///
-    /// The declared tools are not read: parsed function names are not checked
-    /// against them.
-    pub fn new(_tools: &[Tool]) -> Self {
+    /// It reads no tool definition: arguments are the model's own JSON, and
+    /// parsed function names are not checked against the request's tools.
+    pub fn new() -> Self {
         Self {
             inner: JsonToolCallParser::new(QWEN_CONFIG),
         }
@@ -94,7 +100,7 @@ mod tests {
     use thiserror_ext::AsReport;
 
     use super::Qwen25ToolParser;
-    use crate::output::tools::test_utils::{collect_stream, split_by_chars, test_tools};
+    use crate::output::tools::test_utils::{collect_stream, split_by_chars};
     use crate::output::tools::{ToolCallDelta, ToolParser, ToolParserItem, ToolParserOutput};
 
     /// Collects the tool-call updates of `output` in order.
@@ -110,7 +116,7 @@ mod tests {
 
     #[test]
     fn qwen_parse_complete_without_tool_call_keeps_text() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let output = parser.parse_complete("Hello, world!").unwrap();
 
         assert_eq!(output.normal_text(), "Hello, world!");
@@ -119,7 +125,7 @@ mod tests {
 
     #[test]
     fn qwen_parse_complete_extracts_raw_json_arguments() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let arguments = r#"{ "location": "Tokyo", "days": "3" }"#;
         let output = parser
             .parse_complete(&format!(
@@ -137,7 +143,7 @@ mod tests {
 
     #[test]
     fn qwen_does_not_validate_or_normalize_arguments() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let arguments = r#"{"location":"Tokyo",}"#;
         let output = parser
             .parse_complete(&build_tool_call("get_weather", arguments))
@@ -151,7 +157,7 @@ mod tests {
     /// so exactly three argument deltas follow the header.
     #[test]
     fn qwen_streaming_emits_argument_deltas() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let chunks = [
             "<tool_call>",
             "\n{\"name\": \"get_weather\", \"arguments\": ",
@@ -188,7 +194,7 @@ mod tests {
             build_tool_call("get_weather", r#"{"location":"Tokyo"}"#)
         );
         let chunks = split_by_chars(&input, 5);
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
 
         let output = collect_stream(&mut parser, &chunks);
 
@@ -199,7 +205,7 @@ mod tests {
 
     #[test]
     fn qwen_keeps_end_marker_literal_inside_json_string() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let arguments = r#"{"text":"literal </tool_call> inside"}"#;
         let output = parser
             .parse_complete(&build_tool_call("echo", arguments))
@@ -211,7 +217,7 @@ mod tests {
 
     #[test]
     fn qwen_decodes_escaped_function_name() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let output = parser
             .parse_complete(
                 r#"<tool_call>
@@ -227,7 +233,7 @@ mod tests {
     /// and the whole input is plain text.
     #[test]
     fn qwen_requires_newline_after_tool_call_start() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let input = r#"<tool_call>{"name":"get_weather","arguments":{}}
 </tool_call>"#;
 
@@ -241,7 +247,7 @@ mod tests {
     /// text with its chunk instead of holding back all later text.
     #[test]
     fn qwen_streams_text_after_tag_without_newline() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
 
         let first = parser.parse_chunk("Use the <tool_call> tag.").unwrap();
         let second = parser.parse_chunk(" More.").unwrap();
@@ -254,7 +260,7 @@ mod tests {
     /// in the same response parseable.
     #[test]
     fn qwen_parses_tool_call_after_tag_without_newline() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let output = parser
             .parse_complete(&format!(
                 "<tool_call> x\n{}",
@@ -272,7 +278,7 @@ mod tests {
     /// brace is insignificant, as it is anywhere else inside the wrapper.
     #[test]
     fn qwen_accepts_whitespace_before_wrapper_close() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let output = parser
             .parse_complete(
                 "<tool_call>\n{\"name\": \"add\", \"arguments\": {\"x\": 1} \n}\n</tool_call>",
@@ -287,7 +293,7 @@ mod tests {
 
     #[test]
     fn qwen_requires_newline_before_tool_call_end() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let error = parser
             .parse_complete(
                 r#"<tool_call>
@@ -310,7 +316,7 @@ mod tests {
             build_tool_call("add", r#"{"x":1,"y":2}"#),
         );
         let chunks = split_by_chars(&input, 7);
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
 
         let output = collect_stream(&mut parser, &chunks);
 
@@ -333,7 +339,7 @@ mod tests {
 
     #[test]
     fn qwen_finish_fails_incomplete_tool_call() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         parser
             .parse_chunk(
                 r#"<tool_call>
@@ -351,7 +357,7 @@ mod tests {
     /// it as plain text together with its start delimiter.
     #[test]
     fn qwen_finish_returns_incomplete_header_as_text() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let input = "Checking.<tool_call>\n{\"name\": \"get_wea";
 
         let streamed = parser.parse_chunk(input).unwrap();
@@ -370,7 +376,7 @@ mod tests {
     /// arrived over several chunks.
     #[test]
     fn qwen_reset_after_header_error_returns_whole_call() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let mut output = ToolParserOutput::default();
 
         parser
@@ -391,7 +397,7 @@ mod tests {
     /// published with unusable arguments and `reset` returns the whole call.
     #[test]
     fn qwen_rejects_non_object_arguments_before_publishing() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let mut output = ToolParserOutput::default();
         let input = "<tool_call>\n{\"name\": \"add\", \"arguments\": \"{}\"}\n</tool_call>";
 
@@ -404,7 +410,7 @@ mod tests {
 
     #[test]
     fn qwen_malformed_field_order_fails_fast() {
-        let mut parser = Qwen25ToolParser::new(&test_tools());
+        let mut parser = Qwen25ToolParser::new();
         let error = parser
             .parse_chunk(
                 r#"<tool_call>

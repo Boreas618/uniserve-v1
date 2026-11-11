@@ -106,13 +106,13 @@ impl HfSpecialTokens {
 /// `text_config`; the root `model_type` still identifies the family.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct ModelConfig {
+pub struct HfConfig {
     model_type: Option<String>,
     max_position_embeddings: Option<u32>,
     /// Nested language-model section a composite checkpoint may carry.
-    llm_config: Option<Box<ModelConfig>>,
+    llm_config: Option<Box<HfConfig>>,
     /// Nested language-model section a composite checkpoint may carry.
-    text_config: Option<Box<ModelConfig>>,
+    text_config: Option<Box<HfConfig>>,
 }
 
 /// Generation defaults consumed by configured request lowering.
@@ -156,7 +156,7 @@ impl OneOrManyTokenIds {
     }
 }
 
-impl ModelConfig {
+impl HfConfig {
     /// Returns the nested `llm_config` or `text_config` section when present,
     /// otherwise the root configuration.
     fn language_model(&self) -> &Self {
@@ -191,7 +191,7 @@ pub fn load_generation_config(path: Option<&Path>) -> Result<GenerationConfig> {
 }
 
 /// Loads model metadata, returning defaults when no file is configured.
-pub fn load_model_config(path: Option<&Path>) -> Result<ModelConfig> {
+pub fn load_model_config(path: Option<&Path>) -> Result<HfConfig> {
     read_json_file(path)
 }
 
@@ -231,7 +231,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::ModelConfig;
+    use super::HfConfig;
 
     /// A flat layout and a nested one: the family comes from the root
     /// `model_type` and the context limit from the language-model section.
@@ -252,7 +252,7 @@ mod tests {
                 262144,
             ),
         ] {
-            let config: ModelConfig = serde_json::from_str(source).unwrap();
+            let config: HfConfig = serde_json::from_str(source).unwrap();
             assert_eq!(config.model_type(), Some(model_type));
             assert_eq!(config.max_position_embeddings(), Some(max_tokens));
         }

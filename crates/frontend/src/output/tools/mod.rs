@@ -1,4 +1,4 @@
-//! Streaming tool-call parsers and normalized tool descriptors.
+//! Streaming tool-call parsers.
 //!
 //! The chat output tool stage (`output::chat`) feeds visible
 //! assistant text chunk by chunk to a [`ToolParser`]: `Qwen25ToolParser`
@@ -18,8 +18,6 @@ use proto::handoff;
 
 pub use error::{Result, ToolParserError};
 pub use json::Qwen25ToolParser;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Incremental extraction of tool calls from one assistant turn's visible
 /// text.
@@ -72,19 +70,6 @@ pub trait ToolParser: Send {
         output.append(self.finish()?);
         Ok(output.coalesce_calls())
     }
-}
-
-/// One function-style tool made available to the model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tool {
-    /// Function name presented to the model.
-    pub name: String,
-    /// Optional natural-language function description.
-    pub description: Option<String>,
-    /// JSON Schema describing accepted function arguments.
-    pub parameters: Value,
-    /// Optional strict-schema enforcement preference.
-    pub strict: Option<bool>,
 }
 
 /// One tool-call update emitted while parsing assistant text.

@@ -31,13 +31,12 @@ use axum::{Extension, Json, Router};
 use futures::StreamExt as _;
 use serde_json::{Value, json};
 
-use crate::input::video::VideoGenerationRequest;
-use crate::input::video::{FieldKind, request_field};
 use crate::openai::RequestId;
 use crate::openai::Server;
 use crate::openai::video_jobs::{StageClock, VideoFailure, VideoJob, VideoJobs};
 use crate::openai::{ApiError, check_model_served};
 use crate::output::video::ArtifactCollector;
+use crate::protocol::{FieldKind, VideoGenerationRequest, request_field};
 use String;
 
 /// The state of the asynchronous video job routes.
@@ -115,8 +114,8 @@ async fn videos_sync(
         if let Some(event) = &event {
             clock.observe(event);
         }
-        if let ControlFlow::Break(outcome) = collector.push(event) {
-            match outcome {
+        if let ControlFlow::Break(result) = collector.push(event) {
+            match result {
                 Ok(artifact) => break artifact,
                 Err(error) => return ApiError::from(error).into_response(),
             }
@@ -333,8 +332,8 @@ async fn videos_create(
             if let Some((phase, steps)) = event.as_ref().and_then(|event| clock.observe(event)) {
                 store.progress(&id, phase, steps);
             }
-            if let ControlFlow::Break(outcome) = collector.push(event) {
-                break outcome.map(|artifact| artifact.media).map_err(Into::into);
+            if let ControlFlow::Break(result) = collector.push(event) {
+                break result.map(|artifact| artifact.media).map_err(Into::into);
             }
         };
 

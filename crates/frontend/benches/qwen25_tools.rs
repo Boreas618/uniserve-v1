@@ -12,27 +12,11 @@
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use frontend::output::tools::{Qwen25ToolParser, Tool, ToolParser, ToolParserOutput};
+use frontend::output::tools::{Qwen25ToolParser, ToolParser, ToolParserOutput};
 
 /// Unicode scalar values per streamed chunk.
 const CHUNK_CHARS: usize = 7;
 const LONG_NORMAL_TEXT_REPEATS: usize = 2048;
-
-/// The one tool the fixtures call.
-fn weather_tools() -> Vec<Tool> {
-    vec![Tool {
-        name: "get_weather".to_string(),
-        description: None,
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "location": { "type": "string" },
-                "days": { "type": "integer" }
-            }
-        }),
-        strict: None,
-    }]
-}
 
 /// Splits text into chunks of at most `chunk_chars` Unicode scalar values.
 fn split_by_chars(text: &str, chunk_chars: usize) -> Vec<&str> {
@@ -88,7 +72,6 @@ fn feed_parser(parser: &mut Qwen25ToolParser, chunks: &[&str]) -> (String, usize
 fn run_stream_group(
     c: &mut Criterion,
     name: &str,
-    tools: &[Tool],
     text: &str,
     chunk_chars: usize,
     expected_normal_text: &str,
@@ -105,7 +88,7 @@ fn run_stream_group(
     // One parser serves every iteration; this relies on `finish`, called at
     // the end of each stream by `feed_parser`, resetting parser state.
     group.bench_function("native_reuse_parser", |b| {
-        let mut parser = Qwen25ToolParser::new(tools);
+        let mut parser = Qwen25ToolParser::new();
         b.iter(|| {
             let result = feed_parser(&mut parser, black_box(&chunks));
             debug_assert_eq!(result.0, expected_normal_text);
@@ -118,7 +101,7 @@ fn run_stream_group(
     // runs in the untimed `iter_batched` setup closure.
     group.bench_function("native_create_parser", |b| {
         b.iter_batched(
-            || Qwen25ToolParser::new(tools),
+            Qwen25ToolParser::new,
             |mut parser| {
                 let result = feed_parser(&mut parser, black_box(&chunks));
                 debug_assert_eq!(result.0, expected_normal_text);
@@ -133,14 +116,12 @@ fn run_stream_group(
 }
 
 fn bench_qwen25_tools(c: &mut Criterion) {
-    let tools = weather_tools();
     let mixed_text = mixed_fixture();
     let long_normal_text = long_normal_text_fixture();
 
     run_stream_group(
         c,
         "qwen25_tools/mixed_text_tool_call",
-        &tools,
         &mixed_text,
         CHUNK_CHARS,
         "I will check two cities before answering.\n",
@@ -150,7 +131,6 @@ fn bench_qwen25_tools(c: &mut Criterion) {
     run_stream_group(
         c,
         "qwen25_tools/long_normal_text",
-        &tools,
         &long_normal_text,
         CHUNK_CHARS,
         &long_normal_text,

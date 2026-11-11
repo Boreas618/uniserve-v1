@@ -79,7 +79,7 @@ impl ChatParser {
                     })?;
                 let tools = parser
                     .parse_tools
-                    .then(|| ToolStage::new(Box::new(Qwen25ToolParser::new(&[]))));
+                    .then(|| ToolStage::new(Box::new(Qwen25ToolParser::new())));
 
                 Ok(Self {
                     reasoning: reasoning.map(|parser| Box::new(parser) as Box<dyn ReasoningParser>),

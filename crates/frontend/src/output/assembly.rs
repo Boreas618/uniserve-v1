@@ -173,18 +173,20 @@ pub(super) async fn media_output(
                 stop_reason,
                 ..
             } => {
-                let terminal = match FinishReason::from_engine(reason, stop_reason) {
-                    Some(reason) => RequestOutput::Finished {
+                let terminal = if reason == FinishReason::Error {
+                    RequestOutput::Failed {
+                        message: "engine execution failed".to_owned(),
+                    }
+                } else {
+                    RequestOutput::Finished {
                         reason,
+                        stop_reason,
                         usage: RequestUsage {
                             prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
                             timings: clock.timings(),
                             ..RequestUsage::default()
                         },
-                    },
-                    None => RequestOutput::Failed {
-                        message: "engine execution failed".to_owned(),
-                    },
+                    }
                 };
                 y.yield_ok(terminal).await;
                 return Ok(());

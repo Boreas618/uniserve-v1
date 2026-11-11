@@ -47,13 +47,14 @@ use crate::metrics::stats::{self as metrics, RequestStats};
 use crate::migration::{Migrator, RequestEvents};
 use crate::options::{ReasoningParser, ServerArgs, Stated};
 use frontend::input::media::MediaConnector;
-use frontend::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
+use frontend::input::video::{ProcessedVideo, VideoService};
 use frontend::input::{
     AdapterSelection, LoadedModel, LoadedRenderer, Processor, RequestRenderer, ServeError,
     TokenizeError,
 };
 use frontend::model::ModelConfig;
 use frontend::output::RequestOutputStream;
+use frontend::protocol::VideoGenerationRequest;
 
 /// How long the epoch's Program Servers may take to select its programs.
 ///

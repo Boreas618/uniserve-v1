@@ -32,10 +32,12 @@ use futures::future::BoxFuture;
 
 use crate::body::{Opening, Session};
 use crate::events::Events;
-use crate::input::video::{ProcessedVideo, VideoGenerationRequest};
+use crate::input::video::ProcessedVideo;
 use crate::input::{AdapterSelection, Processor, ServeError};
 use crate::output::{OutputProcessor, RequestOutputStream};
-use crate::protocol::{ChatCompletionRequest, ListModelsResponse, ModelObject};
+use crate::protocol::{
+    ChatCompletionRequest, ListModelsResponse, ModelObject, VideoGenerationRequest,
+};
 
 pub use error::{ApiError, Result};
 

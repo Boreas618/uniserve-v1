@@ -28,6 +28,7 @@ use crate::events::Events;
 pub use assembly::started_instant;
 pub use events::{
     FinishReason, PromptInfo, RequestOutput, RequestUsage, RuntimeTimings, StopReason,
+    finish_reason_name,
 };
 pub use processor::OutputProcessor;
 

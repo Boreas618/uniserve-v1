@@ -7,9 +7,6 @@
 pub use decoded::DecodeStream;
 pub use decoded::{DecodedTextEvent, Finished};
 pub use error::{Error, Result};
-pub use logprobs::{
-    DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTokenLogprob,
-};
 
 mod decoded;
 mod error;
