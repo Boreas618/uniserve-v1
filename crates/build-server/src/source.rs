@@ -1181,14 +1181,16 @@ impl Source for CargoSource {
 /// the snapshot holds, so the revision builds with `--locked`.
 ///
 /// The snapshot took its workspace's lockfile, which also locks what the
-/// crates outside the snapshot depend on. cargo rewrites it while resolving
-/// the snapshot offline: every crate the snapshot needs keeps the version the
-/// lockfile gave it, and the rest are dropped.
+/// crates outside the snapshot depend on. `cargo update --workspace` resolves
+/// the snapshot against it offline and rewrites it: every crate the snapshot
+/// needs keeps the version the lockfile gave it, and the rest are dropped.
+/// The resolution reads the registry's index alone, so it downloads no crate,
+/// including the ones the lockfile holds for platforms this host is not.
 ///
 /// # Errors
 ///
 /// Fails when the snapshot does not resolve offline: a dependency the
-/// lockfile does not hold, or one the toolchain's crate cache lacks.
+/// lockfile does not hold and the registry index on this host does not know.
 pub fn lock_snapshot(cargo: &dyn Toolchain, staged: &Path) -> Result<()> {
     let executable = cargo.executable().ok_or_else(|| Error::Toolchain {
         kind: ToolchainKind::Cargo,
@@ -1198,10 +1200,9 @@ pub fn lock_snapshot(cargo: &dyn Toolchain, staged: &Path) -> Result<()> {
     let mut command = Command::new(executable);
     command
         .current_dir(staged.join(crate::snapshot::WORKSPACE))
-        .arg("metadata")
+        .arg("update")
         .arg("--offline")
-        .arg("--format-version")
-        .arg("1");
+        .arg("--workspace");
     cargo.run(command, log.path())
 }
 
