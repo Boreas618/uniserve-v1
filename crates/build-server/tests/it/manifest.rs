@@ -522,7 +522,6 @@ form = "wasm"
 [source]
 kind = "wasm"
 files = ["src/lib.rs"]
-script = "src/build.py"
 
 [parameters]
 bucket = 256
@@ -536,7 +535,7 @@ bucket = 256
     assert!(manifest.covers("default"));
     assert!(manifest.builds_for("wasm32"));
     assert!(!manifest.builds_for("sm_100a"));
-    assert_eq!(manifest.source.script.as_deref(), Some("src/build.py"));
+    assert_eq!(manifest.source.script, None);
     assert_eq!(
         manifest.parameters.get("bucket"),
         Some(&toml::Value::Integer(256)),

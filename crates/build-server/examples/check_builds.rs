@@ -6,7 +6,7 @@
 //! served by a second server with no precompiler.
 //!
 //!     cargo run -p build-server --example check_builds -- \
-//!         --kernels <kernel package root> --fixtures <package fixture root> \
+//!         --kernels <kernel package root> \
 //!         --python <the Build Server's interpreter> --nvcc <nvcc> \
 //!         --precompile <scheduling-precompile> --cargo <cargo> [--keys <key file>]
 //!
@@ -57,7 +57,6 @@ impl<T> Context<T> for Option<T> {
 
 struct Args {
     kernels: PathBuf,
-    fixtures: PathBuf,
     python: PathBuf,
     nvcc: PathBuf,
     precompile: PathBuf,
@@ -66,8 +65,8 @@ struct Args {
 }
 
 fn arguments() -> Result<Args, String> {
-    let (mut kernels, mut fixtures, mut python, mut nvcc, mut precompile, mut cargo, mut keys) =
-        (None, None, None, None, None, None, None);
+    let (mut kernels, mut python, mut nvcc, mut precompile, mut cargo, mut keys) =
+        (None, None, None, None, None, None);
     let mut arguments = std::env::args().skip(1);
     while let Some(flag) = arguments.next() {
         let mut value = || {
@@ -78,7 +77,6 @@ fn arguments() -> Result<Args, String> {
         };
         match flag.as_str() {
             "--kernels" => kernels = Some(value()?),
-            "--fixtures" => fixtures = Some(value()?),
             "--python" => python = Some(value()?),
             "--nvcc" => nvcc = Some(value()?),
             "--precompile" => precompile = Some(value()?),
@@ -89,7 +87,6 @@ fn arguments() -> Result<Args, String> {
     }
     Ok(Args {
         kernels: kernels.ok_or("--kernels names the kernel package root")?,
-        fixtures: fixtures.ok_or("--fixtures names the package fixture root")?,
         python: python.ok_or("--python names the Build Server's interpreter")?,
         nvcc: nvcc.ok_or("--nvcc names the CUDA compiler")?,
         precompile: precompile.ok_or("--precompile names scheduling-precompile")?,
@@ -969,11 +966,7 @@ fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) -> Outcome {
 /// is the step that must have the tree.
 fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) -> Outcome {
     let precompiler = args.precompile.clone();
-    let package = args.fixtures.join("policy");
-    if !package.join("package.toml").is_file() {
-        eprintln!("SKIPPED: the tree holds no policy fixture");
-        return Ok(());
-    }
+    let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scheduling/policies/fixture");
 
     let temporary = tempfile::tempdir().context("a temporary directory")?;
     let root = temporary.path().join("packages");

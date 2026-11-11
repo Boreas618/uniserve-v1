@@ -90,7 +90,13 @@ fn installed(package_root: &Path, revision: u32) {
 /// Records the build inputs of the revision laid out in `directory`, as its
 /// installation would have, and answers their digest.
 fn record(directory: &Path) -> String {
-    let inputs = Inputs::of(directory, "triton 3.7.1".to_owned()).unwrap();
+    // The digest of the revision's own tree: what the installation of a package that is its
+    // directory records. A policy's is its crate's snapshot, which these revisions do not hold,
+    // and no test here reads the digest for more than naming the modules it stores.
+    let inputs = Inputs {
+        package: build_server::snapshot::tree_digest(directory).unwrap(),
+        toolchain: "triton 3.7.1".to_owned(),
+    };
     inputs.write(directory).unwrap();
     inputs.digest()
 }

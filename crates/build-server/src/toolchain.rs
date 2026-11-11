@@ -140,16 +140,17 @@ pub trait Toolchain: Send + Sync {
     /// The interpreter that runs a package's Python compile script, when this
     /// toolchain has one.
     ///
-    /// The Python toolchains are that interpreter. nvcc and the wasm
-    /// toolchain also run a package's compile script, because a CUDA C++ or
-    /// wasm32 package states its command line in a Python driver (design
-    /// section 6.2: a source drives the package's compile script), so they
-    /// carry the Python environment's interpreter when the host has it.
+    /// The Python toolchains are that interpreter. nvcc also runs a
+    /// package's compile script, because a CUDA C++ package may state its
+    /// command line in a Python driver (design section 6.2: a source drives
+    /// the package's compile script), so it carries the Python environment's
+    /// interpreter when the host has it.
     fn script_interpreter(&self) -> Option<&Path> {
         None
     }
 
-    /// cargo, which builds a policy crate for wasm32, when this toolchain has it.
+    /// cargo, which builds a policy's crate for wasm32, when this toolchain
+    /// has it.
     fn cargo(&self) -> Option<&Path> {
         None
     }
@@ -176,9 +177,9 @@ pub struct ToolchainConfig {
     /// The wasm precompiler, `scheduling-precompile`, which builds a policy module with
     /// the schedule crate's own engine. `None` refuses a policy package.
     pub wasm: Option<PathBuf>,
-    /// cargo, which builds a cargo package (the engine) from its snapshot, and a policy crate
-    /// for wasm32 when its package carries no compile script. `None` takes the `cargo` on this
-    /// process's `PATH`, and refuses such a package when there is none.
+    /// cargo, which builds a cargo package (the engine) and a policy's crate from their
+    /// snapshots. `None` takes the `cargo` on this process's `PATH`, and refuses such a
+    /// package when there is none.
     pub cargo: Option<PathBuf>,
     /// The number of compilers that may run at once (`limits.max_jobs`).
     pub max_jobs: usize,
@@ -219,7 +220,7 @@ impl Toolchains {
             nvcc: Nvcc::discover(config),
             triton: Triton::discover(config, interpreter),
             cute_dsl: CuteDsl::discover(config, interpreter),
-            wasm: Wasm::discover(config, interpreter),
+            wasm: Wasm::discover(config),
             cargo: Cargo::discover(config),
             distributions: named_interpreter(interpreter).and_then(python_distributions),
             driver: named_interpreter(interpreter).and_then(driver_directory),
@@ -242,6 +243,13 @@ impl Toolchains {
         }
         let toolchain = self.get(kind)?;
         let mut identity = format!("{kind} {}", toolchain.version());
+        if kind == ToolchainKind::Wasm {
+            // A policy's module is cargo's output before it is the
+            // precompiler's, so the compiler is part of what built it.
+            let cargo = self.get(ToolchainKind::Cargo)?;
+            identity.push_str("; cargo ");
+            identity.push_str(cargo.version());
+        }
         if toolchain.script_interpreter().is_some() {
             let driver = self.driver.as_ref().map_err(|reason| Error::Toolchain {
                 kind,
@@ -517,22 +525,22 @@ impl Toolchain for CuteDsl {
     }
 }
 
-/// The wasm precompiler: the scheduling crate's executable that precompiles a
-/// wasm32 policy for this host's CPU (design section 5.3).
+/// The WebAssembly toolchain of a scheduling policy: cargo, which builds the
+/// policy's crate for wasm32, and the scheduling crate's precompiler, which
+/// serializes the module for this host's CPU (design section 5.3).
 #[derive(Debug)]
 struct Wasm {
     precompiler: PathBuf,
+    /// The precompiler's wasmtime version, which a policy package declares: a
+    /// serialized module loads only in the wasmtime that wrote it.
     version: String,
     max_jobs: usize,
-    /// cargo, which builds a policy crate for wasm32.
-    cargo: Option<PathBuf>,
-    /// The interpreter of the Build Server's Python environment, which runs
-    /// a policy package's compile script when the package names one.
-    interpreter: Option<PathBuf>,
+    /// cargo, or why this host has none.
+    cargo: Discovered<Cargo>,
 }
 
 impl Wasm {
-    fn discover(config: &ToolchainConfig, interpreter: Option<&Path>) -> Discovered<Wasm> {
+    fn discover(config: &ToolchainConfig) -> Discovered<Wasm> {
         let precompiler = config.wasm.clone().ok_or_else(|| {
             "no wasm precompiler named: pass --wasm <scheduling-precompile>".to_owned()
         })?;
@@ -542,10 +550,7 @@ impl Wasm {
             precompiler,
             version,
             max_jobs: config.max_jobs,
-            cargo: config.cargo.as_deref().map(resolve),
-            interpreter: interpreter
-                .filter(|interpreter| interpreter.is_file())
-                .map(Path::to_path_buf),
+            cargo: Cargo::discover(config),
         })
     }
 }
@@ -560,29 +565,34 @@ impl Toolchain for Wasm {
     }
 
     fn run(&self, job: ToolJob) -> Result<()> {
-        execute(&job, self.max_jobs)
+        execute(&job, self.max_jobs())
     }
 
     fn max_jobs(&self) -> usize {
-        self.max_jobs
+        self.cargo
+            .as_ref()
+            .map_or(self.max_jobs, |cargo| cargo.jobs)
     }
 
     fn executable(&self) -> Option<&Path> {
         Some(&self.precompiler)
     }
 
-    fn script_interpreter(&self) -> Option<&Path> {
-        self.interpreter.as_deref()
+    fn cargo(&self) -> Option<&Path> {
+        self.cargo.as_ref().ok().map(|cargo| cargo.path.as_path())
     }
 
-    fn cargo(&self) -> Option<&Path> {
-        self.cargo.as_deref()
+    fn build_directory(&self) -> Option<&Path> {
+        self.cargo
+            .as_ref()
+            .ok()
+            .map(|cargo| cargo.target_directory.as_path())
     }
 }
 
 /// cargo and the compiler it drives: what builds a cargo package, the engine,
-/// from its snapshot.
-#[derive(Debug)]
+/// from its snapshot, and a policy's crate for wasm32.
+#[derive(Clone, Debug)]
 struct Cargo {
     path: PathBuf,
     version: String,

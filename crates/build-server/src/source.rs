@@ -1,7 +1,7 @@
 //! A package's source: how its files become a module (design sections 5.2,
 //! 5.3 and 6.2).
 //!
-//! The Build Server drives six kinds of source:
+//! The Build Server drives seven kinds of source:
 //!
 //! - [`CudaSource`]: CUDA C++ through nvcc, to a cubin (with the launch
 //!   metadata the package writes in Triton's fields) or, when the package
@@ -14,8 +14,10 @@
 //!   native library.
 //! - [`CubinSource`]: a vendor cubin the package carries, such as
 //!   trtllm-gen's launch code and cubins, stored as it is.
-//! - [`WasmSource`]: a scheduling policy built for wasm32 and precompiled for
-//!   this host's CPU.
+//! - [`WasmSource`]: a scheduling policy, a crate built for wasm32 from its
+//!   snapshot and precompiled for this host's CPU.
+//! - [`CargoSource`]: a crate cargo builds to an executable from its
+//!   snapshot, the engine.
 //! - [`ExecutableSource`]: an executable, stored as it is.
 //!
 //! A source builds one descriptor into a [`Workspace`] and returns the names
@@ -92,17 +94,6 @@ pub trait Source: Send + Sync {
         toolchain: &dyn Toolchain,
         dir: &Workspace,
     ) -> Result<Built>;
-
-    /// The module the installed revision already holds, written into `dir`, or
-    /// `None` when the module is made by compiling.
-    ///
-    /// A package that is built when it is installed (design section 6.2, the
-    /// wasm policy) carries its module beside its manifest; publishing it needs
-    /// no toolchain, so a host that cannot compile it can still serve it.
-    fn stored(&self, key: &str, target: &Target, dir: &Workspace) -> Result<Option<Built>> {
-        let _ = (key, target, dir);
-        Ok(None)
-    }
 }
 
 /// Makes the source a package's manifest names.
@@ -881,16 +872,16 @@ impl Source for CubinSource {
     }
 }
 
-/// A scheduling policy: wasm32, then precompiled for this host's CPU
-/// (design section 5.3).
+/// A scheduling policy: a crate built for wasm32 from the snapshot of its
+/// workspace, then precompiled for this host's CPU (design section 5.3).
 ///
-/// A policy is the one package built when it is *installed* (design section
-/// 6.2): its build is the publisher's crate inside the publisher's workspace, so
-/// it can only run while the directory the install named still exists. The
-/// server keeps the precompiled module in the revision directory beside the
-/// manifest, and [`Source::stored`] publishes it — so a host with no wasm
-/// precompiler, or one whose `cargo` cannot build the crate, still serves a
-/// policy the upstream server built.
+/// The installed revision holds the policy's crate and the workspace crates
+/// it depends on, with the lockfile ([`crate::snapshot`]). The build is the
+/// server's own: cargo builds the crate there for `wasm32-unknown-unknown`,
+/// locked and offline, and the scheduling precompiler turns the module into
+/// the serialized form the scheduler's wasmtime loads. Nothing is built where
+/// the package was installed from, so a revision builds on any host that
+/// mounts its package root and has the toolchain.
 #[derive(Clone, Debug)]
 pub struct WasmSource {
     package: PackageSource,
@@ -904,27 +895,9 @@ impl WasmSource {
     }
 }
 
-impl WasmSource {
-    /// The precompiled module an installed revision keeps beside its manifest.
-    fn artifact(&self, key: &str, target: &Target, dir: &Workspace) -> Result<Option<Built>> {
-        let installed = self.package.root.join(MODULE_WASM);
-        if !installed.is_file() {
-            return Ok(None);
-        }
-        std::fs::copy(&installed, dir.path().join(MODULE_WASM))?;
-        let mut files = vec![MODULE_WASM.to_owned()];
-        files.extend(copy_tuning(&self.package, key, target, dir)?);
-        Ok(Some(Built { files }))
-    }
-}
-
 impl Source for WasmSource {
     fn toolchain(&self) -> ToolchainKind {
         ToolchainKind::Wasm
-    }
-
-    fn stored(&self, key: &str, target: &Target, dir: &Workspace) -> Result<Option<Built>> {
-        self.artifact(key, target, dir)
     }
 
     fn build(
@@ -937,56 +910,48 @@ impl Source for WasmSource {
     ) -> Result<Built> {
         let package = &self.package;
         let log = build_log(dir);
-        // A policy is one module with no descriptor and no target, so it is
-        // built once, when the package is installed, and the revision keeps the
-        // precompiled artifact beside its manifest (design section 6.2). A
-        // `prepare` after a restart copies it and runs no compiler: the build
-        // that produced it belongs to the publisher's directory, which this
-        // host need not have.
-        if let Some(stored) = self.stored(key, target, dir)? {
-            return Ok(stored);
-        }
-        let output = dir.path().join(MODULE_WASM);
-        // The raw module: either the package's own build writes it (it knows
-        // how its guest crate is assembled), or the package is a crate that
-        // `cargo build` compiles for wasm32 as it stands.
-        let raw = match package.manifest.source.script.as_deref() {
-            Some(script) => {
-                let script = package.file(script);
-                if !script.is_file() {
-                    return Err(package.failure(
-                        key,
-                        target,
-                        format!("the compile script {} does not exist", script.display()),
-                    ));
-                }
-                let interpreter =
-                    toolchain
-                        .script_interpreter()
-                        .ok_or_else(|| Error::Toolchain {
-                            kind: ToolchainKind::Wasm,
-                            message: format!(
-                                "no Python interpreter to run {}: pass --python",
-                                script.display()
-                            ),
-                        })?;
-                let job = ToolJob::new(interpreter, &package.root, &log)
-                    .argument(&script)
-                    .environment(package.environment(key, target, dir));
-                toolchain
-                    .run(job)
-                    .map_err(|error| package.failure_with_log(key, target, error, &log))?;
-                find_wasm(dir.path())?
-            }
-            None => {
-                let cargo = toolchain.cargo().ok_or_else(|| Error::Toolchain {
-                    kind: ToolchainKind::Wasm,
-                    message: "no cargo named: the wasm32 build of a policy crate needs --cargo"
-                        .into(),
-                })?;
-                build_wasm_crate(cargo, package, key, target, dir, &log, toolchain.max_jobs())?
-            }
+        let missing = |what: &str| Error::Toolchain {
+            kind: ToolchainKind::Wasm,
+            message: format!("no {what} on this host: the wasm32 build of a policy needs --cargo"),
         };
+        let cargo = toolchain.cargo().ok_or_else(|| missing("cargo"))?;
+        let target_directory = toolchain
+            .build_directory()
+            .ok_or_else(|| missing("cargo target directory"))?;
+        let workspace = package.root.join(crate::snapshot::WORKSPACE);
+        let artifact = wasm_artifact(&workspace)
+            .map_err(|error| package.failure(key, target, error.to_string()))?;
+
+        // The raw module: the snapshot's crate, built for wasm32.
+        let job = ToolJob::new(cargo, &workspace, &log)
+            .argument("build")
+            .argument("--release")
+            .argument("--locked")
+            .argument("--offline")
+            .argument("--target")
+            .argument(WASM_TRIPLE)
+            .argument("--jobs")
+            .argument(toolchain.max_jobs().to_string())
+            .argument("--target-dir")
+            .argument(target_directory);
+        toolchain
+            .run(job)
+            .map_err(|error| package.failure_with_log(key, target, error, &log))?;
+        let raw = target_directory
+            .join(WASM_TRIPLE)
+            .join("release")
+            .join(&artifact);
+        if !raw.is_file() {
+            return Err(package.failure(
+                key,
+                target,
+                format!(
+                    "cargo wrote no {}; its log was:\n{}",
+                    raw.display(),
+                    read_log(&log)
+                ),
+            ));
+        }
 
         // Precompile it for this host's CPU: a policy is loaded into the
         // scheduler's wasmtime as a serialized module (design section 5.3).
@@ -996,16 +961,8 @@ impl Source for WasmSource {
                       scheduling-precompile builds it"
                 .into(),
         })?;
-        // A script may write the raw module under the output's own name; move
-        // it aside so the precompiler does not overwrite its input.
-        let raw = if raw == output {
-            let aside = dir.path().join("policy.raw.wasm");
-            std::fs::rename(&raw, &aside)?;
-            aside
-        } else {
-            raw
-        };
-        let job = ToolJob::new(precompiler, &package.root, &log)
+        let output = dir.path().join(MODULE_WASM);
+        let job = ToolJob::new(precompiler, &workspace, &log)
             .argument("--wasm")
             .argument(&raw)
             .argument("--out")
@@ -1029,78 +986,46 @@ impl Source for WasmSource {
     }
 }
 
-/// Compiles a policy package that is a crate by itself: `cargo build
-/// --release` for wasm32, in the package root, with its own target directory
-/// in the build's workspace.
-fn build_wasm_crate(
-    cargo: &Path,
-    package: &PackageSource,
-    key: &str,
-    target: &Target,
-    dir: &Workspace,
-    log: &Path,
-    max_jobs: usize,
-) -> Result<PathBuf> {
-    let target_directory = dir.path().join("cargo");
-    let job = ToolJob::new(cargo, &package.root, log)
-        .argument("build")
-        .argument("--release")
-        .argument("--target")
-        .argument("wasm32-unknown-unknown")
-        .argument("--target-dir")
-        .argument(&target_directory)
-        .environment(package.environment(key, target, dir));
-    crate::toolchain::execute(&job, max_jobs)
-        .map_err(|error| package.failure_with_log(key, target, error, log))?;
-    find_wasm(
-        &target_directory
-            .join("wasm32-unknown-unknown")
-            .join("release"),
-    )
-}
+/// The target triple a policy crate is built for.
+const WASM_TRIPLE: &str = "wasm32-unknown-unknown";
 
-/// The one `.wasm` file a wasm32 build wrote in `directory`.
-fn find_wasm(directory: &Path) -> Result<PathBuf> {
-    let mut candidates = std::fs::read_dir(directory)
-        .map_err(Error::Io)?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "wasm")
+/// The file cargo names the wasm32 module of a snapshot's own crate: the
+/// library's name, which is the package's with `_` for `-` unless the crate
+/// states another, and `.wasm`.
+///
+/// The snapshot's workspace manifest names the crate as the one cargo builds
+/// by default, and cargo's target directory holds the modules of every policy
+/// it built, so the name is read rather than searched for.
+fn wasm_artifact(workspace: &Path) -> Result<String> {
+    let invalid = |message: String| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        ))
+    };
+    let read = |path: &Path| -> Result<toml::Table> {
+        let text = std::fs::read_to_string(path)?;
+        toml::from_str(&text).map_err(|error| invalid(format!("{}: {error}", path.display())))
+    };
+
+    let manifest = read(&workspace.join("Cargo.toml"))?;
+    let member = manifest
+        .get("workspace")
+        .and_then(|workspace| {
+            workspace
+                .get("default-members")?
+                .as_array()?
+                .first()?
+                .as_str()
         })
-        .collect::<Vec<_>>();
-    // A Cdylib names its output after the crate; a package that writes the
-    // raw module under its own name states which one it is.
-    candidates.sort();
-    match candidates.len() {
-        0 => Err(Error::Build {
-            op: String::new(),
-            backend: String::new(),
-            revision: 0,
-            target: String::new(),
-            descriptor: String::new(),
-            message: format!("no .wasm module in {}", directory.display()),
-        }),
-        1 => Ok(candidates.remove(0)),
-        _ => {
-            let chosen = candidates
-                .iter()
-                .find(|path| path.file_name().is_some_and(|name| name == "policy.wasm"));
-            chosen.cloned().ok_or_else(|| Error::Build {
-                op: String::new(),
-                backend: String::new(),
-                revision: 0,
-                target: String::new(),
-                descriptor: String::new(),
-                message: format!(
-                    "more than one .wasm module in {}: {candidates:?}",
-                    directory.display()
-                ),
-            })
-        }
-    }
+        .ok_or_else(|| invalid("the snapshot's workspace names no crate to build".to_owned()))?;
+    let member = read(&workspace.join(member).join("Cargo.toml"))?;
+    let name = member
+        .get("lib")
+        .and_then(|lib| lib.get("name")?.as_str())
+        .or_else(|| member.get("package")?.get("name")?.as_str())
+        .ok_or_else(|| invalid("the policy's crate states no name".to_owned()))?;
+    Ok(format!("{}.wasm", name.replace('-', "_")))
 }
 
 /// An executable, stored as it is (design section 5.1).

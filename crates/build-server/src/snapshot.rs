@@ -37,7 +37,7 @@ const WORKSPACE_MANIFEST: &str = "workspace/Cargo.toml";
 
 /// The source kinds whose packages cargo builds from a workspace snapshot, as
 /// a manifest's `[source] kind` spells them.
-const CARGO_KINDS: [&str; 1] = ["cargo"];
+const CARGO_KINDS: [&str; 2] = ["cargo", "wasm"];
 
 /// Files of a snapshot: each by its name inside the installed revision and
 /// where it is now.

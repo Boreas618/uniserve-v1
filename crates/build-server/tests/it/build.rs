@@ -360,67 +360,27 @@ fn an_executable_revision_is_installed_stored_and_resolved_as_it_is() {
     witness.thread.join().unwrap();
 }
 
-/// A scheduling policy is built when it is installed, and what the store keeps is
-/// its module: a second server over the same package root — the restart a
-/// deployment does — prepares and resolves it with no wasm toolchain at all.
-///
-/// A policy is the one kind whose build needs its repository's ancestry: its
-/// crate inherits a workspace from the directories above it, so it can only be
-/// built while the publisher's directory exists. Building it at install is what
-/// removes that dependency from everything after (design section 6.2).
+/// A scheduling policy is built by the server from the snapshot its installation took: the
+/// tree it was installed from is not read again, and a second server over the same roots, with
+/// no toolchain at all, resolves the module the store keeps.
 #[test]
-#[ignore = "requires the Build Server's interpreter (UNISERVE_BUILD_SERVER_PYTHON) and the wasm precompiler (UNISERVE_SCHEDULING_PRECOMPILE)"]
-fn a_policy_is_built_when_it_is_installed_and_needs_no_compiler_after() {
-    let python = std::env::var_os("UNISERVE_BUILD_SERVER_PYTHON")
-        .map(PathBuf::from)
-        .expect("UNISERVE_BUILD_SERVER_PYTHON must name the Build Server's interpreter");
+#[ignore = "builds a policy crate for wasm32 with cargo and needs the wasm precompiler (UNISERVE_SCHEDULING_PRECOMPILE)"]
+fn a_policy_is_built_from_its_installed_snapshot() {
     let precompiler = std::env::var_os("UNISERVE_SCHEDULING_PRECOMPILE")
         .map(PathBuf::from)
         .expect(
             "UNISERVE_SCHEDULING_PRECOMPILE must name the precompiler: \
              `cargo build -p scheduling --bin scheduling-precompile` builds it",
         );
+    // The tree's default policy: a crate that depends on the guest crate through its workspace.
+    let package =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scheduling/policies/fcfs");
     let temporary = tempfile::tempdir().unwrap();
-    let package = temporary.path().join("policy");
-    std::fs::create_dir_all(package.join("src")).unwrap();
-    // The smallest module wasmtime accepts as a policy's input: the wasm header
-    // and nothing else. What the policy computes is a scheduling question, not
-    // this path's.
-    std::fs::write(
-        package.join("src/build.py"),
-        "import os, pathlib\n\
-         out = pathlib.Path(os.environ['UNISERVE_OUT'])\n\
-         out.mkdir(parents=True, exist_ok=True)\n\
-         (out / 'policy.wasm').write_bytes(b'\\x00asm\\x01\\x00\\x00\\x00')\n",
-    )
-    .unwrap();
-    std::fs::write(
-        package.join("package.toml"),
-        r#"# A synthetic policy: the generation layer's wasm path, nothing else.
-op = "scheduling"
-backend = "fixture"
-interface_version = 1
-
-[toolchain]
-kind = "wasm"
-version = ""
-
-[module]
-form = "wasm"
-
-[source]
-kind = "wasm"
-files = ["src/build.py"]
-script = "src/build.py"
-"#,
-    )
-    .unwrap();
-
     let root = temporary.path().join("packages");
     std::fs::create_dir_all(&root).unwrap();
     let store = temporary.path().join("store");
     std::fs::create_dir_all(&store).unwrap();
-    let with_precompiler = ServerConfig {
+    let with_toolchain = ServerConfig {
         socket: temporary.path().join("first.sock"),
         package_root: root.clone(),
         store_roots: vec![Root {
@@ -431,47 +391,54 @@ script = "src/build.py"
         limits: Limits::default(),
         toolchains: ToolchainConfig {
             nvcc: None,
-            python: Some(python.clone()),
+            python: None,
             wasm: Some(precompiler),
             cargo: None,
-            max_jobs: 1,
+            max_jobs: 4,
         },
         devices: vec![Device {
             arch: Target::new("sm_100a"),
             model: Target::new("b200"),
         }],
     };
-    let (_server, stop, thread) = start(&with_precompiler);
-    let mut client = Client::connect(&with_precompiler.socket).unwrap();
-    client.install(&package).unwrap();
-    stop.store(true, Ordering::SeqCst);
-    thread.join().unwrap();
-
-    // The artifact is beside the installed manifest, so a host that has no
-    // precompiler — the deployment's serving host — can still prepare it.
-    let revision = root.join("scheduling").join("fixture").join("1");
-    assert!(
-        revision.join("module.wasm").is_file(),
-        "install kept no module beside the manifest at {}",
-        revision.display()
-    );
-
-    let mut without_precompiler = with_precompiler.clone();
-    without_precompiler.socket = temporary.path().join("second.sock");
-    without_precompiler.toolchains.wasm = None;
-    let (_server, stop, thread) = start(&without_precompiler);
-    let mut client = Client::connect(&without_precompiler.socket).unwrap();
     let request = PrepareRequest {
         targets: Vec::new(),
         packages: vec![PackageRequest {
             slot: ModuleSlot::all("scheduling"),
             selector: Selector::Latest {
-                backend: "fixture".to_owned(),
+                backend: "fcfs".to_owned(),
                 arguments: toml::Table::new(),
             },
         }],
-        descriptors: Vec::new(),
+        descriptors: vec![Descriptors {
+            slot: ModuleSlot::all("scheduling"),
+            keys: vec![build_server::manifest::SINGLE_KEY.to_owned()],
+        }],
     };
+
+    let (_server, stop, thread) = start(&with_toolchain);
+    let mut client = Client::connect(&with_toolchain.socket).unwrap();
+    client.install(&package).unwrap();
+    // The revision holds the policy's crate and the guest crate it depends on, and no module:
+    // installing built nothing.
+    let revision = root.join("scheduling").join("fcfs").join("1");
+    assert!(
+        revision
+            .join("workspace/crates/scheduling/guest/Cargo.toml")
+            .is_file()
+    );
+    assert!(!revision.join("module.wasm").exists());
+    client
+        .prepare(&request, &mut |_| {})
+        .expect("the server builds the policy from its snapshot");
+    stop.store(true, Ordering::SeqCst);
+    thread.join().unwrap();
+
+    let mut without_toolchain = with_toolchain.clone();
+    without_toolchain.socket = temporary.path().join("second.sock");
+    without_toolchain.toolchains.wasm = None;
+    let (_server, stop, thread) = start(&without_toolchain);
+    let mut client = Client::connect(&without_toolchain.socket).unwrap();
     let prepared = client
         .prepare(&request, &mut |_| {})
         .expect("a policy whose module the store holds needs no compiler");

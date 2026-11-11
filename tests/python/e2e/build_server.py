@@ -51,7 +51,7 @@ from tests.python.e2e.http_helpers import (
 # A package's backend is a package's name: the Build Server selects a package
 # by the backend its manifest declares, and no package is named ``auto``.
 KERNEL_PACKAGES = "crates/ops/kernels"
-POLICY_PACKAGE = "crates/ops/package-fixtures/policy"
+POLICY_PACKAGE = "crates/scheduling/policies/fixture"
 
 # The engine package: the executable every deployment's main processes run
 # as. The daemon fixes its revision when a deployment starts, and the server

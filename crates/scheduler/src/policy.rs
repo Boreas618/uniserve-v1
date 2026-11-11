@@ -254,7 +254,7 @@ pub trait PolicySource: Send + Sync {
 /// operator's single descriptor ([`build_server::manifest::SINGLE_KEY`]).
 ///
 /// The key it resolves under is the store's wasm target, not a CPU triple: a
-/// policy is one artifact per revision, written at install for
+/// policy is one module per revision, built from its snapshot for
 /// [`build_server::manifest::WASM_TARGET`], and it belongs to the whole
 /// architecture rather than to one CPU (§5.3). The host's precompile triple is
 /// wasmtime's business and lives in [`Engine::new`].
@@ -2084,7 +2084,7 @@ mod tests {
 
     #[test]
     fn a_policy_is_resolved_under_the_stores_wasm_key() {
-        // A policy is one artifact per revision, written at install for the
+        // A policy is one module per revision, built from its snapshot for the
         // store's wasm target (`Manifest::builds_for` answers that key and no
         // other for a package with no kernel), so a source that named a CPU
         // triple asked for a path no install writes and no package declares.
@@ -2112,7 +2112,7 @@ mod shipped_packages {
         for package in [
             "crates/scheduling/policies/fcfs/package.toml",
             "crates/scheduling/policies/priority/package.toml",
-            "crates/ops/package-fixtures/policy/package.toml",
+            "crates/scheduling/policies/fixture/package.toml",
         ] {
             let path = root.join(package);
             let text = std::fs::read_to_string(&path)

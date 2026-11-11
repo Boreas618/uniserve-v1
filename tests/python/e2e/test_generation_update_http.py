@@ -63,11 +63,11 @@ from tests.python.e2e.build_server import (
 from tests.python.e2e.build_server import repository
 from tests.python.e2e.http_helpers import (
     QWEN3_CHECKPOINT,
+    engine_selection,
     find_free_port,
     host_asset,
     require_uniserve_binary,
     server_process,
-    engine_selection,
 )
 
 #: Options every deployment this file serves with. They are the live-update
@@ -125,18 +125,17 @@ REVERTED = ["reverted", "purged"]
 
 #: The tree's fixture package each variable stands for when it is unset.
 FIXTURE_PACKAGES = {
-    "UNISERVE_REBIND_PACKAGE": "rms_norm_rebind",
-    "UNISERVE_RECAPTURE_PACKAGE": "recapture",
-    "UNISERVE_POLICY_PACKAGE": "policy",
-    "UNISERVE_WRONG_PACKAGE": "rms_norm_wrong",
+    "UNISERVE_REBIND_PACKAGE": "crates/ops/package-fixtures/rms_norm_rebind",
+    "UNISERVE_RECAPTURE_PACKAGE": "crates/ops/package-fixtures/recapture",
+    "UNISERVE_POLICY_PACKAGE": "crates/scheduling/policies/fixture",
+    "UNISERVE_WRONG_PACKAGE": "crates/ops/package-fixtures/rms_norm_wrong",
 }
 
 
 def _package(name: str) -> Path:
     """The package directory `name` names, else the tree's fixture."""
     value = os.environ.get(name)
-    fixtures = repository() / "crates/ops/package-fixtures"
-    path = Path(value) if value else fixtures / FIXTURE_PACKAGES[name]
+    path = Path(value) if value else repository() / FIXTURE_PACKAGES[name]
     if not path.is_dir():
         pytest.fail(f"{name}: {path} is not a package directory")
     return path

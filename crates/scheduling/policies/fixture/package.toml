@@ -1,24 +1,42 @@
-# The `fixture` policy package: the generation layer's delivery test publishes and
-# precompiles it, and the mechanism instantiates it like any policy (design
-# §4.4, §5.2, §5.3). It fills the scheduling policy with the arrival-order body.
+# The `fixture` policy package: a second revision of the deployment's policy,
+# which the generation update tests install to move the policy the way a kernel
+# package moves (design §4.4, §5.2, §5.3). The deployment serves
+# `scheduling/fcfs`; this package states the same interface and backend with
+# the arrival-order body, so installing it makes the daemon reload its policy
+# module as a generation.
 op = "scheduling"
 backend = "fcfs"
 interface_version = 1
 
+# An empty version means any wasmtime this host has, which is what a fixture
+# that must install on an arbitrary test host declares. A serving package pins
+# the precompiler's version instead, because a precompiled module carries
+# wasmtime's format.
 [toolchain]
 kind = "wasm"
-version = "50.0.1"
+version = ""
 packages = []
 
 [module]
 form = "wasm"
 
+# The package is this crate, built by the Build Server from its snapshot.
 [source]
 kind = "wasm"
-files = ["Cargo.toml", "src/lib.rs"]
+files = []
 
+# The limits are the test deployment's, not the guest's defaults: a policy
+# whose limits exceed the epoch's build config is refused by name
+# (`crates/scheduling/src/limits.rs`), and the tests' configuration states the
+# prefill graph's largest token count and its decode batch sizes (`OPTIONS` in
+# `tests/python/e2e/test_live_updates_http.py`:
+# `cuda_graph_config.prefill_token_sizes=[512]` and
+# `decode_batch_sizes=[1, 2, 4, 8]`). A limit above those refuses the epoch.
 [parameters]
-chunked_prefill_size = 8192
-max_batch = 128
-max_num_batched_tokens = 8192
+chunked_prefill_size = 512
+max_batch = 8
+max_num_batched_tokens = 512
 prefetch_min_tokens = 256
+# Nanoseconds, as `scheduling_guest::limits::Parameters` reads a duration: the
+# fixture states its cap rather than taking the guest's default of the same 30 s.
+timeout = 30000000000

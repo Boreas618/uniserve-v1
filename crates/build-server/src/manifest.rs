@@ -85,7 +85,9 @@ pub enum SourceKind {
     CuteDsl,
     /// A vendor cubin the package carries, stored as it is.
     Cubin,
-    /// A scheduling policy: wasm32, then precompiled for this host's CPU.
+    /// A scheduling policy: a crate of a Cargo workspace, built for wasm32
+    /// from the snapshot an installation takes of it and then precompiled
+    /// for this host's CPU.
     Wasm,
     /// An executable: stored as it is.
     Executable,
@@ -675,6 +677,13 @@ impl Manifest {
                 ));
             }
             _ => {}
+        }
+        if self.source.kind == SourceKind::Wasm && self.source.script.is_some() {
+            return Err(ManifestError::Invalid(
+                "a scheduling policy is a crate the Build Server builds from its snapshot: it \
+                 names no build script"
+                    .into(),
+            ));
         }
         if self.source.kind == SourceKind::Cargo {
             if self.module.form != ModuleForm::Executable || self.kernel.is_some() {
