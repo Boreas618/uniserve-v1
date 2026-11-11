@@ -251,7 +251,7 @@ pub trait PolicySource: Send + Sync {
 /// The daemon names a package by backend, revision and arguments, never by
 /// content: this asks the host's Build Server to `resolve` it — the store's
 /// copy, or a build of it when the store misses it — under the `scheduling`
-/// operator's single descriptor ([`build_server::manifest::POLICY_DESCRIPTOR`]).
+/// operator's single descriptor ([`build_server::manifest::SINGLE_KEY`]).
 ///
 /// The key it resolves under is the store's wasm target, not a CPU triple: a
 /// policy is one artifact per revision, written at install for
@@ -348,7 +348,7 @@ impl PolicySource for ModuleSource {
                     POLICY_OP,
                     &package_revision,
                     &self.target,
-                    build_server::manifest::POLICY_DESCRIPTOR,
+                    build_server::manifest::SINGLE_KEY,
                     &mut |progress| {
                         tracing::info!(
                             target = %self.target,

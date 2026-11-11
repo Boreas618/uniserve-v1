@@ -1044,7 +1044,7 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) -> Out
             "scheduling",
             &revision,
             &Target::new(build_server::manifest::WASM_TARGET),
-            build_server::manifest::POLICY_DESCRIPTOR,
+            build_server::manifest::SINGLE_KEY,
             &mut |_| {},
         )
         .context("the installed policy resolves without a compiler")?;

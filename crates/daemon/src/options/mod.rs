@@ -315,11 +315,6 @@ pub struct ServerArgs {
     #[serde(skip)]
     #[arg(long)]
     pub port: Option<u16>,
-    /// The `uniserve` executable that runs the workers
-    /// (`worker_config.executable`).
-    #[serde(skip)]
-    #[arg(long, value_name = "PATH")]
-    pub worker_executable: Option<PathBuf>,
     /// The descriptor of the handoff socket to the daemon this one succeeds,
     /// whose deployment it takes over, as `POST /admin/restart` starts its
     /// successor (`daemon::restart`); every other argument is ignored.
@@ -380,7 +375,6 @@ impl Default for ServerArgs {
             set: Vec::new(),
             host: None,
             port: None,
-            worker_executable: None,
             predecessor: None,
         }
     }
@@ -851,7 +845,8 @@ impl ServerArgs {
             host: self.host_identity.clone(),
             dist_init_addr: self.dist_init_addr.clone(),
             socket: directory.join(format!("process-{}.sock", std::process::id())),
-            executable: self.worker_config.executable.clone(),
+            // The host services are commands of this executable.
+            executable: std::env::current_exe().unwrap_or_else(|_| "uniserve".into()),
             join_timeout: crate::supervision::JOIN_TIMEOUT,
             devices,
             build_server: self.build_config.clone(),

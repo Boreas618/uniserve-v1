@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-pub use proto::module::{ModuleSlot, PackageRevision, PhaseKind};
+pub use proto::module::{ModuleSet, ModuleSlot, PackageRevision, PhaseKind};
 // The operators the configuration selects a backend for are named by the
 // module vocabulary (`proto::module::operator`), whose names each
 // operator's `Op::NAME` is: the daemon, the Build Server and the main
@@ -98,6 +98,9 @@ pub enum Status {
 pub struct EpochRecord {
     /// What built the epoch.
     pub config: proto::config::EngineConfig,
+    /// The engine package the epoch's main processes run as, at the revision
+    /// fixed when the epoch's configuration was applied.
+    pub engine: PackageRevision,
     /// The kernel package that fills each operator, or each phase of one;
     /// a phase of `None` covers every phase of its operator (§5.2).
     pub kernels: BTreeMap<KernelKey, PackageRevision>,
@@ -597,6 +600,7 @@ impl Epochs {
             epoch,
             EpochRecord {
                 config: deployment.engine.clone(),
+                engine: deployment.modules.engine.clone(),
                 kernels: deployment.modules.kernels.clone(),
                 policy: deployment.modules.policy.clone(),
                 previous_kernels: BTreeMap::new(),
@@ -646,6 +650,7 @@ impl Epochs {
             device: None,
         })?;
         let modules = ModuleSet {
+            engine: record.engine.clone(),
             kernels: record.kernels.clone(),
             policy: record.policy.clone(),
         };
@@ -1103,27 +1108,20 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// only the operators the configuration selects a backend for. The
 /// scheduling interface is not an operator at all: its package is the epoch
 /// record's `policy` field.
-/// The modules a configuration fills, by operator and phase, and the
-/// scheduling interface's (§5.1, §5.2).
+/// The module set `config` names: the engine package, the scheduling policy's
+/// and the kernel package of each operator, or phase of one, it selects a
+/// backend for (§5.1, §5.2).
 ///
 /// The backends and parameters come from the configuration; the revisions
-/// come from `prepare`, which selects each package's latest revision at the
-/// upstream Build Server (§5.1). A package's `revision` is zero until it
-/// was prepared. An operator whose backend the configuration does not state,
-/// or leaves at `auto`, is absent: the deployment names nothing for it, and
-/// the Build Server selects its package for each of its descriptor keys
-/// among the packages that cover them, by manifest priority (§6.3).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ModuleSet {
-    /// The kernel package that fills each operator, or each phase of one.
-    pub kernels: BTreeMap<KernelKey, PackageRevision>,
-    /// The scheduling policy package.
-    pub policy: PackageRevision,
-}
-
-impl ModuleSet {
-    /// The modules `config` fills, without the revisions `prepare` selects.
-    pub fn of(config: &ServerArgs) -> Self {
+/// are fixed when the configuration is applied, at the Build Server
+/// (§5.1). A package's `revision` is zero until then, unless the
+/// configuration states one. An operator whose backend the configuration
+/// does not state, or leaves at `auto`, is absent: the deployment names
+/// nothing for it, and the Build Server selects its package for each of its
+/// descriptor keys among the packages that cover them, by manifest priority
+/// (§6.3).
+pub fn modules_of(config: &ServerArgs) -> ModuleSet {
+    {
         let mut kernels = BTreeMap::new();
         let attention = attention_packages(config);
         kernels.extend(attention);
@@ -1162,7 +1160,12 @@ impl ModuleSet {
                 );
             }
         }
-        Self {
+        ModuleSet {
+            engine: PackageRevision {
+                backend: config.worker_config.engine.clone(),
+                revision: config.worker_config.engine_revision.unwrap_or(0),
+                arguments: toml::Table::new(),
+            },
             kernels,
             policy: PackageRevision {
                 backend: word(&config.scheduler_config.policy),
@@ -1343,7 +1346,7 @@ impl Epoch {
     /// Fails when the configuration does not resolve into an engine configuration
     /// ([`ServerArgs::engine_config`]): its deployment file does not read or place.
     pub fn of(config: ServerArgs) -> anyhow::Result<Self> {
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
         Self::with_modules(config, modules)
     }
 
@@ -1369,7 +1372,11 @@ impl Epoch {
 pub fn layer(previous: &Epoch, next: &Epoch) -> Layer {
     if host_layer_differ(&previous.config, &next.config) {
         Layer::Host
-    } else if previous.engine.build_hash() != next.engine.build_hash() {
+    } else if previous.engine.build_hash() != next.engine.build_hash()
+        || previous.modules.engine != next.modules.engine
+    {
+        // Another engine package, or another revision of it, is another
+        // executable: its main processes are started beside the serving ones.
         Layer::Epoch
     } else if previous.modules != next.modules {
         Layer::Generation
@@ -1411,6 +1418,7 @@ mod tests {
         let config = ServerArgs::default();
         EpochRecord {
             config: config.engine_config().expect("the configuration resolves"),
+            engine: package("uniserve"),
             kernels: BTreeMap::from([(KernelKey::all("rms_norm"), package("triton"))]),
             policy: package("fcfs"),
             previous_kernels: BTreeMap::new(),
@@ -1520,7 +1528,7 @@ mod tests {
 
         // A change that moves only the modules: one operator's backend.
         let mut target = serving.clone();
-        let mut modules = ModuleSet::of(&config);
+        let mut modules = crate::epoch::modules_of(&config);
         modules
             .policy
             .arguments
@@ -1597,7 +1605,7 @@ mod tests {
         epochs.supervise(commands);
 
         let mut target = serving.clone();
-        let mut modules = ModuleSet::of(&config);
+        let mut modules = crate::epoch::modules_of(&config);
         modules
             .policy
             .arguments
@@ -1669,7 +1677,7 @@ mod tests {
         epochs.supervise(commands);
 
         let mut first = serving.clone();
-        let mut modules = ModuleSet::of(&config);
+        let mut modules = crate::epoch::modules_of(&config);
         modules
             .policy
             .arguments
@@ -1689,7 +1697,7 @@ mod tests {
         );
 
         let mut second = serving.clone();
-        let mut modules = ModuleSet::of(&config);
+        let mut modules = crate::epoch::modules_of(&config);
         modules
             .policy
             .arguments
@@ -1734,7 +1742,7 @@ mod tests {
         epochs.supervise(commands);
 
         let mut target = serving.clone();
-        let mut modules = ModuleSet::of(&config);
+        let mut modules = crate::epoch::modules_of(&config);
         modules
             .policy
             .arguments
@@ -1780,7 +1788,7 @@ mod tests {
         epochs.supervise(commands);
 
         let mut target = serving.clone();
-        let mut modules = ModuleSet::of(&config);
+        let mut modules = crate::epoch::modules_of(&config);
         modules
             .policy
             .arguments
@@ -1848,7 +1856,7 @@ mod tests {
         assert!(!epochs.commit_generation().expect("nothing to commit"));
 
         let mut target = serving.clone();
-        let mut modules = ModuleSet::of(&config);
+        let mut modules = crate::epoch::modules_of(&config);
         modules
             .policy
             .arguments
@@ -1918,7 +1926,7 @@ mod tests {
             ..Default::default()
         };
         config.scheduler_config.chunked_prefill_size = None;
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
         assert_eq!(
             modules.policy.arguments["max_num_batched_tokens"],
             toml::Value::Integer(8192)
@@ -1932,7 +1940,7 @@ mod tests {
         // A stated chunk above the bound is stated, not clamped: the
         // mechanism's `BadLimits` is the refusal.
         config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(16384);
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
         assert_eq!(
             modules.policy.arguments["chunked_prefill_size"],
             toml::Value::Integer(16384)
@@ -1951,7 +1959,7 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             NonZeroU32::new(8).unwrap(),
         ]);
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
         assert_eq!(
             modules.policy.arguments["max_num_batched_tokens"],
             toml::Value::Integer(512),
@@ -1974,7 +1982,7 @@ mod tests {
             NonZeroU32::new(4).unwrap(),
             NonZeroU32::new(8).unwrap(),
         ]);
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
         assert_eq!(
             modules.policy.arguments["max_batch"],
             toml::Value::Integer(8),
@@ -1986,7 +1994,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .push(NonZeroU32::new(16).unwrap());
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
         assert_eq!(
             modules.policy.arguments["max_batch"],
             toml::Value::Integer(16),
@@ -1994,7 +2002,7 @@ mod tests {
         );
         // A batch the deployment states below the catalog keeps its own value.
         config.scheduler_config.max_batch = NonZeroUsize::new(4).unwrap();
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
         assert_eq!(
             modules.policy.arguments["max_batch"],
             toml::Value::Integer(4)
@@ -2003,7 +2011,7 @@ mod tests {
         // A deployment that states no token bound and no catalog states no
         // limit, and the mechanism's ceilings are the workers' own.
         let config = ServerArgs::default();
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
         assert!(
             !modules
                 .policy
@@ -2249,7 +2257,7 @@ mod tests {
     #[test]
     fn the_filled_modules_name_the_operators_and_phases() {
         let config = ServerArgs::default();
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
 
         // One attention package for every phase, and no expert exchange for a
         // deployment whose experts all live on one rank: the model's MoE block
@@ -2275,7 +2283,7 @@ mod tests {
         // names.
         let mut parallel = ServerArgs::default();
         parallel.moe_config.expert_parallel = true;
-        let modules = ModuleSet::of(&parallel);
+        let modules = crate::epoch::modules_of(&parallel);
         assert_eq!(
             modules.kernels[&KernelKey::all(operator::EXPERT_EXCHANGE)].backend,
             "alltoall"
@@ -2299,7 +2307,7 @@ mod tests {
             ..Default::default()
         };
         stated.speculative_config.expected_speedup = Some(2.5);
-        let modules = ModuleSet::of(&stated);
+        let modules = crate::epoch::modules_of(&stated);
         assert_eq!(
             modules.policy.arguments["chunked_prefill_size"],
             toml::Value::Integer(2048)
@@ -2324,7 +2332,7 @@ mod tests {
             decode_attention_backend: Some("trtllm".to_owned()),
             ..Default::default()
         };
-        let modules = ModuleSet::of(&split);
+        let modules = crate::epoch::modules_of(&split);
         let prefill =
             &modules.kernels[&KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Prefill)];
         let decode =
@@ -2348,7 +2356,7 @@ mod tests {
             attention_backend: "fa4".to_owned(),
             ..Default::default()
         };
-        let modules = ModuleSet::of(&one);
+        let modules = crate::epoch::modules_of(&one);
         assert_eq!(
             modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
             "fa4"
@@ -2365,7 +2373,7 @@ mod tests {
             decode_attention_backend: Some("fa4".to_owned()),
             ..Default::default()
         };
-        let modules = ModuleSet::of(&agreed);
+        let modules = crate::epoch::modules_of(&agreed);
         assert_eq!(
             modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
             "fa4",
@@ -2377,7 +2385,7 @@ mod tests {
             moe_runner_backend: Some("cutlass".to_owned()),
             ..Default::default()
         };
-        let modules = ModuleSet::of(&moe);
+        let modules = crate::epoch::modules_of(&moe);
         for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
             assert_eq!(
                 modules.kernels[&KernelKey::all(operator)].backend,
@@ -2396,7 +2404,7 @@ mod tests {
             moe_runner_backend: Some("auto".to_owned()),
             ..Default::default()
         };
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
         assert_eq!(
             modules.kernels.keys().cloned().collect::<Vec<_>>(),
             vec![KernelKey::phase(
@@ -2407,7 +2415,7 @@ mod tests {
 
         config.attention_backend = "trtllm".to_owned();
         config.decode_attention_backend = None;
-        let modules = ModuleSet::of(&config);
+        let modules = crate::epoch::modules_of(&config);
         assert_eq!(
             modules.kernels[&KernelKey::all(operator::PAGED_ATTENTION)].backend,
             "trtllm"

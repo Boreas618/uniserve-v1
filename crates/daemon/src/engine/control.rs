@@ -67,22 +67,6 @@ fn main_process_environment() -> std::collections::HashMap<String, String> {
         .collect()
 }
 
-/// Starts the engine processes of one deployment.
-/// Whether `executable` is this process's own binary, by canonical path: a
-/// bare name is looked up by the operating system, not by us, and counts as
-/// another executable.
-fn own_executable(executable: &str) -> bool {
-    let path = std::path::Path::new(executable);
-    if !path.is_absolute() {
-        return false;
-    }
-    let Ok(own) = std::env::current_exe() else {
-        return false;
-    };
-    let own = std::fs::canonicalize(&own).unwrap_or(own);
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) == own
-}
-
 /// How long a Build Server this daemon starts may take to listen: it
 /// discovers its toolchains, which imports the compilers of its Python
 /// environment, and loads every installed package first.
@@ -384,6 +368,11 @@ impl EngineControl {
     /// The host this control's engines run on.
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// This node's Build Server socket.
+    pub fn build_server(&self) -> &std::path::Path {
+        &self.build_server
     }
 
     pub fn request_address(&self) -> &str {
@@ -712,15 +701,11 @@ impl EngineControl {
              epochs by a relaunch"
         );
         let launch = self.launch(args.clone(), engine)?;
-        let executable = launch
-            .engine_config
-            .worker
-            .executable
-            .to_string_lossy()
-            .into_owned();
         Ok(crate::updates::switch::Start {
-            build: own_executable(&executable).then(|| proto::BUILD.to_owned()),
-            executable,
+            // The engine is a package's executable, never this daemon's: its
+            // first child's `Hello` states the build every other child must
+            // report.
+            build: None,
             launch,
             environment: main_process_environment(),
         })
@@ -741,12 +726,6 @@ impl EngineControl {
             "a remote engine needs the deployment's network control address"
         );
 
-        let executable = launch
-            .engine_config
-            .worker
-            .executable
-            .to_string_lossy()
-            .into_owned();
         control.send(&process::Upstream {
             kind: Some(upstream::Kind::Request(process::Request {
                 id: 1,
@@ -755,8 +734,10 @@ impl EngineControl {
                     group: ENGINE_GROUP.to_owned(),
                     rank: launch.rank,
                     generation: engine,
-                    executable,
-                    arguments: vec!["engine".to_owned()],
+                    // The node that starts the process resolves the engine
+                    // package its launch names at its own Build Server.
+                    executable: String::new(),
+                    arguments: Vec::new(),
                     environment: main_process_environment(),
                     inherit,
                     // The node that starts the process writes its launch file.
@@ -1205,7 +1186,8 @@ fn prepare_at(
     steps: &PrepareSteps,
 ) -> anyhow::Result<crate::epoch::ModuleSet> {
     let policy_slot = proto::module::ModuleSlot::all(POLICY_SLOT);
-    let mut requests = Vec::with_capacity(filled.kernels.len() + 1);
+    let engine_slot = proto::module::ModuleSlot::all(proto::module::ENGINE);
+    let mut requests = Vec::with_capacity(filled.kernels.len() + 2);
     for (slot, package) in &filled.kernels {
         requests.push(build_server::PackageRequest {
             slot: slot.clone(),
@@ -1216,10 +1198,22 @@ fn prepare_at(
         slot: policy_slot.clone(),
         selector: selected(selector, &filled.policy),
     });
+    requests.push(build_server::PackageRequest {
+        slot: engine_slot.clone(),
+        selector: selected(selector, &filled.engine),
+    });
+    // The engine's one module is built here, on every host, before any node
+    // starts a main process from it: a host whose store misses it builds the
+    // executable for its own platform now, while nothing waits on a start.
+    let mut descriptors = descriptors.to_vec();
+    descriptors.push(build_server::Descriptors {
+        slot: engine_slot.clone(),
+        keys: vec![proto::module::SINGLE_KEY.to_owned()],
+    });
     let request = build_server::PrepareRequest {
         targets: server.targets.clone(),
         packages: requests,
-        descriptors: descriptors.to_vec(),
+        descriptors,
     };
     // Before the connect, not after it: a daemon that blocks opening the
     // socket names the host it was reaching from this line alone, and the
@@ -1288,14 +1282,18 @@ fn prepare_at(
     );
     let mut kernels = BTreeMap::new();
     let mut policy = None;
+    let mut engine = None;
     for chosen in prepared.packages {
         if chosen.slot == policy_slot {
             policy = Some(chosen.package);
+        } else if chosen.slot == engine_slot {
+            engine = Some(chosen.package);
         } else {
             kernels.insert(chosen.slot, chosen.package);
         }
     }
     let policy = policy.context("the Build Server selected no scheduling policy package")?;
+    let engine = engine.context("the Build Server selected no engine package")?;
     anyhow::ensure!(
         kernels.len() == filled.kernels.len(),
         "the Build Server of {} selected modules for {} of the {} slots asked",
@@ -1303,7 +1301,11 @@ fn prepare_at(
         kernels.len(),
         filled.kernels.len()
     );
-    Ok(crate::epoch::ModuleSet { kernels, policy })
+    Ok(crate::epoch::ModuleSet {
+        engine,
+        kernels,
+        policy,
+    })
 }
 
 /// The slot the scheduling policy package fills: the name the policy packages state
@@ -1319,12 +1321,60 @@ fn selected(
     package: &proto::module::PackageRevision,
 ) -> build_server::Selector {
     match selector {
-        Selector::Latest => build_server::Selector::Latest {
+        // A revision the module set already states is asked for exactly: the
+        // one a configuration pins, or the one an earlier selection fixed.
+        Selector::Latest if package.revision == 0 => build_server::Selector::Latest {
             backend: package.backend.clone(),
             arguments: package.arguments.clone(),
         },
-        Selector::Fixed => build_server::Selector::Fixed(package.clone()),
+        Selector::Latest | Selector::Fixed => build_server::Selector::Fixed(package.clone()),
     }
+}
+
+/// Fixes the engine package `engine` names at the Build Server on `socket`: its latest installed
+/// revision, or the one it states, with its module built for this host.
+///
+/// A main process is started from the engine's module, so this selection comes before any other
+/// of an epoch's: the launch file names the revision it answers, and every node's daemon resolves
+/// that revision at its own Build Server.
+///
+/// # Errors
+///
+/// Fails when the Build Server cannot be reached, holds no such engine package or revision, or
+/// cannot build it.
+pub fn select_engine(
+    socket: &std::path::Path,
+    engine: &proto::module::PackageRevision,
+) -> anyhow::Result<proto::module::PackageRevision> {
+    let slot = proto::module::ModuleSlot::all(proto::module::ENGINE);
+    let request = build_server::PrepareRequest {
+        targets: Vec::new(),
+        packages: vec![build_server::PackageRequest {
+            slot: slot.clone(),
+            selector: selected(Selector::Latest, engine),
+        }],
+        descriptors: vec![build_server::Descriptors {
+            slot,
+            keys: vec![proto::module::SINGLE_KEY.to_owned()],
+        }],
+    };
+    let mut client = build_server::Client::connect(socket)
+        .with_context(|| format!("connecting to the Build Server at {}", socket.display()))?;
+    let prepared = client
+        .prepare(&request, &mut |step| {
+            tracing::info!(
+                path = %step.path,
+                state = ?step.state,
+                "the Build Server prepares the engine's module"
+            );
+        })
+        .with_context(|| format!("selecting the engine package {}", engine.backend))?;
+    prepared
+        .packages
+        .into_iter()
+        .next()
+        .map(|chosen| chosen.package)
+        .context("the Build Server selected no engine package")
 }
 
 /// One epoch's main process on a node, and the daemon's process connection
@@ -2107,11 +2157,11 @@ mod tests {
         );
     }
 
-    /// An epoch's start names this daemon's own build only for its own binary,
-    /// and starts the process with the launch file alone: another executable's
-    /// children fix their identity with their first `Hello` (§7.4).
+    /// An epoch's start carries the launch file alone and names no build: the
+    /// engine is a package's executable, whose children fix their identity
+    /// with their first `Hello` (§7.4).
     #[test]
-    fn an_epoch_start_names_the_build_of_the_daemons_own_executable() {
+    fn an_epoch_start_carries_the_launch_and_names_no_build() {
         let directory = tempfile::tempdir().unwrap();
         let control = EngineControl::new(
             &directory.path().join("requests.sock"),
@@ -2121,7 +2171,6 @@ mod tests {
             std::path::PathBuf::from("/run/build-server.sock"),
         )
         .unwrap();
-        let own = std::env::current_exe().unwrap();
         // The deployment's own engine configuration, as the options resolve it, on this control's
         // host: an epoch's start reads the ranks it places.
         let mut options = ServerArgs {
@@ -2132,13 +2181,12 @@ mod tests {
         };
         options.device_config.devices = vec![0];
         options.device_config.queue_depth = std::num::NonZeroUsize::new(4).unwrap();
-        options.worker_config.executable = own;
         let mut args =
             EngineArgs::new(options.engine_config().expect("the configuration resolves"));
         args.epoch = 3;
 
         let start = control.epoch_start(&args, 9).unwrap();
-        assert_eq!(start.build, Some(proto::BUILD.to_owned()));
+        assert_eq!(start.build, None);
         // The file is the adapter's to write for the process it starts; the
         // start carries its contents, with this process's generation.
         assert_eq!(start.launch.engine, 9);
@@ -2159,12 +2207,6 @@ mod tests {
         let standby = control.epoch_start(&args, 10).unwrap();
         assert!(standby.launch.standby());
         assert_eq!(standby.launch.epoch, 3);
-        args.predecessor = None;
-
-        args.engine_config.worker.executable = std::path::PathBuf::from("/opt/uniserve-b");
-        let other = control.epoch_start(&args, 9).unwrap();
-        assert_eq!(other.build, None);
-        assert_eq!(other.executable, "/opt/uniserve-b");
     }
 
     /// An update of the default deployment's filled modules, for the switch to

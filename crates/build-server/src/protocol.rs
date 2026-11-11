@@ -129,6 +129,11 @@ pub struct ModuleFile {
     pub name: String,
     pub size: u64,
     pub file: std::fs::File,
+    /// The file in the server's store. A module is never replaced, so the
+    /// path names these bytes for as long as the store holds them: a process
+    /// of the server's host that runs the file as an executable starts it
+    /// from here. A module that is loaded is read from [`Self::file`].
+    pub path: std::path::PathBuf,
 }
 
 /// A module the Build Server resolved: its form, its files, and what the
@@ -674,6 +679,7 @@ impl Client {
                                 name: file.name,
                                 size: file.size,
                                 file: std::fs::File::from(descriptor),
+                                path: file.path.into(),
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;

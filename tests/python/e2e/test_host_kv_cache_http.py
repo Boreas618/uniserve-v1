@@ -35,7 +35,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     runtime_directory,
     server_process,
-    worker_executable,
+    engine_selection,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
@@ -108,8 +108,7 @@ def _command(checkpoint: str, port: int) -> list[str]:
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--set",
         "dtype=bfloat16",
         "--set",

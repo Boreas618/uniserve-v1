@@ -16,7 +16,7 @@ from tests.python.e2e.http_helpers import (
     host_asset,
     require_uniserve_binary,
     server_process,
-    worker_executable,
+    engine_selection,
 )
 from tests.python.e2e.test_h3_parallel_http import _assert_media_values_close
 from uniserve_eval.datasets.minimax_h3 import _PROMPT
@@ -127,8 +127,7 @@ def test_every_admitted_duration_and_prompt_length_replays(
         model,
         "--worker-groups",
         str(deployment),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--served-model-name",
         "FastH3",
         "--port",

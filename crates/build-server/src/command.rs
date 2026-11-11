@@ -1,6 +1,6 @@
 //! The `uniserve build-server` command (design sections 6.1 and 6.3).
 //!
-//! Four subcommands:
+//! Its subcommands:
 //!
 //! - `serve`: runs this host's Build Server until it is stopped. With
 //!   `--daemon` it leaves its starter's session first (`service::detach`),
@@ -11,10 +11,14 @@
 //!   another server answers where the upstream is.
 //! - `list`: prints the installed packages, their revisions and their
 //!   modules.
-//! - `build --keys <file>`: fills a store directory with the modules of
-//!   descriptor key lists, with a Build Server of its own for the length of
-//!   the build ([`crate::build`]). The store's `packages` and `modules` are
-//!   then a `serve`'s package root and store root.
+//! - `resolve <op> <backend> <revision>`: prints where the store holds one
+//!   module's files, building the module first when it is missing.
+//! - `build --keys <file> --package <dir>`: fills a store directory with the
+//!   modules of descriptor key lists and of single-module packages (a policy,
+//!   the engine), with a Build Server of its own for the length of the build
+//!   ([`crate::build`]). The store's `packages` and `modules` are then a
+//!   `serve`'s package root and store root, or the read-only store a release
+//!   ships.
 //!
 //! The server launches no kernel and allocates no device memory (design
 //! section 6.1). The targets it builds for are the `--target`s it is given,
@@ -63,7 +67,28 @@ pub enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Build the modules of descriptor key lists into a store directory.
+    /// Resolve one module and print the path of each of its files in the
+    /// store, building the module first when the store misses it.
+    Resolve {
+        /// The Build Server's socket; this user's default socket when unset.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// The interface the package implements, such as `engine`.
+        op: String,
+        /// The package's implementation name.
+        backend: String,
+        /// The package's revision.
+        revision: u32,
+        /// The target the module is built for; this host's platform when
+        /// unset.
+        #[arg(long, value_name = "NAME")]
+        target: Option<String>,
+        /// The module's key; the key of a single-module package when unset.
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
+    },
+    /// Build the modules of descriptor key lists and of single-module
+    /// packages into a store directory.
     Build(Box<BuildArgs>),
 }
 
@@ -71,15 +96,21 @@ pub enum Command {
 #[derive(Debug, Clone, clap::Args)]
 pub struct BuildArgs {
     /// A key list, `operator<TAB>descriptor key` per line; repeatable.
-    #[arg(long = "keys", value_name = "FILE", required = true)]
+    #[arg(long = "keys", value_name = "FILE")]
     pub keys: Vec<PathBuf>,
+    /// The directory of a package that fills a whole interface with one
+    /// module, a scheduling policy or the engine: it is installed and its
+    /// module built for its own target; repeatable.
+    #[arg(long = "package", value_name = "DIR")]
+    pub package: Vec<PathBuf>,
     /// The package tree: one directory per operator, one package directory
     /// per backend. Relative to the directory the command runs in.
     #[arg(long, value_name = "DIR", default_value = "crates/ops/kernels")]
     pub packages: PathBuf,
-    /// The target the modules are built for, such as `sm_100a`.
+    /// The target the kernel keys' modules are built for, such as `sm_100a`;
+    /// required with `--keys`.
     #[arg(long, value_name = "NAME")]
-    pub target: String,
+    pub target: Option<String>,
     /// The store directory: installed packages under `packages`, modules
     /// under `modules`. An existing store is extended.
     #[arg(long, value_name = "DIR")]
@@ -87,10 +118,18 @@ pub struct BuildArgs {
     /// The interpreter of the Build Server's Python environment, which
     /// Triton and CuTe DSL packages build with.
     #[arg(long, value_name = "PATH")]
-    pub python: PathBuf,
+    pub python: Option<PathBuf>,
     /// The CUDA toolkit's nvcc; `$CUDA_HOME/bin/nvcc` when unset.
     #[arg(long, value_name = "PATH")]
     pub nvcc: Option<PathBuf>,
+    /// The precompiler that turns a scheduling policy into a module for this
+    /// host.
+    #[arg(long, value_name = "PATH")]
+    pub wasm: Option<PathBuf>,
+    /// cargo, which builds the engine package; the `cargo` on `PATH` when
+    /// unset.
+    #[arg(long, value_name = "PATH")]
+    pub cargo: Option<PathBuf>,
     /// How many builds may run at once (4 when unset).
     #[arg(long, value_name = "COUNT")]
     pub max_jobs: Option<usize>,
@@ -350,16 +389,50 @@ pub fn run(args: Args, host: HostTargets<'_>) -> Result<()> {
             }
             Ok(())
         }
+        Command::Resolve {
+            socket,
+            op,
+            backend,
+            revision,
+            target,
+            key,
+        } => {
+            let mut client = Client::connect(&socket_or_default(socket))?;
+            let module = client.resolve(
+                &op,
+                &proto::module::PackageRevision {
+                    backend,
+                    revision,
+                    arguments: toml::Table::new(),
+                },
+                &target.map_or_else(Target::host, Target::new),
+                key.as_deref().unwrap_or(crate::manifest::SINGLE_KEY),
+                &mut |progress| {
+                    eprintln!("{} {:?}", progress.path, progress.state);
+                },
+            )?;
+            for file in module.files {
+                println!("{}", file.path.display());
+            }
+            Ok(())
+        }
         Command::Build(build) => run_build(*build, host),
     }
 }
 
-/// Builds the key lists' modules into the store and prints one line per key:
-/// `ok`, the operator, the key and the backends that built it, or `FAILED`,
-/// the operator and the key. Every line is tab-separated.
+/// Builds the key lists' modules and the named packages' into the store and
+/// prints one line per key: `ok`, the operator, the key and the backends that
+/// built it, or `FAILED`, the operator and the key. Every line is
+/// tab-separated.
 fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
-    let python = absolute(args.python);
-    if !python.is_file() {
+    let invalid = |message: &str| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message.to_owned(),
+        ))
+    };
+    let python = args.python.map(absolute);
+    if let Some(python) = python.as_ref().filter(|python| !python.is_file()) {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
@@ -370,11 +443,15 @@ fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
         )));
     }
     let keys = crate::build::read_keys(&args.keys)?;
-    if keys.is_empty() {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the key lists name no descriptor key",
-        )));
+    if keys.is_empty() && args.package.is_empty() {
+        return Err(invalid(
+            "nothing to build: name a key list with --keys or a package with --package",
+        ));
+    }
+    if !keys.is_empty() && args.target.is_none() {
+        return Err(invalid(
+            "kernel keys are built for a device's architecture: name it with --target",
+        ));
     }
 
     // The store's two directories are the roots a `serve` is given; the
@@ -385,26 +462,37 @@ fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
         socket: Some(store.join("build-server.sock")),
         package_root: Some(store.join("packages")),
         store_roots: vec![store.join("modules")],
-        targets: vec![args.target.clone()],
+        targets: args.target.iter().cloned().collect(),
         max_jobs: args.max_jobs,
         nvcc: args.nvcc,
-        python: Some(python),
+        python,
+        wasm: args.wasm,
+        cargo: args.cargo,
         ..Settings::default()
     };
-    let config = settings.config(settings.devices(host)?);
+    // A build of single-module packages alone names no device architecture and
+    // reads none from the host.
+    let devices = match args.target {
+        Some(_) => settings.devices(host)?,
+        None => Vec::new(),
+    };
+    let config = settings.config(devices);
 
-    let report = crate::build::build(
+    let single: Vec<PathBuf> = args.package.into_iter().map(absolute).collect();
+    let total = keys.len() + single.len();
+    let mut unbuilt = Vec::new();
+    let failures = crate::build::build(
         &config,
         &absolute(args.packages),
         &keys,
-        &Target::new(args.target),
-        &mut |outcome| {
-            let (op, key) = (&outcome.key.op, &outcome.key.key);
-            if outcome.backends.is_empty() {
+        args.target.map(Target::new).as_ref(),
+        &single,
+        &mut |op, key, backends| {
+            if backends.is_empty() {
                 println!("FAILED\t{op}\t{key}");
+                unbuilt.push(format!("{op} {key}"));
             } else {
-                let named: Vec<String> = outcome
-                    .backends
+                let named: Vec<String> = backends
                     .iter()
                     .map(|(backend, files)| format!("{backend} ({files} files)"))
                     .collect();
@@ -413,27 +501,22 @@ fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
         },
     )?;
 
-    let unbuilt = report.unbuilt();
     println!(
-        "\n{} of {} descriptors built into the store at {}",
-        keys.len() - unbuilt.len(),
-        keys.len(),
+        "\n{} of {total} modules built into the store at {}",
+        total - unbuilt.len(),
         config.store_roots[0].path.display()
     );
-    if report.failures.is_empty() {
+    if failures.is_empty() {
         return Ok(());
     }
-    eprintln!("\n{} failure(s):", report.failures.len());
-    for failure in &report.failures {
+    eprintln!("\n{} failure(s):", failures.len());
+    for failure in &failures {
         eprintln!("  {failure}");
     }
     Err(Error::Unbuilt {
-        keys: unbuilt
-            .iter()
-            .map(|key| format!("{} {}", key.op, key.key))
-            .collect(),
-        total: keys.len(),
-        failures: report.failures.len(),
+        keys: unbuilt,
+        total,
+        failures: failures.len(),
     })
 }
 

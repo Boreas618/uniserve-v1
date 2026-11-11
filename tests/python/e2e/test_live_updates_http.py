@@ -51,10 +51,15 @@ from tests.python.e2e.http_helpers import (
     admin,
     admin_config,
     admin_status,
+    build_server_socket,
+    engine_executable,
     engine_processes,
+    engine_revision,
+    engine_selection,
     find_free_port,
     granted_devices,
     host_asset,
+    install_engine,
     log_tail,
     metric,
     qwen3_checkpoint,
@@ -66,7 +71,6 @@ from tests.python.e2e.http_helpers import (
     start_server,
     stop_server,
     wait_until,
-    worker_executable,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
@@ -441,7 +445,6 @@ def _deploy(base_url: str, name: str, *assignments: str) -> None:
             "set": [
                 f"model={qwen3_checkpoint()}",
                 f"served_model_name={name}",
-                f"worker_config.executable={worker_executable()}",
                 f"kv_cache_config.host_gib={HOST_GIB}",
                 *OPTIONS,
                 *assignments,
@@ -551,8 +554,7 @@ def _serving(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--set",
         f"kv_cache_config.host_gib={HOST_GIB}",
         *build_server_option(),
@@ -838,19 +840,12 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
     """  # noqa: E501
     name = "qwen3-live-restart-switch"
     log = tmp_path / "server.log"
-    executables = []
-    for ordinal in range(2):
-        directory = tmp_path / f"executable-{ordinal}"
-        directory.mkdir()
-        shutil.copy2(worker_executable(), directory / worker_executable().name)
-        executables.append(directory / worker_executable().name)
+    revisions = [engine_revision() for _ in range(2)]
     successors: list[int] = []
     try:
         with _serve(runtime, log, name, {"RUST_LOG": "info"}) as base_url:
             answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
-            _change_epoch(
-                base_url, f"worker_config.executable={executables[0]}"
-            )
+            _change_epoch(base_url, revisions[0])
             _purged(base_url)
             restarted = admin(base_url, "restart")
             assert restarted.status_code == 200, (
@@ -858,9 +853,7 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
             )
             successors.append(restarted.json()["result"]["pid"])
             _chat(base_url, name, RECOVERY_PROMPT, tokens=8)
-            _change_epoch(
-                base_url, f"worker_config.executable={executables[1]}"
-            )
+            _change_epoch(base_url, revisions[1])
             after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
             assert (
                 after["choices"][0]["message"]["content"]
@@ -1098,9 +1091,9 @@ def _restart_while_streaming(
     )
     reply = _chat(base_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
-    # A scheduling limit is a parameter of the policy package, so it reaches the
-    # serving epoch as a generation update; `max_running_requests` is build config
-    # and would switch the epoch.
+    # A scheduling limit is a parameter of the policy package, so it reaches
+    # the serving epoch as a generation update; `max_running_requests` is build
+    # config and would switch the epoch.
     update = _apply(base_url, "scheduler_config.max_batch=4")
     assert update["change"] == "generation", update
     committed = admin(base_url, "config/commit")
@@ -1724,9 +1717,7 @@ def test_a_standby_started_after_a_switch_maps_what_its_epoch_serves_from(
             "the first epoch's standby did not start",
         )
         first = _prepared_standby(base_url)
-        successor = tmp_path / worker_executable().name
-        shutil.copy2(worker_executable(), successor)
-        result = _apply(base_url, f"worker_config.executable={successor}")
+        result = _apply(base_url, engine_revision())
         assert result["change"] == "epoch", result
         _on_trial(base_url)
         committed = admin(base_url, "config/commit")
@@ -1755,15 +1746,10 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
     """
     name = "qwen3-live-relaunched-storage"
     log = tmp_path / "server.log"
-    executables = []
-    for ordinal in range(3):
-        directory = tmp_path / f"executable-{ordinal}"
-        directory.mkdir()
-        shutil.copy2(worker_executable(), directory / worker_executable().name)
-        executables.append(directory / worker_executable().name)
+    revisions = [engine_revision() for _ in range(3)]
     with _serve(runtime, log, name) as base_url:
         answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
-        result = _apply(base_url, f"worker_config.executable={executables[0]}")
+        result = _apply(base_url, revisions[0])
         assert result["change"] == "epoch", result
         _on_trial(base_url)
         committed = admin(base_url, "config/commit")
@@ -1774,7 +1760,7 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
         )
         result = _apply(
             base_url,
-            f"worker_config.executable={executables[1]}",
+            revisions[1],
             "update_config.previous_epoch=weights",
         )
         assert result["change"] == "epoch", result
@@ -1787,7 +1773,7 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
             "the revert did not end",
             context=lambda: _log_trouble(log),
         )
-        _apply_settled(base_url, f"worker_config.executable={executables[2]}")
+        _apply_settled(base_url, revisions[2])
         _on_trial(base_url)
         committed = admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
@@ -1817,8 +1803,6 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
             base_url, name, RECOVERY_PROMPT, tokens=RECOVERY_TOKENS
         )["choices"][0]["message"]["content"]
         baseline_numbers = _numbers([baseline])
-        successor = tmp_path / worker_executable().name
-        shutil.copy2(worker_executable(), successor)
 
         read: list[str] = []
         done = threading.Event()
@@ -1840,9 +1824,7 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
             "the count did not stream",
             STREAM_POLL_S,
         )
-        report = _change_epoch(
-            base_url, f"worker_config.executable={successor}"
-        )
+        report = _change_epoch(base_url, engine_revision())
         assert report, "the epoch switch reported no epoch"
         for pid in before:
             wait_until(
@@ -1890,20 +1872,36 @@ TRIAL_WINDOW_S = 5
 STATS_REPORT_S = 3
 
 
-def _slower_executable(directory: Path) -> Path:
-    """An executable whose main process steps slower under the same stream.
+def _slower_engine(directory: Path) -> str:
+    """Installs an engine whose main process steps slower under the same stream.
 
-    It walks each batch operator by operator (``UNISERVE_EAGER_REPLAY``) where
+    The package wraps the tree's own engine: its executable runs that engine
+    walking each batch operator by operator (``UNISERVE_EAGER_REPLAY``) where
     the deployment launches a captured graph: the same tokens, later, as a
     release that lost a fast path would serve them, with no fault to report.
+
+    Returns:
+        The assignment that selects the package (``worker_config.engine``).
     """
-    path = directory / "uniserve-slower"
-    path.write_text(
-        "#!/bin/sh\n"
-        f'UNISERVE_EAGER_REPLAY=1 exec "{worker_executable()}" "$@"\n'
+    socket = build_server_socket()
+    engine = engine_executable(socket, install_engine(socket))
+    package = directory / "slower-engine"
+    package.mkdir()
+    (package / "package.toml").write_text(
+        'op = "engine"\n'
+        'backend = "slower"\n'
+        "interface_version = 1\n\n"
+        '[toolchain]\nkind = "none"\nversion = ""\n\n'
+        '[module]\nform = "executable"\n\n'
+        '[source]\nkind = "executable"\nfiles = ["uniserve-slower"]\n'
     )
-    path.chmod(0o755)
-    return path
+    script = package / "uniserve-slower"
+    script.write_text(
+        f'#!/bin/sh\nUNISERVE_EAGER_REPLAY=1 exec "{engine}" "$@"\n'
+    )
+    script.chmod(0o755)
+    install_engine(socket, package)
+    return "worker_config.engine=slower"
 
 
 def _start_count(base_url: str, name: str) -> tuple[threading.Thread, dict]:
@@ -2022,12 +2020,10 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
         before = _engine_pids(base_url)
         previous = admin_config(base_url)["executing"]["epoch"]
         answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
-        successor = tmp_path / worker_executable().name
-        shutil.copy2(worker_executable(), successor)
         streaming, streamed = _start_count(base_url, name)
         result = _apply(
             base_url,
-            f"worker_config.executable={successor}",
+            engine_revision(),
             f"update_config.previous_epoch={previous_epoch}",
         )
         assert result["change"] == "epoch", result
@@ -2108,7 +2104,7 @@ def test_a_regression_of_the_epoch_on_trial_reverts_it(
     )
     with _serve(runtime, log, name) as base_url:
         answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
-        slower = f"worker_config.executable={_slower_executable(tmp_path)}"
+        slower = _slower_engine(tmp_path)
         streaming, streamed = _start_count(base_url, name)
         time.sleep(TRIAL_WINDOW_S + 2)
         result = _apply(base_url, slower, *thresholds)
@@ -2204,8 +2200,6 @@ def test_the_requests_in_flight_warm_the_target_through_the_host_cache(
     name = "qwen3-live-warming"
     log = tmp_path / "server.log"
     with _serve(runtime, log, name) as base_url:
-        successor = tmp_path / worker_executable().name
-        shutil.copy2(worker_executable(), successor)
         streaming, streamed = _start_count(base_url, name)
         wait_until(
             lambda: len(_numbers(streamed["read"])) >= 400,
@@ -2215,7 +2209,7 @@ def test_the_requests_in_flight_warm_the_target_through_the_host_cache(
         hits = metric(base_url, "uniserve:prefix_cache_host_hits")
         result = _apply(
             base_url,
-            f"worker_config.executable={successor}",
+            engine_revision(),
             "update_config.cache_tail_tokens=64",
             "update_config.cache_prefill_tokens=128",
         )
@@ -2250,12 +2244,8 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
     name = "qwen3-live-warming-options"
     log = tmp_path / "server.log"
     with _serve(runtime, log, name) as base_url:
-        first = tmp_path / "first"
-        first.mkdir()
-        later = [tmp_path / f"later-{attempt}" for attempt in range(4)]
-        for directory in (first, *later):
-            directory.mkdir(exist_ok=True)
-            shutil.copy2(worker_executable(), directory / "uniserve")
+        first = engine_revision()
+        later = [engine_revision() for _ in range(4)]
 
         streaming, streamed = _start_count(base_url, name)
         wait_until(
@@ -2265,7 +2255,7 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
         )
         _apply(
             base_url,
-            f"worker_config.executable={first / 'uniserve'}",
+            first,
             "update_config.cache_tail_tokens=2",
         )
         tight = _on_trial(base_url)["warming"]
@@ -2302,10 +2292,10 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
         for thread in running:
             thread.start()
         try:
-            for directory in later:
+            for revision in later:
                 _apply_settled(
                     base_url,
-                    f"worker_config.executable={directory / 'uniserve'}",
+                    revision,
                     "update_config.cache_tail_tokens=1",
                     "update_config.cache_prefill_tokens=128",
                 )

@@ -117,10 +117,6 @@ impl ServerArgs {
                 Value::Integer(i64::from(value)),
             )?;
         }
-        if let Some(value) = &self.worker_executable {
-            let value = Value::String(value.to_string_lossy().into_owned());
-            set(&mut tree, &path("worker_config", "executable"), value)?;
-        }
         for (path, value) in assignments(&self.set)? {
             set(&mut tree, &path, value)?;
         }
@@ -510,8 +506,6 @@ mod tests {
             "0",
             "--dist-init-addr",
             "rank-0:5000",
-            "--worker-executable",
-            "/opt/env/bin/uniserve",
         ])
         .unwrap();
         for path in [
@@ -530,14 +524,9 @@ mod tests {
             "nnodes",
             "node_rank",
             "dist_init_addr",
-            "worker_config.executable",
         ] {
             assert!(stated.contains(path), "{path} is set by its flag");
         }
-        assert_eq!(
-            config.worker_config.executable,
-            PathBuf::from("/opt/env/bin/uniserve")
-        );
 
         let text = printed(&config).unwrap();
         let reread: ServerArgs = toml::from_str(&text).unwrap();

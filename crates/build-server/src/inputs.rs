@@ -40,7 +40,8 @@ pub const BYTECODE_CACHE: &str = "__pycache__";
 /// The build inputs of one installed revision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inputs {
-    /// The SHA-256 of the package's files ([`tree_digest`]), in hex.
+    /// The SHA-256 of the package's files ([`crate::snapshot::files_digest`]),
+    /// in hex.
     pub package: String,
     /// The toolchain that builds the package, as [`crate::Toolchains::identity`]
     /// states it: its kind and version, and the compile driver's digest.
@@ -48,14 +49,17 @@ pub struct Inputs {
 }
 
 impl Inputs {
-    /// The inputs of the package in `directory`, built by `toolchain`.
+    /// The inputs of the package in `directory`, built by `toolchain`: the
+    /// digest of what an installation of it holds
+    /// ([`crate::snapshot::package_files`]).
     ///
     /// # Errors
     ///
-    /// Fails when the directory cannot be read.
+    /// Fails when the package's files cannot be read.
     pub fn of(directory: &Path, toolchain: String) -> Result<Inputs> {
+        let (files, generated) = crate::snapshot::package_files(directory)?;
         Ok(Inputs {
-            package: tree_digest(directory)?,
+            package: crate::snapshot::files_digest(&files, generated.as_deref())?,
             toolchain,
         })
     }
@@ -109,49 +113,6 @@ impl Inputs {
     }
 }
 
-/// The SHA-256 of a directory tree's files, in hex.
-///
-/// Every file is hashed with its path relative to `root`, in path order, so a
-/// renamed or moved file changes the digest as a changed byte does. A symbolic
-/// link counts as what it names, as an install copies it. Python bytecode
-/// ([`BYTECODE_CACHE`]) and a revision's own record ([`RECORD`]) are not
-/// inputs and are skipped.
-///
-/// # Errors
-///
-/// Fails when the tree cannot be read.
-pub fn tree_digest(root: &Path) -> Result<String> {
-    let mut hasher = Sha256::new();
-    hash_tree(root, Path::new(""), &mut hasher)?;
-    Ok(hex(&hasher.finalize()))
-}
-
-fn hash_tree(directory: &Path, prefix: &Path, hasher: &mut Sha256) -> Result<()> {
-    let mut entries: Vec<_> = fs::read_dir(directory)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<io::Result<_>>()?;
-    entries.sort();
-    for name in entries {
-        if name == BYTECODE_CACHE || (prefix.as_os_str().is_empty() && name == RECORD) {
-            continue;
-        }
-        let path = directory.join(&name);
-        let relative = prefix.join(&name);
-        if fs::metadata(&path)?.is_dir() {
-            hash_tree(&path, &relative, hasher)?;
-            continue;
-        }
-        let bytes = fs::read(&path)?;
-        // Each file is framed by its path and its length, so no two trees hash
-        // one byte stream.
-        hasher.update(relative.to_string_lossy().as_bytes());
-        hasher.update([0]);
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(&bytes);
-    }
-    Ok(())
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -159,46 +120,6 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tree(root: &Path, files: &[(&str, &str)]) {
-        for (name, text) in files {
-            let path = root.join(name);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, text).unwrap();
-        }
-    }
-
-    /// A changed byte, a renamed file and an added file each change a tree's digest; bytecode and
-    /// the revision's record do not.
-    #[test]
-    fn a_tree_digest_follows_the_files_a_build_reads() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        tree(
-            root,
-            &[("package.toml", "op = 1\n"), ("src/kernel.py", "x = 1\n")],
-        );
-        let base = tree_digest(root).unwrap();
-
-        tree(
-            root,
-            &[
-                ("src/__pycache__/kernel.pyc", "bytecode"),
-                (RECORD, "record"),
-            ],
-        );
-        assert_eq!(tree_digest(root).unwrap(), base);
-
-        tree(root, &[("src/kernel.py", "x = 2\n")]);
-        let edited = tree_digest(root).unwrap();
-        assert_ne!(edited, base);
-
-        fs::rename(root.join("src/kernel.py"), root.join("src/other.py")).unwrap();
-        assert_ne!(tree_digest(root).unwrap(), edited);
-
-        tree(root, &[("src/kernel.py", "x = 2\n")]);
-        assert_ne!(tree_digest(root).unwrap(), edited);
-    }
 
     /// A record reads back as written, and a module's digest changes with either input.
     #[test]

@@ -43,6 +43,15 @@ impl PartialEq for Family {
 
 impl Eq for Family {}
 
+/// The request-processing side of every model family this tree serves: what a daemon registers,
+/// without linking a model. The engine executable registers the numerical side of the same
+/// families, each of which holds its value of this list.
+pub const FAMILIES: [Family; 3] = [
+    crate::qwen3::MOE,
+    crate::qwen3::HYBRID,
+    crate::minimax_h3::FAMILY,
+];
+
 /// Two families claim one `model_type` or class: a checkpoint of it would resolve to either.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("two model families claim the class {0}")]

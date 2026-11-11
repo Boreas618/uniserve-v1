@@ -138,17 +138,92 @@ def require_uniserve_binary() -> Path:
     return path
 
 
-def worker_executable() -> Path:
-    """The `uniserve` executable a test server's workers run as.
+def engine_selection() -> list[str]:
+    """The `serve` arguments that select a test server's engine package.
 
-    `UNISERVE_WORKER_EXECUTABLE` names it, such as the sanitizer's wrapper;
-    otherwise the workers run the binary the daemon runs
-    (:func:`require_uniserve_binary`), so a server never mixes two builds.
+    The tree's own engine package (`uniserve`, `crates/engine`) is the
+    default and needs no argument: every test's Build Server holds it.
+    `UNISERVE_ENGINE` names another installed engine package, such as the
+    sanitizer's wrapper (`UNISERVE_ENGINE_PACKAGE` is its directory, which
+    the test's Build Server installs).
     """
-    configured = os.environ.get("UNISERVE_WORKER_EXECUTABLE")
+    configured = os.environ.get("UNISERVE_ENGINE")
     if configured:
-        return Path(configured)
-    return require_uniserve_binary()
+        return ["--set", f"worker_config.engine={configured}"]
+    return []
+
+
+def build_server_socket() -> Path:
+    """The socket of the Build Server the module's deployments use."""
+    assert _BUILD_SERVER is not None, "the module started no Build Server"
+    return _BUILD_SERVER
+
+
+def engine_revision() -> str:
+    """An assignment that selects a new revision of the tree's engine.
+
+    The revision is installed now at the module's Build Server. It runs the
+    same code as the serving one under another revision, which is a change
+    of the epoch's engine and of nothing else.
+    """
+    revision = install_engine(build_server_socket())
+    return f"worker_config.engine_revision={revision}"
+
+
+def engine_executable(socket: Path, revision: int) -> Path:
+    """The executable of the tree's engine package at `revision`.
+
+    The Build Server builds the module when its store misses it, and names
+    the file in its store.
+    """
+    resolved = subprocess.run(
+        [
+            str(require_uniserve_binary()),
+            "build-server",
+            "resolve",
+            "--socket",
+            str(socket),
+            "engine",
+            "uniserve",
+            str(revision),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return Path(resolved.stdout.splitlines()[0])
+
+
+def install_engine(socket: Path, package: Path | None = None) -> int:
+    """Installs an engine package at a Build Server and returns its revision.
+
+    Args:
+        socket: The Build Server's socket.
+        package: The package directory; the tree's own engine package when
+            omitted. A new revision of an unchanged package runs the same
+            code, which is what a test applies
+            (`worker_config.engine_revision`) to change the epoch's engine
+            and nothing else.
+
+    Returns:
+        The revision the Build Server numbered the installation.
+    """
+    directory = package or Path.cwd() / "crates/engine"
+    installed = subprocess.run(
+        [
+            str(require_uniserve_binary()),
+            "build-server",
+            "install",
+            "--socket",
+            str(socket),
+            str(directory),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # `engine <backend> revision <n>`.
+    return int(installed.stdout.split()[-1])
 
 
 def wait_until(
@@ -469,7 +544,7 @@ def second_host(
         f"{command_prefix}{shlex.quote(str(require_uniserve_binary()))} "
         "serve --nnodes 2 "
         f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1 "
-        f"--worker-executable {shlex.quote(str(worker_executable()))}"
+        f"{shlex.join(engine_selection())}"
     )
     if arguments:
         remote += " " + shlex.join(arguments)

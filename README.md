@@ -121,7 +121,6 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
 | `--host`, `--port` | The HTTP listener (`server_config`) |
 | `--worker-groups`, `--tensor-parallel-size`, `--data-parallel-size`, `--host-identity` | Parallel configuration: a deployment file, or the tensor- and data-parallel shorthand |
 | `--max-running-requests`, `--mem-fraction-static` | Resident requests and each GPU worker's device-storage share |
-| `--worker-executable` | The `uniserve` executable the workers run as (`worker_config.executable`) |
 | `--config`, `--set` | The configuration file and assignments by path |
 
 | Table | Options for |
@@ -189,7 +188,7 @@ For decision-session replay, give every row of a JSON Lines workload a non-empty
 The [architecture guide](docs/architecture.md) describes how the daemons, the engine process and the executors divide the work, how a main process's threads divide it, and how a request travels through them.
 
 ```text
-src/                    The root package, `uniserve`: the command line, logging, the `serve` and `keys` commands, and `main.rs`, which dispatches every command and registers the model families
+src/                    The root package, `uniserve`: the command line, logging, the `serve` and `keys` commands, and `main.rs`, which dispatches every command; the base executable holds the daemon, the Storage Server and the Build Server, and links no engine or model
 crates/engine/          The main process of a node and epoch: its control thread, schedulers, executors and blocking pool, and the catalogue that resolves a checkpoint to its model family
 crates/proto/           The interfaces across builds: the request interface and the process interface (Protobuf), and the video condition vocabulary
 crates/ipc/             The batch the scheduler submits and the worker serves, scheduler-to-main-process messages, rank channels and the launch descriptor

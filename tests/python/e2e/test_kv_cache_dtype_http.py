@@ -26,7 +26,7 @@ from tests.python.e2e.http_helpers import (
     host_asset,
     require_uniserve_binary,
     server_process,
-    worker_executable,
+    engine_selection,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
@@ -67,8 +67,7 @@ def _generate(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--set",
         "dtype=bfloat16",
         "--set",

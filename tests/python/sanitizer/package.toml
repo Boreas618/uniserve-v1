@@ -1,0 +1,20 @@
+# The `memcheck` engine package: an implementation of the engine interface
+# whose executable runs the tree's engine under compute-sanitizer's memcheck
+# (`memcheck-engine`). The sanitizer workflow installs it at each test module's
+# Build Server and selects it with `worker_config.engine=memcheck`.
+
+op = "engine"
+backend = "memcheck"
+interface_version = 1
+
+# The executable is stored as it is: nothing compiles it.
+[toolchain]
+kind = "none"
+version = ""
+
+[module]
+form = "executable"
+
+[source]
+kind = "executable"
+files = ["memcheck-engine"]

@@ -74,7 +74,7 @@ from tests.python.e2e.http_helpers import (
     scaled,
     server_process,
     wait_until,
-    worker_executable,
+    engine_selection,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
@@ -157,8 +157,7 @@ def _serve(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
     ]
     for option in OPTIONS:
         command += ["--set", option]

@@ -67,17 +67,16 @@ pub(crate) struct Node {
     pub(crate) rank: u32,
 }
 
-/// How the target epoch's main processes are started: the executable, the
-/// build identity it must report when the daemon knows it, and its arguments
-/// and environment.
+/// How the target epoch's main processes are started: the build identity
+/// they must report when the daemon knows it, and their launch and
+/// environment. The executable is the engine package the launch's module set
+/// names, which each node's daemon resolves at its own Build Server.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Start {
-    /// The target main process's executable.
-    pub(crate) executable: String,
-    /// The build identity the target must report in its `Hello`: `Some` when
-    /// the executable is the daemon's own (`proto::BUILD`), `None` for
-    /// another executable, whose first child's `Hello` fixes it and every
-    /// other child must then report the same.
+    /// The build identity the target must report in its `Hello`, when the
+    /// daemon knows it before the first child connects. `None` leaves it to
+    /// the first child's `Hello`, which fixes it: every other child must then
+    /// report the same.
     pub(crate) build: Option<String>,
     /// The launch a process of this epoch is started with: the contents of
     /// its launch file, which the adapter writes for the process it starts
@@ -569,9 +568,10 @@ impl Switch {
                 group: self.group.clone(),
                 rank: node.rank,
                 generation: self.spawn_generation,
-                executable: self.start.executable.clone(),
-                // The adapter states the launch file for this process and
-                // its arguments: they are its to state.
+                // The node's daemon resolves the engine package the launch
+                // names; the adapter states the launch file for this process
+                // and its arguments: they are its to state.
+                executable: String::new(),
                 arguments: Vec::new(),
                 environment: self.start.environment.clone(),
                 inherit: Vec::new(),

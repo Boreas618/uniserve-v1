@@ -48,7 +48,7 @@ from tests.python.e2e.http_helpers import (
     second_host,
     server_process,
     stop_storage_server,
-    worker_executable,
+    engine_selection,
     written_deployment,
 )
 from tests.python.e2e.build_server import remote_build_server
@@ -112,8 +112,7 @@ def _command(port: int, *options: str) -> list[str]:
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
     ]
     for option in OPTIONS:
         command += ["--set", option]

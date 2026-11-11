@@ -1,17 +1,24 @@
-//! `uniserve`: the one executable of every UniServe process.
+//! `uniserve`: the base executable of a deployment, which holds what an
+//! update of the deployment does not replace: the daemon, the Storage Server
+//! and the Build Server.
+//!
+//! The engine is not in it. A node's main process is the executable of the
+//! engine package (`uniserve-engine`, `crates/engine`), which the Build Server
+//! builds and the daemon starts, so this executable links neither the engine
+//! nor a model.
 //!
 //! `main` parses the command line and runs its command: `serve` (a node's
-//! daemon, and on the leader the application, [`serve`]), `engine` (a node's
-//! main process for one epoch), `keys` (a deployment's recorded key list,
-//! [`keys`]), and the host services `storage-server` and
-//! `build-server`, whose commands are their crates' own. `serve` installs
+//! daemon, and on the leader the application, [`serve`]), `keys` (a
+//! deployment's recorded key list, [`keys`]), and the host services
+//! `storage-server` and `build-server`, whose commands are their crates' own.
+//! `serve` installs
 //! tracing and builds the Tokio runtime; its module hands the resolved
 //! configuration to `daemon::serve` with a cancellation token that fires on
 //! Ctrl-C or SIGTERM. The host services run before any thread exists,
 //! because a service started with `--daemon` forks.
 //!
-//! The runtime, the cancellation token and the supervision lifeline are the
-//! executable's own: every command that starts threads takes them from here.
+//! The runtime and the cancellation token are the executable's own: every
+//! command that starts threads takes them from here.
 
 mod cli;
 mod keys;
@@ -20,7 +27,6 @@ mod serve;
 use std::env;
 
 use anyhow::{Context, Result};
-use service::logging;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -105,7 +111,7 @@ fn main() -> Result<std::process::ExitCode> {
         println!("a process panicked: {panic}");
         default(panic);
     }));
-    let lifeline = take_lifeline();
+    take_lifeline();
     // The serving commands read which flags their command line states, so they keep its matches.
     let matches = <Cli as clap::CommandFactory>::command().get_matches();
     let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
@@ -119,16 +125,6 @@ fn main() -> Result<std::process::ExitCode> {
     match cli.command {
         Command::Serve(args) => serve::run(*args, &command_matches(), &cli.log),
         Command::Keys(args) => keys::run(*args, &command_matches(), &cli.log),
-        Command::Engine { launch } => {
-            follow_lifeline(lifeline);
-            logging::init(
-                "Engine",
-                cli.log.log_level.as_deref(),
-                cli.log.log_level_http.as_deref(),
-                logging::Output::Stdout,
-            );
-            engine::run(&launch, &catalogue()?).map(|()| std::process::ExitCode::SUCCESS)
-        }
         Command::StorageServer(args) => {
             storage_server::command::run(*args).map(|()| std::process::ExitCode::SUCCESS)
         }
@@ -172,75 +168,30 @@ fn idle_devices() -> std::result::Result<Vec<u32>, String> {
     Ok(idle)
 }
 
-/// The model families this executable serves: the one place a concrete model is named. Its main
-/// processes load them and its daemon serves requests of them. A model is added with its crate and
-/// one entry here.
-const FAMILIES: [nn::family::Family; 3] = [
-    qwen3::family::FAMILY,
-    qwen3::family::HYBRID_FAMILY,
-    minimax_h3::family::FAMILY,
-];
-
-/// The families this executable's main processes load ([`FAMILIES`]).
-pub(crate) fn catalogue() -> Result<nn::family::Catalogue> {
-    Ok(nn::family::Catalogue::new(FAMILIES)?)
-}
-
-/// What the daemon serves of [`FAMILIES`]: each family's request-processing side, which is all the
-/// daemon reads of a model.
+/// What the daemon serves: the request-processing side of every model family
+/// (`processing::FAMILIES`), which is all the daemon reads of a model. The
+/// engine executable registers the numerical side of the same families.
 pub(crate) fn served() -> Result<processing::Catalogue> {
-    Ok(processing::Catalogue::new(
-        FAMILIES.map(|family| family.request),
-    )?)
+    Ok(processing::Catalogue::new(processing::FAMILIES)?)
 }
 
-/// The lifeline this process inherited from the daemon that supervises it
-/// (`daemon::supervision::LIFELINE_ENV`): the read end of a pipe whose write
-/// end the daemon holds. The variable leaves the environment and the
-/// descriptor turns close-on-exec, so no process this one starts takes
-/// either for its own. Runs before any thread starts.
-fn take_lifeline() -> Option<i32> {
-    let descriptor = std::env::var(daemon::supervision::LIFELINE_ENV)
-        .ok()?
-        .parse::<i32>()
-        .ok()?;
+/// Drops a lifeline this process inherited from a daemon that started it
+/// (`proto::LIFELINE_ENV`): the read end of a pipe whose write end that daemon
+/// holds. A host service outlives the daemon that started it, so it does not
+/// follow the lifeline; the variable leaves the environment and the descriptor
+/// turns close-on-exec, so no process this one starts takes either for its
+/// own. Runs before any thread starts.
+fn take_lifeline() {
+    let Some(descriptor) = std::env::var(daemon::supervision::LIFELINE_ENV)
+        .ok()
+        .and_then(|descriptor| descriptor.parse::<i32>().ok())
+    else {
+        return;
+    };
     // SAFETY: no other thread exists yet to read the environment.
     unsafe { std::env::remove_var(daemon::supervision::LIFELINE_ENV) };
     // SAFETY: fcntl takes integers only; the descriptor is this process's.
     unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
-    Some(descriptor)
-}
-
-/// Ends this process once its daemon is gone: the end of the lifeline's
-/// pipe arrives once the daemon, and every successor a hot restart handed
-/// its processes to, ended, however they ended.
-fn follow_lifeline(lifeline: Option<i32>) {
-    let Some(descriptor) = lifeline else {
-        return;
-    };
-    let watching = std::thread::Builder::new()
-        .name("lifeline".to_owned())
-        .spawn(move || {
-            let mut byte = [0_u8; 1];
-            loop {
-                // SAFETY: reads into a local byte from this process's
-                // descriptor.
-                let read = unsafe { libc::read(descriptor, byte.as_mut_ptr().cast(), 1) };
-                if read == 0 {
-                    eprintln!("the daemon that supervised this process is gone; exiting");
-                    // SAFETY: ends the process at once, as a signal would.
-                    unsafe { libc::_exit(1) };
-                }
-                if read < 0
-                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-                {
-                    return;
-                }
-            }
-        });
-    if let Err(error) = watching {
-        eprintln!("the lifeline's watch did not start: {error}");
-    }
 }
 
 /// The daemon's Tokio runtime.

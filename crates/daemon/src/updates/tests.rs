@@ -21,7 +21,7 @@ use proto::process::{self, command, report};
 use serde_json::Value;
 
 use super::in_flight;
-use crate::epoch::{Epoch, EpochRecord, Epochs, Failure, ModuleSet, Status, Update, UpdateState};
+use crate::epoch::{Epoch, EpochRecord, Epochs, Failure, Status, Update, UpdateState};
 use crate::leader::UpdateError;
 use crate::options::{PreviousEpoch, ServerArgs};
 use crate::supervision::stand_in::{self, Nodes, Refusals};
@@ -76,10 +76,10 @@ impl Deployment {
         let (nodes, roster) = stand_in::roster(&epochs, refusals);
         nodes.greet_frontend(FRONTEND);
         let previous = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
-        // Another executable is a change of what builds the main process:
-        // the epoch layer's.
+        // Another engine package is a change of what the main process is
+        // built from: the epoch layer's.
         let mut config = previous.config.clone();
-        config.worker_config.executable = "/opt/other-uniserve".into();
+        config.worker_config.engine = "other-engine".to_owned();
         let target = Epoch::with_modules(config, previous.modules.clone())
             .expect("the configuration resolves");
         Self {
@@ -268,6 +268,7 @@ impl Deployment {
 fn serving_record(deployment: &Epoch) -> EpochRecord {
     EpochRecord {
         config: deployment.engine.clone(),
+        engine: deployment.modules.engine.clone(),
         kernels: deployment.modules.kernels.clone(),
         policy: deployment.modules.policy.clone(),
         previous_kernels: Default::default(),
@@ -280,7 +281,6 @@ fn serving_record(deployment: &Epoch) -> EpochRecord {
 /// How the target's main process is started.
 fn start() -> Start {
     Start {
-        executable: "/opt/other-uniserve".to_owned(),
         build: Some(BUILD.to_owned()),
         launch: proto::config::EngineArgs {
             engine_config: ServerArgs::default()
@@ -293,6 +293,7 @@ fn start() -> Start {
             processes: "unix:/run/processes.sock".to_owned(),
             engine: 0,
             build_server: "/run/modules.sock".to_owned(),
+            modules: None,
             devices: vec![0],
             group: "engine".to_owned(),
             rank: 0,
@@ -342,7 +343,10 @@ fn an_epoch_switch_serves_the_target_and_a_commit_retires_the_previous_epoch() {
     assert_eq!(spawns.len(), 1);
     assert_eq!(spawns[0].host, deployment.host);
     assert_eq!(spawns[0].generation, SPAWNED);
-    assert_eq!(spawns[0].executable, "/opt/other-uniserve");
+    assert_eq!(
+        spawns[0].executable, "",
+        "the node resolves the engine package the launch names; the leader states no executable"
+    );
     let launch: proto::config::EngineArgs =
         serde_json::from_slice(&spawns[0].launch).expect("the launch file the node writes");
     assert_eq!(
@@ -356,10 +360,7 @@ fn an_epoch_switch_serves_the_target_and_a_commit_retires_the_previous_epoch() {
     assert_eq!(deployment.epoch(TARGET)["status"], "precopy");
     assert_eq!(deployment.process(SPAWNED), "starting");
 
-    let mut modules = ModuleSet {
-        kernels: deployment.target.modules.kernels.clone(),
-        policy: deployment.target.modules.policy.clone(),
-    };
+    let mut modules = deployment.target.modules.clone();
     modules.policy.revision = 3;
     deployment.driver.pin(&modules);
 

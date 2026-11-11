@@ -68,7 +68,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
     stop_storage_server,
-    worker_executable,
+    engine_selection,
 )
 from tests.python.e2e.build_server import remote_build_server
 
@@ -185,8 +185,7 @@ def _serve_command(
         host,
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--set",
         "dtype=bfloat16",
         "--set",

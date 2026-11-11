@@ -126,6 +126,42 @@ impl ModuleSlot {
 /// The packages an epoch fills its operators with, by slot.
 pub type Packages = BTreeMap<ModuleSlot, PackageRevision>;
 
+/// The interface the engine package implements, as its packages are filed: the main process of an
+/// epoch, an executable the daemon starts.
+pub const ENGINE: &str = "engine";
+
+/// The interface a scheduling policy package implements, as its packages are filed.
+pub const POLICY: &str = "scheduling";
+
+/// The key of the one module a package of the engine or the policy interface builds: each fills a
+/// whole interface, not a set of kernel shapes.
+pub const SINGLE_KEY: &str = "default";
+
+/// A module set: for every interface a deployment uses, the package revision selected for it and
+/// its arguments.
+///
+/// The daemon fixes a module set once, when a configuration is applied: it asks the Build Server
+/// which installed revision each named implementation and each installed kernel package is at, and
+/// records the answer. The set is part of the epoch's record and of every launch file made from it,
+/// so a relaunch and a standby run exactly what their epoch runs, and a revision installed later is
+/// run by nobody until a configuration is applied again.
+#[serde_with::serde_as]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModuleSet {
+    /// The engine package: the executable the epoch's main processes run as.
+    pub engine: PackageRevision,
+    /// The scheduling policy's package.
+    pub policy: PackageRevision,
+    /// The kernel packages. A slot of an operator, or of one phase of it, holds the implementation
+    /// the deployment names for it, which is preferred for every key it covers. A slot whose part
+    /// names an implementation holds an installed package the deployment names nothing for: the
+    /// Build Server selects among those for each key by their manifests' priorities.
+    ///
+    /// Written as a list of pairs, because a launch file is JSON and a slot is no JSON key.
+    #[serde_as(as = "Vec<(_, _)>")]
+    pub kernels: BTreeMap<ModuleSlot, PackageRevision>,
+}
+
 /// The operators of this build, by the name their packages are filed under.
 ///
 /// Each constant is the `NAME` of one operator of the kernel library (`ops::Op::NAME`), which takes

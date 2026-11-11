@@ -67,7 +67,7 @@ from tests.python.e2e.http_helpers import (
     host_asset,
     require_uniserve_binary,
     server_process,
-    worker_executable,
+    engine_selection,
 )
 
 #: Options every deployment this file serves with. They are the live-update
@@ -193,8 +193,7 @@ def server(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--set",
         f"build_config.socket={build_server['socket']}",
         "--set",

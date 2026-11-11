@@ -53,6 +53,12 @@ from tests.python.e2e.http_helpers import (
 KERNEL_PACKAGES = "crates/ops/kernels"
 POLICY_PACKAGE = "crates/ops/package-fixtures/policy"
 
+# The engine package: the executable every deployment's main processes run
+# as. The daemon fixes its revision when a deployment starts, and the server
+# builds it with cargo from the installed snapshot the first time it is asked
+# for; cargo's own target directory keeps what it compiled between servers.
+ENGINE_PACKAGE = "crates/engine"
+
 
 def repository() -> Path:
     """The repository root: the workspace the policy package is built in."""
@@ -234,7 +240,13 @@ def packages_in_order() -> list[str]:
     kernels = sorted(
         str(manifest.parent.relative_to(repository())) for manifest in manifests
     )
-    return [*kernels, POLICY_PACKAGE]
+    packages = [*kernels, POLICY_PACKAGE, ENGINE_PACKAGE]
+    # An engine package a run selects with `UNISERVE_ENGINE`, such as the
+    # sanitizer's wrapper, is installed from the directory this names.
+    selected = os.environ.get("UNISERVE_ENGINE_PACKAGE")
+    if selected:
+        packages.append(selected)
+    return packages
 
 
 @contextmanager

@@ -1,14 +1,17 @@
-//! Building a module store from descriptor key lists: what
-//! `uniserve build-server build` does.
+//! Building a module store ahead of serving: what `uniserve build-server
+//! build` does.
 //!
-//! A key list names one `operator<TAB>descriptor key` per line, the
-//! descriptors a deployment launches; `uniserve keys` writes a
-//! deployment's ([`key_list`]). For every operator the lists name, each
-//! package under `<packages>/<operator>/` is installed into the store's
-//! package root, every key a package's manifest covers is prepared for one
-//! target, and each key is resolved to the module it names. A key is built
-//! when one installed backend resolves it; a second backend that cannot is
-//! not a failure, because the operator is served.
+//! A store is built from two kinds of input. A key list names one
+//! `operator<TAB>descriptor key` per line, the kernel keys a deployment
+//! launches; `uniserve keys` writes a deployment's ([`key_list`]). For every
+//! operator the lists name, each package under `<packages>/<operator>/` is
+//! installed into the store's package root, every key a package's manifest
+//! covers is prepared for one target, and each key is resolved to the module
+//! it names. A key is built when one installed backend resolves it; a second
+//! backend that cannot is not a failure, because the operator is served. A
+//! package that fills a whole interface with one module, a scheduling policy
+//! or the engine, is named by its directory: it is installed and its one
+//! module is built for its own target.
 //!
 //! The store is a directory with the two roots a Build Server serves:
 //!
@@ -17,6 +20,10 @@
 //! <store>/modules    the committed modules (`--store-root`)
 //! ```
 //!
+//! Such a directory is what a release ships: a Build Server given it as a
+//! read-only root serves its packages and their modules with no toolchain, so
+//! a first start builds nothing.
+//!
 //! Building into an existing store extends it. A package whose build inputs
 //! (its files, and the toolchain with its compile driver and pins) are
 //! unchanged since its latest installed revision keeps that revision
@@ -24,9 +31,9 @@
 //! store serves, and only a package of changed inputs is installed as a new
 //! revision, whose modules are built again.
 //!
-//! The builds are real: nvcc, Triton, CuTe DSL and wasm run with the host's
-//! toolchains, so a build of a deployment takes minutes. The server is driven
-//! as its own process would be, by a serving thread on the socket its
+//! The builds are real: nvcc, Triton, CuTe DSL, wasm and cargo run with the
+//! host's toolchains, so a build of a deployment takes minutes. The server is
+//! driven as its own process would be, by a serving thread on the socket its
 //! configuration names, and a build whose socket another server owns is
 //! refused before it installs anything.
 
@@ -36,57 +43,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::manifest::SINGLE_KEY;
 use crate::protocol::{Descriptors, PackageRequest, PrepareRequest, Selector};
 use crate::server::{BuildServer, ServerConfig};
 use crate::target::Target;
 use crate::{Error, Manifest, Result};
 use proto::module::ModuleSlot;
 
-/// One line of a key list: an operator and one of its descriptor keys.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Key {
-    pub op: String,
-    pub key: String,
-}
-
-/// What became of one key: the backends that built it, with the number of
-/// files each module holds. No backend means the key did not build.
-#[derive(Clone, Debug)]
-pub struct Outcome {
-    pub key: Key,
-    pub backends: Vec<(String, usize)>,
-}
-
-/// What a build did: every key's outcome, and every failure behind the keys
-/// that did not build, in the order they happened.
-#[derive(Debug, Default)]
-pub struct Report {
-    pub outcomes: Vec<Outcome>,
-    /// One line per failed install, prepare or resolve, and per key no
-    /// backend built. A key can fail in more than one backend.
-    pub failures: Vec<String>,
-}
-
-impl Report {
-    /// The keys no backend built.
-    pub fn unbuilt(&self) -> Vec<&Key> {
-        self.outcomes
-            .iter()
-            .filter(|outcome| outcome.backends.is_empty())
-            .map(|outcome| &outcome.key)
-            .collect()
-    }
-}
+/// What a build is told of each key once its package is done: the operator,
+/// the key, and the backends that built it with the number of files each
+/// module holds. No backend means the key did not build.
+pub type Report<'a> = dyn FnMut(&str, &str, &[(String, usize)]) + 'a;
 
 /// Reads key lists: `operator<TAB>key` per line, blank lines and `#` comments
-/// skipped.
+/// skipped. Answers each line's operator and key.
 ///
 /// # Errors
 ///
 /// Fails when a file cannot be read or a line is not `operator<TAB>key`. A
 /// third field is refused rather than read as part of the key, which would key
 /// a module by a name no launch asks for.
-pub fn read_keys(paths: &[PathBuf]) -> Result<Vec<Key>> {
+pub fn read_keys(paths: &[PathBuf]) -> Result<Vec<(String, String)>> {
     let invalid = |path: &Path, message: String| {
         Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -119,10 +96,7 @@ pub fn read_keys(paths: &[PathBuf]) -> Result<Vec<Key>> {
                     format!("{op:?} states a third field; a key line is `operator<TAB>key`"),
                 ));
             }
-            keys.push(Key {
-                op: op.trim().to_owned(),
-                key: key.trim().to_owned(),
-            });
+            keys.push((op.trim().to_owned(), key.trim().to_owned()));
         }
     }
     Ok(keys)
@@ -155,9 +129,13 @@ pub fn key_list(keys: &BTreeMap<String, BTreeSet<String>>) -> Result<String> {
     Ok(list)
 }
 
-/// Builds `keys` for `target` from the packages under `packages` into the
-/// roots `config` names, reporting each key's outcome to `report` once its
-/// operator is done.
+/// Builds a store in the roots `config` names: `keys`, each an operator and
+/// one of its kernel keys, for `target` from the packages under `packages`,
+/// and the one module of each package directory in `single`. Each key is
+/// reported to `built` once its package is done, as the operator, the key and
+/// the backends that built it with the number of files each module holds; no
+/// backend means the key did not build. Answers one line per failure: a
+/// failed prepare or resolve, and each key no backend built.
 ///
 /// `config` is a Build Server's configuration whose package root and first
 /// store root are the store's, and whose devices include `target`; its socket
@@ -167,16 +145,17 @@ pub fn key_list(keys: &BTreeMap<String, BTreeSet<String>>) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Fails when the server cannot open or serve, or the package tree cannot be
-/// read. A key that does not build is not an error here: it is an outcome with
-/// no backend, and [`Report::unbuilt`] lists it.
+/// Fails when the server cannot open or serve, or a package tree cannot be
+/// read or installed. A key that does not build is not an error here: it is
+/// reported with no backend and among the failures.
 pub fn build(
     config: &ServerConfig,
     packages: &Path,
-    keys: &[Key],
-    target: &Target,
-    report: &mut dyn FnMut(&Outcome),
-) -> Result<Report> {
+    keys: &[(String, String)],
+    target: Option<&Target>,
+    single: &[PathBuf],
+    built: &mut Report<'_>,
+) -> Result<Vec<String>> {
     // The socket is bound before anything is installed, so a second build or
     // a server already answering for this store stops this one before it
     // writes a revision.
@@ -201,33 +180,51 @@ pub fn build(
         move || server.serve_on(listener, lock, stop)
     });
 
-    let built = build_keys(&server, packages, keys, target, report);
+    let failures =
+        build_kernels(&server, packages, keys, target, built).and_then(|mut failures| {
+            failures.extend(build_single(&server, single, built)?);
+            Ok(failures)
+        });
 
     stop.store(true, Ordering::SeqCst);
     let served = serving
         .join()
         .unwrap_or_else(|_| Err(Error::Protocol("the build's server panicked".into())));
-    let built = built?;
+    let failures = failures?;
     served?;
-    Ok(built)
+    Ok(failures)
 }
 
-/// Installs, prepares and resolves every key on a running server.
-fn build_keys(
+/// Installs, prepares and resolves every kernel key on a running server.
+fn build_kernels(
     server: &BuildServer,
     packages: &Path,
-    keys: &[Key],
-    target: &Target,
-    report: &mut dyn FnMut(&Outcome),
-) -> Result<Report> {
-    let mut built = Report::default();
-    let mut ops: Vec<&str> = keys.iter().map(|key| key.op.as_str()).collect();
+    keys: &[(String, String)],
+    target: Option<&Target>,
+    built: &mut Report<'_>,
+) -> Result<Vec<String>> {
+    let mut failures = Vec::new();
+    let Some(target) = target else {
+        // Kernel modules are built for a device's architecture, which a build
+        // of single-module packages alone does not name.
+        failures.extend(
+            keys.iter()
+                .map(|(op, key)| format!("{op} {key}: the build names no target for kernel keys")),
+        );
+        return Ok(failures);
+    };
+
+    let mut ops: Vec<&str> = keys.iter().map(|(op, _)| op.as_str()).collect();
     ops.sort_unstable();
     ops.dedup();
 
     for op in ops {
         let backends = install(server, &packages.join(op))?;
-        let op_keys: Vec<&Key> = keys.iter().filter(|key| key.op == op).collect();
+        let op_keys: Vec<&str> = keys
+            .iter()
+            .filter(|(key_op, _)| key_op == op)
+            .map(|(_, key)| key.as_str())
+            .collect();
 
         // Each key's backends, with the number of files each one's module
         // holds.
@@ -239,72 +236,113 @@ fn build_keys(
             // failure when it cannot build it.
             let covered: Vec<String> = op_keys
                 .iter()
-                .filter(|key| manifest.covers(&key.key))
-                .map(|key| key.key.clone())
+                .filter(|key| manifest.covers(key))
+                .map(|key| (*key).to_owned())
                 .collect();
             if covered.is_empty() {
                 continue;
             }
-
-            let request = PrepareRequest {
-                targets: vec![target.clone()],
-                packages: vec![PackageRequest {
-                    slot: ModuleSlot::all(op),
-                    selector: Selector::Latest {
-                        backend: backend.clone(),
-                        arguments: toml::Table::new(),
-                    },
-                }],
-                descriptors: vec![Descriptors {
-                    slot: ModuleSlot::all(op),
-                    keys: covered.clone(),
-                }],
-            };
-            // A prepare that fails names its first failed build; the backend's
-            // keys are then reported unbuilt rather than built again one by
-            // one by `resolve`.
-            let revision = match server.prepare(&request, &mut |_| {}) {
-                Ok(prepared) => prepared.packages[0].package.clone(),
-                Err(error) => {
-                    built
-                        .failures
-                        .push(format!("{op} {backend}: prepare: {error}"));
-                    continue;
-                }
-            };
-
-            for key in &covered {
-                match server.resolve(op, &revision, target, key, &mut |_| {}) {
-                    Ok(module) => resolved
-                        .entry(key.clone())
-                        .or_default()
-                        .push((backend.clone(), module.files.len())),
-                    Err(error) => built
-                        .failures
-                        .push(format!("{op} {backend} {key}: resolve: {error}")),
-                }
+            for (key, files) in build_package(server, op, backend, &covered, target, &mut failures)
+            {
+                resolved
+                    .entry(key)
+                    .or_default()
+                    .push((backend.clone(), files));
             }
         }
 
         for key in op_keys {
-            let backends_built = resolved.remove(key.key.as_str()).unwrap_or_default();
+            let backends_built = resolved.remove(key).unwrap_or_default();
             if backends_built.is_empty() {
                 let why = if backends.is_empty() {
                     "no package fills the operator"
                 } else {
                     "no backend built it"
                 };
-                built.failures.push(format!("{op} {}: {why}", key.key));
+                failures.push(format!("{op} {key}: {why}"));
             }
-            let outcome = Outcome {
-                key: key.clone(),
-                backends: backends_built,
-            };
-            report(&outcome);
-            built.outcomes.push(outcome);
+            built(op, key, &backends_built);
         }
     }
-    Ok(built)
+    Ok(failures)
+}
+
+/// Installs each package directory of `single` and builds its one module.
+fn build_single(
+    server: &BuildServer,
+    single: &[PathBuf],
+    built: &mut Report<'_>,
+) -> Result<Vec<String>> {
+    let mut failures = Vec::new();
+    for directory in single {
+        let (backend, manifest) = install_package(server, directory)?;
+        let modules = build_package(
+            server,
+            &manifest.op,
+            &backend,
+            &[SINGLE_KEY.to_owned()],
+            &manifest.single_target(),
+            &mut failures,
+        );
+        let backends_built: Vec<(String, usize)> = modules
+            .into_iter()
+            .map(|(_, files)| (backend.clone(), files))
+            .collect();
+        if backends_built.is_empty() {
+            failures.push(format!(
+                "{} {SINGLE_KEY}: its package did not build",
+                manifest.op
+            ));
+        }
+        built(&manifest.op, SINGLE_KEY, &backends_built);
+    }
+    Ok(failures)
+}
+
+/// Prepares `keys` of the latest revision of `op`'s `backend` for `target` and
+/// resolves each one: answers the keys that resolved, each with the number of
+/// files its module holds, and adds a line to `failures` for what did not.
+fn build_package(
+    server: &BuildServer,
+    op: &str,
+    backend: &str,
+    keys: &[String],
+    target: &Target,
+    failures: &mut Vec<String>,
+) -> Vec<(String, usize)> {
+    let request = PrepareRequest {
+        targets: vec![target.clone()],
+        packages: vec![PackageRequest {
+            slot: ModuleSlot::all(op),
+            selector: Selector::Latest {
+                backend: backend.to_owned(),
+                arguments: toml::Table::new(),
+            },
+        }],
+        descriptors: vec![Descriptors {
+            slot: ModuleSlot::all(op),
+            keys: keys.to_vec(),
+        }],
+    };
+    // A prepare that fails names its first failed build; the backend's keys
+    // are then reported unbuilt rather than built again one by one by
+    // `resolve`.
+    let revision = match server.prepare(&request, &mut |_| {}) {
+        Ok(prepared) => prepared.packages[0].package.clone(),
+        Err(error) => {
+            failures.push(format!("{op} {backend}: prepare: {error}"));
+            return Vec::new();
+        }
+    };
+
+    let mut resolved = Vec::new();
+    for key in keys {
+        match server.resolve(op, &revision, target, key, &mut |_| {}) {
+            Ok(module) => resolved.push((key.clone(), module.files.len())),
+            Err(error) => failures.push(format!("{op} {backend} {key}: resolve: {error}")),
+        }
+    }
+    resolved
 }
 
 /// Makes every package of one operator installed, and answers each one's
@@ -339,19 +377,25 @@ fn install(server: &BuildServer, directory: &Path) -> Result<Vec<(String, Manife
     // Backends in name order, so the report reads the same on every host.
     packages.sort();
 
-    let mut backends = Vec::with_capacity(packages.len());
-    for package in packages {
-        let installed = match server.installed(&package)? {
-            Some(installed) => installed,
-            None => server.install(&package)?,
-        };
-        let manifest = Manifest::load(&package).map_err(|source| Error::Manifest {
-            package: package.clone(),
-            source: Box::new(source),
-        })?;
-        backends.push((installed.package.backend, manifest));
-    }
-    Ok(backends)
+    packages
+        .iter()
+        .map(|package| install_package(server, package))
+        .collect()
+}
+
+/// Makes the package in `directory` installed, at its latest revision when
+/// that one was installed from the same build inputs, and answers its backend
+/// and manifest.
+fn install_package(server: &BuildServer, directory: &Path) -> Result<(String, Manifest)> {
+    let installed = match server.installed(directory)? {
+        Some(installed) => installed,
+        None => server.install(directory)?,
+    };
+    let manifest = Manifest::load(directory).map_err(|source| Error::Manifest {
+        package: directory.to_path_buf(),
+        source: Box::new(source),
+    })?;
+    Ok((installed.package.backend, manifest))
 }
 
 #[cfg(test)]
@@ -395,7 +439,6 @@ mod tests {
         let read: Vec<(String, String)> = read_keys(&[path])
             .expect("the key list reads")
             .into_iter()
-            .map(|key| (key.op, key.key))
             .collect();
         assert_eq!(
             read,

@@ -13,10 +13,10 @@
 # the two runs then differ by whatever else changed between the commits and
 # the interval would answer a question nobody asked.
 #
-# A server command names no `--worker-executable`: today's default worker
-# binary is the daemon's own executable, so `run --executable <new binary>`
-# replaces the whole deployment on both implementations instead of pinning
-# one side's worker process. Results land under
+# A server command selects no engine package: `run --executable <new binary>`
+# replaces the daemon and its host services, and the deployment's main
+# processes run the engine package (`worker_config.engine`) the Build Server it
+# serves from holds, on both implementations alike. Results land under
 # artifacts/qwen3_moe/gsm8k/<point>/.
 #
 # The server command states only what can change the scored text or what

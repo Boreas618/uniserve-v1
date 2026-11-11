@@ -55,6 +55,16 @@ const NVCC_PEAK_HOST_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// covers both.
 const WASM_PEAK_HOST_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The peak host memory of one compiler process of a cargo build, in bytes:
+/// one rustc over a crate of the engine's workspace in release. A cargo build
+/// runs as many of them at once as its job count.
+const CARGO_JOB_PEAK_HOST_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The peak host memory of a cargo build's last step, in bytes: the link of
+/// the executable under thin LTO, which holds the code of every crate it
+/// links while the compiler processes before it have ended.
+const CARGO_LINK_PEAK_HOST_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// One compiler process a source runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolJob {
@@ -143,6 +153,13 @@ pub trait Toolchain: Send + Sync {
     fn cargo(&self) -> Option<&Path> {
         None
     }
+
+    /// The directory this toolchain keeps what it compiled between builds:
+    /// cargo's target directory, where the dependencies one revision compiled
+    /// are found by the next. `None` for a toolchain that keeps nothing.
+    fn build_directory(&self) -> Option<&Path> {
+        None
+    }
 }
 
 /// Where each toolchain is on this host.
@@ -159,8 +176,9 @@ pub struct ToolchainConfig {
     /// The wasm precompiler, `scheduling-precompile`, which builds a policy module with
     /// the schedule crate's own engine. `None` refuses a policy package.
     pub wasm: Option<PathBuf>,
-    /// cargo, which builds a policy crate for wasm32 when its package carries no compile
-    /// script. `None` refuses such a package.
+    /// cargo, which builds a cargo package (the engine) from its snapshot, and a policy crate
+    /// for wasm32 when its package carries no compile script. `None` takes the `cargo` on this
+    /// process's `PATH`, and refuses such a package when there is none.
     pub cargo: Option<PathBuf>,
     /// The number of compilers that may run at once (`limits.max_jobs`).
     pub max_jobs: usize,
@@ -174,6 +192,7 @@ pub struct Toolchains {
     triton: Discovered<Triton>,
     cute_dsl: Discovered<CuteDsl>,
     wasm: Discovered<Wasm>,
+    cargo: Discovered<Cargo>,
     /// The distributions the Build Server's Python environment has installed, by normalized
     /// name (PEP 503), with their versions: what a package's `[toolchain] packages` is compared
     /// with before it is built.
@@ -201,6 +220,7 @@ impl Toolchains {
             triton: Triton::discover(config, interpreter),
             cute_dsl: CuteDsl::discover(config, interpreter),
             wasm: Wasm::discover(config, interpreter),
+            cargo: Cargo::discover(config),
             distributions: named_interpreter(interpreter).and_then(python_distributions),
             driver: named_interpreter(interpreter).and_then(driver_directory),
         })
@@ -228,7 +248,7 @@ impl Toolchains {
                 message: reason.clone(),
             })?;
             identity.push_str("; driver ");
-            identity.push_str(&crate::inputs::tree_digest(driver)?);
+            identity.push_str(&crate::snapshot::tree_digest(driver)?);
         }
         Ok(identity)
     }
@@ -291,6 +311,10 @@ impl Toolchains {
                 .wasm
                 .as_ref()
                 .map(|toolchain| toolchain as &dyn Toolchain),
+            ToolchainKind::Cargo => self
+                .cargo
+                .as_ref()
+                .map(|toolchain| toolchain as &dyn Toolchain),
             ToolchainKind::None => Ok(&NOTHING as &dyn Toolchain),
         }
         .map_err(|reason| Error::Toolchain {
@@ -320,6 +344,11 @@ impl Toolchains {
                 .map_err(String::as_str),
             ToolchainKind::Wasm => self
                 .wasm
+                .as_ref()
+                .map(|toolchain| toolchain.version())
+                .map_err(String::as_str),
+            ToolchainKind::Cargo => self
+                .cargo
                 .as_ref()
                 .map(|toolchain| toolchain.version())
                 .map_err(String::as_str),
@@ -549,6 +578,104 @@ impl Toolchain for Wasm {
     fn cargo(&self) -> Option<&Path> {
         self.cargo.as_deref()
     }
+}
+
+/// cargo and the compiler it drives: what builds a cargo package, the engine,
+/// from its snapshot.
+#[derive(Debug)]
+struct Cargo {
+    path: PathBuf,
+    version: String,
+    /// The compiler processes one build runs at once: `CARGO_BUILD_JOBS` of
+    /// the server's environment, else the queue's `limits.max_jobs`.
+    jobs: usize,
+    /// cargo's target directory: `CARGO_TARGET_DIR` of the server's
+    /// environment, else `build-server/cargo` in this user's cache directory.
+    target_directory: PathBuf,
+}
+
+impl Cargo {
+    fn discover(config: &ToolchainConfig) -> Discovered<Cargo> {
+        let path = match &config.cargo {
+            Some(path) => resolve(path),
+            None => std::env::var_os("PATH")
+                .and_then(|paths| {
+                    std::env::split_paths(&paths)
+                        .map(|directory| directory.join("cargo"))
+                        .find(|candidate| candidate.is_file())
+                })
+                .ok_or_else(|| "no cargo named: pass --cargo <path>".to_owned())?,
+        };
+        let reported = Command::new(&path)
+            .arg("--version")
+            .output()
+            .map_err(|error| format!("running {}: {error}", path.display()))?;
+        let text = String::from_utf8_lossy(&reported.stdout);
+        // `cargo 1.99.1 (5f94df478 2026-08-27)`: the release is the second word.
+        let version = text
+            .split_whitespace()
+            .nth(1)
+            .filter(|_| reported.status.success())
+            .ok_or_else(|| format!("{} --version names no release: {text}", path.display()))?
+            .to_owned();
+
+        let jobs = std::env::var("CARGO_BUILD_JOBS")
+            .ok()
+            .and_then(|jobs| jobs.parse::<usize>().ok())
+            .filter(|jobs| *jobs > 0)
+            .unwrap_or(config.max_jobs);
+        let target_directory = match std::env::var_os("CARGO_TARGET_DIR") {
+            Some(directory) if !directory.is_empty() => resolve(Path::new(&directory)),
+            _ => cache_directory().join("cargo"),
+        };
+        Ok(Cargo {
+            path,
+            version,
+            jobs,
+            target_directory,
+        })
+    }
+}
+
+impl Toolchain for Cargo {
+    fn version(&self) -> &str {
+        &self.version
+    }
+
+    fn peak_host_bytes(&self, _op: &str, _key: &str) -> u64 {
+        // The compiler processes run first and the link after them, so the
+        // build's peak is the larger of the two, not their sum.
+        (self.jobs as u64 * CARGO_JOB_PEAK_HOST_BYTES).max(CARGO_LINK_PEAK_HOST_BYTES)
+    }
+
+    fn run(&self, job: ToolJob) -> Result<()> {
+        execute(&job, self.jobs)
+    }
+
+    fn max_jobs(&self) -> usize {
+        self.jobs
+    }
+
+    fn executable(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+
+    fn build_directory(&self) -> Option<&Path> {
+        Some(&self.target_directory)
+    }
+}
+
+/// The directory of this user's Build Server caches:
+/// `$XDG_CACHE_HOME/uniserve/build-server`, else
+/// `~/.cache/uniserve/build-server`.
+fn cache_directory() -> PathBuf {
+    let cache = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(cache) if !cache.is_empty() => PathBuf::from(cache),
+        _ => std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".cache"))
+            .unwrap_or_else(std::env::temp_dir),
+    };
+    cache.join("uniserve").join("build-server")
 }
 
 /// A toolchain for a source that compiles nothing: a vendor cubin, or an

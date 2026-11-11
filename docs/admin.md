@@ -32,7 +32,7 @@ Each write is an operation: it has an identity, runs on a task of its own, and e
 An epoch is one build of the main process serving a deployment: its executable and build identity, its parallel shape, its numerics, the modules it fills, and the KV cache it lays out. The daemon decides once, before anything starts, which layer a change moves on (`crates/daemon/src/updates/`):
 
 - **Generation layer** — only what the main processes execute differs (a new kernel revision, or another scheduling policy or another of its parameters, at an unchanged configuration). The serving epoch's processes install the modules and trial the new ones; nothing restarts.
-- **Epoch layer** — the build config differs: the main-process executable (`worker_config.executable`), the parallel shape and block ownership, `dtype` or `quantization`, the KV layout, the graph tiers and the slot count. The daemon runs an epoch switch, below.
+- **Epoch layer** — the build config differs: the engine package and its revision (`worker_config.engine`, `worker_config.engine_revision`), the parallel shape and block ownership, `dtype` or `quantization`, the KV layout, the graph tiers and the slot count. The daemon runs an epoch switch, below.
 - **Host layer** — the options the daemon reads alone (`server_config` for the leader's application server, `admin_config` for the daemon's own listener, `logging_config`, `chat_config`, `image_fetch_config`, `media_config`, `video_job_config`, `migration_config`, `mm_processor_kwargs`). The daemon restarts itself in place (below).
 
 `PUT /admin/config` resolves the target against the serving configuration and answers with the layer that took it (`change`):

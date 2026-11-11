@@ -89,6 +89,10 @@ pub enum SourceKind {
     Wasm,
     /// An executable: stored as it is.
     Executable,
+    /// A crate of a Cargo workspace, built by cargo to the executable
+    /// [`SourceSpec::binary`] names, from the snapshot an installation takes
+    /// of the crate and the workspace crates it depends on: the engine.
+    Cargo,
 }
 
 /// The toolchain a package needs (design section 6.2).
@@ -104,6 +108,10 @@ pub enum ToolchainKind {
     /// The WebAssembly toolchain: a wasm32 build, then the scheduling
     /// precompiler's wasmtime for this host's CPU.
     Wasm,
+    /// cargo, at the compiler version the package states: it builds a crate
+    /// from its snapshot with the lockfile and the toolchain's own crate
+    /// cache, offline.
+    Cargo,
     /// Nothing: a source that compiles nothing, such as a vendor cubin or an
     /// executable, has no toolchain version to match.
     None,
@@ -122,6 +130,7 @@ impl ToolchainKind {
             Self::Triton => "triton",
             Self::CuteDsl => "cute_dsl",
             Self::Wasm => "wasm",
+            Self::Cargo => "cargo",
             Self::None => "none",
         }
     }
@@ -223,6 +232,10 @@ pub struct SourceSpec {
     /// builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<String>,
+    /// The executable a cargo source builds and the module holds, such as
+    /// `uniserve-engine`: a binary target of the package's crate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
 }
 
 impl SourceSpec {
@@ -247,9 +260,10 @@ impl SourceSpec {
 /// key.
 pub const DESCRIPTOR_PLACEHOLDER: &str = "{descriptor}";
 
-/// The descriptor key of a scheduling policy's one module: a policy covers a
-/// whole interface, not a set of shapes.
-pub const POLICY_DESCRIPTOR: &str = "default";
+/// The key of the one module a package without a `[kernel]` section builds:
+/// a scheduling policy and the engine each fill a whole interface, not a set
+/// of shapes.
+pub const SINGLE_KEY: &str = "default";
 
 /// The target of a scheduling policy's module: wasm32, precompiled for this
 /// host's CPU, not a GPU architecture.
@@ -597,7 +611,7 @@ pub struct Manifest {
     pub source: SourceSpec,
     /// The kernel package's architectures, descriptors and selection rules.
     /// A scheduling policy has no kernel package: it names no architecture
-    /// and one descriptor, [`POLICY_DESCRIPTOR`] (design section 5.3).
+    /// and one key, [`SINGLE_KEY`]; neither does the engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<KernelSpec>,
     /// The package revision's parameters and their default values (design section
@@ -652,13 +666,29 @@ impl Manifest {
                     "the package must name the architectures it supports".into(),
                 ));
             }
-            (None, ModuleForm::Wasm) => {}
+            (None, ModuleForm::Wasm | ModuleForm::Executable) => {}
             (None, _) => {
                 return Err(ManifestError::Invalid(
-                    "only a wasm package may omit the kernel package it fills".into(),
+                    "only a package that fills a whole interface with one module, a wasm policy \
+                     or an executable, may omit its [kernel] section"
+                        .into(),
                 ));
             }
             _ => {}
+        }
+        if self.source.kind == SourceKind::Cargo {
+            if self.module.form != ModuleForm::Executable || self.kernel.is_some() {
+                return Err(ManifestError::Invalid(
+                    "a cargo source builds one executable for the host's platform: its module's \
+                     form is `executable` and it names no [kernel]"
+                        .into(),
+                ));
+            }
+            if self.source.binary.as_deref().is_none_or(str::is_empty) {
+                return Err(ManifestError::Invalid(
+                    "a cargo source names the executable it builds in [source] binary".into(),
+                ));
+            }
         }
         for shape in self.descriptors() {
             for (name, dimension) in &shape.dimensions {
@@ -736,23 +766,33 @@ impl Manifest {
     }
 
     /// Whether this package covers a descriptor key: a kernel package by its
-    /// declared dimensions, a scheduling policy by its one module.
+    /// declared dimensions, a package of one module by [`SINGLE_KEY`].
     pub fn covers(&self, key: &str) -> bool {
         match &self.kernel {
             Some(kernel) => kernel.descriptors.covers(key),
-            None => key == POLICY_DESCRIPTOR,
+            None => key == SINGLE_KEY,
         }
     }
 
     /// Whether this package builds for a target: a kernel package by its
-    /// declared architectures, a scheduling policy for wasm32 alone.
+    /// declared architectures, a package of one module for its
+    /// [`Self::single_target`] alone.
     pub fn builds_for(&self, target: &str) -> bool {
         match &self.kernel {
             Some(kernel) => kernel
                 .architectures
                 .iter()
                 .any(|architecture| architecture == target),
-            None => target == WASM_TARGET,
+            None => target == self.single_target().as_str(),
+        }
+    }
+
+    /// The one target a package without a `[kernel]` section builds for: wasm32
+    /// for a scheduling policy, and this host's platform for an executable.
+    pub fn single_target(&self) -> crate::target::Target {
+        match self.module.form {
+            ModuleForm::Wasm => crate::target::Target::new(WASM_TARGET),
+            _ => crate::target::Target::host(),
         }
     }
 

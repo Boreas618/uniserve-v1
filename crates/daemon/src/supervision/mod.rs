@@ -26,6 +26,7 @@ mod supervisor;
 
 pub(crate) use service::HandedService;
 pub use supervisor::LIFELINE_ENV;
+pub(crate) use supervisor::engine_executable;
 
 use std::net::IpAddr;
 use std::os::fd::OwnedFd;

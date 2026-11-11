@@ -45,7 +45,7 @@ from tests.python.e2e.http_helpers import (
     second_host,
     server_process,
     wait_until,
-    worker_executable,
+    engine_selection,
 )
 from tests.python.e2e.build_server import remote_build_server
 
@@ -142,8 +142,7 @@ def test_a_group_over_two_hosts_promotes_its_standby_when_a_hosts_rank_is_lost(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--host-identity",
         "rank-0",
         "--nnodes",

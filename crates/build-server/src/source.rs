@@ -115,6 +115,7 @@ pub fn open(manifest: &Manifest, root: &Path) -> Result<Box<dyn Source>> {
         SourceKind::Cubin => Box::new(CubinSource::new(package, manifest.clone())),
         SourceKind::Wasm => Box::new(WasmSource::new(package, manifest.clone())),
         SourceKind::Executable => Box::new(ExecutableSource::new(package, manifest.clone())),
+        SourceKind::Cargo => Box::new(CargoSource::new(package, manifest.clone())),
     })
 }
 
@@ -1150,6 +1151,122 @@ impl Source for ExecutableSource {
             files: collect(dir.path())?,
         })
     }
+}
+
+/// A crate cargo builds to an executable from the snapshot of its workspace:
+/// the engine.
+///
+/// The installed revision holds the crate and every workspace crate it depends
+/// on under [`crate::snapshot::WORKSPACE`], with the lockfile
+/// ([`lock_snapshot`]). The build is `cargo build --release --locked
+/// --offline` there: no crate is fetched and no version is chosen, so the
+/// executable is a function of the revision and the toolchain. What cargo
+/// compiled stays in the toolchain's build directory, where the next revision
+/// finds the dependencies it shares.
+#[derive(Clone, Debug)]
+pub struct CargoSource {
+    package: PackageSource,
+}
+
+impl CargoSource {
+    pub fn new(root: PathBuf, manifest: Manifest) -> Self {
+        Self {
+            package: PackageSource::new(root, manifest),
+        }
+    }
+}
+
+impl Source for CargoSource {
+    fn toolchain(&self) -> ToolchainKind {
+        ToolchainKind::Cargo
+    }
+
+    fn build(
+        &self,
+        _op: &str,
+        key: &str,
+        target: &Target,
+        toolchain: &dyn Toolchain,
+        dir: &Workspace,
+    ) -> Result<Built> {
+        let package = &self.package;
+        let log = build_log(dir);
+        let missing = |what: &str| Error::Toolchain {
+            kind: ToolchainKind::Cargo,
+            message: format!("no {what} on this host: pass --cargo <path>"),
+        };
+        let cargo = toolchain.executable().ok_or_else(|| missing("cargo"))?;
+        let target_directory = toolchain
+            .build_directory()
+            .ok_or_else(|| missing("cargo target directory"))?;
+        let binary = package.manifest.source.binary.as_deref().ok_or_else(|| {
+            package.failure(key, target, "the package names no [source] binary to build")
+        })?;
+
+        let job = ToolJob::new(cargo, &package.root.join(crate::snapshot::WORKSPACE), &log)
+            .argument("build")
+            .argument("--release")
+            .argument("--locked")
+            .argument("--offline")
+            .argument("--bin")
+            .argument(binary)
+            .argument("--jobs")
+            .argument(toolchain.max_jobs().to_string())
+            .argument("--target-dir")
+            .argument(target_directory);
+        toolchain
+            .run(job)
+            .map_err(|error| package.failure_with_log(key, target, error, &log))?;
+
+        let built = target_directory.join("release").join(binary);
+        if !built.is_file() {
+            return Err(package.failure(
+                key,
+                target,
+                format!(
+                    "cargo wrote no {}; its log was:\n{}",
+                    built.display(),
+                    read_log(&log)
+                ),
+            ));
+        }
+        // `fs::copy` keeps the mode, so the module's file is executable as built.
+        copy_file(&built, &dir.path().join(binary))?;
+        copy_tuning(package, key, target, dir)?;
+        Ok(Built {
+            files: collect(dir.path())?,
+        })
+    }
+}
+
+/// Reduces the lockfile of a cargo package's staged revision to the crates
+/// the snapshot holds, so the revision builds with `--locked`.
+///
+/// The snapshot took its workspace's lockfile, which also locks what the
+/// crates outside the snapshot depend on. cargo rewrites it while resolving
+/// the snapshot offline: every crate the snapshot needs keeps the version the
+/// lockfile gave it, and the rest are dropped.
+///
+/// # Errors
+///
+/// Fails when the snapshot does not resolve offline: a dependency the
+/// lockfile does not hold, or one the toolchain's crate cache lacks.
+pub fn lock_snapshot(cargo: &dyn Toolchain, staged: &Path) -> Result<()> {
+    let executable = cargo.executable().ok_or_else(|| Error::Toolchain {
+        kind: ToolchainKind::Cargo,
+        message: "no cargo on this host: pass --cargo <path>".into(),
+    })?;
+    let log = tempfile::NamedTempFile::new()?;
+    let job = ToolJob::new(
+        executable,
+        &staged.join(crate::snapshot::WORKSPACE),
+        log.path(),
+    )
+    .argument("metadata")
+    .argument("--offline")
+    .argument("--format-version")
+    .argument("1");
+    cargo.run(job)
 }
 
 #[cfg(test)]

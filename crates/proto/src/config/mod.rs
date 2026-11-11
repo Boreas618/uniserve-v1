@@ -12,7 +12,7 @@ pub mod worker_group;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -501,8 +501,12 @@ impl Default for FlashInferConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerConfig {
-    /// The `uniserve` executable the deployment's main processes run as.
-    pub executable: PathBuf,
+    /// The engine package the deployment's main processes run as: the name of an implementation
+    /// of the engine interface installed at the Build Server.
+    pub engine: String,
+    /// The revision of the engine package to run; the latest installed one, fixed when the
+    /// configuration is applied, when unset.
+    pub engine_revision: Option<u32>,
     /// Time a batch may run without rank progress before the worker group is
     /// replaced; a rank reports a stalled job after half of it.
     #[serde(with = "values::duration")]
@@ -538,7 +542,8 @@ pub struct WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            executable: default_executable(),
+            engine: DEFAULT_ENGINE.to_owned(),
+            engine_revision: None,
             watchdog_timeout: Duration::from_secs(300),
             mesh: None,
             standby: false,
@@ -547,32 +552,9 @@ impl Default for WorkerConfig {
     }
 }
 
-/// The `uniserve` executable of the virtual environment this process runs
-/// in, which runs the main processes.
-///
-/// A daemon built outside one, such as a development build, takes the active
-/// environment's; without one, `uniserve` is looked up on the search path.
-pub fn default_executable() -> PathBuf {
-    const EXECUTABLE: &str = "uniserve";
-    let environment_bin = |directory: &Path| {
-        ["python", "python3"]
-            .iter()
-            .any(|name| directory.join(name).is_file())
-            .then(|| directory.join(EXECUTABLE))
-            .filter(|candidate| candidate.is_file())
-    };
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(candidate) = executable.parent().and_then(environment_bin)
-    {
-        return candidate;
-    }
-    if let Some(environment) = std::env::var_os("VIRTUAL_ENV")
-        && let Some(candidate) = environment_bin(&Path::new(&environment).join("bin"))
-    {
-        return candidate;
-    }
-    EXECUTABLE.into()
-}
+/// The engine package a deployment runs when its configuration names none: the implementation
+/// of the engine interface this tree holds (`crates/engine/package.toml`).
+pub const DEFAULT_ENGINE: &str = "uniserve";
 
 /// What the server logs about its serving (`logging_config`). A process's
 /// log levels are options of the binary that runs it.
@@ -1055,6 +1037,11 @@ pub struct EngineArgs {
     pub engine: u64,
     /// The Build Server's socket.
     pub build_server: String,
+    /// The epoch's module set, as the daemon fixed it when the epoch's configuration was applied:
+    /// the node's daemon starts the engine package it names, and the process loads the kernel and
+    /// policy packages it names at the revisions it names. `None` in a launch built from a
+    /// configuration alone, which serves nothing.
+    pub modules: Option<crate::module::ModuleSet>,
     /// The devices this rank serves, as CUDA ordinals.
     pub devices: Vec<u32>,
     /// This rank's worker group, which keys its storage claims.
@@ -1134,6 +1121,7 @@ impl EngineArgs {
             processes: String::new(),
             engine: 0,
             build_server: String::new(),
+            modules: None,
             devices: Vec::new(),
             group: String::new(),
             rank: 0,

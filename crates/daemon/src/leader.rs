@@ -586,15 +586,37 @@ impl Leader {
             config.served_model_name().to_owned(),
             crate::engine::control::ensure_build_server(&config.build_config)?,
         )?);
+        // The module set the launches name: the engine package is fixed here,
+        // because a main process is started from it, and the policy and the
+        // kernels as the configuration names them until the epoch's own
+        // selection fixes theirs (`install_modules`).
+        let mut modules = crate::epoch::modules_of(config);
+        modules.engine = {
+            let socket = control.build_server().to_path_buf();
+            let named = modules.engine.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::engine::control::select_engine(&socket, &named)
+            })
+            .await
+            .context("the engine's selection did not complete")?
+            .context("selecting the deployment's engine package")?
+        };
+        info!(
+            engine = %modules.engine.backend,
+            revision = modules.engine.revision,
+            "the engine package is selected"
+        );
         let replicas = replica_configs(&prepared.engine)?;
         let clients =
             futures::future::join_all(replicas.into_iter().enumerate().map(|(index, replica)| {
                 let model = config.model().to_owned();
                 let starting = Arc::clone(&control);
+                let modules = modules.clone();
                 tokio::task::spawn_blocking(move || {
                     let observer = Arc::new(crate::observe::Observer::default());
                     let sink = stats_sink(model, Arc::clone(&observer), index);
                     let mut args = proto::config::EngineArgs::new(replica);
+                    args.modules = Some(modules);
                     let client = starting.start(args.clone(), sink)?;
                     args.epoch = client.epoch();
                     Ok::<_, anyhow::Error>((client, args, observer))
@@ -649,7 +671,7 @@ impl Leader {
             // update (§2.3, §7.3).
             leader.epochs().supervise(commands.clone());
             leader
-                .install_modules(commands, config, engines, epoch)
+                .install_modules(commands, config, engines, epoch, modules.engine)
                 .await
                 .context("installing the epoch's modules in its main processes")?;
             // A committed epoch's tensors are what the next epoch starts from: until it is
@@ -673,7 +695,7 @@ impl Leader {
     /// causal language model's operators. A video deployment launches neither, so a slot filled for
     /// them would pin a package no call reaches: every operator it runs is filled from the store.
     fn named_modules(&self, config: &ServerArgs) -> crate::epoch::ModuleSet {
-        let mut filled = crate::epoch::ModuleSet::of(config);
+        let mut filled = crate::epoch::modules_of(config);
         if self.video_service().is_some() {
             filled.kernels.clear();
         }
@@ -700,8 +722,12 @@ impl Leader {
         config: &ServerArgs,
         engines: Vec<crate::engine::control::EpochProcess>,
         epoch: u64,
+        engine: proto::module::PackageRevision,
     ) -> anyhow::Result<()> {
-        let filled = self.named_modules(config);
+        let mut filled = self.named_modules(config);
+        // The engine package the main processes were started from, at the
+        // revision fixed before they started.
+        filled.engine = engine;
         // The startup switch installs the epoch's modules as its record names
         // them: the scheduling policy *and* the kernel of every operator the
         // deployment selects. A main process resolves no kernel itself — its
@@ -788,6 +814,14 @@ impl Leader {
         // handover to a joining process (`Epochs::hand_to`) sending a revision
         // the store never built.
         let deployment = crate::epoch::Epoch::with_modules(config.clone(), prepared.clone())?;
+        // The epoch's module set is fixed: a relaunch and a standby are
+        // started from the launch each replica keeps, so it names this set and
+        // no later selection.
+        for replica in self.replicas() {
+            if let Some(served) = locked(&replica.served).as_mut() {
+                served.modules = Some(prepared.clone());
+            }
+        }
         // Every main process of every engine, each on its own host: a worker group that spans
         // hosts switches every one of its processes together.
         let processes = engines;
@@ -1839,8 +1873,6 @@ pub struct LeaderStatus {
     /// The parked standby beside the serving engine (`worker_config.standby`),
     /// `None` while there is none.
     pub standby: Option<StandbyStatus>,
-    /// The executable the serving engine and its workers run.
-    pub executable: Option<String>,
 }
 
 /// The parked standby of [`LeaderStatus::standby`].
@@ -3397,13 +3429,6 @@ impl Replica {
                     .map(|(_, generation)| *generation)
                     .collect(),
                 prepared: standby.prepared,
-            }),
-            executable: locked(&self.served).as_ref().map(|args| {
-                args.engine_config
-                    .worker
-                    .executable
-                    .to_string_lossy()
-                    .into_owned()
             }),
         }
     }

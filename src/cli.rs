@@ -59,14 +59,6 @@ pub(crate) enum Command {
         override_usage = "uniserve keys MODEL [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
     Keys(Box<ServerArgs>),
-    /// Run the main process of this node and epoch: its schedulers and the
-    /// request interface.
-    #[command(hide = true)]
-    Engine {
-        /// The launch file the daemon wrote for this engine process (`proto::config::EngineArgs`).
-        #[arg(long)]
-        launch: std::path::PathBuf,
-    },
     /// The Storage Server of this host and the operator's commands against
     /// it.
     StorageServer(Box<storage_server::command::Args>),
@@ -97,8 +89,7 @@ mod tests {
         );
     }
 
-    /// Every process of a deployment is one of this binary's commands, and
-    /// the commands that the daemon starts are not in the help.
+    /// Every process of the fixed base is one of this binary's commands.
     #[test]
     fn each_process_is_a_command() {
         for (args, expected) in [
@@ -113,7 +104,6 @@ mod tests {
                 Command::Keys(_) => "keys",
                 Command::StorageServer(_) => "storage-server",
                 Command::BuildServer(_) => "build-server",
-                Command::Engine { .. } => "other",
             };
             assert_eq!(name, expected);
         }

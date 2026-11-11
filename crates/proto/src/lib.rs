@@ -56,6 +56,11 @@ pub mod handoff {
 /// fields leaves the version; any other change raises it.
 pub const ENGINE_INTERFACE_VERSION: u32 = 1;
 
+/// The environment variable that names a supervised process's lifeline: the
+/// descriptor number of the read end of a pipe whose write end its daemon
+/// holds. The process ends once the pipe does.
+pub const LIFELINE_ENV: &str = "UNISERVE_LIFELINE";
+
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled
 /// from, as the engine interface's registration states it.

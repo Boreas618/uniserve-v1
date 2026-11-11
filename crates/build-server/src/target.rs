@@ -44,6 +44,16 @@ impl Target {
         &self.0
     }
 
+    /// This host's platform, such as `aarch64-linux`: the target of a module
+    /// that runs on the host's CPU as its own process, the engine's.
+    pub fn host() -> Self {
+        Self(format!(
+            "{}-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        ))
+    }
+
     /// The architecture target of a device of compute capability
     /// `(major, minor)`: its architecture-specific instruction set, such as
     /// `sm_100a`.

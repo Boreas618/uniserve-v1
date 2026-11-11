@@ -41,6 +41,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -53,10 +54,7 @@ use proto::process::{Exit, Reserve, Reserved, Spawn};
 /// lives; its communicators exist from its startup on.
 const SEGMENT_NOTE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The environment variable that names a supervised process's lifeline:
-/// the descriptor number of the read end of a pipe whose write end its
-/// daemon holds.
-pub const LIFELINE_ENV: &str = "UNISERVE_LIFELINE";
+pub use proto::LIFELINE_ENV;
 
 /// A supervised process: the owner it is answered for, the connection that
 /// asked for it, its worker group, its rank and the generation of the group's
@@ -163,6 +161,70 @@ pub(crate) struct Supervisor {
     build_server: Option<build_server::command::Settings>,
 }
 
+/// The executable a main process started from `launch` runs as: the module of the engine
+/// package the launch's module set names, at the Build Server the launch names.
+///
+/// The module was built when the epoch's modules were prepared, so this is a read of the store;
+/// a store that lost it builds it again first. A module of another version of the engine
+/// interface than this daemon speaks is refused here, before a process starts.
+pub(crate) fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, String> {
+    let modules = launch.modules.as_ref().ok_or_else(|| {
+        format!(
+            "the launch of engine {} names no module set, so no engine package to run",
+            launch.engine
+        )
+    })?;
+    let engine = &modules.engine;
+    let named = format!(
+        "the engine package {} revision {}",
+        engine.backend, engine.revision
+    );
+
+    let mut client = build_server::Client::connect(std::path::Path::new(&launch.build_server))
+        .map_err(|error| {
+            format!(
+                "connecting to the Build Server at {} for {named}: {error}",
+                launch.build_server
+            )
+        })?;
+    let module = client
+        .resolve(
+            proto::module::ENGINE,
+            engine,
+            &build_server::Target::host(),
+            proto::module::SINGLE_KEY,
+            &mut |progress| {
+                tracing::info!(
+                    path = %progress.path,
+                    state = ?progress.state,
+                    "the Build Server is building the engine's module"
+                );
+            },
+        )
+        .map_err(|error| format!("resolving {named}: {error}"))?;
+    if module.interface_version != proto::ENGINE_INTERFACE_VERSION {
+        return Err(format!(
+            "{named} implements version {} of the engine interface and this daemon speaks \
+             version {}",
+            module.interface_version,
+            proto::ENGINE_INTERFACE_VERSION
+        ));
+    }
+
+    // The module is the executable, with any tuning data its package carries beside it.
+    use std::os::unix::fs::PermissionsExt as _;
+    module
+        .files
+        .into_iter()
+        .find(|file| {
+            file.file
+                .metadata()
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        })
+        .map(|file| file.path)
+        .ok_or_else(|| format!("the module of {named} holds no executable file"))
+}
+
 /// A daemon's lifeline: both ends of the pipe, close-on-exec in the
 /// daemon; a spawn makes the read end its process's.
 struct Lifeline {
@@ -212,9 +274,13 @@ impl Supervisor {
         self
     }
 
-    /// Writes the launch file of the main process `spawn` starts, with this node's facts stated in
-    /// it, and answers its path.
-    fn write_launch(&self, spawn: &Spawn) -> Result<std::path::PathBuf, String> {
+    /// The executable of the main process `spawn` starts and the launch file written for it,
+    /// with this node's facts stated in it.
+    ///
+    /// The executable is the engine package the launch's module set names, resolved at this
+    /// node's Build Server: every node runs the revision the epoch fixed, built for its own
+    /// platform.
+    fn main_process(&self, spawn: &Spawn) -> Result<(PathBuf, PathBuf), String> {
         let mut launch: proto::config::EngineArgs =
             serde_json::from_slice(&spawn.launch).map_err(|error| {
                 format!("reading the launch of engine {}: {error}", spawn.generation)
@@ -224,7 +290,8 @@ impl Supervisor {
                 .map_err(|error| format!("starting this node's Build Server: {error:#}"))?;
             launch.build_server = socket.display().to_string();
         }
-        crate::engine::launch::write(
+        let executable = engine_executable(&launch)?;
+        let file = crate::engine::launch::write(
             &crate::options::runtime_directory(),
             spawn.generation,
             &launch,
@@ -234,7 +301,8 @@ impl Supervisor {
                 "writing the launch file of engine {}: {error}",
                 spawn.generation
             )
-        })
+        })?;
+        Ok((executable, file))
     }
 
     /// Starts the process `spawn` describes for `engine`, as a child of this
@@ -258,12 +326,17 @@ impl Supervisor {
             spawn.generation,
         );
 
-        let mut command = Command::new(&spawn.executable);
-        command.args(&spawn.arguments);
-        if !spawn.launch.is_empty() {
-            let launch = self.write_launch(spawn)?;
+        // A main process runs as the engine package its launch names; any
+        // other process as the executable the request states.
+        let mut command = if spawn.launch.is_empty() {
+            Command::new(&spawn.executable)
+        } else {
+            let (executable, launch) = self.main_process(spawn)?;
+            let mut command = Command::new(executable);
             command.arg("--launch").arg(launch);
-        }
+            command
+        };
+        command.args(&spawn.arguments);
         for (name, value) in &spawn.environment {
             command.env(name, value);
         }

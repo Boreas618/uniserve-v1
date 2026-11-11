@@ -33,7 +33,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::builder::{Build, BuildState, Builder, Limits, Urgency};
-use crate::inputs::{BYTECODE_CACHE, Inputs};
+use crate::inputs::Inputs;
 use crate::manifest::Manifest;
 use crate::protocol::{
     self, Chosen, Connection, Descriptors, Module, ModuleFile, PrepareRequest, Progress, Selector,
@@ -315,6 +315,7 @@ impl BuildServer {
                     files.push(wire::ModuleFile {
                         name: file.name.clone(),
                         size: file.size,
+                        path: file.path.to_string_lossy().into_owned(),
                     });
                 }
                 for file in module.files {
@@ -470,8 +471,22 @@ impl BuildServer {
             .toolchains
             .identity(kind)
             .unwrap_or_else(|error| format!("{kind} unavailable: {error}"));
-        let inputs = Inputs::of(directory, toolchain)?;
-        install_package(directory, &root, &inputs)?;
+        let (files, generated) = crate::snapshot::package_files(directory)?;
+        let inputs = Inputs {
+            package: crate::snapshot::files_digest(&files, generated.as_deref())?,
+            toolchain,
+        };
+        install_package(&files, generated.as_deref(), &root, &inputs, |staged| {
+            // A cargo package's revision is built with its lockfile, locked:
+            // the lockfile the snapshot took is its workspace's, so it is
+            // reduced here, once, to the crates the snapshot holds.
+            match (kind, self.toolchains.get(kind)) {
+                (crate::manifest::ToolchainKind::Cargo, Ok(cargo)) => {
+                    crate::source::lock_snapshot(cargo, staged)
+                }
+                _ => Ok(()),
+            }
+        })?;
         // The source compiles the installed copy, not the tree the install
         // named: a downstream server's package root is a read-only mount of the
         // upstream's, and the publisher's directory need not exist there.
@@ -783,7 +798,7 @@ impl BuildServer {
                                 .map(|kernel| &kernel.architectures)
                         )
                     } else {
-                        crate::manifest::WASM_TARGET.to_owned()
+                        package.manifest.single_target().to_string()
                     }
                 ),
             });
@@ -850,6 +865,7 @@ impl BuildServer {
                 name: file.name,
                 size,
                 file: handle,
+                path: file.path,
             });
         }
         let entries = entries_of(&package, &self.store.directory(&path))?;
@@ -1107,27 +1123,12 @@ impl BuildServer {
     /// supports (design section 5.3). A scheduling policy is built once, for
     /// wasm32, whatever the host's GPUs are.
     fn targets(&self, package: &Package, requested: &[Target]) -> Result<Vec<Target>> {
-        let wasm = Target::new(crate::manifest::WASM_TARGET);
         if package.manifest.kernel.is_none() {
-            if !requested.is_empty()
-                && !requested
-                    .iter()
-                    .any(|target| target.as_str() == crate::manifest::WASM_TARGET)
-            {
-                return Err(Error::Build {
-                    op: package.manifest.op.clone(),
-                    backend: package.manifest.backend.clone(),
-                    revision: 0,
-                    target: requested
-                        .iter()
-                        .map(Target::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    descriptor: String::new(),
-                    message: "a scheduling policy is built for wasm32 alone".into(),
-                });
-            }
-            return Ok(vec![wasm]);
+            // A package of one module has one target, whatever the host's GPUs
+            // are: wasm32 for a policy, the host's platform for an executable.
+            // The targets a request names are its kernel packages', so they
+            // do not select among this package's.
+            return Ok(vec![package.manifest.single_target()]);
         }
         let kind = package.manifest.target_kind();
         let host = target::targets(&self.devices, kind);
@@ -1597,10 +1598,22 @@ fn load_packages(root: &Path) -> Result<BTreeMap<(String, String, u32), Arc<Pack
     Ok(packages)
 }
 
-/// Copies a package into its revision's directory with the record of its
-/// build inputs, atomically: a crash leaves no directory a later scan would
-/// mistake for an installed revision, and no revision without its record.
-fn install_package(directory: &Path, destination: &Path, inputs: &Inputs) -> Result<()> {
+/// Writes a package's snapshot into its revision's directory with the record
+/// of its build inputs, atomically: a crash leaves no directory a later scan
+/// would mistake for an installed revision, and no revision without its
+/// record. `finish` completes the staged revision before it is published.
+///
+/// A symbolic link is copied as what it names: an installed revision holds
+/// every byte it builds from, so a source several packages share in the tree
+/// (an operator's ABI header, one convolution source behind three operators)
+/// is one file there and a file of each package's revision.
+fn install_package(
+    files: &[(String, PathBuf)],
+    generated: Option<&str>,
+    destination: &Path,
+    inputs: &Inputs,
+    finish: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         Error::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1620,7 +1633,8 @@ fn install_package(directory: &Path, destination: &Path, inputs: &Inputs) -> Res
         fs::remove_dir_all(&staged)?;
     }
     fs::create_dir_all(&staged)?;
-    copy_tree(directory, &staged)?;
+    crate::snapshot::write_files(files, generated, &staged)?;
+    finish(&staged)?;
     inputs.write(&staged)?;
     if let Ok(handle) = fs::File::open(&staged) {
         handle.sync_all()?;
@@ -1628,32 +1642,6 @@ fn install_package(directory: &Path, destination: &Path, inputs: &Inputs) -> Res
     fs::rename(&staged, destination)?;
     if let Ok(handle) = fs::File::open(parent) {
         handle.sync_all()?;
-    }
-    Ok(())
-}
-
-/// Copies a directory tree, keeping relative paths and file modes, without
-/// Python bytecode ([`BYTECODE_CACHE`]).
-///
-/// A symbolic link is copied as what it names: an installed revision holds
-/// every byte it builds from, so a source several packages share in the tree
-/// (an operator's ABI header, one convolution source behind three operators)
-/// is one file there and a file of each package's revision.
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        if entry.file_name() == BYTECODE_CACHE {
-            continue;
-        }
-        let source = entry.path();
-        let destination = to.join(entry.file_name());
-        if fs::metadata(&source)?.is_dir() {
-            fs::create_dir_all(&destination)?;
-            copy_tree(&source, &destination)?;
-        } else {
-            fs::copy(&source, &destination)?;
-            fs::File::open(&destination)?.sync_all()?;
-        }
     }
     Ok(())
 }

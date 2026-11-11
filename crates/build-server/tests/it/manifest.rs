@@ -74,6 +74,62 @@ fn a_manifest_says_what_the_package_is_and_how_it_is_built() {
     );
 }
 
+/// The engine package of this tree: a crate cargo builds to one executable for the host's
+/// platform, under the one key of a package that fills a whole interface.
+#[test]
+fn the_engine_package_is_a_cargo_package_of_one_executable() {
+    let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine");
+    let manifest = Manifest::load(&package).unwrap();
+
+    assert_eq!(manifest.op, "engine");
+    assert_eq!(manifest.toolchain.kind, ToolchainKind::Cargo);
+    assert_eq!(manifest.source.kind, SourceKind::Cargo);
+    assert_eq!(manifest.module.form, ModuleForm::Executable);
+    assert_eq!(manifest.source.binary.as_deref(), Some("uniserve-engine"));
+    assert!(manifest.covers(build_server::manifest::SINGLE_KEY));
+    assert!(!manifest.covers("dtype_bf16"));
+    let host = build_server::Target::host();
+    assert!(manifest.builds_for(host.as_str()));
+    assert!(!manifest.builds_for("sm_100a"));
+}
+
+/// A cargo package names the executable it builds and no kernel: it builds one module, for the
+/// host.
+#[test]
+fn a_cargo_package_names_its_binary_and_no_kernel() {
+    let cargo = |source: &str, kernel: &str| {
+        format!(
+            r#"
+op = "engine"
+backend = "uniserve"
+interface_version = 1
+
+[toolchain]
+kind = "cargo"
+version = "1.99.1"
+
+[module]
+form = "executable"
+
+[source]
+kind = "cargo"
+files = []
+{source}
+{kernel}
+"#
+        )
+    };
+    let binary = r#"binary = "uniserve-engine""#;
+    Manifest::load(package(&cargo(binary, ""), &[]).path()).unwrap();
+
+    let error = Manifest::load(package(&cargo("", ""), &[]).path()).unwrap_err();
+    assert!(error.to_string().contains("binary"), "{error}");
+
+    let kernel = "[kernel]\narchitectures = [\"sm_100a\"]\ndescriptors = { dimensions = {} }";
+    let error = Manifest::load(package(&cargo(binary, kernel), &[]).path()).unwrap_err();
+    assert!(error.to_string().contains("no [kernel]"), "{error}");
+}
+
 /// A manifest states the version of the interface its package implements: one that states
 /// none, or states zero, is refused, because a loader could not tell what it would be loading.
 #[test]

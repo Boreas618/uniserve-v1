@@ -481,7 +481,7 @@ script = "src/build.py"
             "scheduling",
             &prepared.packages[0].package,
             &target,
-            build_server::manifest::POLICY_DESCRIPTOR,
+            build_server::manifest::SINGLE_KEY,
             &mut |_| {},
         )
         .expect("the policy's module resolves");

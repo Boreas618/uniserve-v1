@@ -584,6 +584,7 @@ mod tests {
             processes: "unix:/run/processes.sock".to_owned(),
             engine: 1,
             build_server: "/run/modules.sock".to_owned(),
+            modules: None,
             devices: vec![0],
             group: "engine".to_owned(),
             rank: 0,

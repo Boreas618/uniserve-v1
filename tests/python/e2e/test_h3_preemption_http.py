@@ -71,7 +71,7 @@ from tests.python.e2e.http_helpers import (
     runtime_directory,
     server_process,
     t2va_request,
-    worker_executable,
+    engine_selection,
     written_deployment,
 )
 
@@ -187,8 +187,7 @@ def _serve(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--worker-groups",
         str(deployment(tmp_path)),
         "--max-running-requests",

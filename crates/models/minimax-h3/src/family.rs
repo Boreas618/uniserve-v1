@@ -34,12 +34,7 @@ use crate::{Config, Error, Result, VideoTask};
 /// The MiniMax-H3 family: a diffusers modular pipeline, which request processing serves through its
 /// video processor ([`processing::minimax_h3::H3Family`]).
 pub const FAMILY: Family = Family {
-    request: processing::Family {
-        id: "minimax_h3",
-        model_types: &[],
-        classes: &[crate::checkpoint::PIPELINE_CLASS],
-        serving: processing::Serving::Video(&processing::minimax_h3::H3Family),
-    },
+    request: processing::minimax_h3::FAMILY,
     model: Model::Video(&MinimaxH3Family),
 };
 

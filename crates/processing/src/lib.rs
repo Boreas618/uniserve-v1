@@ -33,13 +33,14 @@ mod frames;
 mod image;
 mod media;
 pub mod minimax_h3;
+pub mod qwen3;
 pub mod qwen_vl;
 mod serving;
 mod video;
 mod vocabulary;
 
 pub use canvas::{CanvasError, CanvasRule, CoverCrop, cover_crop};
-pub use family::{Catalogue, ClaimError, Family};
+pub use family::{Catalogue, ClaimError, FAMILIES, Family};
 pub use frames::{ClipSpan, FrameClips, requested_frames};
 pub use image::{ImageBlock, ImageFamily, ImageProcessor};
 pub use media::{

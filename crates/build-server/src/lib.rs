@@ -26,6 +26,8 @@
 //!   in a `.committed` mark.
 //! - [`inputs`]: what a module is built from (the package's files, the
 //!   toolchain, the compile driver and its pins) and the digest that names it.
+//! - [`snapshot`]: the files an installation takes of a package, which for a
+//!   package cargo builds are its crate and the workspace crates it depends on.
 //! - [`build`]: `uniserve build-server build`, which fills a store from
 //!   descriptor key lists.
 //! - [`builder`]: the compile queue of section 6.2, with its urgencies, its
@@ -47,6 +49,7 @@ pub mod inputs;
 pub mod manifest;
 pub mod protocol;
 pub mod server;
+pub mod snapshot;
 pub mod source;
 pub mod store;
 pub mod target;
@@ -134,10 +137,10 @@ pub enum Error {
         message: String,
     },
     /// A store build failed somewhere: the keys no installed backend built,
-    /// and how many installs, prepares or resolves failed in all. A key a
-    /// second backend built still counts its first backend's failure.
+    /// and how many prepares or resolves failed in all. A key a second
+    /// backend built still counts its first backend's failure.
     #[error(
-        "{failures} build failure(s), and {} of {total} keys did not build: [{}]",
+        "{failures} build failure(s), and {} of {total} modules did not build: [{}]",
         keys.len(),
         keys.join(", ")
     )]

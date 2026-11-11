@@ -216,6 +216,7 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
                         files: vec![wire::ModuleFile {
                             name: "module.cubin".into(),
                             size: "the cubin bytes".len() as u64,
+                            path: "/store/module.cubin".into(),
                         }],
                         entry: String::new(),
                         entries: std::collections::HashMap::new(),
@@ -371,6 +372,7 @@ fn a_native_module_comes_back_with_its_entries_by_role() {
                         files: vec![wire::ModuleFile {
                             name: "module.so".into(),
                             size: "the shared object".len() as u64,
+                            path: "/store/module.so".into(),
                         }],
                         entry: String::new(),
                         entries: [

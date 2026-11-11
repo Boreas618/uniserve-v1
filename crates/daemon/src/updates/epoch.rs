@@ -105,7 +105,10 @@ pub(crate) fn epoch_arm(
         return Ok(Some(Applied::Planned(json!({
             "change": "epoch",
             "epoch": change.target,
-            "executable": change.start.executable,
+            "engine": {
+                "backend": target.modules.engine.backend,
+                "revision": target.modules.engine.revision,
+            },
             "generation": change.spawn_generation,
             "nodes": nodes.iter().map(|node| node.host.clone()).collect::<Vec<_>>(),
             "pause": "from the first Promote to the last Drained of the previous epoch",

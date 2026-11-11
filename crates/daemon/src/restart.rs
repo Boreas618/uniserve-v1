@@ -146,14 +146,7 @@ struct Takeover {
     frontend_paused: bool,
     /// The modules the serving epoch runs. A configuration names a part of
     /// them and the store fills the rest, so the successor cannot derive them.
-    modules: Option<HandedModuleSet>,
-}
-
-/// The modules of the epoch a takeover continues.
-#[derive(Debug, Serialize, Deserialize)]
-struct HandedModuleSet {
-    kernels: Vec<(crate::epoch::KernelKey, proto::module::PackageRevision)>,
-    policy: proto::module::PackageRevision,
+    modules: Option<proto::module::ModuleSet>,
 }
 
 /// One replica's control connection and executing epoch. Descriptors follow
@@ -447,13 +440,13 @@ impl Restarter {
                     jobs: job_records,
                     then: then.map(|request| *request),
                     frontend_paused: leader.status().paused,
-                    modules: leader
-                        .epochs()
-                        .serving()
-                        .map(|(_, record)| HandedModuleSet {
-                            kernels: record.kernels.into_iter().collect(),
+                    modules: leader.epochs().serving().map(|(_, record)| {
+                        proto::module::ModuleSet {
+                            engine: record.engine,
+                            kernels: record.kernels,
                             policy: record.policy,
-                        }),
+                        }
+                    }),
                 })),
                 &borrowed,
             )?;
@@ -1083,20 +1076,15 @@ fn adopted_epoch(
     epoch: u64,
     engine: u64,
     options: &crate::options::ServerArgs,
-    modules: Option<HandedModuleSet>,
+    modules: Option<proto::module::ModuleSet>,
 ) -> anyhow::Result<(crate::epoch::EpochRecord, crate::epoch::ManagedProcess)> {
     let deployment = crate::epoch::Epoch::of(options.clone())?;
-    let (kernels, policy) = match modules {
-        Some(modules) => (modules.kernels.into_iter().collect(), modules.policy),
-        None => (
-            deployment.modules.kernels.clone(),
-            deployment.modules.policy.clone(),
-        ),
-    };
+    let modules = modules.unwrap_or_else(|| deployment.modules.clone());
     let record = crate::epoch::EpochRecord {
         config: deployment.engine.clone(),
-        kernels,
-        policy,
+        engine: modules.engine,
+        kernels: modules.kernels,
+        policy: modules.policy,
         previous_kernels: std::collections::BTreeMap::new(),
         previous_policy: None,
         status: crate::epoch::Status::Serving,

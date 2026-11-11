@@ -1,12 +1,12 @@
-//! `uniserve keys`: the modules a deployment's main processes launch, as the key list
+//! `uniserve keys`: the kernel keys a deployment's main processes launch, as the key list
 //! `uniserve build-server build --keys` reads, so a store can be built for the deployment before
 //! it serves.
 //!
 //! The configuration resolves as `uniserve serve` resolves it, and the launches are the ones a
-//! serving leader starts its main processes with (`daemon::keys::launches`). Each launch runs
-//! the main process's own start in-process up to the walk every device's runners record
-//! (`engine::record`); the key list is the union of what every main process recorded, sorted and
-//! each key once, written to standard output. Logs go to standard error.
+//! serving leader starts its main processes with. Each launch is run by the engine package the
+//! deployment selects, up to the profile run of every device's runners (`daemon::keys::record`);
+//! the key list is the union of what every main process recorded, sorted and each key once,
+//! written to standard output. Logs go to standard error.
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -42,14 +42,8 @@ pub(crate) fn run(
          in --config"
     );
 
-    let catalogue = crate::catalogue()?;
-    let launches =
-        crate::runtime()?.block_on(daemon::keys::launches(&crate::served()?, &config, &stated))?;
-    let mut recorded = engine::Recorded::new();
-    for launch in &launches {
-        merge(&mut recorded, engine::record(launch, &catalogue)?);
-    }
-
+    let recorded =
+        crate::runtime()?.block_on(daemon::keys::record(&crate::served()?, &config, &stated))?;
     let list = build_server::build::key_list(&recorded)?;
     let mut stdout = std::io::stdout().lock();
     stdout
@@ -57,44 +51,4 @@ pub(crate) fn run(
         .and_then(|()| stdout.flush())
         .context("writing the key list")?;
     Ok(ExitCode::SUCCESS)
-}
-
-/// Adds the modules `other` records to `recorded`: what the deployment's main processes launch
-/// together.
-fn merge(recorded: &mut engine::Recorded, other: engine::Recorded) {
-    for (operator, keys) in other {
-        recorded.entry(operator).or_default().extend(keys);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn recorded(entries: &[(&str, &[&str])]) -> engine::Recorded {
-        entries
-            .iter()
-            .map(|(operator, keys)| {
-                (
-                    (*operator).to_owned(),
-                    keys.iter().map(|key| (*key).to_owned()).collect(),
-                )
-            })
-            .collect()
-    }
-
-    /// The deployment's modules are every main process's, each key once: a key two replicas
-    /// launch is listed once, and an operator only one launches is kept.
-    #[test]
-    fn the_main_processes_modules_are_merged() {
-        let mut merged = recorded(&[("rms_norm", &["a", "b"])]);
-        merge(
-            &mut merged,
-            recorded(&[("rms_norm", &["b", "c"]), ("attention", &["d"])]),
-        );
-        assert_eq!(
-            merged,
-            recorded(&[("attention", &["d"]), ("rms_norm", &["a", "b", "c"])])
-        );
-    }
 }

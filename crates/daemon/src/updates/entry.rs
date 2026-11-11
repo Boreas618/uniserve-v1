@@ -284,7 +284,7 @@ impl Leader {
         dry_run: bool,
     ) -> Result<Option<Applied>, UpdateError> {
         let previous = crate::leader::deployment(current)?;
-        let next = crate::leader::deployment(target)?;
+        let mut next = crate::leader::deployment(target)?;
         if crate::epoch::layer(&previous, &next) != crate::epoch::Layer::Epoch {
             return Ok(None);
         }
@@ -399,8 +399,24 @@ impl Leader {
                 )));
             }
         }
+        // The target's main processes are started from its engine package,
+        // so its revision is fixed here, before the first of them starts; a
+        // dry run starts none and reports the package as the target names it.
+        if !dry_run {
+            let socket = control.build_server().to_path_buf();
+            let named = next.modules.engine.clone();
+            next.modules.engine = tokio::task::spawn_blocking(move || {
+                crate::engine::control::select_engine(&socket, &named)
+            })
+            .await
+            .map_err(|error| UpdateError::Failed(anyhow::anyhow!(error)))?
+            .map_err(|error| {
+                UpdateError::Refused(format!("selecting the target's engine package: {error:#}"))
+            })?;
+        }
         let mut args = proto::config::EngineArgs::new(engine);
         args.epoch = target_epoch;
+        args.modules = Some(next.modules.clone());
         // §7.4 step 1: the target's main processes start as the serving
         // process's standby — they map the predecessor's cache read-only and
         // park — so the storage of an epoch has one writer while both run.
@@ -738,8 +754,8 @@ impl Replica {
         // again, which then leaves the daemon's options as they are.
         if daemon_changes {
             return Ok(Applied::Daemon {
-                config: Box::new(crate::options::with_daemon_options(&current, &target)),
                 executable: None,
+                config: Box::new(crate::options::with_daemon_options(&current, &target)),
                 then: Some(Box::new(request)),
             });
         }

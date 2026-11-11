@@ -750,6 +750,7 @@ mod tests {
                         .map(|meta| meta.len())
                         .unwrap_or_default(),
                     file: handle,
+                    path: nameless.clone(),
                 },
             ],
             "malloc",
@@ -782,6 +783,7 @@ mod tests {
                 .map(|meta| meta.len())
                 .unwrap_or_default(),
             file: std::fs::File::open(path).expect("the test's object opens"),
+            path: path.to_path_buf(),
         }
     }
 }

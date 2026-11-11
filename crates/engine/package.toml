@@ -1,0 +1,30 @@
+# The engine package: the main process of an epoch, as the executable
+# `uniserve-engine`.
+#
+# The package is this crate with every workspace crate it depends on, as an
+# installation snapshots them. The Build Server builds it from that snapshot
+# with the workspace's lockfile, offline, and stores the executable for the
+# host's platform under the package's one key. A deployment selects it by
+# `worker_config.engine` (and a revision by `worker_config.engine_revision`),
+# and a change to any engine code is a new revision of this package, applied
+# as an epoch.
+
+op = "engine"
+backend = "uniserve"
+# The engine interface: its messages with the daemon, the Storage Server and
+# the Build Server (`proto::ENGINE_INTERFACE_VERSION`).
+interface_version = 1
+
+[toolchain]
+kind = "cargo"
+version = "1.99.1"
+
+[module]
+form = "executable"
+
+# The crate's files are the ones cargo resolves from `Cargo.toml`, so none is
+# listed here.
+[source]
+kind = "cargo"
+files = []
+binary = "uniserve-engine"

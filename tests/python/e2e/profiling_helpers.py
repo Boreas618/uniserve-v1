@@ -22,7 +22,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     runtime_directory,
     server_process,
-    worker_executable,
+    engine_selection,
 )
 
 NAME = "qwen3-profiling"
@@ -56,8 +56,7 @@ def serve(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--set",
         f"build_config.socket={build_server}",
     ]

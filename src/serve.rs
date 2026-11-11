@@ -73,7 +73,7 @@ async fn serve(
     }
     info!(model = %config.model(),
         resident_requests = config.max_running_requests,
-        worker_executable = %config.worker_config.executable.display(), "resolved serving options");
+        engine = %config.worker_config.engine, "resolved serving options");
     daemon::serve(
         config,
         stated,

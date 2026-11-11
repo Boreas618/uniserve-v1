@@ -201,6 +201,9 @@ message ModuleFile {
   // The file's name inside the module's directory.
   string name = 1;
   uint64 size = 2;
+  // The file's path in the server's store, for a process of the server's host
+  // that runs the file as an executable.
+  string path = 3;
 }
 
 message Installed {

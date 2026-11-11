@@ -24,7 +24,7 @@ from tests.python.e2e.http_helpers import (
     host_asset,
     require_uniserve_binary,
     server_process,
-    worker_executable,
+    engine_selection,
     written_deployment,
 )
 
@@ -59,8 +59,7 @@ def _command(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--worker-groups",
         str(written_deployment(directory, [worker_config])),
         "--set",
