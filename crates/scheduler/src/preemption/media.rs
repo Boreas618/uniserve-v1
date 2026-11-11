@@ -71,29 +71,40 @@ impl Scheduler {
         cause: MigrationCause,
         select: impl Fn(RequestId) -> bool,
     ) {
-        let (queued, staying): (VecDeque<PendingMedia>, VecDeque<PendingMedia>) =
-            std::mem::take(&mut self.waiting_media)
-                .into_iter()
-                .partition(|pending| select(pending.request.request_id));
-        self.waiting_media = staying;
-        for pending in queued {
-            // A queued request stored nothing here: the daemon submits it
+        let waiting: Vec<RequestId> = self
+            .waiting
+            .iter()
+            .copied()
+            .filter(|id| {
+                select(*id)
+                    && self
+                        .requests
+                        .get(id)
+                        .is_some_and(|request| request.video().is_some())
+            })
+            .collect();
+        for id in waiting {
+            // A waiting request stored nothing here: the daemon submits it
             // again naming the trajectory it named.
-            let _ = pending.event_tx.send(Event::Migratable {
-                cause,
-                denoised_steps: 0,
-                stored_layout: Vec::new(),
-            });
+            self.end_waiting(
+                id,
+                scheduling::guest::event::End::Migratable,
+                Event::Migratable {
+                    cause,
+                    denoised_steps: 0,
+                    stored_layout: Vec::new(),
+                },
+            );
         }
         let running: Vec<RequestId> = self
-            .running_media
-            .iter()
-            .filter(|(id, state)| {
-                select(**id)
-                    && !state.terminal_intent.is_some()
-                    && self.scheduled_steps(**id, &state.denoising) < state.denoising.steps()
+            .requests
+            .running_video()
+            .filter(|(id, status, state)| {
+                select(*id)
+                    && !status.is_finished()
+                    && self.scheduled_steps(*id, &state.denoising) < state.denoising.steps()
             })
-            .map(|(id, _)| *id)
+            .map(|(id, _, _)| id)
             .collect();
         for id in running {
             if let Some(state) = self.media_state_mut(id) {
@@ -103,7 +114,9 @@ impl Scheduler {
                     ?cause,
                     "preempting a video request at its next denoising step boundary"
                 );
-                state.terminal_intent = Some(Terminal::migrate(cause));
+            }
+            if let Some(status) = self.requests.status_mut(&id) {
+                *status = RequestStatus::Finished(Terminal::migrate(cause));
             }
         }
     }
@@ -189,7 +202,7 @@ impl Scheduler {
             return true;
         };
         let preempted = Preempted {
-            request_key: state.admission.request_key,
+            request_key: state.request_key,
             registered: state.admission_state == WorkerRegistration::Registered,
             trajectory: state.request.trajectory.id,
             completed: state.denoising.completed(),
@@ -232,10 +245,10 @@ impl Scheduler {
         };
         let moved = store.poll();
         let pinning: Vec<RequestId> = self
-            .running_media
-            .iter()
-            .filter(|(_, state)| state.host_trajectory.restoring == Restoring::Pinning)
-            .map(|(id, _)| *id)
+            .requests
+            .running_video()
+            .filter(|(_, _, state)| state.host_trajectory.restoring == Restoring::Pinning)
+            .map(|(id, _, _)| id)
             .collect();
         for id in pinning {
             let Some(restored) = self
@@ -310,7 +323,7 @@ impl Scheduler {
         if trajectory.denoised_steps == 0 || trajectory.denoised_steps >= state.denoising.steps() {
             return Restoring::Ready(None);
         }
-        let request_key = state.admission.request_key;
+        let request_key = state.request_key;
         let Some(worker) = self.denoiser_worker(request_key) else {
             return Restoring::Ready(None);
         };

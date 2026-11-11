@@ -2,7 +2,7 @@
 //!
 //! The scheduler thread applies each frontend `Command` (see `crate::handle`)
 //! here. Cancelling a queued request finishes it at once. A running request
-//! records a terminal intent and closes only after every submitted call has
+//! has its end decided and closes only after every submitted call has
 //! resolved: a media request with nothing in flight finishes immediately, and
 //! `reap_cancellations` finishes the rest once their calls drain.
 //! Acknowledgements resolve the stop-string decisions a request awaits
@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::handle;
+use crate::request::Request;
 
 /// The name a stage's refusal uses.
 fn stage_name(stage: Stage) -> &'static str {
@@ -64,29 +65,17 @@ pub(super) struct ShadowPass {
 }
 
 impl Scheduler {
-    /// Removes a queued media request while preserving FIFO order for its peers.
-    fn remove_waiting_media(&mut self, request_id: RequestId) -> Option<PendingMedia> {
-        let index = self
-            .waiting_media
-            .iter()
-            .position(|submission| submission.request.request_id == request_id)?;
-        self.waiting_media.remove(index)
-    }
-
-    /// Removes a queued token request while preserving admission order for its peers.
-    pub(super) fn remove_waiting(&mut self, request_id: RequestId) -> Option<RequestState> {
-        if let Some(index) = self
-            .held_for_index
-            .iter()
-            .position(|held| held.req.request_id == request_id)
-        {
-            return Some(self.held_for_index.remove(index));
+    /// Takes a waiting request out of the queue and the request table,
+    /// preserving the order of its peers; `None` for a request that is not
+    /// waiting.
+    pub(super) fn remove_waiting(&mut self, id: RequestId) -> Option<Request> {
+        if let Some(index) = self.held_for_index.iter().position(|held| *held == id) {
+            self.held_for_index.remove(index);
+        } else {
+            let index = self.waiting.iter().position(|queued| *queued == id)?;
+            self.waiting.remove(index);
         }
-        let index = self
-            .waiting
-            .iter()
-            .position(|queued| queued.req.request_id == request_id)?;
-        self.waiting.remove(index)
+        self.requests.remove(&id)
     }
 
     /// Aborts every queued/gated/running request with a terminal event.
@@ -103,36 +92,22 @@ impl Scheduler {
         self.release_held_for_index();
         self.inflight.pending_submissions.clear();
 
-        while let Some(submission) = self.waiting_media.pop_front() {
-            let _ = submission.event_tx.send(Event::Finished {
-                reason: FinishReason::Aborted,
-                stop_reason: None,
-                prompt_tokens: submission.request.prompt_token_ids.len(),
-                completion_tokens: 0,
-            });
-        }
-        let media = self.media_ids();
-        for id in media {
-            self.finish_media(id, Terminal::finish(FinishReason::Aborted));
-        }
-
-        let queued: Vec<RequestId> = {
-            let mut ids = Vec::new();
-            while let Some(st) = self.waiting.pop_front() {
-                ids.push(st.req.request_id);
-                let _ = st.output.events.event_tx.send(Event::Finished {
+        while let Some(id) = self.waiting.pop_front() {
+            if let Some(request) = self.requests.remove(&id) {
+                let _ = request.event_tx().send(Event::Finished {
                     reason: FinishReason::Aborted,
                     stop_reason: None,
-                    prompt_tokens: st.charged_prompt_tokens(),
+                    prompt_tokens: request.prompt_tokens(),
                     completion_tokens: 0,
                 });
             }
-            ids
-        };
-        let _ = queued;
-        let running: Vec<RequestId> = self.running.keys().copied().collect();
-        for id in running {
-            self.finish(id, FinishReason::Aborted);
+        }
+        for id in self.running.clone() {
+            if self.requests.video(&id).is_some() {
+                self.finish_media(id, Terminal::finish(FinishReason::Aborted));
+            } else {
+                self.finish(id, FinishReason::Aborted);
+            }
         }
 
         // Every running request has now retired its journal, so the retained
@@ -142,9 +117,8 @@ impl Scheduler {
 
     /// Applies one command; returns true on shutdown.
     ///
-    /// Every submission is validated by `enqueue` or `enqueue_media`, which
-    /// refuse what the loaded workers cannot serve and report their own
-    /// rejections.
+    /// Every submission is validated by `add_request`, which refuses what
+    /// the loaded workers cannot serve and reports its own rejections.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         // Work that finished on another thread before this command arrived is
         // taken first, so every answer describes the state the command found:
@@ -156,12 +130,7 @@ impl Scheduler {
         match cmd {
             Command::Submit(submissions) => {
                 for Submission { request, event_tx } in submissions {
-                    match *request {
-                        Request::Generation(request) => self.enqueue(*request, event_tx),
-                        Request::Diffusion(request) => {
-                            self.enqueue_media(request, event_tx, crate::clock::now_monotonic_us())
-                        }
-                    }
+                    self.add_request(*request, event_tx);
                 }
             }
             Command::Cancel(request_id) => self.mark_cancelled(request_id, false),
@@ -860,76 +829,50 @@ impl Scheduler {
         self.recorder.record(views::ended(id, end));
     }
 
-    /// Records cancellation or abortion across queued, media, and running request states.
+    /// Cancels the request `id` for its client, or drops it when `abort`.
     ///
-    /// A queued request finishes here with `Aborted` or `Cancelled`. A running
-    /// media request records the reason, keeping an earlier terminal intent,
-    /// and finishes here only when none of its calls are in flight. A running
-    /// token request drops its pending decoder decisions, records the reason
-    /// as its terminal intent and is finished by `reap_cancellations` once its
+    /// A waiting request finishes here with `Aborted` or `Cancelled`. A
+    /// running video request records the reason, keeping an earlier decided
+    /// end, and finishes here only when none of its calls are in flight. A
+    /// running token request drops its pending decoder decisions, records
+    /// the reason as its end and is retired by `reap_cancellations` once its
     /// calls drain. Unknown requests are ignored.
     pub(super) fn mark_cancelled(&mut self, id: RequestId, abort: bool) {
-        if let Some(submission) = self.remove_waiting_media(id) {
-            let reason = if abort {
-                FinishReason::Aborted
-            } else {
-                FinishReason::Cancelled
-            };
+        let reason = if abort {
+            FinishReason::Aborted
+        } else {
+            FinishReason::Cancelled
+        };
+        let Some(request) = self.requests.get_mut(&id) else {
+            return;
+        };
+        if !request.admitted() {
             // Both reasons are the client's will: it cancelled the request, or
             // it asked for it to be dropped, and the epoch goes on either way.
-            self.announce_end(id, scheduling::guest::event::End::Cancelled);
-            let _ = submission.event_tx.send(Event::Finished {
-                reason,
-                stop_reason: None,
-                prompt_tokens: submission.request.prompt_token_ids.len(),
-                completion_tokens: 0,
-            });
-            return;
-        }
-        if let Some(state) = self.media_state_mut(id) {
-            latch_finish(
-                &mut state.terminal_intent,
-                if abort {
-                    FinishReason::Aborted
-                } else {
-                    FinishReason::Cancelled
+            let prompt_tokens = request.prompt_tokens();
+            self.end_waiting(
+                id,
+                scheduling::guest::event::End::Cancelled,
+                Event::Finished {
+                    reason,
+                    stop_reason: None,
+                    prompt_tokens,
+                    completion_tokens: 0,
                 },
             );
-            let drained = !self.inflight.has_pending_calls(id);
-            if drained {
-                self.finish_media(
-                    id,
-                    Terminal::finish(if abort {
-                        FinishReason::Aborted
-                    } else {
-                        FinishReason::Cancelled
-                    }),
-                );
-            }
             return;
         }
-        if let Some(st) = self.running.get_mut(&id) {
-            st.output.decoder_boundaries.clear();
-            st.terminal_intent = if abort {
-                Some(Terminal::finish(FinishReason::Aborted))
-            } else {
-                Some(Terminal::finish(FinishReason::Cancelled))
-            };
-        }
-        // A request not yet admitted leaves the waiting queue with its reason.
-        if let Some(st) = self.remove_waiting(id) {
-            self.announce_end(id, scheduling::guest::event::End::Cancelled);
-            let reason = if abort {
-                FinishReason::Aborted
-            } else {
-                FinishReason::Cancelled
-            };
-            let _ = st.output.events.event_tx.send(Event::Finished {
-                reason,
-                stop_reason: None,
-                prompt_tokens: st.charged_prompt_tokens(),
-                completion_tokens: 0,
-            });
+        match &mut request.graph {
+            Graph::Video(_) => {
+                request.status.finish(Terminal::finish(reason.clone()));
+                if !self.inflight.has_pending_calls(id) {
+                    self.finish_media(id, Terminal::finish(reason));
+                }
+            }
+            Graph::Tokens(state) => {
+                state.output.decoder_boundaries.clear();
+                request.status = RequestStatus::Finished(Terminal::finish(reason));
+            }
         }
     }
 
@@ -941,7 +884,7 @@ impl Scheduler {
     /// and may apply a finish deferred on them. Requests that are not running
     /// are ignored.
     pub(super) fn acknowledge_output(&mut self, id: RequestId, output_token_count: usize) {
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         while state
@@ -975,16 +918,27 @@ impl Scheduler {
         if self.config.canvas.is_some() {
             return;
         }
-        let queued: Vec<RequestId> = self.waiting.iter().map(|st| st.req.request_id).collect();
-        for id in queued {
-            if let Some(st) = self.remove_waiting(id) {
-                self.announce_end(id, scheduling::guest::event::End::Migratable);
-                let _ = st.output.events.event_tx.send(Event::Migratable {
+        let waiting: Vec<RequestId> = self
+            .waiting
+            .iter()
+            .chain(&self.held_for_index)
+            .copied()
+            .filter(|id| {
+                self.requests
+                    .get(id)
+                    .is_some_and(|request| request.tokens().is_some())
+            })
+            .collect();
+        for id in waiting {
+            self.end_waiting(
+                id,
+                scheduling::guest::event::End::Migratable,
+                Event::Migratable {
                     cause,
                     denoised_steps: 0,
                     stored_layout: Vec::new(),
-                });
-            }
+                },
+            );
         }
         self.migrate_running(cause, |_| true);
     }
@@ -1000,13 +954,19 @@ impl Scheduler {
         if self.config.canvas.is_some() {
             return;
         }
-        for (id, st) in self.running.iter_mut() {
-            if select(*id)
-                && !st.terminal_intent.is_some()
-                && !self.inflight.pending_finishes.contains_key(id)
-            {
-                st.output.decoder_boundaries.clear();
-                st.terminal_intent = Some(Terminal::migrate(cause));
+        for id in self.running.clone() {
+            if !select(id) || self.inflight.pending_finishes.contains_key(&id) {
+                continue;
+            }
+            let Some(request) = self.requests.get_mut(&id) else {
+                continue;
+            };
+            if request.status.is_finished() {
+                continue;
+            }
+            if let Graph::Tokens(state) = &mut request.graph {
+                state.output.decoder_boundaries.clear();
+                request.status = RequestStatus::Finished(Terminal::migrate(cause));
             }
         }
     }
@@ -1014,14 +974,20 @@ impl Scheduler {
     /// Stops a running token request whose frontend decoder matched a stop
     /// string.
     ///
-    /// Drops pending decoder decisions and sets a `Stop` terminal intent that
+    /// Drops pending decoder decisions and decides a `Stop` end that
     /// `reap_cancellations` applies once the request's calls drain. Requests
     /// that are not running are ignored.
     pub(super) fn mark_stopped(&mut self, id: RequestId) {
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(request) = self
+            .requests
+            .get_mut(&id)
+            .filter(|request| request.admitted())
+        else {
             return;
         };
-        state.output.decoder_boundaries.clear();
-        state.terminal_intent = Some(Terminal::finish(FinishReason::Stop));
+        if let Graph::Tokens(state) = &mut request.graph {
+            state.output.decoder_boundaries.clear();
+            request.status = RequestStatus::Finished(Terminal::finish(FinishReason::Stop));
+        }
     }
 }

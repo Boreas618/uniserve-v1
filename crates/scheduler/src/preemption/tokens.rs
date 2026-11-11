@@ -39,8 +39,8 @@ impl Scheduler {
             .starved
             .iter()
             .filter_map(|&(id, needed)| {
-                let state = self.running.get(&id)?;
-                if state.terminal_intent.is_some() {
+                let state = self.requests.tokens(&id)?;
+                if self.requests.finished(&id) {
                     return None;
                 }
                 let held: usize = state
@@ -60,11 +60,8 @@ impl Scheduler {
                 "a request needs more KV cache units than the cache holds: it ends at the length \
                  the cache holds"
             );
-            if let Some(state) = self.running.get_mut(&id) {
-                crate::terminal::latch_finish(
-                    &mut state.terminal_intent,
-                    FinishReason::CacheCapacity,
-                );
+            if let Some(status) = self.requests.status_mut(&id) {
+                status.finish(Terminal::finish(FinishReason::CacheCapacity));
             }
         }
     }
@@ -92,29 +89,33 @@ impl Scheduler {
             || !self.inflight.pending_batches.is_empty()
             || !self.inflight.pending_submissions.is_empty()
             || self
-                .running
-                .values()
-                .any(|state| state.terminal_intent.is_some())
+                .requests
+                .running_tokens()
+                .any(|(_, status, _)| status.is_finished())
         {
             return;
         }
         let starved = |id: &RequestId| self.starved.iter().any(|(starved, _)| starved == id);
-        let live: Vec<(&RequestId, &RequestState)> = self
-            .running
-            .iter()
-            .filter(|(_, state)| !state.terminal_intent.is_some())
+        // Each live token request with its priority and the time it arrived.
+        let live: Vec<(RequestId, i32, u64)> = self
+            .requests
+            .running_tokens()
+            .filter(|(_, status, _)| !status.is_finished())
+            .map(|(id, _, state)| {
+                let queued_us = self
+                    .requests
+                    .get(&id)
+                    .map_or(0, |request| request.queued_us);
+                (id, state.req.priority, queued_us)
+            })
             .collect();
-        if live.len() < 2 || live.iter().any(|(id, _)| !starved(id)) {
+        if live.len() < 2 || live.iter().any(|(id, _, _)| !starved(id)) {
             return;
         }
         let Some(victim) = live
             .iter()
-            .max_by(|(_, a), (_, b)| {
-                (a.req.priority, a.queued_us)
-                    .partial_cmp(&(b.req.priority, b.queued_us))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(id, _)| **id)
+            .max_by_key(|(_, priority, queued_us)| (*priority, *queued_us))
+            .map(|(id, _, _)| *id)
         else {
             return;
         };

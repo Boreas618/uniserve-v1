@@ -411,9 +411,9 @@ impl Scheduler {
             None => Vec::new(),
         };
         let ready: Vec<RequestId> = self
-            .running
-            .iter()
-            .filter(|(id, state)| {
+            .requests
+            .running_tokens()
+            .filter(|(id, _, state)| {
                 state.phase == crate::generation::GenerationPhase::HandOff
                     && state.hand_off == crate::generation::HandOff::None
                     && state.failure.is_none()
@@ -423,14 +423,14 @@ impl Scheduler {
                         .get(id)
                         .is_none_or(|calls| calls.is_empty())
             })
-            .map(|(id, _)| *id)
+            .map(|(id, _, _)| id)
             .collect();
         let mut progressed = !ended.is_empty();
         for id in ready {
             progressed |= self.start_hand_off(id);
         }
         for (id, end) in ended {
-            let Some(state) = self.running.get_mut(&id) else {
+            let Some(state) = self.requests.tokens_mut(&id) else {
                 continue;
             };
             match end {
@@ -469,7 +469,7 @@ impl Scheduler {
     /// its prefill group. Returns whether the request moved on: its copy
     /// started, or it failed.
     fn start_hand_off(&mut self, id: RequestId) -> bool {
-        let Some(state) = self.running.get(&id) else {
+        let Some(state) = self.requests.tokens(&id) else {
             return false;
         };
         let key = RequestKey::new(self.engine_id, id, state.request_epoch);
@@ -502,7 +502,7 @@ impl Scheduler {
         };
         match started {
             Ok(()) => {
-                if let Some(state) = self.running.get_mut(&id) {
+                if let Some(state) = self.requests.tokens_mut(&id) {
                     state.hand_off = crate::generation::HandOff::Copying;
                 }
             }

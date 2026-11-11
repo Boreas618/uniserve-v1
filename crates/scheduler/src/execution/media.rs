@@ -11,14 +11,20 @@
 use super::*;
 use ipc::MediaCall;
 
-/// Scheduler state of one admitted diffusion (media) request, advanced by the
-/// media path in `execution` rather than by `RequestState`.
-pub(crate) struct MediaFlowState {
+/// A video request's graph and what it holds: the calls of its chain
+/// (`graph::VideoGraph`), the products its calls bound, its storage and its
+/// output. Built when the request arrives; admission fills what the request
+/// holds (`allocations`, `reservations`, `admission`).
+pub(crate) struct VideoState {
     pub(crate) request: DiffusionRequest,
+    /// The request's identity on the workers, fixed when it arrives.
+    pub(crate) request_key: RequestKey,
     /// The calls the request runs, the products connecting them and where
     /// each call stands (`graph::NodeState`), which readiness is derived from.
     pub(crate) graph: VideoGraph,
     pub(crate) output: output::EventJournal,
+    /// The rows and output buffers admission reserved on the routed workers;
+    /// empty while the request waits.
     pub(crate) allocations: MediaAllocations,
     /// Each product the request reserved, by its declared name, with the
     /// component output it is reserved under.
@@ -55,30 +61,64 @@ pub(crate) struct MediaFlowState {
     pub(crate) muxing_inputs: Vec<TensorRef>,
     pub(crate) audio: Option<TensorRef>,
     /// Static worker admission, sent as a `BatchCommand::Start` in the batch
-    /// of the request's first scheduled call.
-    pub(crate) admission: NewRequest,
+    /// of the request's first scheduled call; `None` while the request waits.
+    pub(crate) admission: Option<NewRequest>,
     pub(crate) admission_state: WorkerRegistration,
     /// Solver progress of the request's latent trajectory.
     pub(crate) denoising: Denoising,
     pub(crate) scheduled_decode_units: u32,
     pub(crate) scheduled_encode_units: u32,
     pub(crate) predecessor: CallId,
-    pub(crate) terminal_intent: Option<Terminal>,
     pub(crate) artifact: Option<ArtifactEvent>,
     /// The request's trajectory in the host latent pools.
     pub(crate) host_trajectory: HostTrajectory,
 }
 
-/// A video request waiting for admission, with the graph built when it
-/// was queued.
-pub(crate) struct PendingMedia {
-    pub(crate) request: DiffusionRequest,
-    /// The request's call graph, built when it was queued.
-    pub(crate) graph: VideoGraph,
-    pub(crate) event_tx: EventTx,
-    /// Monotonic microseconds (`clock::now_monotonic_us`) at which the
-    /// request entered the waiting queue.
-    pub(crate) queued_us: u64,
+impl VideoState {
+    /// The state of a video request that just arrived: its graph, with
+    /// nothing scheduled and nothing held.
+    pub(crate) fn new(
+        request: DiffusionRequest,
+        request_key: RequestKey,
+        graph: VideoGraph,
+        event_tx: EventTx,
+        steps: u32,
+    ) -> Self {
+        Self {
+            request,
+            request_key,
+            graph,
+            output: output::EventJournal::new(event_tx),
+            allocations: MediaAllocations {
+                request_slots: HashMap::new(),
+                tensors: HashMap::new(),
+            },
+            reservations: HashMap::new(),
+            buffer_bindings: HashMap::new(),
+            condition_media: HashMap::new(),
+            vision_features: None,
+            scheduled_condition_units: 0,
+            encoded_condition_units: 0,
+            condition_video_latents: Vec::new(),
+            condition_audio_latents: None,
+            conditioning: None,
+            latents: Vec::new(),
+            decoded_units: BTreeMap::new(),
+            encoded_units: BTreeMap::new(),
+            encoded_ready: BTreeMap::new(),
+            handed_units: 0,
+            muxing_inputs: Vec::new(),
+            audio: None,
+            admission: None,
+            admission_state: WorkerRegistration::Unsubmitted,
+            denoising: Denoising::new(steps),
+            scheduled_decode_units: 0,
+            scheduled_encode_units: 0,
+            predecessor: CallId::new(0, 0),
+            artifact: None,
+            host_trajectory: HostTrajectory::default(),
+        }
+    }
 }
 
 /// Denoising steps one video request keeps in flight: the step its
@@ -188,7 +228,7 @@ impl Occupancy {
 impl Scheduler {
     /// The cursors of the completed encode rounds the muxer can take next:
     /// the contiguous run that starts where the units it holds end.
-    fn ready_encode_rounds(state: &MediaFlowState) -> Vec<u32> {
+    fn ready_encode_rounds(state: &VideoState) -> Vec<u32> {
         let mut rounds = Vec::new();
         let mut cursor = state.handed_units;
         while let Some(units) = state.encoded_ready.get(&cursor) {
@@ -241,7 +281,7 @@ impl Scheduler {
             .collect()
     }
 
-    pub(crate) fn ready_calls(&self, state: &MediaFlowState) -> Vec<MediaCall> {
+    pub(crate) fn ready_calls(&self, state: &VideoState) -> Vec<MediaCall> {
         let sampling = state.request.sampling;
         let graph = &state.graph;
         // A product is produced once its producing call has left the
@@ -275,7 +315,7 @@ impl Scheduler {
         let resolved = |name: &'static str| {
             self.encoder_outputs
                 .as_ref()
-                .is_none_or(|store| store.resolved(state.admission.request_key, video_output(name)))
+                .is_none_or(|store| store.resolved(state.request_key, video_output(name)))
         };
         let mut ready = Vec::new();
         if graph.encodes_vision() && graph.pending(MediaCall::VisionEncoding) {
@@ -384,7 +424,7 @@ impl Scheduler {
         let Some(inputs) = state.request.encoder_inputs.as_ref() else {
             return;
         };
-        let request_key = state.admission.request_key;
+        let request_key = state.request_key;
         // The visual condition latents are one output, of every unit.
         let units = (!inputs.video_units.is_empty()).then(|| {
             let mut digest = storage::key::Digest::new(b"encoder-units");
@@ -554,8 +594,8 @@ impl Scheduler {
     ///
     /// Returns `None` as well when no component or worker serves latent
     /// encoding.
-    fn latent_round(&self, state: &MediaFlowState) -> Option<(u32, Vec<u32>)> {
-        let request = state.admission.request_key;
+    fn latent_round(&self, state: &VideoState) -> Option<(u32, Vec<u32>)> {
+        let request = state.request_key;
         let work = CallKind::Media(MediaCall::LatentEncoding);
         let component = self.media_component(MediaCall::LatentEncoding)?;
         let (worker, config) = self.placed_component(request, work, &component)?;
@@ -810,13 +850,13 @@ impl Scheduler {
         // its calls as well: another request's preparation or step in such a gap would open its own
         // trajectory over the first one's. A preempted request keeps it until it leaves, which is
         // after its trajectory was written to the host latent pool.
-        for (id, state) in &self.running_media {
+        for (id, _, state) in self.requests.running_video() {
             if !state.graph.pending(MediaCall::LatentPreparation)
                 && state.denoising.completed() < state.denoising.steps()
             {
                 occupancy.occupy(
-                    &self.media_demand(state.admission.request_key, MediaCall::Denoising, 1),
-                    *id,
+                    &self.media_demand(state.request_key, MediaCall::Denoising, 1),
+                    id,
                 );
             }
         }
@@ -858,7 +898,7 @@ impl Scheduler {
     /// decode round always claims the whole capacity. The capacity counts as
     /// one when the component is not measured in media units or the request
     /// is not yet placed on it.
-    pub(crate) fn call_units(&self, state: &MediaFlowState, media_call: MediaCall) -> u32 {
+    pub(crate) fn call_units(&self, state: &VideoState, media_call: MediaCall) -> u32 {
         let width = || {
             self.media_component(media_call)
                 .as_deref()
@@ -866,7 +906,7 @@ impl Scheduler {
                     let worker = self
                         .dispatch
                         .affinity
-                        .get(&(state.admission.request_key, name.to_owned()))?;
+                        .get(&(state.request_key, name.to_owned()))?;
                     self.component_units(worker, name)
                 })
                 .unwrap_or(1)
@@ -915,7 +955,7 @@ impl Scheduler {
         let work = CallKind::Media(media_call);
         let component = self.info.media_components[&media_call].clone();
         let state = self.media_state(id).ok_or("a media candidate is running")?;
-        let request_key = state.admission.request_key;
+        let request_key = state.request_key;
         let stateful = work.advances_state();
 
         // A video request advances one denoising step per call.
@@ -1198,7 +1238,12 @@ impl Scheduler {
             .media_state_mut(id)
             .ok_or("a media candidate is running")?;
         if state.admission_state == WorkerRegistration::Unsubmitted {
-            admissions.push(state.admission.clone());
+            admissions.push(
+                state
+                    .admission
+                    .clone()
+                    .ok_or("an admitted video request states its admission")?,
+            );
             state.admission_state = WorkerRegistration::InFlight;
         }
         for (product, ((component, index), start)) in call.outputs.iter().zip(output_starts) {

@@ -138,7 +138,7 @@ impl Scheduler {
     /// policy reads or writes cached outputs (`CachePolicy`); while that
     /// replica has no room for the call, the encoding waits.
     pub(super) fn encoding_ready(&mut self, id: RequestId, encoding: Encoding) -> bool {
-        let Some(state) = self.running.get(&id) else {
+        let Some(state) = self.requests.tokens(&id) else {
             return false;
         };
         if self.encoder_outputs.is_none() {
@@ -176,7 +176,7 @@ impl Scheduler {
                 output = encoding.output.name,
                 "the image encoding is computed: no rank states its rows"
             );
-            if let Some(state) = self.running.get_mut(&id) {
+            if let Some(state) = self.requests.tokens_mut(&id) {
                 state.host_encoding = Some(encoding);
             }
             return true;
@@ -212,7 +212,7 @@ impl Scheduler {
         );
         // An encoding that could not be looked up is computed: its call
         // carries no host output.
-        if let Some(state) = self.running.get_mut(&id) {
+        if let Some(state) = self.requests.tokens_mut(&id) {
             state.host_encoding = Some(encoding);
         }
         self.encoder_outputs
@@ -223,7 +223,7 @@ impl Scheduler {
     /// Ends request `id`'s lookup of `encoding` in the host encoder pools,
     /// which the request reads from its engine's encoder cache instead.
     pub(super) fn drop_host_encoding(&mut self, id: RequestId, encoding: Encoding) {
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         if state.host_encoding != Some(encoding) {
@@ -249,7 +249,7 @@ impl Scheduler {
         ) {
             return;
         }
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         let Some(encoding) = state.host_encoding.take() else {

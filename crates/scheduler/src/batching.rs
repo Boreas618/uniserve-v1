@@ -138,8 +138,8 @@ impl Scheduler {
     fn reserve_generation_resources(&mut self, call: &Call) -> Option<Vec<BufferSpan>> {
         let id = call.request_key.request_id;
         let request_key = self
-            .running
-            .get(&id)
+            .requests
+            .tokens(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
         self.dispatch.worker_target(
             &self.worker,
@@ -243,7 +243,7 @@ impl Scheduler {
             // A media request lives in the media flow's own state, which the
             // token rule cannot read: `can_schedule_next` finds no token state
             // for it and would refuse every media call of the epoch.
-            let ready = if self.running_media.contains_key(&id) {
+            let ready = if self.requests.video(&id).is_some() {
                 self.media_can_schedule_next(id)
             } else {
                 self.can_schedule_next(id)
@@ -251,18 +251,12 @@ impl Scheduler {
             if !ready {
                 continue;
             }
-            // A media request's terminal intent lives in its own state; a
-            // request in neither map is one this pass must not serve.
+            // A request whose end is decided schedules nothing, and one that is
+            // not running is one this pass must not serve.
             let cancelled = self
-                .running
+                .requests
                 .get(&id)
-                .map(|state| state.terminal_intent.is_some())
-                .or_else(|| {
-                    self.running_media
-                        .get(&id)
-                        .map(|state| state.terminal_intent.is_some())
-                })
-                .unwrap_or(true);
+                .is_none_or(|request| !request.admitted() || request.status.is_finished());
             if cancelled {
                 continue;
             }
@@ -296,7 +290,7 @@ impl Scheduler {
                 {
                     continue;
                 }
-                let request_key = state.admission.request_key;
+                let request_key = state.request_key;
                 let units = self.call_units(state, media_call);
                 let demand = self.media_demand(request_key, media_call, units);
                 let occupancy = media_occupancy.get_or_insert_with(|| self.media_occupancy());
@@ -389,7 +383,7 @@ impl Scheduler {
                 // resources does below.
                 let prefill = call.kind == CallKind::Forward(ForwardMode::Prefill);
                 if prefill && rows_left.context == 0 {
-                    if let Some(state) = self.running.get_mut(&id) {
+                    if let Some(state) = self.requests.tokens_mut(&id) {
                         state.num_cache_units_sent = state
                             .num_cache_units_sent
                             .saturating_sub(u64::from(call.bounds.max_cache_units));
@@ -407,7 +401,7 @@ impl Scheduler {
                     self.record_domain_backpressure(call.kind);
                     // Planning a forward advanced `num_cache_units_sent` past its
                     // fresh units; roll it back so the next plan declares them.
-                    if let Some(state) = self.running.get_mut(&id) {
+                    if let Some(state) = self.requests.tokens_mut(&id) {
                         state.num_cache_units_sent = state
                             .num_cache_units_sent
                             .saturating_sub(u64::from(call.bounds.max_cache_units));
@@ -453,8 +447,8 @@ impl Scheduler {
                 // A request's first call carries its `Start` admission in the
                 // same batch.
                 let finish_token_ids = self
-                    .running
-                    .get(&id)
+                    .requests
+                    .tokens(&id)
                     .map(|state| state.finish_token_ids.clone())
                     .unwrap_or_default();
                 let engine_id = self.engine_id;
@@ -463,10 +457,10 @@ impl Scheduler {
                 // group, with the token it generated on the prefill group,
                 // which its penalties count.
                 let hand_off = self
-                    .running
-                    .get(&id)
+                    .requests
+                    .tokens(&id)
                     .is_some_and(|st| st.hand_off == generation::HandOff::Copied);
-                if let Some(st) = self.running.get_mut(&id)
+                if let Some(st) = self.requests.tokens_mut(&id)
                     && (!st.worker_registered || hand_off)
                 {
                     let request_key = RequestKey::new(engine_id, id, st.request_epoch);
@@ -698,7 +692,7 @@ impl Scheduler {
         // decode's row uninstalled and its gather read whatever the slot held before. One value,
         // one statement - the table this batch addresses.
         for ((call, _), placed) in batch.requests.iter().zip(&mut layouts) {
-            let Some(state) = self.running.get(&call.request_key.request_id) else {
+            let Some(state) = self.requests.tokens(&call.request_key.request_id) else {
                 tracing::debug!(
                     "a batch is dropped: {:?} names a request this scheduler is not running",
                     call.request_key.request_id
@@ -863,7 +857,7 @@ impl Scheduler {
             return;
         }
         for (call, _) in &batch.requests {
-            if let Some(state) = self.running.get_mut(&call.request_key.request_id) {
+            if let Some(state) = self.requests.tokens_mut(&call.request_key.request_id) {
                 state.state_resident = true;
                 // The batch started the request's sampling state on its worker's slot.
                 state.sampling_resident = true;
@@ -936,10 +930,9 @@ impl Scheduler {
             return;
         };
         // The batch's requests share a bucket, so the first states the shape it is found by.
-        let extent = self
-            .running_media
-            .get(&first.request_key.request_id)
-            .map_or(ipc::execution::Extent::None, |state| {
+        let extent = self.requests.video(&first.request_key.request_id).map_or(
+            ipc::execution::Extent::None,
+            |state| {
                 let sampling = &state.request.sampling;
                 ipc::execution::Extent::Request {
                     frames: sampling.num_frames,
@@ -949,7 +942,8 @@ impl Scheduler {
                         .unwrap_or(u32::MAX),
                     condition_rows: sampling.condition_rows,
                 }
-            });
+            },
+        );
         let mut stated = ipc::execution::Computation {
             call: media_call,
             rows,
@@ -974,7 +968,7 @@ impl Scheduler {
             // image travels with the call (`Batch::images`).
             if media_call == ipc::MediaCall::VisionEncoding
                 && call.input_image.is_some()
-                && self.running.contains_key(&call.request_key.request_id)
+                && self.requests.tokens(&call.request_key.request_id).is_some()
             {
                 requests.push(ipc::execution::StagedRequest {
                     request: call.request_key,
@@ -990,7 +984,7 @@ impl Scheduler {
                 });
                 continue;
             }
-            let Some(state) = self.running_media.get(&call.request_key.request_id) else {
+            let Some(state) = self.requests.video(&call.request_key.request_id) else {
                 tracing::debug!(
                     "a media batch is dropped: {:?} names a request this scheduler is not running",
                     call.request_key.request_id
@@ -1089,7 +1083,7 @@ impl Scheduler {
     /// The calls ahead are folded as the trajectory sees them (`Denoising::scheduled`): a latent
     /// preparation still in flight opens it at the step it restores, so the steps after a restore
     /// are numbered from the stored step even before the preparation's result arrives.
-    fn step_of(&self, id: RequestId, call_id: CallId, state: &MediaFlowState) -> u32 {
+    fn step_of(&self, id: RequestId, call_id: CallId, state: &VideoState) -> u32 {
         state.denoising.scheduled(
             self.inflight
                 .pending_calls
@@ -1119,7 +1113,7 @@ impl Scheduler {
         let mut columns = ipc::execution::BatchColumns::default();
         columns.rows.query_offsets.push(0);
         for (call, _) in &batch.requests {
-            let state = self.running_media.get(&call.request_key.request_id)?;
+            let state = self.requests.video(&call.request_key.request_id)?;
             let prompt = &state.request.prompt_token_ids;
             let length = i32::try_from(prompt.len()).ok()?;
             columns.input_ids.extend(prompt.iter().map(|id| *id as i32));
@@ -1142,7 +1136,7 @@ impl Scheduler {
     /// phase decides. Returns `None` when the request is not running or has
     /// no call to issue.
     pub(super) fn peek_next_call_variant(&self, id: RequestId) -> Option<CallKind> {
-        let st = self.running.get(&id)?;
+        let st = self.requests.tokens(&id)?;
         if let Some(variant) = self.pending_successor_code(id) {
             return Some(variant);
         }

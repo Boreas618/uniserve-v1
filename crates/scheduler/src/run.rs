@@ -208,10 +208,8 @@ impl Scheduler {
             info,
             generation_limits,
             special_tokens,
+            requests: request::Requests::default(),
             waiting: VecDeque::new(),
-            waiting_media: VecDeque::new(),
-            running: residents::Residents::default(),
-            running_media: HashMap::new(),
             speculation_meter: Default::default(),
             retiring_requests: HashMap::new(),
             rows_held: 0,
@@ -219,7 +217,7 @@ impl Scheduler {
             epoch: 0,
             next_product_generation: 1,
             next_request_epoch: 1,
-            running_order: Vec::new(),
+            running: Vec::new(),
             output: output::OutputSender::default(),
             policy: None,
             policy_report: None,
@@ -724,35 +722,30 @@ impl Scheduler {
         Arc::clone(&self.failure)
     }
 
-    /// Returns shared access to a media request state.
-    pub(super) fn media_state(&self, id: RequestId) -> Option<&MediaFlowState> {
-        self.running_media.get(&id)
+    /// Returns shared access to an admitted video request's state.
+    pub(super) fn media_state(&self, id: RequestId) -> Option<&VideoState> {
+        self.requests.video(&id)
     }
 
-    /// Returns mutable access to a media request state.
-    pub(super) fn media_state_mut(&mut self, id: RequestId) -> Option<&mut MediaFlowState> {
-        self.running.mark(id);
-        self.running_media.get_mut(&id)
+    /// Returns mutable access to an admitted video request's state.
+    pub(super) fn media_state_mut(&mut self, id: RequestId) -> Option<&mut VideoState> {
+        self.requests.video_mut(&id)
     }
 
-    /// Returns the active media request identifiers.
+    /// Returns the admitted video requests' identifiers, in id order.
     pub(super) fn media_ids(&self) -> Vec<RequestId> {
-        self.running_media.keys().copied().collect()
-    }
-
-    /// Removes and returns a media request's state.
-    pub(super) fn take_media_state(&mut self, id: RequestId) -> Option<MediaFlowState> {
-        self.running_media.remove(&id)
+        self.requests.running_video().map(|(id, _, _)| id).collect()
     }
 
     /// Returns the number of running requests.
     pub(super) fn running_request_count(&self) -> usize {
-        self.running.len().saturating_add(self.running_media.len())
+        self.running.len()
     }
 
-    /// Returns the number of pending requests.
+    /// Returns the number of requests awaiting admission, the ones held for
+    /// their predecessor's index included.
     pub(super) fn pending_request_count(&self) -> usize {
-        self.waiting.len().saturating_add(self.waiting_media.len())
+        self.waiting.len().saturating_add(self.held_for_index.len())
     }
 
     /// All drivers consume the same command ingress before scheduling work.

@@ -22,7 +22,7 @@ impl Scheduler {
         id: RequestId,
         build: impl FnOnce(&Self, &GenerationRequest) -> Result<Call, generation::PlanningError>,
     ) -> Option<Call> {
-        let planned = build(self, &self.running.get(&id)?.req);
+        let planned = build(self, &self.requests.tokens(&id)?.req);
         match planned {
             Ok(mut call) => {
                 if matches!(
@@ -33,7 +33,7 @@ impl Scheduler {
                 ) {
                     // The cache owner keeps unit identities. The scheduled record
                     // only needs the number of fresh units for dispatch and drain.
-                    let state = self.running.get_mut(&id)?;
+                    let state = self.requests.tokens_mut(&id)?;
                     let Some(allocated) = state
                         .allocations()
                         .map(|allocations| allocations.prefix_cache.allocated_units())
@@ -76,7 +76,7 @@ impl Scheduler {
     ) -> Option<Call> {
         let canvas_rows = rows.canvas;
         let (_, cache_visible_len) = self.scheduled_token_lengths(id)?;
-        let context_pending = self.running.get(&id).is_some_and(|st| {
+        let context_pending = self.requests.tokens(&id).is_some_and(|st| {
             self.num_scheduled_prompt_tokens(id)
                 .is_some_and(|count| count < st.req.prompt_token_ids.len() as u32)
                 || self
@@ -89,7 +89,7 @@ impl Scheduler {
         let phase = self.next_generation_phase(id)?;
         match phase {
             Phase::Prefill => {
-                let st = self.running.get(&id)?;
+                let st = self.requests.tokens(&id)?;
                 let samples = self.config.canvas.is_none();
                 let n = st.req.prompt_token_ids.len();
                 let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
@@ -104,7 +104,7 @@ impl Scheduler {
                 // token after it, and the last proposes drafts, whose
                 // chained steps take the positions after the prompt.
                 let draft = if self.speculates() {
-                    let prompt = &self.running.get(&id)?.req.prompt_token_ids;
+                    let prompt = &self.requests.tokens(&id)?.req.prompt_token_ids;
                     ipc::DraftWork {
                         proposals: if end == n {
                             self.proposals_for(id, cache_visible_len)
@@ -146,7 +146,7 @@ impl Scheduler {
             // the tokens it accepted and the drafts after them.
             Phase::DecodeUnd if self.speculates() => {
                 let sampling_state = self.build_token_masks(id, 0);
-                let input_token = self.running.get(&id)?.next_token;
+                let input_token = self.requests.tokens(&id)?.next_token;
                 let drafts = self.verify_drafts(id, cache_visible_len);
                 let proposals = self.proposals_for(id, cache_visible_len);
                 // The cache holds the verified tokens and, for the drafter's
@@ -204,7 +204,7 @@ impl Scheduler {
                     0
                 };
                 let sampling_state = self.build_token_masks(id, projected);
-                let st = self.running.get(&id)?;
+                let st = self.requests.tokens(&id)?;
                 // The prior committed token this decode continues from. It is
                 // attached as a host input only when no exact selected-point
                 // product is eligible for device continuation.
@@ -235,7 +235,7 @@ impl Scheduler {
                 // prefill that completes its context: the prompt's last
                 // chunk, or the previous block's commit, which makes the
                 // planned step the next block's step zero.
-                let st = self.running.get(&id)?;
+                let st = self.requests.tokens(&id)?;
                 let canvas = self.config.canvas?;
                 let canvas_length = canvas.canvas_length as usize;
                 let pending = self.inflight.num_pending_calls(id);
@@ -286,7 +286,7 @@ impl Scheduler {
                 // behind the block's steps still in flight, which are no-ops
                 // (`follows_unconditionally`), so the worker launches it
                 // while they run.
-                let st = self.running.get(&id)?;
+                let st = self.requests.tokens(&id)?;
                 let tokens = st.canvas_commit.clone();
                 if (self.inflight.has_pending_calls(id)
                     && !self.can_queue_successor(id, CallKind::Forward(ForwardMode::Prefill)))
@@ -338,8 +338,8 @@ impl Scheduler {
         let (_, cache_visible_len) = self.scheduled_token_lengths(id)?;
 
         // A latent block's encoder product awaits its own extension.
-        if self.running.get(&id)?.phase == Phase::IngestState {
-            let state = self.running.get(&id)?;
+        if self.requests.tokens(&id)?.phase == Phase::IngestState {
+            let state = self.requests.tokens(&id)?;
             let feature = state.input_image_features.clone()?;
             let (_, encoder_input) = state.input_block(state.block_cursor())?;
             let encoder_input = *encoder_input;
@@ -371,7 +371,7 @@ impl Scheduler {
         // otherwise the encoding is looked up in the host encoder pools before
         // its call is planned.
         while let Some((block, step)) = self.next_context_encode(id) {
-            let state = self.running.get(&id)?;
+            let state = self.requests.tokens(&id)?;
             let (image, _) = state.input_block(block)?;
             let Some(encoding) = self.encoding(&state.req, block) else {
                 self.invariant_broken("a queued input encoder has a valid cache capacity");
@@ -391,7 +391,7 @@ impl Scheduler {
                 if !self.encoding_ready(id, encoding) {
                     return None;
                 }
-                let state = self.running.get(&id)?;
+                let state = self.requests.tokens(&id)?;
                 let draw = generation::latent_draw(&state.req, block);
                 return self.plan_call(id, |scheduler, request| {
                     generation::plan_encode(
@@ -415,7 +415,7 @@ impl Scheduler {
             self.drop_host_encoding(id, encoding);
             // If request ownership disappeared during acquisition, release
             // the pin.
-            let Some(state) = self.running.get_mut(&id) else {
+            let Some(state) = self.requests.tokens_mut(&id) else {
                 let _ = self.storage.encoder_cache.release(cache_key, &product);
                 return None;
             };
@@ -436,7 +436,7 @@ impl Scheduler {
         // not yet encoded ends the chunk.
         let limit = budget.max(1).min(self.config.prefill_chunk());
         let (end, blocks, block_tokens) = {
-            let state = self.running.get(&id)?;
+            let state = self.requests.tokens(&id)?;
             let prompt_len = state.req.prompt_token_ids.len();
             let mut end = cursor;
             let mut used = 0usize;
@@ -539,7 +539,7 @@ impl Scheduler {
         &self,
         id: RequestId,
     ) -> Option<(BlockCursor, crate::ImageEncoder)> {
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         if state.phase == Phase::IngestState {
             return None;
         }
@@ -569,7 +569,7 @@ impl Scheduler {
     /// its blocks, and each block's exact cache length. The blocks are the
     /// request's next ones after its scheduled block cursor.
     pub(super) fn context_segments(&self, id: RequestId, call: &Call) -> Option<Vec<u32>> {
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         let mut block = self.scheduled_context(id)?.blocks;
         let mut segments = Vec::with_capacity(2 * call.vision_inputs.len() + 1);
         let mut text_start = 0u32;
@@ -605,10 +605,10 @@ impl Scheduler {
         id: RequestId,
         projected: usize,
     ) -> Option<SamplingState> {
-        let n_generated = self.running.get(&id).map_or(0, |state| {
+        let n_generated = self.requests.tokens(&id).map_or(0, |state| {
             state.num_generated_tokens.saturating_add(projected)
         });
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         let suppress = suppressed_tokens(
             &state.req.sampling,
             &self.special_tokens.eos,

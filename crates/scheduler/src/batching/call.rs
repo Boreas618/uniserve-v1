@@ -34,11 +34,13 @@ impl Scheduler {
 
         // Planning may queue successors speculatively, but registration still
         // requires the request epoch and exact resident predecessor.
-        let Some((request_epoch, latest_token)) = self.running.get(&request_id).and_then(|state| {
-            state
-                .worker_registered
-                .then(|| (state.request_epoch, state.latest_token.clone()))
-        }) else {
+        let Some((request_epoch, latest_token)) =
+            self.requests.tokens(&request_id).and_then(|state| {
+                state
+                    .worker_registered
+                    .then(|| (state.request_epoch, state.latest_token.clone()))
+            })
+        else {
             tracing::error!(request_id = request_id.0, "planned call lost its request");
             self.latch_fatal();
             return None;
@@ -151,7 +153,7 @@ impl Scheduler {
         // A latent image extension declares the cache tokens of the current
         // input image's encoder that produced its feature.
         let num_image_cache_tokens = if consumes_image_features(&call) {
-            let state = self.running.get(&request_id)?;
+            let state = self.requests.tokens(&request_id)?;
             state
                 .req
                 .multimodal_inputs
@@ -192,7 +194,7 @@ impl Scheduler {
         if let Some(lengths) = cache_lengths {
             // Registration above found the request running, and a running
             // token request always has its cache tables.
-            let Some(state) = self.running.get_mut(&request_id) else {
+            let Some(state) = self.requests.tokens_mut(&request_id) else {
                 self.invariant_broken("a registered token request is admitted with a prefix cache");
                 return None;
             };
@@ -331,8 +333,8 @@ impl Scheduler {
         }
         let mut call_buffers = Vec::with_capacity(reserved_buffers.len());
         let Some(allocations) = self
-            .running
-            .get_mut(&request_id)
+            .requests
+            .tokens_mut(&request_id)
             .and_then(|state| state.allocations_mut())
         else {
             for allocation in reserved_buffers {
@@ -400,7 +402,7 @@ impl Scheduler {
         layouts.push(layout);
         // The resolved token product serves only the first call after its
         // resolution; later calls chain from the in-flight one.
-        if let Some(st) = self.running.get_mut(&request_id) {
+        if let Some(st) = self.requests.tokens_mut(&request_id) {
             st.latest_token = None;
         }
         Some(())
@@ -493,7 +495,7 @@ impl Scheduler {
                     return Err(units.max(1));
                 }
             }
-            let Some(state) = self.running.get_mut(&id) else {
+            let Some(state) = self.requests.tokens_mut(&id) else {
                 return Err(1);
             };
             let (Some(allocations), Some(cache)) =
@@ -528,7 +530,7 @@ impl Scheduler {
     /// A request holds tables only once admitted, and only token requests,
     /// which always have the prefix cache, hold them.
     pub(crate) fn activate_request_tables(&self, id: RequestId) {
-        let tables = self.running.get(&id).and_then(RequestState::block_tables);
+        let tables = self.requests.tokens(&id).and_then(TokenState::block_tables);
         if let (Some(tables), Some(prefix_cache)) = (tables, self.storage.cache()) {
             for table in tables {
                 table.activate(prefix_cache.pool());

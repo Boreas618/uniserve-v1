@@ -438,10 +438,7 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
         .starved
         .iter()
         .filter(|(id, _)| {
-            scheduler
-                .running
-                .get(id)
-                .is_some_and(|state| !state.terminal_intent.is_some())
+            scheduler.requests.tokens(id).is_some() && !scheduler.requests.finished(id)
         })
         .map(|(_, units)| u64::try_from(*units).unwrap_or(u64::MAX))
         .fold(0u64, u64::saturating_add);
@@ -451,10 +448,10 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
     // too many.
     let free = u64::try_from(cache.pool().free_units()).unwrap_or(0);
     let leaving = scheduler
-        .running
-        .values()
-        .filter(|state| state.terminal_intent.is_some())
-        .filter_map(|state| state.block_tables())
+        .requests
+        .running_tokens()
+        .filter(|(_, status, _)| status.is_finished())
+        .filter_map(|(_, _, state)| state.block_tables())
         .flat_map(|tables| tables.iter().map(BlockTable::held_units))
         .map(|units| u64::try_from(units).unwrap_or(u64::MAX))
         .fold(0u64, u64::saturating_add);
@@ -469,7 +466,7 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
 /// The phase of a request's next call, when it has one ready.
 ///
 /// A refill chunk is a prefill call named by the request's draft state.
-fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Option<PhaseId> {
+fn next_phase(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> Option<PhaseId> {
     let kind = scheduler.peek_next_call_variant(id)?;
     let phase = match kind {
         // A refill chunk is the policy's decision alone (`Plan::refill`), and
@@ -503,11 +500,11 @@ fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Opt
 /// the tokens its context already holds plus the block a commit writes. A
 /// canvas-generating request's commit extends the context past its prompt, and
 /// the prefill that writes it is sized from this end.
-fn prefill_end(state: &RequestState) -> u32 {
+fn prefill_end(state: &TokenState) -> u32 {
     // The end of the context the next prefill must reach. A migrated request's
     // prompt continues with the tokens it generated before it moved here
-    // (`Scheduler::request_state`), so the prompt ids say how far the context
-    // goes, while `RequestState::prompt_tokens` is only what the request's
+    // (`Scheduler::token_state`), so the prompt ids say how far the context
+    // goes, while `TokenState::prompt_tokens` is only what the request's
     // usage charges and leaves those tokens out.
     let prompt = u32::try_from(state.req.prompt_token_ids.len()).unwrap_or(u32::MAX);
     // Every input-image block writes its cache tokens into the context at its
@@ -534,7 +531,7 @@ fn prefill_end(state: &RequestState) -> u32 {
         .max(state.cache_visible_len.saturating_add(commit))
 }
 
-fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u32 {
+fn next_tokens(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> u32 {
     match scheduler.peek_next_call_variant(id) {
         // A prompt chunk or a refill is charged the chunk the policy sizes; a
         // structural write (a block's commit) writes one position of its own
@@ -565,7 +562,7 @@ fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u3
 
 /// The worst-case device units a request reserves when it is admitted, or 0
 /// when it reserves nothing.
-fn reservation_units(scheduler: &Scheduler, state: &RequestState) -> u64 {
+fn reservation_units(scheduler: &Scheduler, state: &TokenState) -> u64 {
     let Some(cache) = scheduler.storage.cache() else {
         return 0;
     };
@@ -581,7 +578,7 @@ fn reservation_units(scheduler: &Scheduler, state: &RequestState) -> u64 {
 /// A fact, not a judgement: whether a refill is worth its cost is the policy's
 /// to decide (`Plan::refill`). Both `refill_tokens` and the `Refill` phase read
 /// it here.
-fn refill_gap(scheduler: &Scheduler, state: &RequestState) -> Option<u32> {
+fn refill_gap(scheduler: &Scheduler, state: &TokenState) -> Option<u32> {
     if !scheduler.speculates() {
         return None;
     }
@@ -611,12 +608,12 @@ fn refill_gap(scheduler: &Scheduler, state: &RequestState) -> Option<u32> {
 
 /// The tokens a refill of the request's draft cache would cost, or `None` when
 /// its draft cache has no gap.
-fn refill_tokens(scheduler: &Scheduler, state: &RequestState) -> Option<u32> {
+fn refill_tokens(scheduler: &Scheduler, state: &TokenState) -> Option<u32> {
     refill_gap(scheduler, state)
 }
 
 /// The KV pages a request holds.
-fn cached_pages(state: &RequestState) -> u32 {
+fn cached_pages(state: &TokenState) -> u32 {
     state.allocations().map_or(0, |allocations| {
         allocations
             .block_tables()
@@ -631,15 +628,16 @@ fn cached_pages(state: &RequestState) -> u32 {
 
 /// Whether a resident request waits for a transfer right now: its KV cache is being copied to its
 /// decode group by the device-direct hand-off.
-fn waiting_transfer(state: &RequestState) -> bool {
+fn waiting_transfer(state: &TokenState) -> bool {
     state.hand_off == crate::generation::HandOff::Copying
 }
 
 /// The view of a token request the scheduler holds.
 pub(crate) fn request(
     scheduler: &Scheduler,
-    state: &RequestState,
-    standing: Standing,
+    state: &TokenState,
+    status: &RequestStatus,
+    queued_us: u64,
     recorded: &Recorded,
 ) -> RequestView {
     let id = state.req.request_id;
@@ -651,10 +649,10 @@ pub(crate) fn request(
         .max(recorded.cached_prefix_tokens);
     RequestView {
         id: ViewRequestId(state.req.request_id.0),
-        state: standing,
+        state: standing(status),
         phase: next_phase(scheduler, state, id),
         priority: state.req.priority,
-        arrived_at: nanos_at(state.queued_us),
+        arrived_at: nanos_at(queued_us),
         admitted_at: recorded.admitted_at,
         prompt_tokens: u32::try_from(state.prompt_tokens).unwrap_or(u32::MAX),
         prefill_tokens: prefill_end(state),
@@ -679,8 +677,40 @@ pub(crate) fn request(
         // A request already leaving cannot be given up again
         // (`Scheduler::migrate_running` skips it), so a policy does not
         // name it.
-        migratable: !state.terminal_intent.is_some(),
+        migratable: !status.is_finished(),
         cache_rank: recorded.cache_rank,
+    }
+}
+
+/// How the policy reads a request's status: waiting for admission, or held
+/// by the mechanism until it leaves.
+const fn standing(status: &RequestStatus) -> Standing {
+    match status {
+        RequestStatus::Waiting => Standing::Queued,
+        RequestStatus::Running | RequestStatus::Finished(_) => Standing::Resident,
+    }
+}
+
+/// The view of `request`, whatever its graph: what a policy reads of it.
+///
+/// A video request's progress is its call graph's: its phase is the phase of
+/// the graph's first ready call once it runs, which is what the mechanism
+/// would run next.
+fn view(scheduler: &Scheduler, request: &crate::request::Request, facts: &Recorded) -> RequestView {
+    match &request.graph {
+        Graph::Tokens(state) => {
+            self::request(scheduler, state, &request.status, request.queued_us, facts)
+        }
+        Graph::Video(state) => diffusion_request(
+            &state.request,
+            standing(&request.status),
+            request.queued_us,
+            request
+                .admitted()
+                .then(|| media_phase(scheduler, state.request.request_id))
+                .flatten(),
+            facts,
+        ),
     }
 }
 
@@ -730,70 +760,20 @@ pub(crate) fn diffusion_request(
     }
 }
 
-/// Every request the scheduler holds, in the order a policy reads them: queued
-/// ones in admission order, then resident ones in admission order.
+/// Every request the scheduler holds, in the order a policy reads them: the
+/// waiting ones in the queue's order, then the running ones in admission
+/// order.
 pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<RequestView> {
     let empty = Recorded::default();
-    let mut views = Vec::with_capacity(
-        scheduler.waiting.len() + scheduler.running.len() + scheduler.waiting_media.len(),
-    );
-    for state in &scheduler.waiting {
-        let facts = recorded
-            .get(&state.req.request_id)
-            .copied()
-            .unwrap_or(empty);
-        views.push(request(scheduler, state, Standing::Queued, &facts));
-    }
-    for pending in &scheduler.waiting_media {
-        let facts = recorded
-            .get(&pending.request.request_id)
-            .copied()
-            .unwrap_or(empty);
-        views.push(diffusion_request(
-            &pending.request,
-            Standing::Queued,
-            pending.queued_us,
-            None,
-            &facts,
-        ));
-    }
-    let mut seen = HashSet::new();
-    for id in &scheduler.running_order {
-        if !seen.insert(*id) {
-            continue;
-        }
-        let facts = recorded.get(id).copied().unwrap_or(empty);
-        if let Some(state) = scheduler.running.get(id) {
-            views.push(request(scheduler, state, Standing::Resident, &facts));
-        } else if let Some(flow) = scheduler.running_media.get(id) {
-            // A media request keeps no arrival time of its own once it runs.
-            views.push(diffusion_request(
-                &flow.request,
-                Standing::Resident,
-                0,
-                media_phase(scheduler, *id),
-                &facts,
-            ));
-        }
-    }
-    // A media request the admission order does not name still exists.
-    for id in scheduler.running_media.keys() {
-        let Some(flow) = scheduler.running_media.get(id) else {
-            continue;
-        };
-        if !seen.insert(*id) {
-            continue;
-        }
-        let facts = recorded.get(id).copied().unwrap_or(empty);
-        views.push(diffusion_request(
-            &flow.request,
-            Standing::Resident,
-            0,
-            media_phase(scheduler, *id),
-            &facts,
-        ));
-    }
-    views
+    scheduler
+        .waiting
+        .iter()
+        .chain(&scheduler.running)
+        .filter_map(|id| {
+            let facts = recorded.get(id).copied().unwrap_or(empty);
+            Some(view(scheduler, scheduler.requests.get(id)?, &facts))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -803,9 +783,9 @@ pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<R
 /// The units of every page a resident request continues from.
 fn held_units(scheduler: &Scheduler) -> HashSet<u32> {
     scheduler
-        .running
-        .values()
-        .filter_map(|state| state.allocations())
+        .requests
+        .running_tokens()
+        .filter_map(|(_, _, state)| state.allocations())
         .flat_map(|allocations| allocations.block_tables().iter())
         .flat_map(|table| table.unit_ids())
         .map(|unit| unit.0)
@@ -1148,39 +1128,7 @@ pub(crate) fn view_of(
     recorded: &RecordedTable,
 ) -> Option<RequestView> {
     let facts = recorded.get(&id).copied().unwrap_or_default();
-    if let Some(state) = scheduler.running.get(&id) {
-        return Some(request(scheduler, state, Standing::Resident, &facts));
-    }
-    if let Some(flow) = scheduler.running_media.get(&id) {
-        // A media request keeps no arrival time of its own once it runs.
-        return Some(diffusion_request(
-            &flow.request,
-            Standing::Resident,
-            0,
-            media_phase(scheduler, id),
-            &facts,
-        ));
-    }
-    if let Some(state) = scheduler
-        .waiting
-        .iter()
-        .find(|state| state.req.request_id == id)
-    {
-        return Some(request(scheduler, state, Standing::Queued, &facts));
-    }
-    scheduler
-        .waiting_media
-        .iter()
-        .find(|pending| pending.request.request_id == id)
-        .map(|pending| {
-            diffusion_request(
-                &pending.request,
-                Standing::Queued,
-                pending.queued_us,
-                None,
-                &facts,
-            )
-        })
+    Some(view(scheduler, scheduler.requests.get(&id)?, &facts))
 }
 
 /// The live state a step's validators read: this moment's snapshot, with the
@@ -1222,8 +1170,8 @@ pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -
 /// A resident request's next call on a block and the replicas that may run it,
 /// for `place`: the first resident request that has a next call and a replica.
 pub(crate) fn dispatch(scheduler: &Scheduler) -> Option<(CallView, Vec<ReplicaView>)> {
-    for id in &scheduler.running_order {
-        let Some(state) = scheduler.running.get(id) else {
+    for id in &scheduler.running {
+        let Some(state) = scheduler.requests.tokens(id) else {
             continue;
         };
         let Some(kind) = scheduler.peek_next_call_variant(*id) else {

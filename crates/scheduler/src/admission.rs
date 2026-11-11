@@ -1,26 +1,31 @@
-//! Request admission, resource reservation, and waiting-queue insertion.
+//! Request arrival, the waiting queue and admission.
 //!
-//! Submission (`enqueue`, `enqueue_media`) validates a request and checks it
-//! against the loaded worker's capabilities and the waiting-queue bound. It
-//! either queues the request or rejects it synchronously with
-//! `Event::Rejected` on the request's event channel. Admission
-//! (`admit`, `admit_media`), which the scheduling pass runs before and
-//! between batch assembly, moves requests from the head of the token and
-//! media waiting queues into the running set while `max_running_requests` and
-//! storage allow. A head that does not fit yet blocks the requests behind it
-//! in its queue, and running requests are never preempted to make room.
+//! [`Scheduler::add_request`] validates a request against what the loaded
+//! workers serve and against the waiting-queue bound. It either queues the
+//! request or rejects it synchronously with `Event::Rejected` on the
+//! request's event channel. A token request and a video request wait in one
+//! queue: the requests that resume work another engine began first, then
+//! arrival order.
 //!
-//! A token request reserves a request row and one cache table per cache group;
-//! every group draws units from one pool, so admission compares the sum of
-//! the groups' unit demand with the free units. Its prefill worker is
-//! recorded in `Dispatch::affinity`. A media request
-//! reserves a request row and every declared result buffer on each worker of
-//! its route.
+//! Admission (`admit`) runs once per step on the policy's output. It refuses
+//! the requests the policy rejects and tries the ones it admits in the
+//! queue's order, while `max_running_requests` and storage allow. The head
+//! that does not fit yet blocks the requests behind it; when running
+//! requests themselves cannot grow, the policy names a victim
+//! (`Scheduler::preempt_shortage`).
+//!
+//! A token request reserves a request slot and one cache table per cache
+//! group; every group draws units from one pool, so admission compares the
+//! sum of the groups' unit demand with the free units. Its prefill worker is
+//! recorded in `Dispatch::affinity`. A video request reserves a request slot
+//! and every declared output buffer on each worker of its route.
 
 use super::*;
 use crate::kv_cache::{KvOffloadManager, PrefixScope};
+use crate::request::Request;
 use ipc::ForwardMode;
 use scheduling::guest::Plan;
+use std::ops::ControlFlow;
 
 /// One product a video request reserves: its declared name, the component
 /// output it is reserved under, and its request-sized shape.
@@ -85,62 +90,101 @@ pub(super) enum MediaOutputError {
 }
 
 impl Scheduler {
-    /// Validates and queues one token-generation request or rejects it synchronously.
+    /// Takes one request the daemon submitted: validates it against what the
+    /// loaded workers serve and queues it, or rejects it synchronously.
     ///
-    /// Rejects with `RejectionKind::Invalid` when `validate_submission`
-    /// refuses the request, and with `RejectionKind::Overloaded` when the
-    /// waiting bound is reached. A rejection is sent on `event_tx` and its
-    /// send result is ignored.
-    pub(super) fn enqueue(&mut self, mut req: GenerationRequest, event_tx: EventTx) {
-        let id = req.request_id;
-        let max_cache_tokens = match self.validate_submission(&req) {
-            Ok(tokens) => tokens,
-            Err(message) => {
-                let _ = event_tx.send(Event::Rejected {
-                    kind: RejectionKind::Invalid,
-                    message,
-                });
-                return;
+    /// Rejects with `RejectionKind::Invalid` when the request's own
+    /// validation (`validate_submission`, `validate_video`) refuses it, and
+    /// with `RejectionKind::Overloaded` when the waiting bound is reached. A
+    /// rejection is sent on `event_tx` and its send result is ignored.
+    pub fn add_request(&mut self, request: crate::Request, event_tx: EventTx) {
+        let reject = |event_tx: &EventTx, kind: RejectionKind, message: String| {
+            let _ = event_tx.send(Event::Rejected { kind, message });
+        };
+        let full = "scheduler waiting queue is full".to_owned();
+        let graph = match request {
+            crate::Request::Generation(mut req) => {
+                let max_cache_tokens = match self.validate_submission(&req) {
+                    Ok(tokens) => tokens,
+                    Err(message) => return reject(&event_tx, RejectionKind::Invalid, message),
+                };
+                if self.queue_full() {
+                    return reject(&event_tx, RejectionKind::Overloaded, full);
+                }
+                if req.cache.resume.is_none() {
+                    req.cache.resume = Some(proto::request::CacheResume {
+                        epoch: self.epoch,
+                        request_id: req.request_id.0,
+                    });
+                }
+                Graph::Tokens(Box::new(self.token_state(*req, event_tx, max_cache_tokens)))
+            }
+            crate::Request::Diffusion(request) => {
+                let (graph, steps) = match self.validate_video(&request) {
+                    Ok(validated) => validated,
+                    Err(message) => return reject(&event_tx, RejectionKind::Invalid, message),
+                };
+                if self.queue_full() {
+                    return reject(&event_tx, RejectionKind::Overloaded, full);
+                }
+                let request_key =
+                    RequestKey::new(self.engine_id, request.request_id, self.next_request_epoch);
+                self.next_request_epoch = self.next_request_epoch.saturating_add(1);
+                Graph::Video(Box::new(VideoState::new(
+                    request,
+                    request_key,
+                    graph,
+                    event_tx,
+                    steps,
+                )))
             }
         };
-        // Backpressure: under overload the new submission is rejected rather
-        // than letting queued requests grow without bound and exhaust process
-        // storage. The bound covers both waiting queues and retired requests
-        // whose events are still undelivered; `enqueue_media` applies the
-        // same count.
-        let waiting = self.pending_request_count() + self.output.retained_len();
-        if self
-            .config
-            .max_queued_requests
-            .is_some_and(|bound| waiting >= bound.get())
-        {
-            let _ = event_tx.send(Event::Rejected {
-                kind: RejectionKind::Overloaded,
-                message: "scheduler waiting queue is full".into(),
-            });
-            return;
-        }
-        if req.cache.resume.is_none() {
-            req.cache.resume = Some(proto::request::CacheResume {
-                epoch: self.epoch,
-                request_id: req.request_id.0,
-            });
-        }
-        let st = self.request_state(req, event_tx, max_cache_tokens);
-
-        // The queue keeps no order of its own: which queued request runs next
-        // is the policy's `Plan::admit`, and the mechanism admits in the plan's
-        // order (§4.4).
-        self.waiting.push_back(st);
+        let request = Request::waiting(graph);
+        let id = request.id();
+        self.queue(request);
 
         // The policy sees the request as it arrived: nothing has happened to it
         // yet, so every feature but the submitted ones is empty.
-        if let Some(view) = views::requests(self, self.recorder.recorded())
-            .into_iter()
-            .find(|view| view.id.0 == id.0)
-        {
+        if let Some(view) = views::view_of(self, id, self.recorder.recorded()) {
             self.recorder.record(views::arrived(view));
         }
+    }
+
+    /// Whether the waiting bound is reached.
+    ///
+    /// Backpressure: under overload a new submission is rejected rather than
+    /// letting waiting requests grow without bound and exhaust process
+    /// storage. The bound covers the waiting queue and the retired requests
+    /// whose events are still undelivered.
+    fn queue_full(&self) -> bool {
+        let waiting = self.pending_request_count() + self.output.retained_len();
+        self.config
+            .max_queued_requests
+            .is_some_and(|bound| waiting >= bound.get())
+    }
+
+    /// Queues `request` for admission: a request that resumes work another
+    /// engine began behind the others that resume and ahead of every request
+    /// that starts, and any other request last.
+    ///
+    /// A resumed request arrived first, and what it resumes from stays needed
+    /// until it is admitted: a stored trajectory until its latent preparation
+    /// restores it, so taking the resumed requests first keeps the
+    /// trajectories an epoch still has to restore to those of its latest
+    /// preemption, at most its request slots, which the host latent pools
+    /// are sized by.
+    fn queue(&mut self, request: Request) {
+        let id = request.id();
+        let position = if request.resumes() {
+            self.waiting
+                .iter()
+                .position(|queued| !self.requests.get(queued).is_some_and(Request::resumes))
+                .unwrap_or(self.waiting.len())
+        } else {
+            self.waiting.len()
+        };
+        self.requests.insert(request);
+        self.waiting.insert(position, id);
     }
 
     /// Checks a token-generation request against the loaded workers and
@@ -247,12 +291,12 @@ impl Scheduler {
     /// The state of a validated request, at the next request epoch, which
     /// publishes through `event_tx`. `max_cache_tokens` is its worst-case
     /// cache token count (`validate_submission`).
-    pub(super) fn request_state(
+    pub(super) fn token_state(
         &mut self,
         mut req: GenerationRequest,
         event_tx: EventTx,
         max_cache_tokens: usize,
-    ) -> RequestState {
+    ) -> TokenState {
         let prompt_tokens = req.prompt_token_ids.len();
         let generated = req.generated_token_ids.len();
         // A migrated request's generated tokens continue its prompt: the
@@ -261,7 +305,7 @@ impl Scheduler {
         // They count as generated from the start, so the token limit,
         // `min_tokens`, the penalties and the bad words continue where they
         // were; its usage charges only its own prompt as prompt
-        // (`RequestState::charged_prompt_tokens`).
+        // (`TokenState::charged_prompt_tokens`).
         req.prompt_token_ids
             .extend_from_slice(&req.generated_token_ids);
         let generated_token_ids = req.generated_token_ids.clone();
@@ -269,7 +313,7 @@ impl Scheduler {
         // admission so excess concurrency queues instead of exhausting the prefix cache.
         let reserve_worstcase = !req.multimodal_inputs.images.is_empty();
         let finish_token_ids = finish_token_ids(&req, &self.special_tokens.eos);
-        let st = RequestState {
+        let st = TokenState {
             finish_token_ids,
             allocations: None,
             state_resident: false,
@@ -316,8 +360,6 @@ impl Scheduler {
             canvas_step: 0,
             canvas_commit: Vec::new(),
             output: RequestOutput::new(event_tx),
-            queued_us: crate::clock::now_monotonic_us(),
-            terminal_intent: None,
             failure: None,
             prompt_tokens,
             req,
@@ -343,8 +385,8 @@ impl Scheduler {
     /// Returns a [`MediaOutputError`] naming the product when no component
     /// serves its call, the component declares no output of that name, the output has
     /// no device-sized axis for a request extent, or the request's extent or
-    /// canvas is zero or exceeds the declared maximum. `enqueue_media`
-    /// rejects such a request, and `admit_media` calls this again to size the
+    /// canvas is zero or exceeds the declared maximum. `add_request`
+    /// rejects such a request, and `admit_video` calls this again to size the
     /// reservation.
     fn media_outputs(&self, graph: &VideoGraph) -> Result<Vec<MediaOutput>, MediaOutputError> {
         let mut outputs = Vec::new();
@@ -534,124 +576,41 @@ impl Scheduler {
         Some(routes)
     }
 
-    /// Validates and queues one video request.
+    /// Checks a video request against the loaded workers and returns its
+    /// call graph with the denoiser's step count.
     ///
-    /// Rejects with `RejectionKind::Invalid` when the request fails
-    /// validation; the worker reports no muxing component or no video
-    /// denoiser; the denoiser does not serve the request's task; its call
-    /// graph cannot be built; or `media_outputs` cannot bound its products. A
-    /// served task's calls all have components: the worker checked them at
-    /// startup. The two resident request slots a video decoder needs are the
-    /// rank's to require: it refuses to start with fewer. Rejects with
-    /// `RejectionKind::Overloaded` when the waiting bound is reached. A
-    /// rejection's send result is ignored. A queued request waits behind
-    /// the others in the order [`Self::queue_media`] keeps.
-    pub(super) fn enqueue_media(
-        &mut self,
-        request: DiffusionRequest,
-        event_tx: EventTx,
-        queued_us: u64,
-    ) {
-        let reject = |kind: RejectionKind, message: String| {
-            let _ = event_tx.send(Event::Rejected { kind, message });
-        };
-        if let Err(message) = request.validate() {
-            reject(RejectionKind::Invalid, message.to_string());
-            return;
-        }
-        // A worker reports the component serving each media call it
-        // implements, so a deployment that assembles an artifact is the one
-        // that can serve a video request; reporting some call is not enough.
+    /// Refuses, with the client's message, a request that fails validation;
+    /// when the worker reports no muxing stage or no video denoiser; when
+    /// the denoiser does not serve the request's task; when its call graph
+    /// cannot be built; or when `media_outputs` cannot bound its products. A
+    /// served task's calls all have stages: the worker checked them at
+    /// startup. The two request slots a video decoder needs are the rank's
+    /// to require: it refuses to start with fewer.
+    fn validate_video(&self, request: &DiffusionRequest) -> Result<(VideoGraph, u32), String> {
+        request.validate().map_err(|error| error.to_string())?;
+        // A worker reports the stage serving each media call it implements,
+        // so a deployment that assembles an artifact is the one that can
+        // serve a video request; reporting some call is not enough.
         if !self
             .info
             .media_components
             .contains_key(&ipc::MediaCall::Muxing)
         {
-            reject(
-                RejectionKind::Invalid,
-                "worker does not provide the video media components".to_string(),
-            );
-            return;
+            return Err("worker does not provide the video media components".to_owned());
         }
-        let Some(denoiser) = self.info.video_denoiser.as_ref() else {
-            reject(
-                RejectionKind::Invalid,
-                "worker reports no video denoiser".to_string(),
-            );
-            return;
-        };
+        let denoiser = self
+            .info
+            .video_denoiser
+            .as_ref()
+            .ok_or_else(|| "worker reports no video denoiser".to_owned())?;
         if !denoiser.takes_conditions && !request.conditions.is_empty() {
-            reject(
-                RejectionKind::Invalid,
-                "the deployment's denoiser takes no conditions".to_string(),
-            );
-            return;
+            return Err("the deployment's denoiser takes no conditions".to_owned());
         }
-        let graph = match VideoGraph::new(&request) {
-            Ok(graph) => graph,
-            Err(error) => {
-                reject(RejectionKind::Invalid, error.to_string());
-                return;
-            }
-        };
-        if let Err(error) = self.media_outputs(&graph) {
-            reject(
-                RejectionKind::Invalid,
-                format!("loaded media components cannot hold the request: {error}"),
-            );
-            return;
-        }
-        let waiting = self.waiting.len() + self.waiting_media.len() + self.output.retained_len();
-        if self
-            .config
-            .max_queued_requests
-            .is_some_and(|bound| waiting >= bound.get())
-        {
-            reject(
-                RejectionKind::Overloaded,
-                "scheduler waiting queue is full".to_string(),
-            );
-            return;
-        }
-        let id = request.request_id;
-        self.queue_media(PendingMedia {
-            request,
-            graph,
-            event_tx,
-            queued_us,
-        });
-        // The policy sees a media request as it arrived, exactly as it sees a
-        // token request's arrival: nothing has happened to it yet, so every
-        // feature but the submitted ones is empty. Without this the policy has
-        // no view of a media request at all - not its class, its prompt or its
-        // reservation - and cannot plan its work.
-        if let Some(view) = views::requests(self, self.recorder.recorded())
-            .into_iter()
-            .find(|view| view.id.0 == id.0)
-        {
-            self.recorder.record(views::arrived(view));
-        }
-    }
-
-    /// Queues `pending` for admission: a request that resumes a stored
-    /// trajectory behind the others that resume one and ahead of every
-    /// request that starts one, and any other request last.
-    ///
-    /// A stored trajectory stays needed until its request's latent
-    /// preparation restores it, so taking the resumed requests first keeps
-    /// the trajectories an epoch still has to restore to those of its latest
-    /// preemption, at most its request slots, which the host latent pools
-    /// are sized by; the resumed requests also arrived first.
-    fn queue_media(&mut self, pending: PendingMedia) {
-        let position = if pending.request.trajectory.denoised_steps > 0 {
-            self.waiting_media
-                .iter()
-                .position(|queued| queued.request.trajectory.denoised_steps == 0)
-                .unwrap_or(self.waiting_media.len())
-        } else {
-            self.waiting_media.len()
-        };
-        self.waiting_media.insert(position, pending);
+        let graph = VideoGraph::new(request).map_err(|error| error.to_string())?;
+        self.media_outputs(&graph)
+            .map_err(|error| format!("loaded media components cannot hold the request: {error}"))?;
+        // The denoiser's fixed schedule sets every request's step count.
+        Ok((graph, denoiser.denoise_steps))
     }
 
     /// Reserves a media request's row and output buffers on every routed worker.
@@ -662,7 +621,7 @@ impl Scheduler {
     /// element count and 256-byte aligned.
     ///
     /// Returns `Ok(None)`, with nothing reserved, when a request row or buffer
-    /// span cannot be allocated on some rank now; `admit_media` then leaves
+    /// span cannot be allocated on some rank now; `admit_video` then leaves
     /// the request at the head of the queue. Returns `Err` when a routed
     /// worker has no media storage, after releasing what was already reserved
     /// on known workers.
@@ -720,168 +679,126 @@ impl Scheduler {
         Ok(Some(reserved))
     }
 
-    /// Admits queued media requests while request and product storage remain available.
+    /// Admits the waiting video request `id`, the head of the queue, when its
+    /// route and its storage are available.
     ///
-    /// Media and token requests share the `max_running_requests` running bound.
-    /// Admission stops at the first request that cannot be routed or
-    /// reserved, leaving it at the queue head. A broken scheduler invariant
-    /// also requeues the request, latches engine-fatal, and stops.
-    fn admit_media(&mut self, named: usize) {
-        for _ in 0..named {
-            if self.running_request_count() >= self.config.max_running_requests {
-                break;
+    /// Answers `Break` when the head waits: it cannot be routed or reserved
+    /// now, or a scheduler invariant broke (which also latches engine-fatal).
+    /// Nothing stays reserved for a head that waits.
+    fn admit_video(&mut self, id: RequestId) -> ControlFlow<()> {
+        let Some(state) = self.requests.get(&id).and_then(Request::video) else {
+            self.invariant_broken("a waiting video request is in the request table");
+            return ControlFlow::Break(());
+        };
+        let request_key = state.request_key;
+        let Some(routes) = self.media_routes(&state.graph) else {
+            return ControlFlow::Break(());
+        };
+        // Submission validated these bounds against the same loaded
+        // stages, so a request reaching admission has them.
+        let Ok(outputs) = self.media_outputs(&state.graph) else {
+            self.invariant_broken("a queued media request has valid output bounds");
+            return ControlFlow::Break(());
+        };
+        let prompt_token_ids = state.request.prompt_token_ids.clone();
+        let sampling = state.request.sampling;
+        let conditioning = state.request.conditioning.clone();
+        let route_workers = routes.values().cloned().collect::<HashSet<_>>();
+        let allocations = match self.reserve_media(&route_workers, request_key, &outputs) {
+            Ok(Some(allocations)) => allocations,
+            Ok(None) => return ControlFlow::Break(()),
+            Err(unknown) => {
+                self.invariant_broken(&unknown.to_string());
+                return ControlFlow::Break(());
             }
-            let Some(submission) = self.waiting_media.pop_front() else {
-                break;
-            };
-            // The denoiser's fixed schedule sets every request's step count;
-            // submission refused requests while the worker reports none.
-            let Some(steps) = self
-                .info
-                .video_denoiser
-                .as_ref()
-                .map(|video| video.denoise_steps)
-            else {
-                self.waiting_media.push_front(submission);
-                self.invariant_broken("a queued media request has a video denoiser");
-                break;
-            };
-            let id = submission.request.request_id;
-            let request_epoch = self.next_request_epoch;
-            let request_key = RequestKey::new(self.engine_id, id, request_epoch);
-            let Some(routes) = self.media_routes(&submission.graph) else {
-                self.waiting_media.push_front(submission);
-                break;
-            };
-            // Submission validated these bounds against the same loaded
-            // components, so a request reaching admission has them.
-            let Ok(outputs) = self.media_outputs(&submission.graph) else {
-                self.waiting_media.push_front(submission);
-                self.invariant_broken("a queued media request has valid output bounds");
-                break;
-            };
-            let route_workers = routes.values().cloned().collect::<HashSet<_>>();
-            let allocations = match self.reserve_media(&route_workers, request_key, &outputs) {
-                Ok(Some(allocations)) => allocations,
-                Ok(None) => {
-                    self.waiting_media.push_front(submission);
-                    break;
-                }
-                Err(unknown) => {
-                    self.waiting_media.push_front(submission);
+        };
+
+        // `allocations` holds the request's row on every routed worker;
+        // the admission carries the denoiser's row, and a call placed on
+        // another worker uses that worker's row.
+        let primary_component = self.info.media_components[&MediaCall::Denoising].as_str();
+        let request_pool_idx = allocations.request_slot(&routes[primary_component]);
+        // Submission validated the prompt, sampling and conditions this
+        // admission carries.
+        let admission = match NewRequest::new_media(
+            request_key,
+            request_pool_idx,
+            prompt_token_ids,
+            sampling,
+            ipc::VideoAdmission { conditioning },
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                let released = allocations.free(&mut self.storage);
+                self.invariant_broken(&format!(
+                    "a queued media request forms a valid admission: {error}"
+                ));
+                if let Err(unknown) = released {
                     self.invariant_broken(&unknown.to_string());
-                    break;
                 }
-            };
-
-            // `allocations` holds the request's row on every routed worker;
-            // the admission carries the denoiser's row, and a call placed on
-            // another worker uses that worker's row.
-            let primary_component = self.info.media_components[&MediaCall::Denoising].as_str();
-            let request_pool_idx = allocations.request_slot(&routes[primary_component]);
-            // Submission validated the prompt, sampling and conditions this
-            // admission carries.
-            let admission = match NewRequest::new_media(
-                request_key,
-                request_pool_idx,
-                submission.request.prompt_token_ids.clone(),
-                submission.request.sampling,
-                ipc::VideoAdmission {
-                    conditioning: submission.request.conditioning.clone(),
-                },
-            ) {
-                Ok(admission) => admission,
-                Err(error) => {
-                    let released = allocations.free(&mut self.storage);
-                    self.waiting_media.push_front(submission);
-                    self.invariant_broken(&format!(
-                        "a queued media request forms a valid admission: {error}"
-                    ));
-                    if let Err(unknown) = released {
-                        self.invariant_broken(&unknown.to_string());
-                    }
-                    break;
-                }
-            };
-
-            // The admission commits here; nothing below requeues the request.
-            for (component, worker) in &routes {
-                self.dispatch
-                    .affinity
-                    .insert((request_key, component.clone()), worker.clone());
+                return ControlFlow::Break(());
             }
-            self.next_request_epoch = self.next_request_epoch.saturating_add(1);
-            let root = CallId::new(0, 0);
-            let mut state = MediaFlowState {
-                request: submission.request,
-                graph: submission.graph,
-                output: output::EventJournal::new(submission.event_tx),
-                allocations,
-                reservations: outputs
-                    .iter()
-                    .map(|output| (output.name, (output.component.clone(), output.index)))
-                    .collect(),
-                buffer_bindings: HashMap::new(),
-                condition_media: HashMap::new(),
-                vision_features: None,
-                scheduled_condition_units: 0,
-                encoded_condition_units: 0,
-                condition_video_latents: Vec::new(),
-                condition_audio_latents: None,
-                conditioning: None,
-                latents: Vec::new(),
-                decoded_units: BTreeMap::new(),
-                encoded_units: BTreeMap::new(),
-                encoded_ready: BTreeMap::new(),
-                handed_units: 0,
-                muxing_inputs: Vec::new(),
-                audio: None,
-                admission,
-                admission_state: WorkerRegistration::Unsubmitted,
-                denoising: Denoising::new(steps),
-                scheduled_decode_units: 0,
-                scheduled_encode_units: 0,
-                predecessor: root,
-                terminal_intent: None,
-                artifact: None,
-                host_trajectory: HostTrajectory::default(),
-            };
+        };
 
-            // The interval from receipt to admission is the queue wait. The
-            // engine and rank own the preparation that follows, which the
-            // request's public phases report from here on.
-            let scheduled_us = crate::clock::now_monotonic_us();
-            self.record_queue_wait(submission.queued_us, scheduled_us);
+        // The admission commits here; nothing below leaves the request waiting.
+        for (component, worker) in &routes {
+            self.dispatch
+                .affinity
+                .insert((request_key, component.clone()), worker.clone());
+        }
+        self.waiting.retain(|queued| *queued != id);
+        let Some(request) = self.requests.get_mut(&id) else {
+            return ControlFlow::Break(());
+        };
+        request.status = RequestStatus::Running;
+        let queued_us = request.queued_us;
+        // The interval from receipt to admission is the queue wait. The
+        // engine and rank own the preparation that follows, which the
+        // request's public phases report from here on.
+        let scheduled_us = crate::clock::now_monotonic_us();
+        if let Some(state) = request.video_mut() {
+            state.allocations = allocations;
+            state.reservations = outputs
+                .iter()
+                .map(|output| (output.name, (output.component.clone(), output.index)))
+                .collect();
+            state.admission = Some(admission);
             if !state.output.enqueue(Event::Scheduled {
-                queued_at: crate::clock::unix_secs_at(submission.queued_us),
+                queued_at: crate::clock::unix_secs_at(queued_us),
                 scheduled_at: crate::clock::unix_secs_at(scheduled_us),
             }) {
-                latch_finish(&mut state.terminal_intent, FinishReason::Cancelled);
+                request
+                    .status
+                    .finish(Terminal::finish(FinishReason::Cancelled));
             }
-            // A media request the mechanism admits is announced exactly as a
-            // token one is (`admit_running`): the policy's queue is its own, so
-            // an admission it is not told of is a name it offers in `admit`
-            // again, and one the mechanism then refuses as "not queued". The
-            // watchdog's deadline starts here for the same reason it does
-            // there - a resident request that never advances is a policy
-            // failure, media included.
-            let admitted_at =
-                scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
-            let request = scheduling::guest::RequestId(id.0);
-            self.recorder.admitted(request, admitted_at);
-            self.watchdog.admitted(request, admitted_at);
-            self.running.mark(id);
-            self.running_media.insert(id, state);
-            self.running_order.push(id);
-            // A resumed request's stored trajectory is pinned while its
-            // conditions are prepared, and every request's encoder outputs
-            // are looked up before its encoders are offered.
-            let restoring = self.start_restore(id);
-            if let Some(state) = self.media_state_mut(id) {
-                state.host_trajectory.restoring = restoring;
-            }
-            self.look_up_encoder_outputs(id);
         }
+        self.record_queue_wait(queued_us, scheduled_us);
+        self.running.push(id);
+        self.tell_admitted(id);
+        // A resumed request's stored trajectory is pinned while its
+        // conditions are prepared, and every request's encoder outputs
+        // are looked up before its encoders are offered.
+        let restoring = self.start_restore(id);
+        if let Some(state) = self.media_state_mut(id) {
+            state.host_trajectory.restoring = restoring;
+        }
+        self.look_up_encoder_outputs(id);
+        ControlFlow::Continue(())
+    }
+
+    /// Tells the policy that `id` was admitted, and starts the starvation
+    /// bound's clock for it.
+    ///
+    /// The policy's queue is its own, so an admission it is not told of is a
+    /// name it offers in `admit` again, and one the mechanism then refuses
+    /// as not waiting. A running request that never advances is a policy
+    /// failure, whatever its graph.
+    fn tell_admitted(&mut self, id: RequestId) {
+        let admitted_at =
+            scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+        let request = scheduling::guest::RequestId(id.0);
+        self.recorder.admitted(request, admitted_at);
+        self.watchdog.admitted(request, admitted_at);
     }
 
     /// Whether some worker group prefills only (`WorkerGroupRole::Prefill`),
@@ -940,161 +857,126 @@ impl Scheduler {
         self.generation_limits.covers(features).err()
     }
 
-    /// Reaps terminal requests after all submitted descendants resolve.
+    /// Retires the requests whose end is decided once every call they
+    /// submitted has resolved.
+    ///
+    /// A finished request closes only after every submitted descendant has
+    /// resolved. Host cache ownership then remains pinned through the close
+    /// acknowledgement and ordered worker request retirement.
     pub(super) fn reap_cancellations(&mut self) {
-        // A cancelled request closes only after every submitted descendant has
-        // resolved. Host cache ownership then remains pinned through the close
-        // acknowledgement and ordered worker request retirement.
-        let cancelled: Vec<(RequestId, Option<Terminal>)> = self
+        let finished: Vec<(RequestId, Terminal)> = self
             .running
             .iter()
-            .filter(|(id, state)| {
-                state.terminal_intent.is_some() && !self.inflight.has_pending_calls(**id)
-            })
-            .map(|(id, state)| (*id, state.terminal_intent.clone()))
+            .filter(|id| !self.inflight.has_pending_calls(**id))
+            .filter_map(|id| Some((*id, self.requests.status(id)?.terminal()?.clone())))
             .collect();
-        for (id, intent) in cancelled {
-            let reason = match intent {
-                Some(Terminal::Finished { reason, .. }) => reason,
-                Some(Terminal::Migrated { cause, .. }) => {
+        for (id, terminal) in finished {
+            if self.requests.video(&id).is_some() {
+                match terminal {
+                    // A preempted request is at a step boundary: its trajectory
+                    // is stored before it leaves.
+                    Terminal::Migrated { cause, .. } => {
+                        self.retire_preempted(id, cause);
+                    }
+                    terminal => self.finish_media(id, terminal),
+                }
+                continue;
+            }
+            let reason = match terminal {
+                Terminal::Finished { reason, .. } => reason,
+                Terminal::Migrated { cause, .. } => {
                     self.migrate_request(id, cause);
                     continue;
                 }
-                Some(Terminal::Failed(_) | Terminal::Rejected(_)) => FinishReason::Error,
-                Some(Terminal::Completed(_)) => FinishReason::Completed,
-                None => continue,
+                Terminal::Failed(_) | Terminal::Rejected(_) => FinishReason::Error,
+                Terminal::Completed(_) => FinishReason::Completed,
             };
             self.finish(id, reason);
         }
-        let media = self
-            .running_order
-            .iter()
-            .filter_map(|id| {
-                self.media_state(*id)
-                    .filter(|state| {
-                        state.terminal_intent.is_some()
-                            && !self.inflight.has_pending_calls(state.request.request_id)
-                    })
-                    .map(|state| (state.request.request_id, state.terminal_intent.clone()))
-            })
-            .collect::<Vec<_>>();
-        for (id, intent) in media {
-            match intent {
-                // A preempted request is at a step boundary: its trajectory
-                // is stored before it leaves.
-                Some(Terminal::Migrated { cause, .. }) => {
-                    self.retire_preempted(id, cause);
-                }
-                Some(terminal) => self.finish_media(id, terminal),
-                None => {}
-            }
-        }
     }
 
-    /// Admits requests from the queue head while sequence and storage budgets allow.
+    /// Executes the policy's admission decisions: the requests it rejects
+    /// are refused, and the ones it admits are tried in the queue's order,
+    /// the mechanism stopping at the first the hard limits refuse so that a
+    /// later request never bypasses one ahead of it.
     ///
-    /// Requests configured for worst-case reservation acquire their full cache capacity here,
-    /// keeping that capacity resident for the request lifetime.
+    /// The policy names a *set*, and a waiting request it does not name
+    /// waits for a later step. Which of the named requests the mechanism
+    /// spends its resources on first is the queue's order, which carries a
+    /// rule a policy cannot see (`Self::queue`): the named requests move
+    /// ahead of the rest by a stable partition, never a re-sort.
     ///
-    /// A worst-case request is admitted when the free cache units cover the
-    /// units of `max_reserved_cache_tokens` in every group and its
-    /// encoder-cache entries fit the budget; any other request needs only
-    /// the units of its first prefill chunk beyond its cached prefix, summed
-    /// over every cache group. A head that can never fit the total cache
-    /// capacity is rejected with `RejectionKind::Invalid`. Admission stops
-    /// when the queue is empty, `max_running_requests` is reached, no request row is
-    /// free, the head does not fit yet or finds no ready prefill worker, or a
-    /// scheduler invariant breaks.
-    /// Executes the plan's admission decisions (§4.4): the requests it
-    /// rejects are refused, and the ones it admits are tried in its order, the
-    /// mechanism stopping at the first the hard limits refuse so that a later
-    /// request never bypasses one the policy put first.
-    ///
-    /// The queues are ordered by the plan and bounded by it: a queued request
-    /// the plan does not name waits for a later step's plan, which is what makes
-    /// a policy's admission order its own rather than the arrival order.
-    pub(super) fn admit_plan(&mut self, plan: &Plan) {
+    /// Admission stops when `max_running_requests` is reached or the head
+    /// waits: a token request for a slot, for the units of its first prefill
+    /// chunk beyond its cached prefix, or for a ready prefill worker; a
+    /// video request for its route and its output buffers.
+    pub(super) fn admit(&mut self, plan: &Plan) {
         // A closing scheduler admits nothing more, nor does one that sleeps.
         if self.draining || self.admission_sleeps() {
             return;
         }
         for id in &plan.reject {
-            self.reject_queued(ipc::RequestId(id.0));
+            self.reject_waiting(ipc::RequestId(id.0));
         }
-        let named: Vec<ipc::RequestId> = plan.admit.iter().map(|id| ipc::RequestId(id.0)).collect();
-        self.order_queues_by(&named);
-        let tokens_named = self
-            .waiting
-            .iter()
-            .filter(|state| named.contains(&state.req.request_id))
-            .count();
-        let media_named = self
-            .waiting_media
-            .iter()
-            .filter(|pending| named.contains(&pending.request.request_id))
-            .count();
-        self.admit_tokens(tokens_named);
-        self.admit_media(media_named);
-    }
-
-    /// Refuses one queued request the plan rejected, whether it waits as a
-    /// token request or as a media one.
-    ///
-    /// The policy named it, and the mechanism still tells it the request ended:
-    /// the queue it keeps is the policy's own, and an end it is not told of
-    /// leaves a name behind that a later view change makes admissible again —
-    /// which the mechanism would then refuse as "not queued".
-    fn reject_queued(&mut self, id: ipc::RequestId) {
-        if let Some(position) = self
-            .waiting
-            .iter()
-            .position(|state| state.req.request_id == id)
-            && let Some(state) = self.waiting.remove(position)
-        {
-            self.announce_end(id, scheduling::guest::event::End::Rejected);
-            let _ = state.output.events.event_tx.send(Event::Rejected {
-                kind: RejectionKind::Overloaded,
-                message: "the scheduling policy rejected the request as over capacity".into(),
-            });
-        }
-        if let Some(position) = self
-            .waiting_media
-            .iter()
-            .position(|pending| pending.request.request_id == id)
-            && let Some(pending) = self.waiting_media.remove(position)
-        {
-            self.announce_end(id, scheduling::guest::event::End::Rejected);
-            let _ = pending.event_tx.send(Event::Rejected {
-                kind: RejectionKind::Overloaded,
-                message: "the scheduling policy rejected the request as over capacity".into(),
-            });
-        }
-    }
-
-    /// Moves the requests the plan names ahead of the rest, each group staying
-    /// in the mechanism's own order.
-    ///
-    /// The plan names a *set*: which of the requests it names the mechanism
-    /// spends its resources on first is the mechanism's decision, and the
-    /// queue's order carries rules a policy cannot see. `queue_media` puts a
-    /// request that resumes a stored trajectory ahead of one that starts one,
-    /// so an epoch restores at most the trajectories of its latest preemption —
-    /// a host latent pool is sized by that. Re-ordering the queue by the plan
-    /// would discard it (the policy learns of arrivals, not of the mechanism's
-    /// queue), so this is a stable partition, never a re-sort.
-    fn order_queues_by(&mut self, named: &[ipc::RequestId]) {
-        let is_named = |id: ipc::RequestId| named.contains(&id);
+        let named: HashSet<ipc::RequestId> =
+            plan.admit.iter().map(|id| ipc::RequestId(id.0)).collect();
         self.waiting
             .make_contiguous()
-            .sort_by_key(|state| !is_named(state.req.request_id));
-        self.waiting_media
-            .make_contiguous()
-            .sort_by_key(|pending| !is_named(pending.request.request_id));
+            .sort_by_key(|id| !named.contains(id));
+        let count = self.waiting.iter().filter(|id| named.contains(id)).count();
+        for _ in 0..count {
+            if self.running_request_count() >= self.config.max_running_requests {
+                break;
+            }
+            let Some(&head) = self.waiting.front() else {
+                break;
+            };
+            let admitted = match self.requests.get(&head).map(|request| &request.graph) {
+                Some(Graph::Tokens(_)) => self.admit_tokens(head),
+                Some(Graph::Video(_)) => self.admit_video(head),
+                None => {
+                    self.invariant_broken("a waiting request is in the request table");
+                    ControlFlow::Break(())
+                }
+            };
+            if admitted.is_break() {
+                break;
+            }
+        }
     }
 
-    /// The token half of the plan's admission: at most `named` requests, the
-    /// ones the plan named, and never one behind a request the hard limits
-    /// refused.
+    /// Refuses one waiting request the policy rejected.
+    ///
+    /// The policy named it, and the mechanism still tells it the request
+    /// ended: the queue it keeps is the policy's own, and an end it is not
+    /// told of leaves a name behind that a later view change makes
+    /// admissible again, which the mechanism would then refuse as not
+    /// waiting.
+    fn reject_waiting(&mut self, id: ipc::RequestId) {
+        self.end_waiting(
+            id,
+            scheduling::guest::event::End::Rejected,
+            Event::Rejected {
+                kind: RejectionKind::Overloaded,
+                message: "the scheduling policy rejected the request as over capacity".into(),
+            },
+        );
+    }
+
+    /// Ends the waiting request `id` with `event`, telling the policy how it
+    /// ended. A request that is not waiting is left alone.
+    pub(super) fn end_waiting(
+        &mut self,
+        id: ipc::RequestId,
+        end: scheduling::guest::event::End,
+        event: Event,
+    ) {
+        if let Some(request) = self.remove_waiting(id) {
+            self.announce_end(id, end);
+            let _ = request.event_tx().send(event);
+        }
+    }
+
     /// Whether the scheduler still holds the requests that continue from
     /// its predecessor's pages; once the wait ends, they return to the head
     /// of the queue, in their order.
@@ -1118,113 +1000,133 @@ impl Scheduler {
         }
     }
 
-    fn admit_tokens(&mut self, named: usize) {
-        for _ in 0..named {
-            // A resident the last assembly could not grow takes the units that
-            // come free before any request is admitted: a request admitted
-            // into them would be the first one the reclaim gives up.
-            if self.running_request_count() >= self.config.max_running_requests
-                || self.storage.request_pool.is_empty()
-                || !self.starved.is_empty()
-            {
-                break;
-            }
-            let Some(continues) = self
-                .waiting
-                .front()
-                .map(|head| head.req.cache.resume.is_some())
-            else {
-                break;
-            };
-            // A request that continues from the drained predecessor's pages
-            // waits for their index, which arrives once that epoch parked: a
-            // request admitted before it computes again what the pages hold.
-            // It steps aside, and the requests behind it are admitted.
-            if continues && self.awaits_index() {
-                if let Some(held) = self.waiting.pop_front() {
-                    self.held_for_index.push(held);
-                }
-                continue;
-            }
-            let Some(head) = self.waiting.front() else {
-                break;
-            };
-            // Submission rejects token requests when the worker has no prefix
-            // cache, so a queued one always finds it.
-            let Some(cache) = self.storage.cache() else {
-                self.invariant_broken("a queued token request has a prefix cache");
-                break;
-            };
+    /// Admits the waiting token request `id`, the head of the queue, when a
+    /// slot and the cache units of its first call are free.
+    ///
+    /// A request that reserves its worst case (one with context images) is
+    /// admitted when the free cache units cover the units of
+    /// `max_reserved_cache_tokens` in every group and its encoder-cache
+    /// entries fit the budget; any other request needs only the units of its
+    /// first prefill chunk beyond its cached prefix, summed over every cache
+    /// group. A head that can never fit the total cache capacity is rejected
+    /// with `RejectionKind::Invalid`.
+    ///
+    /// Answers `Continue` when the head left the queue (admitted, rejected,
+    /// or set aside for its predecessor's index) and `Break` when it waits:
+    /// no slot is free, a running request waits for units, the head does not
+    /// fit yet or finds no ready prefill worker, or an invariant broke.
+    fn admit_tokens(&mut self, id: RequestId) -> ControlFlow<()> {
+        // A running request the last assembly could not grow takes the units
+        // that come free before any request is admitted: a request admitted
+        // into them would be the first one the preemption gives up.
+        if self.storage.request_pool.is_empty() || !self.starved.is_empty() {
+            return ControlFlow::Break(());
+        }
+        let Some(continues) = self
+            .requests
+            .get(&id)
+            .and_then(Request::tokens)
+            .map(|head| head.req.cache.resume.is_some())
+        else {
+            self.invariant_broken("a waiting token request is in the request table");
+            return ControlFlow::Break(());
+        };
+        // A request that continues from the drained predecessor's pages
+        // waits for their index, which arrives once that epoch parked: a
+        // request admitted before it computes again what the pages hold.
+        // It steps aside, and the requests behind it are admitted.
+        if continues && self.awaits_index() {
+            self.waiting.retain(|queued| *queued != id);
+            self.held_for_index.push(id);
+            return ControlFlow::Continue(());
+        }
+        let Some(head) = self.requests.get(&id).and_then(Request::tokens) else {
+            return ControlFlow::Break(());
+        };
+        // Submission rejects token requests when the worker has no prefix
+        // cache, so a waiting one always finds it.
+        let Some(cache) = self.storage.cache() else {
+            self.invariant_broken("a queued token request has a prefix cache");
+            return ControlFlow::Break(());
+        };
 
-            if head.reserve_worstcase {
-                let tokens = head.max_reserved_cache_tokens;
-                let need = cache.units_for_tokens(tokens);
-                let encoder_entries = head.req.num_encoder_cache_entries();
-                let encoder_ok = self
-                    .storage
-                    .reserved_encoder_entries
-                    .saturating_add(encoder_entries)
-                    <= self.storage.encoder_cache.budget();
-                if need > self.storage.capacity_units() {
-                    let Some(st) = self.waiting.pop_front() else {
-                        break;
-                    };
-                    // The mechanism ends a request the policy still queues, so
-                    // it says so: a policy learns a request from `Arrived` and
-                    // an end from this, and a name it is not told has gone is
-                    // one it offers in `admit` again (§4.4).
-                    self.announce_end(st.req.request_id, scheduling::guest::event::End::Rejected);
-                    let _ = st.output.events.event_tx.send(Event::Rejected {
-                        kind: RejectionKind::Invalid,
-                        message: "request exceeds total KV capacity".into(),
-                    });
-                    continue;
+        if head.reserve_worstcase {
+            let tokens = head.max_reserved_cache_tokens;
+            let need = cache.units_for_tokens(tokens);
+            let encoder_entries = head.req.num_encoder_cache_entries();
+            let encoder_ok = self
+                .storage
+                .reserved_encoder_entries
+                .saturating_add(encoder_entries)
+                <= self.storage.encoder_cache.budget();
+            if need > self.storage.capacity_units() {
+                self.reject_oversized(id);
+                return ControlFlow::Continue(());
+            }
+            if self.storage.free_units() < need || !encoder_ok {
+                return ControlFlow::Break(());
+            }
+            let Some((target, _)) = self.prefill_target(head) else {
+                return ControlFlow::Break(());
+            };
+            let reservation = match self.reserve_admission(&target.0) {
+                Ok(reservation) => reservation,
+                Err(invariant) => {
+                    self.invariant_broken(invariant);
+                    return ControlFlow::Break(());
                 }
-                if self.storage.free_units() >= need && encoder_ok {
-                    let Some((target, _)) = self.prefill_target(head) else {
-                        break;
-                    };
-                    let Some(st) = self.waiting.pop_front() else {
-                        break;
-                    };
-                    let reservation = match self.reserve_admission(&target.0) {
-                        Ok(reservation) => reservation,
-                        Err(invariant) => {
-                            self.waiting.push_front(st);
-                            self.invariant_broken(invariant);
-                            break;
-                        }
-                    };
-                    let id = st.req.request_id;
-                    self.admit_running(st, target, reservation);
-                    // Grow the tables to the whole worst case now, from token
-                    // zero, so later admissions cannot take these units. The
-                    // result is not checked here: a later call that needs
-                    // more units than the tables cover waits for them.
-                    self.ensure_request_capacity(id, 0, tokens);
-                    continue;
-                }
-            } else {
-                let n = head.req.prompt_token_ids.len();
-                let Some((target, prefix_hit)) = self.prefill_target(head) else {
-                    break;
-                };
+            };
+            self.admit_running(id, target, reservation);
+            // Grow the tables to the whole worst case now, from token
+            // zero, so later admissions cannot take these units. The
+            // result is not checked here: a later call that needs
+            // more units than the tables cover waits for them.
+            self.ensure_request_capacity(id, 0, tokens);
+            return ControlFlow::Continue(());
+        }
 
-                // Units the first prefill chunk needs beyond the cached
-                // prefix. The chunk is bounded by `chunked_prefill_size`
-                // and `max_num_batched_tokens` and holds at least one token.
-                let chunk_limit = self
-                    .config
-                    .prefill_chunk()
-                    .min(self.config.max_num_batched_tokens)
-                    .max(1);
-                let cached_tokens = prefix_hit.cached_tokens.min(n);
-                // The host KV cache may hold the reusable pages that follow
-                // the device match; the head waits for its pins. A request
-                // continuing another epoch's state reads none: the host's
-                // pages are keyed by the epoch that serves.
-                let mut host_tokens = 0;
-                let mut answer = host_prefix(
+        let n = head.req.prompt_token_ids.len();
+        let Some((target, prefix_hit)) = self.prefill_target(head) else {
+            return ControlFlow::Break(());
+        };
+
+        // Units the first prefill chunk needs beyond the cached
+        // prefix. The chunk is bounded by `chunked_prefill_size`
+        // and `max_num_batched_tokens` and holds at least one token.
+        let chunk_limit = self
+            .config
+            .prefill_chunk()
+            .min(self.config.max_num_batched_tokens)
+            .max(1);
+        let cached_tokens = prefix_hit.cached_tokens.min(n);
+        // The host KV cache may hold the reusable pages that follow
+        // the device match; the head waits for its pins. A request
+        // continuing another epoch's state reads none: the host's
+        // pages are keyed by the epoch that serves.
+        let mut host_tokens = 0;
+        let mut host = host_prefix(
+            &mut self.kv_offload,
+            self.storage.cache(),
+            head,
+            &target,
+            cached_tokens,
+            n,
+            0,
+        );
+        // A lookup is a round trip to this host's Storage Server, which answers well
+        // within a millisecond. Taking the answer at the next step instead admitted a burst
+        // of prompts one per step: GSM8K at 64 slots ran 1320 prefill batches with the
+        // host tier on against 1101 with it off. So the head waits a bounded moment for
+        // its own answer; a prefetch from the KV storage, which takes longer, still waits
+        // across steps.
+        if matches!(host, HostHit::Pending) {
+            let deadline = std::time::Instant::now() + HOST_ANSWER_WAIT;
+            while matches!(host, HostHit::Pending) && std::time::Instant::now() < deadline {
+                if let Some(kv_offload) = self.kv_offload.as_mut() {
+                    kv_offload.poll();
+                }
+                std::thread::yield_now();
+                host = host_prefix(
                     &mut self.kv_offload,
                     self.storage.cache(),
                     head,
@@ -1233,125 +1135,104 @@ impl Scheduler {
                     n,
                     0,
                 );
-                // A lookup is a round trip to this host's Storage Server, which answers well
-                // within a millisecond. Taking the answer at the next step instead admitted a burst
-                // of prompts one per step: GSM8K at 64 slots ran 1320 prefill batches with the
-                // host tier on against 1101 with it off. So the head waits a bounded moment for
-                // its own answer; a prefetch from the KV storage, which takes longer, still waits
-                // across steps.
-                if matches!(answer, HostHit::Pending) {
-                    let deadline = std::time::Instant::now() + HOST_ANSWER_WAIT;
-                    while matches!(answer, HostHit::Pending) && std::time::Instant::now() < deadline
-                    {
-                        if let Some(kv_offload) = self.kv_offload.as_mut() {
-                            kv_offload.poll();
-                        }
-                        std::thread::yield_now();
-                        answer = host_prefix(
-                            &mut self.kv_offload,
-                            self.storage.cache(),
-                            head,
-                            &target,
-                            cached_tokens,
-                            n,
-                            0,
-                        );
-                    }
-                }
-                match answer {
-                    HostHit::Serving(boundary) => host_tokens = boundary - cached_tokens,
-                    // The host is looking up this request's pages: the head
-                    // waits for the pins.
-                    HostHit::Pending => break,
-                    HostHit::Nothing => {}
-                }
-                // The two facts of the hit that no view can compute, recorded
-                // where admission measured them.
-                self.recorder.prefix_hit(
-                    scheduling::guest::RequestId(head.req.request_id.0),
-                    u32::try_from(cached_tokens).unwrap_or(u32::MAX),
-                    u32::try_from(host_tokens).unwrap_or(u32::MAX),
-                );
-                // One `Hit` per page the mechanism re-uses: a policy's LRU
-                // orders evictions by these, so a page that was hit must move.
-                for head_unit in &prefix_hit.matched_pages {
-                    self.recorder
-                        .hit(scheduling::guest::PageId(u64::from(*head_unit)));
-                }
-                let prefix_tokens = cached_tokens + host_tokens;
-                let first_chunk = n.saturating_sub(prefix_tokens).min(chunk_limit).max(1);
-                let first_chunk_units =
-                    cache.units_after_prefix(cached_tokens, prefix_tokens + first_chunk);
-
-                // The prompt alone must fit the pool: every full-attention page
-                // and each sliding-window group's pages of one chunk.
-                if cache.min_units_for_prompt(n, chunk_limit) > self.storage.capacity_units() {
-                    let Some(st) = self.waiting.pop_front() else {
-                        break;
-                    };
-                    self.announce_end(st.req.request_id, scheduling::guest::event::End::Rejected);
-                    let _ = st.output.events.event_tx.send(Event::Rejected {
-                        kind: RejectionKind::Invalid,
-                        message: "request exceeds total KV capacity".into(),
-                    });
-                    continue;
-                }
-
-                // Hit pages that are currently unreferenced count as free
-                // until acquisition takes them, so they are subtracted from
-                // the free units. A host hit holds the units of all its pages
-                // from its admission, so the head's whole prompt fits beside
-                // what the residents' prompts still take: requests that hold
-                // every unit with none for their prompts' tails would wait for
-                // one another. What residents generate is not reserved: one
-                // that cannot grow in decode is relieved by the reclaim, which
-                // gives up the request admitted last to be computed again from
-                // its tokens (`Scheduler::reclaim_shortage`).
-                let head_units = cache
-                    .units_after_prefix(cached_tokens, n)
-                    .min(cache.min_units_for_prompt(n, chunk_limit))
-                    .max(first_chunk_units);
-                let capacity_available = self
-                    .storage
-                    .free_units()
-                    .saturating_sub(prefix_hit.cached_free_units)
-                    .saturating_sub(self.units_residents_still_need(chunk_limit))
-                    >= head_units;
-                if capacity_available {
-                    let Some(st) = self.waiting.pop_front() else {
-                        break;
-                    };
-                    let reservation = match self.reserve_admission(&target.0) {
-                        Ok(reservation) => reservation,
-                        Err(invariant) => {
-                            self.waiting.push_front(st);
-                            self.invariant_broken(invariant);
-                            break;
-                        }
-                    };
-                    let id = st.req.request_id;
-                    let worker = target.0.clone();
-                    self.admit_running(st, target, reservation);
-                    self.admit_offloaded_prefix(id, &worker);
-                    continue;
-                }
             }
-
-            // The head does not fit yet. Resident requests keep their physical
-            // cache units and are never preempted or relocated to make room, and
-            // later requests do not bypass the head, so admission waits for
-            // capacity to free.
-            break;
         }
+        match host {
+            HostHit::Serving(boundary) => host_tokens = boundary - cached_tokens,
+            // The host is looking up this request's pages: the head
+            // waits for the pins.
+            HostHit::Pending => return ControlFlow::Break(()),
+            HostHit::Nothing => {}
+        }
+        // The two facts of the hit that no view can compute, recorded
+        // where admission measured them.
+        self.recorder.prefix_hit(
+            scheduling::guest::RequestId(id.0),
+            u32::try_from(cached_tokens).unwrap_or(u32::MAX),
+            u32::try_from(host_tokens).unwrap_or(u32::MAX),
+        );
+        // One `Hit` per page the mechanism re-uses: a policy's LRU
+        // orders evictions by these, so a page that was hit must move.
+        for head_unit in &prefix_hit.matched_pages {
+            self.recorder
+                .hit(scheduling::guest::PageId(u64::from(*head_unit)));
+        }
+        let prefix_tokens = cached_tokens + host_tokens;
+        let first_chunk = n.saturating_sub(prefix_tokens).min(chunk_limit).max(1);
+        let first_chunk_units =
+            cache.units_after_prefix(cached_tokens, prefix_tokens + first_chunk);
+
+        // The prompt alone must fit the pool: every full-attention page
+        // and each sliding-window group's pages of one chunk.
+        if cache.min_units_for_prompt(n, chunk_limit) > self.storage.capacity_units() {
+            self.reject_oversized(id);
+            return ControlFlow::Continue(());
+        }
+
+        // Hit pages that are currently unreferenced count as free
+        // until acquisition takes them, so they are subtracted from
+        // the free units. A host hit holds the units of all its pages
+        // from its admission, so the head's whole prompt fits beside
+        // what the running requests' prompts still take: requests that hold
+        // every unit with none for their prompts' tails would wait for
+        // one another. What running requests generate is not reserved: one
+        // that cannot grow in decode is relieved by the preemption, which
+        // gives up the request admitted last to be computed again from
+        // its tokens (`Scheduler::preempt_shortage`).
+        let head_units = cache
+            .units_after_prefix(cached_tokens, n)
+            .min(cache.min_units_for_prompt(n, chunk_limit))
+            .max(first_chunk_units);
+        let capacity_available = self
+            .storage
+            .free_units()
+            .saturating_sub(prefix_hit.cached_free_units)
+            .saturating_sub(self.units_running_still_need(chunk_limit))
+            >= head_units;
+        // The head does not fit yet. Later requests do not bypass it, so
+        // admission waits for capacity to free.
+        if !capacity_available {
+            return ControlFlow::Break(());
+        }
+        let reservation = match self.reserve_admission(&target.0) {
+            Ok(reservation) => reservation,
+            Err(invariant) => {
+                self.invariant_broken(invariant);
+                return ControlFlow::Break(());
+            }
+        };
+        let worker = target.0.clone();
+        self.admit_running(id, target, reservation);
+        self.admit_offloaded_prefix(id, &worker);
+        ControlFlow::Continue(())
     }
 
-    /// The units the residents still take to compute their whole prompts in chunks of `chunk`.
-    fn units_residents_still_need(&self, chunk: usize) -> usize {
+    /// Rejects the waiting request `id`, whose prompt can never fit the
+    /// cache.
+    ///
+    /// The mechanism ends a request the policy still queues, so it says so:
+    /// a policy learns a request from `Arrived` and an end from this, and a
+    /// name it is not told has gone is one it offers in `admit` again.
+    fn reject_oversized(&mut self, id: RequestId) {
+        self.end_waiting(
+            id,
+            scheduling::guest::event::End::Rejected,
+            Event::Rejected {
+                kind: RejectionKind::Invalid,
+                message: "request exceeds total KV capacity".into(),
+            },
+        );
+    }
+
+    /// The units the running requests still take to compute their whole prompts in chunks of
+    /// `chunk`.
+    fn units_running_still_need(&self, chunk: usize) -> usize {
         let Some(cache) = self.storage.cache() else {
             return 0;
         };
-        self.running
-            .values()
+        self.requests
+            .running_tokens()
+            .map(|(_, _, state)| state)
             .filter(|state| {
                 (state.num_computed_prompt_tokens as usize) < state.req.prompt_token_ids.len()
             })
@@ -1380,7 +1261,7 @@ impl Scheduler {
     /// `None` when the runtime has no prefix cache or no prefill worker is ready.
     pub(super) fn prefill_target(
         &self,
-        state: &RequestState,
+        state: &TokenState,
     ) -> Option<((crate::WorkerGroupId, String), crate::kv_cache::PrefixHit)> {
         let cache = self.storage.cache()?;
         self.dispatch
@@ -1464,37 +1345,41 @@ impl Scheduler {
         })
     }
 
-    /// Moves one validated request into the runnable set with its reservation.
+    /// Admits the waiting token request `id` with its reservation: it leaves
+    /// the queue and runs.
     ///
-    /// Records `target`'s worker as the owner of its component for the
-    /// request, emits the public `Scheduled` event (a closed receiver marks
-    /// the request cancelled), adds its encoder-cache entries to the reserved
+    /// Records `target`'s worker as the owner of its stage for the request,
+    /// emits the public `Scheduled` event (a closed receiver marks the
+    /// request cancelled), adds its encoder-cache entries to the reserved
     /// count, and acquires its cached prefix, which sets the computed-prompt
     /// cursors to the reused tokens. A failed acquisition latches
     /// engine-fatal.
     pub(super) fn admit_running(
         &mut self,
-        mut st: RequestState,
+        id: RequestId,
         target: (crate::WorkerGroupId, String),
         reservation: AdmissionReservation,
     ) {
-        let id = st.req.request_id;
-        // The policy sees every admission as it happens: the request becomes
-        // resident, and the watchdog's deadline starts with it.
-        let admitted_at =
-            scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
-        let request = scheduling::guest::RequestId(id.0);
-        self.recorder.admitted(request, admitted_at);
-        self.watchdog.admitted(request, admitted_at);
-        let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
+        self.tell_admitted(id);
+        self.waiting.retain(|queued| *queued != id);
         let AdmissionReservation {
             source,
             request_slot,
             prefix_cache,
         } = reservation;
-        self.dispatch
-            .affinity
-            .insert((request_key, target.1), target.0);
+        let scheduled_us = crate::clock::now_monotonic_us();
+        let Some(Request {
+            status,
+            queued_us,
+            graph: Graph::Tokens(st),
+        }) = self.requests.get_mut(&id)
+        else {
+            self.invariant_broken("an admitted token request is in the request table");
+            return;
+        };
+        *status = RequestStatus::Running;
+        let queued_us = *queued_us;
+        let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
         if st
             .allocations
             .replace(RequestAllocations {
@@ -1504,29 +1389,29 @@ impl Scheduler {
             })
             .is_none()
         {
-            // The request holds a pool row from now until its execution ends,
-            // which is what `Room::slots` counts without walking the residents.
+            // The request holds a slot from now until its execution ends,
+            // which is what `Room::slots` counts without visiting the
+            // running requests.
             self.rows_held = self.rows_held.saturating_add(1);
         }
-
         // Queue latency is finalized at the same timestamp exposed through the
         // public scheduling event.
-        let queued_us = st.queued_us;
-        let scheduled_us = crate::clock::now_monotonic_us();
-        self.record_queue_wait(queued_us, scheduled_us);
-
         let encoder_entries = st.req.num_encoder_cache_entries();
         if !st.output.events.enqueue(Event::Scheduled {
             queued_at: crate::clock::unix_secs_at(queued_us),
             scheduled_at: crate::clock::unix_secs_at(scheduled_us),
         }) {
-            st.terminal_intent = Some(Terminal::finish(FinishReason::Cancelled));
+            status.finish(Terminal::finish(FinishReason::Cancelled));
         }
+        let resume = st.req.cache.resume;
 
         // Running order, resource reservations, and runtime ownership advance
         // together so the next scheduling pass observes one coherent admission.
-        self.running.insert(id, st);
-        self.running_order.push(id);
+        self.dispatch
+            .affinity
+            .insert((request_key, target.1), target.0);
+        self.record_queue_wait(queued_us, scheduled_us);
+        self.running.push(id);
         self.storage.reserved_encoder_entries = self
             .storage
             .reserved_encoder_entries
@@ -1534,7 +1419,7 @@ impl Scheduler {
 
         // Prefix-cache acquisition pins every reused block to this request's
         // newly installed block tables.
-        let acquired = match (self.running.get_mut(&id), self.storage.cache.as_ref()) {
+        let acquired = match (self.requests.tokens_mut(&id), self.storage.cache.as_ref()) {
             (Some(st), Some(prefix_cache)) => {
                 acquire_cached_prefix(prefix_cache, st, &self.stats, &source)
             }
@@ -1543,11 +1428,7 @@ impl Scheduler {
         if let Err(invariant) = acquired {
             self.invariant_broken(invariant);
         }
-        if let Some(resume) = self
-            .running
-            .get(&id)
-            .and_then(|state| state.req.cache.resume)
-        {
+        if let Some(resume) = resume {
             self.warming.claimed(resume);
         }
     }
@@ -1563,7 +1444,7 @@ impl Scheduler {
         let Some(kv_offload) = self.kv_offload.as_mut() else {
             return;
         };
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         if !state.req.cache.read || state.has_context_images() {
@@ -1592,7 +1473,7 @@ impl Scheduler {
             }
             return;
         }
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         // The draft cache pages the hit loads into units are valid once
@@ -1670,7 +1551,7 @@ pub(super) enum HostHit {
 pub(super) fn host_prefix(
     kv_offload: &mut Option<KvOffloadManager>,
     coordinator: Option<&PrefixCacheCoordinator>,
-    state: &RequestState,
+    state: &TokenState,
     target: &(crate::WorkerGroupId, String),
     device_hit: usize,
     limit: usize,
@@ -1718,7 +1599,7 @@ pub(super) fn host_prefix(
 /// tables do not match the pool's cache groups.
 fn acquire_cached_prefix(
     coordinator: &PrefixCacheCoordinator,
-    state: &mut RequestState,
+    state: &mut TokenState,
     stats: &SchedulerStats,
     source: &ipc::MainProcessEndpoint,
 ) -> Result<(), &'static str> {

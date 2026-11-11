@@ -224,8 +224,8 @@ impl Scheduler {
         let page_tokens = self.page_tokens();
         let mut prefixes = Vec::new();
         let mut live = HashMap::new();
-        for (&id, state) in &self.running {
-            if state.terminal_intent.is_some() {
+        for (id, status, state) in self.requests.running_tokens() {
+            if status.is_finished() {
                 continue;
             }
             // A request that publishes no page computes its state again whatever a wait does.
@@ -275,8 +275,8 @@ impl Scheduler {
             return Ok(Vec::new());
         };
         let mut prefixes = Vec::new();
-        for (&id, state) in &self.running {
-            if state.terminal_intent.is_some() {
+        for (id, status, state) in self.requests.running_tokens() {
+            if status.is_finished() {
                 continue;
             }
             let Some(allocation) = state.allocations.as_ref() else {

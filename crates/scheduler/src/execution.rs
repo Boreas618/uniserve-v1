@@ -35,11 +35,12 @@
 
 mod failure;
 mod media;
-pub(crate) use media::{MediaFlowState, PendingMedia};
+pub(crate) use media::VideoState;
 mod projection;
 mod results;
 
 use super::*;
+use crate::request::Request;
 use ipc::BufferId;
 use scheduling::PolicyError;
 use scheduling::guest::{Plan, Room};
@@ -283,7 +284,7 @@ impl Scheduler {
         let mut queued = VecDeque::new();
         for mut batch in std::mem::take(&mut self.inflight.pending_submissions) {
             for (call, _) in batch.retire_requests(&requests) {
-                self.running.mark(call.request_key.request_id);
+                self.requests.mark(call.request_key.request_id);
                 if let Some(pending) =
                     self.inflight
                         .retire_call(batch.id, call.request_key, call.call_id)
@@ -369,13 +370,12 @@ impl Scheduler {
         if !kv_offload.holds() {
             return answered;
         }
-        let waiting: HashSet<RequestId> = self
-            .waiting
-            .iter()
-            .map(|state| state.req.request_id)
-            .collect();
-        let running = &self.running;
-        kv_offload.sweep(|request| waiting.contains(&request) || running.contains_key(&request));
+        let requests = &self.requests;
+        kv_offload.sweep(|request| {
+            requests
+                .get(&request)
+                .is_some_and(|request| request.tokens().is_some())
+        });
         answered
     }
 
@@ -390,13 +390,10 @@ impl Scheduler {
         // A retiring request keeps its entries because
         // `Dispatch::batch_workers` finds the destinations of its `Finish`
         // and `Free` commands through them.
-        let running = &self.running;
-        let running_media = &self.running_media;
+        let requests = &self.requests;
         let retiring = &self.retiring_requests;
         let live = |request: &ipc::RequestId| {
-            running.contains_key(request)
-                || running_media.contains_key(request)
-                || retiring.contains_key(request)
+            requests.get(request).is_some_and(Request::admitted) || retiring.contains_key(request)
         };
         self.dispatch
             .affinity
@@ -677,7 +674,7 @@ impl Scheduler {
             .policy
             .as_ref()
             .map_or(0, |policy| policy.limits().prefetch_min_tokens) as usize;
-        let Some(state) = self.running.get(&id) else {
+        let Some(state) = self.requests.tokens(&id) else {
             return;
         };
         let Some((target, hit)) = self.prefill_target(state) else {
@@ -753,9 +750,7 @@ impl Scheduler {
             // What could have been served instead: another resident, or a queued request. The
             // watchdog's own view names only the requests it tracks, so this is read from the
             // mechanism's queues rather than from that view.
-            let others = self.running.len() + self.running_media.len() > 1
-                || !self.waiting.is_empty()
-                || !self.waiting_media.is_empty();
+            let others = self.running.len() > 1 || !self.waiting.is_empty();
             if others {
                 tracing::warn!(
                     request = request.0,
@@ -771,7 +766,7 @@ impl Scheduler {
                 );
                 self.fail(format!(
                     "no batch formed for {} resident request(s) at step {}: {report}",
-                    self.running.len() + self.running_media.len(),
+                    self.running.len(),
                     self.step,
                 ));
                 self.policy = Some(policy);
@@ -795,7 +790,7 @@ impl Scheduler {
         if let Err(error) = mechanism::validate_admission(&plan, &live) {
             return self.policy_failed(policy, error);
         }
-        self.admit_plan(&plan);
+        self.admit(&plan);
         // The rest is read against the state admission has left: the admitted
         // requests' views moved, and the pages are the scheduler's own table
         // borrowed for the check (design §4.4).
@@ -812,8 +807,8 @@ impl Scheduler {
     ///
     /// A policy's state is append-only and it learns requests only from this
     /// mechanism's events, so the two sets are one fact. The mechanism holds a
-    /// request from its submission (`waiting`/`waiting_media`) through its
-    /// residence (`running`/`running_media`) to its end, and every one of those
+    /// request from its arrival (`waiting`) through its admission (`running`)
+    /// to its end, and every one of those
     /// transitions is announced (`Arrived`, `Admitted`, `Finished`). A step
     /// boundary is the one place both are complete: nothing is mid-transition
     /// there.
@@ -834,14 +829,8 @@ impl Scheduler {
         let held: std::collections::BTreeSet<scheduling::guest::RequestId> = self
             .waiting
             .iter()
-            .map(|state| guest(state.req.request_id.0))
-            .chain(
-                self.waiting_media
-                    .iter()
-                    .map(|pending| guest(pending.request.request_id.0)),
-            )
-            .chain(self.running.keys().map(|id| guest(id.0)))
-            .chain(self.running_media.keys().map(|id| guest(id.0)))
+            .chain(&self.running)
+            .map(|id| guest(id.0))
             .collect();
         let told: std::collections::BTreeSet<scheduling::guest::RequestId> =
             self.recorder.known().collect();
@@ -876,13 +865,13 @@ impl Scheduler {
     ///
     /// The marked requests are the residents accessed mutably, the requests
     /// whose calls entered or left flight, and the admitted ones
-    /// (`residents.rs`). A media request's next ready call also depends on the
+    /// (`request::Requests`). A media request's next ready call also depends on the
     /// calls other requests hold in flight on a shared component, so every
     /// resident media request is stated each step; they are few, and a token
     /// resident is never walked.
     fn refresh_views(&mut self) {
-        let mut changed = self.running.take_changed();
-        changed.extend(self.running_media.keys().copied());
+        let mut changed = self.requests.take_changed();
+        changed.extend(self.requests.running_video().map(|(id, _, _)| id));
         for id in changed {
             if let Some(view) = views::view_of(self, id, self.recorder.recorded()) {
                 self.recorder.update(view);
@@ -957,8 +946,8 @@ impl Scheduler {
         if calls == 0 {
             tracing::debug!(
                 step = self.step,
-                resident = self.running.len() + self.running_media.len(),
-                queued = self.waiting.len() + self.waiting_media.len(),
+                resident = self.running.len(),
+                queued = self.waiting.len(),
                 planned = plan.work.len() + plan.refill.len(),
                 admitted = plan.admit.len(),
                 in_flight =
@@ -1003,8 +992,8 @@ impl Scheduler {
         let mut text = format!(
             "{} resident, {} queued, {} in flight, {} waiting to be submitted, {} of {} cache \
              units free",
-            self.running.len() + self.running_media.len(),
-            self.waiting.len() + self.waiting_media.len(),
+            self.running.len(),
+            self.waiting.len(),
             self.inflight.pending_batches.len(),
             self.inflight.pending_submissions.len(),
             self.storage.free_units(),
@@ -1026,7 +1015,7 @@ impl Scheduler {
                         },
                         age_ms,
                     ));
-                    if let Some(state) = self.running.get(&RequestId(id.0)) {
+                    if let Some(state) = self.requests.tokens(&RequestId(id.0)) {
                         text.push_str(&format!(
                             ", {} of its {} prompt tokens computed in {} units",
                             state.num_computed_prompt_tokens,
@@ -1302,7 +1291,7 @@ impl Scheduler {
         let request_id = call.request_key.request_id;
         // A call in flight changes what its request's view states (its next
         // phase, whether it waits for a transfer).
-        self.running.mark(request_id);
+        self.requests.mark(request_id);
         let domain = self.stats.domains.get(call.kind);
         let active = domain.active_credits.fetch_add(1, Ordering::Relaxed) + 1;
         domain.peak_credits.fetch_max(active, Ordering::Relaxed);

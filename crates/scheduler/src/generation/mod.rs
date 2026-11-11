@@ -2,7 +2,7 @@
 //!
 //! A request advances through context ingestion, then either understanding
 //! decode or block-diffusion canvases of text ([`GenerationPhase`]).
-//! [`RequestState`] holds the accepted progress of one admitted token request.
+//! [`TokenState`] holds the accepted progress of one admitted token request.
 //!
 //! Each `plan_*` builder returns one call whose identities are placeholders
 //! and whose `Bounds` come from `finish_plan`; `register_call` then stamps the
@@ -12,11 +12,11 @@
 //!
 //! On completion, `validate_generation_result` checks a worker result against
 //! the submitted call and the request's limits, and
-//! `RequestState::process_generation_result` applies its accepted progress.
+//! `TokenState::process_generation_result` applies its accepted progress.
 //! Token semantics (stop conditions, public events) are resolved afterwards
 //! in `output`.
 
-use super::{EncoderCachePin, Phase, RequestAllocations, Terminal};
+use super::{EncoderCachePin, Phase, RequestAllocations};
 use crate::completion::CallCompletion;
 use crate::kv_cache::{BlockTable, CacheAllocation};
 
@@ -136,14 +136,14 @@ pub(crate) enum HandOff {
 
 /// Lifecycle phase for a canonical generation request.
 ///
-/// `RequestState::phase` records the accepted phase. Scheduling projects the
+/// `TokenState::phase` records the accepted phase. Scheduling projects the
 /// phase of the next call from it and the calls still in flight
 /// (`Scheduler::next_generation_phase`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GenerationPhase {
     /// Write the current latent input-image block's encoder feature into cache
-    /// (`RequestState::input_image_features`) with a call of its own.
+    /// (`TokenState::input_image_features`) with a call of its own.
     IngestState,
     /// Ingest the context: prefill prompt tokens and the vision blocks of
     /// input images between them, encoding each block first
@@ -153,7 +153,7 @@ pub(crate) enum GenerationPhase {
     /// prompt to a decode group (`WorkerGroupRole::Decode`): the Storage
     /// Server's Transfer Server copies the request's units from the prefill
     /// group's device planes into the decode group's (`crate::hand_off`),
-    /// and no call runs meanwhile (`RequestState::hand_off`). The decode
+    /// and no call runs meanwhile (`TokenState::hand_off`). The decode
     /// group then decodes the request from its committed token on.
     HandOff,
     /// Decode understanding (text) tokens.
@@ -163,7 +163,7 @@ pub(crate) enum GenerationPhase {
     /// tokens.
     Canvas,
     /// Write a stopped block's tokens into the request's context as a causal
-    /// prefill row (`RequestState::canvas_commit`); the next block reads them.
+    /// prefill row (`TokenState::canvas_commit`); the next block reads them.
     CommitCanvas,
 }
 
@@ -185,7 +185,7 @@ pub(super) fn is_prompt_extend(call: &Call) -> bool {
     call.kind == CallKind::Forward(ForwardMode::Prefill) && !consumes_image_features(call)
 }
 
-impl RequestState {
+impl TokenState {
     /// Applies one validated call in request order. Pending identities are
     /// consumed once before this update; inactive successors never reach it.
     ///
@@ -194,7 +194,7 @@ impl RequestState {
     /// `execution` calls this, after removing the call from the in-flight
     /// queue, only for a `CallStatus::Ok` result that
     /// `validate_generation_result` accepted, on a request of the call's epoch
-    /// whose chain is not invalidated and that has no terminal intent or
+    /// whose chain is not invalidated and whose end is not decided, with no
     /// deferred finish. Phase changes that depend on token values belong to
     /// `output`.
     ///
@@ -709,7 +709,7 @@ pub(super) fn register_call(
 pub(crate) fn validate_generation_result(
     call: &Call,
     image_cache: Option<(u32, Option<u32>)>,
-    state: &RequestState,
+    state: &TokenState,
     record: &CallCompletion,
     canvas: Option<&CanvasSampling>,
 ) -> Result<(), GenerationResultError> {
@@ -954,7 +954,7 @@ pub(crate) enum GenerationResultError {
 }
 
 /// Engine-owned state for one admitted request.
-pub(crate) struct RequestState {
+pub(crate) struct TokenState {
     pub req: GenerationRequest,
     /// Sorted device finish tokens (see `finish_token_ids` in the scheduler
     /// module).
@@ -986,7 +986,7 @@ pub(crate) struct RequestState {
     /// Context images whose every encoder feature has been written into the prefix cache.
     pub(super) num_ingested_images: usize,
     /// Next encoder of the current context image: with `num_ingested_images`,
-    /// the block cursor (`RequestState::block_cursor`).
+    /// the block cursor (`TokenState::block_cursor`).
     pub(super) image_encoder_index: usize,
     /// Encoder feature of the current latent block awaiting its cache write.
     pub(super) input_image_features: Option<TensorRef>,
@@ -1081,11 +1081,6 @@ pub(crate) struct RequestState {
     /// Tokens of the stopped block awaiting their commit
     /// (`GenerationPhase::CommitCanvas`); empty otherwise.
     pub(super) canvas_commit: Vec<u32>,
-    /// Monotonic microseconds (`clock::now_monotonic_us`) at which the
-    /// request state was created: queue waits are measured on the monotonic
-    /// clock, and only the public `Scheduled` event states it as Unix time.
-    pub queued_us: u64,
-    pub(crate) terminal_intent: Option<Terminal>,
     /// Cause of the first rejected worker result, which
     /// `Scheduler::fail_after_inflight` reports as the request's terminal
     /// error and its error finish logs.
@@ -1095,10 +1090,10 @@ pub(crate) struct RequestState {
     pub(super) prompt_tokens: usize,
 }
 
-impl RequestState {
+impl TokenState {
     /// The prompt tokens the request's usage charges: its prompt without the
     /// tokens it generated before it migrated, which its prompt continues
-    /// with (`Scheduler::request_state`) and its usage counts as generated.
+    /// with (`Scheduler::token_state`) and its usage counts as generated.
     pub(crate) fn charged_prompt_tokens(&self) -> usize {
         self.prompt_tokens
     }
@@ -1241,7 +1236,7 @@ pub(crate) struct BlockCursor {
 }
 
 /// What a context prefill adds to its request's context
-/// (`RequestState::context_advance`).
+/// (`TokenState::context_advance`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContextAdvance {
     /// Logical positions: one per prompt token, plus the positions of each

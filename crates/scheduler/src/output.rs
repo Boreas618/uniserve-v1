@@ -8,7 +8,7 @@
 //! and the request's next generation phase, and it owns the termination of
 //! running token requests (`Scheduler::finish_with`), which releases scheduler
 //! resources and publishes the terminal `Finished` event.
-//! `RequestState::process_generation_result` has already applied a call's
+//! `TokenState::process_generation_result` has already applied a call's
 //! accepted progress (cursors, encoder indices, denoising steps, phase) by the
 //! time `resolve` runs.
 
@@ -33,7 +33,7 @@ enum TokenOutcome {
 }
 
 /// What a token request was charged, which its `Finished` event reports.
-fn usage(state: &RequestState) -> Usage {
+fn usage(state: &TokenState) -> Usage {
     Usage {
         prompt_tokens: state.charged_prompt_tokens(),
         completion_tokens: state.num_generated_tokens,
@@ -266,14 +266,14 @@ impl Scheduler {
             // the request asks for them, a verification's accepted drafts
             // as well as the token after them.
             let (logprob, top_logprobs) = take_token_logprobs(&mut record, idx);
-            let Some(st) = self.running.get_mut(&id) else {
+            let Some(st) = self.requests.tokens_mut(&id) else {
                 return;
             };
             st.num_generated_tokens += 1;
             if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, true) {
                 return;
             }
-            if let Some(st) = self.running.get_mut(&id) {
+            if let Some(st) = self.requests.tokens_mut(&id) {
                 st.next_token = tok;
                 st.phase = Phase::DecodeUnd;
             }
@@ -282,7 +282,7 @@ impl Scheduler {
 
     /// Applies one completed call to its request and emits observable output.
     ///
-    /// `RequestState::process_generation_result` has already applied the call's
+    /// `TokenState::process_generation_result` has already applied the call's
     /// accepted progress, so the cursors, encoder indices, denoising step count,
     /// and phase read here reflect this completion. Resolution adds the
     /// remaining effects for the call's kind, such as stop conditions,
@@ -318,15 +318,15 @@ impl Scheduler {
                 if consumes_image_features(&call) {
                     self.free_consumed_products(id, &call);
                     let is_final_step = self
-                        .running
-                        .get(&id)
+                        .requests
+                        .tokens(&id)
                         .is_some_and(|state| state.image_encoder_index == 0);
 
                     // Writing the last image of a fully consumed prompt
                     // starts a canvas-generating request's first block, or
                     // understanding decode from BOS.
                     if is_final_step
-                        && self.running.get(&id).is_some_and(|st| {
+                        && self.requests.tokens(&id).is_some_and(|st| {
                             st.num_ingested_images >= st.req.multimodal_inputs.images.len()
                                 && st.num_computed_prompt_tokens
                                     >= st.req.prompt_token_ids.len() as u32
@@ -334,7 +334,7 @@ impl Scheduler {
                     {
                         let bos = self.special_tokens.bos;
                         let generates_canvases = self.config.canvas.is_some();
-                        if let Some(st) = self.running.get_mut(&id) {
+                        if let Some(st) = self.requests.tokens_mut(&id) {
                             if generates_canvases {
                                 st.phase = Phase::Canvas;
                             } else {
@@ -350,7 +350,7 @@ impl Scheduler {
                 // text and multimodal position has been consumed. The vision
                 // blocks it wrote no longer need their request-local products.
                 self.free_consumed_products(id, &call);
-                let Some(st) = self.running.get(&id) else {
+                let Some(st) = self.requests.tokens(&id) else {
                     return;
                 };
                 let (cursor, prompt_len) = (
@@ -361,7 +361,7 @@ impl Scheduler {
                     return;
                 }
 
-                if self.running.get(&id).is_some_and(|st| {
+                if self.requests.tokens(&id).is_some_and(|st| {
                     st.num_ingested_images < st.req.multimodal_inputs.images.len()
                         || st.num_computed_prompt_tokens < st.req.prompt_token_ids.len() as u32
                 }) {
@@ -372,7 +372,7 @@ impl Scheduler {
                 // nothing, and nor does each of its block commits, which
                 // extend the context the same way; the next block follows.
                 if self.config.canvas.is_some()
-                    && let Some(st) = self.running.get_mut(&id)
+                    && let Some(st) = self.requests.tokens_mut(&id)
                 {
                     st.phase = Phase::Canvas;
                     return;
@@ -383,21 +383,21 @@ impl Scheduler {
                 // latent block.
                 if call.token_output.is_none() {
                     let bos = self.special_tokens.bos;
-                    if let Some(st) = self.running.get_mut(&id) {
+                    if let Some(st) = self.requests.tokens_mut(&id) {
                         st.next_token = bos;
                         st.phase = Phase::DecodeUnd;
                     }
                     return;
                 }
 
-                let Some(st) = self.running.get_mut(&id) else {
+                let Some(st) = self.requests.tokens_mut(&id) else {
                     return;
                 };
                 st.num_generated_tokens += 1;
 
                 // Prompt scoring covers every prompt position after the first;
                 // a complete prompt with unscored positions is an error.
-                if self.running.get(&id).is_some_and(|state| {
+                if self.requests.tokens(&id).is_some_and(|state| {
                     state.req.sampling.prompt_logprobs_requested()
                         && state.output.prompt_logprobs_emitted
                             != state.req.prompt_token_ids.len().saturating_sub(1)
@@ -425,7 +425,7 @@ impl Scheduler {
                 // a decode group first; the decode there continues from the
                 // committed token, which leaves no device token to relay.
                 let hand_off = self.decodes_elsewhere(id);
-                if let Some(st) = self.running.get_mut(&id) {
+                if let Some(st) = self.requests.tokens_mut(&id) {
                     st.next_token = tok;
                     if hand_off {
                         st.phase = Phase::HandOff;
@@ -439,7 +439,7 @@ impl Scheduler {
             // for their commit; they are published first, in order, and the
             // request finishes on the first that ends it.
             CallKind::Forward(ForwardMode::TokenDenoising) => {
-                let tokens = match self.running.get(&id) {
+                let tokens = match self.requests.tokens(&id) {
                     Some(st) if st.phase == Phase::CommitCanvas => st.canvas_commit.clone(),
                     _ => return,
                 };
@@ -460,7 +460,7 @@ impl Scheduler {
             | CallKind::Media(MediaCall::LatentEncoding) => {
                 let Some((block, step, block_cache_key)) =
                     self.next_context_encode(id).and_then(|(block, step)| {
-                        let state = self.running.get(&id)?;
+                        let state = self.requests.tokens(&id)?;
                         let encoding = self.encoding(&state.req, block)?;
                         let key = state.req.cache.write.then(|| encoding.device_key());
                         Some((block, step, key))
@@ -499,7 +499,7 @@ impl Scheduler {
                     // Only a product the cache now holds moves its
                     // buffer from the request to encoder retention.
                     if stored {
-                        let allocation = self.running.get_mut(&id).and_then(|state| {
+                        let allocation = self.requests.tokens_mut(&id).and_then(|state| {
                             state.allocations_mut()?.take_buffer(feature.buffer_id())
                         });
                         let Some(allocation) = allocation else {
@@ -526,7 +526,7 @@ impl Scheduler {
                     let Some(product) = self.storage.encoder_cache.acquire(cache_key) else {
                         return self.finish(id, FinishReason::Error);
                     };
-                    if let Some(st) = self.running.get_mut(&id) {
+                    if let Some(st) = self.requests.tokens_mut(&id) {
                         st.encoder_cache_pins.push(EncoderCachePin {
                             key: cache_key,
                             product: product.clone(),
@@ -536,7 +536,7 @@ impl Scheduler {
                     // the policy evicts by.
                     self.record_encoded(cache_key);
                     product
-                } else if let Some(st) = self.running.get_mut(&id) {
+                } else if let Some(st) = self.requests.tokens_mut(&id) {
                     st.transient_encoder_products.push(feature.clone());
                     feature.clone()
                 } else {
@@ -546,7 +546,7 @@ impl Scheduler {
                 // A latent block is written by its own extension; a
                 // vision block joins the context prefill that reaches
                 // it. Encodes follow the blocks' context order.
-                if let Some(st) = self.running.get_mut(&id) {
+                if let Some(st) = self.requests.tokens_mut(&id) {
                     if step == crate::ImageEncoder::Latent {
                         st.input_image_features = Some(selected_product);
                         st.phase = Phase::IngestState;
@@ -583,7 +583,7 @@ impl Scheduler {
         positions: Vec<Vec<TokenLogprob>>,
     ) {
         let total = positions.len();
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         let processed_before = state.output.prompt_logprobs_processed;
@@ -620,8 +620,8 @@ impl Scheduler {
             .cloned()
             .collect();
         let freed = self
-            .running
-            .get_mut(&id)
+            .requests
+            .tokens_mut(&id)
             .map(|state| {
                 let (freed, kept) = std::mem::take(&mut state.transient_encoder_products)
                     .into_iter()
@@ -633,28 +633,29 @@ impl Scheduler {
         self.free_buffers(freed.into_iter().map(|product| product.buffer_id()));
     }
 
-    /// Flushes the journals of running token and media requests and of retired
-    /// requests. Returns whether any journal changed length.
+    /// Flushes the journals of the running requests and of the retired ones.
+    /// Returns whether any journal changed length.
     ///
-    /// A running request whose receiver has closed is marked for cancellation
-    /// through its terminal intent; it retires once its in-flight calls drain.
+    /// A running request whose receiver has closed ends as cancelled; it
+    /// retires once its in-flight calls drain.
     pub(super) fn flush_output_journals(&mut self) -> bool {
         let mut progressed = false;
-        for (events, intent) in self
-            .running
-            .values_mut()
-            .map(|state| (&mut state.output.events, &mut state.terminal_intent))
-            .chain(
-                self.running_media
-                    .values_mut()
-                    .map(|state| (&mut state.output, &mut state.terminal_intent)),
-            )
-        {
+        let mut closed = Vec::new();
+        for (id, request) in self.requests.admitted_mut() {
+            let events = match &mut request.graph {
+                Graph::Tokens(state) => &mut state.output.events,
+                Graph::Video(state) => &mut state.output,
+            };
             let before = events.journal.len();
             if events.is_closed() || events.flush() {
-                *intent = Some(Terminal::finish(FinishReason::Cancelled));
+                request.status = RequestStatus::Finished(Terminal::finish(FinishReason::Cancelled));
+                closed.push(id);
             }
             progressed |= events.journal.len() != before;
+        }
+        // A request whose end was just decided moved in the policy's view.
+        for id in closed {
+            self.requests.mark(id);
         }
         progressed |= self.output.flush_retired();
         progressed
@@ -674,12 +675,12 @@ impl Scheduler {
         {
             return false;
         }
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return false;
         };
         let accepted = state.output.events.enqueue(event);
-        if !accepted {
-            state.terminal_intent = Some(Terminal::finish(FinishReason::Cancelled));
+        if !accepted && let Some(status) = self.requests.status_mut(&id) {
+            *status = RequestStatus::Finished(Terminal::finish(FinishReason::Cancelled));
         }
         accepted
     }
@@ -691,13 +692,13 @@ impl Scheduler {
     /// dropped it, and `false` when the request is not running or does not emit
     /// text. `tokens_sent` advances only when the event was accepted.
     pub(super) fn emit_text(&mut self, id: RequestId, tok: u32, logprob: Option<f32>) -> bool {
-        let Some(st) = self.running.get_mut(&id) else {
+        let Some(st) = self.requests.tokens_mut(&id) else {
             return false;
         };
         st.generated_token_ids.push(tok);
         let published = self.emit(id, Event::TextToken { id: tok, logprob });
         if published {
-            if let Some(state) = self.running.get_mut(&id) {
+            if let Some(state) = self.requests.tokens_mut(&id) {
                 state.output.tokens_sent = state.output.tokens_sent.saturating_add(1);
             }
             // The policy is told the request emitted a token, and when.
@@ -715,7 +716,7 @@ impl Scheduler {
     /// A running request always records the tokens in `generated_token_ids`.
     /// `tokens_sent` advances only when the event was accepted.
     pub(super) fn emit_text_tokens(&mut self, id: RequestId, tokens: Vec<u32>) {
-        let Some(st) = self.running.get_mut(&id) else {
+        let Some(st) = self.requests.tokens_mut(&id) else {
             return;
         };
         st.generated_token_ids.extend_from_slice(&tokens);
@@ -725,7 +726,7 @@ impl Scheduler {
         let count = tokens.len();
         let published = self.emit(id, Event::TextTokens { ids: tokens });
         if published {
-            if let Some(state) = self.running.get_mut(&id) {
+            if let Some(state) = self.requests.tokens_mut(&id) {
                 state.output.tokens_sent = state.output.tokens_sent.saturating_add(count);
             }
             let at =
@@ -750,7 +751,7 @@ impl Scheduler {
         let mut visible = Vec::with_capacity(tokens.len());
         let mut finish = None;
         for &token_id in tokens {
-            let Some(state) = self.running.get_mut(&id) else {
+            let Some(state) = self.requests.tokens_mut(&id) else {
                 return;
             };
             state.num_generated_tokens += 1;
@@ -758,8 +759,8 @@ impl Scheduler {
                 TokenOutcome::Continue => visible.push(token_id),
                 TokenOutcome::StopToken => {
                     if self
-                        .running
-                        .get(&id)
+                        .requests
+                        .tokens(&id)
                         .is_some_and(|state| state.req.include_stop_token)
                     {
                         visible.push(token_id);
@@ -790,7 +791,7 @@ impl Scheduler {
     /// and a stop-token match takes precedence over EOS and the limit. A
     /// request that is not running continues, and its caller finds it gone.
     fn und_token_outcome(&self, id: RequestId, token_id: u32) -> TokenOutcome {
-        let Some(state) = self.running.get(&id) else {
+        let Some(state) = self.requests.tokens(&id) else {
             return TokenOutcome::Continue;
         };
         let generated = state.num_generated_tokens;
@@ -840,8 +841,8 @@ impl Scheduler {
         top_logprobs: Option<Vec<TokenLogprob>>,
     ) {
         if self
-            .running
-            .get(&id)
+            .requests
+            .tokens(&id)
             .is_some_and(|state| state.req.include_stop_token)
         {
             self.emit_sampled_text(id, token_id, logprob, top_logprobs);
@@ -865,7 +866,7 @@ impl Scheduler {
         top_logprobs: Option<Vec<TokenLogprob>>,
         sampled: bool,
     ) -> bool {
-        if !self.running.contains_key(&id) {
+        if !self.requests.tokens(&id).is_some() {
             return true;
         }
         match self.und_token_outcome(id, token_id) {
@@ -896,7 +897,7 @@ impl Scheduler {
         } else {
             self.emit_text(id, token_id, logprob);
         }
-        !self.running.contains_key(&id)
+        !self.requests.tokens(&id).is_some()
     }
 
     /// Finishes one request without a concrete stop-token or stop-string cause.
@@ -928,8 +929,8 @@ impl Scheduler {
     ) {
         let decoder_pending = !matches!(reason, FinishReason::Error)
             && self
-                .running
-                .get(&id)
+                .requests
+                .tokens(&id)
                 .is_some_and(|state| !state.output.decoder_boundaries.is_empty());
         if !self.inflight.has_pending_calls(id) && !decoder_pending {
             self.finish_with(id, reason, stop_reason);
@@ -943,7 +944,7 @@ impl Scheduler {
         if !terminal_published && !decoder_pending && !matches!(reason, FinishReason::Error) {
             // A closed receiver drops the event; nothing is published later
             // either way.
-            if let Some(state) = self.running.get_mut(&id) {
+            if let Some(state) = self.requests.tokens_mut(&id) {
                 let terminal = Terminal::Finished {
                     reason: reason.clone(),
                     stop_reason: stop_reason.clone(),
@@ -972,7 +973,7 @@ impl Scheduler {
     /// applies once the request's in-flight calls drain. A later cause for
     /// the same request changes neither.
     pub(super) fn fail_after_inflight(&mut self, id: RequestId, cause: String) {
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         if state.failure.is_none() {
@@ -986,8 +987,8 @@ impl Scheduler {
     pub(super) fn finish_pending_if_idle(&mut self, id: RequestId) {
         if self.inflight.has_pending_calls(id)
             || self
-                .running
-                .get(&id)
+                .requests
+                .tokens(&id)
                 .is_some_and(|state| !state.output.decoder_boundaries.is_empty())
         {
             return;
@@ -1043,8 +1044,8 @@ impl Scheduler {
         if terminal.migration().is_some()
             && self.config.canvas.is_none()
             && self
-                .running
-                .get(&id)
+                .requests
+                .tokens(&id)
                 .is_some_and(|state| state.worker_registered && state.caches_generated_text())
         {
             self.advance_request_cache(id, true);
@@ -1061,7 +1062,7 @@ impl Scheduler {
 
         // Report accepted request progress before error teardown removes it.
         if reason == Some(FinishReason::Error)
-            && let Some(state) = self.running.get(&id)
+            && let Some(state) = self.requests.tokens(&id)
         {
             tracing::error!(
                 request_id = id.0,
@@ -1078,7 +1079,17 @@ impl Scheduler {
         // acknowledges the ordered close command.
         let mut awaits_close = false;
         let mut allocations = None;
-        if let Some(mut st) = self.running.remove(&id) {
+        if let Some(mut st) = self
+            .requests
+            .tokens(&id)
+            .is_some()
+            .then(|| self.requests.remove(&id))
+            .flatten()
+            .and_then(|request| match request.graph {
+                Graph::Tokens(state) => Some(state),
+                Graph::Video(_) => None,
+            })
+        {
             if st.allocations.is_some() {
                 // The pool row this request held is free from here on.
                 self.rows_held = self.rows_held.saturating_sub(1);
@@ -1122,7 +1133,7 @@ impl Scheduler {
 
             // Remove admission reservations before exposing terminal output so
             // the next scheduler step observes the released capacity.
-            self.running_order.retain(|request| *request != id);
+            self.running.retain(|request| *request != id);
             self.storage.reserved_encoder_entries = self
                 .storage
                 .reserved_encoder_entries
@@ -1199,7 +1210,7 @@ impl Scheduler {
         // While a refill restores the request's draft cache, its state
         // tables keep the checkpoint the refill continues from.
         let refill_cursor = self.refill_cursor(id);
-        let Some(state) = self.running.get(&id) else {
+        let Some(state) = self.requests.tokens(&id) else {
             return;
         };
         let key = RequestKey::new(self.engine_id, id, state.request_epoch);
@@ -1220,7 +1231,7 @@ impl Scheduler {
             .map(|(_, worker)| Arc::new(worker.endpoint.clone()));
         let (Some(source), Some(state), Some(prefix_cache)) = (
             source,
-            self.running.get_mut(&id),
+            self.requests.tokens_mut(&id),
             self.storage.cache.as_ref(),
         ) else {
             self.invariant_broken(

@@ -120,7 +120,7 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
 mod completion;
 mod stats;
 mod terminal;
-use terminal::{Terminal, Usage, latch_finish};
+use terminal::{Terminal, Usage};
 pub(crate) mod stats_report;
 
 pub use epoch::{GroupCache, ParkedCache};
@@ -153,7 +153,7 @@ mod denoising;
 mod dispatch;
 pub(crate) mod encodings;
 mod execution;
-use execution::{MediaFlowState, PendingMedia};
+use execution::VideoState;
 pub(crate) mod generation;
 pub(crate) mod graph;
 mod inflight;
@@ -162,7 +162,7 @@ mod mechanism;
 pub(crate) mod output;
 mod policy;
 mod preemption;
-mod residents;
+mod request;
 mod run;
 mod speculation;
 pub(crate) mod submission;
@@ -216,10 +216,11 @@ use allocation::requests::{
     UnknownMediaGroup,
 };
 use denoising::Denoising;
-use generation::RequestState;
+use generation::TokenState;
 use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
 use output::RequestOutput;
+use request::{Graph, RequestStatus};
 
 /// The kind of pass a call kind is batched in (see `batch_kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,15 +357,13 @@ pub struct Scheduler {
     info: MainProcessInfo,
     generation_limits: crate::GenerationLimits,
     special_tokens: SpecialTokenIds,
-    /// Token requests awaiting admission, in admission order: arrival order,
-    /// or priority then arrival under the priority policy.
-    waiting: VecDeque<RequestState>,
-    /// Media requests awaiting admission, in arrival order.
-    waiting_media: VecDeque<PendingMedia>,
-    /// The resident token requests, which mark the requests whose policy view
-    /// moved (`residents.rs`).
-    running: residents::Residents,
-    running_media: HashMap<RequestId, MediaFlowState>,
+    /// Every request the scheduler knows, waiting or running, by id.
+    requests: request::Requests,
+    /// The requests awaiting admission, token and video alike: the requests
+    /// that resume work another engine began first, then arrival order
+    /// (`Scheduler::add_request`). Which of them a step admits is the
+    /// policy's decision; the mechanism tries the named ones in this order.
+    waiting: VecDeque<RequestId>,
     /// What the epoch measures of speculation, which the refill policy
     /// weighs.
     speculation_meter: speculation::SpeculationMeter,
@@ -441,10 +440,10 @@ pub struct Scheduler {
     /// results from an earlier lifetime of a request id never match it.
     next_request_epoch: u64,
     config: SchedulerConfig,
-    /// Token and media requests in admission order. Media scheduling visits
-    /// them in this order; batch assembly uses it to break ties within
-    /// `assembly_priority`.
-    running_order: Vec<RequestId>,
+    /// The admitted requests, token and video alike, in admission order.
+    /// Media scheduling visits them in this order; batch assembly uses it
+    /// to break ties within `assembly_priority`.
+    running: Vec<RequestId>,
     output: output::OutputSender,
     /// Where the scheduler is in its life: serving, parking, parked, or
     /// failed (`Lifecycle`).
@@ -480,7 +479,7 @@ pub struct Scheduler {
     /// The requests held for the index meanwhile, in arrival order: the
     /// others are admitted past them, and they return to the head of the
     /// queue when the index arrives or the wait ends.
-    held_for_index: Vec<RequestState>,
+    held_for_index: Vec<RequestId>,
     /// Whether forming batches is held for a change of the device's storage
     /// (`CacheChange::Hold`): nothing runs, and every request keeps its state.
     ///

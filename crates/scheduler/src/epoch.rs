@@ -72,7 +72,7 @@ pub struct ParkedCache {
     pub held_units: u32,
     pub requests: u32,
     /// Of `held_units`, the units of the migrating requests that reserved
-    /// their whole cache at admission (`RequestState::reserve_worstcase`,
+    /// their whole cache at admission (`TokenState::reserve_worstcase`,
     /// a request with images), and how many they were: a successor
     /// reserves their whole cache again, since it computes their context
     /// anew, whether or not it recomputes the others.
@@ -213,10 +213,10 @@ impl Scheduler {
         // What the requests that leave as migratable hold, before they let
         // it go, and whether they reserved their whole cache at admission.
         let migrating: Vec<(u32, bool)> = self
-            .running
-            .values()
-            .filter(|state| !state.terminal_intent.is_some())
-            .map(|state| {
+            .requests
+            .running_tokens()
+            .filter(|(_, status, _)| !status.is_finished())
+            .map(|(_, _, state)| {
                 let units = state.allocations.as_ref().map_or(0, |allocations| {
                     allocations
                         .block_tables()
@@ -255,10 +255,10 @@ impl Scheduler {
     pub(super) fn migrating_cache(&self) -> (u32, Vec<proto::request::wire::RequestPrefix>) {
         let mut units = 0;
         let mut tokens = Vec::new();
-        for state in self
-            .running
-            .values()
-            .filter(|state| !state.terminal_intent.is_some())
+        for (_, _, state) in self
+            .requests
+            .running_tokens()
+            .filter(|(_, status, _)| !status.is_finished())
         {
             units += state.allocations.as_ref().map_or(0, |allocations| {
                 allocations
@@ -288,10 +288,8 @@ impl Scheduler {
     pub(super) fn poll_park(&mut self) {
         if !matches!(self.lifecycle, crate::Lifecycle::Parking(_))
             || !(self.running.is_empty()
-                && self.running_media.is_empty()
                 && self.retiring_requests.is_empty()
                 && self.waiting.is_empty()
-                && self.waiting_media.is_empty()
                 && self.inflight.pending_batches.is_empty()
                 && self.inflight.pending_submissions.is_empty())
         {

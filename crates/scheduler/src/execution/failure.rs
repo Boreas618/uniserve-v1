@@ -137,22 +137,19 @@ impl Scheduler {
         let (ids, commands) = self.inflight.clear_failed_calls();
         self.acknowledge_commands(&commands);
         for id in &ids {
-            self.running.mark(*id);
+            self.requests.mark(*id);
         }
         for id in ids {
             // A request whose migration began ends as it began.
-            let migrating = self
-                .running
-                .get(&id)
-                .and_then(|state| match state.terminal_intent {
-                    Some(Terminal::Migrated { cause, .. }) => Some(cause),
-                    _ => None,
-                });
-            if let Some(state) = self.media_state(id) {
+            let decided = self.requests.status(&id).and_then(RequestStatus::terminal);
+            let migrating = decided
+                .filter(|_| self.requests.tokens(&id).is_some())
+                .and_then(Terminal::migration);
+            if self.media_state(id).is_some() {
                 // A video request leaves as migratable, for the cause its
                 // preemption states or as lost, its trajectory not stored.
-                let cause = match state.terminal_intent {
-                    Some(Terminal::Migrated { cause, .. }) => Some(cause),
+                let cause = match decided {
+                    Some(Terminal::Migrated { cause, .. }) => Some(*cause),
                     None if self.config.canvas.is_none() => Some(MigrationCause::Loss),
                     _ => None,
                 };
@@ -165,7 +162,7 @@ impl Scheduler {
                 self.migrate_request(id, cause);
             } else if self.migrates_on_loss(id) {
                 self.migrate_request(id, MigrationCause::Loss);
-            } else if self.running.contains_key(&id) {
+            } else if self.requests.tokens(&id).is_some() {
                 self.emit(
                     id,
                     Event::Error {
@@ -197,33 +194,29 @@ impl Scheduler {
             .unwrap_or_else(|| "the epoch on trial failed".to_owned());
         self.fail_all_inflight(&failure);
 
-        let queued: Vec<RequestId> = self.waiting.iter().map(|st| st.req.request_id).collect();
-        for id in queued {
-            if let Some(st) = self.remove_waiting(id) {
-                self.announce_end(id, scheduling::guest::event::End::Migratable);
-                let _ = st.output.events.event_tx.send(Event::Migratable {
+        // Every waiting request leaves as migratable, a video request too:
+        // the epoch that held their trajectories failed, and the previous
+        // epoch computes them again from what they name.
+        let waiting: Vec<RequestId> = self
+            .waiting
+            .iter()
+            .chain(&self.held_for_index)
+            .copied()
+            .collect();
+        for id in waiting {
+            self.end_waiting(
+                id,
+                scheduling::guest::event::End::Migratable,
+                Event::Migratable {
                     cause: MigrationCause::Loss,
                     denoised_steps: 0,
                     stored_layout: Vec::new(),
-                });
-            }
-        }
-        // Video requests leave as well, whatever they reached: the epoch
-        // that held their trajectories failed, and the previous epoch
-        // computes them again from what they name.
-        while let Some(pending) = self.waiting_media.pop_front() {
-            self.announce_end(
-                pending.request.request_id,
-                scheduling::guest::event::End::Migratable,
+                },
             );
-            let _ = pending.event_tx.send(Event::Migratable {
-                cause: MigrationCause::Loss,
-                denoised_steps: 0,
-                stored_layout: Vec::new(),
-            });
         }
+        // So does every running video request, whatever it reached.
         for id in self.media_ids() {
-            let cause = match self.media_state(id).map(|state| &state.terminal_intent) {
+            let cause = match self.requests.status(&id).map(RequestStatus::terminal) {
                 Some(Some(Terminal::Migrated { cause, .. })) => *cause,
                 Some(None) => MigrationCause::Loss,
                 _ => continue,
@@ -232,11 +225,11 @@ impl Scheduler {
         }
 
         let running: Vec<(RequestId, MigrationCause)> = self
-            .running
-            .iter()
-            .filter_map(|(id, state)| match state.terminal_intent {
-                Some(Terminal::Migrated { cause, .. }) => Some((*id, cause)),
-                _ if self.migrates_on_loss(*id) => Some((*id, MigrationCause::Loss)),
+            .requests
+            .running_tokens()
+            .filter_map(|(id, status, _)| match status.terminal() {
+                Some(Terminal::Migrated { cause, .. }) => Some((id, *cause)),
+                _ if self.migrates_on_loss(id) => Some((id, MigrationCause::Loss)),
                 _ => None,
             })
             .collect();
@@ -252,10 +245,8 @@ impl Scheduler {
     fn migrates_on_loss(&self, id: RequestId) -> bool {
         self.config.canvas.is_none()
             && !self.inflight.pending_finishes.contains_key(&id)
-            && self
-                .running
-                .get(&id)
-                .is_some_and(|state| !state.terminal_intent.is_some())
+            && self.requests.tokens(&id).is_some()
+            && !self.requests.finished(&id)
     }
 
     /// Reconciles failed work without resetting allocations owned by live consumers.
@@ -343,7 +334,7 @@ impl Scheduler {
             pending.push_back(batch);
         }
         for (batch_id, request, call_id) in retired {
-            self.running.mark(request.request_id);
+            self.requests.mark(request.request_id);
             let Some(inflight) = self.inflight.retire_call(batch_id, request, call_id) else {
                 self.latch_fatal();
                 tracing::error!(
@@ -398,37 +389,41 @@ impl Scheduler {
                 .pending_finishes
                 .get(&id)
                 .is_some_and(|finish| finish.reason == FinishReason::Error);
-            if let Some(state) = self.media_state_mut(id) {
+            let Some(Request { status, graph, .. }) = self
+                .requests
+                .get_mut(&id)
+                .filter(|request| request.admitted())
+            else {
+                continue;
+            };
+            if let Graph::Video(state) = graph {
                 // A video request whose workers were lost leaves as
                 // migratable once its calls drain, its trajectory lost with
                 // them, unless the worker refused it or it already fails;
                 // the daemon submits it again.
-                if state.admission.request_key == request {
-                    state.terminal_intent = match refusal {
-                        Some(reason) => Some(Terminal::Rejected(reason.clone())),
+                if state.request_key == request {
+                    *status = RequestStatus::Finished(match refusal {
+                        Some(reason) => Terminal::Rejected(reason.clone()),
                         None if migrates
-                            && !state
-                                .terminal_intent
-                                .as_ref()
-                                .is_some_and(Terminal::is_failure) =>
+                            && !status.terminal().is_some_and(Terminal::is_failure) =>
                         {
                             migrating = true;
-                            Some(Terminal::migrate(MigrationCause::Loss))
+                            Terminal::migrate(MigrationCause::Loss)
                         }
-                        None => Some(Terminal::Failed(loss.message.clone())),
-                    };
+                        None => Terminal::Failed(loss.message.clone()),
+                    });
                 }
-            } else if let Some(state) = self.running.get_mut(&id) {
+            } else if let Graph::Tokens(state) = graph {
                 if request != RequestKey::new(engine_id, id, state.request_epoch) {
                     continue;
                 }
                 state.output.decoder_boundaries.clear();
                 if migrates
                     && refusal.is_none()
-                    && !state.terminal_intent.is_some()
+                    && !status.is_finished()
                     && !self.inflight.pending_finishes.contains_key(&id)
                 {
-                    state.terminal_intent = Some(Terminal::migrate(MigrationCause::Loss));
+                    *status = RequestStatus::Finished(Terminal::migrate(MigrationCause::Loss));
                     migrating = true;
                 } else {
                     if !error_emitted {
@@ -490,7 +485,7 @@ impl Scheduler {
             }
             if self
                 .media_state(id)
-                .is_some_and(|state| state.admission.request_key == request)
+                .is_some_and(|state| state.request_key == request)
             {
                 if !self.inflight.has_pending_calls(id) {
                     let terminal = match refusal {
@@ -500,7 +495,7 @@ impl Scheduler {
                     };
                     self.finish_media(id, terminal);
                 }
-            } else if self.running.contains_key(&id) && !migrating {
+            } else if self.requests.tokens(&id).is_some() && !migrating {
                 self.finish_after_inflight(id, FinishReason::Error, None);
             }
         }
@@ -519,16 +514,32 @@ impl Scheduler {
         self.inflight.pending_submissions.clear();
         self.fail_inflight_domain_credits();
         let _ = self.inflight.clear_failed_calls();
-        while let Some(submission) = self.waiting_media.pop_front() {
-            let _ = submission.event_tx.send(Event::Error {
-                message: message.to_string(),
-            });
+        // A waiting video request fails with the engine; a waiting token
+        // request is left to `abort_all_requests`.
+        let waiting: Vec<RequestId> = self
+            .waiting
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.requests
+                    .get(id)
+                    .is_some_and(|request| request.video().is_some())
+            })
+            .collect();
+        for id in waiting {
+            self.end_waiting(
+                id,
+                scheduling::guest::event::End::Failed,
+                Event::Error {
+                    message: message.to_string(),
+                },
+            );
         }
         let media = self.media_ids();
         for id in media {
             self.finish_media(id, Terminal::Failed(message.to_string()));
         }
-        let ids = self.running.keys().copied().collect::<Vec<_>>();
+        let ids = self.running.clone();
         for id in ids {
             if self.migrates_on_loss(id) {
                 self.migrate_request(id, MigrationCause::Loss);

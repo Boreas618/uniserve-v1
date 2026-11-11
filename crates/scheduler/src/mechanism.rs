@@ -251,7 +251,7 @@ pub(crate) fn validate_after_admission(
 /// own admission would name requests the mechanism no longer queues.
 pub(crate) fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
     // §4.4 puts the slot limit in the mechanism's *stop*, not in a refusal:
-    // `admit_tokens`/`admit_media` admit in the plan's order until the first
+    // `Scheduler::admit` admits in the queue's order until the first
     // request that cannot be placed, and it and those after it stay queued. A
     // plan that names more requests than there are slots free is exactly what
     // `fcfs` states - it names every queued request - so refusing it here would
@@ -585,7 +585,7 @@ pub(crate) fn validate_victims(
     // 1. An object the policy **was told** about and the mechanism no longer
     //    holds: the mechanism let go of it between the observation the policy
     //    answered from and this call. Nothing of the step can do that today -
-    //    `admit_plan` is the only thing that changes storage between `observe`
+    //    `admit` is the only thing that changes storage between `observe`
     //    and `reclaim`, and it frees nothing - so the case is unreachable, and
     //    its path exists to catch the mechanism, not the policy: a free it made
     //    without recording it is a broken invariant, and the epoch stops naming

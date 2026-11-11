@@ -225,9 +225,7 @@ impl Scheduler {
             .map_or(0, |cache| cache.pool().withdrawn_held());
         if held > 0
             || (resize.change.quiesces()
-                && !(self.running.is_empty()
-                    && self.running_media.is_empty()
-                    && self.retiring_requests.is_empty()))
+                && !(self.running.is_empty() && self.retiring_requests.is_empty()))
         {
             return;
         }
@@ -302,7 +300,10 @@ impl Scheduler {
             .map(|cache| cache.seeds().iter().map(|seed| seed.0).collect::<Vec<_>>())
             .unwrap_or_default();
         let mut kept = 0;
-        for state in self.running.values_mut() {
+        for (_, request) in self.requests.admitted_mut() {
+            let Some(state) = request.tokens_mut() else {
+                continue;
+            };
             // Repeated updates retain the original private lineage. New
             // requests alone begin under the newly published component keys.
             if state.req.cache.state_seeds.is_empty() {
@@ -327,14 +328,8 @@ impl Scheduler {
     /// Ends every request the scheduler holds, aborted: those queued, and
     /// those running once their batches in flight drain.
     fn abort_held_requests(&mut self) {
-        let mut held: Vec<RequestId> = self.running.keys().copied().collect();
-        held.extend(self.waiting.iter().map(|state| state.req.request_id));
-        held.extend(self.media_ids());
-        held.extend(
-            self.waiting_media
-                .iter()
-                .map(|submission| submission.request.request_id),
-        );
+        let mut held: Vec<RequestId> = self.running.clone();
+        held.extend(self.waiting.iter().chain(&self.held_for_index).copied());
         tracing::info!(
             requests = held.len(),
             "aborting the requests in flight for a weight update"
@@ -651,8 +646,8 @@ impl Scheduler {
             return;
         };
         let holds = self
-            .running
-            .get(&id)
+            .requests
+            .tokens(&id)
             .is_some_and(|state| holds_from(state, first));
         if let Some(resize) = self.resizing.as_mut()
             && holds
@@ -666,10 +661,10 @@ impl Scheduler {
     /// generated tokens and holds a unit from `first` on.
     fn migrate_holders(&mut self, first: u32) {
         let holders: Vec<RequestId> = self
-            .running
-            .iter()
-            .filter(|(_, state)| holds_from(state, first))
-            .map(|(id, _)| *id)
+            .requests
+            .running_tokens()
+            .filter(|(_, _, state)| holds_from(state, first))
+            .map(|(id, _, _)| id)
             .collect();
         self.migrate_running(MigrationCause::Drain, |id| holders.contains(&id));
     }
@@ -746,7 +741,7 @@ fn answers<R: serde::Serialize>(replies: &[R]) -> Result<Vec<String>, String> {
 }
 
 /// Returns whether the request holds a unit from `first` on.
-fn holds_from(state: &RequestState, first: u32) -> bool {
+fn holds_from(state: &TokenState, first: u32) -> bool {
     state.allocations.as_ref().is_some_and(|allocations| {
         allocations
             .block_tables()

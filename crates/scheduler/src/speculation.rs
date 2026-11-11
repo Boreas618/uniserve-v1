@@ -190,7 +190,7 @@ impl DraftCache {
 /// The tokens a request's cache holds, in position order: its prompt (a
 /// migrated request's ending with the tokens it generated before) and the
 /// tokens it generated since its admission.
-fn cached_token(state: &RequestState, position: u32) -> Option<u32> {
+fn cached_token(state: &TokenState, position: u32) -> Option<u32> {
     let prompt = &state.req.prompt_token_ids;
     let position = position as usize;
     if let Some(&token) = prompt.get(position) {
@@ -227,7 +227,7 @@ impl Scheduler {
     /// request's `min_tokens` floor. A request without either verifies every
     /// draft it may.
     pub(crate) fn verify_drafts(&self, id: RequestId, visible: u32) -> Vec<u32> {
-        let Some(state) = self.running.get(&id) else {
+        let Some(state) = self.requests.tokens(&id) else {
             return Vec::new();
         };
         if !state.draft.complete(visible) {
@@ -265,8 +265,8 @@ impl Scheduler {
     /// for: the deployment's limit when the request's draft cache is valid
     /// through `start`, so that the forward completes it, none otherwise.
     pub(crate) fn proposals_for(&self, id: RequestId, start: u32) -> u32 {
-        self.running
-            .get(&id)
+        self.requests
+            .tokens(&id)
             .filter(|state| state.draft.complete(start))
             .map_or(0, |_| self.config.draft_tokens as u32)
     }
@@ -305,7 +305,7 @@ impl Scheduler {
             }
         }
         let held = self.holds_draft(id, start, end);
-        let Some(state) = self.running.get_mut(&id) else {
+        let Some(state) = self.requests.tokens_mut(&id) else {
             return;
         };
         if held {
@@ -332,8 +332,8 @@ impl Scheduler {
             .count();
         let terminal = matching == committed.len()
             && committed.last().is_some_and(|token| {
-                self.running
-                    .get(&id)
+                self.requests
+                    .tokens(&id)
                     .is_some_and(|state| state.finish_token_ids.contains(token))
             });
         let accepted = if terminal {
@@ -360,7 +360,7 @@ impl Scheduler {
     /// Whether `id`'s draft cache pages covering positions `[start, end)`
     /// hold units.
     fn holds_draft(&self, id: RequestId, start: u32, end: u32) -> bool {
-        let (Some(state), Some(cache)) = (self.running.get(&id), self.storage.cache.as_ref())
+        let (Some(state), Some(cache)) = (self.requests.tokens(&id), self.storage.cache.as_ref())
         else {
             return false;
         };
@@ -372,7 +372,7 @@ impl Scheduler {
     /// The token boundary whose state checkpoint `id`'s refill continues
     /// from while its draft cache is missing, which its state tables keep.
     pub(crate) fn refill_cursor(&self, id: RequestId) -> Option<usize> {
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         (self.speculates() && !state.draft.complete(state.cache_visible_len))
             .then_some(state.draft.valid as usize)
     }
@@ -393,7 +393,7 @@ impl Scheduler {
     /// grow.
     pub(crate) fn plan_refill(&mut self, id: RequestId, budget: usize) -> Option<Call> {
         let cache = self.storage.cache.as_ref()?;
-        let state = self.running.get(&id)?;
+        let state = self.requests.tokens(&id)?;
         let visible = state.cache_visible_len;
         let target = state.draft.refill_end(visible);
         let allocation = &state.allocations()?.prefix_cache;
@@ -422,7 +422,7 @@ impl Scheduler {
             state.next_token
         };
 
-        let state = self.running.get_mut(&id)?;
+        let state = self.requests.tokens_mut(&id)?;
         let allocations = state.allocations_mut()?;
         let cache = self.storage.cache.as_ref()?;
         cache.hold_states_from(&mut allocations.prefix_cache, start as usize);
@@ -454,7 +454,7 @@ impl Scheduler {
         };
         let end = start + call.input_token_ids.len() as u32;
         if self.holds_draft(id, start, end)
-            && let Some(state) = self.running.get_mut(&id)
+            && let Some(state) = self.requests.tokens_mut(&id)
         {
             state.draft.record(start, end);
             if state.draft.complete(state.cache_visible_len) {
@@ -484,19 +484,19 @@ impl Scheduler {
             return false;
         }
         let mut candidates: Vec<(usize, RequestId)> = self
-            .running
-            .iter()
-            .filter(|(id, state)| {
-                !self.inflight.has_pending_calls(**id)
+            .requests
+            .running_tokens()
+            .filter(|(id, _, state)| {
+                !self.inflight.has_pending_calls(*id)
                     && (state.draft.valid > 0 || state.draft.tail.is_some())
             })
-            .map(|(id, state)| {
+            .map(|(id, _, state)| {
                 (
                     state
                         .req
                         .max_und_tokens
                         .saturating_sub(state.num_generated_tokens),
-                    *id,
+                    id,
                 )
             })
             .collect();
@@ -508,7 +508,7 @@ impl Scheduler {
             if cache.pool().free_units() >= units {
                 break;
             }
-            let Some(state) = self.running.get_mut(&id) else {
+            let Some(state) = self.requests.tokens_mut(&id) else {
                 continue;
             };
             if let Some(allocations) = state.allocations_mut() {
