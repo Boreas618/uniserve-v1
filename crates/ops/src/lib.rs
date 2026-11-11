@@ -59,6 +59,14 @@
 //!
 //! The attention and mixture-of-experts operators are `attention` and `moe`, beside these.
 //!
+//! Tensor primitives, which read strided operands of any shape ([`strided`]):
+//!
+//! | Operator | `NAME` | Module |
+//! | --- | --- | --- |
+//! | [`elementwise::ElementwiseUnary`] | `elementwise_unary` | [`elementwise`] |
+//! | [`elementwise::ElementwiseBinary`] | `elementwise_binary` | [`elementwise`] |
+//! | [`elementwise::ElementwiseWhere`] | `elementwise_where` | [`elementwise`] |
+//!
 //! ## Descriptor keys
 //!
 //! A descriptor's `Display` is its key, and the key is the last segment of the module's path
@@ -93,6 +101,7 @@ pub mod conv;
 pub mod copy_block;
 pub mod cross_fade;
 pub mod descriptor;
+pub mod elementwise;
 pub mod embedding;
 pub mod error;
 pub mod fp4;
@@ -123,6 +132,7 @@ pub mod rope;
 pub mod rows;
 pub mod sampler;
 pub mod snake;
+pub mod strided;
 pub mod tensor;
 pub mod tile_stitch;
 pub mod tolerance;

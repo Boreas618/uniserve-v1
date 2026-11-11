@@ -1,0 +1,47 @@
+# The elementwise_unary operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[[kernel.descriptors]]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# `out[i] = f(x[i])` over an input read through its strides, into a contiguous
+# output. The function, the element type and the number of axes the call
+# traverses are compiled in; the shape, the strides and the function's scalars
+# are launch words, so a module serves every shape of its rank. The key is the
+# one `UnaryDescriptor`'s `Display` prints, e.g.
+# `function_exp_dtype_bf16_rank_1_block_1024_pdl_false`.
+#
+# `src/strided.py` links the address arithmetic every tensor primitive shares,
+# under `kernels/tensor/triton/src/`; an installation copies the file the link
+# names.
+
+op = "elementwise_unary"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/elementwise_unary.py", "src/strided.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# Every function exists on a floating element.
+[[kernel.descriptors]]
+dimensions = { function = ["exp", "log", "sin", "cos", "tanh", "neg", "recip", "sqr", "sqrt", "abs", "gelu", "gelu_erf", "erf", "relu", "silu", "sigmoid", "ceil", "floor", "round", "sign", "affine", "powf", "elu"], dtype = ["f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
+
+# On an integer element, the functions closed over the integers.
+[[kernel.descriptors]]
+dimensions = { function = ["neg", "sqr", "abs", "relu", "ceil", "floor", "round", "sign", "affine"], dtype = ["u8", "u32", "i16", "i32", "i64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
+
+[parameters]

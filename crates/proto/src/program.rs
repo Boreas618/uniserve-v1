@@ -219,6 +219,9 @@ pub mod operator {
     pub const ROPE_APPLY: &str = "rope_apply";
     pub const PCM_INTERLEAVE: &str = "pcm_interleave";
     pub const RGB_BYTES: &str = "rgb_bytes";
+    pub const ELEMENTWISE_UNARY: &str = "elementwise_unary";
+    pub const ELEMENTWISE_BINARY: &str = "elementwise_binary";
+    pub const ELEMENTWISE_WHERE: &str = "elementwise_where";
 
     /// Every operator this build has, in a stable order for a package's coverage check.
     ///
@@ -311,6 +314,9 @@ pub mod operator {
         ROPE_APPLY,
         PCM_INTERLEAVE,
         RGB_BYTES,
+        ELEMENTWISE_UNARY,
+        ELEMENTWISE_BINARY,
+        ELEMENTWISE_WHERE,
     ];
 
     /// `name`, interned, when this build has an operator by that name.
