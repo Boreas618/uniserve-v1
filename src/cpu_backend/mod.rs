@@ -1438,6 +1438,40 @@ impl MatMul {
     }
 }
 
+impl MatMul {
+    /// The product of two F16 or two BF16 operands, computed in F32.
+    ///
+    /// gemm multiplies F32 and F64 here. Widening a 16-bit float to F32 is exact, so the
+    /// product is accumulated in single precision and rounded to the 16-bit type once, on
+    /// every target alike.
+    fn f_widened<T: 'static + WithDType + num_traits::Num + Copy>(
+        &self,
+        lhs: &[T],
+        lhs_l: &Layout,
+        rhs: &[T],
+        rhs_l: &Layout,
+    ) -> Result<Vec<T>> {
+        let (lhs, rhs) = match (T::cpu_storage_ref(lhs), T::cpu_storage_ref(rhs)) {
+            (CpuStorageRef::F16(lhs), CpuStorageRef::F16(rhs)) => {
+                (lhs.to_f32_vec(), rhs.to_f32_vec())
+            }
+            (CpuStorageRef::BF16(lhs), CpuStorageRef::BF16(rhs)) => {
+                (lhs.to_f32_vec(), rhs.to_f32_vec())
+            }
+            _ => Err(Error::UnsupportedDTypeForOp(T::DTYPE, "matmul").bt())?,
+        };
+
+        let dst = self.f::<f32>(&lhs, lhs_l, &rhs, rhs_l)?;
+
+        let dst = match T::DTYPE {
+            DType::F16 => CpuStorage::F16(Vec::from_f32_slice(&dst)),
+            DType::BF16 => CpuStorage::BF16(Vec::from_f32_slice(&dst)),
+            _ => Err(Error::UnsupportedDTypeForOp(T::DTYPE, "matmul").bt())?,
+        };
+        T::cpu_storage_data(dst)
+    }
+}
+
 impl Map2 for MatMul {
     const OP: &'static str = "mat_mul";
 
@@ -1451,7 +1485,8 @@ impl Map2 for MatMul {
         use gemm::{gemm, Parallelism};
 
         match T::DTYPE {
-            DType::F16 | DType::F32 | DType::F64 => {}
+            DType::F32 | DType::F64 => {}
+            DType::F16 | DType::BF16 => return self.f_widened(lhs, lhs_l, rhs, rhs_l),
             _ => Err(Error::UnsupportedDTypeForOp(T::DTYPE, "matmul").bt())?,
         }
 
@@ -2885,16 +2920,6 @@ impl CpuStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        // no bf16 gemm kernel yet: widen to f32, multiply, narrow back
-        if let (Self::BF16(lhs_v), Self::BF16(rhs_v)) = (self, rhs) {
-            let lhs32 = Self::F32(lhs_v.to_f32_vec());
-            let rhs32 = Self::F32(rhs_v.to_f32_vec());
-            let out = MatMul(bmnk).map(&lhs32, lhs_l, &rhs32, rhs_l)?;
-            let Self::F32(out_v) = out else {
-                crate::bail!("matmul dtype mismatch")
-            };
-            return Ok(Self::BF16(Vec::from_f32_slice(&out_v)));
-        }
         MatMul(bmnk).map(self, lhs_l, rhs, rhs_l)
     }
 

@@ -52,14 +52,33 @@ fn matmul(device: &Device) -> Result<()> {
     Ok(())
 }
 
-fn matmul_bf16(device: &Device) -> Result<()> {
-    let data = vec![1.0f32, 2.0, 3.0, 4.0];
-    let a = Tensor::from_slice(&data, (2, 2), device)?.to_dtype(DType::BF16)?;
-    let data = vec![1.0f32, 2.0, 3.0, 4.0];
-    let b = Tensor::from_slice(&data, (2, 2), device)?.to_dtype(DType::BF16)?;
+fn matmul_16bit_floats(device: &Device) -> Result<()> {
+    for dtype in [DType::BF16, DType::F16] {
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let a = Tensor::from_slice(&data, (2, 2), device)?.to_dtype(dtype)?;
+        let b = Tensor::from_slice(&data, (2, 2), device)?.to_dtype(dtype)?;
 
-    let c = a.matmul(&b)?.to_dtype(DType::F32)?;
-    assert_eq!(c.to_vec2::<f32>()?, &[[7.0f32, 10.0], [15.0, 22.0]]);
+        let c = a.matmul(&b)?;
+        assert_eq!(c.dtype(), dtype);
+        assert_eq!(
+            c.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+            &[[7.0f32, 10.0], [15.0, 22.0]]
+        );
+    }
+    Ok(())
+}
+
+// The product of 16-bit floats is accumulated in F32 and rounded once. `large` is the first
+// power of two whose neighbours are two apart in the 16-bit type, so adding one to it twice in
+// that type would leave it unchanged, while the F32 sum `large + 2` is representable.
+fn matmul_16bit_floats_accumulate_in_f32(device: &Device) -> Result<()> {
+    for (dtype, large) in [(DType::BF16, 256f32), (DType::F16, 2048f32)] {
+        let lhs = Tensor::new(&[[large, 1., 1.]], device)?.to_dtype(dtype)?;
+        let rhs = Tensor::new(&[[1f32], [1.], [1.]], device)?.to_dtype(dtype)?;
+
+        let product = lhs.matmul(&rhs)?.to_dtype(DType::F32)?;
+        assert_eq!(product.to_vec2::<f32>()?, [[large + 2.]], "{dtype:?}");
+    }
     Ok(())
 }
 
@@ -249,7 +268,8 @@ fn mm_layout(device: &Device) -> Result<()> {
 }
 
 test_device!(matmul);
-test_device!(matmul_bf16);
+test_device!(matmul_16bit_floats);
+test_device!(matmul_16bit_floats_accumulate_in_f32);
 test_device!(broadcast_matmul);
 test_device!(broadcast_matmul_stride_zero_lhs);
 test_device!(zero_matmul);

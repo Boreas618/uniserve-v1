@@ -657,7 +657,38 @@ fn conv1d_noncontiguous_kernel(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+// The 16-bit floats convolve like F32. Every value here is a small integer, so the F32 result is
+// exact in both 16-bit types, for the 1x1 kernel and for the general kernel alike.
+fn conv2d_16bit_floats(dev: &Device) -> Result<()> {
+    use uniserve_tensor::DType;
+
+    let input_data: Vec<f32> = (0..32).map(|v| (v % 4) as f32).collect();
+    let input = Tensor::from_slice(&input_data, (1, 2, 4, 4), dev)?;
+
+    for kernel_size in [1, 3] {
+        let kernel_data: Vec<f32> = (0..3 * 2 * kernel_size * kernel_size)
+            .map(|v| (v % 3) as f32)
+            .collect();
+        let kernel = Tensor::from_slice(&kernel_data, (3, 2, kernel_size, kernel_size), dev)?;
+        let expected = input.conv2d(&kernel, 0, 1, 1, 1)?;
+
+        for dtype in [DType::BF16, DType::F16] {
+            let res = input
+                .to_dtype(dtype)?
+                .conv2d(&kernel.to_dtype(dtype)?, 0, 1, 1, 1)?;
+            assert_eq!(res.dtype(), dtype);
+            assert_eq!(
+                res.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+                expected.flatten_all()?.to_vec1::<f32>()?,
+                "{dtype:?} with a {kernel_size}x{kernel_size} kernel"
+            );
+        }
+    }
+    Ok(())
+}
+
 test_device!(conv1d);
+test_device!(conv2d_16bit_floats);
 test_device!(conv1d_noncontiguous_kernel);
 test_device!(conv1d_small);
 test_device!(conv2d);

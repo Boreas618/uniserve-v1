@@ -13,7 +13,9 @@ name = "uniserve_tensor"
 [dependencies]
 byteorder = "1.4.3"
 float8 = { version = "0.7.0", features = ["num-traits"] }
-gemm = { version = "0.19.0", features = ["wasm-simd128-enable"] }
+# Without the `f16` feature: `gemm-f16` does not build unoptimized for aarch64 targets that lack
+# FP16 in their baseline, and the CPU backend multiplies F16 matrices in F32 instead.
+gemm = { version = "0.19.0", default-features = false, features = ["std", "rayon", "wasm-simd128-enable"] }
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics"] }
 libc = "0.2.147"
 libm = "0.2.15"
