@@ -131,10 +131,10 @@ impl From<proto::tensor::DType> for ElementType {
 impl ElementType {
     /// The kernel operand type of this storage element, when one describes it.
     ///
-    /// `None` for the storage-only elements: an initialized flag, an 8- or
-    /// 16-bit integer, an unsigned index, a double, or the second FP8 spelling
-    /// a checkpoint uses. A view handed to a kernel must go through this, so a
-    /// storage type no kernel reads never becomes a silently wrong operand.
+    /// `None` for the storage-only elements: an initialized flag, a signed
+    /// 8-bit integer, or the second FP8 spelling a checkpoint uses. A view
+    /// handed to a kernel must go through this, so a storage type no kernel
+    /// reads never becomes a silently wrong operand.
     pub fn to_ops(self) -> Option<ops::DType> {
         match self {
             Self::U8 => Some(ops::DType::U8),
@@ -145,7 +145,9 @@ impl ElementType {
             Self::F32 => Some(ops::DType::F32),
             Self::F8E4M3 => Some(ops::DType::F8E4M3),
             Self::I16 => Some(ops::DType::I16),
-            Self::Bool | Self::I8 | Self::U32 | Self::F64 | Self::F8E5M2 => None,
+            Self::U32 => Some(ops::DType::U32),
+            Self::F64 => Some(ops::DType::F64),
+            Self::Bool | Self::I8 | Self::F8E5M2 => None,
         }
     }
 
@@ -167,6 +169,8 @@ impl ElementType {
             ops::DType::F32 => Self::F32,
             ops::DType::F8E4M3 => Self::F8E4M3,
             ops::DType::I16 => Self::I16,
+            ops::DType::U32 => Self::U32,
+            ops::DType::F64 => Self::F64,
             ops::DType::F4E2M1 => return None,
         })
     }
@@ -886,25 +890,22 @@ mod tests {
 mod element_type_tests {
     use super::ElementType;
 
-    /// The eight element types the kernel ABI describes, and the six storage
+    /// The ten element types the kernel ABI describes, and the three storage
     /// carries that no kernel operand names.
-    const KERNEL: [ElementType; 8] = [
+    const KERNEL: [ElementType; 10] = [
         ElementType::U8,
+        ElementType::U32,
         ElementType::I32,
         ElementType::I64,
         ElementType::I16,
         ElementType::F16,
         ElementType::BF16,
         ElementType::F32,
+        ElementType::F64,
         ElementType::F8E4M3,
     ];
-    const STORAGE_ONLY: [ElementType; 5] = [
-        ElementType::Bool,
-        ElementType::I8,
-        ElementType::U32,
-        ElementType::F64,
-        ElementType::F8E5M2,
-    ];
+    const STORAGE_ONLY: [ElementType; 3] =
+        [ElementType::Bool, ElementType::I8, ElementType::F8E5M2];
 
     #[test]
     fn only_the_kernel_element_types_reach_a_kernel_operand() {
@@ -926,11 +927,13 @@ mod element_type_tests {
     fn every_storable_kernel_element_type_round_trips_and_packed_fp4_has_no_plane() {
         let storable = [
             ops::DType::U8,
+            ops::DType::U32,
             ops::DType::I32,
             ops::DType::I64,
             ops::DType::F16,
             ops::DType::BF16,
             ops::DType::F32,
+            ops::DType::F64,
             ops::DType::F8E4M3,
         ];
         for dtype in storable {

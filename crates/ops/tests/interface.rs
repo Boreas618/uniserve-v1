@@ -244,10 +244,13 @@ fn element_types_keep_their_abi_numbering_and_round_off() {
     assert_eq!(DType::F4E2M1.as_i64(), 7);
     // Appended for the audio decoders' PCM output; the seven numbers before it never move.
     assert_eq!(DType::I16.as_i64(), 8);
-    for number in 0..9 {
+    // Appended for the tensor primitives' indices and for double precision.
+    assert_eq!(DType::U32.as_i64(), 9);
+    assert_eq!(DType::F64.as_i64(), 10);
+    for number in 0..11 {
         assert_eq!(DType::from_i64(number).map(DType::as_i64), Some(number));
     }
-    assert_eq!(DType::from_i64(9), None);
+    assert_eq!(DType::from_i64(11), None);
     assert_eq!(DType::I16.bytes(), Some(2));
     assert_eq!(
         DType::I16.unit_roundoff(),

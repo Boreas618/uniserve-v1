@@ -293,6 +293,11 @@ impl Arguments {
         self.word(u64::from(value.to_bits()))
     }
 
+    /// An `f64` scalar.
+    pub fn f64(&mut self, value: f64) -> &mut Self {
+        self.word(value.to_bits())
+    }
+
     /// A boolean scalar, as the `i32` a C `_Bool` parameter takes.
     pub fn flag(&mut self, value: bool) -> &mut Self {
         self.i32(i32::from(value))

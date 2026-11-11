@@ -262,11 +262,14 @@ fn every_key_is_covered(packages: &[PathBuf], keys: &Path) -> Result<(), String>
 fn element_type_names() -> Vec<String> {
     [
         ops::DType::U8,
+        ops::DType::U32,
+        ops::DType::I16,
         ops::DType::I32,
         ops::DType::I64,
         ops::DType::F16,
         ops::DType::BF16,
         ops::DType::F32,
+        ops::DType::F64,
         ops::DType::F8E4M3,
         ops::DType::F4E2M1,
     ]
