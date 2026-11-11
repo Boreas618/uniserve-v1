@@ -1,4 +1,4 @@
-//! The WebAssembly-text policy modules the policy switch's own unit tests state.
+//! The WebAssembly-text policy modules the policy switch's cases state.
 //!
 //! A [`Toy`] answers what a real policy never gives — a trap, a spent fuel budget, a decision
 //! outside the limits — so the switch's refusals can be stated. It is not a policy anyone serves

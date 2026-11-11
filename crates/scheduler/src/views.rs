@@ -198,7 +198,7 @@ pub(crate) fn block_id(blocks: &[String], name: &str) -> Option<ComponentId> {
 
 /// The blocks of every worker of the epoch: the table `ComponentId`s number, so
 /// a phase's block and a replica's block name the same component.
-pub(crate) fn epoch_blocks(epoch: &dyn super::submission::Epoch) -> Vec<String> {
+pub(crate) fn epoch_blocks(epoch: &super::submission::Submissions) -> Vec<String> {
     let mut names = Vec::new();
     for (_, info) in &epoch.info().workers {
         names.extend(blocks(info));

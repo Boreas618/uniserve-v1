@@ -49,14 +49,6 @@ fn main() -> anyhow::Result<()> {
         },
     )?;
 
-    // A scheduler with no policy decides nothing — no plan, no admission, no
-    // batch — so an epoch that serves must be given the default one: `fcfs`
-    // revision one, instantiated for the capacity this pool was built for.
-    let (program, module) = testkit::packaged_policy(capacity);
-    sched
-        .install_policy(program, &scheduler::PolicyBytes::new(module))
-        .map_err(|error| anyhow::anyhow!("the fcfs policy is installed: {error}"))?;
-
     // Prefix reuse is an epoch setting (`EngineConfig::prefix_cache`), off in a
     // scheduler built by hand: the `reuse` scenario is about the pages a second
     // request reads, so it is turned on as a deployment turns it on.
@@ -65,6 +57,23 @@ fn main() -> anyhow::Result<()> {
     // The scheduler runs on its own thread; this thread submits through the
     // handle and drains each request's event receiver, as a server would.
     let handle = SchedulerHandle::spawn(sched, "sim-model", CommandWaker::noop())?;
+
+    // A scheduler with no policy decides nothing, so an epoch that serves is
+    // given the default one as a launch gives it: `fcfs` revision one for the
+    // capacity this pool was built for, prepared by a precopy and served from
+    // the switchover.
+    let (program, module) = testkit::packaged_policy(capacity);
+    let answered = |answer: crossbeam_channel::Receiver<Result<(), String>>| {
+        answer
+            .recv()
+            .map_err(|_| anyhow::anyhow!("the scheduler stopped"))?
+            .map_err(|error| anyhow::anyhow!("the fcfs policy is installed: {error}"))
+    };
+    answered(handle.precopy_policy(
+        program,
+        std::sync::Arc::new(scheduler::PolicyBytes::new(module)),
+    ))?;
+    answered(handle.switchover_policy())?;
 
     let mut rxs: HashMap<RequestId, (String, scheduler::EventRx)> = HashMap::new();
     let mut next_id = 1u64;

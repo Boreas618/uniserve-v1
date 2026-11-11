@@ -6,6 +6,7 @@
 
 pub(crate) mod fake;
 pub(crate) mod storage;
+pub(crate) mod toy;
 pub(crate) mod video;
 
 pub(crate) use testkit::{SAMPLED, pool};
@@ -74,7 +75,7 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
 
 use ipc::{CallKind, ForwardMode, MainProcessInfo, MediaCall};
 use scheduler::{GenerationFeatures, GenerationLimits};
-use scheduler::{Parameters, PolicyProgram, Scheduler, SchedulerConfig};
+use scheduler::{Parameters, PolicyProgram, SchedulerConfig};
 use testkit::EndOfText;
 
 /// A rank of the scheduler tests' text deployment: every call kind, a buffer
@@ -175,20 +176,16 @@ pub(crate) fn policy_module() -> Vec<u8> {
     testkit::packaged_module()
 }
 
-/// Installs `fcfs` with the ceilings an epoch advertises and the parameters the
-/// epoch states about itself.
+/// The `fcfs` program with the ceilings an epoch advertises and the parameters
+/// the epoch states about itself.
 ///
 /// A judgement the views cannot carry is the policy's, weighed from the
-/// parameters the deployment states (design §7.7): an epoch that speculates
-/// states its speedup and what a refilled token costs there, because the
-/// mechanism's own measurement is not a view a policy reads.
-pub(crate) fn install_policy_stating(
-    scheduler: &mut Scheduler,
-    capacity: scheduler::BatchCapacity,
-    stated: Parameters,
-) {
+/// parameters the deployment states: an epoch that speculates states its
+/// speedup and what a refilled token costs there, because the mechanism's own
+/// measurement is not a view a policy reads.
+pub(crate) fn fcfs(capacity: scheduler::BatchCapacity, stated: Parameters) -> PolicyProgram {
     let ceilings = scheduler::ceilings_of(capacity);
-    let program = PolicyProgram {
+    PolicyProgram {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: Parameters {
@@ -201,11 +198,20 @@ pub(crate) fn install_policy_stating(
             ..stated
         },
         stated: Default::default(),
-    };
-    let source = scheduler::PolicyBytes::new(policy_module());
-    scheduler
-        .install_policy(program, &source)
-        .unwrap_or_else(|error| panic!("the fcfs policy is installed: {error}"));
+    }
+}
+
+/// The source the tests' policy module is read from.
+pub(crate) fn policy_source() -> std::sync::Arc<dyn scheduler::PolicySource + Send + Sync> {
+    std::sync::Arc::new(scheduler::PolicyBytes::new(policy_module()))
+}
+
+/// The answer to a policy command, which a scheduler gives within a minute.
+pub(crate) fn applied<T>(answer: crossbeam_channel::Receiver<Result<T, String>>, what: &str) -> T {
+    answer
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("the scheduler answers {what}"))
+        .unwrap_or_else(|error| panic!("{what} of the fcfs policy: {error}"))
 }
 
 /// Installs `fcfs` on a handle's epoch through the command surface the launch
@@ -218,31 +224,7 @@ pub(crate) fn install_policy_on(
     handle: &scheduler::SchedulerHandle,
     capacity: scheduler::BatchCapacity,
 ) {
-    let ceilings = scheduler::ceilings_of(capacity);
-    let program = PolicyProgram {
-        backend: "fcfs".to_owned(),
-        revision: 1,
-        arguments: Parameters {
-            chunked_prefill_size: Some(ceilings.chunked_prefill_size),
-            max_queued_requests: ceilings.max_queued_requests,
-            max_batch: Some(ceilings.max_batch),
-            max_num_batched_tokens: Some(ceilings.max_num_batched_tokens),
-            prefetch_min_tokens: Some(ceilings.prefetch_min_tokens),
-            timeout: Some(ceilings.timeout),
-            ..Default::default()
-        },
-        stated: Default::default(),
-    };
-    let source: std::sync::Arc<dyn scheduler::PolicySource + Send + Sync> =
-        std::sync::Arc::new(scheduler::PolicyBytes::new(policy_module()));
-    handle
-        .precopy_policy(program, source)
-        .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("the scheduler answers a precopy")
-        .expect("the fcfs policy is precopied");
-    handle
-        .stage(scheduler::Stage::Switchover)
-        .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("the scheduler answers a switchover")
-        .expect("the fcfs policy serves");
+    let program = fcfs(capacity, Parameters::default());
+    applied(handle.precopy_policy(program, policy_source()), "a precopy");
+    applied(handle.stage(scheduler::Stage::Switchover), "a switchover");
 }

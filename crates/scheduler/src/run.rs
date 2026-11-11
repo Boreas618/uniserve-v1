@@ -115,10 +115,9 @@ impl Scheduler {
 
         // The request pool also holds the rows the runtime keeps outside
         // `max_running_requests` (`guidance_prefix_rows`).
-        // `SchedulerHandle::over_batches_telling` refuses a token runtime whose
-        // ranks hold too few, so this clamp lowers the limit only for a
-        // supplied worker or for ranks that fit their request pools to
-        // device storage.
+        // `SchedulerHandle::over_batches` refuses a token runtime whose
+        // ranks hold too few, so this clamp lowers the limit only for
+        // ranks that fit their request pools to device storage.
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity.max(1);
 
@@ -807,7 +806,6 @@ impl Scheduler {
                     self.hand_back_requests();
                 }
                 self.abort_all_requests();
-                let _ = self.worker.close();
                 return true;
             }
         }
@@ -817,7 +815,6 @@ impl Scheduler {
         // far reach the host KV cache first.
         self.flush_offloads();
         self.abort_all_requests();
-        let _ = self.worker.close();
         false
     }
 

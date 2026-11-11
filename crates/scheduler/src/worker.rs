@@ -1,14 +1,12 @@
-//! Logical execution batches, physical execution, and worker contracts.
+//! What the scheduler knows of the ranks it schedules, and how their work
+//! ends.
 //!
-//! A serving scheduler submits its batches through the worker crate's
-//! `Batches` (`Submissions::over_batches`). [`Worker`] is the same boundary
-//! for a simulated pool: `SimWorker` (`crate::sim`) is its implementation,
-//! and a scheduler test plugs it in through `SchedulerHandle::with_worker`.
-//!
-//! Besides the trait, this module owns the values that cross that boundary:
+//! A scheduler submits its batches through the batch interface of its
+//! process's devices (`ipc::execution::Batches`, `Submissions::over_batches`).
+//! This module owns the values that describe the other side of it:
 //! [`WorkerInfo`], which merges the pools' reported capabilities, beside
-//! their layout, into the single capacity view the scheduler plans against;
-//! and the result types a poll returns.
+//! their layout, into the single capacity view the scheduler schedules
+//! against, and the failures a pool reports.
 
 pub use proto::config::{BlockConfig, BlockDistribution, SequenceParallel, WorkerGroupId};
 
@@ -16,15 +14,9 @@ pub use proto::config::{BlockConfig, BlockDistribution, SequenceParallel, Worker
 use ipc::VideoDenoiserInfo;
 use ipc::{ForwardMode, MediaCall};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-#[cfg(feature = "testing")]
-use std::sync::Arc;
-#[cfg(feature = "testing")]
-use std::time::Duration;
 
 use anyhow::Context as _;
 
-#[cfg(feature = "testing")]
-use ipc::BatchCommand;
 use ipc::{CallId, CallKind, MainProcessInfo, RequestKey};
 
 mod batch;
@@ -53,8 +45,8 @@ pub struct WorkerInfo {
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
     ///
-    /// `from_inventory` fills this from the layout; `from_workers` and
-    /// `SimWorker` leave it empty. Scheduler admission restricts a video
+    /// `from_inventory` fills this from the layout; `from_workers` leaves it
+    /// empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the worker chosen to decode.
     pub video_codecs: BTreeMap<WorkerGroupId, BTreeSet<WorkerGroupId>>,
     /// For each pool, the persistent buffer bytes each of its ranks backs,
@@ -64,24 +56,22 @@ pub struct WorkerInfo {
     /// media buffers rank by rank.
     ///
     /// `from_inventory` fills this from its ranks; a pool absent from it, as
-    /// `from_workers` and `SimWorker` leave every pool, has its placed ranks
+    /// `from_workers` leaves every pool, has its placed ranks
     /// (`PoolLayout::ranks`, one when it has no layout), each backing
     /// its reported `buffer_pool_bytes`.
     pub rank_buffer_bytes: BTreeMap<WorkerGroupId, Vec<u64>>,
     /// For each pool, each rank's prefix cache as the rank reported it, with
     /// the host page pools it maps, and the rank's host, in rank order.
     ///
-    /// `from_inventory` fills this from its ranks; `from_workers` and
-    /// `SimWorker` leave it empty, which serves no pool through the host KV
-    /// cache.
+    /// `from_inventory` fills this from its ranks; `from_workers` leaves it
+    /// empty, which serves no pool through the host KV cache.
     pub rank_caches: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::PrefixCacheInfo>)>>,
     /// For each pool, each rank's host latent pool as the rank reported it,
     /// and the rank's host, in rank order: the video denoising ranks report
     /// one, every other rank none (`ipc::MainProcessInfo::latent_pool`).
     ///
     /// `from_inventory` fills this from its ranks; `from_workers` leaves it
-    /// empty, which stores no preempted trajectory, and a
-    /// simulated worker states its own (`SimEngine::set_latent_pools`).
+    /// empty, which stores no preempted trajectory.
     pub rank_latents: BTreeMap<WorkerGroupId, Vec<(String, Option<ipc::LatentPoolInfo>)>>,
     /// For each pool, each rank's host encoder pool as the rank reported it,
     /// and the rank's host, in rank order: the ranks that execute video
@@ -89,8 +79,7 @@ pub struct WorkerInfo {
     /// (`ipc::MainProcessInfo::encoder_pool`).
     ///
     /// `from_inventory` fills this from its ranks; `from_workers` leaves it
-    /// empty, which stores no encoder output, and a simulated
-    /// worker states its own (`SimEngine::set_encoder_pools`).
+    /// empty, which stores no encoder output.
     pub rank_encoders: BTreeMap<WorkerGroupId, RankEncoderPools>,
 }
 
@@ -500,16 +489,6 @@ fn check_video_tasks(info: &MainProcessInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One call result returned from a simulated batch.
-#[cfg(feature = "testing")]
-#[derive(Debug, Clone)]
-pub struct CallResult {
-    /// Validated completion values; media storage is carried by `media` below.
-    pub output: crate::sim::CallOutput,
-    /// Claimed immutable output storage, or its request-local acquisition error.
-    pub media: Result<Option<Arc<ipc::SharedMedia>>, ipc::SharedMediaError>,
-}
-
 /// Distinguishes applied control from physical retirement and unacknowledged failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandOutcome {
@@ -533,25 +512,6 @@ pub struct CommandResult {
     pub request_key: RequestKey,
     /// A failed command retains physical ownership until a subsequent release succeeds.
     pub outcome: CommandOutcome,
-}
-
-/// One independently ready subset of a logical batch, as a simulated pool
-/// reports it.
-#[cfg(feature = "testing")]
-#[derive(Debug, Clone)]
-pub struct BatchResult {
-    /// Logical batch identity assigned at submission.
-    pub batch_id: u64,
-    /// Call completions this join reports as ready.
-    pub results: Vec<CallResult>,
-    /// Receipts for the batch's lifecycle commands; empty unless `done`.
-    pub command_results: Vec<CommandResult>,
-    /// Whether this join completes the batch.
-    pub done: bool,
-    /// Per-worker execution durations in microseconds.
-    pub worker_exec_us: Vec<u64>,
-    /// Per-worker model-forward statistics.
-    pub forward_stats: Vec<ipc::ForwardStats>,
 }
 
 /// Dynamic error returned while polling or administering a worker.
@@ -600,35 +560,6 @@ pub struct ExecuteError {
     pub calls: Vec<ipc::ErrorCallIdentity>,
 }
 
-impl ExecuteError {
-    /// The classification of a batch some of whose calls computed
-    /// non-finite logits (`ErrorCode::NumericalFault`), which fails an epoch
-    /// on trial as a whole; `None` for a batch whose failed calls failed
-    /// otherwise, whose failure the scheduler reconciles by their requests
-    /// alone.
-    #[cfg(feature = "testing")]
-    pub fn non_finite<'a>(
-        batch_id: u64,
-        outputs: impl IntoIterator<Item = &'a crate::sim::CallOutput>,
-    ) -> Option<Self> {
-        let code = ipc::ErrorCode::NumericalFault;
-        outputs
-            .into_iter()
-            .any(|output| {
-                output.status == ipc::CallStatus::Error && output.error_code == Some(code)
-            })
-            .then(|| Self {
-                batch_id: Some(batch_id),
-                fatal: false,
-                code: Some(code),
-                message: format!("calls of batch {batch_id} computed non-finite logits"),
-                phase: None,
-                route: None,
-                calls: Vec::new(),
-            })
-    }
-}
-
 /// Terminal work abandoned by one Worker, with the exact invalidated ownership.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -652,122 +583,6 @@ pub struct WorkerFailure {
     pub execution: Option<ExecuteError>,
     /// Human-readable failure description.
     pub message: String,
-}
-
-/// The asynchronous, pipelined boundary a simulated pool implements.
-///
-/// One submitted batch may come back from `poll` as several
-/// [`BatchResult`]s: each carries completions not reported by an earlier one,
-/// and the last has `done` set and carries the lifecycle command receipts.
-/// A failure may instead surface as an error from `poll`.
-#[cfg(feature = "testing")]
-pub trait Worker: Send {
-    /// Returns the worker's concrete pool capabilities.
-    fn info(&self) -> &WorkerInfo;
-    /// Whether every worker of group `worker` is ready to accept execution.
-    fn is_ready(&self, worker: &WorkerGroupId) -> bool;
-    /// Whether group `worker` executes nothing further: it is closed, or
-    /// could not be replaced. A group whose replacement is starting is not
-    /// ready but not closed either. The default suits a worker that
-    /// replaces no group in the background: a group that is not ready is
-    /// closed.
-    fn is_closed(&self, worker: &WorkerGroupId) -> bool {
-        !self.is_ready(worker)
-    }
-    /// Whether group `worker` has an unclaimed destination submission slot.
-    fn has_capacity(&self, worker: &WorkerGroupId) -> bool;
-    /// Whether every physical owner of a lifecycle command can accept its submission.
-    fn command_has_capacity(&self, command: &BatchCommand) -> bool;
-    /// Submits one logical batch without blocking for capacity.
-    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), WorkerSubmitError>;
-    /// Waits up to `timeout` for one partial or terminal batch result.
-    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, WorkerError>;
-    /// Closes the worker and its physical workers.
-    fn close(&mut self) -> Result<(), WorkerError>;
-    /// Commits the workers' epoch: each worker takes the predecessor
-    /// epoch's storage it mapped read-only. Returns what each worker
-    /// reported. The default suits a worker whose workers succeed no
-    /// epoch.
-    fn commit(&mut self) -> Result<Vec<String>, WorkerError> {
-        Ok(Vec::new())
-    }
-    /// Publishes this epoch's immutable pages after its commit decision.
-    /// Workers without shared storage have nothing to publish.
-    fn publish_epoch(&mut self) -> Result<(), WorkerError> {
-        Ok(())
-    }
-    /// Ends the storage of every epoch of `epochs` on the nodes of the
-    /// worker's workers. The default suits a worker that retains no
-    /// storage.
-    fn retire(&mut self, epochs: &[u64]) -> Result<(), WorkerError> {
-        let _ = epochs;
-        Ok(())
-    }
-    /// Keeps the weights alone of every epoch of `epochs` on the nodes of
-    /// the worker's workers, in host storage when `to_host`, and returns
-    /// each node's report. The default suits a worker that retains no
-    /// storage, which has no node to report.
-    fn keep_weights(
-        &mut self,
-        epochs: &[u64],
-        to_host: bool,
-        cache_keys: &[Vec<u8>],
-    ) -> Result<Vec<String>, WorkerError> {
-        let _ = (epochs, to_host, cache_keys);
-        Ok(Vec::new())
-    }
-    /// The storage ledgers of the nodes of the worker's workers: for each
-    /// node, JSON of `{"host": ..., "ledgers": [...], "host_storage": {...}}`.
-    /// The default suits a worker that retains no storage, whose ledgers
-    /// are empty.
-    fn ledgers(&mut self) -> Result<Vec<String>, WorkerError> {
-        Ok(Vec::new())
-    }
-
-    /// Storage Server endpoints for the deployment nodes. Local numerical
-    /// workers retain no storage outside their process.
-    fn storage_nodes(&self) -> std::collections::BTreeMap<String, String> {
-        std::collections::BTreeMap::new()
-    }
-    /// Performs the storage `operation` on every worker while none runs a
-    /// batch, and returns each worker group's identity with its ranks'
-    /// results, in rank order. The default refuses: the worker has no
-    /// workers to operate on.
-    fn operate_groups(
-        &mut self,
-        operation: &ipc::execution::EpochOperation,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
-        anyhow::bail!("this worker performs no storage operation ({operation:?})")
-    }
-    /// Maps the host KV cache's page pools on every worker's ranks, each
-    /// holding `tokens` tokens of every cache group (`uniserve.host_cache`),
-    /// while none runs a batch, and returns each worker group's identity
-    /// with its ranks' pools (JSON, `null` for a rank that copies no pages),
-    /// in rank order. The default refuses: the worker has no workers.
-    fn map_host_cache(
-        &mut self,
-        tokens: u64,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
-        anyhow::bail!("this worker maps no host KV cache ({tokens} tokens)")
-    }
-    /// Performs the storage `operation` on every worker while none runs a
-    /// batch, and returns each worker's result. The default refuses: the
-    /// worker has no workers to operate on.
-    fn operate(
-        &mut self,
-        operation: &ipc::execution::EpochOperation,
-    ) -> Result<Vec<String>, WorkerError> {
-        anyhow::bail!("this worker performs no storage operation ({operation:?})")
-    }
-
-    /// Commit prepared expert allocations.
-    fn commit_experts(
-        &mut self,
-        order: &BTreeMap<String, Vec<u32>>,
-    ) -> Result<Vec<String>, WorkerError> {
-        let _ = order;
-        anyhow::bail!("this worker holds no expert weights")
-    }
 }
 
 #[cfg(test)]

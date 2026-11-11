@@ -161,35 +161,15 @@ impl Scheduler {
             Command::Commit(answer) => {
                 let _ = answer.send(self.commit());
             }
-            Command::PublishEpoch(answer) => {
-                let published = self
-                    .worker
-                    .publish_epoch()
-                    .map_err(|error| format!("{error:#}"));
-                let _ = answer.send(published);
+            // The four storage commands below concern storage the ranks of this
+            // process do not hold through their scheduler: the engine's storage path
+            // publishes and retires epochs, keeps weights and reads the quota, so a
+            // scheduler has nothing to do and nothing to report.
+            Command::PublishEpoch(answer) | Command::Retire { answer, .. } => {
+                let _ = answer.send(Ok(()));
             }
-            Command::Retire { epochs, answer } => {
-                let retired = self
-                    .worker
-                    .retire(&epochs)
-                    .map_err(|error| format!("{error:#}"));
-                let _ = answer.send(retired);
-            }
-            Command::KeepWeights {
-                epochs,
-                to_host,
-                cache_keys,
-                answer,
-            } => {
-                let kept = self
-                    .worker
-                    .keep_weights(&epochs, to_host, &cache_keys)
-                    .map_err(|error| format!("{error:#}"));
-                let _ = answer.send(kept);
-            }
-            Command::Ledgers(answer) => {
-                let read = self.worker.ledgers().map_err(|error| format!("{error:#}"));
-                let _ = answer.send(read);
+            Command::KeepWeights { answer, .. } | Command::Ledgers(answer) => {
+                let _ = answer.send(Ok(Vec::new()));
             }
             Command::DescribeCache(answer) => {
                 let _ = answer.send(self.describe_cache());
@@ -351,47 +331,6 @@ impl Scheduler {
         }
     }
 
-    /// Installs `program` as this scheduler's policy without a control thread.
-    ///
-    /// §7.3's two stages run here on the calling thread: the precopy
-    /// instantiates the program on this boundary's state and trials every
-    /// decision of §4.4's table against it, and the switchover puts it in. An
-    /// epoch with no control thread — the integration tests, and a simulated
-    /// engine's — has no other way to have a policy, and a scheduler with no
-    /// policy decides nothing, so without this such an epoch schedules no work
-    /// at all.
-    ///
-    /// Production installs a policy through the `PrecopyPolicy` and
-    /// `StagePolicy` commands, with the load, the instantiation and the trial on
-    /// a blocking thread so the serving thread is never held; this is that pair
-    /// without the thread and without the blocking hop, and it is for tests
-    /// only: the caller pays the whole cost of the precopy.
-    ///
-    /// The stage is applied where a stage is always applied — at a boundary with
-    /// nothing in flight — so the first call happens before the epoch submits
-    /// anything.
-    pub fn install_policy(
-        &mut self,
-        program: PolicyProgram,
-        source: &dyn PolicySource,
-    ) -> Result<(), String> {
-        let state = views::trial_state(self, self.step, self.recorder.recorded());
-        let live = views::live(self, self.step, self.recorder.recorded());
-        let ceilings = ceilings_of(BatchCapacity::of(&self.info));
-        let engine = policy::process_engine().map_err(|error| error.to_string())?;
-        let room = state.room.clone();
-        let checked = mechanism::Checked::new(&live, &room);
-        let candidate = PolicySlot::prepare(engine, source, program, state, &ceilings, &checked)
-            .map_err(|error| error.to_string())?;
-        self.policy_prepared = Some(candidate);
-        self.request_stage(Stage::Switchover, None, None);
-        self.apply_policy_stage();
-        if self.policy.is_none() {
-            return Err("the policy did not become this scheduler's".to_owned());
-        }
-        Ok(())
-    }
-
     /// Takes the candidate a precopy prepared, once its blocking thread is done.
     ///
     /// The scheduler that is about to switch reads it; a candidate that failed
@@ -424,13 +363,6 @@ impl Scheduler {
         generation: u64,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     ) {
-        if !self.worker.serves_in_process() {
-            let _ = answer.send(Err(format!(
-                "the shadow pass of generation {generation} starts when a step submits through \
-                 ::worker::Batches; this scheduler submits its batches to a supplied worker"
-            )));
-            return;
-        }
         if let Some(pending) = self.shadow_pass.as_ref() {
             let _ = answer.send(Err(format!(
                 "the shadow pass of generation {} is waiting for the step that runs it",
@@ -789,9 +721,8 @@ impl Scheduler {
     /// Selects commands with available destinations without bypassing an older
     /// command for the same request. Other requests remain independently eligible.
     ///
-    /// A command is deferred when `include` rejects it or
-    /// `Worker::command_has_capacity` reports a full destination; deferred
-    /// commands keep their relative order in `pending_commands`.
+    /// A command is deferred when `include` rejects it; deferred commands
+    /// keep their relative order in `pending_commands`.
     pub(super) fn take_commands(
         &mut self,
         include: impl Fn(&BatchCommand) -> bool,
@@ -802,10 +733,7 @@ impl Scheduler {
             let request = command.request_key();
             // Once one command of a request is deferred, every later command
             // of that request is deferred with it.
-            if blocked.contains(&request)
-                || !include(&command)
-                || !self.worker.command_has_capacity(&command)
-            {
+            if blocked.contains(&request) || !include(&command) {
                 blocked.insert(request);
                 self.inflight.pending_commands.push_back(command);
             } else {

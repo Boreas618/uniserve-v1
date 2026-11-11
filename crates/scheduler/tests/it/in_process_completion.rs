@@ -111,6 +111,7 @@ fn a_request_is_served_through_the_workers_own_batch_path() {
         &testkit::args("in-process-completion"),
         testkit::limits(&*serving),
         batches,
+        scheduler::CommandWaker::noop(),
     )
     .expect("the pool serves");
     install(&handle, &serving);
@@ -201,7 +202,9 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
     let args = testkit::args("in-process-completion");
     let mut limits = testkit::limits(&*serving);
     limits.max_running_requests = 1;
-    let handle = SchedulerHandle::over_batches(&args, limits, batches).expect("the pool serves");
+    let handle =
+        SchedulerHandle::over_batches(&args, limits, batches, scheduler::CommandWaker::noop())
+            .expect("the pool serves");
     install(&handle, &serving);
 
     let mut first = handle
@@ -253,6 +256,7 @@ fn a_policy_stage_applies_after_a_request_ended() {
         &testkit::args("in-process-completion"),
         testkit::limits(&*serving),
         batches,
+        scheduler::CommandWaker::noop(),
     )
     .expect("the pool serves");
     install(&handle, &serving);
@@ -304,6 +308,7 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
         &testkit::args("in-process-completion"),
         testkit::limits(&*serving),
         batches,
+        scheduler::CommandWaker::noop(),
     )
     .expect("the pool serves");
     install(&handle, &serving);
@@ -385,6 +390,7 @@ fn logprobs_reach_the_requests_that_asked_for_them_alone() {
                 ..SchedulerConfig::default()
             },
             pool,
+            scheduler::CommandWaker::noop(),
         )
         .expect("the fake worker serves");
         crate::support::install_policy_on(&engine, BatchCapacity::of(&rank));

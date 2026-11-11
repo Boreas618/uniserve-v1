@@ -31,8 +31,8 @@ use crate::lock;
 ///
 /// Callers run `wake` on their own thread: the command sender right after it
 /// enqueues a command, and `EventRx` after it consumes an output event and
-/// frees channel capacity. The engine's implementations (the in-process
-/// path's nudge and the simulator's progress channel send) do not block.
+/// frees channel capacity. The engine's implementation (the scheduler's
+/// nudge) does not block.
 pub trait Wake: Send + Sync {
     /// Signals the waiting engine owner.
     fn wake(&self);

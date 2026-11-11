@@ -645,7 +645,9 @@ impl Scheduler {
             }
         }
         self.draining = draining;
-        let results = self.worker.commit().map_err(|error| format!("{error:#}"))?;
+        // The epoch this process serves is its ranks' own, committed when they were spawned:
+        // no rank reports anything of the commit.
+        let results = Vec::new();
         if let Some(cache) = self.storage.cache() {
             cache.pool().take_inherited();
         }

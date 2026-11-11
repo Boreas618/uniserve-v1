@@ -11,15 +11,9 @@
 //! (`OutputSender::und_token_outcome`), and the call's budget, cache window and
 //! sampling rows are the plan's.
 //!
-//! Two fillers produce these types, both at the edge of the mechanism and
-//! neither inventing a value:
-//!
-//! - [`BatchReport::from_output`] / [`CallCompletion::from_output`] for the
-//!   in-process worker, which reports `ipc::execution::BatchOutput`: the
-//!   device's own account of each call (2.4).
-//! - `CallCompletion::from_wire` / `BatchReport::from_wire` for a simulated
-//!   worker, which reports in `ipc`'s types; built only with the `testing`
-//!   feature.
+//! [`BatchReport::from_output`] and [`CallCompletion::from_output`] fill these
+//! types at the edge of the mechanism from `ipc::execution::BatchOutput`, the
+//! device's own account of each call, and invent no value.
 
 use std::sync::Arc;
 
@@ -27,9 +21,6 @@ use ipc::{
     CallId, CallStatus, ErrorCode, ForwardStats, RankLatentLayout, RequestKey, SharedMedia,
     SharedMediaError, TimingCounters, TokenLogprob,
 };
-
-#[cfg(feature = "testing")]
-use crate::worker::{BatchResult, CallResult};
 
 /// One call's completion, as the mechanism reads it.
 #[derive(Clone, Debug)]
@@ -68,36 +59,7 @@ pub(crate) struct CallCompletion {
     pub media: Result<Option<Arc<SharedMedia>>, SharedMediaError>,
 }
 
-impl CallCompletion {
-    /// The simulated edge: what a simulated rank reported, in the mechanism's
-    /// type.
-    ///
-    /// A rank's `finish_flags` are dropped rather than carried: the stop
-    /// conditions are the request's own rules and the mechanism evaluates them
-    /// from the sampled token, so a second, device-side copy of that rule would
-    /// be a weaker one.
-    #[cfg(feature = "testing")]
-    pub(crate) fn from_wire(result: CallResult) -> Self {
-        let output = result.output;
-        Self {
-            request_key: output.request_key,
-            call_id: output.call_id,
-            status: output.status,
-            error_code: output.error_code,
-            error_message: output.error_message,
-            timing_counters: output.timing_counters,
-            cache_visible_len: output.cache_visible_len,
-            cache_computed_len: output.cache_computed_len,
-            step_index: output.step_index,
-            committed_tokens: output.committed_tokens,
-            token_logprobs: output.token_logprobs,
-            prompt_logprobs: output.prompt_logprobs,
-            draft_token_ids: output.draft_token_ids,
-            latent_layouts: output.latent_layouts,
-            media: result.media,
-        }
-    }
-}
+impl CallCompletion {}
 
 impl CallCompletion {
     /// The in-process edge: what a device's runner reported, in the mechanism's
@@ -182,31 +144,6 @@ pub(crate) struct BatchReport {
 }
 
 impl BatchReport {
-    /// The simulated edge: a logical result, in the mechanism's type.
-    #[cfg(feature = "testing")]
-    pub(crate) fn from_wire(result: BatchResult) -> Self {
-        Self {
-            batch_id: result.batch_id,
-            calls: result
-                .results
-                .into_iter()
-                .map(CallCompletion::from_wire)
-                .collect(),
-            command_results: result.command_results,
-            done: result.done,
-            // The wire states a duration per worker; the mechanism measures a
-            // step by the device work it waited for, which is their sum.
-            timing: TimingCounters {
-                device_us: result
-                    .worker_exec_us
-                    .into_iter()
-                    .fold(0u64, u64::saturating_add),
-                ..TimingCounters::default()
-            },
-            forward_stats: result.forward_stats,
-        }
-    }
-
     /// The in-process edge: what this process's devices reported, in the
     /// mechanism's type.
     ///

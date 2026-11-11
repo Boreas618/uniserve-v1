@@ -10,12 +10,11 @@
 //! `ranks` index into that list. A scheduler reads the engine configuration
 //! (`proto::config::EngineConfig`) as its process resolved it, the process's
 //! launch, and the mechanism's limits for its ranks ([`SchedulerConfig::of`]). A main process builds one scheduler per
-//! rank it holds with `SchedulerHandle::over_batches_telling`, over the
-//! devices of its own process; `SchedulerHandle::with_worker` takes the CPU
-//! simulation backend instead.
+//! rank it holds with `SchedulerHandle::over_batches`, over the
+//! devices of its own process.
 
 use ipc::MediaCall;
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 use proto::config::DEFAULT_BLOCK;
 use std::collections::BTreeMap;
 
@@ -23,11 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-#[cfg(feature = "testing")]
-use crate::DEFAULT_MAX_RUNNING_REQUESTS;
 use crate::handle::{CommandSender, EventRx, SubmitError};
-#[cfg(feature = "testing")]
-use crate::worker::Worker;
 use crate::worker::WorkerGroupId;
 use crate::{CommandWaker, GenerationLimits, Request};
 use crate::{Scheduler, SpecialTokenIds};
@@ -37,8 +32,6 @@ use ipc::MainProcessInfo;
 use ipc::RequestId;
 use ipc::execution::Batches;
 use proto::config::EngineArgs;
-#[cfg(feature = "testing")]
-use proto::config::EngineConfig;
 #[cfg(test)]
 use proto::config::{BlockConfig, BlockDistribution};
 pub use proto::config::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
@@ -46,84 +39,6 @@ pub use proto::config::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 /// A storage scope no other deployment names.
 pub(crate) fn unnamed_deployment() -> String {
     format!("deployment-{}", uuid::Uuid::new_v4().simple())
-}
-
-/// The arguments of an engine process of `model` on the CPU simulation backend: one pool of one
-/// rank on this host, named as its worker group, the simulator's generation limits and end of
-/// text, and every other section's default. Pair them with [`SchedulerHandle::with_worker`] and
-/// [`SchedulerConfig::default`].
-#[cfg(feature = "testing")]
-pub fn sim_args(model: impl Into<String>) -> EngineArgs {
-    use std::num::NonZeroUsize;
-    #[expect(
-        clippy::expect_used,
-        reason = "DEFAULT_MAX_RUNNING_REQUESTS is a positive constant"
-    )]
-    let max_running_requests =
-        NonZeroUsize::new(DEFAULT_MAX_RUNNING_REQUESTS).expect("a positive default");
-    let group = WorkerGroupConfig::placed(
-        &["localhost".to_owned()],
-        "cpu",
-        1,
-        2,
-        WorkerGroupConfig::single_component(DEFAULT_BLOCK, 1),
-    );
-    let mut args = EngineArgs::new(EngineConfig {
-        executable: proto::BUILD.to_owned(),
-        model: proto::config::ModelConfig {
-            model: model.into(),
-            base: None,
-            lora_path: None,
-            max_model_len: 0,
-            dtype: crate::ModelDtype::BFloat16,
-            quantization: Default::default(),
-            generation_limits: crate::sim::SimEngine::generation_limits(),
-            bos: 0,
-            // `SimEngine` fabricates this end of text after `text_len` tokens; the
-            // scheduler must recognize it to finish a simulated request.
-            eos: vec![crate::sim::FAKE_EOS_TOKEN],
-            canvas_sampling: None,
-            prefill_outputs: true,
-        },
-        parallel: proto::config::ParallelConfig {
-            tensor_parallel_size: NonZeroUsize::MIN,
-            data_parallel_size: NonZeroUsize::MIN,
-            engine_host: "localhost".to_owned(),
-            worker_groups: vec![group.clone()],
-        },
-        deployment: unnamed_deployment(),
-        max_running_requests,
-        max_num_batched_tokens: None,
-        max_logprobs: 20,
-        attention_backend: String::new(),
-        prefill_attention_backend: None,
-        decode_attention_backend: None,
-        moe_runner_backend: None,
-        device: Default::default(),
-        scheduler: Default::default(),
-        media: Default::default(),
-        mem_fraction_static: 0.9,
-        load: Default::default(),
-        kv_cache: Default::default(),
-        moe: Default::default(),
-        cuda_graph: Default::default(),
-        worker: Default::default(),
-        speculative: Default::default(),
-        video: Default::default(),
-        profiling: Default::default(),
-    });
-    // The simulation keeps no host tier: it has no Storage Server to keep one in.
-    args.engine_config.kv_cache.host_tier = false;
-    args.host = "localhost".to_owned();
-    args.group = group.id.0.clone();
-    #[expect(
-        clippy::expect_used,
-        reason = "the simulated group is placed with one rank, which a u32 holds"
-    )]
-    let world_size = u32::try_from(group.ranks.len()).expect("one rank");
-    args.world_size = world_size;
-    args.queue_depth = 2;
-    args
 }
 
 /// The control tokens a scheduler's requests are finished and bounded by: the model's.
@@ -211,20 +126,6 @@ pub struct SchedulerHandle {
 pub(crate) const WARMUP_REQUEST_IDS: u64 = 1 << 63;
 
 impl SchedulerHandle {
-    /// [`Self::over_batches_telling`] with nothing told of a step's progress.
-    ///
-    /// # Errors
-    ///
-    /// Fails as [`Self::over_batches_telling`] does.
-    #[cfg(feature = "testing")]
-    pub fn over_batches(
-        args: &EngineArgs,
-        limits: SchedulerConfig,
-        batches: Arc<dyn Batches>,
-    ) -> anyhow::Result<Self> {
-        Self::over_batches_telling(args, limits, batches, CommandWaker::noop())
-    }
-
     /// Starts one scheduler thread over the worker crate's batch path — the
     /// in-process submission path of §2.4 — and returns its handle, with
     /// `progress` told whenever a step produced events or an answer: what the
@@ -244,7 +145,7 @@ impl SchedulerHandle {
     /// reports no pool, pools that disagree about a component, or not the
     /// launch's pool, when a pool serves fewer request rows than the running
     /// requests need, or when the scheduler's thread cannot be started.
-    pub fn over_batches_telling(
+    pub fn over_batches(
         args: &EngineArgs,
         limits: SchedulerConfig,
         batches: Arc<dyn Batches>,
@@ -272,29 +173,6 @@ impl SchedulerHandle {
         // still be capturing the buckets its batches replay.
         handle.serving_warmup = Mutex::new(Some(args.clone()));
         Ok(handle)
-    }
-
-    /// Runs a scheduler over a simulated worker, as
-    /// [`Self::over_batches_telling`] reads `args` and `limits`.
-    ///
-    /// The command waker is a no-op, so a command does not interrupt the
-    /// scheduler's idle park, and the worker's pools are not compared with
-    /// the launch's.
-    #[cfg(feature = "testing")]
-    pub fn with_worker(
-        args: &EngineArgs,
-        limits: SchedulerConfig,
-        worker: Box<dyn Worker>,
-    ) -> anyhow::Result<Self> {
-        let engine = &args.engine_config;
-        let scheduler = Scheduler::new(
-            crate::submissions(worker),
-            control_tokens(&engine.model),
-            limits,
-            engine.model.generation_limits.clone(),
-        )?;
-        let scheduler = Self::configured(scheduler, args)?;
-        Self::spawn(scheduler, engine.model.model.clone(), CommandWaker::noop())
     }
 
     /// Refuses a token runtime whose workers hold fewer request rows than

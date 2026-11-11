@@ -10,10 +10,6 @@
 //! storage (`allocation`, `reservation`), and submits batches through
 //! `Submissions` (`submission`) to the worker crate's `Batches`.
 //!
-//! The `testing` feature additionally exports `SimWorker`, `SimEngine`, and
-//! `BatchEvent` (`sim`), a GPU-free worker for scheduler tests, which plugs in
-//! through the `Worker` trait.
-//!
 //! The scheduler is the request algorithms and the single-owner control loop.
 //! The loop combines request progress, scheduler policy, storage allocations, and
 //! asynchronous worker completions. All mutable engine state stays on its
@@ -58,22 +54,16 @@ mod hand_off;
 mod handle;
 mod host_pages;
 mod kv_cache;
-#[cfg(feature = "testing")]
-mod sim;
 mod trajectories;
 mod warmup;
 mod worker;
 
-#[cfg(feature = "testing")]
-pub use crate::core::sim_args;
 pub use crate::core::{SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,
     EventSendError, EventTx, HookBarrier, PolicyPrograms, StageApplied, StreamCancelCause,
     Submission, SubmitError, Wake, WeightsInFlight,
 };
-#[cfg(feature = "testing")]
-pub use crate::worker::{BatchResult, CallResult, Worker};
 pub use crate::worker::{
     BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ExecuteError, ExecutionBatch,
     PageOffloads, RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel, WorkerError,
@@ -83,15 +73,6 @@ pub use crate::worker::{
 // submits them in.
 pub use crate::kv_cache::{HostCacheSize, IndexedPage, prefix_seeds};
 pub use crate::submission::Submissions;
-// The simulated engine is test support: `mod sim` is built only with the
-// `testing` feature, so its surface is exported only with it. A production
-// build that exported these would not compile - the module they come from is
-// not there.
-#[cfg(feature = "testing")]
-pub use crate::sim::{
-    BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimSpeculation, SimWorker,
-    sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
-};
 pub use ipc::{MediaCall, VideoDenoiserInfo};
 pub use proto::config::DEFAULT_BLOCK;
 /// Serializable scheduler, cache, and worker performance snapshots.
@@ -166,16 +147,6 @@ mod request;
 mod run;
 mod speculation;
 pub(crate) mod submission;
-/// Policy modules as WebAssembly text for the policy switch's unit tests.
-#[cfg(test)]
-mod toy;
-
-/// The mechanism's door to a worker a test supplies.
-#[cfg(feature = "testing")]
-pub(crate) fn submissions(worker: Box<dyn Worker>) -> submission::Submissions {
-    submission::Submissions::new(worker)
-}
-
 /// The mechanism's door to the worker crate's batch path, the in-process
 /// submission path of §2.4 and §7.3's splice.
 pub(crate) fn submissions_over(

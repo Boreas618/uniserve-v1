@@ -18,100 +18,48 @@ use crossbeam_channel::Receiver;
 use scheduler::{
     CommandSender, PolicyBytes, PolicyProgram, PolicySource, SchedulerConfig, Stage, StageApplied,
 };
-use scheduling::guest::decision::Plan;
 use scheduling::guest::limits::Limits;
 use scheduling::guest::wire::Call;
 
 use crate::support;
-
-/// Where a toy keeps its reply buffers.
-const MESSAGE: u32 = 4096;
-const PLAN: u32 = 8192;
-const LIMITS: u32 = 12288;
-const VICTIMS: u32 = 16384;
+use crate::support::toy::{Toy, toy_module};
 
 /// How long a command answer may take: a precopy loads and instantiates a
 /// module on its own thread.
 const ANSWER: Duration = Duration::from_secs(30);
 
-/// A toy policy program: limits that fit what the simulated workers were
-/// started for, and an empty plan.
+/// A toy policy program: limits that fit what the fake's pool was started
+/// for, and an empty plan.
 ///
 /// An empty plan asks for nothing, so a scheduler that serves under the toy
 /// makes no decision this test has to arrange state for; what the test reads is
 /// which program the scheduler serves, from the commands' answers.
 fn toy() -> Vec<u8> {
-    let limits = Limits {
+    toy_module(&Toy {
+        limits: fitting(),
+        ..Toy::default()
+    })
+}
+
+/// Limits within the ceilings of the pool these cases build.
+fn fitting() -> Limits {
+    Limits {
         chunked_prefill_size: 128,
         max_batch: 1,
         max_num_batched_tokens: 128,
         prefetch_min_tokens: 256,
         ..Limits::default()
-    };
-    let plan = serde_json::to_string(&Plan::default()).expect("a plan is JSON");
-    let limits = serde_json::to_string(&limits).expect("limits are JSON");
-    let victims = "[]".to_owned();
-    let source = format!(
-        "(module (memory (export \"memory\") 1) \
-         (data (i32.const {PLAN}) \"{}\") \
-         (data (i32.const {LIMITS}) \"{}\") \
-         (data (i32.const {VICTIMS}) \"{}\") \
-         (func (export \"sched_alloc\") (param i32) (result i32) i32.const {MESSAGE}) \
-         (func (export \"sched_free\") (param i32 i32)) \
-         (func (export \"sched_init\") (param i32 i32) (result i64) i64.const 0) \
-         (func (export \"sched_observe\") (param i32 i32) (result i64) i64.const 0) \
-         (func (export \"{}\") (result i64) i64.const {}) \
-         (func (export \"{}\") (param i32 i32) (result i64) i64.const {}) \
-         (func (export \"{}\") (param i32 i32) (result i64) i64.const {}) \
-         (func (export \"{}\") (param i32 i32) (result i32) i32.const 0) \
-         (func (export \"{}\") (param i32 i32) (result i32) i32.const 0))",
-        escape(&plan),
-        escape(&limits),
-        escape(&victims),
-        Call::Limits.export(),
-        packed(LIMITS, limits.len()),
-        Call::Dispatch.export(),
-        packed(PLAN, plan.len()),
-        Call::Reclaim.export(),
-        packed(VICTIMS, victims.len()),
-        Call::Route.export(),
-        Call::Place.export(),
-    );
-    wat::parse_str(&source).expect("the toy policy module is valid WebAssembly text")
-}
-
-/// A reply of `len` bytes at `offset`, as the call protocol packs it.
-fn packed(offset: u32, len: usize) -> u64 {
-    (u64::from(offset) << 32) | u64::try_from(len).expect("a reply fits u64")
-}
-
-/// `text` escaped for a WebAssembly text data segment.
-fn escape(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
+    }
 }
 
 /// A toy module that traps in `dispatch`, so its precopy fails: the decisions
 /// are what the switch trials.
 fn trapping() -> Vec<u8> {
-    let source = format!(
-        "(module (memory (export \"memory\") 1) \
-         (func (export \"sched_alloc\") (param i32) (result i32) i32.const {MESSAGE}) \
-         (func (export \"sched_free\") (param i32 i32)) \
-         (func (export \"sched_init\") (param i32 i32) (result i64) i64.const 0) \
-         (func (export \"sched_observe\") (param i32 i32) (result i64) i64.const 0) \
-         (func (export \"{}\") (result i64) i64.const {}) \
-         (func (export \"{}\") (param i32 i32) (result i64) unreachable) \
-         (func (export \"{}\") (param i32 i32) (result i64) unreachable) \
-         (func (export \"{}\") (param i32 i32) (result i32) unreachable) \
-         (func (export \"{}\") (param i32 i32) (result i32) unreachable))",
-        Call::Limits.export(),
-        packed(MESSAGE, 0),
-        Call::Dispatch.export(),
-        Call::Reclaim.export(),
-        Call::Route.export(),
-        Call::Place.export(),
-    );
-    wat::parse_str(&source).expect("the trapping shape is valid WebAssembly text")
+    toy_module(&Toy {
+        limits: fitting(),
+        trap: Some(Call::Dispatch),
+        ..Toy::default()
+    })
 }
 
 /// A scheduler thread serving with no request.
@@ -509,4 +457,153 @@ fn a_precopy_whose_decisions_trap_fails_and_the_serving_policy_stays() {
         .precopy("priority", 3, toy())
         .expect("a later program's precopy");
     epoch.switch_over().expect("the later switchover");
+}
+
+/// A candidate whose decision never returns runs out of the fuel a call is
+/// given: its precopy fails, and the serving policy stays.
+#[test]
+fn a_candidate_that_runs_past_its_fuel_fails_the_precopy() {
+    let epoch = Epoch::start();
+    let spinning = toy_module(&Toy {
+        limits: fitting(),
+        spin: Some(Call::Dispatch),
+        ..Toy::default()
+    });
+    let failed = epoch
+        .precopy("priority", 2, spinning)
+        .expect_err("a decision that never returns fails the precopy");
+    assert!(
+        failed.contains("fuel"),
+        "the refusal names the fuel: {failed}"
+    );
+    assert!(
+        epoch.switch_over().is_err(),
+        "nothing was prepared, so the serving policy stays"
+    );
+}
+
+/// A candidate whose limits exceed what the deployment was built for is
+/// refused at its precopy.
+#[test]
+fn a_candidate_whose_limits_exceed_the_build_config_fails_the_precopy() {
+    let epoch = Epoch::start();
+    let too_large = toy_module(&Toy {
+        limits: Limits {
+            max_num_batched_tokens: u32::MAX,
+            ..fitting()
+        },
+        ..Toy::default()
+    });
+    let failed = epoch
+        .precopy("priority", 2, too_large)
+        .expect_err("limits above the build config fail the precopy");
+    assert!(
+        failed.contains("max_num_batched_tokens"),
+        "the refusal names the limit: {failed}"
+    );
+}
+
+/// A candidate whose decision names a request the scheduler does not hold is
+/// refused at its precopy: every decision is checked before a policy serves.
+#[test]
+fn a_candidate_whose_decision_is_invalid_fails_the_precopy() {
+    let epoch = Epoch::start();
+    let admits_nobody = toy_module(&Toy {
+        limits: fitting(),
+        plan: scheduling::guest::decision::Plan {
+            admit: vec![scheduling::guest::ids::RequestId(999)],
+            ..Default::default()
+        },
+        ..Toy::default()
+    });
+    let failed = epoch
+        .precopy("priority", 2, admits_nobody)
+        .expect_err("an admission of a request nobody submitted fails the precopy");
+    assert!(
+        failed.contains("999"),
+        "the refusal names the request: {failed}"
+    );
+}
+
+/// The control thread's router asks the policy for a new request's rank,
+/// keeps the previous program when the serving one names a rank it was not
+/// offered, and asks no policy on a node of one scheduler.
+#[test]
+fn the_router_routes_switches_reverts_and_refuses_a_rank_it_was_not_offered() {
+    use scheduler::{Arrival, RankView, Router};
+    use scheduling::guest::time::Nanos;
+    use scheduling::guest::view::RequestClass;
+
+    let ranks: Vec<RankView> = (0..2)
+        .map(|index| RankView {
+            index,
+            in_flight: 0,
+            alive: true,
+        })
+        .collect();
+    let arrival = Arrival {
+        id: ipc::RequestId(7),
+        priority: 0,
+        class: RequestClass::Token,
+        prompt_tokens: 8,
+        generated_tokens: 0,
+        remaining_tokens: 8,
+        migratable: false,
+        cache_rank: None,
+        arrived_at: Nanos(0),
+    };
+    let ceilings = Limits {
+        max_batch: 8,
+        max_num_batched_tokens: 1024,
+        chunked_prefill_size: 512,
+        ..Limits::default()
+    };
+    let program = |backend: &str, revision: u32| PolicyProgram {
+        backend: backend.to_owned(),
+        revision,
+        arguments: Default::default(),
+        stated: Default::default(),
+    };
+    let routing = |route: u32| {
+        PolicyBytes::new(toy_module(&Toy {
+            limits: fitting(),
+            route,
+            ..Toy::default()
+        }))
+    };
+
+    let mut router = Router::new(ceilings);
+    assert!(
+        router.route(&arrival, &ranks).is_err(),
+        "no policy routes yet"
+    );
+    assert!(router.switchover(&ranks).is_err(), "nothing was prepared");
+
+    let prepared = Router::prepare(&routing(1), program("a", 1), &ranks, &ceilings)
+        .expect("the candidate prepares");
+    router.adopt(prepared);
+    router
+        .switchover(&ranks)
+        .expect("the switchover installs it");
+    assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
+
+    // A program that names a rank it was not offered fails, and the
+    // program before it routes the request and those after it.
+    let prepared = Router::prepare(&routing(5), program("b", 2), &ranks, &ceilings)
+        .expect("the candidate prepares");
+    router.adopt(prepared);
+    router
+        .switchover(&ranks)
+        .expect("the switchover installs it");
+    assert_eq!(
+        router
+            .route(&arrival, &ranks)
+            .expect("the previous program routes"),
+        1
+    );
+    assert_eq!(router.program().map(|p| p.backend.as_str()), Some("a"));
+    assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
+
+    // A node of one scheduler routes every request there and asks no policy.
+    assert_eq!(router.route(&arrival, &ranks[..1]).expect("rank 0"), 0);
 }

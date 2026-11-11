@@ -116,7 +116,6 @@ impl Scheduler {
             // for the worker and goes to it.
             if batch.requests.is_empty()
                 && batch.page_offloads.is_none()
-                && self.worker.serves_in_process()
                 && !(self.holds_image_features() && !crate::submission::frees(&batch).is_empty())
             {
                 self.acknowledge_commands(&batch.commands);
@@ -212,44 +211,6 @@ impl Scheduler {
         {
             self.invariant_broken(&unknown.to_string());
         }
-    }
-
-    /// Advances scheduler and worker work, blocking only for an outstanding result.
-    ///
-    /// Serving drives `run`; `step` lets tests and examples advance the
-    /// scheduler deterministically from the calling thread.
-    ///
-    /// Drains `commands` first; a shutdown command or a disconnected channel
-    /// aborts every request, closes the worker and returns `false`. When the
-    /// nonblocking tick makes no progress while batches are in flight, this
-    /// waits a bounded time for one result.
-    ///
-    /// Returns whether the loop made progress or handled a worker outcome.
-    #[cfg(feature = "testing")]
-    pub fn step(&mut self, commands: &Receiver<Command>) -> bool {
-        let (stop, handled) = self.drain_commands(commands);
-        if stop {
-            self.abort_all_requests();
-            let _ = self.worker.close();
-            return false;
-        }
-        let progressed = self.step_nonblocking() || handled;
-        if progressed || self.inflight.pending_batches.is_empty() {
-            return progressed;
-        }
-        match self.worker.poll(Duration::from_secs(300)) {
-            Ok(Some(result)) => {
-                self.apply_result(result);
-                self.refill_worker();
-                self.publish_cache_stats();
-            }
-            Ok(None) => return false,
-            Err(error) => {
-                self.on_worker_error(error);
-                self.publish_cache_stats();
-            }
-        }
-        true
     }
 
     /// Advances one nonblocking schedule-ahead tick for the owner-thread reactor. It

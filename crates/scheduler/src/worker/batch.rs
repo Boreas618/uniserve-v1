@@ -4,8 +4,7 @@
 //! [`RequestDispatch`] it chose, plus lifecycle commands, and lays it out once
 //! as the `ipc::execution::Batch` the device worker reads
 //! ([`ExecutionBatch::device`]). `Submissions` hands that batch to the device
-//! worker, stamped with the step's generation, or gives the whole record to
-//! the simulated one.
+//! worker, stamped with the step's generation.
 
 use super::WorkerGroupId;
 use ipc::{BatchCommand, BufferAllocation, Call, DecodeRange, NewRequest, RequestKey};

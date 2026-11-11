@@ -535,7 +535,7 @@ pub(super) fn scheduler(
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.
     let progress = scheduler::CommandWaker::new(move || control.wake());
-    scheduler::SchedulerHandle::over_batches_telling(&args, limits, batches, progress)
+    scheduler::SchedulerHandle::over_batches(&args, limits, batches, progress)
 }
 
 /// How long the scheduler node waits for a peer to report the first rank of a worker group it

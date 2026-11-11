@@ -137,7 +137,9 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
         max_running_requests: 4,
         ..SchedulerConfig::default()
     };
-    let handle = SchedulerHandle::over_batches(&args, limits, batches).expect("the pool serves");
+    let handle =
+        SchedulerHandle::over_batches(&args, limits, batches, scheduler::CommandWaker::noop())
+            .expect("the pool serves");
 
     // The trial asks the decision set once on the state that exists now - a
     // `dispatch` and no `observe`, since observing a step's events is the step's

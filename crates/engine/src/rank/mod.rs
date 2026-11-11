@@ -680,7 +680,7 @@ impl ModelRunner {
             && self.engine_config().kv_cache.prefix_caching
     }
 
-    /// What this rank's scheduler starts with ([`scheduler::SchedulerHandle::over_batches_telling`]):
+    /// What this rank's scheduler starts with ([`scheduler::SchedulerHandle::over_batches`]):
     /// the process's arguments `launch`, with the engine configuration as this process resolves it,
     /// and the mechanism's limits for this rank ([`scheduler::SchedulerConfig::of`]).
     ///

@@ -206,7 +206,9 @@ impl Scheduler {
             page_tokens: self.page_tokens(),
             prefixes,
             ranks,
-            nodes: self.worker.storage_nodes(),
+            // This process's devices hold no deployment storage of their own: the engine's
+            // host KV path is served by the Storage Server it reaches itself.
+            nodes: BTreeMap::new(),
         })
     }
 

@@ -120,8 +120,9 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
     // The boot's whole shape: the facts of a launch file, the worker's batch
     // path, one handle. Nothing is launched: the pool is the rank.
     let (args, limits) = launch();
-    let handle = SchedulerHandle::over_batches(&args, limits, batches)
-        .expect("the launch boots a scheduler");
+    let handle =
+        SchedulerHandle::over_batches(&args, limits, batches, scheduler::CommandWaker::noop())
+            .expect("the launch boots a scheduler");
 
     // The handle is the launched path's: its commands answer, and a stage waits
     // for a boundary.
@@ -180,8 +181,9 @@ fn the_serving_warmup_waits_for_admission_to_open() {
             rank.device = "cuda:0".to_owned();
         }
     }
-    let handle = SchedulerHandle::over_batches(&args, limits, batches)
-        .expect("the launch boots a scheduler");
+    let handle =
+        SchedulerHandle::over_batches(&args, limits, batches, scheduler::CommandWaker::noop())
+            .expect("the launch boots a scheduler");
 
     install(&handle, &serving);
     // The policy serves and could form a batch from here on; the device's captures are still

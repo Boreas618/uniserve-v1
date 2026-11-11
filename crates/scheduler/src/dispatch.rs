@@ -65,7 +65,7 @@ impl Dispatch {
     /// protocol's default component for an undivided model.
     pub(super) fn worker_candidates<'a>(
         &'a self,
-        epoch: &'a dyn super::submission::Epoch,
+        epoch: &'a super::submission::Submissions,
         info: &'a MainProcessInfo,
         kind: CallKind,
     ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a MainProcessInfo)> {
@@ -88,7 +88,7 @@ impl Dispatch {
     /// Other workers are excluded.
     pub(super) fn component_candidates<'a>(
         &'a self,
-        epoch: &'a dyn super::submission::Epoch,
+        epoch: &'a super::submission::Submissions,
         kind: CallKind,
         component: &'a str,
     ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a MainProcessInfo)> {
@@ -133,7 +133,7 @@ impl Dispatch {
     /// choice.
     pub(super) fn component_target<'a>(
         &'a self,
-        epoch: &'a dyn super::submission::Epoch,
+        epoch: &'a super::submission::Submissions,
         request: RequestKey,
         kind: CallKind,
         component: &'a str,
@@ -214,7 +214,7 @@ impl Dispatch {
     /// `info`, as `worker_candidates` does, while preserving residency.
     pub(super) fn worker_target<'a>(
         &'a self,
-        epoch: &'a dyn super::submission::Epoch,
+        epoch: &'a super::submission::Submissions,
         info: &'a MainProcessInfo,
         request: RequestKey,
         kind: CallKind,
@@ -238,7 +238,7 @@ impl Dispatch {
     /// submission capacity.
     pub(super) fn place(
         &mut self,
-        epoch: &dyn super::submission::Epoch,
+        epoch: &super::submission::Submissions,
         info: &MainProcessInfo,
         request: RequestKey,
         kind: CallKind,
@@ -261,7 +261,7 @@ impl Dispatch {
     /// eligible replica with submission capacity.
     pub(super) fn select_worker(
         &mut self,
-        epoch: &dyn super::submission::Epoch,
+        epoch: &super::submission::Submissions,
         info: &MainProcessInfo,
         call: &Call,
         choice: &Choice,

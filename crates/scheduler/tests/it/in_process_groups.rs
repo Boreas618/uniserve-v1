@@ -47,6 +47,7 @@ fn losing_every_worker_stops_request_admission() {
             ..SchedulerConfig::default()
         },
         Arc::clone(&batches) as Arc<dyn ipc::execution::Batches>,
+        scheduler::CommandWaker::noop(),
     )
     .expect("the fake worker serves");
     support::install_policy_on(&engine, scheduler::BatchCapacity::of(&rank));

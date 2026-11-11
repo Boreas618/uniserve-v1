@@ -131,6 +131,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
         &reference_config,
         reference_limits,
         Arc::clone(&reference_pool) as Arc<dyn Batches>,
+        scheduler::CommandWaker::noop(),
     )
     .expect("the reference epoch serves");
     install(&reference, &reference_pool);
@@ -175,6 +176,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
         &running_config,
         running_limits,
         Arc::clone(&running_pool) as Arc<dyn Batches>,
+        scheduler::CommandWaker::noop(),
     )
     .expect("the running epoch serves");
     install(&running, &running_pool);
@@ -198,6 +200,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
         &successor_config,
         successor_limits,
         Arc::clone(&successor_pool) as Arc<dyn Batches>,
+        scheduler::CommandWaker::noop(),
     )
     .expect("the successor starts beside the running epoch");
     install(&successor, &successor_pool);

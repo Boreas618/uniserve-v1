@@ -108,7 +108,7 @@ impl Scheduler {
                 .info()
                 .workers
                 .iter()
-                .any(|(id, info)| !info.supported_calls.is_empty() && !self.worker.is_closed(id))
+                .any(|(_, info)| !info.supported_calls.is_empty())
             {
                 self.fail(format!("every model worker group closed: {error:#}"));
             }

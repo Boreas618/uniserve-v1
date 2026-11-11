@@ -3687,7 +3687,6 @@ dependencies = [
  "png",
  "program-server",
  "proto",
- "scheduler",
  "scheduling",
  "serde",
  "serde_json",
