@@ -6,7 +6,7 @@
 //! control requests through.
 //!
 //! [`WorkerGroupConfig`] is the static deployment description: each group has
-//! an ordered list of physical [`WorkerRank`]s and named components whose
+//! an ordered list of physical [`WorkerRank`]s and named stages whose
 //! `ranks` index into that list. A scheduler reads the engine configuration
 //! (`proto::config::EngineConfig`) as its process resolved it, the process's
 //! launch, and the mechanism's limits for its ranks ([`SchedulerConfig::of`]). A main process builds one scheduler per
@@ -128,7 +128,7 @@ pub(crate) const WARMUP_REQUEST_IDS: u64 = 1 << 63;
 impl SchedulerHandle {
     /// Starts one scheduler thread over the worker crate's batch path — the
     /// in-process submission path of §2.4 — and returns its handle, with
-    /// `progress` told whenever a step produced events or an answer: what the
+    /// `progress` told whenever a step produced events or an response: what the
     /// thread reading them waits on.
     ///
     /// The scheduler reads the process's arguments `args`: its epoch, its host
@@ -142,7 +142,7 @@ impl SchedulerHandle {
     /// then a step forms no batch.
     ///
     /// Fails when the worker
-    /// reports no pool, pools that disagree about a component, or not the
+    /// reports no pool, pools that disagree about a stage, or not the
     /// launch's pool, when a pool serves fewer request rows than the running
     /// requests need, or when the scheduler's thread cannot be started.
     pub fn over_batches(
@@ -444,7 +444,7 @@ impl SchedulerHandle {
     }
 
     /// One of §7.3's steps 3 to 6, applied at this scheduler's next boundary
-    /// where no batch and no submission is in flight, and answered with the step
+    /// where no batch and no submission is in flight, and responded with the step
     /// it applied at.
     pub fn stage(
         &self,
@@ -455,31 +455,31 @@ impl SchedulerHandle {
 
     /// §7.3 step 2's shadow pass for the model generation `generation` (front's
     /// two axes: the model's generation, not a launch's): the following step's
-    /// batches also run in shadow, against the resident data and without
+    /// batches also run in shadow, against the serving data and without
     /// writing it.
     ///
-    /// Answered once one step's batches have been shadowed, or with the reason
+    /// Responds once one step's batches have been shadowed, or with the reason
     /// the pass could not run.
     pub fn shadow(&self, generation: u64) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.shadow(generation)
     }
 
     /// One of the daemon's request commands, applied to the request it names,
-    /// answered when it was enqueued.
+    /// responded when it was enqueued.
     ///
     /// A command whose bookkeeping is the connection's — a consumer's position,
-    /// a takeover — is answered with that reason: the engine's routing holds the
+    /// a takeover — gets its response with that reason: the engine's routing holds the
     /// request's stream, not a scheduler.
     pub fn request_command(
         &self,
         command: proto::request::wire::Command,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = answer.send(self.commands.request_command(command));
+        let (response, done) = crossbeam_channel::bounded(1);
+        let _ = response.send(self.commands.request_command(command));
         done
     }
 
-    /// What this scheduler has done and what its policy has cost (§12), answered
+    /// What this scheduler has done and what its policy has cost (§12), responded
     /// by the scheduler thread.
     pub fn counters(&self) -> crossbeam_channel::Receiver<crate::handle::Counters> {
         self.commands.counters()
@@ -494,7 +494,7 @@ impl SchedulerHandle {
     }
 
     /// Returns the media units one call of `call` covers at once: the ranks
-    /// of a distributed serving component times its units per rank, or one;
+    /// of a distributed serving stage times its units per rank, or one;
     /// `None` when no worker serves `call`.
     pub fn media_units(&self, call: MediaCall) -> Option<u32> {
         self.media_units.get(&call).copied()
@@ -653,7 +653,7 @@ impl SchedulerHandle {
 
     /// Parks the scheduler: every token request it holds that resumes from
     /// its generated tokens (`Scheduler::migrate_requests`) ends as
-    /// migratable, a queued one at once, a running one once its calls in
+    /// migratable, a waiting one at once, a running one once its calls in
     /// flight drain, after every token it generated; the other requests
     /// finish; then it executes nothing more until resumed. The receiver
     /// gets its prefix cache index and what its migrating requests held
@@ -683,7 +683,7 @@ impl SchedulerHandle {
     }
 
     /// §7.3 step 2: prepares `program`'s policy on this scheduler's state,
-    /// without putting it in; the answer arrives when the blocking thread that
+    /// without putting it in; the response arrives when the blocking thread that
     /// loaded it is done.
     pub fn precopy_policy(
         &self,
@@ -693,7 +693,7 @@ impl SchedulerHandle {
         self.commands.precopy_policy(program, source)
     }
 
-    /// §7.3 step 3: the prepared policy answers from this scheduler's next
+    /// §7.3 step 3: the prepared policy responds from this scheduler's next
     /// batch boundary.
     pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.switchover_policy()
@@ -705,14 +705,14 @@ impl SchedulerHandle {
         self.commands.commit_policy()
     }
 
-    /// §7.3 step 4: the previous policy answers again, on the state this
+    /// §7.3 step 4: the previous policy responds again, on the state this
     /// scheduler holds when the stage applies.
     pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.revert_policy()
     }
 
     /// The step this scheduler reached and §12's cost counters for its policy,
-    /// or a timeout when the scheduler does not answer.
+    /// or a timeout when the scheduler does not response.
     pub fn progress(&self) -> crossbeam_channel::Receiver<crate::Progress> {
         self.commands.progress()
     }
@@ -720,8 +720,8 @@ impl SchedulerHandle {
     /// Asks this scheduler for the policy failure it recorded since the last
     /// call, if it recorded one (§7.3).
     ///
-    /// The answer is polled, not waited for: the caller of the stats tick is
-    /// the engine's control thread, and a scheduler that does not answer must
+    /// The response is polled, not waited for: the caller of the stats tick is
+    /// the engine's control thread, and a scheduler that does not respond must
     /// not hold it.
     pub fn take_policy_report(&self) -> crossbeam_channel::Receiver<Option<crate::PolicyReverted>> {
         self.commands.take_policy_report()
@@ -881,10 +881,9 @@ mod tests {
     /// remainder, and a rank's device is its local index on its own host.
     #[test]
     fn a_rank_layout_shares_ranks_across_the_named_hosts() {
-        let components = WorkerGroupConfig::single_component("model", 1);
+        let stages = WorkerGroupConfig::single_component("model", 1);
 
-        let one =
-            WorkerGroupConfig::placed(&["compute-0".to_owned()], "cpu", 2, 1, components.clone());
+        let one = WorkerGroupConfig::placed(&["compute-0".to_owned()], "cpu", 2, 1, stages.clone());
         assert!(
             one.ranks.iter().all(|rank| rank.host == "compute-0"),
             "a rank was placed on a host the rank layout does not name: {:?}",
@@ -898,7 +897,7 @@ mod tests {
             "cuda",
             3,
             1,
-            components,
+            stages,
         );
         let hosts: Vec<_> = two.ranks.iter().map(|rank| rank.host.as_str()).collect();
         assert_eq!(hosts, ["compute-0", "compute-0", "compute-1"]);
@@ -908,13 +907,13 @@ mod tests {
         assert_eq!(devices, ["cuda:0", "cuda:1", "cuda:0"]);
     }
 
-    /// Entries covering the shapes a rank layout must validate: one component
+    /// Entries covering the shapes a rank layout must validate: one stage
     /// parallel over every rank, one dividing its output into units, and one
     /// placed alone.
-    fn mixed_components(rank_count: usize) -> BTreeMap<String, BlockConfig> {
+    fn mixed_stages(rank_count: usize) -> BTreeMap<String, BlockConfig> {
         let members: Vec<_> = (0..rank_count).collect();
-        let mut components = WorkerGroupConfig::single_component("parallel", rank_count);
-        components.insert(
+        let mut stages = WorkerGroupConfig::single_component("parallel", rank_count);
+        stages.insert(
             "divided".into(),
             BlockConfig {
                 ranks: members,
@@ -926,14 +925,14 @@ mod tests {
                 weights: Default::default(),
             },
         );
-        components.insert("alone".into(), BlockConfig::parallel(vec![0]));
-        components
+        stages.insert("alone".into(), BlockConfig::parallel(vec![0]));
+        stages
     }
 
     /// Groups of different sizes validate independently, and a group whose
-    /// component spans more ranks than the group holds is refused.
+    /// stage spans more ranks than the group holds is refused.
     #[test]
-    fn static_components_validate_their_own_parallel_members() -> anyhow::Result<()> {
+    fn static_stages_validate_their_own_parallel_members() -> anyhow::Result<()> {
         let mut workers = Vec::new();
         for (name, degree) in [("first", 1), ("second", 4), ("third", 2)] {
             let mut worker = WorkerGroupConfig::placed(
@@ -960,7 +959,7 @@ mod tests {
         // needs the lowest ranks on the first host, and each host must number
         // its own devices from zero.
         let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
-        let worker = WorkerGroupConfig::placed(&hosts, "cuda", 8, 2, mixed_components(8));
+        let worker = WorkerGroupConfig::placed(&hosts, "cuda", 8, 2, mixed_stages(8));
 
         let rank_layout: Vec<_> = worker
             .ranks
@@ -982,7 +981,7 @@ mod tests {
         );
         assert!(worker.validate().is_ok());
 
-        // A component the model spans over the group keeps all eight ranks,
+        // A stage the model spans over the group keeps all eight ranks,
         // and one it places alone stays on rank zero, which is the engine's
         // host.
         for entry in ["parallel", "divided"] {
@@ -1077,12 +1076,12 @@ mod tests {
         assert_eq!(worker.ranks.len(), 8);
     }
 
-    /// Reordering a component's ranks is a valid rank layout; repeating a rank
+    /// Reordering a stage's ranks is a valid rank layout; repeating a rank
     /// is not.
     #[test]
     fn entry_geometry_uses_unique_ordered_rank_members() {
         let mut worker =
-            WorkerGroupConfig::placed(&["localhost".to_owned()], "cuda", 4, 2, mixed_components(4));
+            WorkerGroupConfig::placed(&["localhost".to_owned()], "cuda", 4, 2, mixed_stages(4));
         assert!(worker.validate().is_ok());
 
         worker.blocks.get_mut("parallel").unwrap().ranks.swap(0, 3);
@@ -1093,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn static_bindings_reject_duplicate_identities_and_allow_component_replicas() {
+    fn static_bindings_reject_duplicate_identities_and_allow_stage_replicas() {
         let worker = WorkerGroupConfig::placed(
             &["localhost".to_owned()],
             "cuda",
@@ -1105,7 +1104,7 @@ mod tests {
         assert!(WorkerGroupConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
 
         // Distinct identities on the same device validate, whether the groups
-        // replicate one component name or hold different ones.
+        // replicate one stage name or hold different ones.
         other.id = WorkerGroupId("other".into());
         assert!(WorkerGroupConfig::validate_all(&[worker.clone(), other.clone()]).is_ok());
 

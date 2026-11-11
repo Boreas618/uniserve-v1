@@ -5,7 +5,7 @@
 //! ([`crate::execution::Batches::operate`]), and reads one reply per rank.
 //! An operation is a typed message: each message here is the payload of one
 //! [`EpochOperation`] variant, and its [`Operation`] impl states what each
-//! rank answers. A rank answers one JSON text per rank ([`answers`]), which
+//! rank responses. A rank responds to one JSON text per rank ([`responds`]), which
 //! the scheduler reads back as the operation's reply type ([`replies`]), so
 //! a rank and its scheduler agree on the message types, not on the text.
 //!
@@ -27,9 +27,9 @@ use serde::{Deserialize, Serialize};
 use crate::execution::EpochOperation;
 
 /// A memory operation: a message that is one [`EpochOperation`], and what
-/// each rank answers.
+/// each rank responses.
 pub trait Operation: Into<EpochOperation> {
-    /// What one rank answers.
+    /// What one rank responses.
     type Reply: Serialize + DeserializeOwned;
 }
 
@@ -38,24 +38,24 @@ pub trait Operation: Into<EpochOperation> {
 /// # Errors
 ///
 /// When a reply is no reply of the operation.
-pub fn replies<O: Operation>(answers: &[String]) -> serde_json::Result<Vec<O::Reply>> {
-    answers
+pub fn replies<O: Operation>(responses: &[String]) -> serde_json::Result<Vec<O::Reply>> {
+    responses
         .iter()
-        .map(|answer| serde_json::from_str(answer))
+        .map(|response| serde_json::from_str(response))
         .collect()
 }
 
-/// The JSON texts of `replies`, one per rank, as a worker answers them.
+/// The JSON texts of `replies`, one per rank, as a worker responds to them.
 ///
 /// # Errors
 ///
 /// When a reply does not serialize.
-pub fn answers<R: Serialize>(replies: &[R]) -> serde_json::Result<Vec<String>> {
+pub fn responses<R: Serialize>(replies: &[R]) -> serde_json::Result<Vec<String>> {
     replies.iter().map(serde_json::to_string).collect()
 }
 
 /// States that each message is the payload of the [`EpochOperation`]
-/// variant of its name, and the reply each rank answers it with.
+/// variant of its name, and the reply each rank responds to it with.
 macro_rules! operations {
     ($($message:ident => $reply:ty;)*) => {
         $(
@@ -153,7 +153,7 @@ impl CacheStorageReport {
 }
 
 /// The segments a rank's planes hold after an operation; a rank whose
-/// planes are not split answers none (`Option<Held>`).
+/// planes are not split responds none (`Option<Held>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Held {
     pub held: u32,
@@ -188,7 +188,7 @@ pub struct Wake;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateWeights;
 
-/// What a rank answers of a weight update.
+/// What a rank responds of a weight update.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeightsUpdated {
     /// The rank's worker group and rank; `None` from a worker of no
@@ -223,7 +223,7 @@ pub struct AdoptCache {
     pub units: Vec<[u32; 2]>,
 }
 
-/// What a rank answers of an [`AdoptCache`].
+/// What a rank responds of an [`AdoptCache`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheAdopted {
     /// The units of the predecessor's planes the rank maps, or whose flags
@@ -275,12 +275,12 @@ mod tests {
     /// leaves out.
     #[test]
     fn replies_cross_typed() {
-        let held = answers(&[Some(Held { held: 2 }), None]).unwrap();
+        let held = responses(&[Some(Held { held: 2 }), None]).unwrap();
         assert_eq!(
             replies::<ReleaseCache>(&held).unwrap(),
             [Some(Held { held: 2 }), None]
         );
-        // A worker without a storage scope answers no group.
+        // A worker without a storage scope responds to no group.
         let updated = replies::<UpdateWeights>(&[r#"{"group":null}"#.to_owned()]).unwrap();
         assert_eq!(updated, [WeightsUpdated::default()]);
         assert!(replies::<CacheStorage>(&["7".to_owned()]).is_err());

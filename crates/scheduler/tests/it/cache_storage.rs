@@ -101,7 +101,7 @@ impl SimWorkers {
 
     /// The deployment's ledger of the worker's GPU: each held segment of the
     /// serving epoch, its process, and the other epoch's and the Transfer
-    /// Server's bookings.
+    /// Server's reservations.
     fn ledger(&self) -> GpuLedger {
         let scope = Scope {
             deployment: "model".into(),
@@ -182,7 +182,7 @@ impl SimWorkers {
 const STEP: Duration = Duration::from_millis(10);
 
 /// The engine's own storage operations as `workers`, whose planes are
-/// segmented, answer them.
+/// segmented, respond to them.
 fn operate(
     workers: &Mutex<SimWorkers>,
     operation: &EpochOperation,
@@ -321,7 +321,7 @@ fn start_split(
     let operated = Arc::clone(&workers);
     let pool = Arc::new(
         FakeBatches::new(vec![inventory])
-            .answering(Arc::new(|batch| {
+            .with_output(Arc::new(|batch| {
                 thread::sleep(STEP);
                 ipc::execution::Outcome::Success(testkit::completed(
                     batch,
@@ -393,12 +393,12 @@ fn terminal(events: &mut EventRx) -> Option<Event> {
     None
 }
 
-/// The answer to a change of the cache's storage, within ten seconds.
+/// The response to a change of the cache's storage, within ten seconds.
 fn resize(handle: &CommandSender, change: CacheChange) -> Result<Vec<String>, String> {
     handle
         .resize_cache(change)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers")
+        .expect("the scheduler responds")
 }
 
 /// A request holding the tail that cannot get a unit to continue is
@@ -509,7 +509,7 @@ fn room_for_a_sessions_storage_comes_from_the_tail_and_grows_back() {
     );
     let reports = made
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers")
+        .expect("the scheduler responds")
         .unwrap();
     let output: serde_json::Value = serde_json::from_str(&reports[0]).unwrap();
     assert_eq!(output["segments_kept"], 6);
@@ -696,7 +696,7 @@ fn a_parked_epoch_lends_the_segments_no_request_in_flight_continues_from() {
     let parked = handle
         .park(true)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers")
+        .expect("the scheduler responds")
         .expect("the scheduler parks");
     assert!(matches!(
         terminal(&mut running),
@@ -729,7 +729,7 @@ fn a_parked_epoch_lends_the_segments_no_request_in_flight_continues_from() {
     let resumed = handle
         .resume(false)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(resumed.is_ok(), "{resumed:?}");
     let mut asking = request(2, kept + 1, 1);
     asking.prompt_token_ids = vec![9; asking.prompt_token_ids.len()];
@@ -742,7 +742,7 @@ fn a_parked_epoch_lends_the_segments_no_request_in_flight_continues_from() {
     let preempted = handle
         .resume(true)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(preempted.is_ok(), "{preempted:?}");
     assert!(matches!(
         terminal(&mut waiting),
@@ -772,7 +772,7 @@ fn a_successor_allocates_the_segments_its_predecessor_lent() {
     let refused = handle
         .promote(parked.clone(), true, false)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers")
+        .expect("the scheduler responds")
         .expect_err("15 free units cannot hold 21");
     assert!(
         refused.contains("15 free units") && refused.contains("need 21"),
@@ -785,7 +785,7 @@ fn a_successor_allocates_the_segments_its_predecessor_lent() {
     let promoted = handle
         .promote(lent, true, false)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(promoted.is_ok(), "{promoted:?}");
     assert!(
         workers
@@ -872,7 +872,7 @@ fn an_aborting_sleep_ends_every_request_before_the_workers_sleep() {
     let updated = handle
         .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Abort)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(updated.is_ok(), "{updated:?}");
     assert!(resize(&handle, CacheChange::Wake).is_ok());
     assert_eq!(
@@ -884,7 +884,7 @@ fn an_aborting_sleep_ends_every_request_before_the_workers_sleep() {
     thread.join().unwrap();
 }
 
-/// A held scheduler forms no batch and answers once those in flight completed.
+/// A held scheduler forms no batch and responds once those in flight completed.
 /// Every request keeps its state through the hold, and generates on from the
 /// token it reached once the hold ends.
 #[test]
@@ -927,7 +927,7 @@ fn a_weight_update_recomputing_the_requests_in_flight_runs_while_the_workers_sle
     let updated = handle
         .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Recompute)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(updated.is_ok(), "{updated:?}");
     assert!(matches!(
         terminal(&mut running),
@@ -962,7 +962,7 @@ fn a_weight_update_keeping_the_requests_in_flight_continues_them() {
     let updated = handle
         .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Keep)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(updated.is_ok(), "{updated:?}");
     assert_eq!(
         workers.lock().unwrap().operations,
@@ -991,7 +991,7 @@ fn a_weight_update_aborting_the_requests_in_flight_ends_them() {
     let updated = handle
         .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Abort)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     assert!(updated.is_ok(), "{updated:?}");
     assert!(matches!(
         terminal(&mut running),

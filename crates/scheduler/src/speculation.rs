@@ -385,13 +385,13 @@ impl Scheduler {
     /// itself. A model with layers kept per request slot ends a chunk short
     /// of that at a checkpoint boundary, from which the next continues. The
     /// chunk's tables grow first: the state checkpoint it writes and its
-    /// draft pages, without which no refill is planned. A checkpoint page
+    /// draft pages, without which no refill is prepared. A checkpoint page
     /// the request holds from the prefix cache, such as the one a migrated
     /// request resumed from, takes fresh units for the chunk to write: other
     /// requests read the shared page, and a predecessor epoch's is mapped
     /// read-only. Returns `None` when no chunk fits or the tables cannot
     /// grow.
-    pub(crate) fn plan_refill(&mut self, id: RequestId, budget: usize) -> Option<Call> {
+    pub(crate) fn prepare_refill(&mut self, id: RequestId, budget: usize) -> Option<Call> {
         let cache = self.storage.cache.as_ref()?;
         let state = self.requests.tokens(&id)?;
         let visible = state.cache_visible_len;
@@ -435,8 +435,8 @@ impl Scheduler {
         if !cache.holds_draft(&allocations.prefix_cache, start as usize, end as usize) {
             return None;
         }
-        self.plan_call(id, |_scheduler, request| {
-            generation::plan_refill(request, start, tokens, lookahead)
+        self.prepare_call(id, |_scheduler, request| {
+            generation::prepare_refill(request, start, tokens, lookahead)
         })
     }
 

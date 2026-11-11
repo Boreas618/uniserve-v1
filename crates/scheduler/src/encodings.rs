@@ -20,7 +20,7 @@
 //!
 //! The device tier is the nearer: an input image's encoding it holds is
 //! pinned for the request without a call. Otherwise the encoding is looked
-//! up in the host tier before its call is planned (`encoding_ready`), and
+//! up in the host tier before its call is prepared (`encoding_ready`), and
 //! the call reads its output from the pool's pages instead of encoding
 //! (an import), or encodes and writes its output to them (an export), or
 //! encodes alone when the pools cannot serve it
@@ -129,7 +129,7 @@ impl Scheduler {
         })
     }
 
-    /// Whether request `id`'s `encoding` may be planned now: its lookup in
+    /// Whether request `id`'s `encoding` may be prepared now: its lookup in
     /// the host encoder pools resolved, or it has none. Starts the lookup
     /// when the request has not looked the encoding up yet, ending the
     /// lookup of an encoding it no longer schedules. The encoding is looked up
@@ -262,7 +262,7 @@ impl Scheduler {
         // The encoding's output is the call's whole output: its first row is
         // the stored output's first, and its rows are bounded by the block's
         // cache tokens.
-        call.host_output = store.plan_call(
+        call.host_output = store.prepare_call(
             request_key,
             encoding.output,
             call.call_id,

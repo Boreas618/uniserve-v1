@@ -8,7 +8,7 @@ use crate::completion::{BatchReport, CallCompletion};
 use ipc::{ForwardMode, MediaCall};
 
 /// Describes a rejected worker result for the request's terminal error and
-/// its error finish's log line: the rejection, then the call it answered.
+/// its error finish's log line: the rejection, then the call it responded.
 fn rejection_cause(call: &Call, error: &generation::GenerationResultError) -> String {
     format!(
         "{error} (call {}.{}, {:?})",
@@ -510,12 +510,12 @@ impl Scheduler {
                 continue;
             };
             // A group's batch timing is the maximum of each phase over its calls.
-            let component = returned_groups[crate::stats::ExecutionDomainStats::index(kind)]
+            let stage = returned_groups[crate::stats::ExecutionDomainStats::index(kind)]
                 .get_or_insert(TimingCounters::default());
-            component.queued_us = component.queued_us.max(record.timing_counters.queued_us);
-            component.device_us = component.device_us.max(record.timing_counters.device_us);
-            component.copy_us = component.copy_us.max(record.timing_counters.copy_us);
-            component.host_us = component.host_us.max(record.timing_counters.host_us);
+            stage.queued_us = stage.queued_us.max(record.timing_counters.queued_us);
+            stage.device_us = stage.device_us.max(record.timing_counters.device_us);
+            stage.copy_us = stage.copy_us.max(record.timing_counters.copy_us);
+            stage.host_us = stage.host_us.max(record.timing_counters.host_us);
         }
 
         let calls_complete = self
@@ -598,7 +598,7 @@ impl Scheduler {
             for (index, command) in pending.commands.into_iter().enumerate() {
                 let failed = report.command_results.iter().any(|result| {
                     result.command_index == index as u32
-                        && result.outcome == crate::worker::CommandOutcome::Failed
+                        && result.status == crate::worker::CommandStatus::Failed
                 });
                 if failed {
                     match command {
@@ -890,7 +890,7 @@ impl Scheduler {
                 // A step queued behind the step that stopped its block is the
                 // exception: the host knew it for a no-op once it accepted the
                 // stopping step, and every call queued since, the block's
-                // commit and the next block's steps, was planned from that
+                // commit and the next block's steps, was prepared from that
                 // host-observed stop (`follows_unconditionally`).
                 if record.status == CallStatus::Predicated {
                     let has_unresolved_descendants = self.inflight.has_pending_calls(id);
@@ -973,7 +973,7 @@ impl Scheduler {
         add_worker_forward_map(&self.stats.worker.forward_mode_counts, &stats.mode_counts);
         add_worker_forward_map(&self.stats.worker.forward_mode_tokens, &stats.mode_tokens);
         add_worker_forward_map(&self.stats.worker.forward_mode_us, &stats.mode_us);
-        add_worker_forward_map(&self.stats.worker.forward_component_us, &stats.component_us);
+        add_worker_forward_map(&self.stats.worker.forward_module_us, &stats.component_us);
         add_worker_forward_map(&self.stats.worker.stream_us, &stats.stream_us);
         add_worker_forward_map(&self.stats.worker.blocking_calls, &stats.blocking_calls);
         add_worker_forward_map(&self.stats.worker.profile, &stats.profile);

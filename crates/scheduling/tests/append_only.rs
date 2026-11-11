@@ -19,7 +19,7 @@ use scheduling::guest::{
     Snapshot, Storage, Victim, Work,
 };
 
-/// Decodes the way the mechanism decodes a policy's answer, and the way a
+/// Decodes the way the mechanism decodes a policy's response, and the way a
 /// policy decodes a message from the mechanism.
 fn decode<T: serde::de::DeserializeOwned>(json: &str) -> T {
     wire::decode(json.as_bytes()).expect("an append-only message decodes")
@@ -45,7 +45,7 @@ fn a_field_the_host_does_not_know_does_not_hide_the_ones_it_does() {
     assert_eq!(request.state, RequestStatus::Running);
     assert_eq!(request.cached_prefix_tokens, 32);
 
-    // The same on a decision a policy answers with.
+    // The same on a decision a policy responds with.
     let output: DispatchOutput = decode(
         r#"{"admit":[1],"work":[{"request":1,"phase":2,"tokens":16}],
             "admission_window":4}"#,
@@ -55,8 +55,8 @@ fn a_field_the_host_does_not_know_does_not_hide_the_ones_it_does() {
     assert_eq!(output.work[0].tokens, 16);
 }
 
-/// A field a later mechanism appends and an older policy omits answers its
-/// default: an answer built against the older revision still means what it
+/// A field a later mechanism appends and an older policy omits takes its
+/// default: a response built against the older revision still means what it
 /// said.
 #[test]
 fn an_answer_that_omits_a_later_field_means_its_default() {

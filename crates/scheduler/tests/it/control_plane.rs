@@ -56,7 +56,7 @@ use scheduler::{
 fn text(depth: usize, end: Option<EndOfText>) -> Arc<FakeBatches> {
     Arc::new(
         support::text_pool(support::text_rank(), depth, end)
-            .answering_media(Arc::new(testkit::Media::new())),
+            .with_media_outputs(Arc::new(testkit::Media::new())),
     )
 }
 
@@ -1082,7 +1082,7 @@ fn a_scheduler_without_a_host_cache_warms_nothing() {
     let handle = CommandSender::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let answer = handle
+    let response = handle
         .cache_warm(
             storage::manifest::cache::Operation::Warmed,
             scheduler::HookBarrier::new(1),
@@ -1090,7 +1090,7 @@ fn a_scheduler_without_a_host_cache_warms_nothing() {
         .recv()
         .unwrap()
         .unwrap();
-    let snapshot: storage::manifest::cache::Snapshot = serde_json::from_str(&answer[0]).unwrap();
+    let snapshot: storage::manifest::cache::Snapshot = serde_json::from_str(&response[0]).unwrap();
     assert!(snapshot.prefixes.is_empty());
 
     drop(handle);
@@ -1281,7 +1281,7 @@ fn min_tokens_floor_overrides_early_eos() {
 }
 
 /// The first request with a context image misses the encoder cache and leaves
-/// its encoder output resident; a second request with the same image hash hits
+/// its encoder output running; a second request with the same image hash hits
 /// that cached output.
 #[test]
 fn multimodal_encode_then_cache_hit() {
@@ -1860,7 +1860,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
 
 /// An engine whose only worker is lost stops admitting work: a batch it
 /// accepted fails, its scheduler thread ends, and a submission after that is
-/// refused rather than queued for a worker that will never answer.
+/// refused rather than queued for a worker that will never response.
 #[test]
 fn losing_every_worker_stops_request_admission() {
     let mut rank = support::text_rank();

@@ -1,13 +1,13 @@
 //! Worker identity, supported calls, and startup capacity handshake.
 //!
-//! A rank answers the engine's `Info` request with a [`MainProcessInfo`]: what only
+//! A rank responds to the engine's `Info` request with a [`MainProcessInfo`]: what only
 //! the loaded rank knows (its endpoint, supported calls, capacities and
-//! component outputs). The engine launched the rank and keeps what it launched
-//! it with (epoch, devices, transfer mechanisms, queue depth and component
+//! stage outputs). The engine launched the rank and keeps what it launched
+//! it with (epoch, devices, transfer mechanisms, queue depth and stage
 //! layout), so the report does not echo those back. The engine requires
 //! every rank of a group to describe the group alike and a replacement rank to
 //! report an identical description apart from its endpoint; the worker then
-//! derives the capacity view the scheduler plans against from the
+//! derives the capacity view the scheduler schedules against from the
 //! descriptions of all workers (`WorkerInfo::runtime_info`).
 
 use super::*;
@@ -58,8 +58,8 @@ pub struct PrefixCacheInfo {
     #[serde(default)]
     pub inherited_units: u32,
     /// The page identity of each cache group, in group order: `|`-separated
-    /// components naming the weights that compute the group's pages and the
-    /// pages' layout. Pipeline stages union these components; an unrelated
+    /// stages naming the weights that compute the group's pages and the
+    /// pages' layout. Pipeline stages union these stages; an unrelated
     /// group or a downstream output head changes none of a group's keys. The
     /// engine seeds the group's page keys from it at every cache level
     /// (`storage::key::page_seed`); empty for a consumer without a model.
@@ -171,7 +171,7 @@ pub struct PoolConversion {
 /// The runs of one `field` (`prefix_cache.key.values/0` for the key values
 /// of a page's column 0, and so on for the values, the initialization flags,
 /// the FP8 scales and the state checkpoints) hold that field's bytes of every
-/// unit once. Two ranks of the same cache plan name the same fields at the
+/// unit once. Two ranks of the same cache layout name the same fields at the
 /// same bytes per unit, so a unit copies between them field by field, from
 /// the run of one holding the unit to the run of the other holding it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,7 +197,7 @@ pub struct LatentPoolInfo {
     /// image model's longest image.
     pub trajectory_pages: u32,
     /// The digest of what determines the rank's share of every request's
-    /// samples: for a video denoiser, the video plan that selects a
+    /// samples: for a video denoiser, the video graph that selects a
     /// request's layout, the slot's pages, the rank's coordinate in the
     /// denoiser's mesh and its rows of every layout startup prepares; for
     /// an image denoiser, whose every rank holds whole latents, the page
@@ -355,13 +355,13 @@ impl PrefixCacheInfo {
             // roots them.
             identities: (0..self.groups.len())
                 .map(|group| {
-                    let mut components = std::collections::BTreeSet::new();
+                    let mut stages = std::collections::BTreeSet::new();
                     for pool in [self, other] {
                         if let Some(identity) = pool.identities.get(group) {
-                            components.extend(identity.split('|'));
+                            stages.extend(identity.split('|'));
                         }
                     }
-                    components.into_iter().collect::<Vec<_>>().join("|")
+                    stages.into_iter().collect::<Vec<_>>().join("|")
                 })
                 .collect(),
             // Stages whose planes split alike give storage back together;
@@ -393,10 +393,10 @@ impl PrefixCacheInfo {
     }
 }
 
-/// The tensor results one placed component declares.
+/// The tensor results one placed stage declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ComponentInfo {
-    /// Component name; `MainProcessInfo::validate` requires it to be non-empty and
+pub struct StageInfo {
+    /// Stage name; `MainProcessInfo::validate` requires it to be non-empty and
     /// unique within one worker.
     pub name: String,
     /// Named tensor results declared by the loaded computation. Their order
@@ -408,7 +408,7 @@ pub struct ComponentInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputInfo {
     /// Result name; `OutputInfo::validate` requires it to be non-empty and
-    /// `MainProcessInfo::validate` unique within its component.
+    /// `MainProcessInfo::validate` unique within its stage.
     pub name: String,
     /// Element type of the result tensor.
     pub dtype: DType,
@@ -488,11 +488,11 @@ impl MainProcessEndpoint {
 /// The denoiser fixes its schedule, and with it every request's step count.
 /// What else bounds a request (its sizes, frame counts and reference limits)
 /// is the model family's, and reaches request processing in `description`
-/// for the family's processor to plan requests with.
+/// for the family's processor to prepare requests with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoDenoiserInfo {
     /// Whether the denoiser takes conditions: a conditioned request's media is
-    /// read on a host component and encoded before denoising.
+    /// read on a host stage and encoded before denoising.
     pub takes_conditions: bool,
     /// The network evaluations of the fixed schedule: the step count of
     /// every request.
@@ -553,12 +553,12 @@ impl ImageCapacity {
 /// [`MainProcessInfo::validate`] checks only internal consistency; the rank runs it
 /// on the report it builds, and the engine takes the report as sent. Launch
 /// values
-/// (world size, devices, transfer mechanisms, queue depth and component
+/// (world size, devices, transfer mechanisms, queue depth and stage
 /// layout) are the engine's and are not reported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MainProcessInfo {
     /// Model-declared finite terminal-media computation, when supported.
-    pub media_components: std::collections::BTreeMap<MediaCall, String>,
+    pub media_stages: std::collections::BTreeMap<MediaCall, String>,
     /// What the deployment's video denoiser serves, when the model has one.
     pub video_denoiser: Option<VideoDenoiserInfo>,
     /// The `[height, width]` image sizes this rank's latent encoder
@@ -583,8 +583,8 @@ pub struct MainProcessInfo {
     /// domain; a descriptor handle reaches only the host that created it, so
     /// this is what decides whether a transfer edge may cross hosts.
     pub fabric_handles: bool,
-    /// The tensor results of each component the rank places.
-    pub components: Vec<ComponentInfo>,
+    /// The tensor results of each stage the rank places.
+    pub stages: Vec<StageInfo>,
     /// Call families accepted by the worker.
     pub supported_calls: Vec<CallKind>,
     /// Maximum calls in one batch. Under CUDA graphs the rank captured a text
@@ -592,7 +592,7 @@ pub struct MainProcessInfo {
     pub max_batch_calls: u32,
     /// Maximum text tokens represented in one batch.
     pub max_batch_tokens: u32,
-    /// Number of resident request slots.
+    /// Number of running request slots.
     pub request_slots: u32,
     /// Paged cache geometry when autoregressive work is supported.
     pub prefix_cache: Option<PrefixCacheInfo>,
@@ -612,7 +612,7 @@ pub struct MainProcessInfo {
     pub image_encoders: Box<std::collections::BTreeMap<String, ImageEncoderOutput>>,
     /// Bytes of the persistent buffer pool this rank backs, which the engine
     /// places this rank's buffers in: on a media rank the products of the
-    /// components it executes and of the components that read them.
+    /// stages it executes and of the stages that read them.
     pub buffer_pool_bytes: u64,
     /// Maximum simultaneously retained encoder feature products.
     pub encoder_cache_entries: u32,
@@ -639,30 +639,30 @@ impl MainProcessInfo {
     pub fn validate(&self) -> ValidationResult<()> {
         self.endpoint.validate()?;
 
-        // Components: unique names, each with unique valid outputs.
+        // Stages: unique names, each with unique valid outputs.
         let mut names = HashSet::new();
-        for component in &self.components {
+        for stage in &self.stages {
             ensure_valid!(
-                !component.name.is_empty() && names.insert(&component.name),
-                "worker repeats or omits a component name"
+                !stage.name.is_empty() && names.insert(&stage.name),
+                "worker repeats or omits a stage name"
             );
             let mut outputs = HashSet::new();
-            for output in &component.outputs {
+            for output in &stage.outputs {
                 output.validate()?;
                 ensure_valid!(
                     outputs.insert(&output.name),
-                    "component repeats a tensor result name"
+                    "stage repeats a tensor result name"
                 );
             }
         }
 
-        // A collective-only participant owns no request components or prefix cache.
+        // A collective-only participant owns no request stages or prefix cache.
         // It remains addressable for progress, failure and shutdown.
         ensure_valid!(
             !self.supported_calls.is_empty()
-                || (self.components.is_empty()
+                || (self.stages.is_empty()
                     && self.prefix_cache.is_none()
-                    && self.media_components.is_empty()),
+                    && self.media_stages.is_empty()),
             "a worker without call kinds must own no request call"
         );
         ensure_valid!(
@@ -674,17 +674,17 @@ impl MainProcessInfo {
                 == self.supported_calls.len(),
             "worker info repeats a call kind"
         );
-        // A worker names the component serving each media call it implements.
+        // A worker names the stage serving each media call it implements.
         // Here every named call must be one it advertises, with a non-empty
-        // component name. The video graph may span workers, a model worker
+        // stage name. The video graph may span workers, a model worker
         // decoding and a host worker encoding and muxing, so its completeness
         // and its diffusion step count are the worker's checks over every
         // worker.
         ensure_valid!(
-            self.media_components.iter().all(|(call, component)| {
-                !component.is_empty() && self.supported_calls.contains(&CallKind::Media(*call))
+            self.media_stages.iter().all(|(call, stage)| {
+                !stage.is_empty() && self.supported_calls.contains(&CallKind::Media(*call))
             }),
-            "a media call names no component this worker serves"
+            "a media call names no stage this worker serves"
         );
         if let Some(capacity) = &self.image_capacity {
             capacity.validate()?;
@@ -728,7 +728,7 @@ impl Default for MainProcessInfo {
     /// Returns a valid single-rank autoregressive worker description.
     fn default() -> Self {
         Self {
-            media_components: Default::default(),
+            media_stages: Default::default(),
             video_denoiser: None,
             captured_latents: None,
             image_capacity: None,
@@ -739,7 +739,7 @@ impl Default for MainProcessInfo {
                 address_space: "simulation".into(),
                 incarnation: "simulation".into(),
             },
-            components: Vec::new(),
+            stages: Vec::new(),
             supported_calls: vec![
                 CallKind::Forward(ForwardMode::Prefill),
                 CallKind::Forward(ForwardMode::Decode),

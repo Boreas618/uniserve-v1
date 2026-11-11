@@ -217,7 +217,7 @@ impl RequestAllocations {
 /// Storage one media request reserves at admission in the per-worker address
 /// spaces of `Storage::media_storage`.
 pub(crate) struct MediaAllocations {
-    /// Declared results keyed by component name and output index.
+    /// Declared results keyed by stage name and output index.
     pub(crate) tensors: HashMap<(String, u32), MediaTensorAllocation>,
     /// The request's row on each worker of its route.
     pub(crate) request_slots: HashMap<crate::WorkerGroupId, RequestSlot>,
@@ -238,35 +238,35 @@ pub(crate) struct MediaTensorAllocation {
 /// identity keeps those physical addresses distinct.
 ///
 /// Request rows are one address space for the group. Each rank has its own
-/// buffer pool, holding only the results of the components it executes and of
-/// the components that read them, so the pool the engine allocates from is
+/// buffer pool, holding only the results of the stages it executes and of
+/// the stages that read them, so the pool the engine allocates from is
 /// the pool the rank backs.
 pub(crate) struct MediaStorage {
     pub(crate) requests: RequestPool,
     /// The buffer address space of each rank, in rank order.
     pub(crate) buffers: Vec<BufferPool>,
-    /// The ranks that back the declared results of each component.
+    /// The ranks that back the declared results of each stage.
     holders: HashMap<String, Vec<u32>>,
 }
 
 impl MediaStorage {
     /// Builds the address spaces of a group whose ranks back `rank_bytes`.
     ///
-    /// A rank backs a component's results when it is one of the component's
-    /// ranks in `components`, the group's layout, or one of a reading
-    /// component's, where readers follow the video
+    /// A rank backs a stage's results when it is one of the stage's
+    /// ranks in `stages`, the group's layout, or one of a reading
+    /// stage's, where readers follow the video
     /// graph's persistent product edges (`MediaCall::readers`) through the
     /// deployment's `routing`; the worker sizes each rank's pool by the same
-    /// rule. A group placed with no components backs every result on every
+    /// rule. A group placed with no stages backs every result on every
     /// rank.
     pub(crate) fn new(
         request_slots: usize,
         rank_bytes: &[u64],
-        components: &BTreeMap<String, proto::config::BlockConfig>,
+        stages: &BTreeMap<String, proto::config::BlockConfig>,
         routing: &BTreeMap<MediaCall, String>,
     ) -> Self {
         let ranks = rank_bytes.len() as u32;
-        let placed = components
+        let placed = stages
             .iter()
             .map(|(name, config)| (name.as_str(), &config.ranks))
             .collect::<HashMap<_, _>>();
@@ -276,17 +276,17 @@ impl MediaStorage {
             .chain(placed.keys().copied())
             .map(|name| {
                 let mut holding = BTreeSet::new();
-                if components.is_empty() {
+                if stages.is_empty() {
                     holding.extend(0..ranks);
                 }
                 let readers = routing
                     .iter()
-                    .filter(|(_, component)| component.as_str() == name)
+                    .filter(|(_, stage)| stage.as_str() == name)
                     .flat_map(|(call, _)| call.readers())
-                    .filter(|reader| !reader.reads_resident_state())
+                    .filter(|reader| !reader.reads_device_state())
                     .filter_map(|reader| routing.get(reader).map(String::as_str));
-                for component in std::iter::once(name).chain(readers) {
-                    if let Some(members) = placed.get(component) {
+                for stage in std::iter::once(name).chain(readers) {
+                    if let Some(members) = placed.get(stage) {
                         holding.extend(members.iter().map(|rank| *rank as u32));
                     }
                 }
@@ -310,10 +310,10 @@ impl MediaStorage {
         }
     }
 
-    /// The ranks that back the declared results of `component`, in rank
-    /// order; none for a component no route or dispatch names.
-    pub(crate) fn holders(&self, component: &str) -> &[u32] {
-        self.holders.get(component).map_or(&[], Vec::as_slice)
+    /// The ranks that back the declared results of `stage`, in rank
+    /// order; none for a stage no route or dispatch names.
+    pub(crate) fn holders(&self, stage: &str) -> &[u32] {
+        self.holders.get(stage).map_or(&[], Vec::as_slice)
     }
 }
 

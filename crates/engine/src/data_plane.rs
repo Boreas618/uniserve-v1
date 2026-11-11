@@ -208,7 +208,7 @@ fn answer<O: memory::Operation + std::fmt::Debug>(
     message: &O,
     replies: Vec<O::Reply>,
 ) -> Result<Vec<String>> {
-    memory::answers(&replies).map_err(|error| rejected(&format!("{message:?}"), error))
+    memory::responses(&replies).map_err(|error| rejected(&format!("{message:?}"), error))
 }
 
 /// The digest a set of weights is known by: what roots the prefix hash chains of the pages computed
@@ -1085,7 +1085,7 @@ impl DataPlane {
             return Err(Error::Interface(refusal.into()));
         }
         let replies = self.rebind(planned)?;
-        memory::answers(&replies).map_err(|error| rejected("an expert redistribution", error))
+        memory::responses(&replies).map_err(|error| rejected("an expert redistribution", error))
     }
 
     /// Publishes the LoRA adapter `payload` names into its slot, on every rank (§7.6).

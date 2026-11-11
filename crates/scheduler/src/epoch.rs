@@ -9,7 +9,7 @@
 //!   denoising step boundary once its trajectory is stored (`preemption`),
 //!   and once nothing runs, offloads the pages it reserved for the host KV
 //!   cache and executes nothing more.
-//!   It answers with its cache index: every published page's public and
+//!   It responds with its cache index: every published page's public and
 //!   private continuation aliases with their units, which the successor
 //!   reads from the planes it maps read-only without duplicating the bytes.
 //!   When the successor maps its cache, it lends it the segments no
@@ -174,7 +174,7 @@ impl ParkedCache {
 
 /// A park waiting for the scheduler's requests to end.
 pub(super) struct Parking {
-    answer: crossbeam_channel::Sender<Result<ParkedCache, String>>,
+    response: crossbeam_channel::Sender<Result<ParkedCache, String>>,
     /// Whether the epoch that succeeds this one maps its cache, and borrows
     /// the segments it lends.
     lend: bool,
@@ -185,17 +185,17 @@ pub(super) struct Parking {
 }
 
 impl Scheduler {
-    /// Parks the scheduler (see the module documentation), answering with
+    /// Parks the scheduler (see the module documentation), responding with
     /// its prefix cache index once it is parked; when it `lend`s, the epoch
     /// that succeeds it maps its cache and borrows the segments it lends
     /// ([`Self::lend_cache`]).
     pub(super) fn park(
         &mut self,
-        answer: crossbeam_channel::Sender<Result<ParkedCache, String>>,
+        response: crossbeam_channel::Sender<Result<ParkedCache, String>>,
         lend: bool,
     ) {
         if matches!(self.lifecycle, crate::Lifecycle::Parked) {
-            let _ = answer.send(Ok(ParkedCache {
+            let _ = response.send(Ok(ParkedCache {
                 pages: self.index(),
                 lent: self
                     .storage
@@ -207,7 +207,7 @@ impl Scheduler {
             return;
         }
         if matches!(self.lifecycle, crate::Lifecycle::Parking(_)) {
-            let _ = answer.send(Err("the scheduler parks already".to_owned()));
+            let _ = response.send(Err("the scheduler parks already".to_owned()));
             return;
         }
         // What the requests that leave as migratable hold, before they let
@@ -237,7 +237,7 @@ impl Scheduler {
         // trajectories stored for the epoch that serves next.
         self.drain(MigrationCause::Drain);
         self.lifecycle = crate::Lifecycle::Parking(Parking {
-            answer,
+            response,
             lend,
             held_units: migrating.iter().map(|(units, _)| units).sum(),
             requests: migrating.len() as u32,
@@ -314,7 +314,7 @@ impl Scheduler {
             lent_units = lent.iter().map(|units| units.len()).sum::<usize>(),
             "the scheduler parked"
         );
-        let _ = parking.answer.send(Ok(ParkedCache {
+        let _ = parking.response.send(Ok(ParkedCache {
             pages: index,
             lent,
             held_units: parking.held_units,

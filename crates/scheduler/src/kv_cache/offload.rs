@@ -42,7 +42,7 @@
 //!   waits for the reads at most [`prefetch_wait`], then pins the pages that
 //!   arrived as ordinary host pages, loads them as above, and computes the
 //!   rest; a read past the wait is cancelled. A peer that cannot be reached
-//!   or answers with an error is skipped for that admission. A failure never
+//!   or responds with an error is skipped for that admission. A failure never
 //!   fails the request.
 //! - **Converted peer loads.** A rank whose pool admits converted loads
 //!   (`ipc::PoolConversion`: an FP8 pool, from its dense compute dtype)
@@ -71,7 +71,7 @@
 //!   commits them, or aborts them when the batch failed.
 //! - **Evictions.** An epoch change evicts idle cached pages from the device
 //!   once their copies commit (`specs/online-operations.md` §6.5, steps 1
-//!   and 5; [`OffloadKind::Evicted`]). A pool answers `Full` for a page it
+//!   and 5; [`OffloadKind::Evicted`]). A pool returns `Full` for a page it
 //!   has no slot for: every slot is reserved, pinned or uploading, as when
 //!   the host's storage held a pool smaller than the pages the device
 //!   evicts. Without a KV storage, such a page is evicted uncopied, and a
@@ -105,8 +105,8 @@
 //! A rank's pool is reached through its host's Storage Server: on the
 //! engine's host through the server's socket, on another host over the TCP
 //! address the rank reports for it. Requests to the servers never block
-//! the scheduler: they are submitted, and their answers are taken by
-//! [`KvOffloadManager::poll`] at every step; while answers are awaited, a
+//! the scheduler: they are submitted, and their responses are taken by
+//! [`KvOffloadManager::poll`] at every step; while responds are awaited, a
 //! parked scheduler wakes after a millisecond to take them.
 
 use std::collections::{BTreeMap, HashMap};
@@ -303,7 +303,7 @@ impl GroupCachePools {
     }
 }
 
-/// What the store asked the pools for, whose answer it reads.
+/// What the store asked the pools for, whose response it reads.
 enum Asked {
     /// Admission pins of `request`'s pages of `group` in `rank`'s pool.
     Pin {
@@ -363,13 +363,13 @@ enum Stage {
     /// not deepen the hit with.
     PeerPinning,
     /// Slots for the pages the peers hold are being reserved; `awaiting`
-    /// reservations have not answered.
+    /// reservations have not responded.
     PeerReserving { awaiting: usize },
     /// The rank's Transfer Servers read the peers' pages; admission waits
     /// for them until `deadline`.
     Reading { deadline: Instant },
     /// The prefetched pages are being pinned; `awaiting` pins have not
-    /// answered.
+    /// responded.
     Repinning { awaiting: usize },
     /// The hit is known.
     Settled,
@@ -382,21 +382,21 @@ struct GroupPins {
     first: usize,
     /// The keys of the group's pages from `first` on.
     keys: Vec<Key>,
-    /// Each rank's slots of the keys, once its pin is answered.
+    /// Each rank's slots of the keys, once its pin is responded.
     slots: Vec<Option<Vec<Option<u64>>>>,
-    /// Each rank's levels of the keys, once its lookup is answered; empty
+    /// Each rank's levels of the keys, once its lookup is responded; empty
     /// for keys not looked up.
     levels: Vec<Option<Vec<PageLevel>>>,
     /// The positions of the keys being prefetched, pinned again once they
     /// arrive.
     fetching: Vec<usize>,
-    /// Each peer's answer to the pins of the keys there, once answered: the
+    /// Each peer's response to the pins of the keys there, once responded: the
     /// pools that hold some of them. Empty until the peers are asked, and
     /// emptied once the pins pass to the reads.
     peers: Vec<Option<Vec<PeerPool>>>,
     /// For each rank, where a peer holds each key in a pool of the rank's
     /// page shape, or of its conversion source's; empty until the peers
-    /// answered.
+    /// responded.
     remote: Vec<Vec<Option<RemoteSlot>>>,
     /// For each rank, the staging slot holding each key's page once a
     /// converted read of it completed.
@@ -503,7 +503,7 @@ impl GroupPins {
             .collect();
     }
 
-    fn answered(&self) -> bool {
+    fn responded(&self) -> bool {
         self.slots.iter().all(Option::is_some) && self.levels.iter().all(Option::is_some)
     }
 }
@@ -531,7 +531,7 @@ struct Pins {
 
 /// One peer read in flight: what it reads, the request whose admission
 /// waits for it (`None` once that admission moved on), and its task once
-/// the local server answered.
+/// the local server responded.
 struct Read {
     request: Option<RequestId>,
     read: PoolRead,
@@ -608,7 +608,7 @@ struct Reservation {
     /// For pages of an eviction asking again: when their pool last granted
     /// the eviction a slot.
     progressed: Option<Instant>,
-    answered: usize,
+    responded: usize,
 }
 
 /// Pages of an eviction that one rank's pool had no slot for, waiting for
@@ -764,7 +764,7 @@ impl KvOffloadManager {
         match self.servers.call(client, &request)? {
             Reply::HostCache { tokens } => Ok(tokens),
             other => {
-                anyhow::bail!("the Storage Server answered a host KV cache size with {other:?}")
+                anyhow::bail!("the Storage Server responded to a host KV cache size with {other:?}")
             }
         }
     }
@@ -907,7 +907,7 @@ impl KvOffloadManager {
         self.servers.submit(client, request, purpose)
     }
 
-    /// The host KV cache's answer for admitting `request` to `worker`, whose
+    /// The host KV cache's response for admitting `request` to `worker`, whose
     /// device cache matched its first `device` tokens and which may reuse at
     /// most `limit`: `None` while pins, lookups or prefetches are in flight,
     /// else the boundary of the hit (at least `device`), which the caller
@@ -1059,11 +1059,11 @@ impl KvOffloadManager {
                 Some(Self::boundary(&pools, pins, Reach::Pinned))
             }
             Stage::PeerPinning => {
-                let answered = pins
+                let responded = pins
                     .groups
                     .iter()
                     .all(|group| group.peers.iter().all(Option::is_some));
-                if !answered {
+                if !responded {
                     return None;
                 }
                 self.read_peers(request, &pools)
@@ -1090,7 +1090,7 @@ impl KvOffloadManager {
                 self.repin(request, &pools)
             }
             Stage::Pinning => {
-                if !pins.groups.iter().all(GroupPins::answered) {
+                if !pins.groups.iter().all(GroupPins::responded) {
                     return None;
                 }
                 let pinned = Self::boundary(&pools, pins, Reach::Pinned);
@@ -1186,7 +1186,7 @@ impl KvOffloadManager {
     }
 
     /// Pin `request`'s pages that were fetched or read into the pools since
-    /// its pins were answered, then settle its hit.
+    /// its pins were responded, then settle its hit.
     fn repin(&mut self, request: RequestId, pools: &GroupCachePools) -> Option<usize> {
         let pins = self.pins.get(&request)?;
         let mut repins = Vec::new();
@@ -1268,7 +1268,7 @@ impl KvOffloadManager {
             layouts.dedup();
             asks.push((index, layouts, pins_of.keys.clone()));
         }
-        let mut answered: Vec<Vec<Option<Vec<PeerPool>>>> =
+        let mut responded: Vec<Vec<Option<Vec<PeerPool>>>> =
             vec![vec![Some(Vec::new()); clients.len()]; asks.len()];
         for (group, layouts, keys) in asks {
             for (peer, client) in clients.iter().enumerate() {
@@ -1287,14 +1287,14 @@ impl KvOffloadManager {
                     .servers
                     .peer_pin(client, layouts.clone(), keys.clone(), purpose)
                 {
-                    answered[group][peer] = None;
+                    responded[group][peer] = None;
                 }
             }
         }
         let Some(pins) = self.pins.get_mut(&request) else {
             return false;
         };
-        for (pins_of, peers) in pins.groups.iter_mut().zip(answered) {
+        for (pins_of, peers) in pins.groups.iter_mut().zip(responded) {
             pins_of.peers = peers;
         }
         pins.peers = clients;
@@ -1303,7 +1303,7 @@ impl KvOffloadManager {
         true
     }
 
-    /// The peers answered `request`'s pins: when the pages they hold deepen
+    /// The peers responded `request`'s pins: when the pages they hold deepen
     /// the hit by at least [`PREFETCH_MIN_TOKENS`], reserve slots for the
     /// pages the deeper boundary needs in each rank's pool; unpin at the
     /// peers every page that is not read.
@@ -1443,7 +1443,7 @@ impl KvOffloadManager {
 
     /// Read `rank`'s pages of `group` that a peer holds in the rank's
     /// conversion source shape into the staging slots `pages` took (each
-    /// page's position, source and slot), one task per peer pool. Answers
+    /// page's position, source and slot), one task per peer pool. Returns
     /// the reads submitted; the slots of a read that cannot be submitted are
     /// free again and its pins end.
     fn read_staged(
@@ -1569,7 +1569,7 @@ impl KvOffloadManager {
         }
     }
 
-    /// `pool` answered the reservation of `request`'s peer pages `keys`
+    /// `pool` responded to the reservation of `request`'s peer pages `keys`
     /// with `slots`: read the reserved ones from their `sources`, one task
     /// per peer pool, and unpin at the peers those it gave no slot. When the
     /// admission left meanwhile, the reserved slots are aborted and the peer
@@ -1846,7 +1846,7 @@ impl KvOffloadManager {
         let Some(pools) = self.workers.get(&pins.worker).cloned() else {
             return;
         };
-        // Pins still in flight are released when their answers arrive, for
+        // Pins still in flight are released when their responses arrive, for
         // exactly the pages they pinned: a pool counts pins per reader, so an
         // unpin of a page this request never pinned would end another
         // request's pin.
@@ -1918,7 +1918,7 @@ impl KvOffloadManager {
                     .collect();
                 self.free_staged(&pins.worker, index, rank, staged);
             }
-            // Pins the peers answered and no read took yet end too.
+            // Pins the peers responded and no read took yet end too.
             for (peer, pools_of) in pins_of.peers.iter().enumerate() {
                 let Some(Some(client)) = pins.peers.get(peer) else {
                     continue;
@@ -1932,7 +1932,7 @@ impl KvOffloadManager {
         self.detach_reads(request);
     }
 
-    /// The keys whose pages `slots`, a pin's answer for `keys`, pinned.
+    /// The keys whose pages `slots`, a pin's response for `keys`, pinned.
     fn pinned(keys: &[Key], slots: Option<&[Option<u64>]>) -> Vec<Key> {
         keys.iter()
             .zip(slots.unwrap_or_default())
@@ -2080,14 +2080,14 @@ impl KvOffloadManager {
     }
 
     /// The store's Storage Server connections, which the scheduler waits on
-    /// beside its wake: an answer or an event ends the wait.
+    /// beside its wake: a response or an event ends the wait.
     pub(crate) fn descriptors(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
         self.servers.descriptors()
     }
 
     /// The next moment the cache acts without an arrival: a prefetch or a
     /// peer read whose patience ends, or the next time the pages of an
-    /// eviction ask their pools again. `None` when it only waits for answers.
+    /// eviction ask their pools again. `None` when it only waits for responses.
     pub(crate) fn deadline(&self) -> Option<Instant> {
         let now = Instant::now();
         let patience = self.pins.values().filter_map(|pins| match pins.stage {
@@ -2156,7 +2156,7 @@ impl KvOffloadManager {
                     window: matches!(kind, OffloadKind::Window { .. }),
                     evicted: matches!(kind, OffloadKind::Evicted),
                     progressed: None,
-                    answered: cache.ranks.len() - submitted,
+                    responded: cache.ranks.len() - submitted,
                 },
             );
         }
@@ -2164,7 +2164,7 @@ impl KvOffloadManager {
 
     /// Whether published pages are still on their way to the host KV cache:
     /// slots being reserved or waited for, offloads waiting for or carried
-    /// by a batch, or their commits unanswered.
+    /// by a batch, or their commits unresolved.
     pub(crate) fn offloading(&self) -> bool {
         !self.reservations.is_empty()
             || !self.deferred.is_empty()
@@ -2263,11 +2263,11 @@ impl KvOffloadManager {
         }
     }
 
-    /// Take the servers' answers and events. Returns whether an admission
+    /// Take the servers' responds and events. Returns whether an admission
     /// moved on, which may let the waiting queue's head proceed.
     pub(crate) fn poll(&mut self) -> bool {
         let mut admissions = false;
-        let (events, answers) = self.servers.take();
+        let (events, responses) = self.servers.take();
         for (client, event) in events {
             if let Event::Transferred { task, end, .. } = event {
                 if let Some(read) = self.tasks.get(&(client, task)).copied() {
@@ -2298,7 +2298,7 @@ impl KvOffloadManager {
             }
             _ => false,
         });
-        for (purpose, reply) in answers {
+        for (purpose, reply) in responses {
             match (purpose, reply) {
                 (
                     Asked::Pin {
@@ -2489,8 +2489,8 @@ impl KvOffloadManager {
                 offload: id,
                 rank: deferred.rank,
             };
-            // Only this rank answers: the reservation is done with its
-            // answer.
+            // Only this rank responses: the reservation is done with its
+            // response.
             if self.servers.reserve(
                 pool.client,
                 pool.pool,
@@ -2509,14 +2509,14 @@ impl KvOffloadManager {
                         window: false,
                         evicted: true,
                         progressed: Some(deferred.progressed),
-                        answered: ranks - 1,
+                        responded: ranks - 1,
                     },
                 );
             }
         }
     }
 
-    /// `rank` answered reservation `id` with `slots`: its reserved pages
+    /// `rank` responded reservation `id` with `slots`: its reserved pages
     /// wait for a batch. A window whose pages the pool could not all store
     /// is aborted on that rank: a window missing one page is useless. Pages
     /// of an eviction the pool had no slot for wait for one when a KV
@@ -2601,12 +2601,12 @@ impl KvOffloadManager {
                 }
             }
         }
-        reservation.answered += 1;
+        reservation.responded += 1;
         let done = self
             .workers
             .get(&reservation.worker)
             .and_then(|pools| pools.groups.get(reservation.group))
-            .is_none_or(|group| reservation.answered >= group.ranks.len());
+            .is_none_or(|group| reservation.responded >= group.ranks.len());
         if done {
             self.reservations.remove(&id);
         }
@@ -2916,7 +2916,7 @@ mod tests {
         while !done(kv_offload) {
             assert!(
                 Instant::now() < deadline,
-                "the host KV cache did not answer"
+                "the host KV cache did not respond"
             );
             kv_offload.poll();
             std::thread::sleep(Duration::from_millis(1));
@@ -2972,7 +2972,7 @@ mod tests {
     }
 
     /// A peer host's pages that its own host's Transfer Server cannot read
-    /// are computed: admission answers the device match, and the pins at
+    /// are computed: admission responds to the device match, and the pins at
     /// the peer and the slots reserved for the reads end.
     #[test]
     fn a_peer_hit_that_cannot_be_read_is_computed_and_its_pins_end() {
@@ -3076,8 +3076,8 @@ mod tests {
         assert_eq!(listed(&peer.socket, peer_pool).ready, 8);
     }
 
-    /// An admission that leaves before its pins are answered holds none of
-    /// the pages they pin once the answers arrive, and the pages stay.
+    /// An admission that leaves before its pins get their responses holds none of
+    /// the pages they pin once the responses arrive, and the pages stay.
     #[test]
     fn pins_answered_after_their_admission_left_are_released() {
         let server = Running::start();
@@ -3132,7 +3132,7 @@ mod tests {
         );
         kv_offload.release(RequestId(1));
 
-        // Every request on the connection is answered in order, the unpins
+        // Every request on the connection gets its response in order, the unpins
         // of what the pins took included.
         poll_until(&mut kv_offload, |kv_offload| !kv_offload.servers.waiting());
         let pool = listed(&server.socket, pools[0]);
@@ -3305,7 +3305,7 @@ mod tests {
         kv_offload.completed(1, true);
         poll_until(&mut kv_offload, |kv_offload| !kv_offload.offloading());
 
-        // Every boundary past 384 lacks its window: the walk passes them.
+        // Every boundary past 384 lacks its window: the search passes them.
         let mut boundary = None;
         poll_until(&mut kv_offload, |kv_offload| {
             boundary = kv_offload.admission(RequestId(2), &text, &keys, 0, 640, 0);

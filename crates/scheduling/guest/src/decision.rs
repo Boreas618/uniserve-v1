@@ -12,11 +12,11 @@ use crate::ids::{EncodingId, PageId, PhaseId, RequestId};
 /// empty entry.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DispatchOutput {
-    /// Queued requests to admit, in order. The mechanism admits each; the
-    /// first one it cannot place and the ones after it stay queued.
+    /// Waiting requests to admit, in order. The mechanism admits each; the
+    /// first one it cannot place and the ones after it stay waiting.
     #[serde(default)]
     pub admit: Vec<RequestId>,
-    /// Queued requests to reject as over capacity.
+    /// Waiting requests to reject as over capacity.
     #[serde(default)]
     pub reject: Vec<RequestId>,
     /// This step's work, in the order it runs: which request, which phase, how

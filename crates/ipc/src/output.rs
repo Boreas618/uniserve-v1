@@ -29,7 +29,7 @@ pub enum CallStatus {
 pub enum ErrorCode {
     /// The rank does not serve the call's kind.
     UnsupportedCall,
-    /// A message, a call or a launch value breaks the protocol contract.
+    /// A message, a call or a launch value breaks the protocol.
     InvalidDescriptor,
     /// The deployment asks for a rank layout, a device or a kernel the rank
     /// cannot provide.

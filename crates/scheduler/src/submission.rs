@@ -10,7 +10,7 @@
 //! nothing to do blocks in [`Submissions::wait`] until something arrives: a
 //! command or a reader that freed room in an event channel
 //! ([`Submissions::waker`]), a submission that settled on its device, or an
-//! answer on a Storage Server connection. Nothing polls for any of them: the
+//! response on a Storage Server connection. Nothing polls for any of them: the
 //! wake is an eventfd, waited on beside the connections in one `poll(2)`.
 
 use std::collections::{BTreeMap, HashMap};
@@ -68,9 +68,9 @@ pub struct Submissions {
 
 /// The state of the shadow submissions an update's pass asked for.
 ///
-/// The pass is answered by the comparison's verdict, not by the fact that the
+/// The pass gets its response by the comparison's verdict, not by the fact that the
 /// batch was submitted: a paired forward that failed on the device is the
-/// update's failure, and answering earlier let a wrong kernel reach the
+/// update's failure, and responding earlier let a wrong kernel reach the
 /// switch.
 pub(super) enum ShadowStatus {
     /// At least one shadow batch has not finished.
@@ -130,7 +130,7 @@ impl Submissions {
     }
 
     /// Blocks until something arrived since the last wait: a wake, or an
-    /// answer or event on one of `connections`, the scheduler's Storage
+    /// response or event on one of `connections`, the scheduler's Storage
     /// Server connections. `deadline` is a bound of the scheduler's own that
     /// passes without any arrival (a starvation bound, a wait for a
     /// predecessor's index, a prefetch's patience, a drain's silence); with
@@ -189,7 +189,7 @@ impl Submissions {
     }
 
     /// Takes a slot for `batch` on every device of `pools` it runs on, when
-    /// each has one free, and answers whether it did. A batch that took its
+    /// each has one free, and responds whether it did. A batch that took its
     /// slots is submitted next; one that did not waits for a completion.
     ///
     /// # Errors
@@ -315,7 +315,7 @@ impl Submissions {
             .batches
             .shadow(batch)
             .map_err(|error| anyhow::anyhow!(error))?;
-        // The update's pass is answered at the step after its verdict.
+        // The update's pass gets its response at the step after its verdict.
         submission.on_settled(&self.settled());
         self.shadows.push(submission);
         self.shadows
@@ -324,7 +324,7 @@ impl Submissions {
     }
 
     /// The state of this pass's shadow submissions, reading every one that has
-    /// finished and answering the first failure.
+    /// finished and responding to the first failure.
     ///
     /// A failure carries the device thread's label beside its error, so the
     /// update states which paired forward of which operator and bucket left
@@ -364,7 +364,7 @@ impl Submissions {
     /// states the extent its kernels were captured for and only the runner
     /// knows it: a bucket captured for one resolution serves no other, and
     /// deriving the extent in the scheduler would be a second statement of
-    /// the runner's buckets. `None` is the answer for a computation no device
+    /// the runner's buckets. `None` is the response for a computation no device
     /// of this rank serves.
     pub(super) fn media(
         &self,
@@ -414,7 +414,7 @@ impl Submissions {
     /// Performs the storage `operation` on every rank and returns what each
     /// reported, by pool.
     ///
-    /// This process's data path answers for its ranks in rank order. Every
+    /// This process's data path responds for its ranks in rank order. Every
     /// group of a scheduler indexes the one unit space its ranks agreed their
     /// cache over, so each group states what every rank reports.
     pub(super) fn operate_groups(
@@ -602,7 +602,8 @@ mod tests {
         let mut pool = testkit::pool("gpu");
         pool.layout.queue_depth = 2;
         let fake = Arc::new(
-            testkit::FakeBatches::new(vec![pool]).answering_media(Arc::new(testkit::Media::new())),
+            testkit::FakeBatches::new(vec![pool])
+                .with_media_outputs(Arc::new(testkit::Media::new())),
         );
         fake.hold();
         let mut submissions =

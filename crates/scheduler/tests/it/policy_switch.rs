@@ -1,14 +1,14 @@
 //! The program-layer switch of design §7.3 through the scheduler's commands: a
 //! program is precopied on a blocking thread while the serving policy keeps
-//! answering, the switchover puts it in at a batch boundary, the commit keeps
+//! responding, the switchover puts it in at a batch boundary, the commit keeps
 //! the policy it replaced, and a revert instantiates that one again on the
 //! state the scheduler holds.
 //!
 //! The programs are toy policy modules written as WebAssembly text and built
 //! here, so the switch is exercised without a compiled policy package: each
-//! answers the pipe's calls with the interface's own JSON, and the answers
+//! responds to the pipe's calls with the interface's own JSON, and the responses
 //! differ per program so that a switch is observable through what the commands
-//! answer.
+//! response.
 
 use std::sync::Arc;
 use std::thread;
@@ -24,16 +24,16 @@ use scheduling::guest::wire::Call;
 use crate::support;
 use crate::support::toy::{Toy, toy_module};
 
-/// How long a command answer may take: a precopy loads and instantiates a
+/// How long a command response may take: a precopy loads and instantiates a
 /// module on its own thread.
-const ANSWER: Duration = Duration::from_secs(30);
+const RESPONSE: Duration = Duration::from_secs(30);
 
 /// A toy policy program: limits that fit what the fake's pool was started
 /// for, and an empty output.
 ///
 /// An empty output asks for nothing, so a scheduler that serves under the toy
 /// makes no decision this test has to arrange state for; what the test reads is
-/// which program the scheduler serves, from the commands' answers.
+/// which program the scheduler serves, from the commands' responses.
 fn toy() -> Vec<u8> {
     toy_module(&Toy {
         limits: fitting(),
@@ -92,7 +92,7 @@ impl Epoch {
         }
     }
 
-    /// Precopy `program` from `wasm`, and answer the result.
+    /// Precopy `program` from `wasm`, and respond to the result.
     fn precopy(&self, backend: &str, revision: u32, wasm: Vec<u8>) -> Result<(), String> {
         let program = PolicyProgram {
             backend: backend.to_owned(),
@@ -101,34 +101,34 @@ impl Epoch {
             stated: Default::default(),
         };
         let source: Arc<dyn PolicySource + Send + Sync> = Arc::new(PolicyBytes::new(wasm));
-        answer(self.handle.precopy_policy(program, source))
+        response(self.handle.precopy_policy(program, source))
     }
 
-    /// The switchover's answer: the step it applied at.
+    /// The switchover's response: the step it applied at.
     fn switch_over(&self) -> Result<StageApplied, String> {
-        answer(self.handle.stage(Stage::Switchover))
+        response(self.handle.stage(Stage::Switchover))
     }
 
-    /// The revert's answer, as the caller that does not use the step reads it.
+    /// The revert's response, as the caller that does not use the step reads it.
     fn revert(&self) -> Result<(), String> {
-        answer(self.handle.revert_policy())
+        response(self.handle.revert_policy())
     }
 
     /// The step the scheduler reached, as it reports it.
     fn step(&self) -> u64 {
         self.handle
             .progress()
-            .recv_timeout(ANSWER)
+            .recv_timeout(RESPONSE)
             .expect("the scheduler reports its step")
             .step
     }
 }
 
-/// Blocks until a command answers, and answers its result.
-fn answer<T>(receiver: Receiver<Result<T, String>>) -> Result<T, String> {
-    match receiver.recv_timeout(ANSWER) {
+/// Blocks until a command responses, and responds to its result.
+fn response<T>(receiver: Receiver<Result<T, String>>) -> Result<T, String> {
+    match receiver.recv_timeout(RESPONSE) {
         Ok(result) => result,
-        Err(error) => Err(format!("the scheduler did not answer: {error}")),
+        Err(error) => Err(format!("the scheduler did not response: {error}")),
     }
 }
 
@@ -137,8 +137,8 @@ fn programs(epoch: &Epoch) -> scheduler::PolicyPrograms {
     epoch
         .handle
         .policy_programs()
-        .recv_timeout(ANSWER)
-        .expect("the scheduler answers with its slot's programs")
+        .recv_timeout(RESPONSE)
+        .expect("the scheduler responds with its slot's programs")
 }
 
 /// The program a slot names, by the two fields that identify it on the wire.
@@ -191,8 +191,8 @@ fn the_slot_names_the_program_serving_and_the_one_a_precopy_prepared() {
     let counters = epoch
         .handle
         .counters()
-        .recv_timeout(ANSWER)
-        .expect("the scheduler answers with its counters");
+        .recv_timeout(RESPONSE)
+        .expect("the scheduler responds with its counters");
     // The two commands read the same counter: a step the scheduler took between
     // them is the only difference, so the figures cannot disagree.
     let after = epoch.step();
@@ -203,7 +203,7 @@ fn the_slot_names_the_program_serving_and_the_one_a_precopy_prepared() {
     );
     assert!(
         counters.policy_calls > 0,
-        "the serving policy has answered at least its trial's calls"
+        "the serving policy has responded at least its trial's calls"
     );
     assert_eq!(
         (counters.kernel_launches, counters.device_ns),
@@ -218,7 +218,7 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
 
     // A precopy's policy module belongs to the process holding the Program
     // Server's client, which resolves it once and precopies each scheduler; the
-    // command is answered with that rather than half applied.
+    // command gets its response with that rather than half applied.
     let precopy = ipc::ProgramCommand::Precopy {
         generation: 1,
         programs: Box::default(),
@@ -229,18 +229,18 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
         },
     };
     let refused =
-        answer(epoch.handle.program_command(precopy)).expect_err("a precopy needs its source");
+        response(epoch.handle.program_command(precopy)).expect_err("a precopy needs its source");
     assert!(
         refused.contains("Program Server"),
         "the refusal names the owner of the program: {refused}"
     );
 
     // A switchover that names the step its expert group agreed applies at that
-    // step: one still ahead waits for it, and its answer is the answer of a
+    // step: one still ahead waits for it, and its response is the response of a
     // stage that applied there.
     epoch.precopy("fcfs", 2, toy()).expect("the first precopy");
     let ahead = epoch.step() + 2;
-    answer(
+    response(
         epoch
             .handle
             .program_command(ipc::ProgramCommand::Switchover {
@@ -257,12 +257,12 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     // A step the scheduler has passed is not a boundary any more: it is refused
     // with the step, rather than applied at one the epoch is past. A candidate is
     // prepared first, because the switchover above used the one it applied: with
-    // nothing prepared the answer would be that, and the boundary's own refusal
+    // nothing prepared the response would be that, and the boundary's own refusal
     // would never be reached.
     epoch
         .precopy("fcfs", 3, toy())
         .expect("a candidate the boundary check can leave prepared");
-    let refused_step = answer(
+    let refused_step = response(
         epoch
             .handle
             .program_command(ipc::ProgramCommand::Switchover {
@@ -292,8 +292,8 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     );
 
     // The boundary belongs to the stage that took it: a second one is refused
-    // with the waiting stage's name, so the first caller's answer is not lost.
-    let refused = answer(epoch.handle.commit_policy())
+    // with the waiting stage's name, so the first caller's response is not lost.
+    let refused = response(epoch.handle.commit_policy())
         .expect_err("a stage waits for the boundary already claimed");
     assert!(
         refused.contains("switchover"),
@@ -332,7 +332,7 @@ fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_
     let first = epoch.switch_over().expect("the first switchover");
     // A stage names the boundary it applied at: a step the scheduler had
     // reached. The scheduler runs on past that boundary as soon as a policy
-    // serves, so the answer is a step it has reached, not the one it is at when
+    // serves, so the response is a step it has reached, not the one it is at when
     // asked — and the slot names the program the stage put in.
     assert!(
         first.step <= epoch.step(),
@@ -365,7 +365,7 @@ fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_
 
     // A commit keeps the replaced policy until the next precopy (§7.3 step 5),
     // so a revert still finds it and brings it back.
-    answer(epoch.handle.commit_policy()).expect("the commit applies at a boundary");
+    response(epoch.handle.commit_policy()).expect("the commit applies at a boundary");
     epoch.revert().expect("the commit kept the previous policy");
     assert_eq!(
         named(programs(&epoch).running),
@@ -394,7 +394,7 @@ fn a_purge_drops_the_policy_a_revert_would_return_to() {
 
     // §7.3 step 6: the generation before the serving one is released once no
     // batch uses it, so the policy a revert would return to is gone.
-    answer(epoch.handle.purge_policy()).expect("the purge applies at a boundary");
+    response(epoch.handle.purge_policy()).expect("the purge applies at a boundary");
     assert!(
         epoch.revert().is_err(),
         "a purged generation cannot be reverted to"
@@ -412,11 +412,11 @@ fn the_engines_commands_reach_a_scheduler_and_name_what_is_not_its_own() {
             proto::process::Switchover { generation: 1 },
         )),
     };
-    answer(epoch.handle.engine_command(switchover))
+    response(epoch.handle.engine_command(switchover))
         .expect("a switchover applies at the scheduler's next boundary");
 
     // A precopy's module comes from the Program Server, whose client the
-    // process holding it resolves: the command is answered with that.
+    // process holding it resolves: the command gets its response with that.
     let precopy = proto::process::Command {
         kind: Some(proto::process::command::Kind::Precopy(
             proto::process::Precopy {
@@ -425,7 +425,7 @@ fn the_engines_commands_reach_a_scheduler_and_name_what_is_not_its_own() {
             },
         )),
     };
-    let refused = answer(epoch.handle.engine_command(precopy))
+    let refused = response(epoch.handle.engine_command(precopy))
         .expect_err("a precopy is not one scheduler's to prepare");
     assert!(
         refused.contains("Program Server"),
@@ -451,7 +451,7 @@ fn a_precopy_whose_decisions_trap_fails_and_the_serving_policy_stays() {
         "a switchover without a prepared instance is refused, so the serving policy stays"
     );
 
-    // The serving policy still answers: a later program's precopy and
+    // The serving policy still responses: a later program's precopy and
     // switchover go through.
     epoch
         .precopy("priority", 3, toy())

@@ -34,7 +34,7 @@ use ipc::memory::CacheStorageReport;
 /// `Scheduler::update_weights`).
 pub(super) struct PendingResize {
     change: Pending,
-    answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+    response: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     /// Requests holding withdrawn units that could not get the units their
     /// next call needs (`Scheduler::note_stuck_holder`): recomputed at the
     /// next poll.
@@ -44,7 +44,7 @@ pub(super) struct PendingResize {
 /// What a pending change does once its units are let go.
 enum Pending {
     /// The workers give back the segments from this one on; the change
-    /// answers with the output of each device it made room on.
+    /// responds with the output of each device it made room on.
     Room { from: u32, output: Vec<String> },
     /// The workers sleep, once no request runs.
     Sleep,
@@ -68,17 +68,17 @@ impl Pending {
 }
 
 impl Scheduler {
-    /// Applies `change` to the KV cache's device storage, and answers with
+    /// Applies `change` to the KV cache's device storage, and responds with
     /// what each worker reported once it is done. A change whose withdrawn
-    /// units requests still hold answers once they let them go
+    /// units requests still hold responds once they let them go
     /// (`Scheduler::poll_resize`).
     pub(super) fn resize_cache(
         &mut self,
         change: CacheChange,
-        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+        response: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     ) {
         if self.resizing.is_some() {
-            let _ = answer.send(Err("another KV cache change is in progress".to_owned()));
+            let _ = response.send(Err("another KV cache change is in progress".to_owned()));
             return;
         }
         let started = match change {
@@ -97,15 +97,15 @@ impl Scheduler {
                 Ok(self.start_sleep().ok_or_else(Vec::new))
             }
             CacheChange::Hold { held } => {
-                let _ = answer.send(self.hold_batches(held));
+                let _ = response.send(self.hold_batches(held));
                 return;
             }
             CacheChange::Grow => {
-                let _ = answer.send(self.grow_cache());
+                let _ = response.send(self.grow_cache());
                 return;
             }
             CacheChange::Wake => {
-                let _ = answer.send(self.wake());
+                let _ = response.send(self.wake());
                 return;
             }
         };
@@ -113,23 +113,23 @@ impl Scheduler {
             Ok(Ok(pending)) => {
                 self.resizing = Some(PendingResize {
                     change: pending,
-                    answer,
+                    response,
                     stuck: Vec::new(),
                 });
                 self.poll_resize();
             }
             // Nothing to give back: the change is done, with its output.
             Ok(Err(output)) => {
-                let _ = answer.send(Ok(output));
+                let _ = response.send(Ok(output));
             }
             Err(error) => {
-                let _ = answer.send(Err(error));
+                let _ = response.send(Err(error));
             }
         }
     }
 
     /// Rewrites the weights in place from the checkpoint at `model_path`,
-    /// and answers with what each worker reported. The requests in flight
+    /// and responds with what each worker reported. The requests in flight
     /// continue as `in_flight` says:
     ///
     /// - `Keep`: once the batches in flight complete, the workers rewrite
@@ -145,19 +145,19 @@ impl Scheduler {
         &mut self,
         model_path: String,
         in_flight: crate::WeightsInFlight,
-        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+        response: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     ) {
         if self.resizing.is_some() {
-            let _ = answer.send(Err("a KV cache change is in progress".to_owned()));
+            let _ = response.send(Err("a KV cache change is in progress".to_owned()));
             return;
         }
         if self.asleep {
-            let _ = answer.send(self.apply_weights(&model_path));
+            let _ = response.send(self.apply_weights(&model_path));
             return;
         }
         match in_flight {
             crate::WeightsInFlight::Keep => {
-                let _ = answer.send(self.apply_weights_keeping(&model_path));
+                let _ = response.send(self.apply_weights_keeping(&model_path));
                 return;
             }
             crate::WeightsInFlight::Abort => self.abort_held_requests(),
@@ -170,7 +170,7 @@ impl Scheduler {
         self.preempt_media(MigrationCause::Drain, |_| true);
         self.resizing = Some(PendingResize {
             change: Pending::Weights(model_path),
-            answer,
+            response,
             stuck: Vec::new(),
         });
         self.poll_resize();
@@ -239,7 +239,7 @@ impl Scheduler {
             Pending::Sleep => {
                 self.asleep = true;
                 self.run_operation(ipc::memory::Sleep)
-                    .and_then(|replies| answers(&replies))
+                    .and_then(|replies| responses(&replies))
                     .inspect(|_| {
                         tracing::info!(
                             "the scheduler sleeps: its KV cache and graph storage are given back"
@@ -258,7 +258,7 @@ impl Scheduler {
                 }),
             Pending::Weights(path) => self.apply_weights(&path),
         };
-        let _ = resize.answer.send(result);
+        let _ = resize.response.send(result);
     }
 
     /// Rewrites the weights from the checkpoint at `path` while no request
@@ -284,7 +284,7 @@ impl Scheduler {
         let pages = self.storage.flush_prefix_cache();
         self.reseed_pages(&results)?;
         tracing::info!(path, pages, "updated the weights in place");
-        answers(&results)
+        responses(&results)
     }
 
     /// Rewrites the weights from the checkpoint at `path` while the requests
@@ -305,7 +305,7 @@ impl Scheduler {
                 continue;
             };
             // Repeated updates retain the original private lineage. New
-            // requests alone begin under the newly published component keys.
+            // requests alone begin under the newly published stage keys.
             if state.req.cache.state_seeds.is_empty() {
                 state.req.cache.state_seeds = state_seeds.clone();
             }
@@ -322,7 +322,7 @@ impl Scheduler {
             kept,
             "updated the weights in place; the requests in flight keep their KV cache"
         );
-        answers(&results)
+        responses(&results)
     }
 
     /// Ends every request the scheduler holds, aborted: those queued, and
@@ -344,7 +344,7 @@ impl Scheduler {
     fn reseed_pages(&mut self, results: &[ipc::memory::WeightsUpdated]) -> Result<(), String> {
         if let Some(cache) = self.storage.cache.as_mut() {
             // Pipeline stages contribute different layers to the same
-            // scheduler group. Union their components just as startup does.
+            // scheduler group. Union their stages just as startup does.
             let mut groups = vec![std::collections::BTreeSet::new(); cache.groups().len()];
             for result in results
                 .iter()
@@ -691,7 +691,7 @@ impl Scheduler {
             cache.pool().restore_to(end);
         }
         tracing::info!(units = self.storage.usable_units(), "restored the KV cache");
-        answers(&results)
+        responses(&results)
     }
 
     /// Creates as many of the given-back segments as every device's ledger
@@ -731,13 +731,13 @@ impl Scheduler {
         }
         self.asleep = false;
         tracing::info!("the scheduler woke");
-        answers(&results)
+        responses(&results)
     }
 }
 
-/// The JSON texts of the workers' `replies`, which a cache change answers.
-fn answers<R: serde::Serialize>(replies: &[R]) -> Result<Vec<String>, String> {
-    ipc::memory::answers(replies).map_err(|error| error.to_string())
+/// The JSON texts of the workers' `replies`, which a cache change responses.
+fn responses<R: serde::Serialize>(replies: &[R]) -> Result<Vec<String>, String> {
+    ipc::memory::responses(replies).map_err(|error| error.to_string())
 }
 
 /// Returns whether the request holds a unit from `first` on.

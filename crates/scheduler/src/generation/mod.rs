@@ -1,12 +1,12 @@
-//! Generation lifecycle state and worker-call planning.
+//! Generation lifecycle state and worker-call preparation.
 //!
 //! A request advances through context ingestion, then either understanding
 //! decode or block-diffusion canvases of text ([`GenerationPhase`]).
 //! [`TokenState`] holds the accepted progress of one admitted token request.
 //!
-//! Each `plan_*` builder returns one call whose identities are placeholders
-//! and whose `Bounds` come from `finish_plan`; `register_call` then stamps the
-//! request key and assigns product generations. Every planned output is named
+//! Each `prepare_*` builder returns one call whose identities are placeholders
+//! and whose `Bounds` come from `finish_call`; `register_call` then stamps the
+//! request key and assigns product generations. Every prepared output is named
 //! by request key (which includes the request epoch), producer call, output
 //! index, and generation.
 //!
@@ -30,7 +30,7 @@ use ipc::{
 use ipc::{CanvasSampling, RequestId, SamplingParams};
 use proto::tensor::DType;
 
-/// Builds an unstamped product reference for a planned call output.
+/// Builds an unstamped product reference for a prepared call output.
 ///
 /// The owning `request_key` and `producer_call_id` are placeholders until
 /// [`register_call`] stamps the real identity, and generation zero marks the
@@ -60,11 +60,11 @@ fn bounded_tensor(output_index: u16, dtype: DType, shape_bound: ShapeBound) -> T
 ///
 /// Fails with `ProductBoundTooLarge` when the element count exceeds
 /// `u32::MAX` and with `MissingProductBound` when it is zero.
-fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, PlanningError> {
+fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, CallError> {
     let elements = bytes.div_ceil(dtype.element_bytes());
-    let max = u32::try_from(elements).map_err(|_| PlanningError::ProductBoundTooLarge { bytes })?;
+    let max = u32::try_from(elements).map_err(|_| CallError::ProductBoundTooLarge { bytes })?;
     if max == 0 {
-        return Err(PlanningError::MissingProductBound);
+        return Err(CallError::MissingProductBound);
     }
     Ok(ShapeBound {
         dims: vec![DimBound::Device { max }],
@@ -89,7 +89,7 @@ fn logprob_result_bytes(
     sampling: &SamplingParams,
     generated_rows: u32,
     prompt_positions: u32,
-) -> Result<Option<u64>, PlanningError> {
+) -> Result<Option<u64>, CallError> {
     let generated = sampling.generated_logprobs_requested();
     let prompt = sampling.prompt_logprobs_requested();
     if !generated && !prompt {
@@ -102,21 +102,21 @@ fn logprob_result_bytes(
         .checked_mul(RANKED_LOGPROB_BYTES)
         .and_then(|bytes| bytes.checked_add(if generated { 4 } else { 0 }))
         .and_then(|bytes| bytes.checked_mul(u64::from(generated_rows)))
-        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+        .ok_or(CallError::ProductBoundTooLarge { bytes: u64::MAX })?;
     let per_prompt_bytes = 4_u64
         .checked_add(
             prompt_entries
                 .unwrap_or(0)
                 .checked_mul(RANKED_LOGPROB_BYTES)
-                .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?,
+                .ok_or(CallError::ProductBoundTooLarge { bytes: u64::MAX })?,
         )
-        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+        .ok_or(CallError::ProductBoundTooLarge { bytes: u64::MAX })?;
     let prompt_bytes = u64::from(prompt_positions)
         .checked_mul(per_prompt_bytes)
-        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+        .ok_or(CallError::ProductBoundTooLarge { bytes: u64::MAX })?;
     let bytes = generated_bytes
         .checked_add(prompt_bytes)
-        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+        .ok_or(CallError::ProductBoundTooLarge { bytes: u64::MAX })?;
     Ok(Some(bytes))
 }
 
@@ -220,7 +220,7 @@ impl TokenState {
         }
 
         match call.kind {
-            // A block commit is planned only in `CommitCanvas`, and a prompt
+            // A block commit is prepared only in `CommitCanvas`, and a prompt
             // chunk never is; the committed block extends the context and
             // the next block starts at step zero.
             CallKind::Forward(ForwardMode::Prefill)
@@ -301,7 +301,7 @@ impl TokenState {
         // and a prompt chunk that samples nothing draws nothing either. The
         // call declares that it sampled by carrying the output it sampled into
         // (`Call::token_output`); `consumer_slots` is the worker's, filled after
-        // this call was planned and never reported back.
+        // this call was prepared and never reported back.
         if matches!(
             call.kind,
             CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Prefill)
@@ -317,7 +317,7 @@ impl TokenState {
 fn encoder_output(
     encoder: MediaCall,
     limits: &crate::GenerationLimits,
-) -> Result<TensorRef, PlanningError> {
+) -> Result<TensorRef, CallError> {
     // An image encoder is a latent or a vision encoding call
     // (`GenerationRequest::validate`).
     let bytes = if encoder == MediaCall::LatentEncoding {
@@ -336,7 +336,7 @@ fn encoder_output(
 ///
 /// Every optional input and output is unset, the call id and the request
 /// key's engine id and epoch are zero placeholders, and the bound is one
-/// token; the `plan_*` builders fill in the rest.
+/// token; the `prepare_*` builders fill in the rest.
 fn new_call(request: &GenerationRequest, kind: CallKind) -> Call {
     let mut call = Call::new(
         RequestKey::new(0, request.request_id, 0),
@@ -362,7 +362,7 @@ fn new_call(request: &GenerationRequest, kind: CallKind) -> Call {
 /// then starts from BOS, as after a trailing latent block. Fails with
 /// `InvalidPromptRange` for a range past the prompt, or an empty one that
 /// carries no block.
-pub(super) fn plan_prompt(
+pub(super) fn prepare_prompt(
     request: &GenerationRequest,
     start: u32,
     end: u32,
@@ -370,12 +370,12 @@ pub(super) fn plan_prompt(
     block_tokens: u32,
     sampling_state: Option<SamplingState>,
     samples: bool,
-) -> Result<Call, PlanningError> {
+) -> Result<Call, CallError> {
     if start > end
         || (start == end && blocks.is_empty())
         || end as usize > request.prompt_token_ids.len()
     {
-        return Err(PlanningError::InvalidPromptRange {
+        return Err(CallError::InvalidPromptRange {
             start,
             end,
             prompt_tokens: request.prompt_token_ids.len(),
@@ -406,11 +406,11 @@ pub(super) fn plan_prompt(
     call.vision_inputs = blocks;
     let ends_prompt = end as usize == request.prompt_token_ids.len();
     if !samples || !ends_prompt || ends_with_block {
-        return finish_plan(request, call, prompt_positions);
+        return finish_call(request, call, prompt_positions);
     }
     call.token_output = Some(output_tensor(0, DType::I64));
     call.sampling_state = sampling_state;
-    finish_plan(request, call, prompt_positions)
+    finish_call(request, call, prompt_positions)
 }
 
 /// Outputs denoising step `step` of the canvas-generating `request`'s block
@@ -424,17 +424,17 @@ pub(super) fn plan_prompt(
 /// four bytes each. Its completion output is true while the block continues
 /// after the step: the predicate of the next step, which the scheduler may
 /// queue before this one resolves.
-pub(super) fn plan_canvas_step(
+pub(super) fn prepare_canvas_step(
     request: &GenerationRequest,
     canvas: &CanvasSampling,
     block: u32,
     step: u32,
-) -> Result<Call, PlanningError> {
+) -> Result<Call, CallError> {
     let mut call = new_call(request, CallKind::Forward(ForwardMode::TokenDenoising));
     call.bounds.max_tokens = canvas.canvas_length;
     call.canvas = Some(CanvasStep { block, step });
     call.completion_output = Some(output_tensor(0, DType::U8));
-    let mut call = finish_plan(request, call, 0)?;
+    let mut call = finish_call(request, call, 0)?;
     call.bounds.max_completion_bytes = u64::from(canvas.canvas_length).saturating_mul(4);
     Ok(call)
 }
@@ -443,30 +443,30 @@ pub(super) fn plan_canvas_step(
 /// canvas-generating `request`: a prefill that writes them into the prefix cache, as causal
 /// prompt, and samples nothing. Fails with `EmptyCanvasCommit` for an empty
 /// block.
-pub(super) fn plan_canvas_commit(
+pub(super) fn prepare_canvas_commit(
     request: &GenerationRequest,
     tokens: &[u32],
-) -> Result<Call, PlanningError> {
+) -> Result<Call, CallError> {
     if tokens.is_empty() {
-        return Err(PlanningError::EmptyCanvasCommit);
+        return Err(CallError::EmptyCanvasCommit);
     }
     let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = u32::try_from(tokens.len())
-        .map_err(|_| PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+        .map_err(|_| CallError::ProductBoundTooLarge { bytes: u64::MAX })?;
     call.input_token_ids = tokens.to_vec();
-    finish_plan(request, call, 0)
+    finish_call(request, call, 0)
 }
 
 /// Outputs a sampled continuation; relay inputs leave host token values empty.
 ///
 /// The call is a decode whose input is `input_token`, or nothing when
-/// `relay_input` continues from the predecessor's device-resident token.
-pub(super) fn plan_decode(
+/// `relay_input` continues from the predecessor's device-running token.
+pub(super) fn prepare_decode(
     request: &GenerationRequest,
     input_token: u32,
     relay_input: bool,
     sampling_state: Option<SamplingState>,
-) -> Result<Call, PlanningError> {
+) -> Result<Call, CallError> {
     let mut call = new_call(request, CallKind::Forward(ForwardMode::Decode));
     call.input_token_ids = if relay_input {
         Vec::new()
@@ -475,7 +475,7 @@ pub(super) fn plan_decode(
     };
     call.token_output = Some(output_tensor(0, DType::I64));
     call.sampling_state = sampling_state;
-    finish_plan(request, call, 0)
+    finish_call(request, call, 0)
 }
 
 /// Outputs the verification of a speculating request's next step: its
@@ -484,13 +484,13 @@ pub(super) fn plan_decode(
 /// after it, at most one more than their count; with no drafts it decodes
 /// one token, a verification row of length one. The call proposes
 /// `proposals` drafts for the step after it.
-pub(super) fn plan_verify(
+pub(super) fn prepare_verify(
     request: &GenerationRequest,
     input_token: u32,
     drafts: &[u32],
     proposals: u32,
     sampling_state: Option<SamplingState>,
-) -> Result<Call, PlanningError> {
+) -> Result<Call, CallError> {
     let mut call = new_call(request, CallKind::Forward(ForwardMode::Verify));
     call.bounds.max_tokens = (1 + drafts.len()).min(u32::MAX as usize) as u32;
     call.input_token_ids = std::iter::once(input_token)
@@ -499,7 +499,7 @@ pub(super) fn plan_verify(
     call.draft.proposals = proposals;
     call.token_output = Some(output_tensor(0, DType::I64));
     call.sampling_state = sampling_state;
-    finish_plan(request, call, 0)
+    finish_call(request, call, 0)
 }
 
 /// The drafts a verification verifies: its input tokens after its current
@@ -518,22 +518,22 @@ pub(crate) fn verify_drafts(call: &Call) -> &[u32] {
 /// evaluates them again, from the state checkpoint at `start`, and the
 /// drafter writes their draft cache entries, the last reading `lookahead`,
 /// the token after them.
-pub(super) fn plan_refill(
+pub(super) fn prepare_refill(
     request: &GenerationRequest,
     start: u32,
     tokens: Vec<u32>,
     lookahead: u32,
-) -> Result<Call, PlanningError> {
+) -> Result<Call, CallError> {
     let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = u32::try_from(tokens.len())
-        .map_err(|_| PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
+        .map_err(|_| CallError::ProductBoundTooLarge { bytes: u64::MAX })?;
     call.input_token_ids = tokens;
     call.draft = ipc::DraftWork {
         proposals: 0,
         lookahead: Some(lookahead),
         refill: Some(start),
     };
-    finish_plan(request, call, 0)
+    finish_call(request, call, 0)
 }
 
 /// Outputs the cache write of a latent input-image block, retaining an exact
@@ -541,17 +541,17 @@ pub(super) fn plan_refill(
 ///
 /// The call is a prefill that reads `feature` and may write up to the
 /// encoder's `cache_token_capacity` cache tokens; it samples nothing.
-pub(super) fn plan_image_extend(
+pub(super) fn prepare_image_extend(
     limits: &crate::GenerationLimits,
     request: &GenerationRequest,
     encoder: crate::ImageEncoderInput,
     feature: TensorRef,
-) -> Result<Call, PlanningError> {
+) -> Result<Call, CallError> {
     let capacity = encoder.cache_token_capacity(limits)?;
     let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = capacity;
     call.latent_feature_input = Some(feature);
-    finish_plan(request, call, 0)
+    finish_call(request, call, 0)
 }
 
 /// Encodes an input image (`image_base64`) into a feature tensor with
@@ -559,15 +559,15 @@ pub(super) fn plan_image_extend(
 /// (`Call::latent_draw`).
 ///
 /// Fails with `MissingImageInput` for an empty payload.
-pub(super) fn plan_encode(
+pub(super) fn prepare_encode(
     limits: &crate::GenerationLimits,
     request: &GenerationRequest,
     step: MediaCall,
     image_base64: String,
     draw: Option<u32>,
-) -> Result<Call, PlanningError> {
+) -> Result<Call, CallError> {
     if image_base64.is_empty() {
-        return Err(PlanningError::MissingImageInput);
+        return Err(CallError::MissingImageInput);
     }
     let mut call = new_call(request, CallKind::Media(step));
     call.input_image = Some(image_base64.into());
@@ -575,7 +575,7 @@ pub(super) fn plan_encode(
     call.latent_draw = (step == MediaCall::LatentEncoding)
         .then_some(draw)
         .flatten();
-    finish_plan(request, call, 0)
+    finish_call(request, call, 0)
 }
 
 /// The posterior draw of a request's latent encoding (`Call::latent_draw`)
@@ -604,12 +604,12 @@ pub(super) fn latent_draw(request: &GenerationRequest, block: BlockCursor) -> u3
 ///
 /// `max_completion_bytes` covers the logprob payload of a token-producing
 /// call. `max_cache_units` starts at zero;
-/// `Scheduler::plan_call` sets it for forward calls.
-fn finish_plan(
+/// `Scheduler::prepare_call` sets it for forward calls.
+fn finish_call(
     request: &GenerationRequest,
     mut call: Call,
     prompt_positions: u32,
-) -> Result<Call, PlanningError> {
+) -> Result<Call, CallError> {
     let logprob_bytes = if call.token_output.is_some() {
         // A verification commits up to its bound of tokens, each reporting
         // its row; every other call reports one.
@@ -632,7 +632,7 @@ fn finish_plan(
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 /// Failure while constructing the next worker call.
-pub(crate) enum PlanningError {
+pub(crate) enum CallError {
     #[error(transparent)]
     Capacity(#[from] crate::GenerationResourceError),
     #[error("invalid prompt range {start}..{end} for {prompt_tokens} input tokens")]
@@ -665,7 +665,7 @@ pub(super) fn register_call(
     call: &mut Call,
     request_key: RequestKey,
     next_product_generation: &mut u64,
-) -> Result<(), PlanningError> {
+) -> Result<(), CallError> {
     let call_id = call.call_id;
     let required_generations = call
         .tensor_outputs()
@@ -675,17 +675,17 @@ pub(super) fn register_call(
     if required_generations > 0 {
         let last_generation = first_generation
             .checked_add(required_generations as u64 - 1)
-            .ok_or(PlanningError::ProductGenerationExhausted)?;
+            .ok_or(CallError::ProductGenerationExhausted)?;
         if last_generation > u64::from(u32::MAX) {
-            return Err(PlanningError::ProductGenerationExhausted);
+            return Err(CallError::ProductGenerationExhausted);
         }
     }
     // The preflight above guarantees every generation this call assigns fits.
     let mut acquire_generation = || {
         let generation = u32::try_from((*next_product_generation).max(1))
-            .map_err(|_| PlanningError::ProductGenerationExhausted)?;
+            .map_err(|_| CallError::ProductGenerationExhausted)?;
         *next_product_generation = u64::from(generation) + 1;
-        Ok::<_, PlanningError>(generation)
+        Ok::<_, CallError>(generation)
     };
     call.request_key = request_key;
     for product in call.tensor_outputs_mut() {
@@ -993,7 +993,7 @@ pub(crate) struct TokenState {
     /// Encoder products of the vision blocks from the accepted block cursor
     /// on, in context order, for the context prefills that inject them. The
     /// blocks of in-flight context prefills lead the list until their
-    /// results are accepted, so a planned call that is not submitted leaves
+    /// results are accepted, so a prepared call that is not submitted leaves
     /// its blocks' products in place.
     pub(super) context_features: Vec<TensorRef>,
     /// Model position of the accepted sequence. Tokens advance it by one and
@@ -1024,10 +1024,10 @@ pub(crate) struct TokenState {
     pub(super) worker_registered: bool,
     /// Whether the request's slot holds the request's recurrent state at its
     /// accepted position: false until the request's first token call is
-    /// planned on the slot, which restores the state from the checkpoint its
+    /// prepared on the slot, which restores the state from the checkpoint its
     /// reused prefix ends at (`batching::columns`). A preempted or migrated
     /// request is admitted again as a new state, so it restores again.
-    pub(crate) state_resident: bool,
+    pub(crate) state_on_device: bool,
     /// Whether the worker's slot holds the request's sampling state: its
     /// penalty counts started from zero and its bias row
     /// (`batching::columns::adjusts_logits`). False until the request's first
@@ -1035,7 +1035,7 @@ pub(crate) struct TokenState {
     /// and again after a hand-off moves the request to the decode group. A
     /// preempted or migrated request is admitted again as a new state, so its
     /// slot starts again.
-    pub(crate) sampling_resident: bool,
+    pub(crate) sampling_on_device: bool,
     /// Allocation serial of the request's cache units already declared to the
     /// workers: units allocated at or after it are fresh for the next
     /// dispatch (`CacheAllocation::allocated_units`).
@@ -1278,7 +1278,7 @@ mod tests {
         let mut asking = request(10);
         asking.sampling.return_prompt_logprobs = true;
         let output = |request: &GenerationRequest, start, end| {
-            plan_prompt(request, start, end, Vec::new(), 0, None, true).expect("a prompt range")
+            prepare_prompt(request, start, end, Vec::new(), 0, None, true).expect("a prompt range")
         };
         let scored = |call: &Call| {
             call.prompt_scores
@@ -1300,7 +1300,7 @@ mod tests {
     fn only_the_chunk_that_ends_a_prompt_samples() {
         let request = request(700);
         let output = |start, end| {
-            plan_prompt(&request, start, end, Vec::new(), 0, None, true).expect("a prompt range")
+            prepare_prompt(&request, start, end, Vec::new(), 0, None, true).expect("a prompt range")
         };
         assert!(
             output(0, 512).token_output.is_none(),

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 /// Result type for semantic worker-message validation.
 pub type ValidationResult<T> = std::result::Result<T, ValidationError>;
 
-/// Describes a worker message that violates the protocol contract.
+/// Describes a worker message that violates the protocol.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid worker message: {0}")]
 pub struct ValidationError(String);

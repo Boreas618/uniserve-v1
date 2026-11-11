@@ -1,20 +1,20 @@
-//! Batch selection, call planning, and physical params assembly.
+//! Batch selection, call preparation, and physical params assembly.
 //!
 //! Each pass selects a batch kind, applies sequence and token budgets, and
-//! emits at most one planned call per eligible request.
+//! emits at most one prepared call per eligible request.
 //!
 //! This is the generation path: token requests in `running`.
 //! `Scheduler::schedule_batches` alternates it with the video media path.
 //! A pass schedules each request's next call from its accepted state plus the
 //! calls still in flight (`scheduled_token_lengths`), so a successor can be
-//! planned before its predecessor resolves. Each planned call then reserves its storage, is
+//! prepared before its predecessor resolves. Each prepared call then reserves its storage, is
 //! registered as in flight, and joins the pass's batch for its phase and
-//! component: one batch per `(phase, component)`, each a single numerical call
-//! on one component, because a worker's batch carries one phase.
+//! stage: one batch per `(phase, stage)`, each a single numerical call
+//! on one stage, because a worker's batch carries one phase.
 //!
-//! Token calls and media calls are planned in the same pass: a token call by
-//! the next-call planner, a media call of a video request by
-//! `plan_media_call`, which owns that flow's numerical extent, decoder ranges,
+//! Token calls and media calls are prepared in the same pass: a token call by
+//! the next-call builder, a media call of a video request by
+//! `prepare_media_call`, which owns that flow's numerical extent, decoder ranges,
 //! and worker admission. The output names both, so one policy decides the whole
 //! step.
 //!
@@ -57,7 +57,7 @@ impl Scheduler {
     /// order of the work list is the decision, and the mechanism schedules each
     /// named phase of the named request, clipping it to its own hard limits
     /// (the pass's rows, the request's storage, the transfer capacity). A
-    /// request the output refills gets a refill chunk after the planned work,
+    /// request the output refills gets a refill chunk after the prepared work,
     /// which is a prefill call that writes the draft cache.
     ///
     /// A request whose call does not fit this step keeps nothing: the work that
@@ -79,18 +79,18 @@ impl Scheduler {
         self.assemble_batch(&work)
     }
 
-    /// The replica a planned call runs on: the mechanism's own residency when
-    /// the request already ran, the policy's answer when it has not (design
+    /// The replica a prepared call runs on: the mechanism's own residency when
+    /// the request already ran, the policy's response when it has not (design
     /// §4.4).
     ///
     /// The policy sees the candidates exactly as `views::replicas` shows them
-    /// and answers one of their indices; `views::replica_targets` names the same
+    /// and responds to one of their indices; `views::replica_targets` names the same
     /// workers in the same order, both built from one filter in `views.rs`, so
     /// an index becomes a worker without two candidate lists that could
     /// disagree. A policy that fails here fails as any decision does: the call
     /// waits this step and the previous policy decides the next one.
     fn place_call(&mut self, call: &Call) -> Option<dispatch::Choice> {
-        if self.dispatch.resident(call.request_key) {
+        if self.dispatch.placed(call.request_key) {
             return Some(dispatch::Choice::Existing);
         }
         let replicas = views::replicas(self, call.request_key, call.kind);
@@ -100,10 +100,10 @@ impl Scheduler {
         let targets = views::replica_targets(self, call.request_key, call.kind);
         let view = views::call_view(call.request_key, call.kind);
         let mut policy = self.policy.take()?;
-        let answer = policy
+        let response = policy
             .place(&view, &replicas)
             .and_then(|index| mechanism::validate_place(&view, &replicas, index).map(|()| index));
-        let target = match answer {
+        let target = match response {
             Ok(index) => targets.get(index).map(|(worker, _)| worker.clone()),
             Err(error) => {
                 let _ = self.policy_failed(policy, error);
@@ -175,7 +175,7 @@ impl Scheduler {
     /// Selects compatible call kinds within the step's token and sequence
     /// budgets, in the output's order.
     ///
-    /// Walks the output's work until `max_batch` calls are selected or the token
+    /// Goes through the output's work until `max_batch` calls are selected or the token
     /// budget is spent. Every selected call is registered in flight before this
     /// returns. A failed call preparation returns no batches; most such
     /// failures latch engine-fatal first.
@@ -183,8 +183,8 @@ impl Scheduler {
         &mut self,
         work: &[(RequestId, PhaseId, Option<u32>)],
     ) -> Vec<ExecutionBatch> {
-        // One batch per (phase, component): a batch is one numerical call of one
-        // phase on one component, so a rank receives a homogeneous group and
+        // One batch per (phase, stage): a batch is one numerical call of one
+        // phase on one stage, so a rank receives a homogeneous group and
         // the worker's phase column names it exactly. The output's order is the
         // order the first call of each pair was selected in.
         let mut kind_order: Vec<(PhaseId, String)> = Vec::new();
@@ -209,11 +209,11 @@ impl Scheduler {
             canvas: row_capacity,
             context: row_capacity.min(self.config.max_batch.get()),
         };
-        // What the media calls in flight occupy — their component's media
+        // What the media calls in flight occupy — their stage's media
         // units and the host task pools preparing their units — built when the
         // pass meets its first media call and charged with each one it selects.
         let mut media_occupancy: Option<super::execution::Occupancy> = None;
-        // A media request's worker admission, queued by `plan_media_call`:
+        // A media request's worker admission, queued by `prepare_media_call`:
         // it travels with the batch of the first call of that request in this
         // pass.
         let mut admissions: Vec<NewRequest> = Vec::new();
@@ -225,13 +225,13 @@ impl Scheduler {
             // The phase names the call kind this entry runs. A phase this epoch
             // has no call for runs nothing, and says so: an entry the policy
             // named and this loop discards is work the epoch believes it
-            // planned, and a pass that names nothing every step is a stall no
+            // prepared, and a pass that names nothing every step is a stall no
             // other layer reports.
             let Some(kind) = views::phase_kind(phase).and_then(views::phase_call) else {
                 tracing::debug!(
                     request = id.0,
                     phase = phase.0,
-                    "a planned entry names a phase this epoch has no call for"
+                    "a prepared entry names a phase this epoch has no call for"
                 );
                 continue;
             };
@@ -262,16 +262,16 @@ impl Scheduler {
             {
                 continue;
             }
-            // A media call is planned by the media flow, not by the token
-            // planner: the call's numerical extent, its decoder ranges, and its
+            // A media call is prepared by the media flow, not by the token
+            // builder: the call's numerical extent, its decoder ranges, and its
             // worker admission are that flow's. Its batch is made first, since
-            // the call's id names it, and the component is known before
-            // planning because a media call's kind fixes it.
-            // A media request's call is planned by the media flow. A token
+            // the call's id names it, and the stage is known before
+            // preparing because a media call's kind fixes it.
+            // A media request's call is prepared by the media flow. A token
             // request's own encoder call — an input image's block — is
-            // planned by the generation flow
+            // prepared by the generation flow
             // below, which knows the context segment it serves: routing it
-            // here found no media state and planned nothing, so the request
+            // here found no media state and prepared nothing, so the request
             // held the encode phase and never advanced.
             if let CallKind::Media(media_call) = kind
                 && let Some(state) = self.media_state(id)
@@ -293,10 +293,10 @@ impl Scheduler {
                     self.record_domain_backpressure(kind);
                     continue;
                 }
-                let Some(component) = self.info.media_components.get(&media_call).cloned() else {
+                let Some(stage) = self.info.media_stages.get(&media_call).cloned() else {
                     continue;
                 };
-                let key = (phase, component);
+                let key = (phase, stage);
                 let (batch, layouts) = kind_batches.entry(key.clone()).or_insert_with(|| {
                     kind_order.push(key);
                     (
@@ -308,17 +308,17 @@ impl Scheduler {
                     self.invariant_broken("a batch's request count fits the IPC index");
                     return Vec::new();
                 };
-                let planned = self.plan_media_call(
+                let prepared = self.prepare_media_call(
                     id,
                     media_call,
                     CallId::new(batch.id, request_index),
                     &mut admissions,
                 );
-                match planned {
-                    Ok(planned) => {
+                match prepared {
+                    Ok(prepared) => {
                         // A media call states no token rows: its batch's device layout is the
                         // computation's own (`attach_media`).
-                        batch.requests.push(planned);
+                        batch.requests.push(prepared);
                         layouts.push(columns::CallLayout::default());
                     }
                     Err(invariant) => {
@@ -330,7 +330,7 @@ impl Scheduler {
                 selected += 1;
                 continue;
             }
-            // Build one call when its exact resident resources fit. A prefill
+            // Build one call when its exact resources it holds fit. A prefill
             // chunk draws on the prefill budget a warming epoch bounds, and its
             // size is the output's: the mechanism clips it only to what is left.
             let writes_prefix = batch_kind(kind) == BatchKind::Prefill;
@@ -345,12 +345,12 @@ impl Scheduler {
             if call_budget == 0 {
                 continue;
             }
-            let planned = if refill {
-                self.plan_refill(id, call_budget)
+            let prepared = if refill {
+                self.prepare_refill(id, call_budget)
             } else {
                 self.next_generation_call(id, call_budget, rows_left)
             };
-            if let Some(mut call) = planned {
+            if let Some(mut call) = prepared {
                 if call.kind != kind {
                     // The request's state moved past the phase the output named:
                     // the output is executed as far as the state allows.
@@ -392,7 +392,7 @@ impl Scheduler {
                 // the row, which is the one whose steps release it.
                 let Some(reserved_buffers) = self.reserve_generation_resources(&call) else {
                     self.record_domain_backpressure(call.kind);
-                    // Planning a forward advanced `num_cache_units_sent` past its
+                    // Preparing a forward advanced `num_cache_units_sent` past its
                     // fresh units; roll it back so the next output declares them.
                     if let Some(state) = self.requests.tokens_mut(&id) {
                         state.num_cache_units_sent = state
@@ -418,7 +418,7 @@ impl Scheduler {
 
                 // Identify the call by its batch and row, and stamp the
                 // coordinates projected through the request's in-flight calls.
-                let key = (phase, call.component.clone());
+                let key = (phase, call.stage.clone());
                 let (batch, layouts) = kind_batches.entry(key.clone()).or_insert_with(|| {
                     kind_order.push(key);
                     (
@@ -462,7 +462,7 @@ impl Scheduler {
                         generated_token_ids.push(st.next_token);
                         // The decode group's slot holds none of the request's sampling state yet:
                         // its first token batch there starts it.
-                        st.sampling_resident = false;
+                        st.sampling_on_device = false;
                     }
                     // Admission reserved the request row, and submission
                     // validated the parameters this admission carries.
@@ -578,7 +578,7 @@ impl Scheduler {
         let mut batches = Vec::with_capacity(kind_order.len());
         for kind in kind_order {
             let Some((mut batch, layouts)) = kind_batches.remove(&kind) else {
-                self.invariant_broken("every selected phase and component has its batch");
+                self.invariant_broken("every selected phase and stage has its batch");
                 return Vec::new();
             };
             if kind == last {
@@ -592,7 +592,7 @@ impl Scheduler {
                 self.attach_media(&mut batch);
             } else {
                 self.attach_columns(&mut batch, layouts);
-                self.note_state_resident(&batch);
+                self.note_state_on_device(&batch);
             }
             batches.push(batch);
         }
@@ -614,7 +614,7 @@ impl Scheduler {
     fn attach_columns(&self, batch: &mut ExecutionBatch, mut layouts: Vec<columns::CallLayout>) {
         // A batch that leaves without columns is dropped: the calls it names are
         // never submitted and the step serves nothing. Nothing downstream can
-        // tell that from a step the policy planned empty, so each refusal names
+        // tell that from a step the policy prepared empty, so each refusal names
         // itself at debug level (`RUST_LOG=scheduler::scheduler::batching=debug`),
         // which is the one way an epoch that dispatches nothing says why.
         let Some(cache) = self.storage.cache() else {
@@ -674,7 +674,7 @@ impl Scheduler {
                     units_per_page: u32::try_from(shape.units_per_page).ok()?,
                 })
             });
-        let mut resident = Vec::with_capacity(batch.requests.len());
+        let mut on_device = Vec::with_capacity(batch.requests.len());
         let mut fresh = Vec::with_capacity(batch.requests.len());
         let mut inputs = Vec::with_capacity(batch.requests.len());
         let mut sampling = Vec::with_capacity(batch.requests.len());
@@ -705,12 +705,12 @@ impl Scheduler {
                     .collect(),
             };
             inputs.push(tokens);
-            resident.push(state.state_resident);
+            on_device.push(state.state_on_device);
             // A slot that does not hold the request's sampling state starts it at the tokens the
             // request accepted so far: a decode group's first batch after a hand-off, and a
             // migrated or preempted request's first batch after its admission, continue penalty
             // counts the request began elsewhere.
-            fresh.push((!state.sampling_resident).then_some(state.generated_token_ids.as_slice()));
+            fresh.push((!state.sampling_on_device).then_some(state.generated_token_ids.as_slice()));
             sampling.push(&state.req.sampling);
             draws.push(state.sampling_position);
             // The layout addresses the request's current cache tables. A call
@@ -776,7 +776,7 @@ impl Scheduler {
             block_size,
             max_kv_len,
             state_pages,
-            &resident,
+            &on_device,
             &fresh,
         );
 
@@ -845,15 +845,15 @@ impl Scheduler {
     /// Marks every request a token batch carries as holding its recurrent state in its slot: the
     /// batch's first call of a request restored it there (or started it from zero), so its later
     /// calls continue from the slot's banks and restore nothing.
-    fn note_state_resident(&mut self, batch: &ExecutionBatch) {
+    fn note_state_on_device(&mut self, batch: &ExecutionBatch) {
         if batch.device.is_none() {
             return;
         }
         for (call, _) in &batch.requests {
             if let Some(state) = self.requests.tokens_mut(&call.request_key.request_id) {
-                state.state_resident = true;
+                state.state_on_device = true;
                 // The batch started the request's sampling state on its worker's slot.
-                state.sampling_resident = true;
+                state.sampling_on_device = true;
             }
         }
     }
@@ -862,14 +862,14 @@ impl Scheduler {
     /// (2.4, 4.5).
     ///
     /// The call kind is the output's - the phases this pass selected - and the extent is the
-    /// worker's own answer: `Batches::media` names the bucket its runner planned the computation
+    /// worker's own response: `Batches::media` names the bucket its runner prepared the computation
     /// into, and a batch captured for one canvas serves no other, so the mechanism asks instead of
     /// deriving. A computation the worker states no bucket for, or a request whose state this
     /// scheduler no longer holds, leaves the batch without columns; it is then refused at
     /// submission by name rather than served at a canvas nothing captured.
     ///
     /// The per-request record is `ipc::execution::StagedRequest`: the request's conditioning
-    /// exactly as the model family planned it, and the step, seed and canvas the request states.
+    /// exactly as the model family prepared it, and the step, seed and canvas the request states.
     /// What the model prepares on the device - the encoded conditioning rows, the latent
     /// trajectory - is not here, because the mechanism cannot read it and a placeholder for it
     /// would be an invented tensor.
@@ -943,8 +943,8 @@ impl Scheduler {
             tokens,
             extent,
         };
-        // The worker's answer is the authority on the extent: it is the bucket its own runner
-        // planned the computation into, and a batch captured for one canvas serves no other.
+        // The worker's response is the authority on the extent: it is the bucket its own runner
+        // prepared the computation into, and a batch captured for one canvas serves no other.
         let Some(extent) = self.worker.media(phase, &stated) else {
             tracing::debug!(
                 "a media batch is dropped: no device of this rank serves a {:?} computation of \
@@ -1101,7 +1101,7 @@ impl Scheduler {
     /// The token columns of a text encoding batch: each request's prompt, packed, one row per request.
     ///
     /// `None` when the batch names a request this scheduler is not running, which the caller has
-    /// the same answer for as for any other media batch it cannot state.
+    /// the same response for as for any other media batch it cannot state.
     fn prompt_columns(&self, batch: &ExecutionBatch) -> Option<ipc::execution::BatchColumns> {
         let mut columns = ipc::execution::BatchColumns::default();
         columns.rows.query_offsets.push(0);
@@ -1144,7 +1144,7 @@ impl Scheduler {
             // A speculating deployment's decode step verifies the drafts its
             // last forward proposed: the call the mechanism builds from
             // `DecodeUnd` is a verification, and the phase a policy reads must
-            // be the one that call runs in, or the batch is planned under one
+            // be the one that call runs in, or the batch is prepared under one
             // kind and built under another and is dropped unnamed.
             Phase::DecodeUnd if self.speculates() => CallKind::Forward(ForwardMode::Verify),
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
@@ -1197,7 +1197,7 @@ impl Scheduler {
             && let Some((_, first)) = batch.requests.first()
             && batch.requests.iter().all(|(call, dispatch)| {
                 dispatch.worker == first.worker
-                    && call.component == DEFAULT_BLOCK
+                    && call.stage == DEFAULT_BLOCK
                     && matches!(
                         call.kind,
                         CallKind::Forward(ForwardMode::Prefill | ForwardMode::Decode)

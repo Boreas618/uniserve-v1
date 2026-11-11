@@ -50,7 +50,7 @@ pub use arrival::Arrival;
 pub use budget::{Shares, Step, prefill_chunk, work_tokens};
 pub use decision::{Inflight, DispatchOutput, Room, Shortage, Storage, Victim, Work};
 pub use event::{End, Event};
-pub use ids::{ComponentId, EncodingId, PageId, PhaseId, RequestId};
+pub use ids::{StageId, EncodingId, PageId, PhaseId, RequestId};
 pub use limits::{Limits, Parameters};
 pub use lru::Lru;
 pub use phases::Phases;

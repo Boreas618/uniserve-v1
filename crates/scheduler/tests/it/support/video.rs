@@ -1,15 +1,15 @@
 //! The video pool and requests shared by the tests of video scheduling: the
-//! pool's components, their products and the ranks each component is
+//! pool's stages, their products and the ranks each stage is
 //! launched on, served by `testkit::FakeBatches` with `testkit::Media`
-//! answering its media calls.
+//! responding to its media calls.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ipc::execution::{Inventory, PoolLayout};
 use ipc::{
-    CallKind, ComponentInfo, DiffusionSamplingParams, DimBound, MainProcessInfo, MediaCall,
-    OutputInfo, RasterAxes, RequestId, ShapeBound,
+    CallKind, DiffusionSamplingParams, DimBound, MainProcessInfo, MediaCall, OutputInfo,
+    RasterAxes, RequestId, ShapeBound, StageInfo,
 };
 use proto::tensor::DType;
 use proto::video::Canvas;
@@ -22,24 +22,24 @@ pub(crate) const STEPS: u32 = 3;
 /// Every request carries the same short prompt.
 pub(crate) const PROMPT: [u32; 3] = [11, 12, 13];
 
-/// Declares one loaded component: the outputs its ranks report and the
-/// component config the pool is launched with, assigning it `ranks`.
+/// Declares one loaded stage: the outputs its ranks report and the
+/// stage config the pool is launched with, assigning it `ranks`.
 ///
-/// A distributed component reconstructs one media unit per rank per round
+/// A distributed stage reconstructs one media unit per rank per round
 /// (`units_per_rank` of one) and keeps the default parallel config, whose
 /// world size of one is what a temporal-unit distribution requires.
-pub(crate) fn component(
+pub(crate) fn stage(
     name: &str,
     ranks: Vec<usize>,
     distributed: bool,
     outputs: Vec<OutputInfo>,
-) -> (ComponentInfo, BlockConfig) {
+) -> (StageInfo, BlockConfig) {
     let mut config = BlockConfig::parallel(ranks);
     if distributed {
         config.distribution = Some(BlockDistribution::TemporalUnits);
     }
 
-    let info = ComponentInfo {
+    let info = StageInfo {
         name: name.to_owned(),
         outputs,
     };
@@ -74,7 +74,7 @@ pub(crate) fn rows(name: &str, max: u32, width: u32, dtype: DType) -> OutputInfo
     }
 }
 
-/// Bounds of the condition products the fixture's components declare.
+/// Bounds of the condition products the fixture's stages declare.
 pub(crate) const MAX_CONDITION_ROWS: u32 = 4_096;
 pub(crate) const MAX_CONDITION_PIXELS: u32 = 1 << 20;
 pub(crate) const MAX_VISION_PATCHES: u32 = 4_096;
@@ -108,17 +108,17 @@ pub(crate) fn media_units(name: &str, units: u32) -> OutputInfo {
     }
 }
 
-/// The fixture's components: the media reader, text encoder, audio decoder
+/// The fixture's stages: the media reader, text encoder, audio decoder
 /// and muxer on rank 0; the denoiser on the first `denoising_ranks` ranks, as
 /// a sequence-parallel denoiser runs; and the latent encoder, video decoder
 /// and video codec distributed over `decoder_ranks` ranks, each
 /// reconstructing and encoding one media unit per round.
-pub(crate) fn video_components(
+pub(crate) fn video_stages(
     decoder_ranks: usize,
     denoising_ranks: usize,
-) -> Vec<(ComponentInfo, BlockConfig)> {
+) -> Vec<(StageInfo, BlockConfig)> {
     vec![
-        component(
+        stage(
             "media_reader",
             vec![0],
             false,
@@ -128,7 +128,7 @@ pub(crate) fn video_components(
                 rows("vision_pixels", MAX_VISION_PATCHES, 1536, DType::F32),
             ],
         ),
-        component(
+        stage(
             "text_encoder",
             vec![0],
             false,
@@ -142,7 +142,7 @@ pub(crate) fn video_components(
                 ),
             ],
         ),
-        component(
+        stage(
             "latent_encoder",
             (0..decoder_ranks).collect(),
             true,
@@ -161,44 +161,44 @@ pub(crate) fn video_components(
                 ),
             ],
         ),
-        component(
+        stage(
             "denoiser",
             (0..denoising_ranks).collect(),
             false,
             vec![output("video_latents", None), output("audio_latents", None)],
         ),
-        component(
+        stage(
             "video_decoder",
             (0..decoder_ranks).collect(),
             true,
             vec![media_units("video_units", 32)],
         ),
-        component(
+        stage(
             "video_codec",
             (0..decoder_ranks).collect(),
             true,
             vec![output("encoded_units", Some(32))],
         ),
-        component(
+        stage(
             "audio_decoder",
             vec![0],
             true,
             vec![output("audio_samples", None)],
         ),
-        component("muxer", vec![0], false, Vec::new()),
+        stage("muxer", vec![0], false, Vec::new()),
     ]
 }
 
 /// What every rank of the fixture's video pool reports: every media call, a
 /// denoiser of [`STEPS`] steps that takes conditions, `host_task_capacity`
-/// host tasks, and `components`.
+/// host tasks, and `stages`.
 ///
-/// Calls route to components the way a loaded model reports them: the video
-/// encoder component encodes the media units the decoder produced, and the
+/// Calls route to stages the way a loaded model reports them: the video
+/// encoder stage encodes the media units the decoder produced, and the
 /// muxer encodes audio and assembles the artifact.
 pub(crate) fn video_info(
     host_task_capacity: u32,
-    components: &[(ComponentInfo, BlockConfig)],
+    stages: &[(StageInfo, BlockConfig)],
 ) -> MainProcessInfo {
     MainProcessInfo {
         supported_calls: MediaCall::ALL
@@ -217,8 +217,8 @@ pub(crate) fn video_info(
             description: b"{}".to_vec(),
         }),
         host_task_capacity,
-        components: components.iter().map(|(info, _)| info.clone()).collect(),
-        media_components: BTreeMap::from([
+        stages: stages.iter().map(|(info, _)| info.clone()).collect(),
+        media_stages: BTreeMap::from([
             (MediaCall::MediaReading, "media_reader".to_owned()),
             (MediaCall::VisionEncoding, "text_encoder".to_owned()),
             (MediaCall::LatentEncoding, "latent_encoder".to_owned()),
@@ -235,7 +235,7 @@ pub(crate) fn video_info(
     }
 }
 
-/// The fixture's video pool, named `sim`, on one host: [`video_components`]
+/// The fixture's video pool, named `sim`, on one host: [`video_stages`]
 /// over as many ranks as they span, each reporting [`video_info`].
 ///
 /// A deep queue keeps queue capacity from bounding which calls are in flight
@@ -245,8 +245,8 @@ pub(crate) fn video_pool(
     host_task_capacity: u32,
     denoising_ranks: usize,
 ) -> Inventory {
-    let components = video_components(decoder_ranks, denoising_ranks);
-    let info = video_info(host_task_capacity, &components);
+    let stages = video_stages(decoder_ranks, denoising_ranks);
+    let info = video_info(host_task_capacity, &stages);
     let ranks = decoder_ranks.max(denoising_ranks).max(1);
 
     Inventory {
@@ -255,7 +255,7 @@ pub(crate) fn video_pool(
         layout: PoolLayout {
             queue_depth: 64,
             ranks,
-            components: components
+            stages: stages
                 .into_iter()
                 .map(|(info, config)| (info.name, config))
                 .collect(),
@@ -264,11 +264,11 @@ pub(crate) fn video_pool(
     }
 }
 
-/// A fake worker serving `pools` whose media calls `media` answers.
+/// A fake worker serving `pools` whose media calls `media` responses.
 pub(crate) fn video_fake(pools: Vec<Inventory>, media: &Arc<Media>) -> Arc<FakeBatches> {
     Arc::new(
         FakeBatches::new(pools)
-            .answering(Arc::clone(media).answering())
+            .with_output(Arc::clone(media).output_fn())
             .with_media(Arc::new(Media::serves)),
     )
 }
@@ -285,7 +285,7 @@ pub(crate) fn video_request(id: u64, video_units: u32) -> Request {
             num_frames: 16,
             video_units,
             seed: id,
-            // The fixture decoder's raster (`video_components`).
+            // The fixture decoder's raster (`video_stages`).
             width: 24,
             height: 16,
             condition_rows: 0,

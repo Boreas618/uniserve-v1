@@ -1,7 +1,7 @@
 //! A stand-in for a main process's request interface, for the daemon's tests.
 //!
 //! The daemon's tests drive a real `Leader` over the request interface. A
-//! serving deployment answers that interface in the engine's main process
+//! serving deployment responds to that interface in the engine's main process
 //! (`engine::process::requests`), whose construction loads ranks onto devices
 //! from a launch file, so these tests serve it from here instead, over
 //! production schedulers whose worker is the batch-interface fake
@@ -9,7 +9,7 @@
 //!
 //! The daemon submits requests and commands; the stand-in routes each request
 //! as the engine does, by the routing policy's `route` decision on the control
-//! thread's instance (`scheduler::Router::route`), answers it `Accepted`
+//! thread's instance (`scheduler::Router::route`), responds to it `Accepted`
 //! naming the scheduler, and forwards its events. A request that resumes a
 //! cache this stand-in recorded goes back to the scheduler that stored it.
 //! Each scheduler's statistics go to the daemon once a second. The storage
@@ -49,7 +49,7 @@ use scheduler::{
 };
 use scheduling::guest::view::RankView;
 
-/// What the stand-in answers a command over the deployment's storage ledgers or transfer budgets,
+/// What the stand-in responds to a command over the deployment's storage ledgers or transfer budgets,
 /// as an engine process does (`engine::process::requests::LEDGERS`).
 const LEDGERS: &str = "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
      by an epoch's main process";
@@ -177,7 +177,7 @@ impl Routing {
     /// `steps` is the epoch's steps — a scheduler takes one per policy step, and
     /// the ranks step together, so it is the largest count any rank reached —
     /// while `batches` counts every batch every rank finalized, which is larger
-    /// because a step submits one batch per (phase, component). `tokens` sums
+    /// because a step submits one batch per (phase, stage). `tokens` sums
     /// the tokens the workers' forwards carried, `queue` is each rank's waiting
     /// depth, and `policy_fuel` and `policy_calls` are the instances' own
     /// figures, summed by [`policy_usage`] (§12). The device's counters and the
@@ -195,9 +195,9 @@ impl Routing {
             metrics.steps = metrics
                 .steps
                 .max(progress.as_ref().map_or(0, |progress| progress.step));
-            // A scheduler that did not answer this tick, and one that has no
+            // A scheduler that did not respond to this tick, and one that has no
             // policy yet, states no cost: the frame undercounts that rank's
-            // cumulative figure until the rank answers again.
+            // cumulative figure until the rank responds again.
             reported.push(progress.and_then(|progress| progress.usage));
             let stats = slot.handle.stats();
             metrics.batches += stats.general.steps.load(Ordering::Relaxed);
@@ -339,7 +339,7 @@ enum Control {
 /// The connection has said hello and been welcomed, and the engine has
 /// reported itself ready; from here on it carries submissions, commands,
 /// events, acceptances and statistics. When every scheduler fails, the
-/// engine reports itself failed and goes on answering each submission with
+/// engine reports itself failed and goes on responding to each submission with
 /// an error.
 ///
 /// # Errors
@@ -422,7 +422,7 @@ fn serve(
     );
     anyhow::ensure!(!routing.slots.is_empty(), "the engine runs no scheduler");
     // A caller that names the epoch's starting policy installs it before the
-    // first submission is read: the control thread's route instance answers
+    // first submission is read: the control thread's route instance responds
     // from it, and without one every request is refused as unroutable.
     if let Some(policy) = start {
         routing
@@ -622,7 +622,7 @@ fn read_requests(
                     warm_cache(warm, front, routing);
                 }
                 Some(wire::engine_command::Kind::DescribeStorage(describe)) => {
-                    // As an engine process answers it: the storage ledgers and the transfer
+                    // As an engine process responds to it: the storage ledgers and the transfer
                     // budgets are each node's daemon's, read over its claim, and an epoch's main
                     // process holds no claim of the deployment's.
                     routing.send(
@@ -647,7 +647,7 @@ fn read_requests(
                         .map(|(path, order)| (path.clone(), order.experts.clone()))
                         .collect::<std::collections::BTreeMap<_, _>>();
                     let together = scheduler::HookBarrier::new(routing.slots.len());
-                    let answers = routing
+                    let responses = routing
                         .slots
                         .iter()
                         .map(|slot| {
@@ -655,7 +655,7 @@ fn read_requests(
                                 .commit_experts(order.clone(), Arc::clone(&together))
                         })
                         .collect();
-                    answer_hooked(commit.id, answers, front, routing);
+                    respond_hooked(commit.id, responses, front, routing);
                 }
                 Some(wire::engine_command::Kind::ResizeCache(resize)) => {
                     resize_cache(&resize, front, routing);
@@ -684,7 +684,7 @@ fn read_requests(
                         ?in_flight,
                         "updating the weights in place"
                     );
-                    let answers: Vec<_> = routing
+                    let responses: Vec<_> = routing
                         .slots
                         .iter()
                         .map(|slot| {
@@ -692,7 +692,7 @@ fn read_requests(
                                 .update_weights(update.model_path.clone(), in_flight)
                         })
                         .collect();
-                    answer_hooked(update.id, answers, front, routing);
+                    respond_hooked(update.id, responses, front, routing);
                 }
                 Some(wire::engine_command::Kind::Configure(configure)) => {
                     configure_schedulers(configure, front, routing);
@@ -746,7 +746,7 @@ fn submit_all(
         };
         let arrival = Arrival::of(id, &request, recovered);
         let Some(index) = recovered.or_else(|| routing.route(&arrival)) else {
-            // The route policy could not answer — it failed and no previous
+            // The route policy could not respond — it failed and no previous
             // policy could take over, or no rank is alive to serve — so the
             // request cannot be placed in this epoch (§7.3).
             let (event, _) = Event::Error {
@@ -824,9 +824,9 @@ fn submit_all(
     }
 }
 
-/// Answers one of the engine's own operations (`wire::Hook`) the daemon names, as an engine whose
-/// schedulers' workers have no device answers it: one result per scheduler, and the daemon `front`
-/// gets them as `Hooked`. The engine process answers these itself (`engine::process::operations`),
+/// Responds to one of the engine's own operations (`wire::Hook`) the daemon names, as an engine whose
+/// schedulers' workers have no device responds to it: one result per scheduler, and the daemon `front`
+/// gets them as `Hooked`. The engine process responds to these itself (`engine::process::operations`),
 /// beside its schedulers, so no scheduler takes part.
 fn run_hook(hook: wire::Hook, front: usize, routing: &Arc<Routing>) {
     let (results, error) = match engine_operation(&hook.name, &hook.payload) {
@@ -843,9 +843,9 @@ fn run_hook(hook: wire::Hook, front: usize, routing: &Arc<Routing>) {
     );
 }
 
-/// What an engine without devices answers to its operation `name` with the JSON `payload`: a
+/// What an engine without devices responds to its operation `name` with the JSON `payload`: a
 /// profiling session it takes part in runs no collector and writes no file, it has no fence probes
-/// to switch, and it loads and unloads LoRA adapters by answering the adapter's slot. Every other
+/// to switch, and it loads and unloads LoRA adapters by responding to the adapter's slot. Every other
 /// name, an expert redistribution's among them, is refused, as no rank holds routed experts.
 fn engine_operation(name: &str, payload: &str) -> Result<serde_json::Value, String> {
     let value = || -> Result<serde_json::Value, String> {
@@ -895,7 +895,7 @@ fn engine_operation(name: &str, payload: &str) -> Result<serde_json::Value, Stri
 }
 
 /// Assigns a continuation to a DP scheduler by its original request identity.
-/// Planning and reservation use this same assignment; `schedulers` is nonzero.
+/// Preparing and reservation use this same assignment; `schedulers` is nonzero.
 fn continuation_slot(origin: u64, schedulers: usize) -> usize {
     (origin % schedulers as u64) as usize
 }
@@ -979,16 +979,16 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
         operation => vec![operation; routing.slots.len()],
     };
     let together = scheduler::HookBarrier::new(routing.slots.len());
-    let answers = routing
+    let responses = routing
         .slots
         .iter()
         .zip(operations)
         .map(|(slot, operation)| slot.handle.cache_warm(operation, Arc::clone(&together)))
         .collect();
-    answer_hooked(warm.id, answers, front, routing);
+    respond_hooked(warm.id, responses, front, routing);
 }
 
-/// Gives back or restores every scheduler's KV cache storage, and answers
+/// Gives back or restores every scheduler's KV cache storage, and responds
 /// the daemon `front` with `Hooked` as `run_hook` does.
 fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>) {
     let change = match scheduler::CacheChange::from_wire(resize) {
@@ -1007,19 +1007,19 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
     };
     tracing::info!(?change, "changing the KV cache storage");
     if resize.keep_weights.is_empty() {
-        let answers: Vec<_> = routing
+        let responses: Vec<_> = routing
             .slots
             .iter()
             .map(|slot| slot.handle.resize_cache(change.clone()))
             .collect();
-        answer_hooked(resize.id, answers, front, routing);
+        respond_hooked(resize.id, responses, front, routing);
         return;
     }
     // The epochs that keep their weights alone release the rest of their
     // storage on every node first, and move their weights to host storage when
     // asked (the deployment's claims cover every node, so the first
     // scheduler asks), on a thread of its own: the change then finds it on
-    // each GPU's ledger. The answer carries each node's report of the
+    // each GPU's ledger. The response carries each node's report of the
     // weights kept, wrapped as `{"kept": ...}`, before the schedulers'.
     let (id, epochs, to_host, cache_keys) = (
         resize.id,
@@ -1055,34 +1055,34 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
                 .into_iter()
                 .map(|report| format!("{{\"kept\":{report}}}"))
                 .collect();
-            let answers: Vec<_> = routing
+            let responses: Vec<_> = routing
                 .slots
                 .iter()
                 .map(|slot| slot.handle.resize_cache(change.clone()))
                 .collect();
-            answer_hooked_after(id, reports, answers, front, &routing);
+            respond_hooked_after(id, reports, responses, front, &routing);
         });
     if let Err(error) = spawned {
         tracing::error!(%error, "the keep-weights thread did not start");
     }
 }
 
-/// Answers the daemon `front` with `Hooked` once every scheduler answered,
+/// Responds to the daemon `front` with `Hooked` once every scheduler responded,
 /// on a thread of its own.
-fn answer_hooked(
+fn respond_hooked(
     id: u64,
-    answers: Vec<crossbeam_channel::Receiver<Result<Vec<String>, String>>>,
+    responses: Vec<crossbeam_channel::Receiver<Result<Vec<String>, String>>>,
     front: usize,
     routing: &Arc<Routing>,
 ) {
-    answer_hooked_after(id, Vec::new(), answers, front, routing);
+    respond_hooked_after(id, Vec::new(), responses, front, routing);
 }
 
-/// [`answer_hooked`], with `first` before the schedulers' results.
-fn answer_hooked_after(
+/// [`respond_hooked`], with `first` before the schedulers' results.
+fn respond_hooked_after(
     id: u64,
     first: Vec<String>,
-    answers: Vec<crossbeam_channel::Receiver<Result<Vec<String>, String>>>,
+    responses: Vec<crossbeam_channel::Receiver<Result<Vec<String>, String>>>,
     front: usize,
     routing: &Arc<Routing>,
 ) {
@@ -1092,8 +1092,8 @@ fn answer_hooked_after(
         .spawn(move || {
             let mut results = first;
             let mut error = String::new();
-            for answer in answers {
-                match answer.recv() {
+            for response in responses {
+                match response.recv() {
                     Ok(Ok(found)) => results.extend(found),
                     Ok(Err(failed)) if error.is_empty() => error = failed,
                     Ok(Err(_)) => {}
@@ -1116,12 +1116,12 @@ fn answer_hooked_after(
 }
 
 /// Gives every scheduler the limits `configure` states, on a thread of its
-/// own so that the daemons' other commands go on, and answers the daemon
+/// own so that the daemons' other commands go on, and responds to the daemon
 /// `front` with `Configured`. A scheduler that refuses them keeps its own;
 /// the others have taken theirs.
 fn configure_schedulers(configure: wire::Configure, front: usize, routing: &Arc<Routing>) {
     let id = configure.id;
-    let answer = move |error: String| {
+    let response = move |error: String| {
         Frame::plain(from_engine::Kind::Configured(wire::Configured {
             id,
             error,
@@ -1135,12 +1135,12 @@ fn configure_schedulers(configure: wire::Configure, front: usize, routing: &Arc<
     {
         Ok(limits) => limits,
         Err(error) => {
-            routing.send(front, answer(format!("{error:#}")));
+            routing.send(front, response(format!("{error:#}")));
             return;
         }
     };
     tracing::info!(?limits, "configuring the schedulers");
-    let answers: Vec<_> = routing
+    let responses: Vec<_> = routing
         .slots
         .iter()
         .map(|slot| slot.handle.configure(limits.clone()))
@@ -1150,8 +1150,8 @@ fn configure_schedulers(configure: wire::Configure, front: usize, routing: &Arc<
         .name("configure".to_owned())
         .spawn(move || {
             let mut error = String::new();
-            for answer in answers {
-                let failed = match answer.recv() {
+            for response in responses {
+                let failed = match response.recv() {
                     Ok(Ok(())) => continue,
                     Ok(Err(failed)) => failed,
                     Err(_) => "a scheduler stopped".to_owned(),
@@ -1160,7 +1160,7 @@ fn configure_schedulers(configure: wire::Configure, front: usize, routing: &Arc<
                     error = failed;
                 }
             }
-            routing.send(front, answer(error));
+            routing.send(front, response(error));
         });
     if let Err(error) = spawned {
         tracing::error!(%error, "the configure thread did not start");
@@ -1230,7 +1230,7 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
     }
 }
 
-/// Parks every scheduler at once, on a thread of its own, and answers the
+/// Parks every scheduler at once, on a thread of its own, and responds to the
 /// daemon `front` with `Parked` and every scheduler's prefix cache index,
 /// each by the worker group whose cache it indexes; every daemon reads the
 /// engine's new state.
@@ -1243,16 +1243,16 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
         tracing::info!("the engine parks already");
     }
     tracing::info!("the engine parks");
-    // A scheduler that stopped on a fatal failure answers no park: it handed
+    // A scheduler that stopped on a fatal failure responds to no park: it handed
     // its requests back, or ended them, as it stopped, and its thread then
     // closes its workers, which the park does not wait for.
-    let answers: Vec<_> = routing
+    let responses: Vec<_> = routing
         .slots
         .iter()
         .enumerate()
         .map(|(index, slot)| {
-            let answer = (!slot.handle.is_dead()).then(|| slot.handle.park(lend));
-            (index, slot.handle.cache_workers(), answer)
+            let response = (!slot.handle.is_dead()).then(|| slot.handle.park(lend));
+            (index, slot.handle.cache_workers(), response)
         })
         .collect();
     let routing = Arc::clone(routing);
@@ -1261,14 +1261,14 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
         .spawn(move || {
             let mut index = Vec::new();
             let mut error = String::new();
-            for (slot_index, group, answer) in answers {
-                let Some(answer) = answer else {
+            for (slot_index, group, response) in responses {
+                let Some(response) = response else {
                     if error.is_empty() {
                         error = "a scheduler stopped".to_owned();
                     }
                     continue;
                 };
-                match answer.recv() {
+                match response.recv() {
                     Ok(Ok(parked)) => {
                         for resume in parked.pages.iter().filter_map(|page| page.resume) {
                             lock(&routing.cache_routes).insert(resume, slot_index);
@@ -1302,7 +1302,7 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
 }
 
 /// Resumes every parked scheduler, retires the epochs `resume` names first,
-/// on a thread of its own, and answers the daemon `front` with `Hooked`;
+/// on a thread of its own, and responds to the daemon `front` with `Hooked`;
 /// every daemon reads that the engine serves again.
 fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>) {
     tracing::info!(retire = ?resume.retire, "the parked engine resumes");
@@ -1313,7 +1313,7 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
     // An epoch the resume retires writes none of the engine's storage any
     // more: each scheduler takes back the cache units it lent it.
     let preempt = !resume.retire.is_empty();
-    let answers: Vec<_> = routing
+    let responses: Vec<_> = routing
         .slots
         .iter()
         .map(|slot| slot.handle.resume(preempt))
@@ -1330,8 +1330,8 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
                     Err(_) => error = "a scheduler stopped".to_owned(),
                 }
             }
-            for answer in answers {
-                match answer.recv() {
+            for response in responses {
+                match response.recv() {
                     Ok(Ok(())) => {}
                     Ok(Err(failed)) if error.is_empty() => error = failed,
                     Ok(Err(_)) => {}
@@ -1367,7 +1367,7 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
 
 /// Commits the engine's epoch: publishes its pages, retires the epochs `commit` names (the
 /// predecessor), then commits every scheduler, on a thread of its own, and
-/// answers the daemon `front` with `Hooked` and every worker's report.
+/// responds to the daemon `front` with `Hooked` and every worker's report.
 fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>) {
     tracing::info!(
         retire = ?commit.retire,
@@ -1396,13 +1396,13 @@ fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>)
                 }
             }
             if error.is_empty() {
-                let answers: Vec<_> = routing
+                let responses: Vec<_> = routing
                     .slots
                     .iter()
                     .map(|slot| slot.handle.commit())
                     .collect();
-                for answer in answers {
-                    match answer.recv() {
+                for response in responses {
+                    match response.recv() {
                         Ok(Ok(found)) => results.extend(found),
                         Ok(Err(failed)) if error.is_empty() => error = failed,
                         Ok(Err(_)) => {}
@@ -1429,9 +1429,9 @@ fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>)
 }
 
 /// Reports every worker group's KV cache as it holds it now, on a thread of
-/// its own, and answers the daemon `front` with `CacheDescribed`.
+/// its own, and responds to the daemon `front` with `CacheDescribed`.
 fn describe_caches(id: u64, front: usize, routing: &Arc<Routing>) {
-    let answers: Vec<_> = routing
+    let responses: Vec<_> = routing
         .slots
         .iter()
         .map(|slot| slot.handle.describe_cache())
@@ -1442,8 +1442,8 @@ fn describe_caches(id: u64, front: usize, routing: &Arc<Routing>) {
         .spawn(move || {
             let mut segments = Vec::new();
             let mut error = String::new();
-            for answer in answers {
-                match answer.recv() {
+            for response in responses {
+                match response.recv() {
                     Ok(Ok(groups)) => segments.extend(groups.into_iter().map(wire_cache)),
                     Ok(Err(failed)) if error.is_empty() => error = failed,
                     Ok(Err(_)) => {}
@@ -1473,7 +1473,7 @@ fn describe_caches(id: u64, front: usize, routing: &Arc<Routing>) {
 
 /// Collect each scheduler's accepted request inventory without stopping it.
 fn describe_requests(id: u64, front: usize, routing: &Arc<Routing>) {
-    let answers: Vec<_> = routing
+    let responses: Vec<_> = routing
         .slots
         .iter()
         .map(|slot| slot.handle.describe_requests())
@@ -1484,8 +1484,8 @@ fn describe_requests(id: u64, front: usize, routing: &Arc<Routing>) {
         .spawn(move || {
             let mut requests = Vec::new();
             let mut error = String::new();
-            for answer in answers {
-                match answer.recv() {
+            for response in responses {
+                match response.recv() {
                     Ok(prefixes) => requests.extend(prefixes),
                     Err(_) => error = "a scheduler stopped".to_owned(),
                 }
@@ -1525,7 +1525,7 @@ fn wire_cache(group: scheduler::GroupCache) -> wire::CacheSegments {
     }
 }
 
-/// Answers the requests a parked engine is submitted: a token request and a
+/// Responds to the requests a parked engine is submitted: a token request and a
 /// video request leave at once as migratable, as the ones it held did, and a
 /// submission that does not decode is refused.
 fn refuse_unready(submit: wire::Submit, front: usize, routing: &Routing) {
@@ -1547,7 +1547,7 @@ fn refuse_unready(submit: wire::Submit, front: usize, routing: &Routing) {
     }
 }
 
-/// Answers a submission that does not decode with its rejection.
+/// Responds to a submission that does not decode with its rejection.
 fn refuse(front: usize, routing: &Routing, id: RequestId, message: String) {
     let (event, _) = Event::Rejected {
         kind: proto::request::RejectionKind::Invalid,

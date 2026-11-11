@@ -1,8 +1,8 @@
-//! Answers to media batches, read from what the mechanism staged for each request.
+//! Responds to media batches, read from what the mechanism staged for each request.
 //!
 //! A media batch carries no token columns: each of its rows is one request's staged record
 //! ([`ipc::execution::StagedRequest`]), which names the request, the diffusion step the call runs
-//! and, for a muxing call, the encoded rounds it hands over. [`Media`] answers such a batch the way
+//! and, for a muxing call, the encoded rounds it hands over. [`Media`] responds such a batch the way
 //! a media runner's completion reads:
 //!
 //! - a latent preparation opens its trajectory at the step its restore stored, or at zero;
@@ -23,9 +23,9 @@ use ipc::execution::{
 };
 use ipc::{CallStatus, ErrorCode, MediaCall, RankLatentLayout, RequestId, TimingCounters};
 
-use crate::batches::Answer;
+use crate::batches::OutputFn;
 
-/// The media half of a fake worker: what its media calls answer.
+/// The media half of a fake worker: what its media calls response.
 #[derive(Default)]
 pub struct Media {
     /// Requests whose media calls the model refuses, with the reason it states.
@@ -65,9 +65,9 @@ impl Media {
             .insert(id, reason.to_owned());
     }
 
-    /// The answer of a fake whose batches are all media batches.
-    pub fn answering(self: Arc<Self>) -> Answer {
-        Arc::new(move |batch| self.answer(batch))
+    /// The response of a fake whose batches are all media batches.
+    pub fn output_fn(self: Arc<Self>) -> OutputFn {
+        Arc::new(move |batch| self.output(batch))
     }
 
     /// The bucket a fake serves `computation` in: the extent the mechanism stated, so every media
@@ -78,7 +78,7 @@ impl Media {
 
     /// The completion of media batch `batch`; a batch without media columns fails, since no
     /// runner of this fake serves it.
-    pub fn answer(&self, batch: &Batch) -> Outcome<BatchOutput> {
+    pub fn output(&self, batch: &Batch) -> Outcome<BatchOutput> {
         let Some(columns) = batch.media.as_ref() else {
             return failed(format!("batch {} carries no media columns", batch.id.0));
         };

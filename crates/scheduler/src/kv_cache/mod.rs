@@ -539,7 +539,7 @@ impl BlockPool {
     }
 
     /// Withdraws the units from `first` on from allocation, as the storage
-    /// holding them is to be given back: the queued ones leave the queue,
+    /// holding them is to be given back: the waiting ones leave the queue,
     /// their published pages the prefix index, and the ones requests hold
     /// leave as their holders let them go. Returns how many are held.
     pub(crate) fn withdraw(&self, first: u32) -> usize {
@@ -1295,7 +1295,7 @@ impl BlockPool {
     ///
     /// A page exists for a request only from its publication to its removal,
     /// and the policy mirrors that from these two lists — one `Cached` and one
-    /// `Freed` event each — so no step has to walk the cache to learn what it
+    /// `Freed` event each — so no step has to scan the cache to learn what it
     /// holds.
     pub(crate) fn take_page_changes(&self) -> (Vec<(u32, u32)>, Vec<u32>) {
         let mut inner = lock(&self.inner);
@@ -1784,7 +1784,7 @@ impl BlockTable {
 ///
 /// Every page is a counted reference, so dropping the allocation releases the
 /// sequence's references, and a page shared through the prefix cache stays
-/// resident while another table still holds it.
+/// allocated while another table still holds it.
 #[derive(Debug)]
 pub(crate) struct CacheAllocation {
     pub(crate) tables: Vec<BlockTable>,

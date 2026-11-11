@@ -1,7 +1,7 @@
 //! The in-process path serving a request, without a device.
 //!
 //! `in_process.rs` states what `SchedulerHandle::over_batches` refuses; this
-//! states what it does. The pool here is `ipc::execution::Batches` and answers
+//! states what it does. The pool here is `ipc::execution::Batches` and responds
 //! every batch it is handed with the mechanism's own values — one
 //! `CallOutput::completed` per call it was given, and the batch's timing — so
 //! the whole path runs: the policy admits, the mechanism assembles columns and
@@ -10,7 +10,7 @@
 //!
 //! What the stub does not stand in for: the device. A real worker captures
 //! graphs, stages columns into its arena and derives the token from the model;
-//! this one is handed the mechanism's batch and answers it. Everything between
+//! this one is handed the mechanism's batch and responds to it. Everything between
 //! those two points is the code under test.
 
 use std::sync::Arc;
@@ -22,27 +22,27 @@ use scheduler::{BatchCapacity, Event, GenerationRequest, SchedulerHandle, Stage}
 
 use crate::support::SAMPLED;
 
-/// How long a command answer may take.
+/// How long a command response may take.
 ///
 /// Generous because the first one is the whole boot of a policy: the precopy
 /// compiles the `fcfs` module inside a debug build, on a machine that runs this
 /// suite's tests in parallel. The bound is the harness's, not the mechanism's;
-/// a mechanism that stopped answering would still fail here, only later.
-const ANSWER: Duration = Duration::from_secs(60);
+/// a mechanism that stopped responding would still fail here, only later.
+const RESPONSE: Duration = Duration::from_secs(60);
 
 /// How long a request may take to emit its first token.
 const FIRST_TOKEN: Duration = Duration::from_secs(60);
 
-/// Blocks until a command answers, and answers its result.
+/// Blocks until a command responses, and responds to its result.
 ///
 /// `track_caller` so a timeout names the command that was awaited rather than
 /// the helper: every wait here shares one bound, and a location inside the
-/// helper cannot tell one unanswered command from another.
+/// helper cannot tell one unresolved command from another.
 #[track_caller]
-fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
-    match receiver.recv_timeout(ANSWER) {
+fn response<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
+    match receiver.recv_timeout(RESPONSE) {
         Ok(result) => result,
-        Err(error) => panic!("the scheduler did not answer: {error}"),
+        Err(error) => panic!("the scheduler did not response: {error}"),
     }
 }
 
@@ -97,8 +97,8 @@ fn policy_program(pool: &testkit::FakeBatches) -> scheduler::PolicyProgram {
 fn install(handle: &SchedulerHandle, pool: &testkit::FakeBatches) {
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    answer(handle.precopy_policy(policy_program(pool), source)).expect("the policy is precopied");
-    answer(handle.stage(Stage::Switchover)).expect("the policy serves");
+    response(handle.precopy_policy(policy_program(pool), source)).expect("the policy is precopied");
+    response(handle.stage(Stage::Switchover)).expect("the policy serves");
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn a_request_is_served_through_the_workers_own_batch_path() {
 /// §4.4's dispatch row puts the error on *work* put into the step, and gives
 /// `admit` the other rule in the same row: the mechanism admits in the output's
 /// order, and the first request it cannot place, and those after it, stay
-/// queued. `fcfs` names every queued request, so a refusal here would stop every
+/// queued. `fcfs` names every waiting request, so a refusal here would stop every
 /// epoch that queues more than it can run at once; a stop serves them in turn.
 #[test]
 fn a_request_that_does_not_fit_a_slot_waits_for_one() {
@@ -242,7 +242,7 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
 /// A request that ended leaves nothing for a boundary to wait on.
 ///
 /// The batch that closes a request carries lifecycle commands alone, and the
-/// in-process arm answers those itself: no worker ever reports that batch. A
+/// in-process arm responds to those itself: no worker ever reports that batch. A
 /// window that kept it would never empty again, so every boundary that needs an
 /// empty window, a policy stage first of all, would wait for a result no one
 /// will send.
@@ -282,9 +282,9 @@ fn a_policy_stage_applies_after_a_request_ended() {
     // switchover asks for a boundary with nothing in flight.
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    answer(handle.precopy_policy(policy_program(&serving), source))
+    response(handle.precopy_policy(policy_program(&serving), source))
         .expect("the next policy is precopied");
-    answer(handle.stage(Stage::Switchover)).expect("the next policy serves");
+    response(handle.stage(Stage::Switchover)).expect("the next policy serves");
     handle.shutdown();
 }
 
@@ -361,7 +361,7 @@ fn logprobs_reach_the_requests_that_asked_for_them_alone() {
 
     let logprobs = |asked: bool| -> Vec<Option<f32>> {
         let pool = Arc::new(
-            testkit::FakeBatches::new(vec![crate::support::pool("model")]).answering(Arc::new(
+            testkit::FakeBatches::new(vec![crate::support::pool("model")]).with_output(Arc::new(
                 |batch| {
                     let mut output =
                         testkit::completed(batch, testkit::Tokens::Draw, testkit::Extent::Stated);
@@ -404,7 +404,7 @@ fn logprobs_reach_the_requests_that_asked_for_them_alone() {
         let mut events = engine
             .submit(request)
             .expect("the engine takes the submission");
-        let deadline = Instant::now() + ANSWER;
+        let deadline = Instant::now() + RESPONSE;
         let mut reported = Vec::new();
         while Instant::now() < deadline {
             match events.try_recv() {

@@ -13,7 +13,7 @@ pub(super) struct Warming {
     pub(super) reserved: Vec<Reserved>,
     pub(super) prefill_tokens: Option<usize>,
     /// The tokens of each request in flight its host pages held when no offload
-    /// was on its way: what [`Scheduler::host_coverage`] answers meanwhile.
+    /// was on its way: what [`Scheduler::host_coverage`] responds meanwhile.
     host_tokens: HashMap<RequestId, u32>,
 }
 
@@ -191,11 +191,11 @@ impl Scheduler {
             let manifest = ipc::memory::CacheManifest {
                 pages: storage::manifest::cache::Pages { pages, host },
             };
-            let answers = self
+            let responses = self
                 .worker
                 .operate(&manifest.into())
                 .map_err(|error| format!("{error:#}"))?;
-            ipc::memory::replies::<ipc::memory::CacheManifest>(&answers)
+            ipc::memory::replies::<ipc::memory::CacheManifest>(&responses)
                 .map_err(|error| error.to_string())?
                 .into_iter()
                 .flatten()
@@ -217,7 +217,7 @@ impl Scheduler {
     /// published to the host as it completes (`Scheduler::advance_prefix_pages`),
     /// so the read waits for no copy of its own: the boundary a request offered
     /// holds once no offload is on its way, and until then the last one that
-    /// held answers, which is what a successor's admission can read now.
+    /// held responses, which is what a successor's admission can read now.
     fn host_coverage(&mut self) -> Vec<Prefix> {
         let Some(kv_offload) = self.kv_offload.as_ref() else {
             return Vec::new();

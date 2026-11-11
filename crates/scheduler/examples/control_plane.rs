@@ -3,7 +3,7 @@
 //!
 //! The example exercises scheduling and lifecycle events without requiring a
 //! model worker or GPU. Three text requests share one scheduler thread over
-//! the production submission door, with `testkit::FakeBatches` answering its
+//! the production submission door, with `testkit::FakeBatches` responding to its
 //! batches; the run passes when every request finishes within the
 //! deadline and each text request emits at least one text token. The process exits
 //! with status 1 on failure, and reports an error when the simulation cannot
@@ -63,17 +63,17 @@ fn main() -> anyhow::Result<()> {
     // capacity this pool was built for, prepared by a precopy and served from
     // the switchover.
     let (program, module) = testkit::packaged_policy(capacity);
-    let answered = |answer: crossbeam_channel::Receiver<Result<(), String>>| {
-        answer
+    let responded = |response: crossbeam_channel::Receiver<Result<(), String>>| {
+        response
             .recv()
             .map_err(|_| anyhow::anyhow!("the scheduler stopped"))?
             .map_err(|error| anyhow::anyhow!("the fcfs policy is installed: {error}"))
     };
-    answered(handle.precopy_policy(
+    responded(handle.precopy_policy(
         program,
         std::sync::Arc::new(scheduler::PolicyBytes::new(module)),
     ))?;
-    answered(handle.switchover_policy())?;
+    responded(handle.switchover_policy())?;
 
     let mut rxs: HashMap<RequestId, (String, scheduler::EventRx)> = HashMap::new();
     let mut next_id = 1u64;

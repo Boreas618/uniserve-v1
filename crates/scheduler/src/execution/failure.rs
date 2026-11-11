@@ -127,7 +127,7 @@ impl Scheduler {
     /// request that resumes from its generated tokens leaves as migratable
     /// (`MigrationCause::Loss`) for the daemon to submit again, and one whose
     /// migration began leaves for that migration's cause; requests with no
-    /// call in flight stay queued or running. The lifecycle commands of
+    /// call in flight stay waiting or running. The lifecycle commands of
     /// the dropped batches are acknowledged as if they had completed.
     pub(crate) fn fail_all_inflight(&mut self, msg: &str) {
         self.inflight.pending_submissions.clear();
@@ -312,7 +312,7 @@ impl Scheduler {
 
         // Strip affected requests' calls and admissions from queued batches
         // and retire them together with the calls the failure named. A batch
-        // left empty is forgotten; the rest stay queued with their command
+        // left empty is forgotten; the rest stay waiting with their command
         // receipts kept in step with the commands they still carry.
         let mut retired = loss.retired.clone();
         let mut pending = VecDeque::new();
@@ -505,7 +505,7 @@ impl Scheduler {
     ///
     /// Covers queued media submissions and every running media and token
     /// request; a token request that resumes from its generated tokens
-    /// leaves as migratable (`MigrationCause::Loss`) instead. Queued token
+    /// leaves as migratable (`MigrationCause::Loss`) instead. Waiting token
     /// requests in `waiting` are not touched: every caller latches
     /// engine-fatal first, and `run` then stops and calls
     /// `abort_all_requests`. The dropped batches' lifecycle commands are

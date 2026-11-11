@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ComponentId, EncodingId, PageId, PhaseId, RequestId};
+use crate::ids::{StageId, EncodingId, PageId, PhaseId, RequestId};
 use crate::time::Nanos;
 
 /// The whole state a policy is instantiated with (`Policy::init`).
@@ -21,7 +21,7 @@ pub struct Snapshot {
     /// The step number the snapshot was taken at.
     #[serde(default)]
     pub step: u64,
-    /// Every request the main process holds: queued, resident, and those that
+    /// Every request the main process holds: queued, running, and those that
     /// finished with output events still retained.
     #[serde(default)]
     pub requests: Vec<RequestView>,
@@ -86,7 +86,7 @@ pub struct RequestView {
     /// When the request reached the main process.
     #[serde(default)]
     pub arrived_at: Nanos,
-    /// When the mechanism admitted it; `None` while queued.
+    /// When the mechanism admitted it; `None` while waiting.
     #[serde(default)]
     pub admitted_at: Option<Nanos>,
     /// Tokens of its prompt.
@@ -117,7 +117,7 @@ pub struct RequestView {
     pub last_emitted_at: Option<Nanos>,
     /// Its class.
     pub class: RequestClass,
-    /// Whether a resident request waits for a transfer (KV storage or a host
+    /// Whether a running request waits for a transfer (KV storage or a host
     /// page read) right now. A request that waits for a transfer is not
     /// starved (design §4.4: "驻留且不在等传输的请求超过 ... timeout").
     #[serde(default)]
@@ -167,7 +167,7 @@ pub struct PhaseView {
     pub id: PhaseId,
     pub kind: PhaseKind,
     /// The block that runs it.
-    pub block: ComponentId,
+    pub block: StageId,
 }
 
 /// The kind of a phase, at the granularity scheduling distinguishes.
@@ -298,7 +298,7 @@ pub struct PageView {
     /// Whether the page currently sits in host memory (an offloaded page).
     #[serde(default)]
     pub on_host: bool,
-    /// Whether no resident request continues from the page, so it may be
+    /// Whether no running request continues from the page, so it may be
     /// offloaded to the host KV cache or freed.
     #[serde(default)]
     pub evictable: bool,
@@ -318,7 +318,7 @@ pub struct EncodingView {
 pub struct RankView {
     /// The scheduler index of the rank; `route` returns this index.
     pub index: usize,
-    /// Requests the rank holds in flight or resident.
+    /// Requests the rank holds in flight or running.
     #[serde(default)]
     pub in_flight: u32,
     /// Whether the rank's scheduler is alive.
@@ -336,29 +336,29 @@ pub struct ReplicaView {
     /// The index in this `place` call's replica list; `place` returns it.
     pub index: usize,
     /// The block this replica runs.
-    pub block: ComponentId,
+    pub block: StageId,
     /// Phase kinds this replica can execute.
     #[serde(default)]
     pub kinds: Vec<PhaseKind>,
-    /// Distinct requests resident on it.
+    /// Distinct requests running on it.
     #[serde(default)]
-    pub resident_requests: u32,
+    pub running_requests: u32,
     /// Requests it can still take.
     #[serde(default)]
     pub capacity: u32,
     /// Whether this request's state already lives on it; a request is never
     /// migrated off a replica that holds it (design §4.4, today's
-    /// `component_target`).
+    /// `stage_target`).
     #[serde(default)]
     pub holds_request: bool,
     /// Whether it runs prefill only, so a decode-stage call never lands on it
     /// (today `dispatch.rs`'s prefill-only groups).
     #[serde(default)]
     pub prefills_only: bool,
-    /// Whether it already holds another component of this request, which a
+    /// Whether it already holds another stage of this request, which a
     /// dispatch prefers to a replica that holds none of it.
     #[serde(default)]
-    pub holds_component: bool,
+    pub holds_stage: bool,
 }
 
 /// The call a `place` decision is about: a request's first call on a block.

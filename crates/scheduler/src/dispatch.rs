@@ -1,9 +1,9 @@
 //! Request residency and capability-based worker dispatch.
 //!
 //! The scheduler asks `Dispatch` which loaded worker replica executes a call.
-//! Candidates are the workers whose reported `supported_calls` and component
+//! Candidates are the workers whose reported `supported_calls` and stage
 //! bindings cover the call; once a request is placed on a replica for a
-//! component, its later calls for that component stay there. A request's
+//! stage, its later calls for that stage stay there. A request's
 //! decode calls stay on the replica that took its first decode-stage call,
 //! which is its prefill replica unless that replica only prefills
 //! (`WorkerGroupRole::Prefill`): then its cache is handed off to a decode
@@ -14,7 +14,7 @@ use ipc::ForwardMode;
 
 #[derive(Default)]
 pub(super) struct Dispatch {
-    /// Replica that holds each request's state for one bound component name.
+    /// Replica that holds each request's state for one bound stage name.
     ///
     /// Admission records the prefill worker of a token request and every route
     /// of a media request; `select_worker` records an entry each time it places
@@ -23,7 +23,7 @@ pub(super) struct Dispatch {
     /// `Scheduler::schedule` prunes entries of requests that are no
     /// longer running or retiring.
     pub(super) affinity: HashMap<(RequestKey, String), crate::WorkerGroupId>,
-    /// Replica that decodes each request for one bound component name: the
+    /// Replica that decodes each request for one bound stage name: the
     /// replica of its decode-stage calls (`decodes`), recorded as `affinity`
     /// is.
     pub(super) decode_affinity: HashMap<(RequestKey, String), crate::WorkerGroupId>,
@@ -47,64 +47,60 @@ fn decodes(kind: CallKind) -> bool {
 /// Who chooses the replica a call runs on.
 pub(super) enum Choice {
     /// The mechanism's own rule: the replica holding the request's state, the
-    /// one already serving another of its components, or the one with the
-    /// fewest resident requests.
+    /// one already serving another of its stages, or the one with the
+    /// fewest running requests.
     Existing,
-    /// The policy's answer for a request that has not run there yet: the worker
+    /// The policy's response for a request that has not run there yet: the worker
     /// it named among the candidates `views::replicas` showed it.
     Target(crate::WorkerGroupId),
 }
 
 impl Dispatch {
-    /// Enumerates loaded components that can execute the requested call.
+    /// Enumerates loaded stages that can execute the requested call.
     ///
-    /// Which component serves a media call is the model's state, not the
-    /// engine's: a worker resolves it from the capabilities its components
-    /// implement and reports it as `media_components`. That report is the
+    /// Which stage serves a media call is the model's state, not the
+    /// engine's: a worker resolves it from the capabilities its stages
+    /// implement and reports it as `media_stages`. That report is the
     /// only authority here. Calls without an explicit media route use the
-    /// protocol's default component for an undivided model.
+    /// protocol's default stage for an undivided model.
     pub(super) fn worker_candidates<'a>(
         &'a self,
         epoch: &'a super::submission::Submissions,
         info: &'a MainProcessInfo,
         kind: CallKind,
     ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a MainProcessInfo)> {
-        let component = match kind {
+        let stage = match kind {
             CallKind::Media(media_call) => info
-                .media_components
+                .media_stages
                 .get(&media_call)
                 .map_or(DEFAULT_BLOCK, String::as_str),
             _ => DEFAULT_BLOCK,
         };
-        self.component_candidates(epoch, kind, component)
+        self.stage_candidates(epoch, kind, stage)
     }
 
-    /// Enumerates workers that support `kind` and can serve `component`, with
-    /// the component name each one binds.
+    /// Enumerates workers that support `kind` and can serve `stage`, with
+    /// the stage name each one binds.
     ///
-    /// A worker binding `component` by name serves it under that name. A
-    /// worker with no component bindings, or with a `DEFAULT_BLOCK`
-    /// binding, serves any requested component under `DEFAULT_BLOCK`.
+    /// A worker binding `stage` by name serves it under that name. A
+    /// worker with no stage bindings, or with a `DEFAULT_BLOCK`
+    /// binding, serves any requested stage under `DEFAULT_BLOCK`.
     /// Other workers are excluded.
-    pub(super) fn component_candidates<'a>(
+    pub(super) fn stage_candidates<'a>(
         &'a self,
         epoch: &'a super::submission::Submissions,
         kind: CallKind,
-        component: &'a str,
+        stage: &'a str,
     ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a MainProcessInfo)> {
         epoch.info().workers.iter().filter_map(move |(id, info)| {
             if !info.supported_calls.contains(&kind) {
                 return None;
             }
-            let bound_component = if info
-                .components
-                .iter()
-                .any(|binding| binding.name == component)
-            {
-                component
-            } else if info.components.is_empty()
+            let bound_stage = if info.stages.iter().any(|binding| binding.name == stage) {
+                stage
+            } else if info.stages.is_empty()
                 || info
-                    .components
+                    .stages
                     .iter()
                     .any(|binding| binding.name == DEFAULT_BLOCK)
             {
@@ -112,38 +108,38 @@ impl Dispatch {
             } else {
                 return None;
             };
-            Some((id, bound_component, info))
+            Some((id, bound_stage, info))
         })
     }
 
     /// Whether a request already runs somewhere: a replica holds its mutable
     /// state, so its next call goes there and the policy is not asked.
-    pub(super) fn resident(&self, request: RequestKey) -> bool {
+    pub(super) fn placed(&self, request: RequestKey) -> bool {
         self.affinity.keys().any(|(key, _)| *key == request)
             || self.decode_affinity.keys().any(|(key, _)| *key == request)
     }
 
     /// Selects one replica while preserving request residency.
     ///
-    /// Returns `None` when no worker can serve the component, when the replica
-    /// that already holds this request's component state is no longer a
+    /// Returns `None` when no worker can serve the stage, when the replica
+    /// that already holds this request's stage state is no longer a
     /// candidate or has no submission capacity, when a replica already holding
-    /// another of the request's components has no capacity, or when no other
+    /// another of the request's stages has no capacity, or when no other
     /// candidate has capacity. Records nothing; `select_worker` records the
     /// choice.
-    pub(super) fn component_target<'a>(
+    pub(super) fn stage_target<'a>(
         &'a self,
         epoch: &'a super::submission::Submissions,
         request: RequestKey,
         kind: CallKind,
-        component: &'a str,
+        stage: &'a str,
         choice: &Choice,
     ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
         // A decode-stage call runs on a replica that decodes, and every other
         // call (a prompt's prefill) on one that is not a decode group: a
         // request reaches a decode group by its hand-off.
         let candidates = self
-            .component_candidates(epoch, kind, component)
+            .stage_candidates(epoch, kind, stage)
             .filter(|(id, _, _)| {
                 if decodes(kind) {
                     !self.prefill_groups.contains(*id)
@@ -154,7 +150,7 @@ impl Dispatch {
             .collect::<Vec<_>>();
         let bound = candidates.first()?.1;
 
-        // Once a request has used this component, its mutable request state and
+        // Once a request has used this stage, its mutable request state and
         // graph slot live on that exact replica. Queue pressure may delay the
         // next call but must never migrate it.
         let pinned = if decodes(kind) {
@@ -163,8 +159,8 @@ impl Dispatch {
             &self.affinity
         };
         if let Some(owner) = pinned.get(&(request, bound.to_owned())) {
-            let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == owner)?;
-            return epoch.has_capacity(id).then_some((id, component));
+            let (id, stage, _) = candidates.into_iter().find(|(id, _, _)| *id == owner)?;
+            return epoch.has_capacity(id).then_some((id, stage));
         }
 
         // A request that has not run here yet runs where the policy says
@@ -172,28 +168,28 @@ impl Dispatch {
         // has no room, leaves the call to a later step: the mechanism never
         // substitutes a replica the policy did not choose.
         if let Choice::Target(named) = choice {
-            let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == named)?;
-            return epoch.has_capacity(id).then_some((id, component));
+            let (id, stage, _) = candidates.into_iter().find(|(id, _, _)| *id == named)?;
+            return epoch.has_capacity(id).then_some((id, stage));
         }
 
-        // Prefer a worker already selected for another component of this
+        // Prefer a worker already selected for another stage of this
         // request. This keeps a replicated denoiser and its media decoders in
         // one process and avoids publishing their large latent products.
-        let resident = self
+        let placed = self
             .affinity
             .iter()
             .filter_map(|((key, _), worker)| (*key == request).then_some(worker))
             .collect::<HashSet<_>>();
-        if let Some((id, component, _)) = candidates
+        if let Some((id, stage, _)) = candidates
             .iter()
             .copied()
-            .find(|(id, _, _)| resident.contains(id))
+            .find(|(id, _, _)| placed.contains(id))
         {
-            return epoch.has_capacity(id).then_some((id, component));
+            return epoch.has_capacity(id).then_some((id, stage));
         }
 
         // Among replicas with queue capacity, a new request goes to the one
-        // holding the fewest distinct resident requests, so a burst fans out
+        // holding the fewest distinct running requests, so a burst fans out
         // instead of filling the first configured worker. Queue capacity is a
         // hard condition; ties go to the earliest worker in
         // `WorkerInfo::workers`.
@@ -207,7 +203,7 @@ impl Dispatch {
                     .collect::<HashSet<_>>()
                     .len()
             })
-            .map(|(id, component, _)| (id, component))
+            .map(|(id, stage, _)| (id, stage))
     }
 
     /// Selects a replica for `kind` using the aggregate media routing in
@@ -220,21 +216,21 @@ impl Dispatch {
         kind: CallKind,
         choice: &Choice,
     ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
-        let component = match kind {
+        let stage = match kind {
             CallKind::Media(media_call) => info
-                .media_components
+                .media_stages
                 .get(&media_call)
                 .map_or("model", String::as_str),
             _ => "model",
         };
-        self.component_target(epoch, request, kind, component, choice)
+        self.stage_target(epoch, request, kind, stage, choice)
     }
 
     /// Places `request`'s calls of `kind` on the replica that will execute
     /// them, as `select_worker` places such a call of the protocol's default
-    /// component: the replica the request is placed on for the component
+    /// stage: the replica the request is placed on for the stage
     /// that serves them, or one chosen and recorded now, so that the call
-    /// planned later lands there. `None` when no eligible replica has
+    /// prepared later lands there. `None` when no eligible replica has
     /// submission capacity.
     pub(super) fn place(
         &mut self,
@@ -243,9 +239,9 @@ impl Dispatch {
         request: RequestKey,
         kind: CallKind,
     ) -> Option<crate::WorkerGroupId> {
-        let (id, bound_component) =
+        let (id, bound_stage) =
             self.worker_target(epoch, info, request, kind, &Choice::Existing)?;
-        let target = (id.clone(), bound_component.to_owned());
+        let target = (id.clone(), bound_stage.to_owned());
         let pinned = if decodes(kind) {
             &mut self.decode_affinity
         } else {
@@ -255,9 +251,9 @@ impl Dispatch {
         Some(target.0)
     }
 
-    /// Binds planned work to its configured component and records request residency.
+    /// Binds prepared work to its configured stage and records request residency.
     ///
-    /// Returns `None`, recording nothing, when `component_target` finds no
+    /// Returns `None`, recording nothing, when `stage_target` finds no
     /// eligible replica with submission capacity.
     pub(super) fn select_worker(
         &mut self,
@@ -266,12 +262,12 @@ impl Dispatch {
         call: &Call,
         choice: &Choice,
     ) -> Option<(crate::WorkerGroupId, String)> {
-        let (id, bound_component) = if call.component == DEFAULT_BLOCK {
+        let (id, bound_stage) = if call.stage == DEFAULT_BLOCK {
             self.worker_target(epoch, info, call.request_key, call.kind, choice)
         } else {
-            self.component_target(epoch, call.request_key, call.kind, &call.component, choice)
+            self.stage_target(epoch, call.request_key, call.kind, &call.stage, choice)
         }?;
-        let target = (id.clone(), bound_component.to_owned());
+        let target = (id.clone(), bound_stage.to_owned());
         let pinned = if decodes(call.kind) {
             &mut self.decode_affinity
         } else {

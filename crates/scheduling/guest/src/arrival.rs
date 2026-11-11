@@ -10,13 +10,13 @@
 //! | --- | --- |
 //! | `admit` | the waiting queue in order ([`Waiting`]); the mechanism admits until the first request it cannot place |
 //! | `work` | requests in `(phase class, admission order)`, at most one call each, charged against the step's tokens and calls; a prefill chunk is [`prefill_chunk`] of the prompt left; a prefill-class call runs only in a prefill step; the prefill window holds while [`PREFILL_WINDOW_CREDITS`] batches with prefill work are in flight |
-//! | `reject` | a queued request whose worst-case reservation is more than the device cache's whole capacity |
-//! | `offload` | the device pages no resident request continues from, least recently used first |
+//! | `reject` | a waiting request whose worst-case reservation is more than the device cache's whole capacity |
+//! | `offload` | the device pages no running request continues from, least recently used first |
 //! | `prefetch` | the requests whose host hit deepens by at least `Limits::prefetch_min_tokens` |
 //! | `refill` | the requests whose draft cache has a gap, when the refill is worth its cost (see [`Arrival::refill_due`]) |
 //! | `preempt` | the least recently used page of the short storage, then the lowest-priority last-admitted request |
 //! | `route` | the recorded cache rank, else the live rank with the fewest requests in flight, from a rotating cursor |
-//! | `place` | the replica that already holds the request; else the one with the fewest resident requests among those with capacity; a decode-stage call never lands on a prefill-only replica |
+//! | `place` | the replica that already holds the request; else the one with the fewest running requests among those with capacity; a decode-stage call never lands on a prefill-only replica |
 //!
 //! # The one judgement the interface cannot state
 //!
@@ -48,9 +48,9 @@ pub const PREFILL_WINDOW_CREDITS: u32 = 2;
 /// The assembly class of a phase kind, with a draft-cache refill as the
 /// prefill work it is.
 ///
-/// Today a refill chunk is planned only in a pass that is not a decode pass
+/// Today a refill chunk is prepared only in a pass that is not a decode pass
 /// and is assembled with the prefills (`batching.rs`: `refill_due` counts as
-/// prefill-ready and `plan_refill` schedules a prefill call), so it belongs with
+/// prefill-ready and `prepare_refill` schedules a prefill call), so it belongs with
 /// the context work whatever class its phase kind carries.
 fn class_of(kind: PhaseKind) -> PhaseClass {
     match kind {
@@ -77,15 +77,15 @@ pub struct Arrival<K: Order> {
     /// Requests waiting for admission, in this policy's order.
     waiting: Waiting<K>,
     /// The latest view of every request the mechanism has told this policy
-    /// about: queued, resident, and those that ended.
+    /// about: queued, running, and those that ended.
     views: HashMap<RequestId, RequestView>,
-    /// The residents, in the order the mechanism admitted them.
+    /// The running requests, in the order the mechanism admitted them.
     admission: Vec<RequestId>,
     /// The pages of the device and host caches, least recently used first.
     pages: Lru<PageId>,
     /// Whether each page sits in host memory.
     on_host: HashMap<PageId, bool>,
-    /// Whether no resident request continues from each page.
+    /// Whether no running request continues from each page.
     evictable: HashMap<PageId, bool>,
     /// The encoder cache entries, least recently used first.
     encodings: Lru<EncodingId>,
@@ -128,13 +128,13 @@ impl<K: Order> Default for Arrival<K> {
 }
 
 impl<K: Order> Arrival<K> {
-    /// The admission position of a request; residents the snapshot listed
+    /// The admission position of a request; running requests the snapshot listed
     /// before this policy saw an admission event sort after them by admission
     /// time, so the order is the mechanism's.
     fn admission_index(&self, id: RequestId) -> usize {
         self.admission
             .iter()
-            .position(|resident| *resident == id)
+            .position(|running| *running == id)
             .unwrap_or(usize::MAX)
     }
 
@@ -143,7 +143,7 @@ impl<K: Order> Arrival<K> {
         view.phase.map(|phase| self.phases.kind(phase))
     }
 
-    /// Whether a resident request contributes work of `class` in this step.
+    /// Whether a running request contributes work of `class` in this step.
     fn has_work_of_class(&self, class: PhaseClass) -> bool {
         self.views.values().any(|view| {
             view.state == RequestStatus::Running
@@ -177,7 +177,7 @@ impl<K: Order> Arrival<K> {
         Pass::Any
     }
 
-    /// The residents in this step's assembly order: the preferred path first,
+    /// The running requests in this step's assembly order: the preferred path first,
     /// then the phase class, then admission order.
     fn assembly_order(&self) -> Vec<RequestId> {
         let mut order: Vec<RequestId> = self
@@ -283,7 +283,7 @@ impl<K: Order> Arrival<K> {
         view.prefetch_tokens >= self.limits.prefetch_min_tokens
     }
 
-    /// The device pages a step offloads: every page no resident request
+    /// The device pages a step offloads: every page no running request
     /// continues from, least recently used first, which is today's rule for
     /// writing a prefix to the host KV cache.
     fn offload_pages(&self) -> Vec<PageId> {
@@ -298,9 +298,9 @@ impl<K: Order> Arrival<K> {
 
     /// The pages a shortage of `kind` may take, least recently used first.
     ///
-    /// A device page a resident request still continues from frees no device
+    /// A device page a running request still continues from frees no device
     /// units the mechanism may take (`validate_victims`: "page N is still
-    /// continued from and cannot be freed"), and a refused answer is a failed
+    /// continued from and cannot be freed"), and a refused response is a failed
     /// policy - so naming one would stop the epoch at the first shortage
     /// instead of freeing what is free. A host page is the host cache's to
     /// take: the mechanism asks only that it is on the host.
@@ -358,20 +358,20 @@ impl<K: Order> Policy for Arrival<K> {
         for view in &state.requests {
             self.views.insert(view.id, view.clone());
         }
-        // Residents start in admission order, which the snapshot states as the
+        // Running requests start in admission order, which the snapshot states as the
         // time each was admitted.
-        let mut residents: Vec<&RequestView> = state
+        let mut running: Vec<&RequestView> = state
             .requests
             .iter()
             .filter(|view| view.state == RequestStatus::Running)
             .collect();
-        residents.sort_by_key(|view| {
+        running.sort_by_key(|view| {
             (
                 view.admitted_at.map(|at| at.0).unwrap_or_default(),
                 view.id.0,
             )
         });
-        self.admission = residents.into_iter().map(|view| view.id).collect();
+        self.admission = running.into_iter().map(|view| view.id).collect();
         for view in &state.requests {
             if view.state == RequestStatus::Waiting {
                 self.waiting.push(view);
@@ -409,7 +409,7 @@ impl<K: Order> Policy for Arrival<K> {
                         self.waiting.push(request);
                     }
                 }
-                // The view of a resident request changed: its next phase,
+                // The view of a running request changed: its next phase,
                 // prompt progress, cached prefix or pages.
                 Event::Updated { request } => {
                     let arrived = request.id;
@@ -449,7 +449,7 @@ impl<K: Order> Policy for Arrival<K> {
                 Event::Finished { request, .. } => {
                     self.waiting.remove(*request);
                     self.views.remove(request);
-                    self.admission.retain(|resident| resident != request);
+                    self.admission.retain(|running| running != request);
                 }
                 Event::Stepped { .. } => {}
                 Event::Cached { page } => {
@@ -489,7 +489,7 @@ impl<K: Order> Policy for Arrival<K> {
         // (today's `pass_kind != Some(BatchKind::Decode)`).
         let pass = self.pass(room);
         let mut output = DispatchOutput {
-            // Every other queued request, in order. The mechanism admits them
+            // Every other waiting request, in order. The mechanism admits them
             // until the first it cannot place, which is the admission
             // decision.
             admit: self
@@ -498,7 +498,7 @@ impl<K: Order> Policy for Arrival<K> {
                 .filter(|id| !reject.contains(id))
                 .collect(),
             reject,
-            // The device pages no resident request continues from go to the
+            // The device pages no running request continues from go to the
             // host KV cache, least recently used first, which is today's rule
             // for writing a prefix out.
             offload: self.offload_pages(),
@@ -517,8 +517,8 @@ impl<K: Order> Policy for Arrival<K> {
             ..DispatchOutput::default()
         };
         // A draft cache with a gap is refilled as the step's prefill work. In a
-        // token step the request is planned as its decode instead, which is
-        // what today's `plan_refill` replaces only outside a decode pass.
+        // token step the request is prepared as its decode instead, which is
+        // what today's `prepare_refill` replaces only outside a decode pass.
         if pass != Pass::Token {
             output.refill = self
                 .admission
@@ -535,7 +535,7 @@ impl<K: Order> Policy for Arrival<K> {
             if step.shares().full() {
                 break;
             }
-            // The step's refill is the request's call: planning its decode too
+            // The step's refill is the request's call: preparing its decode too
             // would schedule two calls, the second before the one it depends on.
             if output.refill.contains(&id) {
                 continue;
@@ -645,22 +645,22 @@ impl<K: Order> Policy for Arrival<K> {
         if let Some(held) = replicas.iter().find(|replica| replica.holds_request) {
             return held.index;
         }
-        // Then a replica that already holds another component of this request,
+        // Then a replica that already holds another stage of this request,
         // so its state stays in one process and its products are not published
-        // (today's `component_target`).
+        // (today's `stage_target`).
         if let Some(chosen) = candidates
             .clone()
-            .filter(|replica| replica.holds_component && replica.capacity > 0)
-            .min_by_key(|replica| (replica.resident_requests, replica.index))
+            .filter(|replica| replica.holds_stage && replica.capacity > 0)
+            .min_by_key(|replica| (replica.running_requests, replica.index))
         {
             return chosen.index;
         }
-        // Otherwise the replica with the fewest resident requests that can take
+        // Otherwise the replica with the fewest running requests that can take
         // one, ties to the earliest in the list.
         if let Some(chosen) = candidates
             .clone()
             .filter(|replica| replica.capacity > 0)
-            .min_by_key(|replica| (replica.resident_requests, replica.index))
+            .min_by_key(|replica| (replica.running_requests, replica.index))
         {
             return chosen.index;
         }
@@ -681,7 +681,7 @@ impl<K: Order> Policy for Arrival<K> {
 mod tests {
     use super::*;
     use crate::End;
-    use crate::ids::{ComponentId, PhaseId};
+    use crate::ids::{StageId, PhaseId};
     use crate::policy::Instantiation;
     use crate::time::{Duration, Nanos};
     use crate::view::{EncodingView, PageView, PhaseView, RankView, ReplicaView, Snapshot};
@@ -709,12 +709,12 @@ mod tests {
                     PhaseView {
                         id: PhaseId(0),
                         kind: PhaseKind::Prefill,
-                        block: ComponentId(0),
+                        block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(1),
                         kind: PhaseKind::Decode,
-                        block: ComponentId(0),
+                        block: StageId(0),
                     },
                 ],
                 ..Snapshot::default()
@@ -787,7 +787,7 @@ mod tests {
     /// **An admitted request with a prompt left is prefilled, and the phase
     /// that says which call it is next is the mechanism's to state.**
     ///
-    /// `fcfs` reproduces today's rule: a queued request the mechanism admitted
+    /// `fcfs` reproduces today's rule: a waiting request the mechanism admitted
     /// is prefilled in the next step, chunked only by
     /// `limits().chunked_prefill_size` and the step's budget. It schedules that
     /// work by the phase the views carry (`RequestView::phase`), because the
@@ -796,8 +796,8 @@ mod tests {
     /// and an invented one would execute a call the mechanism never named.
     ///
     /// The absence is therefore **the mechanism's defect, not the policy's
-    /// answer**: `crates/scheduler`'s `views::next_phase` answers `None` when
-    /// `peek_next_call_variant(id)` names no call, and a resident request with
+    /// response**: `crates/scheduler`'s `views::next_phase` returns `None` when
+    /// `peek_next_call_variant(id)` names no call, and a running request with
     /// prompt left always has one to name. Every helper in this module admitted
     /// a request with `phase: Some(..)` already, which is why no case could
     /// fail while the mechanism stated `None` and every text test went silent.
@@ -985,15 +985,15 @@ mod tests {
                 },
             },
         ]);
-        // The mechanism refuses a page a resident still reads, so the older
+        // The mechanism refuses a page a running request still reads, so the older
         // one is not an offer it can accept: the free page is the victim and
-        // the answer stays valid.
+        // the response stays valid.
         let victims = fcfs.preempt(&Shortage {
             kind: Storage::KvUnits,
             need: 1,
         });
         assert_eq!(victims, vec![Victim::Page(PageId(2))]);
-        // Nothing free: no page is named, which is a valid answer (the work
+        // Nothing free: no page is named, which is a valid response (the work
         // waits), rather than one the mechanism has to refuse.
         fcfs.observe(&[Event::Hit { page: PageId(2) }]);
         let victims = fcfs.preempt(&Shortage {
@@ -1143,23 +1143,23 @@ mod tests {
         let replicas = [
             ReplicaView {
                 index: 0,
-                block: ComponentId(0),
+                block: StageId(0),
                 kinds: vec![PhaseKind::Decode],
-                resident_requests: 0,
+                running_requests: 0,
                 capacity: 4,
                 holds_request: false,
                 prefills_only: true,
-                holds_component: false,
+                holds_stage: false,
             },
             ReplicaView {
                 index: 1,
-                block: ComponentId(0),
+                block: StageId(0),
                 kinds: vec![PhaseKind::Decode],
-                resident_requests: 3,
+                running_requests: 3,
                 capacity: 4,
                 holds_request: false,
                 prefills_only: false,
-                holds_component: false,
+                holds_stage: false,
             },
         ];
         assert_eq!(fcfs.place(&call, &replicas), 1);
@@ -1183,12 +1183,12 @@ mod tests {
                     PhaseView {
                         id: PhaseId(0),
                         kind: PhaseKind::Prefill,
-                        block: ComponentId(0),
+                        block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(1),
                         kind: PhaseKind::Decode,
-                        block: ComponentId(0),
+                        block: StageId(0),
                     },
                 ],
                 ..Snapshot::default()
@@ -1237,7 +1237,7 @@ mod tests {
         let decoding = view(2, 0, 1);
         let _ = admit_with_phase(&mut fcfs, decoding, PhaseId(1));
 
-        // A refill-due resident is prefill work, so with the window open the
+        // A refill-due running is prefill work, so with the window open the
         // step is a prefill step: it names the refill and schedules no work entry
         // for that request — the refill is its call.
         let output = fcfs.dispatch(&room(1024, 8));
@@ -1266,8 +1266,8 @@ mod tests {
         fits.reservation_units = 10;
         let mut enormous = view(11, 0, 2);
         enormous.reservation_units = 1_000;
-        // A resident prefill, a resident decode with a draft gap, and a
-        // resident media request whose host hit deepens.
+        // A running prefill, a running request decode with a draft gap, and a
+        // running media request whose host hit deepens.
         let mut prefill = view(20, 0, 3);
         prefill.state = RequestStatus::Running;
         prefill.phase = Some(PhaseId(0));
@@ -1291,17 +1291,17 @@ mod tests {
                     PhaseView {
                         id: PhaseId(0),
                         kind: PhaseKind::Prefill,
-                        block: ComponentId(0),
+                        block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(1),
                         kind: PhaseKind::Decode,
-                        block: ComponentId(0),
+                        block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(2),
                         kind: PhaseKind::Denoise,
-                        block: ComponentId(1),
+                        block: StageId(1),
                     },
                 ],
                 pages: vec![
@@ -1392,17 +1392,17 @@ mod tests {
                     PhaseView {
                         id: PhaseId(0),
                         kind: PhaseKind::Prefill,
-                        block: ComponentId(0),
+                        block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(1),
                         kind: PhaseKind::Decode,
-                        block: ComponentId(0),
+                        block: StageId(0),
                     },
                     PhaseView {
                         id: PhaseId(2),
                         kind: PhaseKind::Denoise,
-                        block: ComponentId(1),
+                        block: StageId(1),
                     },
                 ],
                 ..Snapshot::default()
@@ -1411,10 +1411,10 @@ mod tests {
         fcfs
     }
 
-    /// **The pages a step offloads are the ones no resident request continues
+    /// **The pages a step offloads are the ones no running request continues
     /// from, in least-recently-used order.**
     ///
-    /// The mechanism refuses to free a page a resident request still continues
+    /// The mechanism refuses to free a page a running request still continues
     /// from (`validate_victims`), so naming one would fail the policy at the
     /// first offload; `RequestView::cached_pages` and the mechanism's own
     /// `evictable` flag are how the policy knows. The flag moves after a page

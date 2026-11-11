@@ -31,7 +31,7 @@ pub struct Parameters {
     /// The smallest prefix-hit deepening the policy asks for.
     #[serde(default)]
     pub prefetch_min_tokens: Option<u32>,
-    /// How long a resident request may go without progressing before the
+    /// How long a running request may go without progressing before the
     /// policy has starved it (design §4.4; the mechanism caps it at 30 s, as
     /// sched_ext caps `timeout_ms`).
     #[serde(default)]
@@ -68,7 +68,7 @@ pub struct Limits {
     /// The smallest prefix-hit deepening the policy asks for.
     #[serde(default = "default_prefetch_min_tokens")]
     pub prefetch_min_tokens: u32,
-    /// How long a resident request may go without progressing before the
+    /// How long a running request may go without progressing before the
     /// policy has starved it.
     #[serde(default = "default_timeout")]
     pub timeout: Nanos,

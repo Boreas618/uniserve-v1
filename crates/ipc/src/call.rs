@@ -55,7 +55,7 @@ pub enum ForwardMode {
 impl ForwardMode {}
 
 /// Exactly one call classification. The sum preserves the distinct
-/// forward and media contracts without parallel opcode metadata.
+/// forward and media interfaces without parallel opcode metadata.
 ///
 /// Serde represents a kind by its inner enum's snake_case name alone
 /// (`untagged`), which round-trips only while the names of [`ForwardMode`]
@@ -127,7 +127,7 @@ pub struct Bounds {
 /// `allowed_token_ids` distinguishes no whitelist (`None`) from a present empty
 /// whitelist, which deterministically represents an invalid all-masked
 /// distribution. Penalty token counts are not carried here: they are a
-/// device-resident committed base plus bounded per-call deltas folded after
+/// device-running committed base plus bounded per-call deltas folded after
 /// sampling accepts tokens, so no host token history participates in a
 /// successor's sampling input.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -170,7 +170,7 @@ impl CallCoordinates {
     }
 }
 
-/// One denoising step of a block-diffusion request's resident canvas.
+/// One denoising step of a block-diffusion request's canvas on the device.
 ///
 /// The deployment's launch configuration fixes the sampling
 /// (`EngineConfig::canvas_sampling`); the worker holds the canvas, its
@@ -246,8 +246,8 @@ pub struct Call {
     pub call_id: CallId,
     /// Coordinates this call executes at, so a rank does not derive them.
     pub coordinates: CallCoordinates,
-    /// Component bound within the selected Worker.
-    pub component: String,
+    /// Stage bound within the selected Worker.
+    pub stage: String,
     /// Kind performed by this call.
     pub kind: CallKind,
     /// Scheduler-declared limits for the call and its outputs.
@@ -258,8 +258,8 @@ pub struct Call {
     pub outputs: Vec<TensorRef>,
     /// Acknowledgment slots of the ranks that read this call's products.
     ///
-    /// A producing rank cannot name its readers: it knows its own component,
-    /// not which component consumes what it publishes, and a product is read
+    /// A producing rank cannot name its readers: it knows its own stage,
+    /// not which stage consumes what it publishes, and a product is read
     /// in a later batch than the one producing it. The engine states them, and
     /// a published product retires once each has acknowledged it. The
     /// executing rank's own slot is never listed.
@@ -283,7 +283,7 @@ pub struct Call {
     pub sampling_state: Option<SamplingState>,
     /// Host-known prompt, draft, or decode input tokens in model input order.
     /// Empty when continuation reads its predecessor's device token, and for
-    /// a token-denoising call, which denoises its resident canvas.
+    /// a token-denoising call, which denoises its canvas on the device.
     pub input_token_ids: Vec<u32>,
     /// The step a token-denoising call runs on its request's generation
     /// canvas; absent for every other call.
@@ -422,7 +422,7 @@ impl Call {
             request_key,
             call_id,
             kind,
-            component: DEFAULT_BLOCK.into(),
+            stage: DEFAULT_BLOCK.into(),
             coordinates: CallCoordinates::default(),
             bounds: Bounds::default(),
             inputs: Vec::new(),
@@ -511,18 +511,15 @@ impl Call {
 
     /// Validates the invariants one call carries on its own.
     ///
-    /// Checks identity, component, coordinates, the token bound, canonical
+    /// Checks identity, stage, coordinates, the token bound, canonical
     /// sampling-state sets, the encoded-image source, product ownership, generations, output indices, dtypes,
     /// cross-request inputs, the predicate, and the stored trajectory of a
     /// latent preparation. Relationships to other calls and to the
     /// batch's allocation tables are the scheduler's to keep.
     pub fn validate(&self) -> ValidationResult<()> {
-        // Establish call identity, component, coordinates, and token capacity.
+        // Establish call identity, stage, coordinates, and token capacity.
         ensure_valid!(self.call_id.batch_id > 0, "call id must be positive");
-        ensure_valid!(
-            !self.component.is_empty(),
-            "call component must not be empty"
-        );
+        ensure_valid!(!self.stage.is_empty(), "call stage must not be empty");
         self.coordinates.validate()?;
 
         ensure_valid!(
@@ -560,7 +557,7 @@ impl Call {
             "only a latent encoding names a posterior draw"
         );
 
-        // A token-denoising call runs one step of its request's resident
+        // A token-denoising call runs one step of its request's running
         // generation canvas of `max_tokens` tokens, and produces no sampled
         // token output.
         let denoises = self.kind == CallKind::Forward(ForwardMode::TokenDenoising);
@@ -575,7 +572,7 @@ impl Call {
         if self.canvas.is_some() {
             ensure_valid!(
                 self.input_token_ids.is_empty() && self.bounds.max_tokens > 0,
-                "a canvas step denoises its resident canvas of max_tokens tokens"
+                "a canvas step denoises its canvas on the device of max_tokens tokens"
             );
         }
 
@@ -727,11 +724,11 @@ impl MediaCall {
     /// The calls that read this call's products in a video request's graph,
     /// in the order the graph consumes them.
     ///
-    /// The engine plans a request's consumption from this table, and both
+    /// The engine prepares a request's consumption from this table, and both
     /// the engine and the worker derive from it which ranks back a
-    /// component's persistent products: the ranks that execute the
-    /// component and those that execute a reader of its products. A reader
-    /// of resident state ([`Self::reads_resident_state`]) reads the
+    /// stage's persistent products: the ranks that execute the
+    /// stage and those that execute a reader of its products. A reader
+    /// of running state ([`Self::reads_device_state`]) reads the
     /// denoiser's latent pages instead of a persistent product.
     pub const fn readers(self) -> &'static [Self] {
         match self {
@@ -748,8 +745,8 @@ impl MediaCall {
     }
 
     /// Whether this call reads its predecessor's trajectory from the
-    /// denoiser's resident latent pages instead of a persistent product.
-    pub const fn reads_resident_state(self) -> bool {
+    /// denoiser's running latent pages instead of a persistent product.
+    pub const fn reads_device_state(self) -> bool {
         matches!(self, Self::Denoising)
     }
 }

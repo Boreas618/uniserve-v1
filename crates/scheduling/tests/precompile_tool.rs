@@ -3,7 +3,7 @@
 //! declares the version this binary reports, and the main process loads what it
 //! wrote with an engine built the same way.
 //!
-//! These cases state the contract from the outside — the command line a package
+//! These cases state the interface from the outside — the command line a package
 //! is built with, and the artifact the main process then loads — because the
 //! two processes never share memory, only files.
 

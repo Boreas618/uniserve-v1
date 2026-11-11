@@ -32,8 +32,8 @@ impl Scheduler {
     ) -> Option<()> {
         let request_id = call.request_key.request_id;
 
-        // Planning may queue successors speculatively, but registration still
-        // requires the request epoch and exact resident predecessor.
+        // Preparing may queue successors speculatively, but registration still
+        // requires the request epoch and exact predecessor on the device.
         let Some((request_epoch, latest_token)) =
             self.requests.tokens(&request_id).and_then(|state| {
                 state
@@ -41,7 +41,7 @@ impl Scheduler {
                     .then(|| (state.request_epoch, state.latest_token.clone()))
             })
         else {
-            tracing::error!(request_id = request_id.0, "planned call lost its request");
+            tracing::error!(request_id = request_id.0, "prepared call lost its request");
             self.latch_fatal();
             return None;
         };
@@ -66,7 +66,7 @@ impl Scheduler {
         // carry no predicate.
         // A verification carries its current token among its host tokens,
         // whose draft pass reads them, so it never continues from a
-        // device-resident token.
+        // device-running token.
         let projected_successor = self.inflight.has_pending_calls(request_id);
         let reusable_device_token = if !projected_successor
             && call.kind != CallKind::Forward(ForwardMode::Verify)
@@ -165,7 +165,7 @@ impl Scheduler {
             None
         };
 
-        // A generation step denoises the request's resident canvas of
+        // A generation step denoises the request's canvas on the device of
         // `max_tokens` tokens, one read-only forward row below.
         let canvas_lengths = if call.canvas.is_some() {
             vec![call.bounds.max_tokens]
@@ -215,7 +215,7 @@ impl Scheduler {
             // its last declaration (growth, or window retirement in a
             // sliding-window group) or it holds fresh units, which the worker
             // must reset before use. A forward's fresh units are those
-            // allocated since the declared watermark (`plan_call`).
+            // allocated since the declared watermark (`prepare_call`).
             // Admission (or re-admission) declares every table again, with
             // every allocated page fresh; pages acquired from the prefix
             // cache already hold computed keys and values and are never fresh.
@@ -355,18 +355,18 @@ impl Scheduler {
         }
 
         // Worker selection records the request's residency on that worker. A
-        // request that has not run this component yet is placed where the
+        // request that has not run this stage yet is placed where the
         // policy says (§4.4); one that has goes back to the replica holding its
-        // state, whatever the policy would answer.
+        // state, whatever the policy would response.
         let choice = self.place_call(&call)?;
         let Some((worker, entry)) =
             self.dispatch
                 .select_worker(&self.worker, &self.info, &call, &choice)
         else {
-            self.invariant_broken("a planned call retains an executable component");
+            self.invariant_broken("a prepared call retains an executable stage");
             return None;
         };
-        call.component = entry;
+        call.stage = entry;
 
         // An image extension writes its block's prefix cache, whose extent its
         // result is checked against.

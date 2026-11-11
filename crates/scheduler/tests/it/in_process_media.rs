@@ -18,8 +18,8 @@ use scheduler::{BatchCapacity, Event, GenerationRequest, SchedulerHandle, Stage}
 use crate::support;
 use testkit::FakeBatches;
 
-/// How long a command answer may take.
-const ANSWER: Duration = Duration::from_secs(60);
+/// How long a command response may take.
+const RESPONSE: Duration = Duration::from_secs(60);
 
 /// Instantiates the epoch's first policy for `pool` and switches it in.
 fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
@@ -47,13 +47,13 @@ fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
         Arc::new(scheduler::PolicyBytes::new(support::policy_module()));
     let installed = handle
         .precopy_policy(program, source)
-        .recv_timeout(ANSWER)
-        .expect("the scheduler answers a precopy");
+        .recv_timeout(RESPONSE)
+        .expect("the scheduler responds to a precopy");
     installed.expect("the policy is precopied");
     let switched = handle
         .stage(Stage::Switchover)
-        .recv_timeout(ANSWER)
-        .expect("the scheduler answers a switchover");
+        .recv_timeout(RESPONSE)
+        .expect("the scheduler responds to a switchover");
     switched.expect("the policy serves");
     // The kernels this epoch serves on. The switchover command publishes the
     // program but does not number a generation — that is the process command's
@@ -114,14 +114,14 @@ fn video_request(id: u64) -> DiffusionRequest {
 
 /// Waits for the next event of `events`, failing by name after the bound.
 fn next(events: &mut scheduler::EventRx, what: &str) -> Event {
-    let deadline = Instant::now() + ANSWER;
+    let deadline = Instant::now() + RESPONSE;
     while Instant::now() < deadline {
         if let Ok(event) = events.try_recv() {
             return event;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    panic!("{what} did not answer within the bound");
+    panic!("{what} did not respond within the bound");
 }
 
 /// Requests the deployment cannot serve are rejected on their own streams, and
@@ -149,7 +149,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
     let mut before = engine
         .submit(text_request(0, 8))
         .expect("the first text request is accepted");
-    let (served_before, ended_before) = support::wait_for_tokens(&mut before, 1, ANSWER);
+    let (served_before, ended_before) = support::wait_for_tokens(&mut before, 1, RESPONSE);
     assert!(
         !served_before.is_empty(),
         "the deployment serves text before any rejection: no token arrived, and the request \
@@ -175,7 +175,7 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
     let mut served = engine
         .submit(text_request(1, 8))
         .expect("the text request is accepted");
-    let deadline = Instant::now() + ANSWER;
+    let deadline = Instant::now() + RESPONSE;
     let mut terminal = None;
     while Instant::now() < deadline && terminal.is_none() {
         match served.try_recv() {

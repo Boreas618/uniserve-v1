@@ -472,28 +472,28 @@ pub struct Submission {
 
 /// Command sent from a frontend handler to the scheduler thread.
 /// Who asked for a stage: a caller that reads the step it applied at, or an
-/// engine command that is answered with whether it applied.
+/// engine command that gets its response with whether it applied.
 ///
-/// One path applies every stage; the answer shape is the only difference, so a
+/// One path applies every stage; the response shape is the only difference, so a
 /// stage has exactly one place where it changes the slot.
 #[derive(Debug)]
-pub enum StageAnswer {
-    /// A handle's `stage`, answered with the step it applied at.
+pub enum StageResponse {
+    /// A handle's `stage`, responded with the step it applied at.
     Step(crossbeam_channel::Sender<Result<StageApplied, String>>),
-    /// An engine or program-layer command, answered with whether it applied.
+    /// An engine or program-layer command, responded with whether it applied.
     Applied(crossbeam_channel::Sender<Result<(), String>>),
 }
 
-impl StageAnswer {
+impl StageResponse {
     /// Sends `result`, dropping either the step or the detail as the caller's
     /// shape requires.
     pub(crate) fn send(self, result: Result<StageApplied, String>) {
         match self {
-            Self::Step(answer) => {
-                let _ = answer.send(result);
+            Self::Step(response) => {
+                let _ = response.send(result);
             }
-            Self::Applied(answer) => {
-                let _ = answer.send(result.map(|_| ()));
+            Self::Applied(response) => {
+                let _ = response.send(result.map(|_| ()));
             }
         }
     }
@@ -567,63 +567,63 @@ pub enum Command {
     Abort(RequestId),
     /// Parks the scheduler (`Scheduler::park`): ends every token request
     /// that resumes from its generated tokens as migratable, lets the
-    /// others finish, and answers with the prefix cache index once nothing
+    /// others finish, and responds with the prefix cache index once nothing
     /// runs, having lent the epoch that succeeds it the cache segments no
     /// request in flight continues from when it `lend`s; it executes
     /// nothing more until resumed.
     Park {
         lend: bool,
-        answer: crossbeam_channel::Sender<Result<crate::ParkedCache, String>>,
+        response: crossbeam_channel::Sender<Result<crate::ParkedCache, String>>,
     },
     /// Resumes a parked scheduler, taking back the cache units it lent when
-    /// it takes them back, and answers whether it did.
+    /// it takes them back, and responds whether it did.
     Resume {
         take_back: bool,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Promotes a successor scheduler (`Scheduler::promote`): imports its
     /// predecessor's prefix cache index, once its cache holds the requests
     /// the predecessor hands over (which `recompute` from their tokens or
     /// not, while it `grows` into the predecessor's storage at once or not),
-    /// and answers with the outcome.
+    /// and responds with the outcome.
     Promote {
         cache: crate::ParkedCache,
         recompute: bool,
         grows: bool,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Holds the requests that continue from a predecessor epoch's pages
     /// until its index arrives (`Inherit`), for at most the duration.
     AwaitIndex(std::time::Duration),
     /// Adopts the published pages of the drained predecessor epoch, which
     /// lie in the cache segments the scheduler's workers map
-    /// (`Scheduler::inherit`), and answers with the outcome.
+    /// (`Scheduler::inherit`), and responds with the outcome.
     Inherit {
         caches: Vec<(String, crate::ParkedCache)>,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     },
-    /// Commits a successor scheduler (`Scheduler::commit`), and answers
+    /// Commits a successor scheduler (`Scheduler::commit`), and responds
     /// with what each worker reported.
     Commit(crossbeam_channel::Sender<Result<Vec<String>, String>>),
     /// Publishes the committed epoch's immutable pages on every claimed node.
     PublishEpoch(crossbeam_channel::Sender<Result<(), String>>),
     /// Ends the storage of other epochs on the nodes of the scheduler's
-    /// workers (`Worker::retire`), and answers whether it did.
+    /// workers (`Worker::retire`), and responds whether it did.
     Retire {
         epochs: Vec<u64>,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Reads the storage ledgers of the nodes of the scheduler's workers
-    /// (`Worker::ledgers`), and answers with each node's.
+    /// (`Worker::ledgers`), and responds with each node's.
     Ledgers(crossbeam_channel::Sender<Result<Vec<String>, String>>),
     /// Keeps the weights alone of other epochs on the nodes of the
     /// scheduler's workers, in host storage when `to_host`
-    /// (`Worker::keep_weights`), and answers with each node's report.
+    /// (`Worker::keep_weights`), and responds with each node's report.
     KeepWeights {
         epochs: Vec<u64>,
         to_host: bool,
         cache_keys: Vec<Vec<u8>>,
-        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+        response: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Reports the KV cache each worker group holds now
     /// (`Scheduler::describe_cache`).
@@ -632,47 +632,47 @@ pub enum Command {
     DescribeRequests(crossbeam_channel::Sender<Vec<proto::request::wire::RequestPrefix>>),
     /// §7.3 step 2: prepares `program`'s policy on this scheduler's state,
     /// without putting it in. The load and the instantiation run on a blocking
-    /// thread; the answer says whether a candidate was prepared.
+    /// thread; the response says whether a candidate was prepared.
     PrecopyPolicy {
         program: crate::PolicyProgram,
         source: std::sync::Arc<dyn crate::PolicySource + Send + Sync>,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// One of §7.3's steps 3 to 6, applied at the next boundary where nothing
-    /// is in flight; the answer names the step it was applied at.
+    /// is in flight; the response names the step it was applied at.
     StagePolicy {
         stage: crate::Stage,
-        answer: StageAnswer,
+        response: StageResponse,
     },
     /// One command of the program-layer update (§2.3, §7.3), applied as far as
     /// one scheduler applies it: a stage, at the boundary its command names.
     ProgramCommand {
         command: ipc::ProgramCommand,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// One of the epoch's engine commands, applied as far as one scheduler
-    /// applies it (§7.3): the stages yes, the rest answered with the reason.
+    /// applies it (§7.3): the stages yes, the rest responded with the reason.
     EngineCommand {
         command: proto::process::Command,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Asks that the following step's batches also run in shadow for the model
     /// generation `generation` (§7.3 step 2): the worker compares the new
-    /// generation against the resident data and never writes resident memory.
-    /// Answered once one step's batches have been shadowed.
+    /// generation against the serving data and never writes serving memory.
+    /// Responds once one step's batches have been shadowed.
     Shadow {
         generation: u64,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// What this scheduler has done and what its policy has cost (§12): the
     /// step and batch counters with the policy's calls and fuel.
     Counters {
-        answer: crossbeam_channel::Sender<Counters>,
+        response: crossbeam_channel::Sender<Counters>,
     },
     /// The program the slot serves and the one a precopy prepared, for the
     /// handle the control thread holds (§7.3).
     PolicyPrograms {
-        answer: crossbeam_channel::Sender<PolicyPrograms>,
+        response: crossbeam_channel::Sender<PolicyPrograms>,
     },
     /// §7.3 step 2's failure: the precopied generation is dropped and the
     /// serving policy kept.
@@ -681,7 +681,7 @@ pub enum Command {
     /// policy has made and the fuel they consumed, absent before its first
     /// switchover.
     Progress {
-        answer: crossbeam_channel::Sender<crate::Progress>,
+        response: crossbeam_channel::Sender<crate::Progress>,
     },
     /// Hands the control thread a policy failure this scheduler recorded: it
     /// reverted to the previous policy and serves on (§7.3).
@@ -689,36 +689,36 @@ pub enum Command {
     CacheWarm {
         operation: storage::manifest::cache::Operation,
         together: Arc<HookBarrier>,
-        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+        response: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Revokes every cached prefix page, so that later prompts compute
     /// their prefixes anew; requests in flight keep their pages.
     FlushCache,
     /// Takes other scheduling limits and policy from the next step on
-    /// (`Scheduler::reconfigure`), and answers whether it did.
+    /// (`Scheduler::reconfigure`), and responds whether it did.
     Configure {
         limits: Box<crate::SchedulerConfig>,
-        answer: crossbeam_channel::Sender<Result<(), String>>,
+        response: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Gives back or restores KV cache storage (`Scheduler::resize_cache`),
-    /// and answers with what each worker reported.
+    /// and responds with what each worker reported.
     ResizeCache {
         change: CacheChange,
-        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+        response: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Rewrites the weights in place from the checkpoint at `model_path`
     /// (`Scheduler::update_weights`), the requests in flight continuing as
-    /// `in_flight` says, and answers with what each worker reported.
+    /// `in_flight` says, and responds with what each worker reported.
     UpdateWeights {
         model_path: String,
         in_flight: WeightsInFlight,
-        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+        response: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Commit prepared expert copies across a common step boundary.
     CommitExperts {
         order: std::collections::BTreeMap<String, Vec<u32>>,
         together: Arc<crate::HookBarrier>,
-        answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+        response: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
     /// Requests orderly engine shutdown.
     Shutdown,
@@ -780,7 +780,7 @@ pub enum CacheChange {
     /// aborted first: a weight update's `abort` (`WeightsInFlight::Abort`).
     SleepAborting,
     /// Stops forming batches, or starts again, with every request keeping its
-    /// state: the answer comes once the batches in flight completed. What a
+    /// state: the response comes once the batches in flight completed. What a
     /// weight update's `keep` holds the device still with, while the graph
     /// storage is given back for a load the free storage does not hold.
     Hold { held: bool },
@@ -939,8 +939,8 @@ impl CommandSender {
         &self,
         lend: bool,
     ) -> crossbeam_channel::Receiver<Result<crate::ParkedCache, String>> {
-        let (answer, parked) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Park { lend, answer });
+        let (response, parked) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Park { lend, response });
         parked
     }
 
@@ -948,8 +948,11 @@ impl CommandSender {
     /// cache units it lent when it takes them back; the receiver gets
     /// whether it did.
     pub fn resume(&self, take_back: bool) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, resumed) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Resume { take_back, answer });
+        let (response, resumed) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Resume {
+            take_back,
+            response,
+        });
         resumed
     }
 
@@ -961,12 +964,12 @@ impl CommandSender {
         recompute: bool,
         grows: bool,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, promoted) = crossbeam_channel::bounded(1);
+        let (response, promoted) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::Promote {
             cache,
             recompute,
             grows,
-            answer,
+            response,
         });
         promoted
     }
@@ -983,23 +986,23 @@ impl CommandSender {
         &self,
         caches: Vec<(String, crate::ParkedCache)>,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, inherited) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Inherit { caches, answer });
+        let (response, inherited) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Inherit { caches, response });
         inherited
     }
 
     /// Publishes the committed epoch's immutable pages on every claimed node.
     pub fn publish_epoch(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, published) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::PublishEpoch(answer));
+        let (response, published) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::PublishEpoch(response));
         published
     }
 
     /// Ends the storage of `epochs` on the nodes of the scheduler's workers
     /// (`Command::Retire`); the receiver gets whether it did.
     pub fn retire(&self, epochs: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, retired) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Retire { epochs, answer });
+        let (response, retired) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Retire { epochs, response });
         retired
     }
 
@@ -1012,12 +1015,12 @@ impl CommandSender {
         to_host: bool,
         cache_keys: Vec<Vec<u8>>,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        let (answer, kept) = crossbeam_channel::bounded(1);
+        let (response, kept) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::KeepWeights {
             epochs,
             to_host,
             cache_keys,
-            answer,
+            response,
         });
         kept
     }
@@ -1025,16 +1028,16 @@ impl CommandSender {
     /// Reads the storage ledgers of the nodes of the scheduler's workers
     /// (`Command::Ledgers`); the receiver gets each node's.
     pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        let (answer, read) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Ledgers(answer));
+        let (response, read) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Ledgers(response));
         read
     }
 
     /// Reports the KV cache each worker group holds now
     /// (`Command::DescribeCache`).
-    /// Answers `answer` with the reason a command could not be delivered.
+    /// Returns `response` with the reason a command could not be delivered.
     ///
-    /// A command sent to a scheduler that has ended never reaches it, and the answer channel is
+    /// A command sent to a scheduler that has ended never reaches it, and the response channel is
     /// dropped with the command: a caller then sees a receiver with no sender, which reads as "not
     /// yet" at one call site and as "the group is gone" at another. Neither sentence is the one a
     /// reader can act on, and both are guesses about a fact this function holds: the send failed.
@@ -1044,22 +1047,22 @@ impl CommandSender {
     /// a dropped channel.
     fn refuse_into<T>(
         &self,
-        answer: &crossbeam_channel::Sender<Result<T, String>>,
+        response: &crossbeam_channel::Sender<Result<T, String>>,
         delivered: bool,
     ) {
         if !delivered {
-            let _ = answer.send(Err(Self::ended()));
+            let _ = response.send(Err(Self::ended()));
         }
     }
 
-    /// The same, for the channel whose payload is a [`StageAnswer`].
+    /// The same, for the channel whose payload is a [`StageResponse`].
     fn refuse_next_step(
         &self,
-        answer: &crossbeam_channel::Sender<Result<StageApplied, String>>,
+        response: &crossbeam_channel::Sender<Result<StageApplied, String>>,
         delivered: bool,
     ) {
         if !delivered {
-            let _ = answer.send(Err(Self::ended()));
+            let _ = response.send(Err(Self::ended()));
         }
     }
 
@@ -1072,9 +1075,9 @@ impl CommandSender {
     ///
     /// # Caller obligation: the scheduler must be able to reach a boundary
     ///
-    /// A scheduler answers a command of this kind at its next batch boundary, and a scheduler
+    /// A scheduler responds to a command of this kind at its next batch boundary, and a scheduler
     /// holding paused or parked requests never reaches one. A caller that has quiesced the
-    /// scheduler - a park, a drain, a handover's pause - must not ask it: the answer is not late,
+    /// scheduler - a park, a drain, a handover's pause - must not ask it: the response is not late,
     /// it is never coming, and a caller that waits for it stalls until its own bound expires and
     /// reports a scheduler that is not there.
     ///
@@ -1084,28 +1087,28 @@ impl CommandSender {
     pub fn describe_cache(
         &self,
     ) -> crossbeam_channel::Receiver<Result<Vec<crate::GroupCache>, String>> {
-        let (answer, described) = crossbeam_channel::bounded(1);
+        let (response, described) = crossbeam_channel::bounded(1);
         self.refuse_into(
-            &answer,
-            self.send(Command::DescribeCache(answer.clone())).is_ok(),
+            &response,
+            self.send(Command::DescribeCache(response.clone())).is_ok(),
         );
         described
     }
 
     /// Prepares `program`'s policy on this scheduler's state without putting it
-    /// in (§7.3 step 2); the answer arrives when the blocking thread is done.
+    /// in (§7.3 step 2); the response arrives when the blocking thread is done.
     pub fn precopy_policy(
         &self,
         program: crate::PolicyProgram,
         source: std::sync::Arc<dyn crate::PolicySource + Send + Sync>,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, done) = crossbeam_channel::bounded(1);
+        let (response, done) = crossbeam_channel::bounded(1);
         self.refuse_into(
-            &answer,
+            &response,
             self.send(Command::PrecopyPolicy {
                 program,
                 source,
-                answer: answer.clone(),
+                response: response.clone(),
             })
             .is_ok(),
         );
@@ -1113,7 +1116,7 @@ impl CommandSender {
     }
 
     /// One of §7.3's steps 3 to 6, applied at the scheduler's next boundary,
-    /// and answered with the step it was applied at (§7.3: one batch boundary).
+    /// and responded with the step it was applied at (§7.3: one batch boundary).
     ///
     /// A switchover with nothing prepared is refused at once; the others wait
     /// for a boundary where no batch and no submission is in flight.
@@ -1121,28 +1124,28 @@ impl CommandSender {
         &self,
         stage: crate::Stage,
     ) -> crossbeam_channel::Receiver<Result<StageApplied, String>> {
-        let (answer, done) = crossbeam_channel::bounded(1);
+        let (response, done) = crossbeam_channel::bounded(1);
         self.refuse_next_step(
-            &answer,
+            &response,
             self.send(Command::StagePolicy {
                 stage,
-                answer: StageAnswer::Step(answer.clone()),
+                response: StageResponse::Step(response.clone()),
             })
             .is_ok(),
         );
         done
     }
 
-    /// A stage answered with whether it applied, for a caller that does not use
+    /// A stage responded with whether it applied, for a caller that does not use
     /// the step it applied at.
     fn stage_applied(
         &self,
         stage: crate::Stage,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, done) = crossbeam_channel::bounded(1);
+        let (response, done) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::StagePolicy {
             stage,
-            answer: StageAnswer::Applied(answer),
+            response: StageResponse::Applied(response),
         });
         done
     }
@@ -1171,53 +1174,56 @@ impl CommandSender {
         self.stage_applied(crate::Stage::Purge)
     }
 
-    /// One command of the program-layer update, answered when this scheduler
+    /// One command of the program-layer update, responded when this scheduler
     /// applied it (§2.3, §7.3).
     pub fn program_command(
         &self,
         command: ipc::ProgramCommand,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::ProgramCommand { command, answer });
+        let (response, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::ProgramCommand { command, response });
         done
     }
 
     /// The epoch's engine command as this scheduler applies it (§7.3): the
-    /// stages are answered when they apply, and every other command is answered
+    /// stages get their responses when they apply, and every other command gets its response
     /// with why it belongs to the main process rather than to one scheduler.
     pub fn engine_command(
         &self,
         command: proto::process::Command,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::EngineCommand { command, answer });
+        let (response, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::EngineCommand { command, response });
         done
     }
 
     /// Runs the following step's batches in shadow for `generation` too (§7.3
-    /// step 2), answered once one step's batches have been shadowed.
+    /// step 2), responded once one step's batches have been shadowed.
     pub fn shadow(&self, generation: u64) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Shadow { generation, answer });
+        let (response, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Shadow {
+            generation,
+            response,
+        });
         done
     }
 
     /// What this scheduler has done and what its policy has cost (§12).
     pub fn counters(&self) -> crossbeam_channel::Receiver<Counters> {
-        let (answer, counters) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Counters { answer });
+        let (response, counters) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Counters { response });
         counters
     }
 
     /// The serving program and the prepared one (§7.3).
     pub fn policy_programs(&self) -> crossbeam_channel::Receiver<PolicyPrograms> {
-        let (answer, programs) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::PolicyPrograms { answer });
+        let (response, programs) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::PolicyPrograms { response });
         programs
     }
 
     /// A request-path command, translated to the scheduler command that
-    /// carries it, and answered when it was enqueued.
+    /// carries it, and responded when it was enqueued.
     ///
     /// `Consumed` and `Takeover` are the connection's bookkeeping rather than a
     /// scheduler's — the engine's routing holds the request's stream — so they
@@ -1254,16 +1260,16 @@ impl CommandSender {
     /// The step and cost counters, polled rather than waited for: the caller is
     /// the engine's control thread, which no scheduler may hold.
     pub fn progress(&self) -> crossbeam_channel::Receiver<crate::Progress> {
-        let (answer, progress) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Progress { answer });
+        let (response, progress) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Progress { response });
         progress
     }
 
     /// Takes the policy failure this scheduler recorded since the last call,
     /// if it recorded one: the control thread forwards it to the daemons.
     pub fn take_policy_report(&self) -> crossbeam_channel::Receiver<Option<crate::PolicyReverted>> {
-        let (answer, report) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::TakePolicyReport(answer));
+        let (response, report) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::TakePolicyReport(response));
         report
     }
 
@@ -1271,8 +1277,8 @@ impl CommandSender {
     pub fn describe_requests(
         &self,
     ) -> crossbeam_channel::Receiver<Vec<proto::request::wire::RequestPrefix>> {
-        let (answer, described) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::DescribeRequests(answer));
+        let (response, described) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::DescribeRequests(response));
         described
     }
 
@@ -1282,20 +1288,20 @@ impl CommandSender {
         operation: storage::manifest::cache::Operation,
         together: Arc<HookBarrier>,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        let (answer, response) = crossbeam_channel::bounded(1);
+        let (response, warmed) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::CacheWarm {
             operation,
             together,
-            answer,
+            response,
         });
-        response
+        warmed
     }
 
     /// Commits a successor scheduler's epoch (`Command::Commit`); the
     /// receiver gets what each worker reported.
     pub fn commit(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        let (answer, committed) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Commit(answer));
+        let (response, committed) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Commit(response));
         committed
     }
 
@@ -1310,12 +1316,12 @@ impl CommandSender {
         &self,
         limits: crate::SchedulerConfig,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, receiver) = crossbeam_channel::bounded(1);
+        let (response, receiver) = crossbeam_channel::bounded(1);
         let limits = Box::new(limits);
-        if let Err(error) = self.send(Command::Configure { limits, answer })
-            && let Command::Configure { answer, .. } = error.0
+        if let Err(error) = self.send(Command::Configure { limits, response })
+            && let Command::Configure { response, .. } = error.0
         {
-            let _ = answer.send(Err("the scheduler stopped".to_owned()));
+            let _ = response.send(Err("the scheduler stopped".to_owned()));
         }
         receiver
     }
@@ -1326,11 +1332,11 @@ impl CommandSender {
         &self,
         change: CacheChange,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        let (answer, receiver) = crossbeam_channel::bounded(1);
-        if let Err(error) = self.send(Command::ResizeCache { change, answer })
-            && let Command::ResizeCache { answer, .. } = error.0
+        let (response, receiver) = crossbeam_channel::bounded(1);
+        if let Err(error) = self.send(Command::ResizeCache { change, response })
+            && let Command::ResizeCache { response, .. } = error.0
         {
-            let _ = answer.send(Err("the scheduler stopped".to_owned()));
+            let _ = response.send(Err("the scheduler stopped".to_owned()));
         }
         receiver
     }
@@ -1344,14 +1350,14 @@ impl CommandSender {
         model_path: String,
         in_flight: WeightsInFlight,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        let (answer, receiver) = crossbeam_channel::bounded(1);
+        let (response, receiver) = crossbeam_channel::bounded(1);
         if let Err(error) = self.send(Command::UpdateWeights {
             model_path,
             in_flight,
-            answer,
-        }) && let Command::UpdateWeights { answer, .. } = error.0
+            response,
+        }) && let Command::UpdateWeights { response, .. } = error.0
         {
-            let _ = answer.send(Err("the scheduler stopped".to_owned()));
+            let _ = response.send(Err("the scheduler stopped".to_owned()));
         }
         receiver
     }
@@ -1366,14 +1372,14 @@ impl CommandSender {
         order: std::collections::BTreeMap<String, Vec<u32>>,
         together: Arc<crate::HookBarrier>,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        let (answer, receiver) = crossbeam_channel::bounded(1);
+        let (response, receiver) = crossbeam_channel::bounded(1);
         if let Err(error) = self.send(Command::CommitExperts {
             order,
             together,
-            answer,
-        }) && let Command::CommitExperts { answer, .. } = error.0
+            response,
+        }) && let Command::CommitExperts { response, .. } = error.0
         {
-            let _ = answer.send(Err("the scheduler stopped".to_owned()));
+            let _ = response.send(Err("the scheduler stopped".to_owned()));
         }
         receiver
     }

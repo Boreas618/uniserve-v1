@@ -49,7 +49,7 @@ impl PeerRegistration {
     }
 }
 
-/// The answer to a [`PeerRegistration`]: the accepting main process keeps the
+/// The response to a [`PeerRegistration`]: the accepting main process keeps the
 /// connection under this rank.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

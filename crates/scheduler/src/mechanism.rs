@@ -8,12 +8,12 @@
 //!   its previous module and the switch. It is the mechanism's whole view of the
 //!   policy; nothing here reaches past it.
 //! - The validators ([`validate_output`], [`validate_victims`],
-//!   [`validate_route`], [`validate_place`]): every answer is checked against the live state and
+//!   [`validate_route`], [`validate_place`]): every response is checked against the live state and
 //!   the step's hard limits before it is executed. A decision that names
 //!   something that does not exist, does not fit or cannot be chosen is the
 //!   policy's failure (§4.4), never the mechanism's.
 //! - The [`Recorder`] and the [`Watchdog`]: the state changes the policy is
-//!   told about, and the resident request that did not progress within
+//!   told about, and the running request that did not progress within
 //!   `limits().timeout`, which is the other way a policy fails.
 //!
 //! The validators are pure functions over the interface's own types, so the
@@ -60,7 +60,7 @@ impl Validators for Checked<'_> {
     fn victims(&self, shortage: &Shortage, victims: &[Victim]) -> Result<(), PolicyError> {
         // A trial runs on the mechanism's own state at this moment, so a
         // victim cannot have vanished under it: the door maps that arm to a
-        // malformed answer rather than inventing a second failure kind for a
+        // malformed response rather than inventing a second failure kind for a
         // case the trial cannot see.
         match validate_victims(shortage, victims, self.live) {
             Ok(()) => Ok(()),
@@ -99,7 +99,7 @@ impl Validators for Checked<'_> {
 #[derive(Clone, Debug)]
 pub(crate) struct Live<'a> {
     /// Every request the main process holds, by id, as the policy was last
-    /// told it: a queued request is one whose view is `Queued`.
+    /// told it: a waiting request is one whose view is `Waiting`.
     pub requests: std::borrow::Cow<'a, BTreeMap<RequestId, RequestView>>,
     /// Every device and host page, by id: the scheduler's own table, which the
     /// page delta maintains, borrowed for a step and owned when the state is
@@ -112,7 +112,7 @@ pub(crate) struct Live<'a> {
     /// The page identities the policy was told about and has not been told are
     /// gone: the `Snapshot` it was instantiated with, plus every `Cached` since.
     ///
-    /// A victim is judged against this, not against `pages`: the policy answers
+    /// A victim is judged against this, not against `pages`: the policy responds
     /// about the state it was shown, so an identity it was shown and the
     /// mechanism has since freed is *already freed*, while an identity it was
     /// never shown is a decision about something that does not exist.
@@ -228,7 +228,7 @@ pub(crate) fn validate_output(
 ///
 /// A step applies a dispatch output's admission before it checks the rest, so that one
 /// output can both admit a request and run it (§4.4); the work then names a
-/// resident request and nothing else. The admission itself is checked against
+/// running request and nothing else. The admission itself is checked against
 /// the queue the policy was given, before it is applied — see
 /// [`validate_admission`].
 pub(crate) fn validate_after_admission(
@@ -241,7 +241,7 @@ pub(crate) fn validate_after_admission(
     Ok(())
 }
 
-/// Admission names queued requests, and never the same one twice or both
+/// Admission names waiting requests, and never the same one twice or both
 /// admitted and rejected.
 ///
 /// The order is the policy's: the mechanism admits in the output's order and
@@ -259,9 +259,9 @@ pub(crate) fn validate_admission(
 ) -> Result<(), PolicyError> {
     // §4.4 puts the slot limit in the mechanism's *stop*, not in a refusal:
     // `Scheduler::admit` admits in the queue's order until the first
-    // request that cannot be placed, and it and those after it stay queued. A
+    // request that cannot be placed, and it and those after it stay waiting. A
     // output that names more requests than there are slots free is exactly what
-    // `fcfs` states - it names every queued request - so refusing it here would
+    // `fcfs` states - it names every waiting request - so refusing it here would
     // stop every loaded epoch.
     let mut admitted = BTreeSet::new();
     for id in &output.admit {
@@ -318,11 +318,11 @@ fn validate_work(output: &DispatchOutput, room: &Room, live: &Live<'_>) -> Resul
     let mut seen = BTreeSet::new();
     let mut tokens = 0u64;
     let mut prefill_tokens = 0u64;
-    // The tokens of each (component, kind) group: a batch is one numerical call
-    // on one component, so the graph tier bounds the group, not the step.
+    // The tokens of each (stage, kind) group: a batch is one numerical call
+    // on one stage, so the graph tier bounds the group, not the step.
     let mut groups: Vec<((u32, PhaseKind), u64)> = Vec::new();
 
-    // A request the output admits is resident for the work the same output gives
+    // A request the output admits is running for the work the same output gives
     // it: the step applies admission before the work, which is what lets one
     // output both admit and run a request (§4.4). The trial runs the same check
     // on one state and never applies anything, so it reads the output's own
@@ -399,15 +399,15 @@ fn validate_work_entry(
     if request.state != RequestStatus::Running && !by_this_output {
         return Err(invalid(
             Call::Dispatch,
-            format!("{} is not resident", work.request.0),
+            format!("{} is not running", work.request.0),
         ));
     }
     // A request the output itself admits has no phase in this state: the phase it
-    // serves next is the mechanism's to compute once the request is resident,
+    // serves next is the mechanism's to compute once the request is running,
     // and a step applies admission before it checks the work. So the phase is
-    // compared where the mechanism's own answer exists — against the state
+    // compared where the mechanism's own response exists — against the state
     // admission left (`validate_after_admission` on the live step) — and not
-    // here, where a queued view's `None` would refuse every output that admits
+    // here, where a waiting view's `None` would refuse every output that admits
     // and runs a request in one step.
     if !by_this_output && request.phase != Some(work.phase) {
         return Err(invalid(
@@ -430,8 +430,8 @@ fn validate_work_entry(
         ));
     }
     if by_this_output {
-        // A request this output admits has no resident view yet, so the work's
-        // own bounds cannot be checked against it: a queued view states no
+        // A request this output admits has no running view yet, so the work's
+        // own bounds cannot be checked against it: a waiting view states no
         // prompt length and no prefilled count, and a prefill chunk or a decode
         // charge measured against those zeros would refuse every output that
         // admits a request and runs it in one step (§4.4). The live step
@@ -506,10 +506,7 @@ fn validate_release(output: &DispatchOutput, live: &Live<'_>) -> Result<(), Poli
         if !page.evictable {
             return Err(invalid(
                 Call::Dispatch,
-                format!(
-                    "page {} is still continued from by a resident request",
-                    id.0
-                ),
+                format!("page {} is still continued from by a running request", id.0),
             ));
         }
         if !pages.insert(*id) {
@@ -526,7 +523,7 @@ fn validate_release(output: &DispatchOutput, live: &Live<'_>) -> Result<(), Poli
         if request.state != RequestStatus::Running {
             return Err(invalid(
                 Call::Dispatch,
-                format!("prefetch names {}, which is not resident", id.0),
+                format!("prefetch names {}, which is not running", id.0),
             ));
         }
         if request.prefetch_tokens == 0 {
@@ -549,7 +546,7 @@ fn validate_release(output: &DispatchOutput, live: &Live<'_>) -> Result<(), Poli
         if request.state != RequestStatus::Running {
             return Err(invalid(
                 Call::Dispatch,
-                format!("refill names {}, which is not resident", id.0),
+                format!("refill names {}, which is not running", id.0),
             ));
         }
         if request.refill_tokens.unwrap_or(0) == 0 {
@@ -570,7 +567,7 @@ fn validate_release(output: &DispatchOutput, live: &Live<'_>) -> Result<(), Poli
 
 /// Checks the objects a policy would free for a shortage (design §4.4).
 ///
-/// The legal answers are these, and only these:
+/// The legal responds are these, and only these:
 ///
 /// | shortage           | victims                                   |
 /// |--------------------|-------------------------------------------|
@@ -578,10 +575,10 @@ fn validate_release(output: &DispatchOutput, live: &Live<'_>) -> Result<(), Poli
 /// | `HostPages`        | a host page                                |
 /// | `EncoderEntries`   | an encoder cache entry                     |
 ///
-/// A page may be freed only when it is live and no resident request continues
-/// from it (`evictable`); a request may be ended only when it is resident and
+/// A page may be freed only when it is live and no running request continues
+/// from it (`evictable`); a request may be ended only when it is running and
 /// migratable, because that is the only way the mechanism can end one without
-/// losing the tokens it generated (the frontend resubmits it). An empty answer
+/// losing the tokens it generated (the frontend resubmits it). An empty response
 /// is legal: a policy may leave the shortfall to natural completion.
 pub(crate) fn validate_victims(
     shortage: &Shortage,
@@ -592,7 +589,7 @@ pub(crate) fn validate_victims(
     //
     // 1. An object the policy **was told** about and the mechanism no longer
     //    holds: the mechanism let go of it between the observation the policy
-    //    answered from and this call. Nothing of the step can do that today -
+    //    responded from and this call. Nothing of the step can do that today -
     //    `admit` is the only thing that changes storage between `observe`
     //    and `preempt`, and it frees nothing - so the case is unreachable, and
     //    its path exists to catch the mechanism, not the policy: a free it made
@@ -603,13 +600,13 @@ pub(crate) fn validate_victims(
     //    §4.4 makes that a failed policy. This is what keeps case 1 honest -
     //    without it, a name that never existed would read as already freed.
     // 3. The semantic refusals stay refusals throughout, as a policy's failure:
-    //    a page on the host frees no device units, a page a resident request
+    //    a page on the host frees no device units, a page a running request
     //    still continues from cannot be freed, an encoder entry no request
-    //    holds is not a cache entry, and a request that is not resident and
+    //    holds is not a cache entry, and a request that is not running and
     //    migratable cannot be ended.
     //
-    // An empty answer stays legal: a policy may leave the shortfall to natural
-    // completion or to the next step, and only a resident request starved past
+    // An empty response stays legal: a policy may leave the shortfall to natural
+    // completion or to the next step, and only a running request starved past
     // `limits().timeout` is a failure (§4.4).
     let mut seen: Vec<Victim> = Vec::new();
     for victim in victims {
@@ -654,9 +651,9 @@ pub(crate) fn validate_victims(
                             "{} cannot be ended as migratable: it is {} and {} migratable",
                             view.id.0,
                             if view.state == RequestStatus::Running {
-                                "resident"
+                                "running"
                             } else {
-                                "not resident"
+                                "not running"
                             },
                             if view.migratable { "" } else { "not" }
                         ),
@@ -772,7 +769,7 @@ fn told_request(
 /// The two are kept apart because only one of them is the policy's: a
 /// [`VictimError::Vanished`] is the mechanism's own bookkeeping broken (§4.4's
 /// failure taxonomy has no place for it), and the epoch must stop naming that
-/// rather than blame the policy for answering about the view it was given.
+/// rather than blame the policy for responding about the view it was given.
 #[derive(Debug)]
 pub(crate) enum VictimError {
     /// The policy's decision is invalid: it names an object it was never
@@ -831,7 +828,7 @@ pub(crate) fn validate_route(
 /// Checks a dispatch decision against the replicas the mechanism offered.
 ///
 /// The replica must be in the list, run the call's kind, and not run prefill
-/// only when the call is a decode-stage one (today's `component_target` rules
+/// only when the call is a decode-stage one (today's `stage_target` rules
 /// are the policy's; these are the mechanism's hard constraints). Capacity is a
 /// preference the policy weighs, not a hard limit: a request that must run
 /// somewhere still runs on a full replica rather than not at all.
@@ -888,7 +885,7 @@ pub(crate) fn advanced_tokens(call: &ipc::Call) -> u32 {
 
 /// The state changes the policy is told about, in the order they happened.
 ///
-/// Events are proportional to state changes, never to resident requests or
+/// Events are proportional to state changes, never to running requests or
 /// cache pages (§4.4): the mechanism records one event per change it makes, and
 /// an `Updated` only for a request whose scheduling-relevant view moved since
 /// the policy was last told. The list is closed before the step's `dispatch`
@@ -973,7 +970,7 @@ impl Recorder {
     /// The requests the policy currently knows, as the mechanism's own account
     /// of what it last told: a request leaves here when its end is announced,
     /// which is what makes this the set to compare against the mechanism's
-    /// queues. (The `announced_*` sets below are cumulative: they answer "was
+    /// queues. (The `announced_*` sets below are cumulative: they respond "was
     /// this ever shown", which is the victim rules' question, not this one.)
     pub(crate) fn known(&self) -> impl Iterator<Item = RequestId> + '_ {
         self.told.keys().copied()
@@ -991,13 +988,13 @@ impl Recorder {
 
     /// Records one state change.
     /// A page was published: a policy that mirrors the cache keeps it from now
-    /// on, and no step has to walk the pool to learn it.
+    /// on, and no step has to scan the pool to learn it.
     pub(crate) fn cached(&mut self, page: PageView) {
         self.record(crate::views::cached(page));
     }
 
     /// A page went: the policy drops it, and the mechanism's own table of live
-    /// pages stops answering for it.
+    /// pages stops responding for it.
     pub(crate) fn freed(&mut self, page: PageId) {
         self.record(crate::views::freed(page));
     }
@@ -1094,9 +1091,9 @@ impl Recorder {
     /// device cache reused, and the tokens the host KV cache could deepen that
     /// hit by.
     ///
-    /// Neither is a view's to compute: the device hit is the answer of the
+    /// Neither is a view's to compute: the device hit is the response of the
     /// prefill worker admission asked (`Scheduler::lookup_prefix`), and the
-    /// host deepening is the boundary `KvOffloadManager::admission` answers,
+    /// host deepening is the boundary `KvOffloadManager::admission` responses,
     /// less the device hit. Both are known only where admission computes them,
     /// so they are recorded there and `views.rs` reads them back from
     /// [`Recorder::recorded`].
@@ -1148,19 +1145,19 @@ impl Recorder {
 
 /// The starvation watchdog (design §4.4).
 ///
-/// A resident request that is not waiting for a transfer and has not advanced
+/// A running request that is not waiting for a transfer and has not advanced
 /// within `limits().timeout` is the policy's failure, exactly as sched_ext
 /// treats a runnable task its scheduler did not run within `timeout_ms`. The
 /// mechanism decides when a request advanced (one completed call it put in a
 /// output); the policy cannot move the deadline, only its own `timeout`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Watchdog {
-    /// When each resident request last advanced, or was admitted.
+    /// When each running request last advanced, or was admitted.
     advancing: BTreeMap<RequestId, Nanos>,
 }
 
 impl Watchdog {
-    /// A request became resident: its deadline starts now.
+    /// A request became running: its deadline starts now.
     pub(crate) fn admitted(&mut self, request: RequestId, at: Nanos) {
         self.advancing.insert(request, at);
     }
@@ -1209,7 +1206,7 @@ mod tests {
     use super::*;
     use crate::policy::{PolicyReverted, TrialState};
 
-    use scheduling::guest::{ComponentId, RequestClass, Room, Storage};
+    use scheduling::guest::{RequestClass, Room, StageId, Storage};
 
     fn request(id: u64, state: RequestStatus) -> RequestView {
         RequestView {
@@ -1251,7 +1248,7 @@ mod tests {
                         PhaseView {
                             id: PhaseId(*index),
                             kind: *kind,
-                            block: ComponentId(*index),
+                            block: StageId(*index),
                         },
                     )
                 })
@@ -1309,7 +1306,7 @@ mod tests {
             ],
             &[],
         );
-        // Any order of queued requests is legal; the order is the policy's.
+        // Any order of waiting requests is legal; the order is the policy's.
         let mut p = output(Vec::new());
         p.admit = vec![RequestId(2), RequestId(1)];
         validate_output(&p, &room(), &live).expect("a policy may reorder the queue");
@@ -1371,7 +1368,7 @@ mod tests {
         let error = validate_output(&p, &room(), &live).expect_err("wrong phase");
         assert!(format!("{error}").contains("next phase"));
 
-        // A request that is not resident cannot be given work.
+        // A request that is not running cannot be given work.
         let mut queued = request(3, RequestStatus::Waiting);
         queued.phase = Some(PhaseId(1));
         let mut live = live.clone();
@@ -1382,7 +1379,7 @@ mod tests {
             tokens: 1,
         }]);
         let error = validate_output(&p, &room(), &live).expect_err("queued");
-        assert!(format!("{error}").contains("not resident"));
+        assert!(format!("{error}").contains("not running"));
     }
 
     #[test]
@@ -1556,9 +1553,9 @@ mod tests {
         validate_victims(&units, &[Victim::Request(RequestId(2))], &live)
             .expect("a migratable request");
 
-        // Freeing nothing is a legal answer: work that did not fit waits for
+        // Freeing nothing is a legal response: work that did not fit waits for
         // the next step, and §4.4's watchdog is what fails a policy that then
-        // never advances a resident request. The shortage itself is not a
+        // never advances a running request. The shortage itself is not a
         // failure, because a policy may have nothing it may free.
         validate_victims(&units, &[], &live).expect("freeing nothing is legal");
         let error = validate_victims(&units, &[Victim::Request(RequestId(1))], &live)
@@ -1595,11 +1592,11 @@ mod tests {
         // the residency the live step will have made; without that, a mid-flight
         // install whose first output admits and runs a request could never pass
         // probation.
-        // A queued view states no prompt length and no prefilled count: the run
+        // A waiting view states no prompt length and no prefilled count: the run
         // reported exactly that, "a 4-token prefill chunk with 0 prompt tokens
         // left". The output admits the request and runs its first chunk anyway,
         // because the step applies admission before it checks the work, so a
-        // tree that measures the chunk against the queued view refuses this
+        // tree that measures the chunk against the waiting view refuses this
         // output and fails here.
         let queued = request(1, RequestStatus::Waiting);
         let live = live(vec![queued], &[(0, PhaseKind::Prefill)]);
@@ -1617,8 +1614,8 @@ mod tests {
         // The same work without the admission names a request that is not
         // running, which stays a refused decision.
         let refused = output(vec![work]);
-        let error = validate_output(&refused, &room(), &live).expect_err("not resident");
-        assert!(format!("{error}").contains("not resident"));
+        let error = validate_output(&refused, &room(), &live).expect_err("not running");
+        assert!(format!("{error}").contains("not running"));
     }
 
     #[test]
@@ -1650,7 +1647,7 @@ mod tests {
     #[test]
     fn a_victim_the_policy_was_shown_and_is_gone_is_the_mechanisms_defect() {
         // Nothing of a step frees a page between the observation the policy
-        // answered from and the preemption, so this state means the mechanism let
+        // responded from and the preemption, so this state means the mechanism let
         // go of a told object without recording it: an invariant of its own,
         // named as such and never as the policy's wrong decision.
         let live = live(Vec::new(), &[]);
@@ -1692,23 +1689,23 @@ mod tests {
         let replicas = vec![
             ReplicaView {
                 index: 0,
-                block: ComponentId(0),
+                block: StageId(0),
                 kinds: vec![PhaseKind::Prefill],
-                resident_requests: 1,
+                running_requests: 1,
                 capacity: 1,
                 holds_request: false,
                 prefills_only: true,
-                holds_component: false,
+                holds_stage: false,
             },
             ReplicaView {
                 index: 1,
-                block: ComponentId(1),
+                block: StageId(1),
                 kinds: vec![PhaseKind::Decode],
-                resident_requests: 4,
+                running_requests: 4,
                 capacity: 0,
                 holds_request: false,
                 prefills_only: false,
-                holds_component: false,
+                holds_stage: false,
             },
         ];
         let call = CallView {
@@ -1860,7 +1857,7 @@ mod tests {
             failures: 0,
         };
 
-        // A good answer validates and executes; the failed one is the policy's.
+        // A good response validates and executes; the failed one is the policy's.
         let decision = policy.dispatch(&room()).expect("the fixed output");
         validate_output(&decision, &room(), &live).expect("a valid output");
 
@@ -1880,7 +1877,7 @@ mod tests {
                 .is_none()
         );
 
-        // The routing and dispatch answers are checked the same way.
+        // The routing and dispatch responds are checked the same way.
         let ranks = vec![RankView {
             index: 0,
             in_flight: 0,

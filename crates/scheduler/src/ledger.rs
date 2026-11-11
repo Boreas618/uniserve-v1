@@ -30,7 +30,7 @@ pub(super) struct Room {
     pub(super) quota: u64,
     /// What the ledger books.
     pub(super) booked: u64,
-    /// The device's free storage when planned.
+    /// The device's free storage when prepared.
     pub(super) free: u64,
     /// The device storage the session holds.
     pub(super) bytes: u64,

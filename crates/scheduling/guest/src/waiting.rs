@@ -9,7 +9,7 @@
 //!
 //! A policy learns of arrivals from [`Event::Arrived`](crate::Event::Arrived),
 //! of admissions from [`Event::Admitted`](crate::Event::Admitted), and of the
-//! end of a queued request from [`Event::Finished`](crate::Event::Finished); a
+//! end of a waiting request from [`Event::Finished`](crate::Event::Finished); a
 //! request stays queued until one of those says otherwise. `init` fills the
 //! queue from the snapshot, so a policy put in mid-flight sees the requests
 //! that already wait.
@@ -54,7 +54,7 @@ impl Order for PriorityOrder {
 
 /// A request waiting for admission, with the key its order puts it at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Queued<K> {
+struct Entry<K> {
     key: K,
     request: RequestId,
 }
@@ -66,7 +66,7 @@ struct Queued<K> {
 /// queue, which is the same cost as the ordered insertion.
 #[derive(Clone, Debug)]
 pub struct Waiting<K: Order> {
-    queued: Vec<Queued<K>>,
+    queued: Vec<Entry<K>>,
 }
 
 impl<K: Order> Default for Waiting<K> {
@@ -93,7 +93,7 @@ impl<K: Order> Waiting<K> {
         let at = self.queued.partition_point(|queued| queued.key <= key);
         self.queued.insert(
             at,
-            Queued {
+            Entry {
                 key,
                 request: view.id,
             },

@@ -27,62 +27,62 @@ use ipc::ForwardMode;
 use scheduling::guest::DispatchOutput;
 use std::ops::ControlFlow;
 
-/// One product a video request reserves: its declared name, the component
+/// One product a video request reserves: its declared name, the stage
 /// output it is reserved under, and its request-sized shape.
 pub(super) struct MediaOutput {
     pub(super) name: &'static str,
-    pub(super) component: String,
+    pub(super) stage: String,
     pub(super) index: u32,
     pub(super) dtype: DType,
     pub(super) shape: ShapeBound,
 }
 
-/// Why the loaded media components cannot hold a request's product.
+/// Why the loaded media stages cannot hold a request's product.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(super) enum MediaOutputError {
-    /// No loaded component serves the call that publishes the product.
-    #[error("no loaded component serves {0:?}")]
+    /// No loaded stage serves the call that publishes the product.
+    #[error("no loaded stage serves {0:?}")]
     Unserved(MediaCall),
-    /// The serving component has no dispatch candidate.
-    #[error("component {0} has no loaded candidate")]
+    /// The serving stage has no dispatch candidate.
+    #[error("stage {0} has no loaded candidate")]
     Unplaced(String),
-    /// The candidate's worker does not bind the component.
-    #[error("component {0} is not bound on its worker")]
+    /// The candidate's worker does not bind the stage.
+    #[error("stage {0} is not bound on its worker")]
     Unbound(String),
-    /// The component declares no output of the product's name.
-    #[error("component {component} declares no {product} output")]
+    /// The stage declares no output of the product's name.
+    #[error("stage {stage} declares no {product} output")]
     Undeclared {
-        component: String,
+        stage: String,
         product: &'static str,
     },
     /// A raster-laid output lacks a static axis for one side of the canvas.
-    #[error("{product} of component {component} has no static {side} axis")]
+    #[error("{product} of stage {stage} has no static {side} axis")]
     RasterAxis {
-        component: String,
+        stage: String,
         product: &'static str,
         side: &'static str,
     },
     /// The request's canvas side is zero or exceeds the declared extent.
     #[error(
-        "{product} of component {component} holds a {side} of at most {max} pixels, the request's canvas has {extent}"
+        "{product} of stage {stage} holds a {side} of at most {max} pixels, the request's canvas has {extent}"
     )]
     Raster {
-        component: String,
+        stage: String,
         product: &'static str,
         side: &'static str,
         max: u32,
         extent: u32,
     },
     /// A request-sized product's output has no device-sized axis.
-    #[error("{product} of component {component} has no request-sized axis")]
+    #[error("{product} of stage {stage} has no request-sized axis")]
     RequestAxis {
-        component: String,
+        stage: String,
         product: &'static str,
     },
     /// The request's extent is zero or exceeds the device-sized maximum.
-    #[error("{product} of component {component} holds 1 to {max}, the request needs {extent}")]
+    #[error("{product} of stage {stage} holds 1 to {max}, the request needs {extent}")]
     Request {
-        component: String,
+        stage: String,
         product: &'static str,
         max: u32,
         extent: u32,
@@ -318,8 +318,8 @@ impl Scheduler {
         let st = TokenState {
             finish_token_ids,
             allocations: None,
-            state_resident: false,
-            sampling_resident: false,
+            state_on_device: false,
+            sampling_on_device: false,
             request_epoch: self.next_request_epoch,
             last_state_call_id: CallId::default(),
             latest_token: None,
@@ -373,19 +373,19 @@ impl Scheduler {
     /// Resolves the products a video request reserves at admission.
     ///
     /// Each product of the request's graph is found by name among the
-    /// outputs of the component serving its call, as bound on that call's
+    /// outputs of the stage serving its call, as bound on that call's
     /// first dispatch candidate. A product with a request extent takes it
     /// as the extent of its output's device-sized axis, which must not exceed
     /// the declared maximum; a product without one keeps its declared
     /// extent there. An output declaring raster axes takes the request's
     /// canvas height and width in them, each at most the declared extent.
-    /// Returns one entry per product: its name, component, output index,
+    /// Returns one entry per product: its name, stage, output index,
     /// dtype and shape bound.
     ///
     /// # Errors
     ///
-    /// Returns a [`MediaOutputError`] naming the product when no component
-    /// serves its call, the component declares no output of that name, the output has
+    /// Returns a [`MediaOutputError`] naming the product when no stage
+    /// serves its call, the stage declares no output of that name, the output has
     /// no device-sized axis for a request extent, or the request's extent or
     /// canvas is zero or exceeds the declared maximum. `add_request`
     /// rejects such a request, and `admit_video` calls this again to size the
@@ -395,26 +395,26 @@ impl Scheduler {
         for product in graph.products() {
             let name = self
                 .info
-                .media_components
+                .media_stages
                 .get(&product.call)
                 .ok_or(MediaOutputError::Unserved(product.call))?;
             let (_, bound, info) = self
                 .dispatch
-                .component_candidates(&self.worker, CallKind::Media(product.call), name)
+                .stage_candidates(&self.worker, CallKind::Media(product.call), name)
                 .next()
                 .ok_or_else(|| MediaOutputError::Unplaced(name.clone()))?;
-            let component = info
-                .components
+            let stage = info
+                .stages
                 .iter()
-                .find(|component| component.name == bound)
+                .find(|stage| stage.name == bound)
                 .ok_or_else(|| MediaOutputError::Unbound(bound.to_owned()))?;
-            let (index, output) = component
+            let (index, output) = stage
                 .outputs
                 .iter()
                 .enumerate()
                 .find(|(_, output)| output.name == product.name)
                 .ok_or_else(|| MediaOutputError::Undeclared {
-                    component: name.clone(),
+                    stage: name.clone(),
                     product: product.name,
                 })?;
             let mut shape = output.shape_bound.clone();
@@ -429,14 +429,14 @@ impl Scheduler {
                 ] {
                     let Some(DimBound::Static(max)) = shape.dims.get(axis as usize).copied() else {
                         return Err(MediaOutputError::RasterAxis {
-                            component: name.clone(),
+                            stage: name.clone(),
                             product: product.name,
                             side,
                         });
                     };
                     if extent == 0 || extent > max {
                         return Err(MediaOutputError::Raster {
-                            component: name.clone(),
+                            stage: name.clone(),
                             product: product.name,
                             side,
                             max,
@@ -452,7 +452,7 @@ impl Scheduler {
                     .iter_mut()
                     .find(|dim| matches!(dim, DimBound::Device { .. }))
                     .ok_or_else(|| MediaOutputError::RequestAxis {
-                        component: name.clone(),
+                        stage: name.clone(),
                         product: product.name,
                     })?;
                 let DimBound::Device { max } = *dim else {
@@ -460,7 +460,7 @@ impl Scheduler {
                 };
                 if extent == 0 || extent > max {
                     return Err(MediaOutputError::Request {
-                        component: name.clone(),
+                        stage: name.clone(),
                         product: product.name,
                         max,
                         extent,
@@ -470,7 +470,7 @@ impl Scheduler {
             }
             outputs.push(MediaOutput {
                 name: product.name,
-                component: name.clone(),
+                stage: name.clone(),
                 index: index as u32,
                 dtype: output.dtype,
                 shape,
@@ -479,18 +479,18 @@ impl Scheduler {
         Ok(outputs)
     }
 
-    /// Chooses one physical owner for every component a media request's
+    /// Chooses one physical owner for every stage a media request's
     /// calls run on.
     ///
     /// The denoiser is selected first because it defines the expensive replica
-    /// residency. Components co-located with that worker follow it; shared
-    /// components such as a TP text encoder and the host codec worker retain
+    /// residency. Stages co-located with that worker follow it; shared
+    /// stages such as a TP text encoder and the host codec worker retain
     /// their own independently bounded request rows. Otherwise the candidate
     /// with the fewest distinct requests placed on it in `Dispatch::affinity`
     /// wins, then the one with the most free request rows.
     ///
-    /// Returns a map from component name to worker, or `None` when some
-    /// component has no ready candidate that is already on the route or has
+    /// Returns a map from stage name to worker, or `None` when some
+    /// stage has no ready candidate that is already on the route or has
     /// a free request row. When the worker reports admissible video
     /// codecs for the video decoder's chosen worker, the video codec's
     /// candidates are further limited to those.
@@ -502,9 +502,9 @@ impl Scheduler {
             .iter()
             .filter_map(|call| {
                 self.info
-                    .media_components
+                    .media_stages
                     .get(call)
-                    .map(|component| (*call, component.clone()))
+                    .map(|stage| (*call, stage.clone()))
             })
             .collect::<Vec<_>>();
         // Routing order: the denoiser first, then the calls that feed it, then
@@ -522,23 +522,23 @@ impl Scheduler {
         });
         let mut routes = HashMap::new();
         let mut selected_workers = HashSet::new();
-        for (call, component) in required {
-            // A component serving several media calls is routed once.
-            if routes.contains_key(&component) {
+        for (call, stage) in required {
+            // A stage serving several media calls is routed once.
+            if routes.contains_key(&stage) {
                 continue;
             }
             // A request's media units are encoded where they were decoded, so
             // its encoder is one of the replicas admissible for its decoder.
             let admissible = (call == MediaCall::VideoEncoding)
                 .then(|| {
-                    let decoder = self.info.media_components.get(&MediaCall::VideoDecoding)?;
+                    let decoder = self.info.media_stages.get(&MediaCall::VideoDecoding)?;
                     let worker = routes.get(decoder)?;
                     self.worker.info().video_codecs.get(worker)
                 })
                 .flatten();
             let candidates = self
                 .dispatch
-                .component_candidates(&self.worker, CallKind::Media(call), &component)
+                .stage_candidates(&self.worker, CallKind::Media(call), &stage)
                 .filter(|(worker, _, _)| {
                     admissible.is_none_or(|encoders| encoders.contains(*worker))
                         && self.worker.is_ready(worker)
@@ -552,14 +552,14 @@ impl Scheduler {
                 .collect::<Vec<_>>();
 
             // A worker already on the route is preferred, so co-located
-            // components follow the denoiser. It needs no further free row
+            // stages follow the denoiser. It needs no further free row
             // because `reserve_media` takes one request row per distinct
             // worker.
-            let resident = candidates
+            let placed = candidates
                 .iter()
                 .copied()
                 .find(|(worker, _, _)| selected_workers.contains(*worker));
-            let chosen = resident.or_else(|| {
+            let chosen = placed.or_else(|| {
                 candidates.into_iter().min_by_key(|(worker, _, _)| {
                     let active = self
                         .dispatch
@@ -573,7 +573,7 @@ impl Scheduler {
                 })
             })?;
             selected_workers.insert(chosen.0.clone());
-            routes.insert(component.clone(), chosen.0.clone());
+            routes.insert(stage.clone(), chosen.0.clone());
         }
         Some(routes)
     }
@@ -593,12 +593,8 @@ impl Scheduler {
         // A worker reports the stage serving each media call it implements,
         // so a deployment that assembles an artifact is the one that can
         // serve a video request; reporting some call is not enough.
-        if !self
-            .info
-            .media_components
-            .contains_key(&ipc::MediaCall::Muxing)
-        {
-            return Err("worker does not provide the video media components".to_owned());
+        if !self.info.media_stages.contains_key(&ipc::MediaCall::Muxing) {
+            return Err("worker does not provide the video media stages".to_owned());
         }
         let denoiser = self
             .info
@@ -610,7 +606,7 @@ impl Scheduler {
         }
         let graph = VideoGraph::new(request).map_err(|error| error.to_string())?;
         self.media_outputs(&graph)
-            .map_err(|error| format!("loaded media components cannot hold the request: {error}"))?;
+            .map_err(|error| format!("loaded media stages cannot hold the request: {error}"))?;
         // The denoiser's fixed schedule sets every request's step count.
         Ok((graph, denoiser.denoise_steps))
     }
@@ -619,7 +615,7 @@ impl Scheduler {
     ///
     /// Every declared output is reserved in full in the buffer pool of each
     /// rank that backs it on each routed worker, not only on the worker whose
-    /// component produces it; spans are sized from the shape bound's maximum
+    /// stage produces it; spans are sized from the shape bound's maximum
     /// element count and 256-byte aligned.
     ///
     /// Returns `Ok(None)`, with nothing reserved, when a request row or buffer
@@ -649,7 +645,7 @@ impl Scheduler {
             reserved.request_slots.insert(worker.clone(), slot);
         }
         for output in outputs {
-            let (component, index) = (output.component.clone(), output.index);
+            let (stage, index) = (output.stage.clone(), output.index);
             let bytes = output
                 .shape
                 .max_elements()
@@ -661,22 +657,22 @@ impl Scheduler {
             };
             for worker in route_workers {
                 let Some(storage) = self.storage.media_storage.get_mut(worker) else {
-                    reserved.tensors.insert((component, index), tensor);
+                    reserved.tensors.insert((stage, index), tensor);
                     reserved.free(&mut self.storage)?;
                     return Err(UnknownMediaGroup(worker.clone()));
                 };
-                for rank in storage.holders(&component).to_vec() {
+                for rank in storage.holders(&stage).to_vec() {
                     let Ok(buffer) =
                         storage.buffers[rank as usize].allocate(request_key, bytes, 256)
                     else {
-                        reserved.tensors.insert((component, index), tensor);
+                        reserved.tensors.insert((stage, index), tensor);
                         reserved.free(&mut self.storage)?;
                         return Ok(None);
                     };
                     tensor.allocations.insert((worker.clone(), rank), buffer);
                 }
             }
-            reserved.tensors.insert((component, index), tensor);
+            reserved.tensors.insert((stage, index), tensor);
         }
         Ok(Some(reserved))
     }
@@ -684,7 +680,7 @@ impl Scheduler {
     /// Admits the waiting video request `id`, the head of the queue, when its
     /// route and its storage are available.
     ///
-    /// Answers `Break` when the head waits: it cannot be routed or reserved
+    /// Returns `Break` when the head waits: it cannot be routed or reserved
     /// now, or a scheduler invariant broke (which also latches engine-fatal).
     /// Nothing stays reserved for a head that waits.
     fn admit_video(&mut self, id: RequestId) -> ControlFlow<()> {
@@ -699,7 +695,7 @@ impl Scheduler {
         // Submission validated these bounds against the same loaded
         // stages, so a request reaching admission has them.
         let Ok(outputs) = self.media_outputs(&state.graph) else {
-            self.invariant_broken("a queued media request has valid output bounds");
+            self.invariant_broken("a waiting media request has valid output bounds");
             return ControlFlow::Break(());
         };
         let prompt_token_ids = state.request.prompt_token_ids.clone();
@@ -718,8 +714,8 @@ impl Scheduler {
         // `allocations` holds the request's row on every routed worker;
         // the admission carries the denoiser's row, and a call placed on
         // another worker uses that worker's row.
-        let primary_component = self.info.media_components[&MediaCall::Denoising].as_str();
-        let request_pool_idx = allocations.request_slot(&routes[primary_component]);
+        let primary_stage = self.info.media_stages[&MediaCall::Denoising].as_str();
+        let request_pool_idx = allocations.request_slot(&routes[primary_stage]);
         // Submission validated the prompt, sampling and conditions this
         // admission carries.
         let admission = match NewRequest::new_media(
@@ -733,7 +729,7 @@ impl Scheduler {
             Err(error) => {
                 let released = allocations.free(&mut self.storage);
                 self.invariant_broken(&format!(
-                    "a queued media request forms a valid admission: {error}"
+                    "a waiting media request forms a valid admission: {error}"
                 ));
                 if let Err(unknown) = released {
                     self.invariant_broken(&unknown.to_string());
@@ -743,10 +739,10 @@ impl Scheduler {
         };
 
         // The admission commits here; nothing below leaves the request waiting.
-        for (component, worker) in &routes {
+        for (stage, worker) in &routes {
             self.dispatch
                 .affinity
-                .insert((request_key, component.clone()), worker.clone());
+                .insert((request_key, stage.clone()), worker.clone());
         }
         self.waiting.retain(|queued| *queued != id);
         let Some(request) = self.requests.get_mut(&id) else {
@@ -762,7 +758,7 @@ impl Scheduler {
             state.allocations = allocations;
             state.reservations = outputs
                 .iter()
-                .map(|output| (output.name, (output.component.clone(), output.index)))
+                .map(|output| (output.name, (output.stage.clone(), output.index)))
                 .collect();
             state.admission = Some(admission);
             if !state.output.enqueue(Event::Scheduled {
@@ -1013,7 +1009,7 @@ impl Scheduler {
     /// group. A head that can never fit the total cache capacity is rejected
     /// with `RejectionKind::Invalid`.
     ///
-    /// Answers `Continue` when the head left the queue (admitted, rejected,
+    /// Returns `Continue` when the head left the queue (admitted, rejected,
     /// or set aside for its predecessor's index) and `Break` when it waits:
     /// no slot is free, a running request waits for units, the head does not
     /// fit yet or finds no ready prefill worker, or an invariant broke.
@@ -1048,7 +1044,7 @@ impl Scheduler {
         // Submission rejects token requests when the worker has no prefix
         // cache, so a waiting one always finds it.
         let Some(cache) = self.storage.cache() else {
-            self.invariant_broken("a queued token request has a prefix cache");
+            self.invariant_broken("a waiting token request has a prefix cache");
             return ControlFlow::Break(());
         };
 
@@ -1101,7 +1097,7 @@ impl Scheduler {
         // The prompt's longest cached prefix over every tier. The head
         // waits while no prefill worker is ready or a tier below the device
         // is still looking its pages up.
-        let Some((target, prefix_hit)) = self.lookup_prefix(id, n, 0, HOST_ANSWER_WAIT) else {
+        let Some((target, prefix_hit)) = self.lookup_prefix(id, n, 0, HOST_RESPONSE_WAIT) else {
             return ControlFlow::Break(());
         };
         let Some(cache) = self.storage.cache() else {
@@ -1230,8 +1226,8 @@ impl Scheduler {
     /// the hit ends at what the other tiers hold.
     ///
     /// Asking below the device is a round trip to this host's Storage
-    /// Server, which answers well within a millisecond, so the call waits
-    /// for that answer at most `wait`: taking it at the next step instead
+    /// Server, which responds well within a millisecond, so the call waits
+    /// for that response at most `wait`: taking it at the next step instead
     /// admits a burst of prompts one per step. A read from a peer or the
     /// remote store takes longer and is waited for across steps.
     ///
@@ -1281,7 +1277,7 @@ impl Scheduler {
     /// prefill owner.
     ///
     /// Picks the first ready worker that serves prefill and returns it with
-    /// the component name it binds, plus the prefix hit on that worker's
+    /// the stage name it binds, plus the prefix hit on that worker's
     /// endpoint (prefix-cache residency is keyed by endpoint). The hit is an
     /// estimate; `acquire_cached_prefix` takes the actual prefix. Returns
     /// `None` when the runtime has no prefix cache or no prefill worker is ready.
@@ -1297,7 +1293,7 @@ impl Scheduler {
                 CallKind::Forward(ForwardMode::Prefill),
             )
             .filter(|(worker, _, _)| self.worker.is_ready(worker))
-            .map(|(worker, component, info)| {
+            .map(|(worker, stage, info)| {
                 let hit = cache.find_prefix(
                     &state.req.prompt_token_ids,
                     state.req.cache.read,
@@ -1305,7 +1301,7 @@ impl Scheduler {
                     PrefixScope::of(&state.req.cache),
                     &info.endpoint,
                 );
-                ((worker.clone(), component.to_owned()), hit)
+                ((worker.clone(), stage.to_owned()), hit)
             })
             .next()
     }
@@ -1333,7 +1329,7 @@ impl Scheduler {
     /// Reserves what admission to `target` needs before the request commits.
     ///
     /// Admission checked request-row capacity and chose `target` among loaded
-    /// workers, and the text prefix cache exists for every queued token request, so
+    /// workers, and the text prefix cache exists for every waiting token request, so
     /// an error names the scheduler invariant that no longer holds. Nothing
     /// stays reserved on error.
     fn reserve_admission(
@@ -1352,7 +1348,7 @@ impl Scheduler {
             .storage
             .cache
             .as_ref()
-            .ok_or("a queued token request has a prefix cache")?;
+            .ok_or("a waiting token request has a prefix cache")?;
         let request_slot = self
             .storage
             .request_pool
@@ -1551,7 +1547,7 @@ pub(super) struct AdmissionReservation {
 }
 
 /// How long admission waits for the head request's lookup below the device within one step.
-const HOST_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
+const HOST_RESPONSE_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Asks the tiers below the device for the pages a request can reuse beyond
 /// the device hit it already has, up to `limit` tokens of its prompt.

@@ -10,7 +10,7 @@
 //! tokens than its context pages: each lacks the draft cache entries of the
 //! positions between, and verifies drafts only once they are refilled.
 //!
-//! The worker is `testkit::FakeBatches`, answering as a drafter that proposes
+//! The worker is `testkit::FakeBatches`, responding as a drafter that proposes
 //! the model's next `accepted` tokens and then wrong ones: a verification row
 //! samples the fake's token at its position, and the call accepts the drafts
 //! its rows' samples confirm.
@@ -63,7 +63,7 @@ fn reusing(suffix: u32) -> Vec<u32> {
         .collect()
 }
 
-/// The fake's answer to `batch`: a call samples the fake's token after its
+/// The fake's response to `batch`: a call samples the fake's token after its
 /// last row; a verification's row reads its current token and its drafts and
 /// commits the drafts the fake's samples confirm and the token after them;
 /// and every call that samples proposes `DRAFTS` drafts, the first `accepted`
@@ -152,7 +152,7 @@ impl Epoch {
         });
         let fake = Arc::new(
             support::text_pool(rank, 1, None)
-                .answering(Arc::new(move |batch| drafting(batch, accepted))),
+                .with_output(Arc::new(move |batch| drafting(batch, accepted))),
         );
         let scheduler = support::fake::scheduler_over(
             Arc::<FakeBatches>::clone(&fake),

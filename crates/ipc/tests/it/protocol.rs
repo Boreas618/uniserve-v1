@@ -56,7 +56,7 @@ fn ar_decode_call() -> Call {
         sampling_state: None,
         request_key: request_key(),
         call_id: CallId::new(11, 0),
-        component: "model".into(),
+        stage: "model".into(),
         kind,
         bounds: Bounds {
             max_tokens: 1,
@@ -147,7 +147,7 @@ fn main_process_info_round_trips() {
             }],
             ..MainProcessInfo::default().prefix_cache.unwrap()
         }),
-        components: vec![ComponentInfo {
+        stages: vec![StageInfo {
             name: "denoiser".into(),
             outputs: vec![
                 OutputInfo {
@@ -192,10 +192,10 @@ fn main_process_info_round_trips() {
     assert_eq!(decoded, info);
 }
 
-/// A component's distribution is omitted from its encoding when absent, so
+/// A stage's distribution is omitted from its encoding when absent, so
 /// both forms must decode, each with its own units per rank.
 #[test]
-fn a_component_round_trips_with_and_without_a_distribution() {
+fn a_stage_round_trips_with_and_without_a_distribution() {
     use proto::config::{BlockConfig, BlockDistribution};
 
     let grouped = BlockConfig::parallel(vec![0]);
@@ -209,11 +209,11 @@ fn a_component_round_trips_with_and_without_a_distribution() {
     }
 }
 
-/// A component's layout reaches its ranks in the launch descriptor with
+/// A stage's layout reaches its ranks in the launch descriptor with
 /// every sequence-parallel strategy, a Ulysses group's head projection
 /// included.
 #[test]
-fn a_component_round_trips_with_every_sequence_parallel_strategy() {
+fn a_stage_round_trips_with_every_sequence_parallel_strategy() {
     use proto::config::{BlockConfig, SequenceParallel};
 
     let strategies = [
@@ -248,11 +248,8 @@ fn a_component_round_trips_with_every_sequence_parallel_strategy() {
 #[test]
 fn cache_free_main_process_info_round_trips() {
     let info = MainProcessInfo {
-        media_components: video_components(),
-        supported_calls: video_components()
-            .into_keys()
-            .map(CallKind::Media)
-            .collect(),
+        media_stages: video_stages(),
+        supported_calls: video_stages().into_keys().map(CallKind::Media).collect(),
         prefix_cache: None,
         ..MainProcessInfo::default()
     };
@@ -476,7 +473,7 @@ fn full_caps() -> MainProcessInfo {
         encoder_cache_entries: 64,
         encoder_entry_bytes: 128 << 20,
         max_logprobs: 20,
-        media_components: video_components(),
+        media_stages: video_stages(),
         supported_calls: CallKind::ALL.to_vec(),
         // A full-attention group with 64-token pages of one unit and a
         // sliding-window group with 32-token pages of two units share one
@@ -506,7 +503,7 @@ fn full_caps() -> MainProcessInfo {
     }
 }
 
-fn video_components() -> std::collections::BTreeMap<MediaCall, String> {
+fn video_stages() -> std::collections::BTreeMap<MediaCall, String> {
     [
         (MediaCall::TextEncoding, "text_encoder"),
         (MediaCall::LatentPreparation, "denoiser"),
@@ -518,7 +515,7 @@ fn video_components() -> std::collections::BTreeMap<MediaCall, String> {
         (MediaCall::Muxing, "output"),
     ]
     .into_iter()
-    .map(|(call, component)| (call, component.to_owned()))
+    .map(|(call, stage)| (call, stage.to_owned()))
     .collect()
 }
 
@@ -767,7 +764,7 @@ fn a_page_read_fills_only_new_units_of_the_batch() {
 }
 
 /// A state copy moves a page of its own slot's tables, restores run before checkpoints, and each
-/// checkpoint answers a row that keeps its state.
+/// checkpoint responds to a row that keeps its state.
 #[test]
 fn a_state_copy_moves_a_page_of_its_slot_around_the_forward() {
     use execution::{StateCopy, StateDirection};
@@ -811,8 +808,8 @@ fn a_state_copy_moves_a_page_of_its_slot_around_the_forward() {
     );
     assert!(refusal(reordered.validate()).contains("precedes a restore"));
 
-    let unanswered = stated(vec![copy(1, &[6], StateDirection::Keep)], vec![0, 0]);
-    assert!(refusal(unanswered.validate()).contains("checkpoint tokens"));
+    let unresolved = stated(vec![copy(1, &[6], StateDirection::Keep)], vec![0, 0]);
+    assert!(refusal(unresolved.validate()).contains("checkpoint tokens"));
 }
 
 #[test]

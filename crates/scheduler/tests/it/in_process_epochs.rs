@@ -23,18 +23,18 @@ use scheduler::{BatchCapacity, Event, GenerationRequest, SchedulerHandle, Stage}
 use crate::support;
 use testkit::FakeBatches;
 
-/// How long a command answer may take.
-/// How long a command answer may take.
+/// How long a command response may take.
+/// How long a command response may take.
 ///
-/// The first answer of each epoch is its policy's precopy, which compiles the
+/// The first response of each epoch is its policy's precopy, which compiles the
 /// `fcfs` module inside a debug build; this case builds three epochs, and a
 /// bound that does not cover the compile reports a timeout for an epoch that is
 /// booting. Three boots measured near a hundred seconds between them, so the
 /// bound is three times that: a careful margin costs nothing when the case is
 /// green and costs a whole round trip when it is short. The margin is the
-/// compile's, not the mechanism's: a mechanism that stopped answering still
+/// compile's, not the mechanism's: a mechanism that stopped responding still
 /// fails here, only later.
-const ANSWER: Duration = Duration::from_secs(300);
+const RESPONSE: Duration = Duration::from_secs(300);
 
 /// How long a park may take once the epoch has been asked.
 ///
@@ -90,23 +90,24 @@ fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
     };
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(support::policy_module()));
-    answer("the precopy", handle.precopy_policy(program, source)).expect("the policy is precopied");
-    answer("the switchover", handle.stage(Stage::Switchover)).expect("the policy serves");
+    response("the precopy", handle.precopy_policy(program, source))
+        .expect("the policy is precopied");
+    response("the switchover", handle.stage(Stage::Switchover)).expect("the policy serves");
 }
 
-/// Waits for a command's answer.
-fn answer<T>(
+/// Waits for a command's response.
+fn response<T>(
     what: &str,
     receiver: crossbeam_channel::Receiver<Result<T, String>>,
 ) -> Result<T, String> {
-    receiver.recv_timeout(ANSWER).unwrap_or_else(|error| {
-        panic!("the scheduler did not answer {what} within {ANSWER:?}: {error}")
+    receiver.recv_timeout(RESPONSE).unwrap_or_else(|error| {
+        panic!("the scheduler did not respond {what} within {RESPONSE:?}: {error}")
     })
 }
 
-/// Collects a request's terminal event, answering what ended it.
+/// Collects a request's terminal event, responding to what ended it.
 fn terminal(events: &mut scheduler::EventRx) -> Event {
-    let deadline = Instant::now() + ANSWER;
+    let deadline = Instant::now() + RESPONSE;
     while Instant::now() < deadline {
         match events.try_recv() {
             Ok(event) if event.is_terminal() => return event,
@@ -114,7 +115,7 @@ fn terminal(events: &mut scheduler::EventRx) -> Event {
             Err(_) => std::thread::sleep(Duration::from_millis(1)),
         }
     }
-    panic!("the request never ended within {ANSWER:?}");
+    panic!("the request never ended within {RESPONSE:?}");
 }
 
 /// An epoch that succeeds a running one parks it, is promoted with its prefix
@@ -139,10 +140,10 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
         .submit(request(91, 8, 100, Vec::new()))
         .expect("the reference takes the request");
     let (expected, finished) =
-        support::wait_for_tokens(&mut reference_events, GENERATED + CONTINUED, ANSWER);
+        support::wait_for_tokens(&mut reference_events, GENERATED + CONTINUED, RESPONSE);
     // Two facts with two owners: how many tokens the request produced is its
     // budget's, and what event ended it is the stream's. A single assertion
-    // would let either answer for the other.
+    // would let either response for the other.
     assert_eq!(
         expected.len(),
         GENERATED + CONTINUED,
@@ -183,7 +184,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     let mut running_events = running
         .submit(request(91, 8, 100, Vec::new()))
         .expect("the running epoch takes the request");
-    let (first, _) = support::wait_for_tokens(&mut running_events, GENERATED, ANSWER);
+    let (first, _) = support::wait_for_tokens(&mut running_events, GENERATED, RESPONSE);
     assert_eq!(
         first,
         expected[..GENERATED],
@@ -191,7 +192,7 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     );
 
     // Its successor starts beside it.
-    answer("the running epoch's cache", running.describe_cache())
+    response("the running epoch's cache", running.describe_cache())
         .expect("the running epoch states its cache");
     let successor_pool = Arc::new(support::by_extent(vec![support::pool("model")]));
     let (mut successor_config, successor_limits) = support::config(&successor_pool, "epochs");
@@ -208,20 +209,20 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     // The running epoch parks, the successor is promoted with its index, and
     // the running epoch closes.
     // The park is waited for with a bound of its own, and a park that does not
-    // answer is reported with what the epoch was doing: steps taken since the
-    // command and whether it is still answering at all.
+    // response is reported with what the epoch was doing: steps taken since the
+    // command and whether it is still responding at all.
     //
-    // `poll_park` answers only when seven sets are empty: running requests,
+    // `poll_park` responds only when seven sets are empty: running requests,
     // running media, retiring requests, waiting requests, waiting media,
     // batches in flight and pending submissions (`scheduler/epoch.rs:232`). A
     // request's `Finish` leaves inside a batch, so a close that never rides one
-    // keeps the park from answering: an epoch still counting steps is that
-    // case, and an epoch answering nothing has a stopped control thread. Two
+    // keeps the park from responding: an epoch still counting steps is that
+    // case, and an epoch responding nothing has a stopped control thread. Two
     // owners, which is why the timeout names which one it met.
     let steps_before = running
         .counters()
         .recv_timeout(PARK)
-        .expect("the running epoch answers its counters")
+        .expect("the running epoch responds to its counters")
         .steps;
     let parked = match running.park(true).recv_timeout(PARK) {
         Ok(result) => result,
@@ -231,14 +232,14 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
                 .recv_timeout(PARK)
                 .map(|counters| format!("{} steps, {} batches", counters.steps, counters.batches))
                 .unwrap_or_else(|why| format!("no counters ({why})"));
-            let cache = answer("the running epoch's cache", running.describe_cache())
+            let cache = response("the running epoch's cache", running.describe_cache())
                 .map(|groups| format!("{} group(s)", groups.len()))
-                .unwrap_or_else(|why| format!("no answer ({why})"));
+                .unwrap_or_else(|why| format!("no response ({why})"));
             panic!(
                 "the running epoch did not park within {PARK:?} ({error}): it had taken \
                  {steps_before} steps before the command, and afterwards {alive} and {cache} — \
                  an epoch still counting steps is parking and never meets the condition, a \
-                 epoch that stopped answering is stuck"
+                 epoch that stopped responding is stuck"
             );
         }
     };
@@ -247,13 +248,13 @@ fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
         .promote(index, false, false)
         .expect("the successor is promoted with the parked index");
     running.shutdown();
-    answer("the successor's commit", successor.commit()).expect("the successor commits");
+    response("the successor's commit", successor.commit()).expect("the successor commits");
 
     // The continuation samples what the uninterrupted request sampled next.
     let mut continuation = successor
         .submit(request(91, 8, 100, first.clone()))
         .expect("the successor takes the continuation");
-    let (continued, _) = support::wait_for_tokens(&mut continuation, CONTINUED, ANSWER);
+    let (continued, _) = support::wait_for_tokens(&mut continuation, CONTINUED, RESPONSE);
     assert_eq!(
         continued,
         expected[GENERATED..GENERATED + CONTINUED],

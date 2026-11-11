@@ -82,7 +82,7 @@
 //! what they named before.
 //!
 //! Requests to the servers never block the scheduler: they are submitted,
-//! and their answers are taken by [`TrajectoryStore::poll`] at every step.
+//! and their responses are taken by [`TrajectoryStore::poll`] at every step.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -259,7 +259,7 @@ fn hold_every_sample(stored: &[&StoredRank], all: &[StoredRank]) -> bool {
         .all(|(shape, held)| !held.is_empty() && covers(shape, held))
 }
 
-/// What the store asked the pools for, whose answer it reads.
+/// What the store asked the pools for, whose response it reads.
 enum Asked {
     /// The reservation of an offload's pages on one rank.
     Reserve { request: RequestId, rank: usize },
@@ -271,7 +271,7 @@ enum Asked {
 
 /// Where an offload stands.
 enum OffloadStage {
-    /// Reservations submitted; each rank's slots once it answered.
+    /// Reservations submitted; each rank's slots once it responded.
     Reserving(Vec<Option<Vec<PageSlot>>>),
     /// Every rank reserved what it does not hold: the copies wait for a
     /// batch of the denoiser's worker group.
@@ -279,7 +279,7 @@ enum OffloadStage {
     /// The copies are carried by the submitted batch.
     Carried(u64),
     /// The copies completed and the commits are submitted: so many ranks
-    /// have not answered.
+    /// have not responded.
     Committing(usize),
     /// The trajectory is stored.
     Stored,
@@ -327,7 +327,7 @@ struct Source {
 /// Where a restore stands.
 #[derive(PartialEq, Eq)]
 enum RestoreStage {
-    /// Pins submitted; each source's slots once it answered.
+    /// Pins submitted; each source's slots once it responded.
     Pinning(Vec<Option<Vec<Option<u64>>>>),
     /// Every page of every source is pinned.
     Hit(LatentRestore),
@@ -364,7 +364,7 @@ pub(crate) enum Restored {
 /// The scheduler's side of the host latent pools.
 pub(crate) struct TrajectoryStore {
     /// The connections to the pools' servers, with the purpose of every
-    /// request not yet answered.
+    /// request not yet responded.
     servers: Servers<Asked>,
     /// The engine's host.
     host: String,
@@ -471,7 +471,7 @@ impl TrajectoryStore {
     /// (`CallOutput::latent_layouts`). Returns `false`, starting nothing,
     /// when the store does not serve `worker` or a rank's layout is missing
     /// or malformed; an offload a server could not be asked for fails
-    /// ([`Self::offloaded`]) once the others answered.
+    /// ([`Self::offloaded`]) once the others responded.
     pub(crate) fn offload(
         &mut self,
         request: RequestId,
@@ -543,7 +543,7 @@ impl TrajectoryStore {
             forgotten: false,
         };
         if submitted < ranks.len() {
-            // The ranks that were asked answer into an offload that failed:
+            // The ranks that were asked response into an offload that failed:
             // their reservations are aborted as they arrive.
             offload.stage = OffloadStage::Failed;
         }
@@ -554,7 +554,7 @@ impl TrajectoryStore {
     /// The copies of `request`'s offload once every rank reserved its
     /// pages, for a batch of the denoiser's worker group with id `batch`,
     /// which carries them from now on; `None` while the reservations are
-    /// answered, or once the copies were taken.
+    /// responded, or once the copies were taken.
     pub(crate) fn take_offload(
         &mut self,
         request: RequestId,
@@ -603,7 +603,7 @@ impl TrajectoryStore {
     pub(crate) fn offloaded(&mut self, request: RequestId) -> Option<Offloaded> {
         match self.offloads.get(&request)?.stage {
             OffloadStage::Stored => {}
-            OffloadStage::Failed if !self.answering(request) => {
+            OffloadStage::Failed if !self.responding(request) => {
                 self.offloads.remove(&request);
                 return Some(Offloaded::Failed);
             }
@@ -619,8 +619,8 @@ impl TrajectoryStore {
         }
     }
 
-    /// Whether a reservation of `request`'s offload has not been answered.
-    fn answering(&self, request: RequestId) -> bool {
+    /// Whether a reservation of `request`'s offload has not been responded.
+    fn responding(&self, request: RequestId) -> bool {
         self.servers.pending().any(|purpose| {
             matches!(
                 purpose,
@@ -700,20 +700,20 @@ impl TrajectoryStore {
                 )
             })
             .collect();
-        let mut answering = 0;
+        let mut responding = 0;
         for (client, commit) in commits {
             if self
                 .servers
                 .submit(client, &commit, Purpose::Store(Asked::Commit { request }))
             {
-                answering += 1;
+                responding += 1;
             }
         }
         if let Some(offload) = self.offloads.get_mut(&request) {
-            offload.stage = if answering == 0 {
+            offload.stage = if responding == 0 {
                 OffloadStage::Stored
             } else {
-                OffloadStage::Committing(answering)
+                OffloadStage::Committing(responding)
             };
         }
     }
@@ -743,8 +743,8 @@ impl TrajectoryStore {
         }
     }
 
-    /// `rank` answered `request`'s reservation with `slots`: once every rank
-    /// answered, the copies of what they reserved wait for a batch, or, when
+    /// `rank` responded `request`'s reservation with `slots`: once every rank
+    /// responded, the copies of what they reserved wait for a batch, or, when
     /// a pool could not hold a page, the reservations are aborted.
     fn reserved(&mut self, request: RequestId, rank: usize, slots: Vec<PageSlot>) {
         let Some(offload) = self.offloads.get_mut(&request) else {
@@ -760,20 +760,20 @@ impl TrajectoryStore {
                 PageSlot::Present | PageSlot::Full => None,
             })
             .collect();
-        let answered = match &mut offload.stage {
-            OffloadStage::Reserving(answers) => {
-                answers[rank] = Some(slots);
+        let responded = match &mut offload.stage {
+            OffloadStage::Reserving(responses) => {
+                responses[rank] = Some(slots);
                 if !whole {
                     None
                 } else {
-                    Some(answers.iter().all(Option::is_some))
+                    Some(responses.iter().all(Option::is_some))
                 }
             }
             // An offload that failed while this rank was asked aborts what
             // the rank reserved.
             _ => None,
         };
-        match answered {
+        match responded {
             Some(true) => {
                 // A page every rank holds already needs no copy.
                 offload.stage = if offload.reserved.iter().all(Vec::is_empty) {
@@ -841,7 +841,7 @@ impl TrajectoryStore {
                 },
             ) {
                 // A server that cannot be asked holds nothing for us; what
-                // the others pin is released as they answer.
+                // the others pin is released as they respond.
                 restore.stage = RestoreStage::Miss;
                 break;
             }
@@ -931,7 +931,7 @@ impl TrajectoryStore {
     }
 
     /// How `request`'s restore resolved; `None` while its pins are
-    /// answered, and for a request without one.
+    /// responded, and for a request without one.
     pub(crate) fn restored(&self, request: RequestId) -> Option<Restored> {
         match &self.restores.get(&request)?.stage {
             RestoreStage::Pinning(_) => None,
@@ -941,7 +941,7 @@ impl TrajectoryStore {
     }
 
     /// End `request`'s restore: the pins it holds are released. A restore
-    /// whose pins are still answered releases them as they arrive.
+    /// whose pins are still responded releases them as they arrive.
     pub(crate) fn release(&mut self, request: RequestId) {
         let Some(restore) = self.restores.remove(&request) else {
             return;
@@ -952,11 +952,11 @@ impl TrajectoryStore {
                     self.unpin(&source.pinned, source.keys.clone());
                 }
             }
-            RestoreStage::Pinning(answers) => {
-                // The sources that answered release what they pinned now;
-                // the others release it when they answer.
-                for (source, answer) in restore.sources.iter().zip(answers) {
-                    if let Some(slots) = answer {
+            RestoreStage::Pinning(responses) => {
+                // The sources that responded release what they pinned now;
+                // the others release it when they respond.
+                for (source, response) in restore.sources.iter().zip(responses) {
+                    if let Some(slots) = response {
                         self.unpin(&source.pinned, pinned(&source.keys, &slots));
                     }
                 }
@@ -968,8 +968,8 @@ impl TrajectoryStore {
         }
     }
 
-    /// Turn the unanswered pins of `request` into orphans, which release
-    /// what they pinned when they are answered.
+    /// Turn the unresolved pins of `request` into orphans, which release
+    /// what they pinned when they are responded.
     fn orphan_pins(&mut self, request: RequestId, sources: &[Source]) {
         for purpose in self.servers.pending_mut() {
             if let Purpose::Store(Asked::Pin {
@@ -1039,29 +1039,33 @@ impl TrajectoryStore {
         self.servers.unpin(pin.client, pin.pool, &pin.reader, keys);
     }
 
-    /// Source `source` answered `request`'s pin with `slots`: once every
-    /// source answered, the restore is a hit when every page is pinned, and
+    /// Source `source` responded `request`'s pin with `slots`: once every
+    /// source responded, the restore is a hit when every page is pinned, and
     /// a miss otherwise, which releases the pages pinned.
     fn pinned(&mut self, request: RequestId, source: usize, slots: Vec<Option<u64>>) {
         let Some(restore) = self.restores.get_mut(&request) else {
             return;
         };
-        let RestoreStage::Pinning(answers) = &mut restore.stage else {
+        let RestoreStage::Pinning(responses) = &mut restore.stage else {
             return;
         };
-        answers[source] = Some(slots);
-        if !answers.iter().all(Option::is_some) {
+        responses[source] = Some(slots);
+        if !responses.iter().all(Option::is_some) {
             return;
         }
-        let answers: Vec<Vec<Option<u64>>> = answers.iter_mut().filter_map(Option::take).collect();
-        let whole = answers.iter().zip(&restore.sources).all(|(slots, source)| {
-            slots.len() == source.keys.len() && slots.iter().all(Option::is_some)
-        });
+        let responses: Vec<Vec<Option<u64>>> =
+            responses.iter_mut().filter_map(Option::take).collect();
+        let whole = responses
+            .iter()
+            .zip(&restore.sources)
+            .all(|(slots, source)| {
+                slots.len() == source.keys.len() && slots.iter().all(Option::is_some)
+            });
         if whole {
             let sources = restore
                 .sources
                 .iter()
-                .zip(&answers)
+                .zip(&responses)
                 .map(|(source, slots)| LatentSource {
                     slots: slots.iter().flatten().copied().collect(),
                     ..source.source.clone()
@@ -1078,7 +1082,7 @@ impl TrajectoryStore {
         let release: Vec<(Pinned, Vec<Key>)> = restore
             .sources
             .iter()
-            .zip(&answers)
+            .zip(&responses)
             .map(|(source, slots)| (source.pinned.clone(), pinned(&source.keys, slots)))
             .collect();
         for (pin, keys) in release {
@@ -1086,11 +1090,11 @@ impl TrajectoryStore {
         }
     }
 
-    /// Take the servers' answers. Returns whether a restore or an offload
+    /// Take the servers' responses. Returns whether a restore or an offload
     /// moved on.
     pub(crate) fn poll(&mut self) -> bool {
         let mut moved = false;
-        for (purpose, reply) in self.servers.answers() {
+        for (purpose, reply) in self.servers.responses() {
             moved = true;
             match (purpose, reply) {
                 (Asked::Reserve { request, rank }, reply) => {
@@ -1144,7 +1148,7 @@ impl TrajectoryStore {
     }
 
     /// The store's Storage Server connections, which the scheduler waits on
-    /// beside its wake: an answer or an event ends the wait.
+    /// beside its wake: a response or an event ends the wait.
     pub(crate) fn descriptors(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
         self.servers.descriptors()
     }

@@ -16,7 +16,7 @@ use crate::view::{PhaseClass, PhaseKind, PhaseView};
 /// without asking the mechanism again.
 #[derive(Clone, Debug, Default)]
 pub struct Phases {
-    /// The kind of each phase, by id; a churned table answers [`PhaseKind::Other`].
+    /// The kind of each phase, by id; a churned table responds [`PhaseKind::Other`].
     kinds: Vec<PhaseKind>,
 }
 
@@ -58,7 +58,7 @@ impl Phases {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::ComponentId;
+    use crate::ids::StageId;
 
     #[test]
     fn a_phase_reads_as_the_snapshot_states_it() {
@@ -66,12 +66,12 @@ mod tests {
             PhaseView {
                 id: PhaseId(0),
                 kind: PhaseKind::Prefill,
-                block: ComponentId(0),
+                block: StageId(0),
             },
             PhaseView {
                 id: PhaseId(1),
                 kind: PhaseKind::Decode,
-                block: ComponentId(0),
+                block: StageId(0),
             },
         ];
         let phases = Phases::new(&views);

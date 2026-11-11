@@ -13,7 +13,7 @@
 //! - [`MediaColumns`] are a media computation's columns, per request as the model prepared them,
 //!   and [`StagedRequest`] is the mechanism's record of one such request;
 //! - [`BatchOutput`] and [`CallOutput`] are what the step produced, and [`Submission`] is what the
-//!   caller holds until the worker answers;
+//!   caller holds until the worker responses;
 //! - [`Batches`] is what the mechanism asks of the worker that serves it, which the worker
 //!   implements over its devices.
 //!
@@ -35,7 +35,7 @@ use crate::{
 };
 
 /// A failure the worker reports: what a failed [`Outcome`] carries and what a refused request of
-/// [`Batches`] answers. The scheduler reads it as text; the worker that raised it can downcast it
+/// [`Batches`] responses. The scheduler reads it as text; the worker that raised it can downcast it
 /// to its own error.
 pub type Fault = dyn std::error::Error + Send + Sync;
 
@@ -64,11 +64,11 @@ impl<T: Clone, E: ?Sized> Clone for Outcome<T, E> {
 }
 
 /// One completion shared by an operation and its consumers: its outcome, recorded once, the
-/// waiters it wakes and the observers it answers.
+/// waiters it wakes and the observers it responses.
 ///
 /// `C` is the observer type (the worker's retirement notifications and host task callbacks; a
 /// submission has none), `T` the operation's value and `E` its failure. Completing an operation
-/// answers its callbacks so the owner can dispatch them after releasing its lock.
+/// responds to its callbacks so the owner can dispatch them after releasing its lock.
 pub struct Completion<C, T = (), E: ?Sized = Fault> {
     state: Mutex<CompletionState<C, T, E>>,
     /// Signalled when the outcome lands, so a waiter sleeps instead of polling.
@@ -152,7 +152,7 @@ impl<C, T: Clone, E: ?Sized> Completion<C, T, E> {
         state.outcome.clone()
     }
 
-    /// Registers a callback, or answers it for immediate dispatch when the operation ended.
+    /// Registers a callback, or responds to it for immediate dispatch when the operation ended.
     pub fn subscribe(&self, callback: C) -> Option<C> {
         let mut state = self.state();
         if state.outcome.is_some() {
@@ -162,7 +162,7 @@ impl<C, T: Clone, E: ?Sized> Completion<C, T, E> {
         None
     }
 
-    /// Records `outcome` when the operation has none yet, wakes every waiter, and answers the
+    /// Records `outcome` when the operation has none yet, wakes every waiter, and responds to the
     /// callbacks to run; `None` when an outcome was already recorded, which this one does not
     /// replace.
     pub fn settle(&self, outcome: Outcome<T, E>) -> Option<Vec<C>> {
@@ -177,7 +177,7 @@ impl<C, T: Clone, E: ?Sized> Completion<C, T, E> {
         Some(callbacks)
     }
 
-    /// Cancels an unresolved completion, answering whether it is now cancelled and the callbacks
+    /// Cancels an unresolved completion, responding whether it is now cancelled and the callbacks
     /// to run. This does not stop its producer.
     pub fn cancel(&self) -> (bool, Vec<C>) {
         let mut state = self.state();
@@ -209,7 +209,7 @@ impl<C, T: Clone, E> Completion<C, T, E> {
     }
 }
 
-/// What the contract answers by itself, in plain text: a worker that serves no such work, or a
+/// What the interface returns by itself, in plain text: a worker that serves no such work, or a
 /// submission that completed without an outcome.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -436,7 +436,7 @@ impl Batch {
     ///   allocation's units lie inside the table of the same slot and group;
     /// - a page read fills only units the batch newly allocates, which the worker resets first;
     /// - a recurrent-state copy moves a page of one of its slot's tables, restores precede
-    ///   checkpoints, and each checkpoint answers a row's checkpoint token count;
+    ///   checkpoints, and each checkpoint responds to a row's checkpoint token count;
     /// - a request has at most one stored trajectory to restore and one host encoder output.
     pub fn validate(&self) -> ValidationResult<()> {
         let mut calls = std::collections::HashSet::with_capacity(self.calls.len());
@@ -537,7 +537,7 @@ impl Batch {
     /// Checks the recurrent-state copies against the calls and tables of the batch: a copy moves a
     /// state page of one of the batch's request slots, every restore precedes every checkpoint (the
     /// restores run before the forward and the checkpoints after it), a slot restores at most once,
-    /// and each checkpoint answers one row's non-zero `checkpoints` entry.
+    /// and each checkpoint responds to one row's non-zero `checkpoints` entry.
     fn check_state_copies(
         &self,
         slots: &std::collections::HashSet<u32>,
@@ -581,7 +581,7 @@ impl Batch {
             .count();
         ensure_valid!(
             keeps == kept_rows,
-            "the batch's state checkpoints do not answer its rows' checkpoint tokens"
+            "the batch's state checkpoints do not respond to its rows' checkpoint tokens"
         );
         Ok(())
     }
@@ -590,7 +590,7 @@ impl Batch {
 impl CallOutput {
     /// Checks that the completion's fields agree with its status.
     ///
-    /// Rules that relate a completion to the kind of the call it answers belong to the mechanism,
+    /// Rules that relate a completion to the kind of the call it responds belong to the mechanism,
     /// which holds the call.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
@@ -639,17 +639,17 @@ impl CallOutput {
 }
 
 impl BatchOutput {
-    /// Checks every completion, and that the output answers only calls `batch` carried, each once.
+    /// Checks every completion, and that the output responds only calls `batch` carried, each once.
     pub fn validate(&self, batch: &Batch) -> ValidationResult<()> {
-        let mut answered = std::collections::HashSet::with_capacity(self.calls.len());
+        let mut responded = std::collections::HashSet::with_capacity(self.calls.len());
         for output in &self.calls {
             output.validate()?;
             ensure_valid!(
                 batch.calls.contains(&output.call),
-                "a completion answers a call its batch did not carry"
+                "a completion responds to a call its batch did not carry"
             );
             ensure_valid!(
-                answered.insert(output.call),
+                responded.insert(output.call),
                 "a batch output repeats a call"
             );
         }
@@ -659,7 +659,7 @@ impl BatchOutput {
 
 /// One host-side call of a batch: which request, which phase, which rows it occupies.
 ///
-/// The mechanism builds these from the scheduler's plan; the worker uploads the columns
+/// The mechanism builds these from the scheduler's batch; the worker uploads the columns
 /// [`BatchRows`] carries into the device views a model reads (`nn::TokenBatch`). A call's `rows`
 /// are the half-open row range it owns in the batch's device columns.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -995,7 +995,7 @@ impl MediaColumns {
     /// The columns of a media batch, from the facts the mechanism states per request.
     ///
     /// The mechanism owns the computation and, per request, the request's own stated parameters:
-    /// its conditioning as the model family planned it, the diffusion step it runs, and the seed
+    /// its conditioning as the model family prepared it, the diffusion step it runs, and the seed
     /// and canvas its noise is drawn from. It does not own what the model prepares on the device
     /// — the encoded conditioning rows, the latent trajectory — so a staged set carries the first
     /// and never a placeholder for the second.
@@ -1037,7 +1037,7 @@ impl MediaColumns {
 ///
 /// The record is the mechanism-to-model seam for one request of a media computation, and it holds
 /// what the mechanism owns and nothing else: the request's conditioning exactly as the model family
-/// planned it, the diffusion step the batch is, the seed and canvas the request states, and the
+/// prepared it, the diffusion step the batch is, the seed and canvas the request states, and the
 /// request's identity. The model's own device-side preparation (the encoded conditioning rows, the
 /// latent trajectory) is the model's and is not carried here, because a mechanism that filled it
 /// would be inventing either a tensor it cannot read or a shape the model never stated.
@@ -1067,7 +1067,7 @@ pub struct StagedRequest {
     /// The request this row's state belongs to: the only name a step has for what it must find
     /// again, since a batch numbers its calls by position.
     pub request: crate::RequestKey,
-    /// The request's conditioning, as the model family planned it.
+    /// The request's conditioning, as the model family prepared it.
     pub conditioning: Vec<u8>,
     /// The zero-based diffusion step this batch is.
     pub step: u32,
@@ -1350,7 +1350,7 @@ impl BatchColumns {
 ///
 /// A prefill bucket carries the sampler because the logits are computed anyway, and because it is
 /// what makes a first token possible without a decode step spent only on choosing it. The draw is
-/// the expensive tail: its candidate selection walks every row of the bucket for milliseconds, which
+/// the expensive tail: its candidate selection visits every row of the bucket for milliseconds, which
 /// a batch of greedy prompt endings and a batch that ends no prompt both have no use for. So those
 /// two take the greedy tail, and only a batch with a drawing row pays for the draw.
 ///
@@ -1496,7 +1496,7 @@ impl Variant {
     /// Whether this variant is performed in this process rather than on a device (§2.4).
     ///
     /// The artifact's three host calls capture no graph: their work is encoding and muxing, which
-    /// the process's media lane does. A bucket of one states which device serves the call and never
+    /// the process's media thread pool does. A bucket of one states which device serves the call and never
     /// an extent, so no canvas narrows it.
     pub const fn host(self) -> bool {
         matches!(
@@ -1624,7 +1624,7 @@ impl fmt::Display for Shape {
     }
 }
 
-/// One media computation as the mechanism states it, so that a plan can say whether it serves it.
+/// One media computation as the mechanism states it, so that a batch can say whether it serves it.
 ///
 /// The three fields are what a media graph's capture depends on: which computation it is, how many
 /// requests it holds, and - for a decode or a denoising step - the shape its kernels are captured
@@ -1648,7 +1648,7 @@ impl Computation {
         Variant::of_media(self.call)
     }
 
-    /// Whether this is a computation the worker serves at all, before any plan is consulted.
+    /// Whether this is a computation the worker serves at all, before any batch is consulted.
     pub const fn stated(self) -> bool {
         self.variant().is_some()
     }
@@ -1708,7 +1708,7 @@ pub trait Batches: Send + Sync {
     /// Runs one shadow batch (7.3 step 2): the paired forwards of `batch.generation`'s changed
     /// operators against the serving generation's kernels, compared by each operator's tolerance.
     ///
-    /// A shadow batch never writes resident memory and never serves a request; its failure is the
+    /// A shadow batch never writes running memory and never serves a request; its failure is the
     /// update's, which the main process reports as `PrecopyFailed`.
     fn shadow(&self, batch: Batch) -> Result<Submission, Box<Fault>>;
 
@@ -1716,7 +1716,7 @@ pub trait Batches: Send + Sync {
     /// computation (2.4's stated capability).
     ///
     /// The mechanism asks before it forms a media batch: a media call is served only where a
-    /// runner's plan states the computation, and the answer is the bucket that plan planned it
+    /// runner's batch states the computation, and the response is the bucket that step prepared it
     /// into, so the refusal the mechanism makes names a capability the worker does not state
     /// rather than a check that was deleted. A missing phase is its own refusal: a batch cannot be
     /// sent to a device that does not exist.
@@ -1731,7 +1731,7 @@ pub trait Batches: Send + Sync {
     /// The devices `batch` runs on, each by its place among [`Batches::device_count`] devices.
     ///
     /// A device runs the batches it is handed from a queue of its own, and the launch's
-    /// `queue_depth` bounds that queue, as the capacity plan reserves each device's in-flight calls
+    /// `queue_depth` bounds that queue, as the capacity reservation holds each device's in-flight calls
     /// by it. A mechanism that counted every batch of a rank against one bound would hold one
     /// device's clip behind another device's, so it counts the devices a batch takes. A worker of
     /// one device runs every batch there.
@@ -1755,17 +1755,17 @@ pub trait Batches: Send + Sync {
         &[]
     }
 
-    /// Performs the storage `operation` on every rank, while no batch runs (7.6), and answers each
+    /// Performs the storage `operation` on every rank, while no batch runs (7.6), and responds to each
     /// rank's JSON result.
     ///
     /// A worker with no storage of its own has nothing to change and nothing to report, which
-    /// is an empty answer: the mechanism reads it as a cache that is not split into segments.
+    /// is an empty response: the mechanism reads it as a cache that is not split into segments.
     fn operate(&self, _operation: &EpochOperation) -> Result<Vec<String>, Box<Fault>> {
         Ok(Vec::new())
     }
 
     /// Puts the prepared expert redistribution of `order` in place, while no batch runs (7.6), and
-    /// answers each rank's result.
+    /// responds to each rank's result.
     fn commit_experts(
         &self,
         _order: &std::collections::BTreeMap<String, Vec<u32>>,
@@ -1774,9 +1774,9 @@ pub trait Batches: Send + Sync {
     }
 
     /// Maps the host KV cache's page pools on this rank's devices, `tokens` tokens of each cache
-    /// group, and copies pages through them from now on. Answers each pool's name with its ranks'
+    /// group, and copies pages through them from now on. Responds to each pool's name with its ranks'
     /// pools, in rank order, as the mechanism keys the host KV cache by them. A worker that keeps
-    /// no host KV cache maps nothing, and the mechanism plans no host write.
+    /// no host KV cache maps nothing, and the mechanism prepares no host write.
     fn map_host_cache(&self, _tokens: u64) -> Result<HostPools, Box<Fault>> {
         Ok(Vec::new())
     }
@@ -1808,7 +1808,7 @@ pub trait Batches: Send + Sync {
 /// a mapping it changes (7.6).
 ///
 /// Each variant carries its message from [`crate::memory`], whose [`crate::memory::Operation`]
-/// impl names the reply every rank answers (one JSON text per rank, [`crate::memory::replies`]).
+/// impl names the reply every rank responds (one JSON text per rank, [`crate::memory::replies`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum EpochOperation {
@@ -1858,8 +1858,8 @@ pub struct PoolLayout {
     pub queue_depth: usize,
     /// Ranks the pool was launched with, counted as at least one.
     pub ranks: usize,
-    /// The pool's components by name, each with its member ranks, parallel degrees and distribution.
-    pub components: std::collections::BTreeMap<String, proto::config::BlockConfig>,
+    /// The pool's stages by name, each with its member ranks, parallel degrees and distribution.
+    pub stages: std::collections::BTreeMap<String, proto::config::BlockConfig>,
 }
 
 /// What the caller of a submission holds until its jobs ended.
@@ -1917,7 +1917,7 @@ impl Submission {
     /// This submission and the same batch's on `peers`, as one.
     ///
     /// The ranks of a group run one batch together, so it has ended when every one of them ended:
-    /// this rank's outcome is the answer, and a peer's failure replaces it, because a rank that
+    /// this rank's outcome is the response, and a peer's failure replaces it, because a rank that
     /// failed leaves the others' output without its part.
     #[must_use]
     pub fn joined(mut self, peers: Vec<Submission>) -> Self {
@@ -1943,7 +1943,7 @@ impl Submission {
         (Arc::clone(&self.state), self.id)
     }
 
-    /// Waits until the submission completed and answers its outcome.
+    /// Waits until the submission completed and responds to its outcome.
     pub fn wait(&self) -> Outcome<BatchOutput> {
         let own = self.wait_own();
         let peers: Vec<Outcome<BatchOutput>> = self.peers.iter().map(Self::wait).collect();
@@ -1964,7 +1964,7 @@ impl Submission {
         }
     }
 
-    /// Waits until this rank's part completed and answers its outcome.
+    /// Waits until this rank's part completed and responds to its outcome.
     fn wait_own(&self) -> Outcome<BatchOutput> {
         self.state.completion.wait()
     }
@@ -2066,7 +2066,7 @@ mod joined_tests {
     }
 
     /// A batch a group runs together has ended when every rank's part ended, and the rank that
-    /// failed decides the answer: the others' output lacks its part.
+    /// failed decides the response: the others' output lacks its part.
     #[test]
     fn a_joined_submission_waits_for_every_rank_and_answers_a_peers_failure() {
         let (pending, state) = Submission::pending(SubmissionId(2));

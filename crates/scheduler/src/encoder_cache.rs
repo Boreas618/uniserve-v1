@@ -1,4 +1,4 @@
-//! Reference-counted cache of worker-resident encoder products: the device
+//! Reference-counted cache of encoder products held on workers: the device
 //! tier of image requests' encoder outputs, nearer than the host encoder
 //! pools (`crate::encoder_outputs`).
 //!
@@ -94,7 +94,7 @@ impl EncoderCacheManager {
         self.budget
     }
 
-    /// Returns a resident output without changing LRU order or cache metrics.
+    /// Returns a cached output without changing LRU order or cache metrics.
     pub(crate) fn peek_product(&self, hash: EncoderKey) -> Option<TensorRef> {
         self.entries.get(&hash).map(|entry| entry.product.clone())
     }
@@ -177,7 +177,7 @@ impl EncoderCacheManager {
     /// This is the encoder cache as a policy sees it: `Snapshot.encodings`
     /// describes each entry by `views::encoding_id(key)` and its last use, and
     /// `Victim::Encoding` names one. A pinned entry is listed too — it is live,
-    /// and whether it may be freed is [`Self::evict`]'s answer.
+    /// and whether it may be freed is [`Self::evict`]'s response.
     pub(crate) fn entries(&self) -> impl Iterator<Item = (EncoderKey, u64)> + '_ {
         self.entries.iter().map(|(key, entry)| (*key, entry.lru))
     }
@@ -386,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn lru_eviction_reports_the_exact_reclaimable_product() {
+    fn lru_eviction_reports_the_exact_releasable_product() {
         let mut cache = EncoderCacheManager::new(2);
         let first = product(100);
         let second = product(200);
@@ -411,7 +411,7 @@ mod tests {
 
     /// Invalidation frees an unpinned product at once and retires a pinned one
     /// until its last pin is released. A replacement inserted under the same
-    /// key stays resident through those releases, and an extra release of the
+    /// key stays cached through those releases, and an extra release of the
     /// retired product is a no-op.
     #[test]
     fn invalidation_preserves_pins_and_independent_replacements() {

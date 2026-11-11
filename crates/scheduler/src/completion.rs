@@ -8,7 +8,7 @@
 //! what a successor may read, the log-probabilities a client asked for, the
 //! artifact — and the mechanism keeps *its own rules*: the
 //! stop conditions are evaluated here from the sampled token
-//! (`OutputSender::und_token_outcome`), and the call's budget, cache window and
+//! (`OutputSender::und_token_kind`), and the call's budget, cache window and
 //! sampling rows are the output's.
 //!
 //! [`BatchReport::from_output`] and [`CallCompletion::from_output`] fill these
@@ -115,11 +115,11 @@ impl CallCompletion {
 /// # Safety
 ///
 /// The publisher writes nothing after it relinquishes the object and never resizes it, which is the
-/// contract `SharedMedia::open` requires. The mechanism is the only claimer of a name the worker
+/// requirement `SharedMedia::open` states. The mechanism is the only claimer of a name the worker
 /// published for one completion.
 fn claim(published: &ipc::MediaOutput) -> Result<Option<Arc<SharedMedia>>, SharedMediaError> {
     let ipc::ArtifactHandle::PosixShm { name } = &published.handle;
-    // SAFETY: see this function's contract - the bytes are written before the publisher
+    // SAFETY: see this function's requirement - the bytes are written before the publisher
     // relinquishes the object and no process modifies it while the mapping lives.
     let media = unsafe { SharedMedia::open(name, published.bytes)? };
     Ok(Some(Arc::new(media)))
@@ -251,7 +251,7 @@ mod tests {
     use ipc::execution::{BatchOutput, CallId as DeviceCallId, CallOutput as DeviceCall};
 
     /// What one device call reports: `committed` tokens, the batches it stands
-    /// at, and the log-probability of each when the deployment planned them.
+    /// at, and the log-probability of each when the deployment prepared them.
     fn device_call(index: u64, committed: &[u32], logprobs: &[f32]) -> DeviceCall {
         let mut call = DeviceCall::completed(
             DeviceCallId(index),

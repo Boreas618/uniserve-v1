@@ -271,19 +271,19 @@ fn a_blocks_steps_are_queued_behind_the_step_in_flight() {
     let pacer = Pacer::start(&fake, Duration::from_millis(20));
     let running = Running::start(fake, config());
     let key = stream(5);
-    let answer = events(running.submit(block_request(5, 24, 1_000)));
+    let response = events(running.submit(block_request(5, 24, 1_000)));
     drop(pacer);
     let accepted = running.stop();
 
     assert_eq!(
-        published_blocks(&answer),
+        published_blocks(&response),
         vec![
             text(key, 24, 0..16),
             text(key, 24, 16..32),
             text(key, 24, 32..40)
         ]
     );
-    assert_eq!(finish_of(&answer), (FinishReason::Eos, 41));
+    assert_eq!(finish_of(&response), (FinishReason::Eos, 41));
 
     for block in 0..3u32 {
         let stop = testkit::block_stop_step(key, block, MAX_STEPS);
@@ -326,19 +326,19 @@ fn a_blocks_first_step_is_queued_behind_the_prefill_before_it() {
     let pacer = Pacer::start(&fake, Duration::from_millis(20));
     let running = Running::start(fake, config());
     let key = stream(6);
-    let answer = events(running.submit(block_request(6, 24, 1_000)));
+    let response = events(running.submit(block_request(6, 24, 1_000)));
     drop(pacer);
     let accepted = running.stop();
 
     assert_eq!(
-        published_blocks(&answer),
+        published_blocks(&response),
         vec![
             text(key, 24, 0..16),
             text(key, 24, 16..32),
             text(key, 24, 32..40)
         ]
     );
-    assert_eq!(finish_of(&answer), (FinishReason::Eos, 41));
+    assert_eq!(finish_of(&response), (FinishReason::Eos, 41));
 
     let mut first_steps = 0;
     for (position, step) in accepted.iter().enumerate() {
@@ -373,19 +373,19 @@ fn a_blocks_commit_is_queued_behind_the_step_that_computes_nothing() {
     let pacer = Pacer::start(&fake, Duration::from_millis(20));
     let running = Running::start(fake, config());
     let key = stream(7);
-    let answer = events(running.submit(block_request(7, 24, 1_000)));
+    let response = events(running.submit(block_request(7, 24, 1_000)));
     drop(pacer);
     let accepted = running.stop();
 
     assert_eq!(
-        published_blocks(&answer),
+        published_blocks(&response),
         vec![
             text(key, 24, 0..16),
             text(key, 24, 16..32),
             text(key, 24, 32..40)
         ]
     );
-    assert_eq!(finish_of(&answer), (FinishReason::Eos, 41));
+    assert_eq!(finish_of(&response), (FinishReason::Eos, 41));
 
     // A commit is a prefill that starts at or after the prompt's end.
     let commits: Vec<&Accepted> = accepted
@@ -429,13 +429,13 @@ fn the_terminal_event_does_not_wait_for_the_step_behind_it() {
 
     // Every batch completes in order but the step behind the stopping one,
     // which stays on the device.
-    let mut answer = Vec::new();
+    let mut response = Vec::new();
     let mut released = 0;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !matches!(answer.last(), Some(Event::Finished { .. })) {
-        assert!(Instant::now() < deadline, "no terminal event: {answer:?}");
+    while !matches!(response.last(), Some(Event::Finished { .. })) {
+        assert!(Instant::now() < deadline, "no terminal event: {response:?}");
         while let Ok(event) = receiver.try_recv() {
-            answer.push(event);
+            response.push(event);
         }
         if let Some(next) = fake.accepted().get(released)
             && !steps_of(&next.batch, key).contains(&(0, stop + 1))
@@ -449,8 +449,8 @@ fn the_terminal_event_does_not_wait_for_the_step_behind_it() {
     fake.resume();
     let accepted = running.stop();
 
-    assert_eq!(published_blocks(&answer), vec![text(key, 24, 0..16)]);
-    assert_eq!(finish_of(&answer), (FinishReason::MaxTokens, 16));
+    assert_eq!(published_blocks(&response), vec![text(key, 24, 0..16)]);
+    assert_eq!(finish_of(&response), (FinishReason::MaxTokens, 16));
     let steps: Vec<u32> = accepted
         .iter()
         .flat_map(|accepted| steps_of(&accepted.batch, key))
@@ -469,14 +469,14 @@ fn the_terminal_event_does_not_wait_for_the_step_behind_it() {
 fn the_completion_limit_truncates_inside_a_block() {
     let running = Running::start(fake(1_000, 1), config());
     let key = stream(2);
-    let answer = events(running.submit(block_request(2, 8, 20)));
+    let response = events(running.submit(block_request(2, 8, 20)));
     let accepted = running.stop();
 
     assert_eq!(
-        published_blocks(&answer),
+        published_blocks(&response),
         vec![text(key, 8, 0..16), text(key, 8, 16..20)]
     );
-    assert_eq!(finish_of(&answer), (FinishReason::MaxTokens, 20));
+    assert_eq!(finish_of(&response), (FinishReason::MaxTokens, 20));
     let commits = accepted
         .iter()
         .flat_map(|accepted| prefill_starts(&accepted.batch, key))
@@ -496,20 +496,20 @@ fn a_stop_token_ends_the_request_inside_its_block() {
     let mut included = block_request(4, 8, 1_000);
     included.stop_token_ids = text(included_key, 8, 5..6);
     included.include_stop_token = true;
-    let excluded_answer = events(running.submit(excluded));
-    let included_answer = events(running.submit(included));
+    let excluded_events = events(running.submit(excluded));
+    let included_events = events(running.submit(included));
     running.stop();
 
     assert_eq!(
-        published_blocks(&excluded_answer),
+        published_blocks(&excluded_events),
         vec![text(excluded_key, 8, 0..16), text(excluded_key, 8, 16..21)]
     );
-    assert_eq!(finish_of(&excluded_answer).0, FinishReason::Stop);
+    assert_eq!(finish_of(&excluded_events).0, FinishReason::Stop);
     assert_eq!(
-        published_blocks(&included_answer),
+        published_blocks(&included_events),
         vec![text(included_key, 8, 0..6)]
     );
-    assert_eq!(finish_of(&included_answer).0, FinishReason::Stop);
+    assert_eq!(finish_of(&included_events).0, FinishReason::Stop);
 }
 
 /// A denoising step and a block commit each need a whole block of one step's
@@ -535,18 +535,18 @@ fn an_unseeded_block_request_is_refused() {
     let running = Running::start(fake(40, 1), config());
     let mut request = block_request(6, 8, 64);
     request.sampling.seed = None;
-    let answer = events(running.submit(request));
+    let response = events(running.submit(request));
     running.stop();
 
     assert!(
         matches!(
-            answer.last(),
+            response.last(),
             Some(Event::Rejected {
                 kind: RejectionKind::Invalid,
                 ..
             })
         ),
-        "{answer:?}"
+        "{response:?}"
     );
 }
 

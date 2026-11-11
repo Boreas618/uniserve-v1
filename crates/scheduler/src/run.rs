@@ -85,21 +85,21 @@ impl Scheduler {
                     .any(|kind| matches!(kind, CallKind::Media(_)))
             })
             .map(|(id, worker)| {
-                // The ranks back the results of the components the engine
-                // placed on them, not a component list a rank reports.
-                let components = submissions
+                // The ranks back the results of the stages the engine
+                // placed on them, not a stage list a rank reports.
+                let stages = submissions
                     .info()
                     .layouts
                     .get(id)
-                    .map(|layout| layout.components.clone())
+                    .map(|layout| layout.stages.clone())
                     .unwrap_or_default();
                 (
                     id.clone(),
                     MediaStorage::new(
                         worker.request_slots as usize,
                         &submissions.info().rank_buffer_bytes(id),
-                        &components,
-                        &info.media_components,
+                        &stages,
+                        &info.media_stages,
                     ),
                 )
             })
@@ -152,7 +152,7 @@ impl Scheduler {
                 option = "max_batch",
                 stated = config.max_batch,
                 captured = max_batch_calls,
-                "the catalogue's row bound lowers the batch's call count"
+                "the buckets' row bound lowers the batch's call count"
             );
         }
         if max_batch_calls > 0 {
@@ -517,8 +517,8 @@ impl Scheduler {
     /// the TCP address another host's rank reports, when every rank that
     /// executes the denoiser reports one (`WorkerInfo::rank_latents`), as
     /// a head of `deployment` in `epoch`, whose trajectories the servers
-    /// keep its own while it is on trial. The denoiser is the component
-    /// that serves denoising calls, or the protocol's default component of
+    /// keep its own while it is on trial. The denoiser is the stage
+    /// that serves denoising calls, or the protocol's default stage of
     /// a model that routes none. Without them a preempted request continues
     /// from noise wherever it resumes.
     pub fn enable_trajectory_store(
@@ -528,19 +528,19 @@ impl Scheduler {
         epoch: u64,
         host: &str,
     ) {
-        let component = self
+        let stage = self
             .info
-            .media_components
+            .media_stages
             .get(&MediaCall::Denoising)
             .cloned()
             .unwrap_or_else(|| DEFAULT_BLOCK.to_owned());
         let info = self.worker.info();
         let mut denoisers = Vec::new();
         for (worker, ranks) in &info.rank_latents {
-            // The ranks that hold trajectories: those the denoiser's component
+            // The ranks that hold trajectories: those the denoiser's stage
             // config assigns, or every rank of a group placed without one.
             let holders: Vec<usize> = info
-                .component_config(worker, &component)
+                .stage_config(worker, &stage)
                 .map_or_else(|| (0..ranks.len()).collect(), |config| config.ranks.clone());
             let reports: Option<Vec<(u32, crate::trajectories::RankLatents<'_>)>> = holders
                 .iter()
@@ -759,11 +759,11 @@ impl Scheduler {
 
     /// All drivers consume the same command ingress before scheduling work.
     ///
-    /// Applies every queued command without blocking. Answers whether the
+    /// Applies every queued command without blocking. Returns whether the
     /// engine must stop — a `Shutdown` command arrived or every sender has
     /// disconnected — and whether any command was applied, which is progress a
     /// tick made even when it formed no batch: a submission that only queues a
-    /// request still changed the epoch a step is planned from.
+    /// request still changed the epoch a step is prepared from.
     pub(super) fn take_commands_from(&mut self, commands: &Receiver<Command>) -> (bool, bool) {
         let mut handled = false;
         loop {
@@ -806,8 +806,8 @@ impl Scheduler {
                 self.progress.wake();
             }
             let progressed = self.step() || handled;
-            // An update's shadow pass is answered once the step that ran it has
-            // ended (§7.3 step 2): the answer never claims a comparison the
+            // An update's shadow pass gets its response once the step that ran it has
+            // ended (§7.3 step 2): the response never claims a comparison the
             // step has not finished.
             self.settle_shadow();
             if !self.failed() && !progressed {
@@ -826,7 +826,7 @@ impl Scheduler {
                 return true;
             }
         }
-        // Finish everything still queued or running with `Aborted` before
+        // Finish everything still waiting or running with `Aborted` before
         // closing the worker, so every open consumer receives a terminal
         // event rather than only a closed channel. The pages published so
         // far reach the host KV cache first.
@@ -909,8 +909,8 @@ impl Scheduler {
         let drained = self.drain_batches();
         self.draining = draining;
         drained?;
-        let answers = self.operate_workers(&operation)?;
-        ipc::memory::replies::<O>(&answers)
+        let responses = self.operate_workers(&operation)?;
+        ipc::memory::replies::<O>(&responses)
             .map_err(|error| format!("a worker's reply to {operation:?}: {error}"))
     }
 
@@ -942,7 +942,7 @@ impl Scheduler {
     /// caller set `draining`.
     ///
     /// The drain is unbounded in what it may wait for and bounded only in
-    /// silence: a batch the worker never answers, and never finishes,
+    /// silence: a batch the worker never responses, and never finishes,
     /// would otherwise hold the hook the drain serves for ever. Whenever a
     /// batch or a submission leaves the pending set the drain has made
     /// progress and its silence clock restarts, so a scheduler that keeps
@@ -1002,7 +1002,7 @@ impl Scheduler {
     }
 
     /// Blocks until something arrives: a command, a completed batch, a reader
-    /// that freed room in an event channel, or an answer of a Storage Server.
+    /// that freed room in an event channel, or a response of a Storage Server.
     ///
     /// The wait has no tick. It ends without an arrival only at a moment the
     /// scheduler itself acts at: `bound`, which a caller that waits for
@@ -1023,7 +1023,7 @@ impl Scheduler {
         .into_iter()
         .flatten()
         .min();
-        // The Storage Servers answer on connections of their own: the host KV
+        // The Storage Servers response on connections of their own: the host KV
         // cache's, the host latent and encoder pools' and the transfers'.
         let connections: Vec<std::os::fd::BorrowedFd<'_>> = self
             .kv_offload
@@ -1078,7 +1078,7 @@ impl Scheduler {
 /// age and the requests it carries, and the submissions the worker never
 /// accepted.
 ///
-/// A batch the worker never answered and never finished is named by id, with
+/// A batch the worker never responded and never finished is named by id, with
 /// how long it has been in flight and which requests it carries, so a hook that
 /// stopped can be diagnosed from its error alone.
 fn abandoned_drain(inflight: &super::inflight::Inflight, held: (usize, usize)) -> String {

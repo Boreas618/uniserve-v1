@@ -70,7 +70,7 @@ pub struct SharedMedia {
 }
 
 // SAFETY: the pointer refers to a `PROT_READ` mapping that no process writes
-// after export (the `open` contract) and that stays mapped until this value
+// after export (what `open` requires) and that stays mapped until this value
 // drops, so moving it across threads cannot race.
 unsafe impl Send for SharedMedia {}
 // SAFETY: as for Send above; shared references only read the immutable
@@ -104,7 +104,7 @@ impl SharedMedia {
             usize::try_from(num_bytes).map_err(|_| SharedMediaError::TooLarge(num_bytes))?;
 
         // Reject a malformed locator before touching any object: the name must
-        // be one non-empty component (the leading `/` is added below), and a
+        // be one non-empty segment (the leading `/` is added below), and a
         // export is never empty.
         if bytes == 0 || name.is_empty() || name.contains('/') {
             return Err(SharedMediaError::Locator);

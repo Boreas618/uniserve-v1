@@ -89,7 +89,7 @@ struct Served {
     /// Every media call, in the order the worker accepted them.
     calls: Vec<ObservedCall>,
     /// Every event each request's stream delivered.
-    outcomes: HashMap<RequestId, Vec<Event>>,
+    ended: HashMap<RequestId, Vec<Event>>,
 }
 
 impl Served {
@@ -123,7 +123,7 @@ impl Served {
 
     /// Asserts that a request delivered a video artifact and then finished.
     fn assert_completed(&self, request: RequestId) {
-        let events = &self.outcomes[&request];
+        let events = &self.ended[&request];
         let artifact = events.iter().find_map(|event| match event {
             Event::Artifact(artifact) => Some(artifact),
             _ => None,
@@ -229,7 +229,7 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     Served {
         submissions: Vec::new(),
         calls: Vec::new(),
-        outcomes: HashMap::from([(RequestId(90), events)]),
+        ended: HashMap::from([(RequestId(90), events)]),
     }
     .assert_completed(RequestId(90));
 }
@@ -240,7 +240,7 @@ fn serve(pool: Inventory, requests: Vec<Request>) -> Served {
     serve_with(pool, Media::new(), requests, None)
 }
 
-/// Serves the requests over `pool` whose media calls `media` answers, with an
+/// Serves the requests over `pool` whose media calls `media` responses, with an
 /// optional bound on waiting request state.
 fn serve_with(
     pool: Inventory,
@@ -270,7 +270,7 @@ fn serve_with(
     let handle = CommandSender::new(tx);
 
     // Every request is queued before the loop starts, so one admission pass
-    // sees them together, resident in submission order.
+    // sees them together, running in submission order.
     let mut streams = requests
         .into_iter()
         .map(|request| {
@@ -281,7 +281,7 @@ fn serve_with(
     let pacer = Pacer::start(&fake, DEVICE_STEP);
     let engine_loop = thread::spawn(move || scheduler.run(rx));
 
-    let mut outcomes: HashMap<RequestId, Vec<Event>> = HashMap::new();
+    let mut ended: HashMap<RequestId, Vec<Event>> = HashMap::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut terminal = 0;
     while terminal < streams.len() && Instant::now() < deadline {
@@ -292,7 +292,7 @@ fn serve_with(
                 if event.is_terminal() {
                     terminal += 1;
                 }
-                outcomes.entry(*id).or_default().push(event);
+                ended.entry(*id).or_default().push(event);
             }
         }
         if idle {
@@ -306,21 +306,21 @@ fn serve_with(
     assert_eq!(
         terminal,
         streams.len(),
-        "every request reaches a terminal event: {outcomes:?}"
+        "every request reaches a terminal event: {ended:?}"
     );
 
-    record(&fake.accepted(), &units, outcomes)
+    record(&fake.accepted(), &units, ended)
 }
 
 /// The media submissions of `accepted`, each with the calls of the earlier
-/// ones still in flight when it was accepted, and the requests' outcomes.
+/// ones still in flight when it was accepted, and the requests' ended.
 ///
 /// A decode covers the units from its round's first unit to the next round's
 /// first, and the last round the request's remaining units.
 fn record(
     accepted: &[testkit::Accepted],
     units: &HashMap<RequestId, u32>,
-    outcomes: HashMap<RequestId, Vec<Event>>,
+    ended: HashMap<RequestId, Vec<Event>>,
 ) -> Served {
     // Each media batch's calls, with each decode's first unit.
     let mut batches = Vec::new();
@@ -393,7 +393,7 @@ fn record(
     Served {
         submissions,
         calls,
-        outcomes,
+        ended,
     }
 }
 
@@ -433,7 +433,7 @@ fn a_younger_request_denoises_only_after_the_older_request_completes_its_steps()
         );
     }
 
-    // Different components overlap: the older request decodes and encodes
+    // Different stages overlap: the older request decodes and encodes
     // its media while the younger request denoises.
     assert!(
         younger_steps.iter().any(|(_, submission)| {
@@ -563,7 +563,7 @@ fn an_admitted_video_request_reports_scheduling_before_its_progress() {
 
     // A job's public phases start at admission: the scheduling event carries
     // the queue interval and precedes every progress report.
-    let events = &served.outcomes[&request];
+    let events = &served.ended[&request];
     let scheduled = events
         .iter()
         .position(|event| matches!(event, Event::Scheduled { .. }))
@@ -597,7 +597,7 @@ fn a_full_waiting_queue_rejects_a_video_request_as_overloaded() {
 
     // The second request arrives while the first still waits, so the bound
     // refuses it as retryable overload rather than as an invalid request.
-    let events = &served.outcomes[&refused];
+    let events = &served.ended[&refused];
     assert!(
         matches!(
             events.as_slice(),
@@ -759,7 +759,7 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
 /// both sizes, beyond what the latent encoder declares.
 #[test]
 fn conditioned_requests_beyond_the_deployment_are_refused() {
-    let rejected = |served: &Served, id: u64| match served.outcomes[&RequestId(id)].as_slice() {
+    let rejected = |served: &Served, id: u64| match served.ended[&RequestId(id)].as_slice() {
         [
             Event::Rejected {
                 kind: RejectionKind::Invalid,
@@ -808,7 +808,7 @@ fn a_request_the_worker_refuses_is_rejected_with_its_reason() {
         None,
     );
 
-    let refused = served.outcomes[&RequestId(1)]
+    let refused = served.ended[&RequestId(1)]
         .iter()
         .find_map(|event| match event {
             Event::Rejected { kind, message } => Some((*kind, message.clone())),
@@ -864,7 +864,7 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
         );
     }
 
-    match served.outcomes[&RequestId(3)].as_slice() {
+    match served.ended[&RequestId(3)].as_slice() {
         [
             Event::Rejected {
                 kind: RejectionKind::Invalid,

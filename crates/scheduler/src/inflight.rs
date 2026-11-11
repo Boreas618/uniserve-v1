@@ -1,6 +1,6 @@
 //! Scheduler-owned pending batches and request-local completion ordering.
 //!
-//! [`Inflight`] owns everything between planning a call and applying its
+//! [`Inflight`] owns everything between preparing a call and applying its
 //! result: batches awaiting submission, submitted batches awaiting their
 //! results and command receipts, each request's queue of submitted calls,
 //! completions queued until their call may apply, deferred terminal events,
@@ -62,7 +62,7 @@ pub(super) struct PendingFinish {
 /// One submitted batch remains owned until all results and command receipts arrive.
 /// Partial results consume identities without releasing the batch's queue credit.
 pub(super) struct PendingBatch {
-    /// Time the scheduling pass planned the batch; the batch round trip is
+    /// Time the scheduling pass prepared the batch; the batch round trip is
     /// measured from it.
     pub(super) started: Instant,
     /// The batch's calls in the order the batch numbers them, once its
@@ -116,7 +116,7 @@ pub(super) struct Inflight {
     pub(super) pending_completions: HashMap<RequestId, BTreeMap<CallId, PendingCompletion>>,
     /// Terminal events deferred until the request's calls have drained.
     pub(super) pending_finishes: HashMap<RequestId, PendingFinish>,
-    /// Batches by id, from registration at planning until their final result;
+    /// Batches by id, from registration at preparing until their final result;
     /// includes batches still waiting in `pending_submissions`.
     pub(super) pending_batches: HashMap<u64, PendingBatch>,
     /// `Finish` and `Free` commands awaiting a batch to carry them.
@@ -226,7 +226,7 @@ impl Inflight {
     /// by `completion_priority` and then arrival. A call is ready when it is at
     /// the front of its request's queue, or when it is independent (an
     /// `InflightInput::Media` call that does not advance state) and none of its
-    /// tensor inputs is produced by a call still queued. Applying a released
+    /// tensor inputs is produced by a call still waiting. Applying a released
     /// completion can make the next one ready, so the caller repeats until
     /// nothing is returned. Completions of a request with no queued call stay
     /// queued.

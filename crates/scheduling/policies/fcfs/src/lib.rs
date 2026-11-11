@@ -19,7 +19,7 @@
 //! Today's waiting queue is a `VecDeque` appended to in submission order
 //! (`scheduler/admission.rs`, `enqueue`), and admission examines only its
 //! head, so the order in which requests are admitted is exactly the order in
-//! which they arrived. Batch assembly then takes the residents by assembly
+//! which they arrived. Batch assembly then takes the running requests by assembly
 //! class and, within a class, by the order they were admitted
 //! (`batching.rs`, `assembly_order`), which is arrival order again because
 //! admission is. Neither decision reads the request's own `priority` under

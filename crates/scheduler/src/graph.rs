@@ -11,8 +11,8 @@
 //! its audio tracks separately (`LatentEncoding`); latent preparation then
 //! reads the text features and every condition latent.
 //!
-//! Products are named as the loaded components declare them, so admission
-//! finds each product's output on the component serving its call by name.
+//! Products are named as the loaded stages declare them, so admission
+//! finds each product's output on the stage serving its call by name.
 //! A product laid out at the request's raster declares its raster axes, which
 //! admission binds to the graph's canvas. The graph holds sizes only: it never
 //! inspects media.
@@ -34,7 +34,7 @@ pub(crate) use ipc::product;
 pub(crate) struct GraphProduct {
     /// The call that publishes it.
     pub(crate) call: MediaCall,
-    /// The name its component declares it under.
+    /// The name its stage declares it under.
     pub(crate) name: &'static str,
     /// The request's exact extent of the product's device-sized axis, or
     /// `None` for a product whose every extent is static.

@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn philox_matches_the_reference_known_answer_vectors() {
-        // Random123 Philox4x32-10 known-answer vectors establish the exact
+        // Random123 Philox4x32-10 known-response vectors establish the exact
         // round count, word ordering, and key schedule.
         assert_eq!(
             philox4x32_10([0, 0, 0, 0], [0, 0]),

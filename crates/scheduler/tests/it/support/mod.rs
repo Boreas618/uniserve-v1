@@ -111,7 +111,7 @@ pub(crate) fn text_pool(
         layout: ipc::execution::PoolLayout {
             queue_depth,
             ranks: 1,
-            components: std::collections::BTreeMap::new(),
+            stages: std::collections::BTreeMap::new(),
         },
         max_model_len: TEXT_MAX_MODEL_LEN,
     };
@@ -206,11 +206,14 @@ pub(crate) fn policy_source() -> std::sync::Arc<dyn scheduler::PolicySource + Se
     std::sync::Arc::new(scheduler::PolicyBytes::new(policy_module()))
 }
 
-/// The answer to a policy command, which a scheduler gives within a minute.
-pub(crate) fn applied<T>(answer: crossbeam_channel::Receiver<Result<T, String>>, what: &str) -> T {
-    answer
+/// The response to a policy command, which a scheduler gives within a minute.
+pub(crate) fn applied<T>(
+    response: crossbeam_channel::Receiver<Result<T, String>>,
+    what: &str,
+) -> T {
+    response
         .recv_timeout(std::time::Duration::from_secs(60))
-        .unwrap_or_else(|_| panic!("the scheduler answers {what}"))
+        .unwrap_or_else(|_| panic!("the scheduler responds {what}"))
         .unwrap_or_else(|error| panic!("{what} of the fcfs policy: {error}"))
 }
 

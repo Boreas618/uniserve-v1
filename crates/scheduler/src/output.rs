@@ -21,8 +21,8 @@ use crate::kv_cache::manager::AttentionManager;
 use crate::kv_cache::{CachedTokens, KvOffloadManager, OffloadKind, PageRef};
 
 /// How one understanding token ends or continues its request
-/// (`Scheduler::und_token_outcome`).
-enum TokenOutcome {
+/// (`Scheduler::und_token_kind`).
+enum TokenKind {
     /// The token is ordinary output.
     Continue,
     /// The token is one of the request's stop tokens, published only with
@@ -522,7 +522,7 @@ impl Scheduler {
                         }
                     }
 
-                    // The request pins the resident entry, which may be an
+                    // The request pins the cached entry, which may be an
                     // earlier equivalent product rather than this call's.
                     let Some(product) = self.storage.encoder_cache.acquire(cache_key) else {
                         return self.finish(id, FinishReason::Error);
@@ -756,9 +756,9 @@ impl Scheduler {
                 return;
             };
             state.num_generated_tokens += 1;
-            match self.und_token_outcome(id, token_id) {
-                TokenOutcome::Continue => visible.push(token_id),
-                TokenOutcome::StopToken => {
+            match self.und_token_kind(id, token_id) {
+                TokenKind::Continue => visible.push(token_id),
+                TokenKind::StopToken => {
                     if self
                         .requests
                         .tokens(&id)
@@ -769,7 +769,7 @@ impl Scheduler {
                     finish = Some((FinishReason::Stop, Some(crate::StopReason::Token(token_id))));
                     break;
                 }
-                TokenOutcome::Finish(reason) => {
+                TokenKind::Finish(reason) => {
                     if !self.special_tokens.eos.contains(&token_id) {
                         visible.push(token_id);
                     }
@@ -791,23 +791,23 @@ impl Scheduler {
     /// precede the token; the token limit applies regardless of that floor,
     /// and a stop-token match takes precedence over EOS and the limit. A
     /// request that is not running continues, and its caller finds it gone.
-    fn und_token_outcome(&self, id: RequestId, token_id: u32) -> TokenOutcome {
+    fn und_token_kind(&self, id: RequestId, token_id: u32) -> TokenKind {
         let Some(state) = self.requests.tokens(&id) else {
-            return TokenOutcome::Continue;
+            return TokenKind::Continue;
         };
         let generated = state.num_generated_tokens;
         let under_floor = generated <= state.req.sampling.min_tokens;
         if !under_floor && state.req.stop_token_ids.contains(&token_id) {
-            TokenOutcome::StopToken
+            TokenKind::StopToken
         } else if generated >= state.req.max_und_tokens {
-            TokenOutcome::Finish(FinishReason::MaxTokens)
+            TokenKind::Finish(FinishReason::MaxTokens)
         } else if self.special_tokens.eos.contains(&token_id)
             && !state.req.sampling.ignore_eos
             && !under_floor
         {
-            TokenOutcome::Finish(FinishReason::Eos)
+            TokenKind::Finish(FinishReason::Eos)
         } else {
-            TokenOutcome::Continue
+            TokenKind::Continue
         }
     }
 
@@ -870,8 +870,8 @@ impl Scheduler {
         if !self.requests.tokens(&id).is_some() {
             return true;
         }
-        match self.und_token_outcome(id, token_id) {
-            TokenOutcome::StopToken => {
+        match self.und_token_kind(id, token_id) {
+            TokenKind::StopToken => {
                 self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs);
                 self.finish_after_inflight(
                     id,
@@ -880,7 +880,7 @@ impl Scheduler {
                 );
                 return true;
             }
-            TokenOutcome::Finish(reason) => {
+            TokenKind::Finish(reason) => {
                 if !self.special_tokens.eos.contains(&token_id) {
                     if sampled {
                         self.emit_sampled_text(id, token_id, logprob, top_logprobs);
@@ -891,7 +891,7 @@ impl Scheduler {
                 self.finish_after_inflight(id, reason, None);
                 return true;
             }
-            TokenOutcome::Continue => {}
+            TokenKind::Continue => {}
         }
         if sampled {
             self.emit_sampled_text(id, token_id, logprob, top_logprobs);

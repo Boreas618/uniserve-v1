@@ -78,7 +78,7 @@ impl std::ops::DerefMut for Serving {
 
 impl Serving {
     /// Runs the scheduler on the calling thread until `commands` shuts it
-    /// down or closes, and answers what `Scheduler::run` answers: whether the
+    /// down or closes, and responds to what `Scheduler::run` responses: whether the
     /// engine died.
     ///
     /// The commands a case sends wait until the policy serves, then reach the

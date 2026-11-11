@@ -7,16 +7,16 @@
 //! - **the precopy trial** refuses five of them. §4.4 has a precopy ask every
 //!   decision on the mechanism's current state, so a trap, spent fuel, limits
 //!   over the build config's ceilings and a decision the validators refuse are found before the program can serve: the command
-//!   answers with the reason, the serving program is untouched, and no revert
+//!   responds with the reason, the serving program is untouched, and no revert
 //!   happens because nothing was replaced;
 //! - **the live step** decides the sixth, and it is not a policy failure. A
-//!   starved request is a condition of serving, not of a program's answers, so
+//!   starved request is a condition of serving, not of a program's responses, so
 //!   the program is switched in, admits a request and never advances it, and
 //!   the mechanism acts on what could otherwise have been served: a request
 //!   starved while another request could still be served is that request's
 //!   failure, ended by name while the epoch serves on; a request starved with
-//!   nothing else resident is the epoch ending, by a name that states what was
-//!   resident. Neither burns the policy, which did nothing wrong.
+//!   nothing else running is the epoch ending, by a name that states what was
+//!   running. Neither burns the policy, which did nothing wrong.
 //!
 //! Nothing here is a test-only branch: the scheduler, the trial, the switch and
 //! the validators are the ones the epoch runs.
@@ -44,13 +44,13 @@ const OUTPUT: u32 = 8192;
 const LIMITS: u32 = 12288;
 const VICTIMS: u32 = 16384;
 
-/// How long a command answer may take.
-const ANSWER: Duration = Duration::from_secs(30);
+/// How long a command response may take.
+const RESPONSE: Duration = Duration::from_secs(30);
 
 /// What a toy's `observe` does.
 #[derive(Clone, Copy)]
 enum Observe {
-    Answers,
+    Returns,
     Traps,
 }
 
@@ -58,11 +58,11 @@ enum Observe {
 #[derive(Clone, Copy)]
 enum Dispatch {
     Decides,
-    /// Answers the same output once and an empty one afterwards.
+    /// Responds to the same output once and an empty one afterwards.
     ///
-    /// A real policy names only queued requests, so a program that admits a
+    /// A real policy names only waiting requests, so a program that admits a
     /// request and keeps naming it on later dispatches states an admission of a
-    /// resident request, which §4.4 refuses — and the refusal, not the
+    /// running request, which §4.4 refuses — and the refusal, not the
     /// starvation, is then what the case reports.
     ///
     /// This double does not read the dispatch view: it decides from its own
@@ -87,7 +87,7 @@ struct Toy {
 }
 
 impl Toy {
-    /// A policy that answers every decision with nothing.
+    /// A policy that responds to every decision with nothing.
     fn idle() -> Self {
         Self {
             limits: Limits {
@@ -98,7 +98,7 @@ impl Toy {
                 ..Limits::default()
             },
             output: DispatchOutput::default(),
-            observe: Observe::Answers,
+            observe: Observe::Returns,
             dispatch: Dispatch::Decides,
         }
     }
@@ -107,7 +107,7 @@ impl Toy {
         let output = serde_json::to_string(&self.output).expect("a dispatch output is JSON");
         let limits = serde_json::to_string(&self.limits).expect("limits are JSON");
         let observe = match self.observe {
-            Observe::Answers => {
+            Observe::Returns => {
                 "(func (export \"sched_observe\") (param i32 i32) (result i64) i64.const 0)"
                     .to_owned()
             }
@@ -147,14 +147,14 @@ impl Toy {
              (func (export \"sched_init\") (param i32 i32) (result i64) i64.const 0) \
              {observe} \
              {dispatch} \
-             (func (export \"{limits_call}\") (result i64) i64.const {limits_answer}) \
+             (func (export \"{limits_call}\") (result i64) i64.const {limits_output}) \
              (func (export \"{preempt_call}\") (param i32 i32) (result i64) i64.const {preempt_reply}) \
              (func (export \"{route_call}\") (param i32 i32) (result i32) i32.const 0) \
              (func (export \"{place_call}\") (param i32 i32) (result i32) i32.const 0))",
             output = escape(&output),
             limits = escape(&limits),
             limits_call = Call::Limits.export(),
-            limits_answer = packed(LIMITS, limits.len()),
+            limits_output = packed(LIMITS, limits.len()),
             preempt_call = Call::Preempt.export(),
             preempt_reply = packed(VICTIMS, 2),
             route_call = Call::Route.export(),
@@ -172,9 +172,9 @@ impl Toy {
 /// decision from the one the case is about.
 fn unknown_phase() -> DispatchOutput {
     DispatchOutput {
-        // The request is the scheduler's resident when the trial judges the
+        // The request is the scheduler's running request when the trial judges the
         // output, so no admission is stated and the work is judged against the
-        // resident view: the refusal that follows is the phase's and not the
+        // running view: the refusal that follows is the phase's and not the
         // request's. A dispatch output that admitted it instead would have its work
         // judged on the admission this output makes (§4.4), which exempts the
         // work from every check this case exists to state.
@@ -258,12 +258,12 @@ impl Epoch {
         epoch
     }
 
-    /// Offers `failing` as the epoch's next program and answers the trial's
+    /// Offers `failing` as the epoch's next program and responds to the trial's
     /// reason for refusing it.
     ///
     /// §4.4's first failures are decided here rather than live: the trial asks
     /// every decision the state names on the mechanism's current state, and a
-    /// program whose answers run past their fuel, declare limits above the
+    /// program whose responses run past their fuel, declare limits above the
     /// build config's ceilings, or name something that does not exist never
     /// becomes the serving one.
     ///
@@ -281,7 +281,7 @@ impl Epoch {
         };
         let source: Arc<dyn PolicySource + Send + Sync> =
             Arc::new(PolicyBytes::new(failing.wasm()));
-        match answer(self.handle.precopy_policy(program, source)) {
+        match response(self.handle.precopy_policy(program, source)) {
             Ok(()) => panic!("the trial refuses this program, and it did not"),
             Err(reason) => reason,
         }
@@ -292,7 +292,7 @@ impl Epoch {
         self.handle
             .progress()
             .recv()
-            .expect("the scheduler answers its progress")
+            .expect("the scheduler responds to its progress")
             .step
     }
 
@@ -317,8 +317,8 @@ impl Epoch {
             stated: Default::default(),
         };
         let source: Arc<dyn PolicySource + Send + Sync> = Arc::new(PolicyBytes::new(toy.wasm()));
-        answer(self.handle.precopy_policy(program, source))?;
-        answer(self.handle.switchover_policy())
+        response(self.handle.precopy_policy(program, source))?;
+        response(self.handle.switchover_policy())
     }
 
     /// The revision of the program that serves: after a refused candidate or
@@ -326,8 +326,8 @@ impl Epoch {
     fn serving_revision(&self) -> Option<u32> {
         self.handle
             .policy_programs()
-            .recv_timeout(ANSWER)
-            .expect("the scheduler answers with its slot's programs")
+            .recv_timeout(RESPONSE)
+            .expect("the scheduler responds with its slot's programs")
             .running
             .map(|program| program.revision)
     }
@@ -338,24 +338,24 @@ impl Epoch {
     }
 }
 
-/// Blocks until a stage command answers, and answers its result without the
+/// Blocks until a stage command responses, and responds to its result without the
 /// stage's own report.
-fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<(), String> {
-    match receiver.recv_timeout(ANSWER) {
+fn response<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<(), String> {
+    match receiver.recv_timeout(RESPONSE) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(error),
-        Err(error) => Err(format!("the scheduler did not answer: {error}")),
+        Err(error) => Err(format!("the scheduler did not response: {error}")),
     }
 }
 
-/// Polls `poll` until it answers `Some`.
+/// Polls `poll` until it returns `Some`.
 fn eventually<T>(mut poll: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + ANSWER;
+    let deadline = Instant::now() + RESPONSE;
     loop {
         if let Some(value) = poll() {
             return value;
         }
-        assert!(Instant::now() < deadline, "the scheduler never answered");
+        assert!(Instant::now() < deadline, "the scheduler never responded");
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -383,7 +383,7 @@ fn a_trap_in_observe_fails_the_policy() {
         reason.contains("trap") && reason.contains("observ"),
         "the reason names the failed call: {reason}"
     );
-    // The program before the trapping one answers the next decision: its
+    // The program before the trapping one responds to the next decision: its
     // layout is the one handed over, and the failed program's is not.
     assert_eq!(epoch.serving_revision(), Some(1));
     assert!(
@@ -445,18 +445,18 @@ fn limits_over_the_build_ceiling_fail_the_policy() {
 #[test]
 fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     // The serving program admits the request and gives it no work, so the
-    // state the trial judges holds it as a resident and the refused output's
+    // state the trial judges holds it as a running request and the refused output's
     // work is judged against that view.
     let mut admitting = Toy::idle();
     admitting.output = DispatchOutput {
         admit: vec![scheduling::guest::RequestId(1)],
         ..DispatchOutput::default()
     };
-    // It admits once: naming the resident request again on the next dispatch
+    // It admits once: naming the running request again on the next dispatch
     // would be a refused admission, which is a different failure from the one
     // this case states.
     admitting.dispatch = Dispatch::DecidesOnce;
-    // A program may admit only a queued request (§4.4), and the trial of the
+    // A program may admit only a waiting request (§4.4), and the trial of the
     // first program runs before this request exists. So the epoch serves an
     // idle program first, the request arrives, and the admitting program is
     // installed over it: the epoch this case is about is one whose serving
@@ -488,13 +488,13 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
         "the reason names the refused decision: {reason}"
     );
     // Nothing of the refused output ran, and nothing of it serves: the program
-    // that answers the next decision is the one that was already serving.
+    // that responds to the next decision is the one that was already serving.
     assert_eq!(epoch.serving_revision(), Some(2));
     epoch.no_failure();
 }
 
 /// A policy that admits `admit` and gives it no work, with `timeout` as its
-/// starvation deadline: §4.4's sixth failure is a resident request the policy
+/// starvation deadline: §4.4's sixth failure is a running request the policy
 /// never advanced.
 fn starving(admit: Vec<RequestId>, timeout: Nanos) -> Toy {
     Toy {
@@ -532,12 +532,12 @@ fn text_request(id: u64, prompt: usize, tokens: usize) -> GenerationRequest {
 #[test]
 fn a_starved_request_with_nothing_else_resident_ends_the_epoch() {
     // One millisecond of starvation: the request is admitted by the output and never given work, and
-    // §4.4's watchdog is the mechanism's, not the policy's, so a policy that answers every call
+    // §4.4's watchdog is the mechanism's, not the policy's, so a policy that responds to every call
     // correctly still starves it.
     //
-    // Nothing else is resident, so nothing could have been served: the epoch ends by that name - the
-    // failure string says "no batch formed for 1 resident request(s)" and states the resident set -
-    // and the request ends with the epoch. It is not a policy failure: the program that answers every
+    // Nothing else is running, so nothing could have been served: the epoch ends by that name - the
+    // failure string says "no batch formed for 1 running request(s)" and states the running set -
+    // and the request ends with the epoch. It is not a policy failure: the program that responds to every
     // decision correctly did nothing wrong, so no report is recorded and the previous program is not
     // put back in.
     let epoch = Epoch::serving(Toy::idle());
@@ -560,7 +560,7 @@ fn a_starved_request_with_nothing_else_resident_ends_the_epoch() {
 #[test]
 fn a_starved_request_fails_alone_while_the_epoch_serves() {
     // Two requests, one of them admitted and given no work: the starved one fails by name and the
-    // epoch does not, because the other request was still queued and could have been served. One
+    // epoch does not, because the other request was still waiting and could have been served. One
     // request's thirty seconds is not evidence that every request must be lost. (That the queued
     // one is then served is the policy's decision, which this program does not make; what is
     // asserted here is that the epoch is still there to make it.)
@@ -574,8 +574,8 @@ fn a_starved_request_fails_alone_while_the_epoch_serves() {
         .submit(text_request(2, 8, 4))
         .expect("the second request is submitted");
     stepped_past(&epoch, epoch.step());
-    // `DispatchOnce` admits request 1 alone and gives it no work, so request 2 stays queued: the
-    // mechanism's starvation rule watches residents, so request 1 is the one that starves.
+    // `DispatchOnce` admits request 1 alone and gives it no work, so request 2 stays waiting: the
+    // mechanism's starvation rule watches running requests, so request 1 is the one that starves.
     epoch
         .install("fcfs", 2, starving(vec![RequestId(1)], Nanos(1_000_000)))
         .expect("the starving program is instantiated before it serves");

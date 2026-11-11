@@ -8,8 +8,8 @@
 //! [`scheduling_guest::Arrival`] and the only difference is the ordering key.
 //!
 //! Today the same policy exists as an ordering of the waiting queue and of
-//! the resident set: `scheduler/admission.rs` inserts a request after every
-//! queued request with a lower priority value or an equal one and an earlier
+//! the running set: `scheduler/admission.rs` inserts a request after every
+//! waiting request with a lower priority value or an equal one and an earlier
 //! arrival, and `Scheduler::reconfigure` re-sorts the queue the same way when
 //! the policy changes. The batch assembly order follows admission order
 //! within a phase class, so the priority decides there too.

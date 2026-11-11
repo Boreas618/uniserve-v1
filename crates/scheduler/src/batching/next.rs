@@ -1,4 +1,4 @@
-//! Planning a request's next call: the call chosen from its accepted state
+//! Preparing a request's next call: the call chosen from its accepted state
 //! and pending input ranges (context prefill with the encodes its blocks need,
 //! the phases of generation), built with the cache units
 //! its dispatch owns, and the token constraints that vary with its scheduled
@@ -14,16 +14,16 @@ impl Scheduler {
     /// group's table gained since the last dispatch and advances
     /// `num_cache_units_sent`; a caller that drops the call must roll that back.
     ///
-    /// Returns `None` when the request is not running, when planning fails
+    /// Returns `None` when the request is not running, when preparing it fails
     /// (the request is then finished with `Error`), or, after latching
     /// engine-fatal, when a forward's request holds no cache tables.
-    pub(crate) fn plan_call(
+    pub(crate) fn prepare_call(
         &mut self,
         id: RequestId,
-        build: impl FnOnce(&Self, &GenerationRequest) -> Result<Call, generation::PlanningError>,
+        build: impl FnOnce(&Self, &GenerationRequest) -> Result<Call, generation::CallError>,
     ) -> Option<Call> {
-        let planned = build(self, &self.requests.tokens(&id)?.req);
-        match planned {
+        let prepared = build(self, &self.requests.tokens(&id)?.req);
+        match prepared {
             Ok(mut call) => {
                 if matches!(
                     call.kind,
@@ -39,7 +39,7 @@ impl Scheduler {
                         .map(|allocations| allocations.prefix_cache.allocated_units())
                     else {
                         self.invariant_broken(
-                            "a request planning a forward holds its cache tables",
+                            "a request preparing a forward holds its cache tables",
                         );
                         return None;
                     };
@@ -52,7 +52,11 @@ impl Scheduler {
                 Some(call)
             }
             Err(error) => {
-                tracing::error!(request_id = id.0, ?error, "generation planning failed");
+                tracing::error!(
+                    request_id = id.0,
+                    ?error,
+                    "preparing the generation call failed"
+                );
                 self.finish(id, FinishReason::Error);
                 None
             }
@@ -65,7 +69,7 @@ impl Scheduler {
     /// `next_context_call`; otherwise the request's next phase decides.
     /// A canvas step takes one of the pass's canvas `rows`, and a context
     /// prefill the segments that fit its context rows within `budget` tokens.
-    /// Returns `None` when nothing can be planned now, including when the
+    /// Returns `None` when nothing can be prepared now, including when the
     /// cache capacity a call needs or room for one whole canvas row is
     /// unavailable.
     pub(crate) fn next_generation_call(
@@ -123,8 +127,8 @@ impl Scheduler {
                     return None;
                 }
                 let sampling_state = self.build_token_masks(id, 0);
-                self.plan_call(id, |_scheduler, request| {
-                    generation::plan_prompt(
+                self.prepare_call(id, |_scheduler, request| {
+                    generation::prepare_prompt(
                         request,
                         cursor as u32,
                         end as u32,
@@ -174,8 +178,8 @@ impl Scheduler {
                     );
                     return None;
                 }
-                let planned = self.plan_call(id, |_scheduler, request| {
-                    generation::plan_verify(
+                let prepared = self.prepare_call(id, |_scheduler, request| {
+                    generation::prepare_verify(
                         request,
                         input_token,
                         &drafts,
@@ -183,7 +187,7 @@ impl Scheduler {
                         sampling_state,
                     )
                 });
-                if planned.is_none() {
+                if prepared.is_none() {
                     tracing::warn!(
                         request = id.0,
                         drafts = drafts.len(),
@@ -191,7 +195,7 @@ impl Scheduler {
                         "a verification could not be built from the request's state"
                     );
                 }
-                planned
+                prepared
             }
             Phase::DecodeUnd => {
                 let projected_successor = self.inflight.has_pending_calls(id);
@@ -215,8 +219,8 @@ impl Scheduler {
                     return None;
                 }
 
-                self.plan_call(id, |_scheduler, request| {
-                    generation::plan_decode(request, input_token, relay_input, sampling_state)
+                self.prepare_call(id, |_scheduler, request| {
+                    generation::prepare_decode(request, input_token, relay_input, sampling_state)
                 })
             }
             // The hand-off copies the request's cache with no call.
@@ -234,7 +238,7 @@ impl Scheduler {
                 // A block's first step may likewise be queued behind the
                 // prefill that completes its context: the prompt's last
                 // chunk, or the previous block's commit, which makes the
-                // planned step the next block's step zero.
+                // prepared step the next block's step zero.
                 let st = self.requests.tokens(&id)?;
                 let canvas = self.config.canvas?;
                 let canvas_length = canvas.canvas_length as usize;
@@ -247,7 +251,7 @@ impl Scheduler {
                 {
                     return None;
                 }
-                // The steps in flight that the planned step follows are those
+                // The steps in flight that the prepared step follows are those
                 // behind the latest queued prefill: steps queued before a
                 // commit are the stopped block's no-ops.
                 let queued = self.inflight.pending_calls.get(&id);
@@ -275,13 +279,13 @@ impl Scheduler {
                 if step >= canvas.max_steps {
                     return None;
                 }
-                self.plan_call(id, |_scheduler, request| {
-                    generation::plan_canvas_step(request, &canvas, block, step)
+                self.prepare_call(id, |_scheduler, request| {
+                    generation::prepare_canvas_step(request, &canvas, block, step)
                 })
             }
             Phase::CommitCanvas => {
                 // The stopped block's tokens extend the context as one causal
-                // prefill row. The commit is planned once the host accepts
+                // prefill row. The commit is prepared once the host accepts
                 // the step that stopped the block, queued without a predicate
                 // behind the block's steps still in flight, which are no-ops
                 // (`follows_unconditionally`), so the worker launches it
@@ -298,8 +302,8 @@ impl Scheduler {
                 if !self.ensure_request_capacity(id, cache_visible_len as usize, end) {
                     return None;
                 }
-                self.plan_call(id, |_scheduler, request| {
-                    generation::plan_canvas_commit(request, &tokens)
+                self.prepare_call(id, |_scheduler, request| {
+                    generation::prepare_canvas_commit(request, &tokens)
                 })
             }
         }
@@ -322,7 +326,7 @@ impl Scheduler {
     /// not fit waits for the next chunk, which it starts, and a chunk that
     /// starts with a block may exceed the threshold within the budget. It is
     /// one forward row, which `context_rows` must leave room for.
-    /// Returns `None` when nothing can be planned now, including when the
+    /// Returns `None` when nothing can be prepared now, including when the
     /// next block does not fit this pass or the request's cache capacity is
     /// unavailable.
     pub(crate) fn next_context_call(
@@ -356,8 +360,8 @@ impl Scheduler {
             ) {
                 return None;
             }
-            return self.plan_call(id, |scheduler, request| {
-                generation::plan_image_extend(
+            return self.prepare_call(id, |scheduler, request| {
+                generation::prepare_image_extend(
                     &scheduler.generation_limits,
                     request,
                     encoder_input,
@@ -369,7 +373,7 @@ impl Scheduler {
         // Encode the next block the context needs. A product the encoder
         // cache holds is pinned for the request instead, without a call;
         // otherwise the encoding is looked up in the host encoder pools before
-        // its call is planned.
+        // its call is prepared.
         while let Some((block, step)) = self.next_context_encode(id) {
             let state = self.requests.tokens(&id)?;
             let (image, _) = state.input_block(block)?;
@@ -386,15 +390,15 @@ impl Scheduler {
             };
             let Some(cached_product) = cached else {
                 // A cache miss schedules the encoder. Nothing else of the
-                // request is planned while it is in flight, so its completion
+                // request is prepared while it is in flight, so its completion
                 // finds the same block here.
                 if !self.encoding_ready(id, encoding) {
                     return None;
                 }
                 let state = self.requests.tokens(&id)?;
                 let draw = generation::latent_draw(&state.req, block);
-                return self.plan_call(id, |scheduler, request| {
-                    generation::plan_encode(
+                return self.prepare_call(id, |scheduler, request| {
+                    generation::prepare_encode(
                         &scheduler.generation_limits,
                         request,
                         step.into(),
@@ -404,7 +408,7 @@ impl Scheduler {
                 });
             };
             let product = self.storage.encoder_cache.acquire(cache_key)?;
-            // Planning a call that reads a cached feature re-uses the entry, so
+            // Preparing a call that reads a cached feature re-uses the entry, so
             // the policy's LRU sees the use.
             self.record_encoded(cache_key);
             if product != cached_product {
@@ -509,8 +513,8 @@ impl Scheduler {
 
         let sampling_state = self.build_token_masks(id, 0);
         let samples = self.config.canvas.is_none();
-        self.plan_call(id, |_scheduler, request| {
-            generation::plan_prompt(
+        self.prepare_call(id, |_scheduler, request| {
+            generation::prepare_prompt(
                 request,
                 cursor as u32,
                 end as u32,
@@ -526,15 +530,15 @@ impl Scheduler {
     /// advance, with its encoder, or `None` when the next context call needs
     /// no encode.
     ///
-    /// Walks the blocks after the accepted block cursor, whose leading
+    /// Goes through the blocks after the accepted block cursor, whose leading
     /// products `context_features` holds: the latent block at the scheduled
     /// prompt cursor is encoded for its own extension; vision blocks are
     /// encoded in order ahead of the context prefill that writes them, while
     /// their image lies within the long-prefill threshold of the scheduled
-    /// prompt cursor. The walk stops at a latent block past that cursor,
+    /// prompt cursor. The search stops at a latent block past that cursor,
     /// which the chunk before it does not reach. A request schedules nothing
     /// while its encode is in flight, so the encode's completion identifies
-    /// its block by the same walk.
+    /// its block by the same search.
     pub(crate) fn next_context_encode(
         &self,
         id: RequestId,

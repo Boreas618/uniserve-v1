@@ -66,7 +66,7 @@ pub use crate::handle::{
     Submission, SubmitError, Wake, WeightsInFlight,
 };
 pub use crate::worker::{
-    BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ExecuteError, ExecutionBatch,
+    BlockConfig, BlockDistribution, CommandResult, CommandStatus, ExecuteError, ExecutionBatch,
     PageOffloads, RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel, WorkerError,
     WorkerFailure, WorkerGroupId, WorkerInfo,
 };
@@ -241,14 +241,14 @@ struct EncoderCachePin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Restoring {
     /// Its stored trajectory's pages are being pinned in the host latent
-    /// pools; the preparation waits for the answers.
+    /// pools; the preparation waits for the responses.
     Pinning,
     /// The pages are pinned (`Some`), or the trajectory starts from noise:
     /// the request names no stored steps, the host latent pools do not
     /// serve its denoiser, or a page is missing. The preparation takes it.
     Ready(Option<ipc::LatentRestore>),
-    /// The preparation was planned; the pins, if any, end with its result.
-    Planned,
+    /// The preparation was prepared; the pins, if any, end with its result.
+    Prepared,
 }
 
 impl Default for Restoring {
@@ -300,7 +300,7 @@ enum WorkerRegistration {
 enum Lifecycle {
     /// Admits and runs requests.
     Serving,
-    /// A park waits for the scheduler's requests to end; it answers once
+    /// A park waits for the scheduler's requests to end; it responds once
     /// they did.
     Parking(epoch::Parking),
     /// Parked: it admits and executes nothing until it resumes, and keeps
@@ -314,7 +314,7 @@ enum Lifecycle {
 pub struct Scheduler {
     worker: submission::Submissions,
     inflight: inflight::Inflight,
-    /// Resident resource ownership and reservation accounting.
+    /// Ownership and reservation accounting of what running requests hold.
     storage: allocation::requests::Storage,
     dispatch: dispatch::Dispatch,
     /// Aggregate capacity view of the loaded workers.
@@ -342,10 +342,10 @@ pub struct Scheduler {
     /// scheduler exists and before its first step.
     policy: Option<policy::PolicySlot>,
     /// The report of a policy failure the mechanism did not take from `fail`'s
-    /// answer, for the control thread.
+    /// response, for the control thread.
     policy_report: Option<policy::PolicyReverted>,
     /// §7.3 step 2's paired pass: an update asked that the following step's
-    /// batches also run in shadow for an epoch generation, and the answer waits
+    /// batches also run in shadow for an epoch generation, and the response waits
     /// for the step that shadows them.
     shadow_pass: Option<control::ShadowPass>,
     /// The candidate a precopy is preparing on a blocking thread, while it runs
@@ -365,34 +365,34 @@ pub struct Scheduler {
     /// step across two generations.
     step_generation: u64,
     /// Tells the thread that reads this scheduler's output that there is some:
-    /// its events and its answers wait for that thread, so a step that produced
+    /// its events and its responses wait for that thread, so a step that produced
     /// them says so rather than leaving them to its next periodic pass.
     progress: CommandWaker,
-    /// The stage §7.3 asked for and the answer to give once it is applied: a
+    /// The stage §7.3 asked for and the response to give once it is applied: a
     /// stage changes the serving policy, so it waits for a boundary where no
     /// batch and no submission is in flight.
     policy_stage: Option<(
         policy::Stage,
-        Option<crate::handle::StageAnswer>,
+        Option<crate::handle::StageResponse>,
         Option<u64>,
     )>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,
     /// The device pages that exist, kept from the epoch's snapshot and from the
     /// `Cached`/`Freed` announcements of each step: the table `Live` checks a
-    /// named page against, without a step walking the prefix cache.
+    /// named page against, without a step scanning the prefix cache.
     pages: std::collections::BTreeMap<scheduling::guest::PageId, scheduling::guest::PageView>,
-    /// The resident requests that hold a row of the request pool: what
+    /// The running requests that hold a row of the request pool: what
     /// `Room::slots` subtracts from the pool's rows.
     ///
     /// Maintained where a request's allocations are installed (admission) and
-    /// taken (the end of its execution), because a step must not walk the
-    /// residents to count them (design §4.4).
+    /// taken (the end of its execution), because a step must not scan the
+    /// running requests to count them (design §4.4).
     rows_held: usize,
     /// Whether `pages` was built yet. It is built on the first step that
-    /// announces a change, from `views::page_index`, which is the one walk.
+    /// announces a change, from `views::page_index`, which is the one scan.
     pages_seeded: bool,
-    /// The starvation watchdog: a resident request that does not advance
+    /// The starvation watchdog: a running request that does not advance
     /// within the policy's `timeout` is the policy's failure (§4.4).
     watchdog: mechanism::Watchdog,
     /// The moment of the last step's starvation check: a request past its
@@ -589,7 +589,7 @@ const OUTPUT_JOURNAL_CAPACITY: usize = EVENT_BUFFER_CAPACITY;
 /// free for the request's terminal events.
 const OUTPUT_TERMINAL_RESERVE: usize = 2;
 
-/// Cache extent of one planned generation call, in tokens.
+/// Cache extent of one prepared generation call, in tokens.
 #[derive(Debug, Clone, Copy)]
 struct CacheLengths {
     /// Tokens the call's cache-writing forward row appends: the prompt slice

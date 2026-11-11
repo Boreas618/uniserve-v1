@@ -45,7 +45,7 @@ pub fn pool(group: &str) -> Inventory {
         layout: PoolLayout {
             queue_depth: 1,
             ranks: 1,
-            components: std::collections::BTreeMap::from([(
+            stages: std::collections::BTreeMap::from([(
                 proto::config::DEFAULT_BLOCK.to_owned(),
                 BlockConfig {
                     ranks: vec![0],

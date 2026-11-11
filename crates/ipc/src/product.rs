@@ -1,4 +1,4 @@
-//! Product names, as a main process's components declare their outputs and a request's graph
+//! Product names, as a main process's stages declare their outputs and a request's graph
 //! asks for them.
 
 /// The media reader's RGB24 pixels of every visual condition, `[pixels,

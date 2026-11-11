@@ -1,18 +1,18 @@
 //! The one test double at the worker's batch interface.
 //!
 //! [`FakeBatches`] implements [`Batches`], the door a serving scheduler executes through, and
-//! answers every batch from what the mechanism wrote into it: the calls it names, the rows each
+//! responds to every batch from what the mechanism wrote into it: the calls it names, the rows each
 //! call owns ([`ipc::execution::BatchRow::rows`]), the keys those rows see (`seq_lens`) and the
 //! Philox address of each sampling row (`draws`). It reads nothing private to the scheduler, so a
 //! case written against it observes the mechanism through the same completion path a device
-//! worker's answer takes.
+//! worker's response takes.
 //!
 //! What a case can vary, and nothing else:
 //!
 //! - the pools the fake states ([`FakeBatches::new`]) and how many devices run them
 //!   ([`FakeBatches::with_devices`]);
 //! - the token each call samples ([`Tokens`]) and the extent it leaves ([`Extent`]), or a whole
-//!   answer of its own ([`FakeBatches::answering`]);
+//!   response of its own ([`FakeBatches::with_output`]);
 //! - the media computations it serves ([`FakeBatches::with_media`]);
 //! - the step limit of the blocks a diffusion language model denoises
 //!   ([`FakeBatches::with_block_steps`]), which a block stops within ([`block_stop_step`]);
@@ -98,8 +98,8 @@ pub enum Extent {
     OnePast,
 }
 
-/// A case's own answer to a batch, in place of the [`Tokens`] and [`Extent`] rules.
-pub type Answer = Arc<dyn Fn(&Batch) -> Outcome<BatchOutput> + Send + Sync>;
+/// A case's own response to a batch, in place of the [`Tokens`] and [`Extent`] rules.
+pub type OutputFn = Arc<dyn Fn(&Batch) -> Outcome<BatchOutput> + Send + Sync>;
 
 /// The media capability a fake states: the bucket it serves a computation in, or `None`.
 pub type Media = Arc<dyn Fn(&Computation) -> Option<MediaExtent> + Send + Sync>;
@@ -129,11 +129,11 @@ pub struct FakeBatches {
     devices: usize,
     tokens: Tokens,
     extent: Extent,
-    answer: Option<Answer>,
+    output: Option<OutputFn>,
     media: Option<Media>,
-    /// The answers to media batches ([`FakeBatches::answering_media`]); token batches keep the
+    /// The outputs of media batches ([`FakeBatches::with_media_outputs`]); token batches keep the
     /// token and extent rules.
-    media_answers: Option<Arc<crate::Media>>,
+    media_outputs: Option<Arc<crate::Media>>,
     end: Option<EndOfText>,
     /// How many tokens each request's text holds before it ends ([`FakeBatches::with_text_len`]).
     text_len: Option<u64>,
@@ -175,9 +175,9 @@ impl FakeBatches {
             devices: 1,
             tokens: Tokens::default(),
             extent: Extent::default(),
-            answer: None,
+            output: None,
             media: None,
-            media_answers: None,
+            media_outputs: None,
             end: None,
             text_len: None,
             block_steps: None,
@@ -244,10 +244,10 @@ impl FakeBatches {
         self
     }
 
-    /// Answers every batch with `answer` instead of the token and extent rules.
+    /// Completes every batch with `output` instead of the token and extent rules.
     #[must_use]
-    pub fn answering(mut self, answer: Answer) -> Self {
-        self.answer = Some(answer);
+    pub fn with_output(mut self, output: OutputFn) -> Self {
+        self.output = Some(output);
         self
     }
 
@@ -259,17 +259,17 @@ impl FakeBatches {
     }
 
     /// Serves every media computation in the extent the mechanism stated ([`crate::Media::serves`])
-    /// and answers each media batch with `media`, as a rank whose media runners serve them;
+    /// and responds to each media batch with `media`, as a rank whose media runners serve them;
     /// token batches keep the token and extent rules, the end of text included.
     #[must_use]
-    pub fn answering_media(mut self, media: Arc<crate::Media>) -> Self {
+    pub fn with_media_outputs(mut self, media: Arc<crate::Media>) -> Self {
         self.media = Some(Arc::new(crate::Media::serves));
-        self.media_answers = Some(media);
+        self.media_outputs = Some(media);
         self
     }
 
     /// Performs the storage operations the mechanism asks for with `operate`, as the ranks of a
-    /// worker with storage of its own answer them; without one, every operation answers nothing.
+    /// worker with storage of its own performs them; without one, every operation returns nothing.
     pub fn with_operate(mut self, operate: Operate) -> Self {
         self.operate = Some(operate);
         self
@@ -318,7 +318,7 @@ impl FakeBatches {
         lock(&self.held).len()
     }
 
-    /// Completes up to `count` held batches, oldest first, with their answers; answers how many it
+    /// Completes up to `count` held batches, oldest first, with their outputs; returns how many it
     /// completed.
     pub fn release(&self, count: usize) -> usize {
         let released: Vec<Held> = {
@@ -334,7 +334,7 @@ impl FakeBatches {
     }
 
     /// Fails every held batch with `message`: the device that ran them was lost after it accepted
-    /// them. Answers how many it failed.
+    /// them. Returns how many it failed.
     pub fn fail_held(&self, message: &str) -> usize {
         let failed: Vec<Held> = lock(&self.held).drain(..).collect();
         let count = failed.len();
@@ -345,14 +345,14 @@ impl FakeBatches {
         count
     }
 
-    /// The outcome a batch completes with: the case's own answer, or each call completed by the
+    /// The outcome a batch completes with: the case's own response, or each call completed by the
     /// token and extent rules.
-    fn answer(&self, batch: &Batch) -> Outcome<BatchOutput> {
-        if let Some(answer) = &self.answer {
-            return answer(batch);
+    fn output(&self, batch: &Batch) -> Outcome<BatchOutput> {
+        if let Some(output) = &self.output {
+            return output(batch);
         }
-        if let (Some(media), Some(_)) = (&self.media_answers, &batch.media) {
-            return media.answer(batch);
+        if let (Some(media), Some(_)) = (&self.media_outputs, &batch.media) {
+            return media.output(batch);
         }
 
         if batch.shape.variant == Variant::TokenDenoise {
@@ -447,14 +447,14 @@ impl FakeBatches {
         }
     }
 
-    /// Accepts `batch` and answers its submission: completed now, or held.
+    /// Accepts `batch` and responds to its submission: completed now, or held.
     fn serve(&self, batch: &Batch) -> Result<Submission, Box<Fault>> {
         if let Some(message) = lock(&self.refusal).clone() {
             return Err(message.into());
         }
 
         let id = SubmissionId(self.next.fetch_add(1, Ordering::Relaxed));
-        let outcome = self.answer(batch);
+        let outcome = self.output(batch);
         if !*lock(&self.holding) {
             return Ok(Submission::completed(id, outcome));
         }
@@ -470,7 +470,7 @@ impl FakeBatches {
 }
 
 /// `batch` completed as the fake completes it by `tokens` and `extent`: each call samples one
-/// token and leaves the extent its last row states. A case's own [`Answer`] starts from this to
+/// token and leaves the extent its last row states. A case's own [`OutputFn`] starts from this to
 /// change some calls and keep the rest.
 pub fn completed(batch: &Batch, tokens: Tokens, extent: Extent) -> BatchOutput {
     completed_until(batch, tokens, extent, None)

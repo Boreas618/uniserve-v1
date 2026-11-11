@@ -59,8 +59,8 @@ pub struct RequestDispatch {
     /// rank of the worker that backs them. Request retirement retains every
     /// physical reader and writer allocation.
     pub buffers: Vec<RankBuffer>,
-    /// For a video request's call, the worker routed to each component that
-    /// reads its products, keyed by component name, as the request's graph
+    /// For a video request's call, the worker routed to each stage that
+    /// reads its products, keyed by stage name, as the request's graph
     /// connects its calls; empty for a call whose products leave the graph.
     /// Admission fixes a video request's route, so a product is published
     /// only toward the replicas that read it. `None` for calls outside a
@@ -196,7 +196,7 @@ impl ExecutionBatch {
     /// (`Batch::frees`): a product's storage is the rank's, and the rank
     /// releases it before it serves the batch. A batch of commands alone
     /// carries its frees to `frees_group`, the group that encodes images,
-    /// which releases them and answers no call. A batch that completes
+    /// which releases them and responds to no call. A batch that completes
     /// reports no command as failed, which the scheduler reads as its
     /// commands having been applied.
     pub(crate) fn device_batch(
@@ -376,7 +376,7 @@ impl ExecutionBatch {
             // `WorkerGroupId`'s public field admits any string; only its
             // constructor checks the identifier syntax.
             WorkerGroupId::new(dispatch.worker.0.clone())?;
-            anyhow::ensure!(!call.component.is_empty(), "call requires a component");
+            anyhow::ensure!(!call.stage.is_empty(), "call requires a stage");
             anyhow::ensure!(
                 identities.insert(call.call_id),
                 "logical batch repeats a call identity"

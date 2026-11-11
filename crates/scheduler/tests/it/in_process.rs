@@ -2,7 +2,7 @@
 //! builds the handle the launched path builds, over a pool this process did not
 //! launch, and refuses what it cannot serve.
 //!
-//! The pool here answers no batch: these tests state the constructor's contract —
+//! The pool here responds to no batch: these tests state the constructor's interface —
 //! the capabilities come from what the worker reports, the command surface is
 //! the launched path's, and a pool whose facts are absent is refused rather than
 //! guessed.
@@ -15,20 +15,20 @@ use proto::config::EngineArgs;
 use scheduler::{SchedulerConfig, SchedulerHandle};
 use testkit::FakeBatches;
 
-/// How long a command answer may take.
+/// How long a command response may take.
 ///
 /// Generous because the first one is the whole installation of a policy: the
 /// tree's `fcfs` module is built for `wasm32-unknown-unknown` on first use and
 /// then loaded and instantiated, on a machine that runs this suite's tests in
 /// parallel. The bound is the harness's, not the mechanism's; a mechanism that
-/// stopped answering would still fail here, only later.
-const ANSWER: Duration = Duration::from_secs(60);
+/// stopped responding would still fail here, only later.
+const RESPONSE: Duration = Duration::from_secs(60);
 
-/// Blocks until a command answers, and answers its result.
-fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
-    match receiver.recv_timeout(ANSWER) {
+/// Blocks until a command responses, and responds to its result.
+fn response<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
+    match receiver.recv_timeout(RESPONSE) {
         Ok(result) => result,
-        Err(error) => panic!("the scheduler did not answer: {error}"),
+        Err(error) => panic!("the scheduler did not response: {error}"),
     }
 }
 
@@ -59,16 +59,16 @@ fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
     }
     .expect("the pool serves");
 
-    // The command surface is the launched path's: the handle answers its own
+    // The command surface is the launched path's: the handle responds to its own
     // commands over the same channel.
     let progress = handle
         .progress()
-        .recv_timeout(ANSWER)
-        .expect("the scheduler answers with its progress");
+        .recv_timeout(RESPONSE)
+        .expect("the scheduler responds with its progress");
     assert_eq!(progress.step, 0, "no step ran: no policy serves yet");
     // Nothing serves yet: a switchover has no prepared policy to put in, and
     // the refusal says so rather than applying nothing silently.
-    let refused = answer(handle.stage(scheduler::Stage::Switchover))
+    let refused = response(handle.stage(scheduler::Stage::Switchover))
         .expect_err("no policy is prepared before the epoch's first precopy");
     assert!(refused.contains("without a policy prepared"), "{refused}");
 

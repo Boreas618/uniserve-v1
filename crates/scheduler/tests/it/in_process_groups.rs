@@ -12,7 +12,7 @@ use testkit::FakeBatches;
 use crate::support;
 
 /// How long a request may take to reach its terminal event.
-const ANSWER: Duration = Duration::from_secs(30);
+const RESPONSE: Duration = Duration::from_secs(30);
 
 /// A text request whose prompt is `length` tokens starting at `first`.
 fn request(id: u64, length: u32, first: u32) -> GenerationRequest {
@@ -56,7 +56,7 @@ fn losing_every_worker_stops_request_admission() {
     let mut first = engine
         .submit(request(1, 4, 100))
         .expect("the engine takes the submission");
-    let deadline = Instant::now() + ANSWER;
+    let deadline = Instant::now() + RESPONSE;
     let mut served = false;
     while Instant::now() < deadline && !served {
         match first.try_recv() {
@@ -72,12 +72,12 @@ fn losing_every_worker_stops_request_admission() {
     let _second = engine
         .submit(request(3, 4, 300))
         .expect("the engine takes the submission");
-    let deadline = Instant::now() + ANSWER;
+    let deadline = Instant::now() + RESPONSE;
     while batches.held() == 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(1));
     }
     batches.fail_held("every rank of the group was lost");
-    let deadline = Instant::now() + ANSWER;
+    let deadline = Instant::now() + RESPONSE;
     while !engine.is_dead() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }

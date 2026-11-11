@@ -9,7 +9,7 @@
 //! switchover, because its requests are batches like a client's: the scheduler
 //! schedules them into the device's captured buckets, and the switchover only
 //! queues those captures, which run behind it for as long as a model's bucket
-//! catalogue takes. A batch planned before its bucket is captured finds no graph
+//! buckets take. A batch prepared before its bucket is captured finds no graph
 //! to replay, which fails the worker. Admission opens once every capture has
 //! run, and a scheduler that admits has a policy (one with none forms no batch),
 //! so the owner of admission starts the warm-up then

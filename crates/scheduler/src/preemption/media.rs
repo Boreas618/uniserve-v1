@@ -122,18 +122,18 @@ impl Scheduler {
     }
 
     /// The worker group that holds `request_key`'s trajectory: the replica
-    /// its denoising calls are placed on, as the component that serves them
+    /// its denoising calls are placed on, as the stage that serves them
     /// binds there.
     fn denoiser_worker(&self, request_key: RequestKey) -> Option<WorkerGroupId> {
         let kind = CallKind::Media(MediaCall::Denoising);
-        let component = self
+        let stage = self
             .info
-            .media_components
+            .media_stages
             .get(&MediaCall::Denoising)
             .map_or(DEFAULT_BLOCK, String::as_str);
         let (_, bound, _) = self
             .dispatch
-            .component_candidates(&self.worker, kind, component)
+            .stage_candidates(&self.worker, kind, stage)
             .next()?;
         self.dispatch
             .affinity
@@ -146,7 +146,7 @@ impl Scheduler {
     /// storing: past its first step and not past its last, of a request the
     /// daemon gave a trajectory identity, preempted by a drain while its
     /// workers hold it. `offloading` states whether the host latent pools
-    /// are storing it already, whose answer then decides how it leaves.
+    /// are storing it already, whose response then decides how it leaves.
     fn store_preempted(
         &mut self,
         id: RequestId,
@@ -196,7 +196,7 @@ impl Scheduler {
 
     /// Ends preempted video request `id`, whose calls completed: its
     /// trajectory is stored when it reached a step worth storing, and it
-    /// leaves once the store answered. Returns whether it left.
+    /// leaves once the store responded. Returns whether it left.
     pub(crate) fn retire_preempted(&mut self, id: RequestId, cause: MigrationCause) -> bool {
         let Some(state) = self.media_state(id) else {
             return true;
@@ -235,7 +235,7 @@ impl Scheduler {
         }
     }
 
-    /// Takes the host latent pools' answers: a resumed request's restore
+    /// Takes the host latent pools' responses: a resumed request's restore
     /// resolves, and the copies of a preempted request's trajectory leave
     /// in a batch of latent offloads alone to its denoiser's worker group.
     /// Returns whether anything moved on.

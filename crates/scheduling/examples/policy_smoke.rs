@@ -103,10 +103,10 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
         limits.timeout.0
     );
 
-    // An arrival each, then a resident request's view changing: a policy that
+    // An arrival each, then a running request's view changing: a policy that
     // sizes a chunk from the prefilled prefix, as `fcfs` does, reads it from
-    // `Updated` (§4.4: a resident request's changing view reaches the policy
-    // as a state change, not as a per-step dump of every resident).
+    // `Updated` (§4.4: a running request's changing view reaches the policy
+    // as a state change, not as a per-step dump of every running request).
     let events = [
         Event::Arrived {
             request: request(1)?,
@@ -155,7 +155,7 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
         room.step = u64::from(step);
         let output = policy.dispatch(&room)?;
         if step == 1 {
-            print_plan(&output);
+            print_output(&output);
         }
         // Step 1's `observe` ran above, outside the loop; later steps observe
         // the one event a quiet step carries.
@@ -191,7 +191,7 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
     let call: CallView = decode(br#"{"request":1,"phase":1,"kind":{"kind":"prefill"}}"#)?;
     let replicas: Vec<ReplicaView> = decode(
         br#"[{"index":0,"block":0,"kinds":[{"kind":"prefill"},{"kind":"decode"}],
-              "resident_requests":1,"capacity":7}]"#,
+              "running_requests":1,"capacity":7}]"#,
     )?;
     let before = Meter::of(&policy);
     let replica = policy.place(&call, &replicas)?;
@@ -207,11 +207,11 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
             .filter(|(_, calls)| *calls > 0)
             .collect::<Vec<_>>()
     );
-    println!("ok: every call answered");
+    println!("ok: every call responded");
     Ok(())
 }
 
-/// A small state at instantiation: two queued token requests, one prefill
+/// A small state at instantiation: two waiting token requests, one prefill
 /// phase, two ranks.
 ///
 /// Written as the encoding rather than as a struct literal, so a view that
@@ -232,19 +232,19 @@ fn snapshot() -> Result<Snapshot, Box<dyn Error>> {
     )
 }
 
-/// One resident token request whose prompt is `prompt` tokens long and whose
+/// One running token request whose prompt is `prompt` tokens long and whose
 /// prefix cache holds `prefilled` of them.
 fn updated(id: u64, prompt: u32, prefilled: u32) -> Result<RequestView, Box<dyn Error>> {
     decode(
         format!(
-            r#"{{"id":{id},"state":{{"state":"resident"}},"class":{{"class":"token"}},
+            r#"{{"id":{id},"state":{{"state":"running"}},"class":{{"class":"token"}},
                  "phase":1,"prompt_tokens":{prompt},"cached_prefix_tokens":{prefilled}}}"#
         )
         .as_bytes(),
     )
 }
 
-/// One queued token request.
+/// One waiting token request.
 fn request(id: u64) -> Result<RequestView, Box<dyn Error>> {
     decode(
         format!(
@@ -278,7 +278,7 @@ impl Meter {
         }
     }
 
-    /// Prints what the module did since `self`, and answers the fuel it burned.
+    /// Prints what the module did since `self`, and responds to the fuel it burned.
     fn report(&self, policy: &PolicyInstance, call: &str) -> u64 {
         let fuel = policy.fuel_consumed().saturating_sub(self.fuel);
         let calls: u64 = policy
@@ -292,7 +292,7 @@ impl Meter {
 }
 
 /// Prints what a step's output asks for.
-fn print_plan(output: &DispatchOutput) {
+fn print_output(output: &DispatchOutput) {
     println!(
         "dispatch: admit {} reject {} work {} offload {} prefetch {} refill {}",
         output.admit.len(),

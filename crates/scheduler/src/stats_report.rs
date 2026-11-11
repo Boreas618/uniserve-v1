@@ -258,9 +258,9 @@ fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let component_us = stats
+    let module_us = stats
         .worker
-        .forward_component_us
+        .forward_module_us
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
@@ -304,7 +304,7 @@ fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
         mode_counts,
         mode_tokens,
         mode_us,
-        component_us,
+        component_us: module_us,
         stream_us,
         blocking_calls,
         fence_us,
@@ -546,7 +546,7 @@ mod tests {
             .store(120, Ordering::Relaxed);
         stats
             .worker
-            .forward_component_us
+            .forward_module_us
             .lock()
             .unwrap()
             .insert("text_model_forward".into(), 42);

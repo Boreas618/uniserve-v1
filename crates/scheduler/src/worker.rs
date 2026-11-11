@@ -36,7 +36,7 @@ pub struct WorkerInfo {
     /// stated.
     pub max_model_len: u32,
     /// For each pool, how it is placed. A pool absent from the map is placed
-    /// with no components and a queue depth of one.
+    /// with no stages and a queue depth of one.
     ///
     /// `from_inventory` and `SimWorker` fill this; `from_workers` leaves it
     /// empty.
@@ -51,8 +51,8 @@ pub struct WorkerInfo {
     pub video_codecs: BTreeMap<WorkerGroupId, BTreeSet<WorkerGroupId>>,
     /// For each pool, the persistent buffer bytes each of its ranks backs,
     /// in rank order, as the ranks reported them. Each rank has its own
-    /// buffer pool, sized to the products of the components it executes and
-    /// of the components that read them, so the engine places a pool's
+    /// buffer pool, sized to the products of the stages it executes and
+    /// of the stages that read them, so the engine places a pool's
     /// media buffers rank by rank.
     ///
     /// `from_inventory` fills this from its ranks; a pool absent from it, as
@@ -92,25 +92,25 @@ impl WorkerInfo {
     ///
     /// Each rank validated the report it built, so the records are taken as
     /// they are. Fails when `pools` is empty, repeats a pool id, or holds
-    /// replicas of one component that expose different numerical outputs.
+    /// replicas of one stage that expose different numerical outputs.
     pub fn from_workers(pools: Vec<(WorkerGroupId, MainProcessInfo)>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !pools.is_empty(),
             "worker info must contain at least one pool"
         );
         let mut ids = std::collections::HashSet::new();
-        let mut components: BTreeMap<&str, &ipc::ComponentInfo> = BTreeMap::new();
+        let mut stages: BTreeMap<&str, &ipc::StageInfo> = BTreeMap::new();
         for (id, info) in &pools {
             anyhow::ensure!(ids.insert(id), "worker info repeats pool id {id}");
-            for component in &info.components {
-                if let Some(other) = components.get(component.name.as_str()) {
+            for stage in &info.stages {
+                if let Some(other) = stages.get(stage.name.as_str()) {
                     anyhow::ensure!(
-                        other.outputs == component.outputs,
-                        "replicas of component {} expose different numerical outputs",
-                        component.name
+                        other.outputs == stage.outputs,
+                        "replicas of stage {} expose different numerical outputs",
+                        stage.name
                     );
                 } else {
-                    components.insert(&component.name, component);
+                    stages.insert(&stage.name, stage);
                 }
             }
         }
@@ -120,10 +120,10 @@ impl WorkerInfo {
         })
     }
 
-    /// Returns the configuration the engine placed component `name` with on
-    /// `worker`, or `None` when the pool holds no such component.
-    pub fn component_config(&self, worker: &WorkerGroupId, name: &str) -> Option<&BlockConfig> {
-        self.layouts.get(worker)?.components.get(name)
+    /// Returns the configuration the engine placed stage `name` with on
+    /// `worker`, or `None` when the pool holds no such stage.
+    pub fn stage_config(&self, worker: &WorkerGroupId, name: &str) -> Option<&BlockConfig> {
+        self.layouts.get(worker)?.stages.get(name)
     }
 
     /// The persistent buffer bytes each rank of `worker` backs, in rank
@@ -148,27 +148,27 @@ impl WorkerInfo {
         self.rank_buffer_bytes(worker).len().max(1)
     }
 
-    /// Resolves which component serves each media call across every worker.
+    /// Resolves which stage serves each media call across every worker.
     ///
     /// The video graph may span workers: a model worker serves decoding and a
     /// host worker serves encoding and muxing. Each call is served by one
-    /// component, which several workers may replicate, and a deployment that
+    /// stage, which several workers may replicate, and a deployment that
     /// muxes serves the whole video graph between its workers.
     pub fn media_routing(&self) -> anyhow::Result<BTreeMap<MediaCall, String>> {
         // The first worker seen serving a call is kept only to name it if
-        // another worker routes that call to a different component.
+        // another worker routes that call to a different stage.
         let mut routing: BTreeMap<MediaCall, (String, &WorkerGroupId)> = BTreeMap::new();
         for (id, info) in &self.workers {
-            for (call, component) in &info.media_components {
+            for (call, stage) in &info.media_stages {
                 if let Some((other, owner)) = routing.get(call) {
                     anyhow::ensure!(
-                        other == component,
-                        "media call {call:?} is served by component {other} of worker {owner} \
-                         and by component {component} of worker {id}"
+                        other == stage,
+                        "media call {call:?} is served by stage {other} of worker {owner} \
+                         and by stage {stage} of worker {id}"
                     );
                     continue;
                 }
-                routing.insert(*call, (component.clone(), id));
+                routing.insert(*call, (stage.clone(), id));
             }
         }
         if routing.contains_key(&MediaCall::Muxing) {
@@ -179,19 +179,19 @@ impl WorkerInfo {
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 missing.is_empty(),
-                "a deployment that muxes video serves no component for {}",
+                "a deployment that muxes video serves no stage for {}",
                 missing.join(", ")
             );
         }
         Ok(routing
             .into_iter()
-            .map(|(call, (component, _))| (call, component))
+            .map(|(call, (stage, _))| (call, stage))
             .collect())
     }
 
     /// Returns the media units one call of `call` covers at once: the ranks
-    /// of a distributed serving component times its `units_per_rank`, or one
-    /// for any other component, on the narrowest worker serving the call.
+    /// of a distributed serving stage times its `units_per_rank`, or one
+    /// for any other stage, on the narrowest worker serving the call.
     ///
     /// A latent encoding round is dealt to the latent encoder's ranks that a
     /// request's prompt does not take (`Scheduler::latent_round`), so while
@@ -206,17 +206,17 @@ impl WorkerInfo {
         self.workers
             .iter()
             .filter_map(|(worker, info)| {
-                let component = info.media_components.get(&call)?;
-                let config = self.component_config(worker, component)?;
+                let stage = info.media_stages.get(&call)?;
+                let config = self.stage_config(worker, stage)?;
                 if config.distribution.is_none() {
                     return Some(1);
                 }
 
                 let prompt = info
-                    .media_components
+                    .media_stages
                     .get(&MediaCall::TextEncoding)
                     .filter(|_| call == MediaCall::LatentEncoding)
-                    .and_then(|name| self.component_config(worker, name));
+                    .and_then(|name| self.stage_config(worker, name));
                 let unshared = config
                     .ranks
                     .iter()
@@ -245,7 +245,7 @@ impl WorkerInfo {
     /// The exceptions are the prefix cache, whose layout the cache pools must share
     /// and whose block count is their smallest and per-token footprint their
     /// largest; request slots of a deployment that muxes video,
-    /// the narrowest per-component sum of replica slots; and the video
+    /// the narrowest per-stage sum of replica slots; and the video
     /// denoiser and latent page geometry, taken from the first denoising
     /// pool and absent or zero without one.
     ///
@@ -294,7 +294,7 @@ impl WorkerInfo {
         // Fields not merged below keep the seed pool's values.
         let seed_index = cache_indices.first().copied().unwrap_or(0);
         let mut merged = self.workers[seed_index].1.clone();
-        merged.media_components = self.media_routing()?;
+        merged.media_stages = self.media_routing()?;
         let denoising = routed(CallKind::Media(MediaCall::Denoising));
         // The denoising worker owns the denoiser: its description is the
         // deployment's.
@@ -302,7 +302,7 @@ impl WorkerInfo {
         // A deployment that assembles video denoises over the fixed schedule
         // the denoising worker describes.
         anyhow::ensure!(
-            !merged.media_components.contains_key(&MediaCall::Muxing)
+            !merged.media_stages.contains_key(&MediaCall::Muxing)
                 || merged.video_denoiser.is_some(),
             "a deployment that muxes video reports no video denoiser"
         );
@@ -353,27 +353,24 @@ impl WorkerInfo {
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
-        merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
+        merged.request_slots = if merged.media_stages.contains_key(&MediaCall::Muxing) {
             // A replicated media route owns an independent request-row bank in
             // every group. End-to-end concurrency is the narrowest sum
-            // of replica capacities among the graph's components. Each
-            // component is keyed to the first call it serves; its replicas are
-            // the pools that support that call and bind the component.
-            let mut components = BTreeMap::new();
-            for (call, component) in &merged.media_components {
-                components.entry(component.as_str()).or_insert(*call);
+            // of replica capacities among the graph's stages. Each
+            // stage is keyed to the first call it serves; its replicas are
+            // the pools that support that call and bind the stage.
+            let mut stages = BTreeMap::new();
+            for (call, stage) in &merged.media_stages {
+                stages.entry(stage.as_str()).or_insert(*call);
             }
-            components
+            stages
                 .into_iter()
-                .map(|(component, call)| {
+                .map(|(stage, call)| {
                     self.workers
                         .iter()
                         .filter(|(_, info)| {
                             info.supported_calls.contains(&CallKind::Media(call))
-                                && info
-                                    .components
-                                    .iter()
-                                    .any(|binding| binding.name == component)
+                                && info.stages.iter().any(|binding| binding.name == stage)
                         })
                         .map(|(_, info)| info.request_slots)
                         .try_fold(0u32, |total, slots| total.checked_add(slots))
@@ -460,10 +457,10 @@ impl WorkerInfo {
     }
 }
 
-/// Checks that the deployment places a component for every call its video
+/// Checks that the deployment places a stage for every call its video
 /// denoiser's requests make.
 ///
-/// A conditioned request reads its media on a host component and encodes its
+/// A conditioned request reads its media on a host stage and encodes its
 /// conditions before denoising, so a deployment whose denoiser takes
 /// conditions must place the media reader and both condition encoders as
 /// well as the generation calls.
@@ -473,12 +470,12 @@ fn check_video_tasks(info: &MainProcessInfo) -> anyhow::Result<()> {
     };
     let missing = crate::graph::video_calls(denoiser.takes_conditions)
         .into_iter()
-        .filter(|call| !info.media_components.contains_key(call))
+        .filter(|call| !info.media_stages.contains_key(call))
         .map(|call| format!("{call:?}"))
         .collect::<Vec<_>>();
     anyhow::ensure!(
         missing.is_empty(),
-        "the deployment's denoiser {} but places no component for {}",
+        "the deployment's denoiser {} but places no stage for {}",
         if denoiser.takes_conditions {
             "takes conditions"
         } else {
@@ -491,7 +488,7 @@ fn check_video_tasks(info: &MainProcessInfo) -> anyhow::Result<()> {
 
 /// Distinguishes applied control from physical retirement and unacknowledged failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandOutcome {
+pub enum CommandStatus {
     /// Every target pool acknowledged the command.
     Applied,
     /// The targeted request was tainted by a worker failure, so the command
@@ -503,7 +500,7 @@ pub enum CommandOutcome {
     Failed,
 }
 
-/// Terminal outcome of one logical lifecycle command.
+/// Terminal status of one logical lifecycle command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
     /// Position among lifecycle commands, excluding request admissions.
@@ -511,7 +508,7 @@ pub struct CommandResult {
     /// Request targeted by the command.
     pub request_key: RequestKey,
     /// A failed command retains physical ownership until a subsequent release succeeds.
-    pub outcome: CommandOutcome,
+    pub status: CommandStatus,
 }
 
 /// Dynamic error returned while polling or administering a worker.
@@ -531,7 +528,7 @@ pub type WorkerError = anyhow::Error;
 #[error("worker execute error: {message}")]
 pub struct ExecuteError {
     /// Batch whose response carried this error. Composite workers use it to
-    /// join the same terminal outcome across ranks before returning the
+    /// join the same terminal status across ranks before returning the
     /// failure to the scheduler.
     pub batch_id: Option<u64>,
     /// Whether the error invalidates the worker.
@@ -583,9 +580,9 @@ mod tests {
     fn media_info(routes: &[(MediaCall, &str)]) -> MainProcessInfo {
         let denoises = routes.iter().any(|(call, _)| *call == MediaCall::Denoising);
         MainProcessInfo {
-            media_components: routes
+            media_stages: routes
                 .iter()
-                .map(|(call, component)| (*call, (*component).to_owned()))
+                .map(|(call, stage)| (*call, (*stage).to_owned()))
                 .collect(),
             supported_calls: routes
                 .iter()
@@ -607,12 +604,12 @@ mod tests {
     ) -> (WorkerGroupId, MainProcessInfo) {
         let mut info = media_info(routes);
         info.request_slots = request_slots;
-        info.components = routes
+        info.stages = routes
             .iter()
-            .map(|(_, component)| *component)
+            .map(|(_, stage)| *stage)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .map(|name| ipc::ComponentInfo {
+            .map(|name| ipc::StageInfo {
                 name: name.to_owned(),
                 outputs: Vec::new(),
             })
@@ -639,7 +636,7 @@ mod tests {
 
     #[test]
     fn replicated_media_routes_add_independent_request_capacity() -> anyhow::Result<()> {
-        // Each pool serves the whole video graph, so every component's
+        // Each pool serves the whole video graph, so every stage's
         // replica capacity is the sum over both pools.
         let info = WorkerInfo::from_workers(vec![
             media_replica("replica-0", 2),
@@ -708,7 +705,7 @@ mod tests {
         assert_eq!(routing[&MediaCall::VideoDecoding], "video_decoder");
     }
 
-    /// A distributed component's round covers its ranks times its units per
+    /// A distributed stage's round covers its ranks times its units per
     /// rank, an undistributed one's a single unit, and the narrowest replica
     /// binds; a call no worker serves has no round units. A latent encoding
     /// round leaves out the ranks its worker's text encoder takes.
@@ -720,13 +717,13 @@ mod tests {
             units_per_rank,
             ..parallel(ranks)
         };
-        // A pool placing each named component as configured.
+        // A pool placing each named stage as configured.
         let pool = |id: &str, routes: &[(MediaCall, &str)], configs: Vec<(&str, BlockConfig)>| {
             let (id, info) = media_pool(id, routes, 0);
             let layout = PoolLayout {
                 queue_depth: 1,
                 ranks: 8,
-                components: configs
+                stages: configs
                     .into_iter()
                     .map(|(name, config)| (name.to_owned(), config))
                     .collect(),
@@ -806,7 +803,7 @@ mod tests {
     /// media reader and both condition encoders; one serving `t2va` alone
     /// needs only the generation calls.
     #[test]
-    fn a_denoiser_that_takes_conditions_requires_its_condition_components() {
+    fn a_denoiser_that_takes_conditions_requires_its_condition_stages() {
         let generation = [
             (MediaCall::TextEncoding, "text_encoder"),
             (MediaCall::LatentPreparation, "denoiser"),

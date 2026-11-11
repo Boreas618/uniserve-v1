@@ -8,8 +8,8 @@
 //! 1. the scheduler node's main process receives `Precopy` and fans it out to
 //!    every main process of the epoch over the existing ipc channel (§2.3), so
 //!    that all ranks install the same generation;
-//! 2. every main process answers `Precopied` or `PrecopyFailed` (step 2);
-//! 3. after all have answered, the daemon sends `Switchover` to each DP rank's
+//! 2. every main process returns `Precopied` or `PrecopyFailed` (step 2);
+//! 3. after all have responded, the daemon sends `Switchover` to each DP rank's
 //!    scheduler, which puts it in its batch sequence at a batch boundary and
 //!    tells its ranks (step 3);
 //! 4. during probation, `Commit` or `Revert` ends the update (step 5), and a
@@ -95,7 +95,7 @@ impl ProgramCommand {
         }
     }
 
-    /// The stage's name, for tracing and for the status the command answers with.
+    /// The stage's name, for tracing and for the status the command responds with.
     pub const fn stage(&self) -> &'static str {
         match self {
             Self::Precopy { .. } => "precopy",

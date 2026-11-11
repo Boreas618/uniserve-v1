@@ -109,8 +109,8 @@ fn a_migrated_request_continues_its_budget_and_charges_its_whole_usage() {
 }
 
 /// Parking ends a running token request after the tokens it generated, and
-/// a queued one at once, each with a migratable end in place of a finish,
-/// and answers with the scheduler's prefix cache index once nothing runs.
+/// a waiting one at once, each with a migratable end in place of a finish,
+/// and responds with the scheduler's prefix cache index once nothing runs.
 #[test]
 fn parking_ends_running_and_queued_requests_as_migratable() {
     let (handle, thread) = start(1);
@@ -259,7 +259,7 @@ enum Fault {
     Refused,
 }
 
-/// The fault the fake answers with from the moment it is set, and how many
+/// The fault the fake responds with from the moment it is set, and how many
 /// batches a `Refused` fault has refused: one, after which the fault ends.
 #[derive(Default)]
 struct Faults {
@@ -267,7 +267,7 @@ struct Faults {
     refused_batches: usize,
 }
 
-/// The fake's answer to `batch` under `faults`: every call completed by its
+/// The fake's response to `batch` under `faults`: every call completed by its
 /// draw, or failed with the fault's code.
 fn faulting(batch: &Batch, faults: &Mutex<Faults>) -> Outcome<ipc::execution::BatchOutput> {
     let mut output = testkit::completed(batch, testkit::Tokens::Draw, testkit::Extent::Stated);
@@ -310,10 +310,10 @@ struct Faulted {
 fn fail_while_generating(trial: bool, fault: Fault, request: GenerationRequest) -> Faulted {
     let faults = Arc::new(Mutex::new(Faults::default()));
     let inventory = fake::text_pool("model", 8);
-    let answering = Arc::clone(&faults);
+    let responding = Arc::clone(&faults);
     let pool = Arc::new(
         FakeBatches::new(vec![inventory])
-            .answering(Arc::new(move |batch| faulting(batch, &answering))),
+            .with_output(Arc::new(move |batch| faulting(batch, &responding))),
     );
     let mut scheduler = fake::scheduler_over(
         Arc::<testkit::FakeBatches>::clone(&pool),
@@ -504,7 +504,7 @@ fn a_promotion_refuses_the_requests_its_cache_cannot_hold() {
     let refused = handle
         .promote(parked.clone(), true, false)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers");
+        .expect("the scheduler responds");
     let reason = refused.expect_err("15 free units cannot hold 65");
     assert!(
         reason.contains("15 free units") && reason.contains("need 65"),
@@ -520,7 +520,7 @@ fn a_promotion_refuses_the_requests_its_cache_cannot_hold() {
     let reason = handle
         .promote(reserving, false, false)
         .recv_timeout(Duration::from_secs(10))
-        .expect("the scheduler answers")
+        .expect("the scheduler responds")
         .expect_err("15 free units cannot hold a whole reservation of 64");
     assert!(
         reason.contains("15 free units") && reason.contains("need 64"),
@@ -530,7 +530,7 @@ fn a_promotion_refuses_the_requests_its_cache_cannot_hold() {
         handle
             .promote(parked, false, false)
             .recv_timeout(Duration::from_secs(10))
-            .expect("the scheduler answers")
+            .expect("the scheduler responds")
             .is_ok()
     );
 

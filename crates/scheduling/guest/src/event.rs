@@ -2,7 +2,7 @@
 //!
 //! The mechanism hands a policy the events since the previous step, in the
 //! order they happened, once per step (`Policy::observe`). Events are
-//! proportional to state changes, never to resident requests or cache pages:
+//! proportional to state changes, never to running requests or cache pages:
 //! an ordered structure such as an LRU list is the policy's own, maintained
 //! from [`Event::Cached`], [`Event::Hit`] and [`Event::Freed`] (design §4.4).
 //!
@@ -45,9 +45,9 @@ pub enum End {
 pub enum Event {
     /// A request reached the main process, before `route` decides its rank.
     Arrived { request: RequestView },
-    /// The mechanism admitted a queued request.
+    /// The mechanism admitted a waiting request.
     Admitted { request: RequestId },
-    /// A resident request's view changed in a way the policy must see: its
+    /// A running request's view changed in a way the policy must see: its
     /// next phase changed, its prompt progress or cached prefix moved, its
     /// page count changed. Emitted before the `dispatch` of the step the
     /// change belongs to, and always after the event that caused it.
@@ -79,7 +79,7 @@ pub enum Event {
     Stepped { step: u64, duration: Duration },
     /// A page entered the cache.
     Cached { page: PageView },
-    /// A resident (device) page was used again.
+    /// A device page was used again.
     Hit { page: PageId },
     /// A page was freed.
     Freed { page: PageId },

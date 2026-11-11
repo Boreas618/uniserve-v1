@@ -22,7 +22,7 @@
 //! each other's outputs, and an epoch that computes otherwise finds none.
 //!
 //! - **Lookup.** Every page of an output is pinned before its encoder calls
-//!   are planned. When every page is pinned, the output's calls read their
+//!   are prepared. When every page is pinned, the output's calls read their
 //!   rows from the pages instead of computing them (`Call::host_output`, an
 //!   import), and the pins end once the calls completed.
 //! - **Store.** When a page is missing, the pages pinned are released and
@@ -124,13 +124,13 @@ struct Output {
     stage: Stage,
     /// The output's calls in flight.
     calls: u32,
-    /// Whether the scheduler planned every call of the output.
-    planned: bool,
+    /// Whether the scheduler prepared every call of the output.
+    prepared: bool,
     /// Whether one of its calls failed.
     failed: bool,
 }
 
-/// What the store asked the pools for, whose answer it reads.
+/// What the store asked the pools for, whose response it reads.
 enum Asked {
     /// The pins of an output's pages.
     Pin {
@@ -319,7 +319,7 @@ impl EncoderStore {
                 write: access.write,
                 stage,
                 calls: 0,
-                planned: false,
+                prepared: false,
                 failed: false,
             },
         );
@@ -339,7 +339,7 @@ impl EncoderStore {
     /// output holds the stored output's rows `rows`, and the call counted in
     /// flight; `last` when no other call of the output follows. `None` for
     /// an output the store neither reads nor writes.
-    pub(crate) fn plan_call(
+    pub(crate) fn prepare_call(
         &mut self,
         request: RequestKey,
         output: OutputId,
@@ -354,7 +354,7 @@ impl EncoderStore {
             Stage::Pinning | Stage::Reserving | Stage::Compute => return None,
         };
         stored.calls += 1;
-        stored.planned |= last;
+        stored.prepared |= last;
         let host = HostOutput {
             pool: stored.pool.pool,
             import,
@@ -392,7 +392,7 @@ impl EncoderStore {
         };
         stored.calls = stored.calls.saturating_sub(1);
         stored.failed |= !succeeded;
-        if stored.calls > 0 || !stored.planned {
+        if stored.calls > 0 || !stored.prepared {
             return;
         }
         let Some(stored) = outputs.remove(&output) else {
@@ -405,7 +405,7 @@ impl EncoderStore {
     }
 
     /// End what `output` holds, whose calls completed: its pins, or its
-    /// reserved pages, committed when every call was planned and succeeded
+    /// reserved pages, committed when every call was prepared and succeeded
     /// and aborted otherwise.
     fn settle(&mut self, output: Output) {
         let Output {
@@ -413,7 +413,7 @@ impl EncoderStore {
             keys,
             stage,
             failed,
-            planned,
+            prepared,
             ..
         } = output;
         match stage {
@@ -429,7 +429,7 @@ impl EncoderStore {
                     return;
                 }
                 // Pages its calls wrote only in part are aborted.
-                let written = !failed && planned;
+                let written = !failed && prepared;
                 self.servers
                     .settle(pool.client, pool.pool, reserved, written);
             }
@@ -438,7 +438,7 @@ impl EncoderStore {
     }
 
     /// End `request`'s lookup of `output`, which the scheduler no longer
-    /// needs: its pins and its reservations end, also those not answered
+    /// needs: its pins and its reservations end, also those not responded
     /// yet, and those of an output whose calls are in flight once they
     /// completed.
     pub(crate) fn drop_output(&mut self, request: RequestKey, output: OutputId) {
@@ -455,7 +455,7 @@ impl EncoderStore {
     }
 
     /// Forget admission `request`, which left the scheduler: the pins and
-    /// the reservations of its outputs end, also those not answered yet,
+    /// the reservations of its outputs end, also those not responded yet,
     /// and those of an output whose calls are in flight once they completed.
     pub(crate) fn forget(&mut self, request: RequestKey) {
         let Some(outputs) = self.requests.remove(&request) else {
@@ -467,7 +467,7 @@ impl EncoderStore {
     }
 
     /// End `request`'s lookup of `output`, removed from the store's
-    /// lookups: an answer still awaited releases what it pinned or
+    /// lookups: a response still awaited releases what it pinned or
     /// reserved, and an output whose calls are in flight ends once they
     /// completed, its reserved pages aborted.
     fn end(&mut self, request: RequestKey, output: OutputId, stored: Output) {
@@ -566,7 +566,7 @@ impl EncoderStore {
         self.servers.settle(pool.client, pool.pool, keys, false);
     }
 
-    /// An output's pins answered `slots`: every page pinned is imported;
+    /// An output's pins responded `slots`: every page pinned is imported;
     /// otherwise the pins end and every page is reserved, unless the
     /// request stores no output, which then computes it.
     fn pinned(&mut self, request: RequestKey, output: OutputId, slots: Vec<Option<u64>>) {
@@ -620,7 +620,7 @@ impl EncoderStore {
         self.unpin(&pool, held);
     }
 
-    /// An output's reservation answered `slots`: the calls write the pages
+    /// An output's reservation responded `slots`: the calls write the pages
     /// reserved, unless a page could not be reserved, when they write none
     /// and the pages reserved are aborted.
     fn reserved(&mut self, request: RequestKey, output: OutputId, slots: Vec<PageSlot>) {
@@ -670,10 +670,10 @@ impl EncoderStore {
         self.abort(&pool, keys);
     }
 
-    /// Take the servers' answers. Returns whether a lookup moved on.
+    /// Take the servers' responses. Returns whether a lookup moved on.
     pub(crate) fn poll(&mut self) -> bool {
         let mut moved = false;
-        for (purpose, reply) in self.servers.answers() {
+        for (purpose, reply) in self.servers.responses() {
             match (purpose, reply) {
                 (Asked::Pin { request, output }, reply) => {
                     moved = true;
@@ -703,7 +703,7 @@ impl EncoderStore {
     }
 
     /// The store's Storage Server connections, which the scheduler waits on
-    /// beside its wake: an answer or an event ends the wait.
+    /// beside its wake: a response or an event ends the wait.
     pub(crate) fn descriptors(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
         self.servers.descriptors()
     }

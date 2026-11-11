@@ -239,15 +239,15 @@ impl HandOffs {
     }
 
     /// The store's Storage Server connections, which the scheduler waits on
-    /// beside its wake: an answer or an event ends the wait.
+    /// beside its wake: a response or an event ends the wait.
     pub(crate) fn descriptors(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
         self.servers.descriptors()
     }
 
-    /// Take the servers' answers and events, and the hand-offs that ended.
+    /// Take the servers' responds and events, and the hand-offs that ended.
     pub(crate) fn poll(&mut self) -> Vec<(RequestId, HandOffEnd)> {
-        let (events, answers) = self.servers.take();
-        for (purpose, reply) in answers {
+        let (events, responses) = self.servers.take();
+        for (purpose, reply) in responses {
             match (purpose, reply) {
                 (Asked::Transfer { request, client }, Reply::Transferring { task }) => {
                     self.tasks.insert((client, task), request);

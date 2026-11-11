@@ -2,14 +2,14 @@
 //! that replaces it in place (§4.4, §7.3).
 //!
 //! The mechanism asks the policy for one decision at each decision point and
-//! validates and executes the answer; this module owns the wasmtime instance
-//! that answers, the module kept for a revert, the instance a precopy prepared,
+//! validates and executes the response; this module owns the wasmtime instance
+//! that responses, the module kept for a revert, the instance a precopy prepared,
 //! the stages that change them, and the control thread's own instance for
 //! `route`.
 //!
 //! The switch follows §7.3's stages. A precopy instantiates the new policy on
 //! the state that exists now and asks it every decision once, executing
-//! nothing, so an illegal answer or an invalid decision fails the update while
+//! nothing, so an illegal response or an invalid decision fails the update while
 //! the serving policy is untouched. A switchover puts the prepared instance in
 //! at a batch boundary and keeps the module it replaced. A commit leaves that
 //! module in place until the next precopy, which is where §7.3's purge of it
@@ -20,7 +20,7 @@
 //!
 //! Both instances — each scheduler thread's and the control thread's
 //! [`Router`] — come from one program and switch together (§4.4: "两者是同一个
-//! program，一起换代"). The router's instance answers `route` from the arriving
+//! program，一起换代"). The router's instance returns `route` from the arriving
 //! request's view and the ranks' views alone; it is told no events.
 
 use std::path::{Path, PathBuf};
@@ -317,13 +317,13 @@ impl ProgramSource {
         let client = client.as_mut().ok_or_else(|| PolicyError::Load {
             message: "the Program Server connection was closed".to_owned(),
         })?;
-        let answer = ask(client);
-        if answer.is_err() {
+        let response = ask(client);
+        if response.is_err() {
             // A failed exchange may leave the stream out of step; the next
             // precopy opens a new one.
             *crate::lock(&self.client) = None;
         }
-        answer
+        response
     }
 }
 
@@ -397,7 +397,7 @@ impl PolicySource for ProgramSource {
     }
 }
 
-/// A policy module a caller already holds in memory: a store's answer, read
+/// A policy module a caller already holds in memory: a store's response, read
 /// once, that keeps handing out the same bytes.
 #[derive(Clone, Debug, Default)]
 pub struct PolicyBytes {
@@ -436,14 +436,14 @@ pub struct TrialState {
     /// The shortage the mechanism faces, for `preempt`; `None` skips the call,
     /// as the mechanism calls `preempt` only when something is short.
     pub shortage: Option<Shortage>,
-    /// A queued request and the ranks, for `route`; `None` skips the call.
+    /// A waiting request and the ranks, for `route`; `None` skips the call.
     pub arrival: Option<(RequestView, Vec<RankView>)>,
     /// A request's first call on a block and the replicas, for `place`; `None`
     /// skips the call.
     pub call: Option<(CallView, Vec<ReplicaView>)>,
 }
 
-/// The mechanism's validation of a decision's answer, without executing it
+/// The mechanism's validation of a decision's response, without executing it
 /// (§4.4, §7.3 step 2).
 ///
 /// The validators are the mechanism's own — the same ones that gate a live
@@ -530,7 +530,7 @@ pub struct PolicyUsage {
     /// replaced (§4.4).
     ///
     /// This is the epoch's call discipline as a caller can see it: one `observe`
-    /// and one `dispatch` per step whatever they answer, each optional decision
+    /// and one `dispatch` per step whatever they respond, each optional decision
     /// only where the state names it, and the trial a precopy ran on the
     /// instance a switchover adopts. A policy that replaced another carries the
     /// replaced instance's counts forward, as `calls` and `fuel` do.
@@ -919,7 +919,7 @@ impl PolicySlot {
     /// §7.3 step 2: instantiate `program` on `state` and ask it every decision
     /// of §4.4 once, executing nothing.
     ///
-    /// An answer that does not decode, a trap, fuel exhaustion, limits outside
+    /// A response that does not decode, a trap, fuel exhaustion, limits outside
     /// the build config, a decision that names something that does not exist or
     /// cannot be chosen all fail the precopy: no candidate is returned and the serving policy is
     /// untouched. `validators` are the mechanism's own, so the candidate is
@@ -1145,7 +1145,7 @@ impl PolicySlot {
         Ok(())
     }
 
-    /// A decision failed: serve on under the previous policy and answer the
+    /// A decision failed: serve on under the previous policy and respond to the
     /// report the control thread hands to the daemons (§7.3, "提交之后调度策略
     /// 出错").
     ///
@@ -1179,13 +1179,13 @@ fn init_of(program: &PolicyProgram, state: &TrialState) -> Instantiation {
 
 /// The mechanism's validation of the control thread's only decision.
 ///
-/// The route instance answers `route` alone: a dispatch output, victims and a placement
+/// The route instance returns `route` alone: a dispatch output, victims and a placement
 /// are a scheduler thread's decisions, judged there. A route decision must name
 /// a rank that was offered and is alive.
 pub struct RouteTrial;
 
 impl Validators for RouteTrial {
-    fn output(&self, _plan: &DispatchOutput) -> Result<(), PolicyError> {
+    fn output(&self, _output: &DispatchOutput) -> Result<(), PolicyError> {
         Ok(())
     }
 
@@ -1212,13 +1212,13 @@ impl Validators for RouteTrial {
     }
 }
 
-/// The policy instance that answers `route` for every data-parallel rank of a
+/// The policy instance that returns `route` for every data-parallel rank of a
 /// main process (§4.4).
 ///
 /// # Which instance routes
 ///
 /// Routing is decided on the engine's control thread, before any scheduler
-/// holds the request, so the instance that answers it is the control thread's
+/// holds the request, so the instance that responds to it is the control thread's
 /// own: an instance of the epoch's policy program, prepared, switched over,
 /// committed and reverted with the schedulers' instances, so all of them run
 /// one program (§4.4: "两者是同一个 program，一起换代"). It is the only
@@ -1277,7 +1277,7 @@ impl Router {
     /// it on `ranks`, executing nothing.
     ///
     /// A static function, so the module's compilation runs on a thread of
-    /// the caller's choosing; [`Self::adopt`] keeps the answer.
+    /// the caller's choosing; [`Self::adopt`] keeps the response.
     pub fn prepare(
         source: &dyn PolicySource,
         program: PolicyProgram,
@@ -1374,7 +1374,7 @@ impl Router {
     /// A node with one scheduler serves every request on that rank and asks
     /// no policy. A request that resumes a stored cache is routed to the rank
     /// recorded for it by the policy itself (`RequestView::cache_rank`), and
-    /// the answer is checked like any other. An answer that names no live rank
+    /// the response is checked like any other. A response that names no live rank
     /// offered fails the policy: the previous program is instantiated on
     /// `ranks` and routes this request and later ones. When no previous
     /// program can take over, the request is refused and the refusal's
@@ -1408,7 +1408,7 @@ impl Router {
         }
     }
 
-    /// One `route` answer of the serving instance, checked; a failure reverts
+    /// One `route` response of the serving instance, checked; a failure reverts
     /// the instance ([`Self::route`]).
     fn decide(&mut self, arrival: &Arrival, ranks: &[RankView]) -> Result<usize, RouteRefusal> {
         let Some(slot) = self.slot.as_mut() else {
@@ -1420,10 +1420,10 @@ impl Router {
             });
         };
         let request = arrival_view(arrival);
-        let answer = slot
+        let response = slot
             .route(&request, ranks)
             .and_then(|index| RouteTrial.route(&request, ranks, index).map(|()| index));
-        let error = match answer {
+        let error = match response {
             Ok(index) => return Ok(index),
             Err(error) => error,
         };
@@ -1453,7 +1453,7 @@ mod tests {
     //! The switch of §7.3 over toy policy modules written as WebAssembly text.
     //!
     //! The toys speak the committed call protocol (`scheduling::guest::wire`)
-    //! and answer with the interface's own JSON, so the tests exercise the
+    //! and respond with the interface's own JSON, so the tests exercise the
     //! switch rather than a mock of it: a trap, a fuel run-out, a limit outside
     //! the build config, an invalid decision, and the stages of §7.3.
 
@@ -1627,7 +1627,7 @@ mod tests {
     #[test]
     fn a_policy_is_resolved_under_the_stores_wasm_key() {
         // A policy is one artifact per revision, written at install for the
-        // store's wasm target (`Manifest::builds_for` answers that key and no
+        // store's wasm target (`Manifest::builds_for` responds to that key and no
         // other for a package with no kernel), so a source that named a CPU
         // triple asked for a path no install writes and no package declares.
         let source = ProgramSource::connect("/tmp/none.sock");

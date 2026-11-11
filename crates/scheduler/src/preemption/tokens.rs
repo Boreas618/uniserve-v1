@@ -61,7 +61,7 @@ impl Scheduler {
             }
             Err(mechanism::VictimError::Vanished(message)) => {
                 // Nothing of this step can free a page or end a request between
-                // the observation the policy answered from and this call, so a
+                // the observation the policy responded from and this call, so a
                 // victim that is gone means the mechanism let go of it without
                 // recording that it did: an invariant of its own, never the
                 // policy's decision (§4.4's taxonomy).

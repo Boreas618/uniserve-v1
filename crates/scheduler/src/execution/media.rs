@@ -1,12 +1,12 @@
 //! Video media scheduling: a video request runs the calls of its graph
 //! (`graph::VideoGraph`, built at admission from its task and conditions),
 //! offered by `ready_calls` as their inputs become available. Calls occupy
-//! their components' capacity on their workers and, for media reading,
+//! their stages' capacity on their workers and, for media reading,
 //! encoding and muxing, host task pools, tracked by the media occupancy
-//! ([`Occupancy`]); `plan_media_call` builds one call with its products,
-//! buffer bindings, latent pages and reading components, and
+//! ([`Occupancy`]); `prepare_media_call` builds one call with its products,
+//! buffer bindings, latent pages and reading stages, and
 //! `assemble_batch` schedules a media call of the step's output onto the batch of its
-//! phase and component.
+//! phase and stage.
 
 use super::*;
 use ipc::MediaCall;
@@ -27,9 +27,9 @@ pub(crate) struct VideoState {
     /// empty while the request waits.
     pub(crate) allocations: MediaAllocations,
     /// Each product the request reserved, by its declared name, with the
-    /// component output it is reserved under.
+    /// stage output it is reserved under.
     pub(crate) reservations: HashMap<&'static str, (String, u32)>,
-    /// Logical products mapped to their reserved component output and unit slice.
+    /// Logical products mapped to their reserved stage output and unit slice.
     pub(crate) buffer_bindings: HashMap<BufferId, (String, u32, u32)>,
     /// The media reader's products, by name, once its call is scheduled.
     pub(crate) condition_media: HashMap<&'static str, TensorRef>,
@@ -136,17 +136,17 @@ fn video_output(name: &'static str) -> crate::encoder_outputs::OutputId {
 
 /// What one media call occupies while it is in flight.
 ///
-/// On a component whose capacity is measured in media units the call
-/// carries `units`; a demand with zero `units` holds its component
+/// On a stage whose capacity is measured in media units the call
+/// carries `units`; a demand with zero `units` holds its stage
 /// exclusively, one request at a time. `cpu_workers` names the host task
 /// pools the call places tasks on.
 pub(crate) struct Demand {
-    /// The worker and component whose capacity the call occupies, taken
+    /// The worker and stage whose capacity the call occupies, taken
     /// from the request's dispatch (`Dispatch::affinity`). Admission places
-    /// a media request on a worker for every media component, so a request's
-    /// first call is checked against its component too. `None` when no
-    /// component serves the call or the request holds no dispatch for it.
-    component: Option<(crate::WorkerGroupId, String)>,
+    /// a media request on a worker for every media stage, so a request's
+    /// first call is checked against its stage too. `None` when no
+    /// stage serves the call or the request holds no dispatch for it.
+    stage: Option<(crate::WorkerGroupId, String)>,
     units: u32,
     /// Host task pools this call occupies, each named by its worker and rank
     /// with the number of tasks the call places on it: one per media unit
@@ -154,7 +154,7 @@ pub(crate) struct Demand {
     cpu_workers: Vec<(crate::WorkerGroupId, usize, u32)>,
 }
 
-/// What the media calls in flight occupy of their components and of the
+/// What the media calls in flight occupy of their stages and of the
 /// ranks' host task pools.
 ///
 /// `media_occupancy` rebuilds it from the in-flight calls at the start of each
@@ -162,9 +162,9 @@ pub(crate) struct Demand {
 /// pass; the pass charges each call it selects.
 #[derive(Default)]
 pub(crate) struct Occupancy {
-    /// The request holding each exclusively held component.
+    /// The request holding each exclusively held stage.
     exclusive: HashMap<(crate::WorkerGroupId, String), RequestId>,
-    /// Media units in flight on each unit-measured component.
+    /// Media units in flight on each unit-measured stage.
     units: HashMap<(crate::WorkerGroupId, String), u32>,
     /// Each rank owns one host task pool, so occupancy is counted per rank
     /// of each worker.
@@ -175,7 +175,7 @@ impl Occupancy {
     /// Returns whether one request's call fits what it occupies.
     ///
     /// Every host task pool the call places tasks on must have room for
-    /// them. An exclusively held component admits further calls of the
+    /// them. An exclusively held stage admits further calls of the
     /// request already holding it.
     pub(crate) fn admits(
         &self,
@@ -190,20 +190,20 @@ impl Occupancy {
         }) {
             return false;
         }
-        let Some((worker, component)) = demand.component.as_ref() else {
+        let Some((worker, stage)) = demand.stage.as_ref() else {
             return true;
         };
         if demand.units > 0 {
-            let capacity = scheduler.component_units(worker, component).unwrap_or(1);
+            let capacity = scheduler.stage_units(worker, stage).unwrap_or(1);
             self.units
-                .get(&(worker.clone(), component.clone()))
+                .get(&(worker.clone(), stage.clone()))
                 .copied()
                 .unwrap_or(0)
                 + demand.units
                 <= capacity
         } else {
             self.exclusive
-                .get(&(worker.clone(), component.clone()))
+                .get(&(worker.clone(), stage.clone()))
                 .is_none_or(|holder| *holder == request)
         }
     }
@@ -213,10 +213,10 @@ impl Occupancy {
         for (worker, rank, tasks) in &demand.cpu_workers {
             *self.host.entry((worker.clone(), *rank)).or_default() += tasks;
         }
-        let Some((worker, component)) = demand.component.as_ref() else {
+        let Some((worker, stage)) = demand.stage.as_ref() else {
             return;
         };
-        let key = (worker.clone(), component.clone());
+        let key = (worker.clone(), stage.clone());
         if demand.units > 0 {
             *self.units.entry(key).or_default() += demand.units;
         } else {
@@ -470,13 +470,9 @@ impl Scheduler {
             };
             let Some(worker) = self
                 .info
-                .media_components
+                .media_stages
                 .get(&media_call)
-                .and_then(|component| {
-                    self.dispatch
-                        .affinity
-                        .get(&(request_key, component.clone()))
-                })
+                .and_then(|stage| self.dispatch.affinity.get(&(request_key, stage.clone())))
             else {
                 continue;
             };
@@ -521,43 +517,43 @@ impl Scheduler {
         )
     }
 
-    /// Returns the component that serves one media call.
-    fn media_component(&self, media_call: MediaCall) -> Option<String> {
-        self.info.media_components.get(&media_call).cloned()
+    /// Returns the stage that serves one media call.
+    fn media_stage(&self, media_call: MediaCall) -> Option<String> {
+        self.info.media_stages.get(&media_call).cloned()
     }
 
-    /// Returns the worker serving `component` for one request, with the
-    /// component's dispatch there.
+    /// Returns the worker serving `stage` for one request, with the
+    /// stage's dispatch there.
     ///
-    /// The worker is the request's owner of `component` when it has one,
+    /// The worker is the request's owner of `stage` when it has one,
     /// otherwise the first candidate that can execute `work`. Returns `None`
-    /// when no such worker is loaded or its bound component has no binding
+    /// when no such worker is loaded or its bound stage has no binding
     /// on that worker.
-    fn placed_component<'a>(
+    fn placed_stage<'a>(
         &'a self,
         request: RequestKey,
         work: CallKind,
-        component: &'a str,
+        stage: &'a str,
     ) -> Option<(&'a crate::WorkerGroupId, &'a crate::BlockConfig)> {
-        let owner = self.dispatch.affinity.get(&(request, component.to_owned()));
+        let owner = self.dispatch.affinity.get(&(request, stage.to_owned()));
         let (worker, bound, _) = self
             .dispatch
-            .component_candidates(&self.worker, work, component)
+            .stage_candidates(&self.worker, work, stage)
             .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))?;
-        let config = self.worker.info().component_config(worker, bound)?;
+        let config = self.worker.info().stage_config(worker, bound)?;
         Some((worker, config))
     }
 
     /// Returns how many media units one call of this kind covers at once.
     ///
-    /// A distributed component reconstructs `units_per_rank` media units on
-    /// each of its ranks per round; any other component counts one unit per
-    /// rank, on the worker `placed_component` names.
+    /// A distributed stage reconstructs `units_per_rank` media units on
+    /// each of its ranks per round; any other stage counts one unit per
+    /// rank, on the worker `placed_stage` names.
     ///
-    /// Returns `None` when the component has no dispatch or the width does
+    /// Returns `None` when the stage has no dispatch or the width does
     /// not fit in `u32`.
-    fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> Option<u32> {
-        let (_, config) = self.placed_component(request, work, component)?;
+    fn stage_width(&self, request: RequestKey, work: CallKind, stage: &str) -> Option<u32> {
+        let (_, config) = self.placed_stage(request, work, stage)?;
         let units_per_rank = if config.distribution.is_some() {
             config.units_per_rank.max(1)
         } else {
@@ -573,7 +569,7 @@ impl Scheduler {
     /// and otherwise the request's audio tracks, which are one unit.
     /// Condition units are encoded independently of one another, so a
     /// distributed latent encoder deals a call only to its free ranks, in
-    /// the component's rank order: those that hold none of the request's
+    /// the stage's rank order: those that hold none of the request's
     /// calls in flight and that the prompt's encoding, until its text
     /// encoding is placed, does not take. A rank still encoding the prompt
     /// or an earlier round thus takes no unit that a free rank would
@@ -581,15 +577,15 @@ impl Scheduler {
     /// completing call frees its ranks.
     ///
     /// A latent encoder whose members encode together has no deal: its call
-    /// covers the component's width and names no rank.
+    /// covers the stage's width and names no rank.
     ///
-    /// Returns `None` as well when no component or worker serves latent
+    /// Returns `None` as well when no stage or worker serves latent
     /// encoding.
     fn latent_round(&self, state: &VideoState) -> Option<(u32, Vec<u32>)> {
         let request = state.request_key;
         let work = CallKind::Media(MediaCall::LatentEncoding);
-        let component = self.media_component(MediaCall::LatentEncoding)?;
-        let (worker, config) = self.placed_component(request, work, &component)?;
+        let stage = self.media_stage(MediaCall::LatentEncoding)?;
+        let (worker, config) = self.placed_stage(request, work, &stage)?;
         let remaining =
             state.graph.condition_units().len() as u32 - state.scheduled_condition_units;
         if config.distribution.is_none() {
@@ -603,15 +599,15 @@ impl Scheduler {
         }
 
         // A call in flight on this worker holds the ranks it was dealt to,
-        // or every rank of its component when it names none.
+        // or every rank of its stage when it names none.
         let mut held = std::collections::HashSet::new();
         // The vision and text encodings run one after the other on the text
         // encoder's ranks, which are theirs from the start: between the two
         // calls no call of the prompt is in flight there.
         if state.graph.pending(MediaCall::TextEncoding)
-            && let Some(name) = self.media_component(MediaCall::TextEncoding)
+            && let Some(name) = self.media_stage(MediaCall::TextEncoding)
             && let Some((owner, prompt)) =
-                self.placed_component(request, CallKind::Media(MediaCall::TextEncoding), &name)
+                self.placed_stage(request, CallKind::Media(MediaCall::TextEncoding), &name)
             && owner == worker
         {
             held.extend(prompt.ranks.iter().copied());
@@ -623,7 +619,7 @@ impl Scheduler {
             .into_iter()
             .flatten()
         {
-            let name = &pending.call.component;
+            let name = &pending.call.stage;
             if self.dispatch.affinity.get(&(request, name.clone())) != Some(worker) {
                 continue;
             }
@@ -637,7 +633,7 @@ impl Scheduler {
                 _ => held.extend(
                     self.worker
                         .info()
-                        .component_config(worker, name)
+                        .stage_config(worker, name)
                         .into_iter()
                         .flat_map(|config| config.ranks.iter().copied()),
                 ),
@@ -663,16 +659,16 @@ impl Scheduler {
         Some((units, free[..holders].to_vec()))
     }
 
-    /// Returns a component's capacity on `worker` in media units.
+    /// Returns a stage's capacity on `worker` in media units.
     ///
-    /// A component that distributes its work measures its capacity in the
-    /// units its ranks reconstruct together; every other component is held
+    /// A stage that distributes its work measures its capacity in the
+    /// units its ranks reconstruct together; every other stage is held
     /// exclusively and admits one request at a time.
     ///
-    /// Returns `None` for an exclusively held component, and when `worker`
-    /// was launched without a component named `component`.
-    fn component_units(&self, worker: &crate::WorkerGroupId, component: &str) -> Option<u32> {
-        let config = self.worker.info().component_config(worker, component)?;
+    /// Returns `None` for an exclusively held stage, and when `worker`
+    /// was launched without a stage named `stage`.
+    fn stage_units(&self, worker: &crate::WorkerGroupId, stage: &str) -> Option<u32> {
+        let config = self.worker.info().stage_config(worker, stage)?;
         config
             .distribution
             .as_ref()
@@ -681,8 +677,8 @@ impl Scheduler {
 
     /// Returns what one media call occupies and how much of each.
     ///
-    /// Only decoding calls on a unit-measured component charge media units;
-    /// every other placed call holds its component exclusively. Media
+    /// Only decoding calls on a unit-measured stage charge media units;
+    /// every other placed call holds its stage exclusively. Media
     /// reading, encoding and muxing calls also place tasks on host task
     /// pools.
     pub(crate) fn media_demand(
@@ -691,22 +687,22 @@ impl Scheduler {
         media_call: MediaCall,
         units: u32,
     ) -> Demand {
-        let component = self.media_component(media_call);
-        let placed_component = component.as_ref().and_then(|component| {
+        let stage = self.media_stage(media_call);
+        let placed_stage = stage.as_ref().and_then(|stage| {
             self.dispatch
                 .affinity
-                .get(&(request, component.clone()))
-                .map(|worker| (worker.clone(), component.clone()))
+                .get(&(request, stage.clone()))
+                .map(|worker| (worker.clone(), stage.clone()))
         });
         let device_units = match media_call {
-            // A decode round occupies the component's media units. Encoding
+            // A decode round occupies the stage's media units. Encoding
             // a media unit is admitted on its rank's host task pool, so it
             // overlaps the decode round that follows it rather than
             // excluding it, and the post-processing it begins with rides on
             // the same admission.
-            MediaCall::VideoDecoding | MediaCall::AudioDecoding => placed_component
+            MediaCall::VideoDecoding | MediaCall::AudioDecoding => placed_stage
                 .as_ref()
-                .and_then(|(worker, name)| self.component_units(worker, name))
+                .and_then(|(worker, name)| self.stage_units(worker, name))
                 .map_or(0, |_| units.max(1)),
             _ => 0,
         };
@@ -714,46 +710,44 @@ impl Scheduler {
             MediaCall::MediaReading
             | MediaCall::VideoEncoding
             | MediaCall::AudioEncoding
-            | MediaCall::Muxing => self.host_task_workers(request, component.as_deref(), units),
+            | MediaCall::Muxing => self.host_task_workers(request, stage.as_deref(), units),
             _ => Vec::new(),
         };
         Demand {
-            component: placed_component,
+            stage: placed_stage,
             units: device_units,
             cpu_workers,
         }
     }
 
-    /// Returns the host task pools one call of a component occupies, each
-    /// named by the worker holding the component and the rank within it,
+    /// Returns the host task pools one call of a stage occupies, each
+    /// named by the worker holding the stage and the rank within it,
     /// with the tasks the call places there.
     ///
-    /// A distributed component's round runs on as many of its ranks as it has
+    /// A distributed stage's round runs on as many of its ranks as it has
     /// media units, each rank taking one task per unit it encodes; any other
-    /// component runs one task on each of its ranks.
+    /// stage runs one task on each of its ranks.
     ///
-    /// The worker is the request's owner of the component, or the first
+    /// The worker is the request's owner of the stage, or the first
     /// loaded worker holding it before the request is placed. Returns no
-    /// pools when `component` is `None` or that worker is not loaded or does
-    /// not hold the component.
+    /// pools when `stage` is `None` or that worker is not loaded or does
+    /// not hold the stage.
     fn host_task_workers(
         &self,
         request: RequestKey,
-        component: Option<&str>,
+        stage: Option<&str>,
         units: u32,
     ) -> Vec<(crate::WorkerGroupId, usize, u32)> {
-        let Some(component) = component else {
+        let Some(stage) = stage else {
             return Vec::new();
         };
-        let owner = self.dispatch.affinity.get(&(request, component.to_owned()));
+        let owner = self.dispatch.affinity.get(&(request, stage.to_owned()));
         let worker = self.worker.info();
         let Some((worker, config)) = worker.workers.iter().find_map(|(id, _)| {
             if owner.is_some_and(|owner| id != owner) {
                 return None;
             }
-            worker
-                .component_config(id, component)
-                .map(|config| (id, config))
+            worker.stage_config(id, stage).map(|config| (id, config))
         }) else {
             return Vec::new();
         };
@@ -793,18 +787,18 @@ impl Scheduler {
     /// bytes occupies.
     ///
     /// The worker prepares an inline input image (decoding, resizing,
-    /// normalization) as one host task on each rank of the component that
+    /// normalization) as one host task on each rank of the stage that
     /// encodes it, and the call holds those tasks until its result returns.
-    /// The component is the one the worker routes `media_call` to, or the
-    /// default component, as `Dispatch::worker_target` resolves it.
+    /// The stage is the one the worker routes `media_call` to, or the
+    /// default stage, as `Dispatch::worker_target` resolves it.
     pub(crate) fn image_demand(&self, request: RequestKey, media_call: MediaCall) -> Demand {
-        let component = self
-            .media_component(media_call)
+        let stage = self
+            .media_stage(media_call)
             .unwrap_or_else(|| DEFAULT_BLOCK.to_owned());
         Demand {
-            component: None,
+            stage: None,
             units: 0,
-            cpu_workers: self.host_task_workers(request, Some(&component), 1),
+            cpu_workers: self.host_task_workers(request, Some(&stage), 1),
         }
     }
 
@@ -856,26 +850,26 @@ impl Scheduler {
 
     /// Returns whether the rank group that owns one call can accept a batch.
     ///
-    /// Returns `false` when no component serves `media_call` or
-    /// `Dispatch::component_target` selects no worker. Residency narrows
-    /// that choice: a request already placed on the component is checked only
-    /// against its owning worker's queue, and one resident on a candidate
-    /// worker for another component only against that worker's queue.
+    /// Returns `false` when no stage serves `media_call` or
+    /// `Dispatch::stage_target` selects no worker. Residency narrows
+    /// that choice: a request already placed on the stage is checked only
+    /// against its owning worker's queue, and one running request on a candidate
+    /// worker for another stage only against that worker's queue.
     pub(crate) fn call_has_queue_capacity(
         &self,
         request: RequestKey,
         media_call: MediaCall,
     ) -> bool {
         self.info
-            .media_components
+            .media_stages
             .get(&media_call)
-            .is_some_and(|component| {
+            .is_some_and(|stage| {
                 self.dispatch
-                    .component_target(
+                    .stage_target(
                         &self.worker,
                         request,
                         CallKind::Media(media_call),
-                        component,
+                        stage,
                         &dispatch::Choice::Existing,
                     )
                     .is_some()
@@ -884,21 +878,21 @@ impl Scheduler {
 
     /// Returns the media units one scheduled call of this kind would occupy.
     ///
-    /// A video decode round occupies its component's whole capacity
-    /// (`component_units`) unless the track has fewer units left; an audio
+    /// A video decode round occupies its stage's whole capacity
+    /// (`stage_units`) unless the track has fewer units left; an audio
     /// decode round always claims the whole capacity. The capacity counts as
-    /// one when the component is not measured in media units or the request
+    /// one when the stage is not measured in media units or the request
     /// is not yet placed on it.
     pub(crate) fn call_units(&self, state: &VideoState, media_call: MediaCall) -> u32 {
         let width = || {
-            self.media_component(media_call)
+            self.media_stage(media_call)
                 .as_deref()
                 .and_then(|name| {
                     let worker = self
                         .dispatch
                         .affinity
                         .get(&(state.request_key, name.to_owned()))?;
-                    self.component_units(worker, name)
+                    self.stage_units(worker, name)
                 })
                 .unwrap_or(1)
         };
@@ -925,18 +919,18 @@ impl Scheduler {
     /// names the readiness invariant that no longer holds. A request's first
     /// call also queues its worker admission onto `admissions`.
     ///
-    /// Planning advances the request's scheduling cursors, selects the worker
+    /// Preparing advances the request's scheduling cursors, selects the worker
     /// (recording the request's residency there), binds every product to its
-    /// reserved buffer on that worker, names the components that read the
+    /// reserved buffer on that worker, names the stages that read the
     /// call's products from the request's graph, and registers the call as in
     /// flight. The cursors advance before the worker is selected, so an error
-    /// can leave the request partially planned; `assemble_batch` latches
+    /// can leave the request partially prepared; `assemble_batch` latches
     /// engine-fatal on any error.
     ///
     /// A latent encoding call is a visual round while condition units remain
     /// unscheduled, covering the next units its free ranks encode together,
     /// and otherwise the request's one audio call (`latent_round`).
-    pub(crate) fn plan_media_call(
+    pub(crate) fn prepare_media_call(
         &mut self,
         id: RequestId,
         media_call: MediaCall,
@@ -944,7 +938,7 @@ impl Scheduler {
         admissions: &mut Vec<NewRequest>,
     ) -> Result<(Call, RequestDispatch), &'static str> {
         let work = CallKind::Media(media_call);
-        let component = self.info.media_components[&media_call].clone();
+        let stage = self.info.media_stages[&media_call].clone();
         let state = self.media_state(id).ok_or("a media candidate is running")?;
         let request_key = state.request_key;
         let stateful = work.advances_state();
@@ -971,7 +965,7 @@ impl Scheduler {
                 call_id,
                 cursor: state.scheduled_decode_units,
                 max_units: self
-                    .component_width(request_key, work, &component)
+                    .stage_width(request_key, work, &stage)
                     .ok_or("a scheduled decoder has a loaded owner")?
                     .min(state.request.sampling.video_units - state.scheduled_decode_units),
                 ranks: Vec::new(),
@@ -988,7 +982,7 @@ impl Scheduler {
                 call_id,
                 cursor: 0,
                 max_units: self
-                    .component_width(request_key, work, &component)
+                    .stage_width(request_key, work, &stage)
                     .ok_or("a scheduled decoder has a loaded owner")?,
                 ranks: Vec::new(),
             }),
@@ -1088,7 +1082,7 @@ impl Scheduler {
         };
 
         // Declare the call's products against the request's reservations,
-        // by the names their component declares them under. A slice holds
+        // by the names their stage declares them under. A slice holds
         // the product's leading extent and its first unit within the
         // reservation.
         let mut declared: Vec<(&'static str, Option<(u32, u32)>)> = Vec::new();
@@ -1184,7 +1178,7 @@ impl Scheduler {
                 .and_then(|product| product.extent)
                 .map(|rows| (name, [0, rows], true))
         };
-        let host_plan = match media_call {
+        let host_output = match media_call {
             MediaCall::VisionEncoding => encoded(product::VISION_FEATURES),
             MediaCall::TextEncoding => encoded(product::CONDITIONING),
             MediaCall::LatentEncoding if visual_round => decode.as_ref().map(|range| {
@@ -1209,15 +1203,15 @@ impl Scheduler {
         };
 
         let mut call = Call::new(request_key, call_id, work);
-        call.component = component.to_owned();
+        call.stage = stage.to_owned();
         call.inputs = inputs;
         call.outputs = outputs;
         call.completion_output = completion_output;
         call.predicate = predicate;
         call.latent_restore = latent_restore;
-        call.host_output = match (host_plan, self.encoder_outputs.as_mut()) {
+        call.host_output = match (host_output, self.encoder_outputs.as_mut()) {
             (Some((name, rows, last)), Some(store)) => {
-                store.plan_call(request_key, video_output(name), call_id, rows, last)
+                store.prepare_call(request_key, video_output(name), call_id, rows, last)
             }
             _ => None,
         };
@@ -1237,10 +1231,10 @@ impl Scheduler {
             );
             state.admission_state = WorkerRegistration::InFlight;
         }
-        for (product, ((component, index), start)) in call.outputs.iter().zip(output_starts) {
+        for (product, ((stage, index), start)) in call.outputs.iter().zip(output_starts) {
             let replaced = state
                 .buffer_bindings
-                .insert(product.buffer_id(), (component, index, start));
+                .insert(product.buffer_id(), (stage, index, start));
             debug_assert!(replaced.is_none(), "media buffer identity was reused");
         }
         match media_call {
@@ -1270,7 +1264,7 @@ impl Scheduler {
                 }
             }
             MediaCall::LatentPreparation => {
-                state.host_trajectory.restoring = Restoring::Planned;
+                state.host_trajectory.restoring = Restoring::Prepared;
             }
             // Submitted steps are derived from the pending denoising calls.
             MediaCall::Denoising => {}
@@ -1321,11 +1315,11 @@ impl Scheduler {
         // Place the call, recording the request's residency on the selected
         // worker, then bind each distinct input and output buffer to its
         // reserved span in the buffer pool of each rank that backs it.
-        let (worker, selected_component) = self
+        let (worker, selected_stage) = self
             .dispatch
             .select_worker(&self.worker, &self.info, &call, &dispatch::Choice::Existing)
-            .ok_or("a planned call retains an executable component")?;
-        call.component = selected_component;
+            .ok_or("a prepared call retains an executable stage")?;
+        call.stage = selected_stage;
         let state = self
             .media_state(id)
             .ok_or("a selected media request is running")?;
@@ -1335,9 +1329,8 @@ impl Scheduler {
             .chain(call.buffer_outputs())
             .filter(|product| bound.insert(product.buffer_id()))
             .flat_map(|product| {
-                let (component, index, start) = &state.buffer_bindings[&product.buffer_id()];
-                state.allocations.tensors[&(component.clone(), *index)]
-                    .bind(product, *start, &worker)
+                let (stage, index, start) = &state.buffer_bindings[&product.buffer_id()];
+                state.allocations.tensors[&(stage.clone(), *index)].bind(product, *start, &worker)
             })
             .collect();
 
@@ -1345,21 +1338,18 @@ impl Scheduler {
         // latent pages of its slot from its own pool.
         let request_pool_idx = state.allocations.request_slot(&worker);
 
-        // Admission routed every component of the request, so the replicas
+        // Admission routed every stage of the request, so the replicas
         // reading this call's products are known here: the producer names
-        // the ranks of the components its request's graph reads them with,
+        // the ranks of the stages its request's graph reads them with,
         // on the replicas the request was routed to.
         let readers = state
             .graph
             .consumers(media_call)
             .iter()
             .filter_map(|consumer| {
-                let component = self.info.media_components.get(consumer)?;
-                let routed = self
-                    .dispatch
-                    .affinity
-                    .get(&(request_key, component.clone()))?;
-                Some((component.clone(), routed.clone()))
+                let stage = self.info.media_stages.get(consumer)?;
+                let routed = self.dispatch.affinity.get(&(request_key, stage.clone()))?;
+                Some((stage.clone(), routed.clone()))
             })
             .collect();
 

@@ -200,7 +200,7 @@ impl Scheduler {
                         .inflight
                         .pending_shadows
                         .push((copy, batch.token_shape())),
-                    // A refused pass is answered at once, because waiting will
+                    // A refused pass gets its response at once, because waiting will
                     // not shadow it.
                     Err(error) => self.shadow_failed(format!("{error:#}")),
                 }
@@ -260,8 +260,8 @@ impl Scheduler {
     /// Returns whether any rank queue can still accept a batch.
     ///
     /// `queue_depth` bounds the batches in flight on one rank, not across the
-    /// worker group: a batch carries one call kind to one component, so a media
-    /// pass occupies a slot on each component it touches rather than a single
+    /// worker group: a batch carries one call kind to one stage, so a media
+    /// pass occupies a slot on each stage it touches rather than a single
     /// shared slot. Assembling stops once every rank queue is full.
     fn a_rank_queue_admits(&self) -> bool {
         self.worker
@@ -306,7 +306,7 @@ impl Scheduler {
     /// Strips a retiring request's queued calls, and the admissions among its
     /// commands, from the batches the worker has not accepted yet.
     ///
-    /// A batch is planned from the state of the step that named it, and a
+    /// A batch is prepared from the state of the step that named it, and a
     /// worker queue deeper than one batch keeps it queued while later steps
     /// run. A request that ends in that window leaves calls behind that no
     /// result will resolve, and a batch that still carries one can no longer
@@ -368,7 +368,7 @@ impl Scheduler {
 
     /// One pass of the step loop, without waiting: flushes the output
     /// journals, takes one completed batch (`update`), reads what the Storage
-    /// Servers answered, assembles the batches that fit (`schedule`) and
+    /// Servers responded, assembles the batches that fit (`schedule`) and
     /// submits them. Returns whether anything happened; a caller that finds
     /// nothing did waits (`Scheduler::wait`).
     pub(super) fn step(&mut self) -> bool {
@@ -421,18 +421,18 @@ impl Scheduler {
         progressed
     }
 
-    /// Takes the host KV cache's answers, and ends the pins of requests
+    /// Takes the host KV cache's responses, and ends the pins of requests
     /// that left the scheduler. Returns whether admission pins were
-    /// answered.
+    /// responded.
     fn poll_kv_offload(&mut self) -> bool {
         let Some(kv_offload) = self.kv_offload.as_mut() else {
             return false;
         };
-        let answered = kv_offload.poll();
+        let responded = kv_offload.poll();
         // Nothing pinned means nothing to sweep, so a step gathers no live set
         // to find that out (design §4.4).
         if !kv_offload.holds() {
-            return answered;
+            return responded;
         }
         let requests = &self.requests;
         kv_offload.sweep(|request| {
@@ -440,7 +440,7 @@ impl Scheduler {
                 .get(&request)
                 .is_some_and(|request| request.tokens().is_some())
         });
-        answered
+        responded
     }
 
     /// Assembles the batches that fit now, at most one per worker group and
@@ -632,7 +632,7 @@ impl Scheduler {
             .collect();
         // A page the host was offered as it was published has nothing left to move. A policy names
         // the same idle pages step after step, and taking one again pins it out of the free queue
-        // until the host answers, so requests that need units would wait behind cached pages.
+        // until the host responses, so requests that need units would wait behind cached pages.
         let units = self
             .storage
             .cache()
@@ -656,7 +656,7 @@ impl Scheduler {
     ///
     /// The device hit cannot grow, so the deepening is the host boundary
     /// beyond it: asking again after host pages arrive raises the boundary,
-    /// and the answer is recorded so the next dispatch sees what the request
+    /// and the response is recorded so the next dispatch sees what the request
     /// can reuse. A request the mechanism cannot place, or whose host lookup
     /// is still in flight, keeps what it had: the output asked, the cache is not
     /// ready, and no request is at fault.
@@ -691,7 +691,7 @@ impl Scheduler {
     /// Nothing decides before the policy is installed: an epoch waits for its
     /// first `Switchover` (§7.3), and a scheduler with no slot schedules
     /// nothing. The slot is taken out of the scheduler for the calls and put
-    /// back whatever they answer, so a failure can hand the mechanism's state
+    /// back whatever they respond, so a failure can hand the mechanism's state
     /// to the switch without borrowing the scheduler the slot lives in.
     fn policy_step(&mut self) -> Option<DispatchOutput> {
         let mut policy = self.policy.take()?;
@@ -721,7 +721,7 @@ impl Scheduler {
         #[cfg(debug_assertions)]
         self.assert_policy_in_sync();
         let room = self.room();
-        // A resident request that has not advanced within the policy's timeout
+        // A running request that has not advanced within the policy's timeout
         // is the policy's failure, not the request's (design §4.4) - but one
         // request's silence is not the deployment's (§4.4's liveness rule is
         // per request): the request fails by name and the others are served.
@@ -736,7 +736,7 @@ impl Scheduler {
                 .map(|request| (request, self.starvation_report(&live, now)))
         };
         if let Some((request, report)) = starved {
-            // What could have been served instead: another resident, or a queued request. The
+            // What could have been served instead: another running request, or a waiting request. The
             // watchdog's own view names only the requests it tracks, so this is read from the
             // mechanism's queues rather than from that view.
             let others = self.running.len() > 1 || !self.waiting.is_empty();
@@ -751,10 +751,10 @@ impl Scheduler {
                 tracing::error!(
                     request = request.0,
                     reason = %report,
-                    "no batch was formed for anything resident"
+                    "no batch was formed for anything running"
                 );
                 self.fail(format!(
-                    "no batch formed for {} resident request(s) at step {}: {report}",
+                    "no batch formed for {} running request(s) at step {}: {report}",
                     self.running.len(),
                     self.step,
                 ));
@@ -772,7 +772,7 @@ impl Scheduler {
         };
         // The admission the output states is checked against the queue the policy
         // was given, and applied before the rest of the output is checked: a
-        // request the output admits is resident for the work the same output gives
+        // request the output admits is running for the work the same output gives
         // it, which is what lets one output both admit and run a request (§4.4).
         // Applying it first would make its own names unqueued.
         let live = self.live();
@@ -852,12 +852,12 @@ impl Scheduler {
     /// moved since the last call, which `close` turns into one `Updated` per
     /// view that differs from what the policy was told.
     ///
-    /// The marked requests are the residents accessed mutably, the requests
+    /// The marked requests are the running requests accessed mutably, the requests
     /// whose calls entered or left flight, and the admitted ones
     /// (`request::Requests`). A media request's next ready call also depends on the
-    /// calls other requests hold in flight on a shared component, so every
-    /// resident media request is stated each step; they are few, and a token
-    /// resident is never walked.
+    /// calls other requests hold in flight on a shared stage, so every
+    /// running media request is stated each step; they are few, and a token
+    /// running is never visited.
     ///
     /// Returns whether any view differed: the policy has something new to
     /// decide on.
@@ -923,10 +923,10 @@ impl Scheduler {
         None
     }
 
-    /// One line per step: what it planned and what became a batch.
+    /// One line per step: what it prepared and what became a batch.
     ///
     /// A step that serves nothing is the interesting one - a starvation is
-    /// otherwise unfalsifiable - so the line names what was resident, what the
+    /// otherwise unfalsifiable - so the line names what was running, what the
     /// output asked for, and how much of it became calls. The rows' classes are
     /// the calls' own kinds, which is what a refusal is about (a mixed phase or
     /// a mixed sampling class).
@@ -938,9 +938,9 @@ impl Scheduler {
         if calls == 0 {
             tracing::debug!(
                 step = self.step,
-                resident = self.running.len(),
+                running = self.running.len(),
                 queued = self.waiting.len(),
-                planned = output.work.len() + output.refill.len(),
+                prepared = output.work.len() + output.refill.len(),
                 admitted = output.admit.len(),
                 in_flight =
                     self.inflight.pending_batches.len() + self.inflight.pending_submissions.len(),
@@ -970,11 +970,11 @@ impl Scheduler {
         );
     }
 
-    /// The starvation rule's report: what was resident, in which state, and how
+    /// The starvation rule's report: what was running, in which state, and how
     /// long each request has gone without advancing.
     ///
     /// A starvation with a healthy device must never end a process without
-    /// saying what was resident (§4.4), so the report is read by the failure
+    /// saying what was running (§4.4), so the report is read by the failure
     /// itself and by the log line above it.
     fn starvation_report(
         &self,
@@ -982,7 +982,7 @@ impl Scheduler {
         now: scheduling::guest::Nanos,
     ) -> String {
         let mut text = format!(
-            "{} resident, {} queued, {} in flight, {} waiting to be submitted, {} of {} cache \
+            "{} running, {} waiting, {} in flight, {} waiting to be submitted, {} of {} cache \
              units free",
             self.running.len(),
             self.waiting.len(),
@@ -1129,10 +1129,10 @@ impl Scheduler {
 
     /// States the page table and the recorder from the instance that serves
     /// now, which every change of instance does: a mechanism that kept the
-    /// table of the instance before it would judge the new one's answers by a
+    /// table of the instance before it would judge the new one's responds by a
     /// state it was never told.
     pub(super) fn seed_from_policy(&mut self) {
-        // The epoch's page table is walked once, here, so every later step costs
+        // The epoch's page table is read once, here, so every later step costs
         // what changed: the policy was handed the same table in its snapshot.
         self.pages = views::page_index(self);
         self.pages_seeded = true;
@@ -1170,7 +1170,7 @@ impl Scheduler {
     /// Allocates the completion product of a state-advancing media call that
     /// declares no outputs.
     ///
-    /// `plan_media_call` requests one for latent preparation and every
+    /// `prepare_media_call` requests one for latent preparation and every
     /// denoising step but the last; the request's next state-advancing call
     /// names it as its `predicate` while this call is still in flight. The
     /// generation counter is shared with the products the generation path

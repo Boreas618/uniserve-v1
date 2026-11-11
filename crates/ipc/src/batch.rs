@@ -128,7 +128,7 @@ pub struct LatentOffload {
 /// pinned the pool slots until the call's result.
 ///
 /// The stored ranks may have laid the samples out under another parallel
-/// configuration than the restoring ranks: every rank plans its copies
+/// configuration than the restoring ranks: every rank prepares its copies
 /// from the sources it reads ([`LatentSource::readers`]) to its own pages,
 /// and pages laid out alike are copied whole.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,9 +254,9 @@ pub struct DecodeRange {
     pub cursor: u32,
     /// Maximum decoder units the call may process.
     pub max_units: u32,
-    /// Ranks of a distributed component that hold the call's units, in unit
+    /// Ranks of a distributed stage that hold the call's units, in unit
     /// order: each takes the next `units_per_rank` units and the last what
-    /// remains. Empty deals the units to the component's ranks in configured
+    /// remains. Empty deals the units to the stage's ranks in configured
     /// order, the deal of every call whose units follow that order.
     pub ranks: Vec<u32>,
 }

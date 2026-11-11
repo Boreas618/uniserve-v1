@@ -16,7 +16,7 @@ use scheduling_guest::time::Nanos;
 use crate::error::PolicyError;
 
 /// The longest starvation deadline §4.4 allows, the way sched_ext caps
-/// `timeout_ms` at 30 seconds: a policy may not let a resident request wait
+/// `timeout_ms` at 30 seconds: a policy may not let a running request wait
 /// longer than this without failing.
 pub const MAX_STARVATION_TIMEOUT: Nanos = Nanos(30_000_000_000);
 
@@ -74,7 +74,7 @@ pub(crate) fn check(limits: &Limits, ceilings: &Limits) -> Result<(), PolicyErro
 
     if limits.timeout.0 == 0 {
         return Err(outside(
-            "timeout is zero; a resident request would be starved from the first step",
+            "timeout is zero; a running request would be starved from the first step",
         ));
     }
     if limits.timeout > MAX_STARVATION_TIMEOUT {

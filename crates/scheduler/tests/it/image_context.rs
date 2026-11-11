@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ipc::execution::{Batch, RowKind, Variant};
-use ipc::{BufferId, CallKind, ComponentInfo, ForwardMode, MediaCall};
+use ipc::{BufferId, CallKind, ForwardMode, MediaCall, StageInfo};
 use ipc::{CanvasSampling, RequestId, SamplingParams};
 use scheduler::{
     CachePolicy, Event, FinishReason, GenerationRequest, ImageEncoderInput, ImageInput,
@@ -68,11 +68,11 @@ fn image_pool() -> ipc::execution::Inventory {
         rank.encoder_entry_bytes = 256 << 20;
         rank.max_batch_calls = 1024;
         rank.max_unresolved_calls = 2;
-        rank.components = vec![ComponentInfo {
+        rank.stages = vec![StageInfo {
             name: "model".to_owned(),
             outputs: Vec::new(),
         }];
-        rank.media_components = BTreeMap::from([(MediaCall::VisionEncoding, "model".to_owned())]);
+        rank.media_stages = BTreeMap::from([(MediaCall::VisionEncoding, "model".to_owned())]);
         for group in rank
             .prefix_cache
             .iter_mut()
@@ -92,7 +92,7 @@ fn fake(pool: ipc::execution::Inventory) -> Arc<FakeBatches> {
         FakeBatches::new(vec![pool])
             .with_text_len(TEXT_LEN)
             .with_block_steps(SAMPLING.max_steps)
-            .answering_media(Arc::new(testkit::Media::new())),
+            .with_media_outputs(Arc::new(testkit::Media::new())),
     )
 }
 
@@ -335,9 +335,9 @@ fn an_image_prompt_is_written_by_one_context_prefill() {
         .multimodal_inputs
         .images
         .push(vision_image(99, 10, 9));
-    let answer = events(running.submit(request));
+    let response = events(running.submit(request));
     let accepted = running.stop();
-    assert_generated(&answer, key, 25);
+    assert_generated(&response, key, 25);
 
     // The image is encoded, the context is prefilled, and the block's steps
     // follow.
@@ -381,9 +381,9 @@ fn a_context_prefill_writes_every_image_it_reaches() {
         .multimodal_inputs
         .images
         .push(vision_image(102, 12, 7));
-    let answer = events(running.submit(request));
+    let response = events(running.submit(request));
     let accepted = running.stop();
-    assert_generated(&answer, key, 32);
+    assert_generated(&response, key, 32);
 
     let features: Vec<BufferId> = accepted
         .iter()
@@ -490,9 +490,9 @@ fn a_context_chunk_ends_before_an_image_block_it_cannot_hold() {
         .multimodal_inputs
         .images
         .push(vision_image(103, 12, 9));
-    let answer = events(running.submit(request));
+    let response = events(running.submit(request));
     let accepted = running.stop();
-    assert_generated(&answer, key, 39);
+    assert_generated(&response, key, 39);
 
     let chunks: Vec<_> = accepted
         .iter()
@@ -600,10 +600,10 @@ fn a_blocks_first_step_is_queued_behind_its_image_context_prefill() {
         .multimodal_inputs
         .images
         .push(vision_image(104, 20, 9));
-    let answer = events(running.submit(request));
+    let response = events(running.submit(request));
     drop(pacer);
     let accepted = running.stop();
-    assert_generated(&answer, key, 33);
+    assert_generated(&response, key, 33);
 
     let prefill = accepted
         .iter()
