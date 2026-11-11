@@ -157,6 +157,8 @@ pub fn collective_type(dtype: DType) -> Option<CollectiveType> {
         DType::BF16 => CollectiveType::Bf16,
         DType::F32 => CollectiveType::F32,
         DType::F8E4M3 => CollectiveType::F8E4M3,
+        DType::U32 => CollectiveType::U32,
+        DType::F64 => CollectiveType::F64,
         // NCCL has no 16-bit integer reduction: a silent fallback would be a wrong answer, so a
         // PCM sample travels as bytes and never as a collective's element.
         DType::I16 => return None,

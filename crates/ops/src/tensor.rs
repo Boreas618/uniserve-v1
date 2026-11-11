@@ -100,6 +100,11 @@ pub enum DType {
     F4E2M1 = 7,
     /// Signed 16-bit integer: the 16-bit PCM sample element.
     I16 = 8,
+    /// Unsigned 32-bit integer: the index element of the tensor primitives, and their `argmin` and
+    /// `argmax` result.
+    U32 = 9,
+    /// IEEE 754 double precision.
+    F64 = 10,
 }
 
 impl DType {
@@ -120,6 +125,8 @@ impl DType {
             6 => Self::F8E4M3,
             7 => Self::F4E2M1,
             8 => Self::I16,
+            9 => Self::U32,
+            10 => Self::F64,
             _ => return None,
         })
     }
@@ -130,8 +137,8 @@ impl DType {
             Self::F4E2M1 => 4,
             Self::U8 | Self::F8E4M3 => 8,
             Self::F16 | Self::BF16 | Self::I16 => 16,
-            Self::I32 | Self::F32 => 32,
-            Self::I64 => 64,
+            Self::I32 | Self::U32 | Self::F32 => 32,
+            Self::I64 | Self::F64 => 64,
         }
     }
 
@@ -151,7 +158,7 @@ impl DType {
     pub const fn is_float(self) -> bool {
         matches!(
             self,
-            Self::F16 | Self::BF16 | Self::F32 | Self::F8E4M3 | Self::F4E2M1
+            Self::F16 | Self::BF16 | Self::F32 | Self::F64 | Self::F8E4M3 | Self::F4E2M1
         )
     }
 
@@ -160,21 +167,26 @@ impl DType {
     /// Stability of Numerical Algorithms*, 2nd ed., §2.2).
     pub const fn unit_roundoff(self) -> f64 {
         match self {
-            Self::F32 => 5.960_464_477_539_063e-8, // 2^-24
-            Self::BF16 => 3.906_25e-3,             // 2^-8
-            Self::F16 => 4.882_812_5e-4,           // 2^-11
-            Self::F8E4M3 => 6.25e-2,               // 2^-4
-            Self::F4E2M1 => 2.5e-1,                // 2^-2
-            Self::U8 | Self::I16 | Self::I32 | Self::I64 => 0.0,
+            Self::F64 => 1.110_223_024_625_156_5e-16, // 2^-53
+            Self::F32 => 5.960_464_477_539_063e-8,    // 2^-24
+            Self::BF16 => 3.906_25e-3,                // 2^-8
+            Self::F16 => 4.882_812_5e-4,              // 2^-11
+            Self::F8E4M3 => 6.25e-2,                  // 2^-4
+            Self::F4E2M1 => 2.5e-1,                   // 2^-2
+            Self::U8 | Self::U32 | Self::I16 | Self::I32 | Self::I64 => 0.0,
         }
     }
 
     /// The element type a reduction over this one accumulates in.
     ///
-    /// Every operator here accumulates a floating reduction in FP32, so the
-    /// bounds are written with `u = 2^-24` whatever the input dtype is.
+    /// Every operator here accumulates a floating reduction in FP32, so the bounds are written
+    /// with `u = 2^-24` whatever the input dtype is; FP64 alone accumulates in itself, because
+    /// FP32 would lose what its elements hold.
     pub const fn accumulate(self) -> Self {
-        Self::F32
+        match self {
+            Self::F64 => Self::F64,
+            _ => Self::F32,
+        }
     }
 }
 
@@ -206,12 +218,14 @@ impl fmt::Display for DType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::U8 => "u8",
+            Self::U32 => "u32",
             Self::I16 => "i16",
             Self::I32 => "i32",
             Self::I64 => "i64",
             Self::F16 => "f16",
             Self::BF16 => "bf16",
             Self::F32 => "f32",
+            Self::F64 => "f64",
             Self::F8E4M3 => "f8e4m3",
             Self::F4E2M1 => "f4e2m1",
         };

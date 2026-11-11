@@ -59,6 +59,19 @@
 //!
 //! The attention and mixture-of-experts operators are `attention` and `moe`, beside these.
 //!
+//! Tensor primitives, which read strided operands of any shape ([`strided`]):
+//!
+//! | Operator | `NAME` | Module |
+//! | --- | --- | --- |
+//! | [`elementwise::ElementwiseUnary`] | `elementwise_unary` | [`elementwise`] |
+//! | [`elementwise::ElementwiseBinary`] | `elementwise_binary` | [`elementwise`] |
+//! | [`elementwise::ElementwiseWhere`] | `elementwise_where` | [`elementwise`] |
+//! | [`cast::Cast`] | `cast` | [`cast`] |
+//! | [`copy_strided::CopyStrided`] | `copy_strided` | [`copy_strided`] |
+//! | [`fill::Fill`] | `fill` | [`fill`] |
+//! | [`reduce::Reduce`] | `reduce` | [`reduce`] |
+//! | [`index::Index`] | `index` | [`index`] |
+//!
 //! ## Descriptor keys
 //!
 //! A descriptor's `Display` is its key, and the key is the last segment of the module's path
@@ -87,20 +100,25 @@ pub mod block_copy;
 #[cfg(test)]
 pub mod call_layout_check;
 pub mod capture;
+pub mod cast;
 pub mod channel_affine;
 pub mod commit;
 pub mod conv;
 pub mod copy_block;
+pub mod copy_strided;
 pub mod cross_fade;
 pub mod descriptor;
+pub mod elementwise;
 pub mod embedding;
 pub mod error;
+pub mod fill;
 pub mod fp4;
 pub mod fp8;
 pub mod frame;
 pub mod gelu;
 pub mod gemm;
 pub mod generation;
+pub mod index;
 pub mod install;
 pub mod kernel;
 pub mod kv;
@@ -117,12 +135,14 @@ pub mod position;
 pub mod posterior;
 pub mod prefix_cache;
 pub mod recurrent;
+pub mod reduce;
 pub mod residual;
 pub mod rgb;
 pub mod rope;
 pub mod rows;
 pub mod sampler;
 pub mod snake;
+pub mod strided;
 pub mod tensor;
 pub mod tile_stitch;
 pub mod tolerance;

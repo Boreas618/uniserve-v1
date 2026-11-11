@@ -1,0 +1,45 @@
+# The copy_strided operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# `destination[i] = source[i]`: a source read through its strides, moved into a
+# row-major window — a contiguous tensor, or a block of a larger one. That is a
+# strided tensor made contiguous at an element offset, a two-dimensional copy
+# whose row strides differ on the two sides, and a concatenation, a padding or a
+# slice assignment writing its block. No element is converted, so the operator's
+# tolerance is `exact()`. The element type and the number of axes the call
+# traverses are compiled in; the shape and both stride vectors are launch words.
+# The key is the one `Descriptor`'s `Display` prints, e.g.
+# `dtype_bf16_rank_2_block_1024_pdl_false`.
+#
+# `src/strided.py` links the address arithmetic every tensor primitive shares,
+# under `kernels/tensor/triton/src/`; an installation copies the file the link
+# names.
+
+op = "copy_strided"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/copy_strided.py", "src/strided.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
+
+[parameters]

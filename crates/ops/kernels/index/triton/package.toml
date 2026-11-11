@@ -1,0 +1,52 @@
+# The index operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# Elements read or written at the positions an index tensor names along one
+# axis. `gather` reads the source at the indexed positions; `scatter_set` and
+# `scatter_add` store or add the source at the indexed positions of a
+# contiguous destination. An index vector that serves every position off the
+# axis is indices with a zero stride off it, so `index_select` is a `gather`
+# and `index_add` a `scatter_add`. Indices are `u8`, `u32` or `i64`, and the
+# largest value of the type names no element.
+#
+# A gather's programs are independent. A scatter's traverse the indexed axis in
+# order within each column, so a repeated index is well defined and the
+# operator's tolerance is `exact()` for all three functions.
+#
+# The function, both element types and the number of axes the call traverses are
+# compiled in; extents, strides and the axis's steps are launch words. The key
+# is the one `Descriptor`'s `Display` prints, e.g.
+# `function_gather_dtype_bf16_indices_u32_rank_2_block_1024_pdl_false`.
+#
+# `src/strided.py` links the address arithmetic every tensor primitive shares,
+# under `kernels/tensor/triton/src/`; an installation copies the file the link
+# names.
+
+op = "index"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/index.py", "src/strided.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { function = ["gather", "scatter_set", "scatter_add"], dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], indices = ["u8", "u32", "i64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
+
+[parameters]
