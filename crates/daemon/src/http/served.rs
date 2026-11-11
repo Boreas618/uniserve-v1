@@ -9,10 +9,12 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 
 use frontend::body::{Opening, Session};
+use frontend::events::Events;
 use frontend::input::video::{ProcessedVideo, VideoGenerationRequest};
-use frontend::input::{AdapterSelection, GenerateRequest, InputProcessor, ServeError};
-use frontend::openai::{ApiError, Generation, Server};
-use frontend::output::RequestOutputStream;
+use frontend::input::{AdapterSelection, Processor, ServeError};
+use frontend::openai::{ApiError, Server};
+use frontend::output::{OutputProcessor, RequestOutputStream};
+use frontend::protocol::ChatCompletionRequest;
 
 use crate::http::handoff::Handoff;
 use crate::http::stream::{HandedBody, ResponseStream, attach};
@@ -45,12 +47,17 @@ impl Server for Served {
         self.leader.adapter(name)
     }
 
-    fn processor(&self) -> &InputProcessor {
+    fn processor(&self) -> &Processor {
         self.leader.processor()
     }
 
-    fn generate(&self, request: GenerateRequest) -> BoxFuture<'_, Result<Generation, ServeError>> {
-        self.leader.generate(request).boxed()
+    fn generate(
+        &self,
+        request_id: String,
+        request: ChatCompletionRequest,
+        adapter: Option<AdapterSelection>,
+    ) -> BoxFuture<'_, Result<(Box<dyn Events>, OutputProcessor), ApiError>> {
+        self.leader.generate(request_id, request, adapter).boxed()
     }
 
     fn generate_video(

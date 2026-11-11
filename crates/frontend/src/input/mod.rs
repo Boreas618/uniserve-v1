@@ -1,25 +1,23 @@
 //! Input processing: what turns an API request into the request the engine
 //! serves.
 //!
-//! [`InputProcessor`] renders and tokenizes a request against the loaded
-//! model: chat templates (`chat`), sampling controls (`sampling`), images
-//! (`media`), and the lowering of each model family's requests (`video`). Each
-//! request leaves with its engine request and the parameters its output
-//! processing takes (`OutputParams`, `crate::output`).
+//! [`Processor`] renders and tokenizes a request against the loaded model:
+//! chat templates (`chat`), sampling controls (`sampling`), images (`media`),
+//! and the lowering of each model family's requests (`video`). Each request
+//! leaves as its engine request and the lowering its output processing is
+//! built from (`proto::handoff::Lowering`).
 
 pub mod chat;
 mod error;
 pub mod media;
 pub mod processor;
-mod request;
-pub(crate) mod sampling;
+mod sampling;
 pub mod video;
 
 pub use error::{ServeError, SubmitError, TokenizeError};
 pub use media::ImageInput;
-pub use processor::{InputProcessor, ModelResolutionError, RequestRenderer};
+pub use processor::{AdapterSelection, ModelResolutionError, Processor, RequestRenderer};
 pub use processor::{LoadedModel, LoadedRenderer};
-pub use request::{AdapterSelection, GenerateRequest};
 
 /// Result type returned by serving-runtime calls.
 pub type Result<T> = std::result::Result<T, ServeError>;

@@ -2,7 +2,7 @@
 //! media request's engine events into public serving events.
 //!
 //! [`StreamClock`] keeps the timings every response reports in its terminal
-//! usage; a token request's body (`output::run`) and [`media_output`] share
+//! usage; a token request's `OutputProcessor` and [`media_output`] share
 //! it. Elapsed times are microseconds since the request started. The queue
 //! wait is the difference of the engine's `Scheduled` UNIX timestamps,
 //! clamped at zero.
@@ -11,7 +11,7 @@
 //! `Finished` with the request's usage, `Rejected`, `Failed`, or an
 //! `OutputError` when engine output violates the event protocol.
 
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::events::Events;
 use asynk_strim_attr::{TryYielder, try_stream};
@@ -37,10 +37,7 @@ impl StreamClock {
     pub(super) fn new(started: Instant, compile_us: u64) -> Self {
         Self {
             started,
-            started_unix_us: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|since| since.as_micros() as u64)
-                .unwrap_or_default(),
+            started_unix_us: unix_us(),
             compile_us,
             queue_us: None,
             first_visible_output_us: None,
@@ -55,7 +52,7 @@ impl StreamClock {
         compile_us: u64,
     ) -> Self {
         Self {
-            started: super::run::started_instant(started_unix_us),
+            started: started_instant(started_unix_us),
             started_unix_us,
             compile_us,
             queue_us: state.queue_us,
@@ -104,6 +101,21 @@ impl StreamClock {
             total_us: self.elapsed_us(),
         }
     }
+}
+
+/// The current UNIX time in microseconds.
+fn unix_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_micros() as u64)
+        .unwrap_or_default()
+}
+
+/// The instant a response started, from the wall-clock origin a handed state
+/// carries: the successor's timings continue the predecessor's.
+pub fn started_instant(started_unix_us: u64) -> Instant {
+    let elapsed = unix_us().saturating_sub(started_unix_us);
+    Instant::now() - Duration::from_micros(elapsed)
 }
 
 /// The error of engine output that violates the event protocol.

@@ -3,8 +3,8 @@
 //! [`DecodeStream`] consumes one generation request's `RequestEvents`,
 //! checks the engine event protocol, detokenizes generated tokens with the
 //! tokenizer's `IncrementalDecoder`, decodes requested logprobs, matches stop
-//! strings, and passes image events through in order. `output::run`
-//! feeds its output to the request's chat output processor.
+//! strings, and passes image events through in order. The request's
+//! `OutputProcessor` feeds its output to the reasoning and tool-call parsers.
 //!
 //! The decoder also reports its stop-string decisions to the engine: it
 //! acknowledges each token only after checking that it completes no stop
@@ -14,40 +14,14 @@
 use std::sync::Arc;
 
 use crate::events::Events;
+use proto::handoff::TextDecode;
 use proto::request::{Event, PositionLogprobs, RejectionKind};
-use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
 
 use super::logprobs::{DecodedLogprobs, decode_logprobs, decode_prompt_logprobs};
 use crate::output::events::{FinishReason, PromptInfo, StopReason};
 use crate::output::text::error::Error;
 use crate::tokenizer::{DynTokenizer, IncrementalDecoder};
-
-/// Request-neutral options for incremental text decoding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TextDecodeOptions {
-    /// Whether tokenizer special tokens are omitted from decoded text.
-    pub skip_special_tokens: bool,
-    /// Whether the matched stop string remains in emitted output.
-    pub include_stop_str_in_output: bool,
-    /// Decoded strings that terminate generation.
-    pub stop_strings: Option<Vec<String>>,
-    /// Minimum number of generated tokens before stop strings can terminate output.
-    pub min_tokens: u32,
-}
-
-impl Default for TextDecodeOptions {
-    /// Skips special tokens, excludes a matched stop string from output, and
-    /// configures no stop strings or minimum length.
-    fn default() -> Self {
-        Self {
-            skip_special_tokens: true,
-            include_stop_str_in_output: false,
-            stop_strings: None,
-            min_tokens: 0,
-        }
-    }
-}
 
 /// How a decoded request finished, with its token counts.
 #[derive(Debug, Clone, PartialEq)]
@@ -138,7 +112,7 @@ pub struct DecodeStream {
     generated_logprobs_requested: bool,
     decoder: IncrementalDecoder,
     /// Decode options; matched stop strings are removed from `stop_strings`.
-    options: TextDecodeOptions,
+    options: TextDecode,
     /// Prompt logprob positions received so far.
     prompt_positions: Vec<PositionLogprobs>,
     /// `(queued_at, scheduled_at)` of the engine's scheduling event.
@@ -176,7 +150,7 @@ impl DecodeStream {
         prompt_token_ids: Vec<u32>,
         prompt_logprobs_requested: bool,
         generated_logprobs_requested: bool,
-        decode_options: TextDecodeOptions,
+        decode_options: TextDecode,
     ) -> Result<Self, Error> {
         if prompt_token_ids.is_empty() {
             return Err(Error::EmptyPromptTokenIds { request_id });
@@ -202,8 +176,13 @@ impl DecodeStream {
         })
     }
 
+    /// The prompt's token identifiers, which seeded the decoder.
+    pub fn prompt_token_ids(&self) -> &[u32] {
+        &self.prompt_token_ids
+    }
+
     /// The decode options, with the stop strings not matched yet.
-    pub fn options(&self) -> &TextDecodeOptions {
+    pub fn options(&self) -> &TextDecode {
         &self.options
     }
 
@@ -535,7 +514,7 @@ impl DecodeStream {
                 skip_special_tokens: decoder.skip_special_tokens,
                 min_bytes_to_buffer: decoder.min_bytes_to_buffer as u64,
             }),
-            stop_strings: self.options.stop_strings.clone().unwrap_or_default(),
+            stop_strings: self.options.stop_strings.clone(),
             prompt_positions: self
                 .prompt_positions
                 .iter()
@@ -570,7 +549,7 @@ impl DecodeStream {
         prompt_token_ids: Vec<u32>,
         prompt_logprobs_requested: bool,
         generated_logprobs_requested: bool,
-        options: TextDecodeOptions,
+        options: TextDecode,
         state: &proto::handoff::Decode,
     ) -> Result<Self, Error> {
         if prompt_token_ids.is_empty() {
@@ -598,7 +577,7 @@ impl DecodeStream {
             ),
         };
         let mut options = options;
-        options.stop_strings = (!state.stop_strings.is_empty()).then(|| state.stop_strings.clone());
+        options.stop_strings.clone_from(&state.stop_strings);
         Ok(Self {
             request_id,
             tokenizer,
@@ -642,17 +621,12 @@ fn decode_one_token(
     decoder: &mut IncrementalDecoder,
     token_id: u32,
     output_tokens: usize,
-    options: &mut TextDecodeOptions,
+    options: &mut TextDecode,
 ) -> Result<ArDecode, Error> {
     let new_bytes = decoder.push_token(token_id)?;
     let stop = if output_tokens + 1 > options.min_tokens as usize {
-        if let Some(stops) = options.stop_strings.as_mut()
-            && let Some((index, offset)) = matches_stop_string(stops, decoder.output(), new_bytes)
-        {
-            Some((stops.swap_remove(index), offset))
-        } else {
-            None
-        }
+        matches_stop_string(&options.stop_strings, decoder.output(), new_bytes)
+            .map(|(index, offset)| (options.stop_strings.swap_remove(index), offset))
     } else {
         None
     };
@@ -670,14 +644,15 @@ fn decode_one_token(
 /// match out of emitted text until the next token confirms or rules it out.
 /// No holdback is needed when matched stop strings stay in the output. The
 /// result is passed to the decoder as its `min_bytes_to_buffer`.
-fn stop_string_holdback_bytes(options: &TextDecodeOptions) -> usize {
+fn stop_string_holdback_bytes(options: &TextDecode) -> usize {
     if options.include_stop_str_in_output {
         return 0;
     }
     options
         .stop_strings
-        .as_ref()
-        .and_then(|stops| stops.iter().map(String::len).max())
+        .iter()
+        .map(String::len)
+        .max()
         .unwrap_or(1)
         .saturating_sub(1)
 }

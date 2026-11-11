@@ -2,12 +2,10 @@
 
 use std::sync::Arc;
 
-use frontend::input::chat::{ChatRequest, ChatToolChoice};
 use frontend::output::chat::AssistantEvent;
-use frontend::output::chat::{AssistantBlockKind, ChatOutputProcessor};
-use frontend::output::tools::Tool;
-use frontend::test_support::chat;
+use frontend::output::chat::{AssistantBlockKind, ChatParser};
 use frontend::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use proto::handoff;
 use tokenizers::models::bpe::BPE;
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
@@ -30,27 +28,24 @@ fn qwen_tokenizer() -> Result<DynTokenizer, Box<dyn std::error::Error + Send + S
     Ok(Arc::new(HuggingFaceTokenizer::from_json(definition)?))
 }
 
-/// A chat request that declares the `lookup` tool with `Auto` tool choice,
-/// which enables tool-call parsing.
-fn request_with_lookup() -> ChatRequest {
-    let mut request = chat::request(vec![chat::user("test")]);
-    request.tools = vec![Tool {
-        name: "lookup".to_string(),
-        description: None,
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {"q": {"type": "string"}},
-            "required": ["q"]
-        }),
-        strict: None,
-    }];
-    request.tool_choice = ChatToolChoice::Auto;
-    request
+/// The parsers of a Qwen3 request: `<think>` reasoning when `reasoning` is
+/// set, JSON tool calls when `tools` is.
+fn qwen3(
+    tools: bool,
+    tokenizer: DynTokenizer,
+    reasoning: bool,
+) -> Result<ChatParser, Box<dyn std::error::Error + Send + Sync>> {
+    let parser = handoff::Parser {
+        kind: handoff::parser::Kind::ParserKindQwen3 as i32,
+        parse_reasoning: reasoning,
+        parse_tools: tools,
+    };
+    Ok(ChatParser::new(&parser, tokenizer)?)
 }
 
 /// Runs `processor` over `prompt` and `deltas`, then finishes it.
 fn parse(
-    mut processor: ChatOutputProcessor,
+    mut processor: ChatParser,
     prompt: &[u32],
     deltas: &[&str],
 ) -> Result<Vec<AssistantEvent>, Box<dyn std::error::Error + Send + Sync>> {
@@ -117,8 +112,7 @@ fn qwen3_processor_emits_reasoning_text_and_tool_calls() -> TestResult {
         .token_to_id("<|im_end|>")
         .ok_or_else(|| std::io::Error::other("configured prompt-end token is unavailable"))?;
     // The final argument enables reasoning parsing.
-    let processor =
-        ChatOutputProcessor::qwen3(Some(&request_with_lookup().tools), tokenizer, true)?;
+    let processor = qwen3(true, tokenizer, true)?;
 
     // The prompt ends with `<|im_end|>` and has no reasoning delimiter after
     // it, so generation starts outside a reasoning section and the `<think>`
@@ -158,8 +152,7 @@ fn qwen3_processor_emits_reasoning_text_and_tool_calls() -> TestResult {
 /// starts inside a call's arguments.
 #[test]
 fn qwen3_processor_keeps_text_and_tool_call_order_within_a_delta() -> TestResult {
-    let processor =
-        ChatOutputProcessor::qwen3(Some(&request_with_lookup().tools), qwen_tokenizer()?, false)?;
+    let processor = qwen3(true, qwen_tokenizer()?, false)?;
 
     // The first delta starts outside any call and ends inside the second
     // call's arguments; the second delta starts inside those arguments.
@@ -206,7 +199,7 @@ fn qwen3_processor_keeps_text_and_tool_call_order_within_a_delta() -> TestResult
 /// delimiters arrive in separate deltas.
 #[test]
 fn disabled_reasoning_parsing_streams_delimiters_as_content() -> TestResult {
-    let processor = ChatOutputProcessor::qwen3(None, qwen_tokenizer()?, false)?;
+    let processor = qwen3(false, qwen_tokenizer()?, false)?;
 
     let events = parse(processor, &[], &["<think>", "hi</think>after"])?;
 

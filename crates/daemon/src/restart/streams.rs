@@ -367,13 +367,13 @@ fn take_over(
                 &chat.engine_request_id,
                 chat.consumed_events,
             )?;
-            let started = frontend::output::run::started_instant(
+            let started = frontend::output::started_instant(
                 chat.lowering
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
             let outcome = leader.request_outcome(&state.request_id, chat.engine_replica, started);
-            let run = frontend::output::run::GenerationRun::resume_stream(
+            let run = frontend::openai::run::GenerationRun::resume_stream(
                 &chat,
                 leader.tokenizer(),
                 Box::new(events),
@@ -389,13 +389,13 @@ fn take_over(
                 &chat.engine_request_id,
                 chat.consumed_events,
             )?;
-            let started = frontend::output::run::started_instant(
+            let started = frontend::output::started_instant(
                 chat.lowering
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
             let outcome = leader.request_outcome(&state.request_id, chat.engine_replica, started);
-            let run = frontend::output::run::GenerationRun::resume_collection(
+            let run = frontend::openai::run::GenerationRun::resume_collection(
                 &chat,
                 leader.tokenizer(),
                 Box::new(events),
@@ -414,7 +414,7 @@ fn take_over(
                     content.job_id
                 )
             })?;
-            let run = frontend::output::run::VideoContentRun::new(
+            let run = frontend::openai::run::VideoContentRun::new(
                 content.job_id.clone(),
                 content.content_type.clone(),
                 media,

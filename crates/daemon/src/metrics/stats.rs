@@ -638,7 +638,7 @@ fn seconds(microseconds: u64) -> f64 {
     microseconds as f64 / 1_000_000.0
 }
 
-impl frontend::events::Outcome for RequestOutcome {
+impl frontend::events::Stats for RequestOutcome {
     fn started(&self) -> Instant {
         RequestOutcome::started(self)
     }

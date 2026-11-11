@@ -1,6 +1,6 @@
 //! Assistant output processing for chat generation.
 //!
-//! [`ChatOutputProcessor`] parses one request's decoded text, as vLLM's
+//! [`ChatParser`] parses one request's decoded text, as vLLM's
 //! default chat output processor does: an optional reasoning parser splits
 //! reasoning from visible text, and an optional tool parser extracts tool
 //! calls from the visible text (`tool`). Qwen3 chooses its parsers:
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::output::chat::{AssistantBlockKind, Error, Result};
 use crate::output::reasoning::{Qwen3ReasoningParser, ReasoningDelta, ReasoningParser};
-use crate::output::tools::{Qwen25ToolParser, Tool, ToolParser};
+use crate::output::tools::Qwen25ToolParser;
 use crate::tokenizer::DynTokenizer;
 
 use super::tool::ToolStage;
@@ -49,30 +49,44 @@ pub enum AssistantEvent {
 /// visible text passes unchanged. Text a parser holds back as a possible
 /// partial delimiter is released by a later push or by [`Self::finish`].
 #[derive(Default)]
-pub struct ChatOutputProcessor {
+pub struct ChatParser {
     reasoning: Option<Box<dyn ReasoningParser>>,
     tools: Option<ToolStage>,
-    /// The parser set the request's model family chose, which a successor
-    /// rebuilds the same processors from (design §7.5.1 step 3).
-    parser: handoff::Parser,
 }
 
-impl ChatOutputProcessor {
-    /// A processor over `reasoning` and `tools`.
-    pub fn new(
-        reasoning: Option<Box<dyn ReasoningParser>>,
-        tools: Option<Box<dyn ToolParser>>,
-    ) -> Self {
-        Self {
-            reasoning,
-            tools: tools.map(ToolStage::new),
-            parser: handoff::Parser::default(),
-        }
-    }
+impl ChatParser {
+    /// The parsers `parser` states for a request: its model family's reasoning format when
+    /// reasoning is parsed, and its tool-call format when tool calls are.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::ParserInitialization` when the tokenizer lacks a reasoning delimiter
+    /// as one token.
+    pub fn new(parser: &handoff::Parser, tokenizer: DynTokenizer) -> Result<Self> {
+        let kind = handoff::parser::Kind::try_from(parser.kind)
+            .unwrap_or(handoff::parser::Kind::ParserKindNone);
+        match kind {
+            handoff::parser::Kind::ParserKindNone => Ok(Self::default()),
+            handoff::parser::Kind::ParserKindQwen3 => {
+                let reasoning = parser
+                    .parse_reasoning
+                    .then(|| Qwen3ReasoningParser::new(tokenizer))
+                    .transpose()
+                    .map_err(|error| Error::ParserInitialization {
+                        kind: "reasoning",
+                        name: "qwen3".to_string(),
+                        error: Box::new(error),
+                    })?;
+                let tools = parser
+                    .parse_tools
+                    .then(|| ToolStage::new(Box::new(Qwen25ToolParser::new(&[]))));
 
-    /// The parser set this processor was built for.
-    pub fn parser(&self) -> &handoff::Parser {
-        &self.parser
+                Ok(Self {
+                    reasoning: reasoning.map(|parser| Box::new(parser) as Box<dyn ReasoningParser>),
+                    tools,
+                })
+            }
+        }
     }
 
     /// The parsers' state, for the process that goes on writing the response
@@ -103,42 +117,6 @@ impl ChatOutputProcessor {
         if let (Some(tools), Some(tools_state)) = (self.tools.as_mut(), state.tools.as_ref()) {
             tools.resume(tools_state);
         }
-    }
-
-    /// The Qwen3 processor of a request: `<think>` reasoning when
-    /// `parse_reasoning` is set, and JSON tool calls naming `tools` when a
-    /// request parses tool calls (`ChatRequest::tool_parsing_enabled`, the
-    /// condition under which its chat template sees the tools).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::ParserInitialization` when the tokenizer lacks the
-    /// `<think>` or `</think>` token.
-    pub fn qwen3(
-        tools: Option<&[Tool]>,
-        tokenizer: DynTokenizer,
-        parse_reasoning: bool,
-    ) -> Result<Self> {
-        let reasoning = parse_reasoning
-            .then(|| Qwen3ReasoningParser::new(tokenizer))
-            .transpose()
-            .map_err(|error| Error::ParserInitialization {
-                kind: "reasoning",
-                name: "qwen3".to_string(),
-                error: Box::new(error),
-            })?;
-        let parse_tools = tools.is_some();
-        let tools = tools.map(Qwen25ToolParser::new);
-        let mut processor = Self::new(
-            reasoning.map(|parser| Box::new(parser) as Box<dyn ReasoningParser>),
-            tools.map(|parser| Box::new(parser) as Box<dyn ToolParser>),
-        );
-        processor.parser = handoff::Parser {
-            kind: handoff::parser::Kind::ParserKindQwen3 as i32,
-            parse_reasoning,
-            parse_tools,
-        };
-        Ok(processor)
     }
 
     /// Chooses the region generation starts in from the prompt.

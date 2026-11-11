@@ -6,12 +6,12 @@ use proto::request::SamplingParams;
 
 use super::TokenizeError;
 use crate::model::SamplingDefaults;
-use crate::openai::ChatCompletionRequest;
+use crate::protocol::ChatCompletionRequest;
 use crate::tokenizer::HuggingFaceTokenizer;
 
 /// The engine's sampling parameters of `request`: each control it sets over
-/// the model's `defaults`, its logit biases (`logit_bias`, already keyed by
-/// token ID), and its bad words tokenized with `tokenizer`.
+/// the model's `defaults`, its logit biases keyed by token ID, and its bad
+/// words tokenized with `tokenizer`.
 ///
 /// Temperature, top-k, top-p, min-p and repetition penalty fall back to the
 /// model's defaults, then to the neutral value; every other control is the
@@ -20,21 +20,14 @@ use crate::tokenizer::HuggingFaceTokenizer;
 ///
 /// # Errors
 ///
-/// Fails when a bad word cannot be tokenized or the parameters fail
-/// `SamplingParams::validate`.
-pub(crate) fn lower(
+/// Fails when a `logit_bias` key is not a token ID, a bad word cannot be
+/// tokenized or the parameters fail `SamplingParams::validate`.
+pub(super) fn lower(
     request: &ChatCompletionRequest,
-    logit_bias: Option<std::collections::HashMap<u32, f32>>,
     defaults: &SamplingDefaults,
     tokenizer: &HuggingFaceTokenizer,
 ) -> Result<SamplingParams, TokenizeError> {
-    // The ordered map yields `logit_bias` sorted by token ID.
-    let logit_bias = logit_bias
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<std::collections::BTreeMap<_, _>>()
-        .into_iter()
-        .collect();
+    let logit_bias = logit_bias(request.logit_bias.as_ref())?;
     let logprobs = request
         .logprobs
         .then_some(request.top_logprobs.unwrap_or(0));
@@ -66,6 +59,32 @@ pub(crate) fn lower(
     };
     sampling.validate()?;
     Ok(sampling)
+}
+
+/// Converts OpenAI-style `logit_bias`, whose JSON object keys are decimal
+/// token IDs, into `(token_id, bias)` pairs sorted by token ID.
+///
+/// Token IDs are not checked against the vocabulary here.
+fn logit_bias(
+    logit_bias: Option<&std::collections::HashMap<String, f32>>,
+) -> Result<Vec<(u32, f32)>, TokenizeError> {
+    let mut pairs = logit_bias
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| {
+            key.parse()
+                .map(|token| (token, *value))
+                .map_err(|_| TokenizeError::InvalidParameter {
+                    param: Some("logit_bias"),
+                    message: format!(
+                        "Invalid key in 'logit_bias': '{key}' is not a valid token ID. \
+                         Token IDs must be non-negative integers."
+                    ),
+                })
+        })
+        .collect::<Result<Vec<(u32, f32)>, _>>()?;
+    pairs.sort_by_key(|(token, _)| *token);
+    Ok(pairs)
 }
 
 /// Converts a wire logprob count into the engine count.
@@ -118,17 +137,17 @@ fn tokenize_bad_words(
 ///
 /// # Errors
 ///
-/// Returns `text::Error::PromptTooLong` when `max_model_len` is set and
+/// Returns `TokenizeError::PromptTooLong` when `max_model_len` is set and
 /// `prompt_len >= max_model_len`.
 pub(super) fn resolve_max_tokens(
     user_max_tokens: Option<u32>,
     default_max_tokens: Option<u32>,
     max_model_len: Option<u32>,
     prompt_len: u32,
-) -> crate::output::text::Result<u32> {
+) -> Result<u32, TokenizeError> {
     let model_max_tokens = match max_model_len {
         Some(max_model_len) if prompt_len >= max_model_len => {
-            return Err(crate::output::text::Error::PromptTooLong {
+            return Err(TokenizeError::PromptTooLong {
                 max_model_len,
                 prompt_len,
             });
@@ -148,7 +167,6 @@ pub(super) fn resolve_max_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::text::Error;
 
     #[test]
     fn resolve_max_tokens_caps_by_model_len() {
@@ -175,7 +193,7 @@ mod tests {
     fn resolve_max_tokens_prompt_too_long() {
         assert!(matches!(
             resolve_max_tokens(Some(10), None, Some(100), 100),
-            Err(Error::PromptTooLong {
+            Err(TokenizeError::PromptTooLong {
                 max_model_len: 100,
                 prompt_len: 100,
             })

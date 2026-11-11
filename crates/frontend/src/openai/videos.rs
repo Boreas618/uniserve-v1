@@ -403,7 +403,7 @@ async fn videos_content(State(state): State<JobState>, Path(id): Path<String>) -
     // The body registers before it writes a chunk, so a hot restart pauses it
     // between two chunks and the successor goes on streaming the same
     // artifact from the byte this process reached.
-    let body = crate::output::run::VideoContentRun::new(id.clone(), "video/mp4".to_owned(), media);
+    let body = crate::openai::run::VideoContentRun::new(id.clone(), "video/mp4".to_owned(), media);
     let opening = crate::body::Opening::Streamed { keep_alive: false };
     match state
         .engine
@@ -443,7 +443,7 @@ fn media_body<M: AsRef<[u8]> + Send + Sync + 'static>(media: Arc<M>) -> Body {
 }
 
 /// Reports the served model, its video limits
-/// (`InputProcessor::video_capabilities`), and the settings of the job store.
+/// (`Processor::video_capabilities`), and the settings of the job store.
 async fn capabilities(State(state): State<JobState>) -> Json<Value> {
     let settings = state.jobs.settings();
     Json(json!({

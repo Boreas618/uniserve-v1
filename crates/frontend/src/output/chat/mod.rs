@@ -1,19 +1,17 @@
 //! The assistant side of chat: the values an assistant message consists of,
-//! the chat error, and the output processing of a chat request.
+//! and the parsing of a chat request's decoded text.
 //!
-//! A chat request flows through chat twice. Before submission,
-//! `InputProcessor` validates the request (`crate::input::chat`), builds its
-//! request-scoped [`ChatOutputProcessor`] with its model family's parsers,
-//! and renders the request into a prompt. During generation,
-//! `output::assembly` feeds decoded text through that processor and frames
-//! the resulting assistant events as public serving events (`structured`).
+//! A request's [`ChatParser`] holds the reasoning and tool-call parsers of the
+//! formats its model family's chat profile names. The request's
+//! `OutputProcessor` feeds decoded text through it and frames the resulting
+//! assistant events as response deltas (`structured`).
 //!
 //! The daemon's `chat_config.reasoning_parser` setting decides whether
 //! reasoning sections become reasoning blocks.
 
-pub use processor::{AssistantEvent, ChatOutputProcessor};
+pub use parser::{AssistantEvent, ChatParser};
 
-mod processor;
+mod parser;
 pub mod structured;
 mod tool;
 
@@ -25,26 +23,8 @@ use thiserror::Error;
 type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Error)]
-/// Error produced by chat request rendering or output processing.
+/// Why a chat request's output cannot be processed.
 pub enum Error {
-    /// The request contains no messages to render.
-    #[error("chat request must contain at least one message")]
-    EmptyMessages,
-    /// Continuation mode is selected for history that does not end with an assistant message.
-    #[error("cannot continue the final message when the last message is not from the assistant")]
-    ContinueFinalAssistantWithoutFinalAssistant,
-    /// Prompt rendering requires a template but no template is configured.
-    #[error("chat template is required but none was configured")]
-    MissingChatTemplate,
-    /// The chat template cannot be loaded, compiled, or rendered, or assistant
-    /// history cannot be converted into template values (for example, tool-call
-    /// arguments that are not valid JSON).
-    #[error("chat template error: {0}")]
-    ChatTemplate(String),
-    /// Multimodal content reached a text-only conversion or a renderer
-    /// configured without multimodal support.
-    #[error("unsupported multimodal content: {0}")]
-    UnsupportedMultimodalContent(&'static str),
     /// A reasoning or tool-call output parser cannot be initialized.
     #[error("failed to initialize {kind} parser `{name}`")]
     ParserInitialization {
@@ -64,9 +44,6 @@ pub enum Error {
         /// Description of the violated stream invariant.
         message: String,
     },
-    /// Model profile assets cannot be loaded or validated.
-    #[error(transparent)]
-    ModelAssets(#[from] crate::model::assets::Error),
     /// The text layer fails, for example in detokenization or engine output
     /// validation.
     #[error(transparent)]

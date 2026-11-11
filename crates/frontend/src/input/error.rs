@@ -1,6 +1,6 @@
-//! Serving errors: failures to resolve and tokenize a model input
-//! ([`TokenizeError`]), and the runtime's own ([`ServeError`]), which
-//! include failures to decode or parse model output.
+//! Input processing's errors: failures to lower and tokenize a request
+//! ([`TokenizeError`]), and the refusals a request leaves the deployment with
+//! before an engine serves it ([`ServeError`]).
 
 use thiserror::Error;
 
@@ -12,12 +12,29 @@ pub enum TokenizeError {
     /// The model tokenizer cannot encode request content.
     #[error(transparent)]
     Tokenizer(#[from] crate::tokenizer::TokenizerError),
-    /// Chat rendering or semantic request validation fails.
+    /// Chat rendering fails.
     #[error(transparent)]
-    Chat(#[from] crate::output::chat::Error),
-    /// Text sampling or decoding options cannot be resolved.
-    #[error(transparent)]
-    Text(#[from] crate::output::text::Error),
+    Chat(#[from] crate::input::chat::Error),
+    /// The tokenized prompt fills or exceeds the model context window, leaving
+    /// no room for a generated token.
+    #[error(
+        "this model's maximum context length is {max_model_len} tokens, \
+         but the prompt contains {prompt_len} input tokens"
+    )]
+    PromptTooLong {
+        /// Maximum token count accepted by the model context.
+        max_model_len: u32,
+        /// Tokenized prompt length.
+        prompt_len: u32,
+    },
+    /// A request parameter states a value the deployment does not take.
+    #[error("{message}")]
+    InvalidParameter {
+        /// The request field at fault, when one field is.
+        param: Option<&'static str>,
+        /// What is wrong with it.
+        message: String,
+    },
     /// Sampling controls violate the engine contract.
     #[error(transparent)]
     Sampling(#[from] proto::request::SamplingParamsError),

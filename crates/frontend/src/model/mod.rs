@@ -18,7 +18,7 @@ pub mod generation;
 // `ResolvedModelFiles::config_path`) or, for a diffusers pipeline, the
 // `_class_name` of its root index (see [`assets::PipelineCheckpoint`]). The
 // result is one [`ModelConfig`], built at startup by `ModelConfig::load` in
-// `input::processor`. The leader's startup reads it, and `InputProcessor::new` then
+// `input::processor`. The leader's startup reads it, and `Processor::new` then
 // binds the worker's capabilities onto it before request preprocessing and
 // discovery share it immutably.
 //
