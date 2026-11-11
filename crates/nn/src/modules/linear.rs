@@ -246,7 +246,7 @@ impl Linear {
     ///
     /// When `modules` and `outputs` disagree in count, or a module cannot be read.
     pub fn load_merged(
-        vb: &VarBuilder<'_, '_>,
+        vb: VarBuilder<'_, '_>,
         modules: &[&str],
         inputs: u32,
         outputs: &[u32],

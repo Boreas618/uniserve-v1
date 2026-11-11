@@ -227,7 +227,7 @@ fn several_modules_are_read_as_one_merged_projection() {
     let loader = WeightLoader::new(&checkpoint, &store, None, None);
 
     let merged =
-        Linear::load_merged(&loader.root().pp("heads"), &["a", "b"], 4, &[2, 3], true).unwrap();
+        Linear::load_merged(loader.root().pp("heads"), &["a", "b"], 4, &[2, 3], true).unwrap();
     assert_eq!((merged.k(), merged.n()), (4, 5));
 
     let x = sequence(4, 12);
