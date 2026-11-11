@@ -21,11 +21,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, Operand};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Shape, Strides, Operand};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// One compilation of `rms_norm`: element type, row width, and the row tile the kernel loads.
@@ -46,7 +49,7 @@ pub struct RmsNormDescriptor {
 impl fmt::Display for RmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("tile", self.tile)
             .field("pdl", self.pdl);
@@ -156,7 +159,7 @@ pub struct AddRmsNormDescriptor {
 impl fmt::Display for AddRmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("tile", self.tile)
             .field("pdl", self.pdl);
@@ -266,7 +269,7 @@ pub struct GatedRmsNormDescriptor {
 impl fmt::Display for GatedRmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("tile", self.tile)
             .finish(formatter)
@@ -371,7 +374,7 @@ impl Op for GatedRmsNorm {
         let rounding =
             Tolerance::rounding(u64::from(descriptor.columns), DType::F32, descriptor.dtype);
         Tolerance {
-            rtol: rounding.rtol + 3.0 * DType::F32.unit_roundoff() as f32,
+            rtol: rounding.rtol + 3.0 * tolerance::unit_roundoff(DType::F32) as f32,
             ..rounding
         }
     }
@@ -395,7 +398,7 @@ pub struct LayerNormDescriptor {
 impl fmt::Display for LayerNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("tile", self.tile)
             .field("bias", self.bias)
             .field("pdl", self.pdl)
@@ -523,7 +526,7 @@ pub struct SoftmaxDescriptor {
 impl fmt::Display for SoftmaxDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("tile", self.tile)
             .field("pdl", self.pdl)

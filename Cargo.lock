@@ -1213,6 +1213,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "uniserve-tensor",
  "worker",
 ]
 
@@ -2790,6 +2791,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "uniserve-tensor",
 ]
 
 [[package]]
@@ -2954,6 +2956,7 @@ dependencies = [
  "proto",
  "serde",
  "thiserror 2.0.18",
+ "uniserve-tensor",
 ]
 
 [[package]]
@@ -3243,6 +3246,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "uniserve-tensor",
 ]
 
 [[package]]
@@ -6002,6 +6006,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tracing",
+ "uniserve-tensor",
 ]
 
 [[package]]

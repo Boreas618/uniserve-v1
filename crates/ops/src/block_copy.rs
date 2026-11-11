@@ -17,10 +17,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, Operand};
+use crate::tensor::{Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -50,7 +53,7 @@ pub struct BlockShape {
 impl fmt::Display for BlockShape {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("shape", self.shape)
             .field("strides", self.strides)
             .field("index_stride", self.index_stride)
@@ -83,7 +86,7 @@ impl BlockShape {
                 operator,
                 format!(
                     "the descriptor copies {} elements, the field holds {}",
-                    self.dtype, field.dtype
+                    abi::name(self.dtype), abi::name(field.dtype)
                 ),
             ));
         }
@@ -101,7 +104,7 @@ impl BlockShape {
         if blocks.dtype != DType::I64 {
             return Err(Error::argument(
                 operator,
-                format!("the block indices are {}, not i64", blocks.dtype),
+                format!("the block indices are {}, not i64", abi::name(blocks.dtype)),
             ));
         }
         if blocks.strides.get(0) != self.index_stride {

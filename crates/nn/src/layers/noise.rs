@@ -73,7 +73,7 @@ impl Noise {
     /// The descriptor one draw takes: the element type, the distribution and the key source. The
     /// keys, the stage, the draw's index and its offset travel with the call.
     fn descriptor(
-        dtype: ops::DType,
+        dtype: uniserve_tensor::DType,
         kind: ops::noise::NoiseKind,
         source: ops::noise::KeySource,
     ) -> noise::NoiseDescriptor {

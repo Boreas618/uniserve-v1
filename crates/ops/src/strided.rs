@@ -27,10 +27,12 @@
 //! The extent of slot 0 does not travel: only an outermost axis can sit there, and a row-major
 //! index needs no modulus on its outermost axis.
 
+use uniserve_tensor::DType;
+
 use crate::kernel::Arguments;
 use crate::platform::Stream;
-use crate::tensor::{DType, MAX_RANK, Operand, Shape, Strides};
-use crate::{Error, Result, Twins};
+use crate::tensor::{MAX_RANK, Operand, Shape, Strides};
+use crate::{Error, Result, Twins, abi};
 
 /// The element types the primitives compute with.
 pub(crate) const ELEMENTS: [DType; 9] = [
@@ -60,7 +62,10 @@ pub(crate) fn require_element(
     }
     Err(Error::argument(
         operator,
-        format!("the descriptor's {field} is {dtype}, which is none of {allowed:?}"),
+        format!(
+            "the descriptor's {field} is {}, which is none of {allowed:?}",
+            abi::name(dtype)
+        ),
     ))
 }
 
@@ -87,7 +92,11 @@ pub(crate) fn require_dtype(
     }
     Err(Error::argument(
         operator,
-        format!("expected {dtype} {name}, found {}", operand.dtype),
+        format!(
+            "expected {} {name}, found {}",
+            abi::name(dtype),
+            abi::name(operand.dtype)
+        ),
     ))
 }
 

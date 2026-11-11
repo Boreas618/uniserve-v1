@@ -15,7 +15,8 @@
 use ops::attention::dense::{DenseArgs, DenseAttention as DenseOp, DenseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention as PagedOp, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvWrite, KvWriteScaled};
-use ops::{DType, Shape, Operand};
+use ops::{Shape, Operand};
+use uniserve_tensor::DType;
 use proto::program::PhaseKind;
 
 use crate::capability::{KvGroup, KvLayer, TokenBatch};
@@ -276,7 +277,7 @@ impl PagedAttention {
     ///
     /// When the fill cannot be issued.
     pub fn zero_counters(f: &Forward, workspace: Operand) -> Result<()> {
-        let bytes = workspace.numel() * workspace.dtype.bytes().unwrap_or(1);
+        let bytes = workspace.numel() * ops::abi::bytes(workspace.dtype).unwrap_or(1);
         f.zero(workspace, bytes.min(COUNTER_BYTES))
     }
 
@@ -411,7 +412,7 @@ impl PagedAttention {
                     format!(
                         "the cache is {} keys and {} values over {} projections: a cache is the \
                          projections' own type or E4M3 in both planes",
-                        planes.key.dtype, planes.value.dtype, key.dtype
+                        ops::abi::name(planes.key.dtype), ops::abi::name(planes.value.dtype), ops::abi::name(key.dtype)
                     ),
                 ));
             }
@@ -471,7 +472,7 @@ impl PagedAttention {
                     "PagedAttention::write",
                     format!(
                         "the {name} cache is {} and carries no page scale",
-                        cache.dtype
+                        ops::abi::name(cache.dtype)
                     ),
                 )
             })?;
@@ -516,7 +517,7 @@ impl PagedAttention {
         if table.dtype != DType::I32 {
             return Err(Error::shape(
                 "PagedAttention::attend",
-                format!("the page table is {} pages, not i32", table.dtype),
+                format!("the page table is {} pages, not i32", ops::abi::name(table.dtype)),
             ));
         }
         Ok(())
@@ -665,16 +666,16 @@ impl PagedAttention {
 /// launches, and answers a plausible tensor. The write divides each page by the page's own FP32
 /// scale, so the reader's operand is a table of the same length: the pages of the plane in F32.
 fn page_scale(plane: Operand, scale: Option<Operand>) -> Result<Option<Operand>> {
-    match (plane.dtype == ops::DType::F8E4M3, scale) {
+    match (plane.dtype == uniserve_tensor::DType::F8E4M3, scale) {
         (true, Some(scale)) => {
             let pages = plane.shape.dim(0);
-            if scale.dtype != ops::DType::F32 || scale.shape.numel() != pages {
+            if scale.dtype != uniserve_tensor::DType::F32 || scale.shape.numel() != pages {
                 return Err(Error::shape(
                     "PagedAttention::attend",
                     format!(
                         "an FP8 plane of {pages} pages carries {pages} F32 page scales; the operand \
                          is {} of {} element(s)",
-                        scale.dtype,
+                        ops::abi::name(scale.dtype),
                         scale.shape.numel()
                     ),
                 ));
@@ -689,7 +690,7 @@ fn page_scale(plane: Operand, scale: Option<Operand>) -> Result<Option<Operand>>
             "PagedAttention::attend",
             format!(
                 "a {} cache plane carries no scale; the scale belongs to the page's encoding",
-                plane.dtype
+                ops::abi::name(plane.dtype)
             ),
         )),
         (false, None) => Ok(None),
@@ -698,7 +699,8 @@ fn page_scale(plane: Operand, scale: Option<Operand>) -> Result<Option<Operand>>
 
 #[cfg(test)]
 mod tests {
-    use ops::{DType, DevicePtr, Shape};
+    use ops::{DevicePtr, Shape};
+    use uniserve_tensor::DType;
 
     use super::*;
 

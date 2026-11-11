@@ -23,7 +23,8 @@
 use std::sync::{Arc, Mutex};
 
 use nn::capability::{DecodedMedia, Decoder};
-use ops::{DType, Shape, Operand};
+use ops::{Shape, Operand};
+use uniserve_tensor::DType;
 use platform::DeviceId;
 use proto::video::{LatentShape, Layout};
 

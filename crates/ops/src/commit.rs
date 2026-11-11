@@ -35,10 +35,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand};
+use crate::tensor::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -71,9 +74,9 @@ pub struct CommitDescriptor {
 impl fmt::Display for CommitDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("index", self.index)
-            .field("verified", self.verified)
-            .field("penalties", self.penalties)
+            .field("index", abi::name(self.index))
+            .field("verified", abi::name(self.verified))
+            .field("penalties", abi::name(self.penalties))
             .field("stride", self.stride)
             .field("future_stride", self.future_stride)
             .field("vocab", self.vocab)
@@ -214,7 +217,7 @@ impl Op for SlotCommit {
                     SlotCommit::NAME,
                     format!(
                         "{name} are {}, an integer flag is i32, i64 or u8",
-                        view.dtype
+                        abi::name(view.dtype)
                     ),
                 ));
             }
@@ -348,7 +351,11 @@ fn check_type(
     if view.dtype != expected {
         return Err(Error::argument(
             operator,
-            format!("{name} are {}, the descriptor says {expected}", view.dtype),
+            format!(
+                "{name} are {}, the descriptor says {}",
+                abi::name(view.dtype),
+                abi::name(expected)
+            ),
         ));
     }
     Ok(())
@@ -457,7 +464,7 @@ mod tests {
             flags.valid = view(dtype, &[4], &[1]);
             assert!(
                 refusal(&descriptor(), &flags).contains("integer flag"),
-                "{dtype}"
+                "{dtype:?}"
             );
         }
         let mut wide = args();

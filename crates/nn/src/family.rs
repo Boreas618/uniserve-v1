@@ -33,7 +33,8 @@ use crate::capability::{
     CausalLm, Decoder, Denoiser, Encoder, KvView, MediaFormat, Splicer, TokenBatch, Vision,
     WarmPrompt, WarmRequest,
 };
-use crate::{Checkpoint, DType, Forward, Result, Operand, WeightLoader};
+use crate::{Checkpoint, Forward, Result, Operand, WeightLoader};
+use uniserve_tensor::DType;
 
 /// One model family a build serves: what execution loads of its checkpoints, beside how they
 /// declare it and what request processing serves ([`processing::Family`]).
@@ -392,7 +393,7 @@ impl StateField {
     /// The bytes one slot of the field occupies.
     pub fn bytes(&self) -> u64 {
         let elements: u64 = self.dims.iter().product();
-        elements * self.dtype.bytes().unwrap_or(0)
+        elements * ops::abi::bytes(self.dtype).unwrap_or(0)
     }
 }
 

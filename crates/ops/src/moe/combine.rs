@@ -20,14 +20,17 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-use super::{address, dtype_code, to_i64};
+use super::{address, to_i64};
 
 /// Which row convention the combine's input buffer is in.
 ///
@@ -89,9 +92,9 @@ impl fmt::Display for Descriptor {
             .field("hidden", self.hidden)
             .field("top", self.top)
             .field("experts", self.experts)
-            .field("input", self.input)
-            .field("scales", self.scales)
-            .field("output", self.output)
+            .field("input", abi::name(self.input))
+            .field("scales", abi::name(self.scales))
+            .field("output", abi::name(self.output))
             .finish(formatter)
     }
 }
@@ -224,7 +227,7 @@ impl Op for MoeUnpermute {
                 Self::NAME,
                 format!(
                     "expected i32 route maps, found {}",
-                    args.expanded_to_permuted.dtype
+                    abi::name(args.expanded_to_permuted.dtype)
                 ),
             ));
         }
@@ -233,7 +236,7 @@ impl Op for MoeUnpermute {
                 Self::NAME,
                 format!(
                     "expected {} route weights, found {}",
-                    descriptor.scales, args.scales.dtype
+                    abi::name(descriptor.scales), abi::name(args.scales.dtype)
                 ),
             ));
         }
@@ -266,9 +269,9 @@ impl Op for MoeUnpermute {
             top: to_i64(Self::NAME, top)?,
             hidden: to_i64(Self::NAME, hidden)?,
             routes_rows: to_i64(Self::NAME, routes)?,
-            input_dtype: dtype_code(descriptor.input),
-            scales_dtype: dtype_code(descriptor.scales),
-            output_dtype: dtype_code(descriptor.output),
+            input_dtype: abi::code(descriptor.input)?,
+            scales_dtype: abi::code(descriptor.scales)?,
+            output_dtype: abi::code(descriptor.output)?,
             layout: descriptor.layout.as_i64(),
             error: [0; 512],
         };

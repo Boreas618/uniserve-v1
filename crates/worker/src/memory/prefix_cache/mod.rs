@@ -64,7 +64,7 @@ pub struct LayerPlanes {
     /// Pages the pool holds for the layer's group.
     pub pages: u32,
     /// The element type the group's value planes hold, as a kernel operand.
-    pub dtype: ops::DType,
+    pub dtype: uniserve_tensor::DType,
     /// The layer's key values, `[pages, block_size, kv_heads, head_dim]`.
     pub key: StorageView,
     /// The layer's value values, as `key`.

@@ -29,7 +29,8 @@ use ops::prefix_cache::{
     CacheCopyRegion, ConversionArgs, ConversionDescriptor, CopyRegionArgs, CopyRegionDescriptor,
     Field, PageConversion, scratch_bytes,
 };
-use ops::{DType, DevicePtr, Shape, Operand};
+use ops::{DevicePtr, Shape, Operand};
+use uniserve_tensor::DType;
 use platform::{CopyBatch, DeviceId, SourceOrder};
 
 use super::host;

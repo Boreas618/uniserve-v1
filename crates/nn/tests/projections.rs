@@ -30,7 +30,8 @@ fn dtype_name(dtype: DType) -> &'static str {
         DType::F32 => "F32",
         DType::F64 => "F64",
         DType::F8E4M3 => "F8_E4M3",
-        DType::F4E2M1 => "F4_E2M1",
+        DType::F4 => "F4_E2M1",
+        other => panic!("the fixtures write no {other:?} tensor"),
     }
 }
 

@@ -48,11 +48,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, Operand};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Shape, Strides, Operand};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The batch columns a recurrent operator reads, as paged attention reads them.
@@ -144,7 +147,11 @@ fn check_bank(
 ) -> Result<u64> {
     let refuse = |problem: String| Error::argument(operator, format!("the {name} bank {problem}"));
     if bank.dtype != dtype {
-        return Err(refuse(format!("holds {}, not {dtype}", bank.dtype)));
+        return Err(refuse(format!(
+            "holds {}, not {}",
+            abi::name(bank.dtype),
+            abi::name(dtype)
+        )));
     }
     if bank.shape.rank() != dims.len() + 1 || bank.shape.dims()[1..] != *dims {
         return Err(refuse(format!(
@@ -174,7 +181,7 @@ pub struct CausalConv1dDescriptor {
 impl fmt::Display for CausalConv1dDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("channels", self.channels)
             .field("width", self.width)
             .field("block", self.block)
@@ -329,7 +336,7 @@ impl Op for CausalConv1d {
         // A sum of `width` products of rounded inputs and taps in FP32, the SiLU's few ulps, and one
         // rounding into the output type.
         Tolerance::dot(u64::from(descriptor.width), DType::F32, descriptor.dtype)
-            .with_atol(2.0 * descriptor.dtype.unit_roundoff() as f32)
+            .with_atol(2.0 * tolerance::unit_roundoff(descriptor.dtype) as f32)
     }
 }
 
@@ -383,7 +390,7 @@ pub struct GatedDeltaRuleDescriptor {
 impl fmt::Display for GatedDeltaRuleDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("key_heads", self.key_heads)
             .field("value_heads", self.value_heads)
             .field("key_dim", self.key_dim)

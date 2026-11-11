@@ -1,10 +1,10 @@
 //! The element type a tensor crosses a process boundary with.
 //!
 //! A product the scheduler declares (`ipc::TensorRef`), a relay column and a transfer locator
-//! state their element type as [`DType`]. The kernel library's element type (`ops::DType`) is the
-//! same vocabulary with the formats only a kernel operand has (FP8, NVFP4), and converts from this
-//! one; the variants this one names carry the same numbers there, so the two never disagree on
-//! what a number means.
+//! state their element type as [`DType`]. A kernel operand's element type is the tensor library's,
+//! which has the formats only an operand has (FP8, NVFP4) and which `ops::abi::from_wire` gives for
+//! this one; the variants this one names carry the numbers the kernel library's package ABI gives
+//! them (`ops::abi::code`), so the two never disagree on what a number means.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,8 +12,8 @@ use crate::request::ModelDtype;
 
 /// Element type of a tensor's backing storage.
 ///
-/// The numbering is the kernel library's ABI numbering (`ops::DType`); a variant this type lacks
-/// keeps its number there, so the numbers here have gaps.
+/// The numbering is the kernel library's package ABI numbering (`ops::abi::code`); an element
+/// type this type lacks keeps its number there, so the numbers here have gaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]

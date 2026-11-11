@@ -21,10 +21,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -53,7 +56,7 @@ pub struct ZeroPaddingDescriptor {
 impl fmt::Display for ZeroPaddingDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("heads", self.heads)
             .field("tile_rows", self.tile_rows)
             .field("width", self.width)
@@ -160,7 +163,7 @@ pub struct AddGatedTilesDescriptor {
 impl fmt::Display for AddGatedTilesDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("tile_rows", self.tile_rows)
             .field("width", self.width)
             .field("block_rows", self.block_rows)
@@ -299,7 +302,7 @@ impl fmt::Display for ComposeGatedRowsDescriptor {
             .map(ToString::to_string)
             .collect();
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("heads", self.heads)
             .field("tile_rows", self.tile_rows)
             .field("width", self.width)
@@ -387,7 +390,7 @@ impl Op for VsaComposeGatedRows {
                     format!(
                         "the {name} are not [{rows}, {heads}, {width}] {} rows with a unit column \
                          stride",
-                        descriptor.dtype
+                        abi::name(descriptor.dtype)
                     ),
                 ));
             }
@@ -684,7 +687,7 @@ pub struct PrepareTilesDescriptor {
 impl fmt::Display for PrepareTilesDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("heads", self.heads)
             .field("width", self.width)
             .field("rotated", self.rotated)
@@ -951,7 +954,11 @@ fn check_rows(
     if view.dtype != dtype {
         return Err(Error::argument(
             operator,
-            format!("expected {dtype} rows, found {}", view.dtype),
+            format!(
+                "expected {} rows, found {}",
+                abi::name(dtype),
+                abi::name(view.dtype)
+            ),
         ));
     }
     if view.strides.last() != 1 {
@@ -1081,7 +1088,7 @@ impl Op for VsaScores {
                 Self::NAME,
                 format!(
                     "the pooled query rows are FP32, the view says {}",
-                    args.pooled_query.dtype
+                    abi::name(args.pooled_query.dtype)
                 ),
             ));
         }
@@ -1090,7 +1097,7 @@ impl Op for VsaScores {
                 Self::NAME,
                 format!(
                     "the pooled key rows are FP32, the view says {}",
-                    args.pooled_key.dtype
+                    abi::name(args.pooled_key.dtype)
                 ),
             ));
         }
@@ -1260,7 +1267,7 @@ impl CompressPooledDescriptor {
 impl fmt::Display for CompressPooledDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("heads", self.heads)
             .field("width", self.width)
             .field("max_tiles", self.max_tiles.next_power_of_two())
@@ -1322,7 +1329,7 @@ impl Op for VsaCompressPooled {
                 Self::NAME,
                 format!(
                     "the compression is written as the attention's rows, not {}",
-                    descriptor.dtype
+                    abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -1331,7 +1338,7 @@ impl Op for VsaCompressPooled {
                 Self::NAME,
                 format!(
                     "the pooled scores and values are FP32, the views say {} and {}",
-                    args.scores.dtype, args.values.dtype
+                    abi::name(args.scores.dtype), abi::name(args.values.dtype)
                 ),
             ));
         }
@@ -1387,7 +1394,7 @@ impl Op for VsaCompressPooled {
                 Self::NAME,
                 format!(
                     "the compression is {} and the view says {}",
-                    descriptor.dtype, args.out.dtype
+                    abi::name(descriptor.dtype), abi::name(args.out.dtype)
                 ),
             ));
         }

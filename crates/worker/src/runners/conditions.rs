@@ -119,10 +119,10 @@ pub(crate) fn patches(
     let channels = format.channels as usize;
     let (height, width) = ((rows * patch) as usize, (columns * patch) as usize);
     let area = height * width;
-    let element = format.dtype.bytes().ok_or_else(|| {
+    let element = ops::abi::bytes(format.dtype).ok_or_else(|| {
         mismatched(format!(
             "{} patch rows have no whole-byte element",
-            format.dtype
+            ops::abi::name(format.dtype)
         ))
     })? as usize;
     let width_bytes = format.width() as usize * element;
@@ -194,7 +194,7 @@ pub(crate) fn patches(
 
 /// `values` in `dtype`'s little-endian bytes.
 fn encode(dtype: DType, values: &[f32]) -> Result<Vec<u8>> {
-    Ok(dtype.encode(values)?)
+    Ok(ops::values::encode(dtype, values)?)
 }
 
 /// The samples an encoder reads of a track of `samples` samples: the track right-padded with zeros

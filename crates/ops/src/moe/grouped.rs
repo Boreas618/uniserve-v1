@@ -30,16 +30,19 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::activation::Activation;
 use crate::descriptor::Key;
 use crate::fp4::ScaleLayout;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-use super::{address, dtype_code, to_i64};
+use super::{address, to_i64};
 
 /// The largest magnitude one activation element of a grouped GEMM is written for.
 ///
@@ -87,7 +90,7 @@ impl fmt::Display for GatherGemmDescriptor {
             .field("experts", self.experts)
             .field("top", self.top)
             .field("activation", self.activation)
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("tile", format_args!("{}x{}", self.tile.0, self.tile.1))
             .field(
                 "cluster",
@@ -126,7 +129,7 @@ impl fmt::Display for RouteGemmDescriptor {
             .field("intermediate", self.intermediate)
             .field("experts", self.experts)
             .field("top", self.top)
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("tile", format_args!("{}x{}", self.tile.0, self.tile.1))
             .field(
                 "cluster",
@@ -278,7 +281,7 @@ impl Op for GatherGemm {
             if view.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected i32 {what}, found {}", view.dtype),
+                    format!("expected i32 {what}, found {}", abi::name(view.dtype)),
                 ));
             }
         }
@@ -291,7 +294,7 @@ impl Op for GatherGemm {
             if view.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected i32 sort metadata, found {}", view.dtype),
+                    format!("expected i32 sort metadata, found {}", abi::name(view.dtype)),
                 ));
             }
             super::require_i32_vector(Self::NAME, view)?;
@@ -351,7 +354,7 @@ impl Op for GatherGemm {
             hidden_size: to_i64(Self::NAME, hidden)?,
             experts: to_i64(Self::NAME, experts)?,
             top: to_i64(Self::NAME, top)?,
-            dtype: dtype_code(descriptor.dtype),
+            dtype: abi::code(descriptor.dtype)?,
             error: [0; 512],
         };
         // SAFETY: `GatherCall` is the call structure this package's entry declares, and its layout is
@@ -418,7 +421,7 @@ impl Op for RouteGemm {
         if args.ids.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 route ids, found {}", args.ids.dtype),
+                format!("expected i32 route ids, found {}", abi::name(args.ids.dtype)),
             ));
         }
         for view in [
@@ -430,7 +433,7 @@ impl Op for RouteGemm {
             if view.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected i32 sort metadata, found {}", view.dtype),
+                    format!("expected i32 sort metadata, found {}", abi::name(view.dtype)),
                 ));
             }
             super::require_i32_vector(Self::NAME, view)?;
@@ -485,7 +488,7 @@ impl Op for RouteGemm {
             width: to_i64(Self::NAME, hidden)?,
             intermediate: to_i64(Self::NAME, intermediate)?,
             experts: to_i64(Self::NAME, experts)?,
-            dtype: dtype_code(descriptor.dtype),
+            dtype: abi::code(descriptor.dtype)?,
             error: [0; 512],
         };
         // SAFETY: `RouteCall` is the call structure this package's entry declares, and its layout is
@@ -655,8 +658,8 @@ impl fmt::Display for GatherGemmNvfp4Descriptor {
             .field("experts", self.experts)
             .field("top", self.top)
             .field("activation", self.activation)
-            .field("dtype", self.dtype)
-            .field("scale", self.scale)
+            .field("dtype", abi::name(self.dtype))
+            .field("scale", abi::name(self.scale))
             .field("layout", self.layout)
             .field("tile", format_args!("{}x{}", self.tile.0, self.tile.1))
             .field(
@@ -727,7 +730,7 @@ fn check_workspace(operator: &'static str, workspace: Operand) -> Result<()> {
     if workspace.dtype != DType::U8 {
         return Err(Error::argument(
             operator,
-            format!("expected u8 workspace bytes, found {}", workspace.dtype),
+            format!("expected u8 workspace bytes, found {}", abi::name(workspace.dtype)),
         ));
     }
     if workspace.numel() == 0 {
@@ -794,7 +797,7 @@ pub struct GatherNvfp4Call {
     /// The compiled cluster, rows by columns.
     pub cluster_m: i64,
     pub cluster_n: i64,
-    /// The element type of the activations and the output, as `DType::as_i64`.
+    /// The element type of the activations and the output, as `abi::code` numbers it.
     pub dtype: i64,
     /// A NUL-terminated refusal, when the entry returns nonzero.
     pub error: [u8; 512],
@@ -882,7 +885,7 @@ pub struct RouteNvfp4Call {
     /// The compiled cluster, rows by columns.
     pub cluster_m: i64,
     pub cluster_n: i64,
-    /// The element type of the activations and the output, as `DType::as_i64`.
+    /// The element type of the activations and the output, as `abi::code` numbers it.
     pub dtype: i64,
     /// A NUL-terminated refusal, when the entry returns nonzero.
     pub error: [u8; 512],
@@ -963,7 +966,7 @@ impl Op for GatherGemmNvfp4 {
                 format!(
                     "expected the gathered activations as packed u8, found {}: the product's kernels \
                      take an E2M1 activation, and `nvfp4_quantize` is the program that encodes one",
-                    args.hidden.dtype
+                    abi::name(args.hidden.dtype)
                 ),
             ));
         }
@@ -983,7 +986,7 @@ impl Op for GatherGemmNvfp4 {
                 format!(
                     "expected one f32 per-token scale, found {}: the artifact's FP4 kernels read the \
                      encoder's per-token factor beside the block scales",
-                    args.hidden_token_scale.dtype
+                    abi::name(args.hidden_token_scale.dtype)
                 ),
             ));
         }
@@ -1011,7 +1014,7 @@ impl Op for GatherGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected the packed E2M1 field as u8, found {}",
-                    args.weights.dtype
+                    abi::name(args.weights.dtype)
                 ),
             ));
         }
@@ -1020,7 +1023,7 @@ impl Op for GatherGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected {} block scales, found {}",
-                    descriptor.scale, args.scales.dtype
+                    abi::name(descriptor.scale), abi::name(args.scales.dtype)
                 ),
             ));
         }
@@ -1062,7 +1065,7 @@ impl Op for GatherGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected f32 tensor scales, found {}",
-                    args.global_scale.dtype
+                    abi::name(args.global_scale.dtype)
                 ),
             ));
         }
@@ -1093,7 +1096,7 @@ impl Op for GatherGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected i32 permuted rows, found {}",
-                    args.permuted_to_token.dtype
+                    abi::name(args.permuted_to_token.dtype)
                 ),
             ));
         }
@@ -1150,7 +1153,7 @@ impl Op for GatherGemmNvfp4 {
             tile_n: i64::from(descriptor.tile.1),
             cluster_m: i64::from(descriptor.cluster.0),
             cluster_n: i64::from(descriptor.cluster.1),
-            dtype: dtype_code(descriptor.dtype),
+            dtype: abi::code(descriptor.dtype)?,
             error: [0; 512],
         };
         // SAFETY: `GatherNvfp4Call` is the structure this package's entry declares, and its layout is
@@ -1339,8 +1342,8 @@ impl fmt::Display for RouteGemmNvfp4Descriptor {
             .field("intermediate", self.intermediate)
             .field("experts", self.experts)
             .field("top", self.top)
-            .field("dtype", self.dtype)
-            .field("scale", self.scale)
+            .field("dtype", abi::name(self.dtype))
+            .field("scale", abi::name(self.scale))
             .field("layout", self.layout)
             .field("tile", format_args!("{}x{}", self.tile.0, self.tile.1))
             .field(
@@ -1432,8 +1435,9 @@ impl Op for RouteGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected the gated rows as packed u8, found {}: FC1's epilogue emits \
-                     {:?}, and `nvfp4_quantize` is the program that encodes it",
-                    args.hidden.dtype, descriptor.dtype
+                     {}, and `nvfp4_quantize` is the program that encodes it",
+                    abi::name(args.hidden.dtype),
+                    abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -1452,7 +1456,7 @@ impl Op for RouteGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected one f32 per-token scale per route, found {}",
-                    args.hidden_token_scale.dtype
+                    abi::name(args.hidden_token_scale.dtype)
                 ),
             ));
         }
@@ -1474,7 +1478,7 @@ impl Op for RouteGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected the packed E2M1 field as u8, found {}",
-                    args.weights.dtype
+                    abi::name(args.weights.dtype)
                 ),
             ));
         }
@@ -1483,7 +1487,7 @@ impl Op for RouteGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected {} block scales, found {}",
-                    descriptor.scale, args.scales.dtype
+                    abi::name(descriptor.scale), abi::name(args.scales.dtype)
                 ),
             ));
         }
@@ -1518,7 +1522,7 @@ impl Op for RouteGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected f32 tensor scales, found {}",
-                    args.global_scale.dtype
+                    abi::name(args.global_scale.dtype)
                 ),
             ));
         }
@@ -1529,7 +1533,7 @@ impl Op for RouteGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected i32 permuted rows, found {}",
-                    args.permuted_to_expanded.dtype
+                    abi::name(args.permuted_to_expanded.dtype)
                 ),
             ));
         }
@@ -1571,7 +1575,7 @@ impl Op for RouteGemmNvfp4 {
             tile_n: i64::from(descriptor.tile.1),
             cluster_m: i64::from(descriptor.cluster.0),
             cluster_n: i64::from(descriptor.cluster.1),
-            dtype: dtype_code(descriptor.dtype),
+            dtype: abi::code(descriptor.dtype)?,
             error: [0; 512],
         };
         // SAFETY: `RouteNvfp4Call` is the structure this package's entry declares, and its layout is

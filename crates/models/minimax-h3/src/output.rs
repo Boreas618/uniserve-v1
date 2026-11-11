@@ -206,7 +206,7 @@ fn check_previous(
         return Err(Error::config(format!(
             "a predecessor's tail is {shape:?} {dtype} and the view is {:?} {}",
             previous.shape.dims(),
-            previous.dtype
+            ops::abi::name(previous.dtype), dtype = ops::abi::name(dtype)
         )));
     }
     Ok(())

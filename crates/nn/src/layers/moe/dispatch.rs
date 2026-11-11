@@ -164,7 +164,8 @@ impl DispatchViews {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DType, DevicePtr, Shape};
+    use crate::{DevicePtr, Shape};
+    use uniserve_tensor::DType;
 
     fn exchange(ranks: u32, rank_rows: u32, hidden: u64, top: u64) -> DispatchViews {
         let rows = u64::from(ranks) * u64::from(rank_rows);

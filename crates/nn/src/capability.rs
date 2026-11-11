@@ -24,7 +24,8 @@ use proto::video::{LatentShape, Layout};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::tensor::{DType, Operand};
+use crate::tensor::Operand;
+use uniserve_tensor::DType;
 
 /// The device-side layout of one batch, as a model's layers read it.
 ///
@@ -123,7 +124,7 @@ impl TokenBatch {
             if view.dtype != dtype {
                 return Err(Error::shape(
                     "TokenBatch",
-                    format!("{name} is {}, not {dtype}", view.dtype),
+                    format!("{name} is {}, not {dtype}", ops::abi::name(view.dtype), dtype = ops::abi::name(dtype)),
                 ));
             }
         }
@@ -135,7 +136,7 @@ impl TokenBatch {
                 format!(
                     "logits_rows is {} {} elements for {rows} rows, not at most one i32 per row",
                     self.logits_rows.numel(),
-                    self.logits_rows.dtype
+                    ops::abi::name(self.logits_rows.dtype)
                 ),
             ));
         }
@@ -149,7 +150,7 @@ impl TokenBatch {
                 format!(
                     "rope_positions is {:?} {}, [axes, {tokens}] i32 expected",
                     coordinates.shape.dims(),
-                    coordinates.dtype
+                    ops::abi::name(coordinates.dtype)
                 ),
             ));
         }
@@ -161,7 +162,7 @@ impl TokenBatch {
                 format!(
                     "draft_lens is {} {} elements for {rows} rows",
                     draft_lens.numel(),
-                    draft_lens.dtype
+                    ops::abi::name(draft_lens.dtype)
                 ),
             ));
         }
@@ -1349,7 +1350,8 @@ mod tests {
 
 #[cfg(test)]
 mod batch_tests {
-    use ops::{DType, DevicePtr, Shape};
+    use ops::{DevicePtr, Shape};
+    use uniserve_tensor::DType;
 
     use super::*;
 

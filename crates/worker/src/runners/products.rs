@@ -51,7 +51,7 @@ use crate::arena::StreamId;
 
 /// The element type of [`Product::ConditionPixels`] and [`Product::ConditionSamples`]: the media
 /// stage converts decoded frames and tracks to FP32, which is what the conditioning encoders read.
-pub const CONDITION_MEDIA: ops::DType = ops::DType::F32;
+pub const CONDITION_MEDIA: uniserve_tensor::DType = uniserve_tensor::DType::F32;
 
 /// One kind of media product a request has.
 ///
@@ -334,7 +334,7 @@ pub struct Published {
     /// The product's length, in bytes.
     pub bytes: u64,
     /// The element type its producer wrote, which is the only type a copy of it can land in.
-    pub dtype: ops::DType,
+    pub dtype: uniserve_tensor::DType,
 }
 
 /// The write a producer is about to publish, as an event a crossing reader waits on.
@@ -559,7 +559,7 @@ enum Route {
 /// leaves exactly the conversions a stated handover performs - and this store's handover copies. The
 /// check is over types and not over byte counts because `f16` and `bf16` are the same width, so an
 /// agreeing byte count is precisely the case that would copy one type's bits as another's.
-fn copyable(from: ops::DType, to: ops::DType, request: RequestKey, kind: Product) -> Result<()> {
+fn copyable(from: uniserve_tensor::DType, to: uniserve_tensor::DType, request: RequestKey, kind: Product) -> Result<()> {
     if from == to {
         return Ok(());
     }
@@ -911,7 +911,8 @@ impl Products for Held {
 mod tests {
     use super::*;
 
-    use ops::{DType, DevicePtr, Shape};
+    use ops::{DevicePtr, Shape};
+    use uniserve_tensor::DType;
     use platform::DeviceId;
 
     /// A copy is bytes of one type; another type is a conversion, and the store says so by name.

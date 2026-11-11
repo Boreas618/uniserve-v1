@@ -36,12 +36,15 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
 use crate::strided;
-use crate::tensor::{DType, MAX_RANK, Operand, Shape};
-use crate::tolerance::Tolerance;
+use crate::tensor::{MAX_RANK, Operand, Shape};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The function one compilation of `reduce` folds with.
@@ -139,7 +142,7 @@ impl fmt::Display for Descriptor {
         // program, so naming it would file one module under several keys.
         Key::new()
             .field("function", self.function)
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("kept", self.kept)
             .field("reduced", self.reduced)
             .field("tile", self.tile())
@@ -307,7 +310,7 @@ impl Op for Reduce {
         if descriptor.function == Function::Sum && dtype.is_float() {
             // Terms of either sign accumulated in the computing type, in whatever order a program
             // takes them, and rounded once into the element type: the bound of the class.
-            return Tolerance::dot(u64::from(descriptor.reduction), dtype.accumulate(), dtype);
+            return Tolerance::dot(u64::from(descriptor.reduction), tolerance::accumulate(dtype), dtype);
         }
         // An integer sum wraps the same way in any order; a minimum or a maximum is one of the
         // input's values, and an index that differs names another element.

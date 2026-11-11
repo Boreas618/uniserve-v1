@@ -41,12 +41,15 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
 use crate::strided;
-use crate::tensor::{DType, Operand};
-use crate::tolerance::Tolerance;
+use crate::tensor::Operand;
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The bound on `|x|`, and on elu's `|a|`, that the absolute part of `gelu`'s, `gelu_erf`'s and
@@ -220,7 +223,7 @@ impl fmt::Display for UnaryDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("function", self.function)
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("rank", self.rank)
             .field("block", self.block)
             .field("pdl", self.pdl)
@@ -272,7 +275,7 @@ impl Op for ElementwiseUnary {
                 Self::NAME,
                 format!(
                     "{} is not closed over the integers and the descriptor's dtype is {}",
-                    descriptor.function, descriptor.dtype
+                    descriptor.function, abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -330,7 +333,7 @@ impl Op for ElementwiseUnary {
             return Tolerance::exact();
         }
 
-        let compute = dtype.accumulate();
+        let compute = tolerance::accumulate(dtype);
         match descriptor.function {
             // A product and a sum of either sign: the sum may cancel below its two terms.
             UnaryFunction::Affine => Tolerance::dot(roundings, compute, dtype),
@@ -342,7 +345,7 @@ impl Op for ElementwiseUnary {
             // implementation.
             UnaryFunction::Gelu | UnaryFunction::GeluErf | UnaryFunction::Elu => {
                 Tolerance::rounding(roundings, compute, dtype)
-                    .with_atol(2.0 * VALUE_ENVELOPE * compute.unit_roundoff() as f32)
+                    .with_atol(2.0 * VALUE_ENVELOPE * tolerance::unit_roundoff(compute) as f32)
             }
             // Products, quotients, sums of one sign and library functions accurate to their last
             // place: each rounds relative to its own result.
@@ -451,7 +454,7 @@ impl fmt::Display for BinaryDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("function", self.function)
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("rank", self.rank)
             .field("block", self.block)
             .field("pdl", self.pdl)
@@ -538,7 +541,7 @@ impl Op for ElementwiseBinary {
                 if dtype.is_float() =>
             {
                 // One operation in the computing type, rounded once into the element type.
-                Tolerance::rounding(1, dtype.accumulate(), dtype)
+                Tolerance::rounding(1, tolerance::accumulate(dtype), dtype)
             }
             // Integer arithmetic wraps the same way everywhere; a maximum or a minimum is one of
             // its operands, and a comparison that differs is a wrong decision, not a rounding.
@@ -578,8 +581,8 @@ impl WhereDescriptor {
 impl fmt::Display for WhereDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
-            .field("condition", self.condition)
+            .field("dtype", abi::name(self.dtype))
+            .field("condition", abi::name(self.condition))
             .field("rank", self.rank)
             .field("block", self.block)
             .field("pdl", self.pdl)
@@ -872,7 +875,7 @@ mod tests {
             elu.rtol,
             Tolerance::rounding(3, DType::F32, DType::F32).rtol
         );
-        assert_eq!(elu.atol, 16.0 * DType::F32.unit_roundoff() as f32);
+        assert_eq!(elu.atol, 16.0 * tolerance::unit_roundoff(DType::F32) as f32);
     }
 
     fn binary(lhs: Operand, rhs: Operand, function: BinaryFunction) -> BinaryArgs {

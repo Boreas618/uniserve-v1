@@ -95,7 +95,8 @@ fn record(context: &Context, operator: &'static str, key: String) {
 #[cfg(test)]
 pub(crate) mod tests {
     use ops::norm::{RmsNorm, RmsNormArgs, RmsNormDescriptor};
-    use ops::{DType, DevicePtr, Operand, Shape};
+    use ops::{DevicePtr, Operand, Shape};
+    use uniserve_tensor::DType;
 
     use super::launch;
     use crate::{Context, Error, Result};

@@ -14,7 +14,8 @@
 //! moments are one buffer cut by an offset and nothing is copied or transposed.
 
 use ops::posterior::{self, Posterior as PosteriorOp};
-use ops::{DType, Shape, Strides, Operand};
+use ops::{Shape, Strides, Operand};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -58,7 +59,7 @@ impl Posterior {
                     OWNER,
                     format!(
                         "the {name} raster is {}, and a posterior is FP32",
-                        view.dtype
+                        ops::abi::name(view.dtype)
                     ),
                 ));
             }

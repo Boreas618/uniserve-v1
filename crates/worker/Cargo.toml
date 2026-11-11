@@ -22,6 +22,8 @@ libloading.workspace = true
 nvtx.workspace = true
 nn.workspace = true
 ops.workspace = true
+# The element type of a kernel operand (`DType`).
+uniserve-tensor.workspace = true
 proto.workspace = true
 rusqlite.workspace = true
 rustix = { workspace = true, features = ["fs", "pipe", "system"] }

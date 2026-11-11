@@ -87,7 +87,7 @@ impl Bench {
     /// A new device tensor of `dtype` and `dims`, row-major, its contents undefined.
     pub(crate) fn tensor(&mut self, dtype: DType, dims: &[u64]) -> Outcome<Operand> {
         let shape = Shape::new(dims);
-        let bytes = shape.numel() * dtype.bytes().ok_or("an element type without a width")?;
+        let bytes = shape.numel() * ops::abi::bytes(dtype).ok_or("an element type without a width")?;
         let buffer = DeviceAllocation::linear(DEVICE, bytes.max(1) as usize)?;
         let view = Operand::new(DevicePtr::new(buffer.address()), dtype, shape);
         self.buffers.push(buffer);
@@ -119,7 +119,7 @@ impl Bench {
     ) -> Outcome<Operand> {
         let view = self.tensor(dtype, dims)?;
         if view.byte_len()? != bytes.len() as u64 {
-            return Err(format!("{} bytes for a {dtype} tensor of {dims:?}", bytes.len()).into());
+            return Err(format!("{} bytes for a {dtype} tensor of {dims:?}", bytes.len(), dtype = ops::abi::name(dtype)).into());
         }
         self.write(view.ptr, bytes)?;
         Ok(view)

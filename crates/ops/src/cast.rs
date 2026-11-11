@@ -24,12 +24,15 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
 use crate::strided;
-use crate::tensor::{DType, Operand};
-use crate::tolerance::Tolerance;
+use crate::tensor::Operand;
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// One compilation of `cast`.
@@ -63,8 +66,8 @@ impl Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("input", self.input)
-            .field("output", self.output)
+            .field("input", abi::name(self.input))
+            .field("output", abi::name(self.output))
             .field("rank", self.rank)
             .field("block", self.block)
             .field("pdl", self.pdl)
@@ -85,7 +88,7 @@ pub struct Args {
 pub struct Cast;
 
 /// The bits a value of `dtype` is exact to: an integer's value bits, a float's significand.
-const fn precision(dtype: DType) -> u32 {
+fn precision(dtype: DType) -> u32 {
     match dtype {
         DType::U8 | DType::BF16 => 8,
         DType::F16 => 11,
@@ -96,7 +99,7 @@ const fn precision(dtype: DType) -> u32 {
         DType::F64 => 53,
         DType::I64 => 63,
         // No other type is an element of a conversion; `check` refuses it.
-        DType::F8E4M3 | DType::F4E2M1 => 0,
+        _ => 0,
     }
 }
 
@@ -106,7 +109,7 @@ const fn precision(dtype: DType) -> u32 {
 /// is exact for an integer that fits its significand, and for a narrower float when the target is
 /// FP32 or FP64: a half-precision target has a narrower exponent range than BF16 and a narrower
 /// significand than F16, so neither holds the other.
-const fn holds(input: DType, output: DType) -> bool {
+fn holds(input: DType, output: DType) -> bool {
     if !output.is_float() {
         return true;
     }
@@ -128,7 +131,7 @@ impl Op for Cast {
                 Self::NAME,
                 format!(
                     "a conversion from {} to itself moves elements, which copy_strided does",
-                    descriptor.input
+                    abi::name(descriptor.input)
                 ),
             ));
         }
@@ -180,7 +183,7 @@ impl Op for Cast {
             return Tolerance::exact();
         }
         // One rounding into the output, after at most one into the type it is reached through.
-        Tolerance::rounding(1, descriptor.output.accumulate(), descriptor.output)
+        Tolerance::rounding(1, tolerance::accumulate(descriptor.output), descriptor.output)
     }
 }
 
@@ -223,7 +226,7 @@ mod tests {
             for output in strided::ELEMENTS {
                 let args = args(input, output, &[4, 8]);
                 let checked = Cast::check(&Descriptor::of(&args, BLOCK, false), &args);
-                assert_eq!(checked.is_ok(), input != output, "{input} to {output}");
+                assert_eq!(checked.is_ok(), input != output, "{input:?} to {output:?}");
             }
         }
 

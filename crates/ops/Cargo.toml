@@ -6,12 +6,14 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# `ops` depends only on the CUDA boundary and on `serde` for the one value the epoch record carries
-# as data (the phase): it loads and launches the modules it is handed and knows no model, no layer
-# and no runtime object.
+# `ops` depends on the CUDA boundary, on the tensor library for the element type its operands
+# carry, and on `serde` for the one value the epoch record carries as data (the phase): it loads
+# and launches the modules it is handed and knows no model, no layer and no runtime object.
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 platform = { path = "../platform" }
+# The element type of an operand (`DType`); `ops::abi` states its number and spelling for packages.
+uniserve-tensor.workspace = true
 # The operator names and phases the kernel library keys its generations by.
 proto.workspace = true
 thiserror.workspace = true

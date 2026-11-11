@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail};
 use ipc::execution::Variant;
 use nn::family::{VideoModel, VideoServing};
-use ops::{DType, Generation};
+use ops::Generation;
 use platform::DeviceId;
 use worker::blocking::BlockingKind;
 use worker::plan::Buckets;
@@ -109,7 +109,7 @@ impl ModelRunner {
         // The encoder writes its hidden states in the deployment's effective type, which the daemon
         // resolved against the checkpoint before it wrote this build config (a `dtype` of `auto`
         // never reaches a main process as `auto`).
-        let dtype = DType::from(self.engine_config().model.dtype);
+        let dtype = ops::abi::from_wire(self.engine_config().model.dtype.into());
 
         let stream = |name: &str| -> Result<platform::Stream> {
             platform::Stream::new(device)
@@ -148,8 +148,7 @@ impl ModelRunner {
         // Server, maps none.
         let reports = report.is_some();
         let longest = u64::from(capacities.iter().copied().max().unwrap_or(0));
-        let element = dtype
-            .bytes()
+        let element = ops::abi::bytes(dtype)
             .context("the encoder's states have no whole-byte element")?;
         let (encoder, encoder_info) = match client {
             Some(client) => {

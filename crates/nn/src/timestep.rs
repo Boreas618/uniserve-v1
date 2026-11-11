@@ -101,7 +101,7 @@ impl TimestepEmbedding {
     }
 
     /// The element type the pair computes in: its weights'.
-    pub fn dtype(&self) -> ops::DType {
+    pub fn dtype(&self) -> uniserve_tensor::DType {
         self.first.weight().dtype
     }
 

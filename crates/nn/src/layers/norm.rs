@@ -31,7 +31,8 @@ use ops::frame::{self, FrameMoments, FrameNormPad};
 use ops::modulation::{self, ModulatedRmsNorm};
 use ops::norm::{self, AddRmsNorm, LayerNorm as LayerNormOp, RmsNorm as RmsNormOp};
 use ops::residual::{self, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm};
-use ops::{DType, Shape, Operand};
+use ops::{Shape, Operand};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -326,10 +327,10 @@ impl RmsNorm {
                 OWNER,
                 format!(
                     "an output of {} {:?} for {:?} rows of {}",
-                    out.dtype,
+                    ops::abi::name(out.dtype),
                     out.shape.dims(),
                     x.shape.dims(),
-                    self.output
+                    ops::abi::name(self.output)
                 ),
             ));
         }
@@ -342,7 +343,7 @@ impl RmsNorm {
                 OWNER,
                 format!(
                     "this form writes its input's {} and the normalization was built for {}",
-                    x.dtype, self.output
+                    ops::abi::name(x.dtype), ops::abi::name(self.output)
                 ),
             ));
         }

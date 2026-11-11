@@ -115,7 +115,7 @@ impl CausalPad {
 /// `channels_last` holds and packed channel-first otherwise.
 pub(crate) fn frame(
     f: &Forward,
-    dtype: ops::DType,
+    dtype: uniserve_tensor::DType,
     shape: Shape,
     channels_last: bool,
 ) -> Result<Operand> {
@@ -684,7 +684,8 @@ impl ResnetBlock3d {
 #[cfg(test)]
 mod tests {
     use super::{channels_last_storage, channels_last_strides};
-    use ops::tensor::{DType, DevicePtr, Shape, Strides, Operand};
+    use ops::tensor::{DevicePtr, Shape, Strides, Operand};
+    use uniserve_tensor::DType;
 
     /// The encoder's first convolution's operand: 3 channels, 19 frames, 258 x 258 pixels.
     fn operand(strides: Strides) -> Operand {

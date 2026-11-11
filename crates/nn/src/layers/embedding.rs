@@ -6,7 +6,8 @@
 //! embedding.
 
 use ops::embedding::{self, Descriptor, Embedding as EmbeddingOp};
-use ops::{DType, Operand};
+use ops::Operand;
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::family::Split;

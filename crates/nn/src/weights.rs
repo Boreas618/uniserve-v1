@@ -38,7 +38,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ops::fp4::ScaleLayout;
 use ops::values::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use ops::{DType, Shape, Operand};
+use ops::{Shape, Operand};
+use uniserve_tensor::DType;
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};
@@ -558,7 +559,7 @@ impl fmt::Display for WeightKey {
         write!(
             formatter,
             "{files}|{}|{}|{}",
-            self.dtype, self.layout, self.region
+            ops::abi::name(self.dtype), self.layout, self.region
         )?;
         if let Some(provenance) = &self.provenance {
             write!(formatter, "|{provenance}")?;
@@ -864,7 +865,7 @@ fn block_scale_dtype(tensor: &str, dtype: DType) -> Result<DType> {
         other => Err(Error::weight(
             tensor,
             format!(
-                "block scales are one byte each — F8_E4M3, or U8 where the export says so — not                  {other}"
+                "block scales are one byte each — F8_E4M3, or U8 where the export says so — not                  {other}", other = ops::abi::name(other)
             ),
         )),
     }
@@ -888,10 +889,10 @@ impl Weight {
     ///
     /// A view whose element type has no whole-byte size.
     pub fn borrowed(view: Operand) -> Result<Self> {
-        let element = view.dtype.bytes().ok_or_else(|| {
+        let element = ops::abi::bytes(view.dtype).ok_or_else(|| {
             Error::weight(
                 "",
-                format!("a borrowed {} view has no whole-byte element", view.dtype),
+                format!("a borrowed {} view has no whole-byte element", ops::abi::name(view.dtype)),
             )
         })?;
         Ok(Self {
@@ -928,7 +929,7 @@ impl Weight {
                 format!("row {row} of a weight of {:?}", shape.dims()),
             ));
         }
-        let element = self.view.dtype.bytes().unwrap_or(0);
+        let element = ops::abi::bytes(self.view.dtype).unwrap_or(0);
         let bytes = shape.dim(1) * element;
         Ok(Self {
             backing: self.backing,
@@ -1174,10 +1175,10 @@ impl<'a> WeightLoader<'a> {
         bytes: impl FnOnce(&Self) -> Result<Cow<'c, [u8]>>,
     ) -> Result<Weight> {
         let backing = if self.is_meta() {
-            let element = key.dtype.bytes().ok_or_else(|| {
+            let element = ops::abi::bytes(key.dtype).ok_or_else(|| {
                 Error::weight(
                     &key.region.to_string(),
-                    format!("{} has no whole-byte element size", key.dtype),
+                    format!("{} has no whole-byte element size", ops::abi::name(key.dtype)),
                 )
             })?;
             let length = shape.numel().checked_mul(element).ok_or_else(|| {
@@ -1229,7 +1230,7 @@ impl<'a> WeightLoader<'a> {
                     name,
                     format!(
                         "a weight-only NVFP4 weight is [rows, columns / 2] U8, not {} {:?}",
-                        packed.dtype,
+                        ops::abi::name(packed.dtype),
                         packed.shape.dims()
                     ),
                 ));
@@ -1308,7 +1309,7 @@ impl<'a> WeightLoader<'a> {
                 format!(
                     "block scales of {} {:?} for a {rows} × {columns} matrix; one F8_E4M3 per \
                      sixteen elements expected",
-                    scales.dtype,
+                    ops::abi::name(scales.dtype),
                     scales.shape.dims()
                 ),
             ));
@@ -1380,16 +1381,16 @@ impl<'a> WeightLoader<'a> {
         if source_dtype != dtype {
             conversion(source_dtype, dtype, &request.tensor)?;
         }
-        let source_element = source_dtype.bytes().ok_or_else(|| {
+        let source_element = ops::abi::bytes(source_dtype).ok_or_else(|| {
             Error::weight(
                 &request.tensor,
-                format!("{source_dtype} has no whole-byte size"),
+                format!("{source_dtype} has no whole-byte size", source_dtype = ops::abi::name(source_dtype)),
             )
         })?;
-        let element = dtype.bytes().ok_or_else(|| {
+        let element = ops::abi::bytes(dtype).ok_or_else(|| {
             Error::weight(
                 &request.tensor,
-                format!("{dtype} has no whole-byte element size"),
+                format!("{dtype} has no whole-byte element size", dtype = ops::abi::name(dtype)),
             )
         })?;
         let expected = request
@@ -1408,7 +1409,7 @@ impl<'a> WeightLoader<'a> {
                 &request.tensor,
                 format!(
                     "{converted} bytes were read, {expected} expected for {:?} of {dtype}",
-                    request.shape.dims()
+                    request.shape.dims(), dtype = ops::abi::name(dtype)
                 ),
             ));
         }
@@ -1479,7 +1480,7 @@ impl<'a> WeightLoader<'a> {
                 name,
                 format!(
                     "weight normalization of {} is not floating point",
-                    value.dtype
+                    ops::abi::name(value.dtype)
                 ),
             ));
         }
@@ -1562,7 +1563,7 @@ impl<'a> WeightLoader<'a> {
         let held = checkpoint.dtypes();
         let listed = held
             .iter()
-            .map(ToString::to_string)
+            .map(|dtype| ops::abi::name(*dtype))
             .collect::<Vec<_>>()
             .join(", ");
         if let Some(quantization) = self.quantization {
@@ -1570,17 +1571,17 @@ impl<'a> WeightLoader<'a> {
             if !held.contains(&encoding) {
                 return Err(Error::policy(format!(
                     "a {quantization} policy encodes weights as {encoding}, and this checkpoint \
-                     holds {listed}"
+                     holds {listed}", encoding = ops::abi::name(encoding)
                 )));
             }
         }
         if let Some(dtype) = self.dtype {
-            for encoded in [DType::F8E4M3, DType::F4E2M1] {
+            for encoded in [DType::F8E4M3, DType::F4] {
                 if held.contains(&encoded) {
                     return Err(Error::policy(format!(
                         "this checkpoint holds {encoded} encoded weights, which a {dtype} element \
                          type does not describe; the quantization is the loader's policy, not its \
-                         element type"
+                         element type", encoded = ops::abi::name(encoded), dtype = ops::abi::name(dtype)
                     )));
                 }
             }
@@ -1678,7 +1679,7 @@ impl<'a> WeightLoader<'a> {
         if packed.dtype() != DType::U8 {
             return Err(Error::weight(
                 &values_request.tensor,
-                format!("packed E2M1 values are U8 bytes, not {}", packed.dtype()),
+                format!("packed E2M1 values are U8 bytes, not {}", ops::abi::name(packed.dtype())),
             ));
         }
         // A calibrated export never packs an all-zero matrix: every E2M1 code would be zero, the
@@ -1907,7 +1908,7 @@ impl<'a> WeightLoader<'a> {
                 &request.tensor,
                 format!(
                     "a tensor scale is one floating number, not {} {:?}",
-                    location.dtype,
+                    ops::abi::name(location.dtype),
                     location.shape.dims()
                 ),
             ));
@@ -2020,7 +2021,7 @@ impl<'a> WeightLoader<'a> {
                 if values.dtype != DType::U8 {
                     return Err(Error::weight(
                         &values_name,
-                        format!("packed E2M1 values are U8 bytes, not {}", values.dtype),
+                        format!("packed E2M1 values are U8 bytes, not {}", ops::abi::name(values.dtype)),
                     ));
                 }
                 let (rows_here, columns_here) = match values.shape.dims() {
@@ -2059,7 +2060,7 @@ impl<'a> WeightLoader<'a> {
                             &scales_name,
                             format!(
                                 "block scales are {here} here against the stack's {agreed}: one \
-                                 stack is one scale type"
+                                 stack is one scale type", here = ops::abi::name(here), agreed = ops::abi::name(agreed)
                             ),
                         ));
                     }
@@ -2374,8 +2375,8 @@ impl<'a> WeightLoader<'a> {
         producer: &'static str,
         writable: bool,
     ) -> Result<Weight> {
-        let element = dtype.bytes().ok_or_else(|| {
-            Error::weight(name, format!("{dtype} has no whole-byte element size"))
+        let element = ops::abi::bytes(dtype).ok_or_else(|| {
+            Error::weight(name, format!("{dtype} has no whole-byte element size", dtype = ops::abi::name(dtype)))
         })?;
         let expected = shape
             .numel()
@@ -2387,7 +2388,7 @@ impl<'a> WeightLoader<'a> {
                 format!(
                     "{} bytes for {:?} of {dtype}, {expected} expected",
                     bytes.len(),
-                    shape.dims()
+                    shape.dims(), dtype = ops::abi::name(dtype)
                 ),
             ));
         }
@@ -2438,7 +2439,7 @@ impl<'a> WeightLoader<'a> {
                         name,
                         format!(
                             "the fused parts mix {seen} and {source} elements",
-                            source = location.dtype
+                            source = ops::abi::name(location.dtype), seen = ops::abi::name(seen)
                         ),
                     ));
                 }
@@ -2463,7 +2464,7 @@ impl<'a> WeightLoader<'a> {
         if !dtype.is_float() || !checkpoint.is_float() {
             return Err(Error::weight(
                 names.first().map(String::as_str).unwrap_or(""),
-                format!("converting {checkpoint} to {dtype} is not a floating-point conversion"),
+                format!("converting {checkpoint} to {dtype} is not a floating-point conversion", checkpoint = ops::abi::name(checkpoint), dtype = ops::abi::name(dtype)),
             ));
         }
         Ok(dtype)
@@ -2599,7 +2600,7 @@ impl<'s, 'a> Scope<'s, 'a> {
     }
 
     /// A table this module computes rather than reads: `values` encoded as `dtype`
-    /// ([`DType::encode`], which rounds to nearest even), published as `<path>.<leaf>`.
+    /// ([`ops::values::encode`], which rounds to nearest even), published as `<path>.<leaf>`.
     ///
     /// The module path names the constant, and the retained key's provenance digests the bytes
     /// ([`WeightLoader::constant`]), so two modules' constants never share a name and one module's
@@ -2615,7 +2616,7 @@ impl<'s, 'a> Scope<'s, 'a> {
         shape: &[u64],
         values: &[f32],
     ) -> Result<Weight> {
-        let bytes = dtype.encode(values).map_err(Error::from)?;
+        let bytes = ops::values::encode(dtype, values).map_err(Error::from)?;
         self.publish(leaf, dtype, shape, &bytes)
     }
 
@@ -2685,10 +2686,10 @@ impl<'s, 'a> Scope<'s, 'a> {
 
     /// The bytes of `shape` zeros of `dtype`: every supported type's zero is the all-zero pattern.
     fn zero_bytes(&self, leaf: &str, dtype: DType, shape: &[u64]) -> Result<Vec<u8>> {
-        let element = dtype.bytes().ok_or_else(|| {
+        let element = ops::abi::bytes(dtype).ok_or_else(|| {
             Error::weight(
                 &self.name(leaf),
-                format!("{dtype} has no whole-byte element"),
+                format!("{dtype} has no whole-byte element", dtype = ops::abi::name(dtype)),
             )
         })?;
         Ok(vec![0; (Shape::new(shape).numel() * element) as usize])
@@ -2812,8 +2813,8 @@ fn spans_in<'l>(
         } => {
             let location = locate(tensor).ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
             let length = stored_bytes(location);
-            let element = location.dtype.bytes().ok_or_else(|| {
-                Error::weight(tensor, format!("{} has no whole-byte size", location.dtype))
+            let element = ops::abi::bytes(location.dtype).ok_or_else(|| {
+                Error::weight(tensor, format!("{} has no whole-byte size", ops::abi::name(location.dtype)))
             })?;
             let begin = usize::try_from(start * element).map_err(|_| {
                 Error::weight(tensor, "the region's first element is past usize::MAX")
@@ -2844,8 +2845,8 @@ fn spans_in<'l>(
             row_stride,
         } => {
             let location = locate(tensor).ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
-            let element = location.dtype.bytes().ok_or_else(|| {
-                Error::weight(tensor, format!("{} has no whole-byte size", location.dtype))
+            let element = ops::abi::bytes(location.dtype).ok_or_else(|| {
+                Error::weight(tensor, format!("{} has no whole-byte size", ops::abi::name(location.dtype)))
             })?;
             if shape.rank() == 0 {
                 return Err(Error::weight(
@@ -2903,8 +2904,8 @@ fn spans_in<'l>(
             let mut spans = Vec::new();
             for name in parts {
                 let location = locate(name).ok_or_else(|| Error::MissingTensor(name.clone()))?;
-                let element = location.dtype.bytes().ok_or_else(|| {
-                    Error::weight(name, format!("{} has no whole-byte size", location.dtype))
+                let element = ops::abi::bytes(location.dtype).ok_or_else(|| {
+                    Error::weight(name, format!("{} has no whole-byte size", ops::abi::name(location.dtype)))
                 })?;
                 if block.row_stride < block.columns {
                     return Err(Error::weight(
@@ -2996,10 +2997,8 @@ fn block_spans<'a>(
     block: &PartBlock,
 ) -> Result<Vec<Span<'a>>> {
     let location = locate(name).ok_or_else(|| Error::MissingTensor(name.to_owned()))?;
-    let element = location
-        .dtype
-        .bytes()
-        .ok_or_else(|| Error::weight(name, format!("{} has no whole-byte size", location.dtype)))?;
+    let element = ops::abi::bytes(location.dtype)
+        .ok_or_else(|| Error::weight(name, format!("{} has no whole-byte size", ops::abi::name(location.dtype))))?;
     if block.row_stride < block.columns {
         return Err(Error::weight(
             name,
@@ -3072,12 +3071,12 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
     if from == to {
         return Ok(bytes.to_vec());
     }
-    let source_bytes = usize::try_from(from.bytes().unwrap_or(4)).unwrap_or(4);
-    let target_bytes = usize::try_from(to.bytes().unwrap_or(4)).unwrap_or(4);
+    let source_bytes = usize::try_from(ops::abi::bytes(from).unwrap_or(4)).unwrap_or(4);
+    let target_bytes = usize::try_from(ops::abi::bytes(to).unwrap_or(4)).unwrap_or(4);
     if !bytes.len().is_multiple_of(source_bytes) {
         return Err(Error::weight(
             tensor,
-            format!("{} bytes are not whole {from} elements", bytes.len()),
+            format!("{} bytes are not whole {from} elements", bytes.len(), from = ops::abi::name(from)),
         ));
     }
     let count = bytes.len() / source_bytes;
@@ -3093,13 +3092,13 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
             other => {
                 return Err(Error::weight(
                     tensor,
-                    format!("converting {other} is not a floating-point conversion"),
+                    format!("converting {other} is not a floating-point conversion", other = ops::abi::name(other)),
                 ));
             }
         };
         match to {
             // A weight narrowed to BF16 at load keeps its top sixteen bits: the loader truncates where
-            // `DType::encode` and `torch` round to nearest. Served weights were narrowed this way, so
+            // `ops::values::encode` and `torch` round to nearest. Served weights were narrowed this way, so
             // the rule stands until a measured run replaces it.
             DType::BF16 => {
                 converted.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes())
@@ -3110,7 +3109,7 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
             other => {
                 return Err(Error::weight(
                     tensor,
-                    format!("converting to {other} is not a floating-point conversion"),
+                    format!("converting to {other} is not a floating-point conversion", other = ops::abi::name(other)),
                 ));
             }
         }
@@ -3135,7 +3134,7 @@ fn conversion(from: DType, to: DType, tensor: &str) -> Result<()> {
         (same, target) if same == target => Ok(()),
         (source, target) => Err(Error::weight(
             tensor,
-            format!("converting {source} to {target} is not implemented"),
+            format!("converting {source} to {target} is not implemented", source = ops::abi::name(source), target = ops::abi::name(target)),
         )),
     }
 }
@@ -3455,8 +3454,10 @@ mod tests {
             let bytes = vec![0u8; 2];
             let error = convert(from, to, &bytes, "pcm").unwrap_err().to_string();
             assert!(
-                error.contains(&from.to_string()) && error.contains(&to.to_string()),
-                "{from} to {to} was refused without naming both: {error}"
+                error.contains(ops::abi::name(from)) && error.contains(ops::abi::name(to)),
+                "{from} to {to} was refused without naming both: {error}",
+                from = ops::abi::name(from),
+                to = ops::abi::name(to)
             );
         }
     }

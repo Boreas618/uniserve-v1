@@ -57,11 +57,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, Operand};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Shape, Strides, Operand};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// Which half of a K/V page a launch converts.
@@ -118,8 +121,8 @@ impl fmt::Display for ConversionDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("field", self.field)
-            .field("source", self.source)
-            .field("compute", self.compute)
+            .field("source", abi::name(self.source))
+            .field("compute", abi::name(self.compute))
             .field("head_dim", self.head_dim)
             .field("heads", self.heads)
             .field("layers", self.layers)
@@ -165,7 +168,7 @@ impl Op for PageConversion {
                     Self::NAME,
                     format!(
                         "a scaled source stores {} rather than E4M3",
-                        descriptor.source
+                        abi::name(descriptor.source)
                     ),
                 ));
             }
@@ -185,7 +188,7 @@ impl Op for PageConversion {
         if args.scratch.dtype != DType::U8 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("the scratch is {}, not raw bytes", args.scratch.dtype),
+                format!("the scratch is {}, not raw bytes", abi::name(args.scratch.dtype)),
             ));
         }
         let needed = scratch_bytes(args.elements, args.scales);
@@ -275,14 +278,14 @@ impl Op for PageConversion {
         // One rounded multiply per stored value: the source's own writes rounded the same way, and a
         // narrow compute type rounds the product once more into the FP32 block.
         let extra =
-            if descriptor.compute.unit_roundoff() > f64::from(DType::F32.unit_roundoff() as f32) {
+            if tolerance::unit_roundoff(descriptor.compute) > f64::from(tolerance::unit_roundoff(DType::F32) as f32) {
                 1.0
             } else {
                 0.0
             };
         Tolerance::new(
             0.0,
-            (1.0 + extra) * descriptor.compute.unit_roundoff() as f32,
+            (1.0 + extra) * tolerance::unit_roundoff(descriptor.compute) as f32,
         )
     }
 }
@@ -317,7 +320,7 @@ impl fmt::Display for CopyRegionDescriptor {
             .field("plane_bytes", self.plane_bytes)
             .field("heads", self.heads)
             .field("head_dim", self.head_dim)
-            .field("element", self.element)
+            .field("element", abi::name(self.element))
             .field("scaled", self.scaled)
             .finish(formatter)
     }
@@ -364,10 +367,10 @@ impl Op for CacheCopyRegion {
                 "a unit needs layers, units per page, heads and features".to_owned(),
             ));
         }
-        let element_bytes = descriptor.element.bytes().ok_or_else(|| {
+        let element_bytes = abi::bytes(descriptor.element).ok_or_else(|| {
             Error::argument(
                 Self::NAME,
-                format!("{} has no byte width", descriptor.element),
+                format!("{} has no byte width", abi::name(descriptor.element)),
             )
         })?;
         let expected_plane = descriptor.plane_bytes;
@@ -447,7 +450,7 @@ impl Op for CacheCopyRegion {
         if args.units.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("the unit ids are {}, not u32", args.units.dtype),
+                format!("the unit ids are {}, not u32", abi::name(args.units.dtype)),
             ));
         }
         let block_size = expected_plane
@@ -523,7 +526,7 @@ impl Op for CacheCopyRegion {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The destination encodes each written value once into its stored type; scaling the unit up
         // rescales the resident values, one rounding each.
-        Tolerance::new(0.0, 2.0 * descriptor.element.unit_roundoff() as f32)
+        Tolerance::new(0.0, 2.0 * tolerance::unit_roundoff(descriptor.element) as f32)
     }
 }
 

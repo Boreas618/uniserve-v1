@@ -25,11 +25,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Shape, Operand};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The widest row the modulation kernel reduces, in elements.
@@ -70,9 +73,9 @@ pub struct ModulatedRmsNormDescriptor {
 impl fmt::Display for ModulatedRmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
-            .field("output", self.output)
-            .field("indices", self.indices)
+            .field("dtype", abi::name(self.dtype))
+            .field("output", abi::name(self.output))
+            .field("indices", abi::name(self.indices))
             .field("width", self.width)
             .field("block", self.block)
             .field("epsilon", self.epsilon)
@@ -135,7 +138,7 @@ impl Op for ModulatedRmsNorm {
         if !descriptor.dtype.is_float() {
             return Err(Error::argument(
                 Self::NAME,
-                format!("{} is not a floating activation type", descriptor.dtype),
+                format!("{} is not a floating activation type", abi::name(descriptor.dtype)),
             ));
         }
         if descriptor.width == 0 || descriptor.width > MAX_WIDTH {
@@ -173,7 +176,7 @@ impl Op for ModulatedRmsNorm {
                 Self::NAME,
                 format!(
                     "expected {} row indices, found {}",
-                    descriptor.indices, args.row_indices.dtype
+                    abi::name(descriptor.indices), abi::name(args.row_indices.dtype)
                 ),
             ));
         }
@@ -269,7 +272,7 @@ impl Op for ModulatedRmsNorm {
                     Self::NAME,
                     format!(
                         "a dequantization scale was given for a {} output",
-                        descriptor.output
+                        abi::name(descriptor.output)
                     ),
                 ));
             }
@@ -343,7 +346,7 @@ impl Op for ModulatedRmsNorm {
         let chain = if descriptor.update { 8.0 } else { 6.0 };
         Tolerance::new(
             statistics.atol,
-            statistics.rtol + chain * descriptor.dtype.unit_roundoff() as f32,
+            statistics.rtol + chain * tolerance::unit_roundoff(descriptor.dtype) as f32,
         )
     }
 }
@@ -368,8 +371,8 @@ pub struct GatedResidualDescriptor {
 impl fmt::Display for GatedResidualDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
-            .field("indices", self.indices)
+            .field("dtype", abi::name(self.dtype))
+            .field("indices", abi::name(self.indices))
             .field("width", self.width)
             .field("gate_stride", self.gate_stride)
             .finish(formatter)

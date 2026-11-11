@@ -16,7 +16,8 @@
 
 use ops::modulation::{self, GatedResidual as GatedResidualOp};
 use ops::residual::{self, ScaledAdd, ScaledResidual};
-use ops::{DType, Operand};
+use ops::Operand;
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;

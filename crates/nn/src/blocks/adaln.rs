@@ -23,7 +23,8 @@
 //! interval, so the block exposes its two modulated stages beside the whole forward. Each stage's
 //! intermediates are reserved from the forward's arena and handed back before it returns.
 
-use ops::{DType, DevicePtr, Shape, Strides, Operand};
+use ops::{DevicePtr, Shape, Strides, Operand};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::family::Split;
@@ -112,7 +113,7 @@ impl ModulationTable {
 
     /// Vector `index` of every parameter row, as a `[parameters, width]` row-strided weight.
     fn vector(&self, index: u64) -> Result<Weight> {
-        let element = self.table.dtype.bytes().unwrap_or(1);
+        let element = ops::abi::bytes(self.table.dtype).unwrap_or(1);
         let view = Operand::with_strides(
             DevicePtr::new(self.table.ptr.address() + index * self.width * element),
             self.table.dtype,
