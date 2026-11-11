@@ -633,7 +633,32 @@ fn conv2d_noncontiguous_kernel(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+// A non-contiguous kernel and its contiguous copy must produce identical results.
+fn conv1d_noncontiguous_kernel(dev: &Device) -> Result<()> {
+    let input_data: Vec<f32> = (1..=10).map(|v| v as f32 * 0.1).collect();
+    let weight_data: Vec<f32> = (1..=24).map(|v| v as f32 * 0.1).collect();
+    let input = Tensor::from_slice(&input_data, (1, 2, 5), dev)?;
+    let weight = Tensor::from_slice(&weight_data, (3, 4, 2), dev)?;
+
+    // Non-contiguous kernel: a channel slice of a larger weight, so it has a non-zero offset.
+    let kernel = weight.i((.., 1..3, ..))?;
+    assert!(!kernel.is_contiguous());
+    let res = input.conv1d(&kernel, 0, 1, 1, 1)?;
+
+    // Reference: the same logical kernel forced contiguous.
+    let kernel_ref = kernel.contiguous()?;
+    let res_ref = input.conv1d(&kernel_ref, 0, 1, 1, 1)?;
+
+    assert_eq!(res.dims(), [1, 3, 4]);
+    assert_eq!(
+        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        test_utils::to_vec1_round(&res_ref.flatten_all()?, 4)?,
+    );
+    Ok(())
+}
+
 test_device!(conv1d);
+test_device!(conv1d_noncontiguous_kernel);
 test_device!(conv1d_small);
 test_device!(conv2d);
 test_device!(conv2d_non_square);

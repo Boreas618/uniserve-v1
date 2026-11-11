@@ -2679,20 +2679,21 @@ impl CpuStorage {
         let k = op.l_k * params.c_in;
         let m = l_out;
         let col_l = Layout::contiguous((b, m, k));
-        let res = if kernel_l.is_contiguous() {
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
-                .transpose(1, 2)?
-                .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+        // The matmul views the kernel as rows of (n, k) from its start offset, which a
+        // contiguous kernel provides; any other kernel is copied into one first.
+        let kernel_c;
+        let (kernel, kernel_offset) = if kernel_l.is_contiguous() {
+            (kernel, kernel_l.start_offset())
         } else {
-            // Make the kernel contiguous if not already the case.
-            let mut kernel_c = unsafe { CpuDevice.alloc_uninit(kernel_l.shape(), kernel.dtype())? };
-            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
-                .transpose(1, 2)?
-                .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+            let mut copy = unsafe { CpuDevice.alloc_uninit(kernel_l.shape(), kernel.dtype())? };
+            kernel.copy_strided_src(&mut copy, 0, kernel_l)?;
+            kernel_c = copy;
+            (&kernel_c, 0)
         };
+        let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_offset)
+            .transpose(1, 2)?
+            .broadcast_as((b, k, n))?;
+        let res = col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?;
         let res_l = Layout::contiguous((b, l_out, params.c_out)).transpose(1, 2)?;
         let mut res_t = unsafe { CpuDevice.alloc_uninit(res_l.shape(), res.dtype())? };
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
