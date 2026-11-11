@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use ops::{DType, TensorView, Tolerance, Twins};
+use ops::{DType, Operand, Tolerance, Twins};
 use platform::{DeviceId, PinnedBuffer, Stream};
 
 use crate::{Error, Result};
@@ -461,8 +461,8 @@ impl Staging {
         stream: &Stream,
         offset: usize,
         bytes: usize,
-        real: &TensorView,
-        shadow: &TensorView,
+        real: &Operand,
+        shadow: &Operand,
     ) -> Result<()> {
         // SAFETY: `reserve` sized both host buffers for every pair, so `offset..offset + bytes` is
         // page-locked storage of this staging, which no other copy targets; each device source

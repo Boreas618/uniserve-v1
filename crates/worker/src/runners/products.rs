@@ -43,7 +43,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use ipc::RequestKey;
-use ops::TensorView;
+use ops::Operand;
 use platform::{DeviceId, Event};
 
 use crate::Result;
@@ -161,7 +161,7 @@ pub trait Products: Send + Sync {
         device: DeviceId,
         stream: StreamId,
         written: Option<Arc<Event>>,
-        view: &TensorView,
+        view: &Operand,
     ) -> Result<()>;
 
     /// Borrows `request`'s `kind` product as a view a call on `stream` may read **directly**.
@@ -187,7 +187,7 @@ pub trait Products: Send + Sync {
         kind: Product,
         device: DeviceId,
         stream: StreamId,
-    ) -> Result<Option<TensorView>>;
+    ) -> Result<Option<Operand>>;
 
     /// Orders `stream` after the write of `request`'s `kind` product and answers its view, to read
     /// in place.
@@ -202,7 +202,7 @@ pub trait Products: Send + Sync {
         request: RequestKey,
         kind: Product,
         stream: &platform::Stream,
-    ) -> Result<Option<TensorView>> {
+    ) -> Result<Option<Operand>> {
         let _ = (request, kind, stream);
         Err(crate::Error::Invalid(
             "this product store cannot order a read in place: it holds no device".into(),
@@ -253,7 +253,7 @@ pub trait Products: Send + Sync {
         &self,
         request: RequestKey,
         kind: Product,
-        destination: &TensorView,
+        destination: &Operand,
         stream: &platform::Stream,
     ) -> Result<bool>;
 
@@ -267,7 +267,7 @@ pub trait Products: Send + Sync {
         _request: RequestKey,
         _kind: Product,
         _stream: &platform::Stream,
-    ) -> Result<Option<TensorView>> {
+    ) -> Result<Option<Operand>> {
         Err(crate::Error::Invalid(
             "this store lends no region to a reader".into(),
         ))
@@ -443,7 +443,7 @@ impl Products for RankProducts {
         device: DeviceId,
         stream: StreamId,
         written: Option<Arc<Event>>,
-        view: &TensorView,
+        view: &Operand,
     ) -> Result<()> {
         self.store(kind)
             .publish(request, kind, device, stream, written, view)
@@ -455,7 +455,7 @@ impl Products for RankProducts {
         kind: Product,
         device: DeviceId,
         stream: StreamId,
-    ) -> Result<Option<TensorView>> {
+    ) -> Result<Option<Operand>> {
         self.store(kind).borrow(request, kind, device, stream)
     }
 
@@ -464,7 +464,7 @@ impl Products for RankProducts {
         request: RequestKey,
         kind: Product,
         stream: &platform::Stream,
-    ) -> Result<Option<TensorView>> {
+    ) -> Result<Option<Operand>> {
         match kind {
             // The media reader's regions are pinned host storage, which every rank's device reads
             // in place: the first rank published them, and the rest order after its write.
@@ -491,7 +491,7 @@ impl Products for RankProducts {
         &self,
         request: RequestKey,
         kind: Product,
-        destination: &TensorView,
+        destination: &Operand,
         stream: &platform::Stream,
     ) -> Result<bool> {
         self.store(kind)
@@ -503,7 +503,7 @@ impl Products for RankProducts {
         request: RequestKey,
         kind: Product,
         stream: &platform::Stream,
-    ) -> Result<Option<TensorView>> {
+    ) -> Result<Option<Operand>> {
         self.store(kind).lent(request, kind, stream)
     }
 
@@ -537,7 +537,7 @@ impl Products for RankProducts {
 /// issued unordered.
 #[derive(Clone)]
 struct Placed {
-    view: TensorView,
+    view: Operand,
     device: DeviceId,
     stream: StreamId,
     written: Option<Arc<Event>>,
@@ -603,7 +603,7 @@ impl Held {
         request: RequestKey,
         kind: Product,
         stream: &platform::Stream,
-    ) -> Result<Option<TensorView>> {
+    ) -> Result<Option<Operand>> {
         let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
         let Some(placed) = placed else {
             return Ok(None);
@@ -641,7 +641,7 @@ impl Products for Held {
         device: DeviceId,
         stream: StreamId,
         written: Option<Arc<Event>>,
-        view: &TensorView,
+        view: &Operand,
     ) -> Result<()> {
         // A trajectory is published again at every step and the last write is the one a reader
         // wants, so publishing replaces rather than refusing a second write.
@@ -664,7 +664,7 @@ impl Products for Held {
         kind: Product,
         device: DeviceId,
         stream: StreamId,
-    ) -> Result<Option<TensorView>> {
+    ) -> Result<Option<Operand>> {
         let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
         let Some(placed) = placed else {
             return Ok(None);
@@ -699,7 +699,7 @@ impl Products for Held {
         request: RequestKey,
         kind: Product,
         stream: &platform::Stream,
-    ) -> Result<Option<TensorView>> {
+    ) -> Result<Option<Operand>> {
         let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
         let Some(placed) = placed else {
             return Ok(None);
@@ -763,7 +763,7 @@ impl Products for Held {
         request: RequestKey,
         kind: Product,
         stream: &platform::Stream,
-    ) -> Result<Option<TensorView>> {
+    ) -> Result<Option<Operand>> {
         let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
         let Some(placed) = placed else {
             return Ok(None);
@@ -787,7 +787,7 @@ impl Products for Held {
         &self,
         request: RequestKey,
         kind: Product,
-        destination: &TensorView,
+        destination: &Operand,
         stream: &platform::Stream,
     ) -> Result<bool> {
         let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
@@ -997,10 +997,10 @@ mod tests {
         RequestKey::new(1, ipc::RequestId(id), 0)
     }
 
-    /// A view whose element count names it: `TensorView` exposes no address, so the count is what a
+    /// A view whose element count names it: `Operand` exposes no address, so the count is what a
     /// test compares - the store's contract is that the same view comes back, not that a number does.
-    fn view(address: u64, elements: u64) -> TensorView {
-        TensorView::new(
+    fn view(address: u64, elements: u64) -> Operand {
+        Operand::new(
             DevicePtr::new(address),
             DType::BF16,
             Shape::new(&[elements]),

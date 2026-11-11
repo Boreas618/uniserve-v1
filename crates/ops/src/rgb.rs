@@ -47,7 +47,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -96,7 +96,7 @@ pub fn quantize_scaled(scaled: f32) -> u8 {
 ///
 /// A sub-region of a larger raster passes unchanged: it is only a bigger outer stride, which is what
 /// the decoder's tile-in-a-canvas write needs.
-fn raster(operator: &'static str, name: &str, view: &TensorView) -> Result<()> {
+fn raster(operator: &'static str, name: &str, view: &Operand) -> Result<()> {
     let rank = view.shape.rank();
     let strides = view.strides.as_slice();
     for axis in 0..rank {
@@ -123,7 +123,7 @@ fn raster(operator: &'static str, name: &str, view: &TensorView) -> Result<()> {
 }
 
 /// The three outer strides of a rank-4 raster view that [`raster`] accepted.
-fn outer_strides(view: &TensorView) -> [u64; 3] {
+fn outer_strides(view: &Operand) -> [u64; 3] {
     let strides = view.strides.as_slice();
     [strides[0], strides[1], strides[2]]
 }
@@ -156,13 +156,13 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[channels, frames, rows, columns]` the normalized raster.
-    pub input: TensorView,
+    pub input: Operand,
     /// `[channels]` f32: each channel's ImageNet mean, the addend of the de-normalization.
-    pub mean: TensorView,
+    pub mean: Operand,
     /// `[channels]` f32: each channel's ImageNet standard deviation, the multiplier.
-    pub std: TensorView,
+    pub std: Operand,
     /// `[frames, rows, columns, channels]` u8: the packed image bytes.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The normalized raster to packed 8-bit RGB.
@@ -401,7 +401,7 @@ mod tests {
 
         // One tile of a larger packed raster: 2 frames of rows × columns pixels of 3 bytes, placed
         // every 1000 bytes along the canvas's rows (a row is 96 bytes) and every 2000 rows in frames.
-        let tile = TensorView {
+        let tile = Operand {
             ptr: DevicePtr::new(0),
             dtype: DType::U8,
             shape: Shape::new(&[2, 4, 32, 3]),
@@ -411,14 +411,14 @@ mod tests {
         assert_eq!(outer_strides(&tile), [4000, 1000, 3]);
 
         // The same view squeezed against its neighbour: the rows would share bytes.
-        let overlapping = TensorView {
+        let overlapping = Operand {
             strides: Strides::new(&[4 * 90, 90, 3, 1]),
             ..tile
         };
         assert!(raster("test", "out", &overlapping).is_err());
 
         // A broadcast axis is not a raster.
-        let broadcast = TensorView {
+        let broadcast = Operand {
             strides: Strides::new(&[0, 1000, 3, 1]),
             ..tile
         };

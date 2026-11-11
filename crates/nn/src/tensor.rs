@@ -1,9 +1,9 @@
 //! The tensor ABI `nn` shares with `ops`, and the storage a layer's weight view is carved from.
 //!
-//! The view types are not defined here. [`TensorView`], [`Shape`], [`Strides`], [`DType`] and
+//! The view types are not defined here. [`Operand`], [`Shape`], [`Strides`], [`DType`] and
 //! [`DevicePtr`] are [`ops`] types, because they are the ABI of an operator's arguments and `ops`
 //! depends on `platform` alone; `nn` re-exports them so a model writes
-//! `nn::TensorView`, not two names for one thing.
+//! `nn::Operand`, not two names for one thing.
 //!
 //! What `nn` adds is [`Backing`]: the retained region a weight view borrows. The worker publishes
 //! a converted weight to retained storage and binds the storage read-only; a layer receives the
@@ -11,7 +11,7 @@
 
 use crate::{Error, Result};
 
-pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
+pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, Operand};
 
 /// The device storage a borrowed view is carved from.
 ///
@@ -44,7 +44,7 @@ impl Backing {
     ///
     /// Fails when the elements do not fit the region: a view that reaches past its backing is a
     /// loading defect, not a launch-time argument error.
-    pub fn view(self, dtype: DType, shape: Shape) -> Result<TensorView> {
+    pub fn view(self, dtype: DType, shape: Shape) -> Result<Operand> {
         let bytes = dtype.bytes().ok_or_else(|| {
             Error::Unsupported(format!(
                 "{dtype} elements are sub-byte and named by their storage layout, not a view"
@@ -65,7 +65,7 @@ impl Backing {
                 ),
             ));
         }
-        Ok(TensorView::new(self.address, dtype, shape))
+        Ok(Operand::new(self.address, dtype, shape))
     }
 }
 

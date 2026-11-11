@@ -35,7 +35,7 @@ use crate::descriptor::Key;
 use crate::fp4::ScaleLayout;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -140,26 +140,26 @@ impl fmt::Display for RouteGemmDescriptor {
 #[derive(Clone, Copy)]
 pub struct GatherGemmArgs {
     /// `[tokens, hidden]` hidden states, row-major.
-    pub hidden: TensorView,
+    pub hidden: Operand,
     /// `[experts, 2 · intermediate, hidden]` expert weights.
-    pub weights: TensorView,
+    pub weights: Operand,
     /// `[tokens, top]` i32 route ids — the source of the expanded route count.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[tokens, top]` i32: the permuted row of each `(token, route)` pair, as `moe_sort` writes it
     /// (the same map `moe_unpermute` reads). It is the consumer's lookup, not this product's: the
     /// product writes row `p` of `out` at the sort's permuted row `p`, so the map is what lets the
     /// reader find a route afterwards.
-    pub expanded_to_permuted: TensorView,
+    pub expanded_to_permuted: Operand,
     /// `[max_tiles]` i32 expert of each tile.
-    pub tile_to_expert: TensorView,
+    pub tile_to_expert: Operand,
     /// `[max_tiles]` i32 live rows of each tile.
-    pub tile_to_limit: TensorView,
+    pub tile_to_limit: Operand,
     /// `[max_permuted_rows]` i32 expanded route of each permuted row.
-    pub permuted_to_expanded: TensorView,
+    pub permuted_to_expanded: Operand,
     /// `[1]` i32 live tiles.
-    pub num_non_exiting_tiles: TensorView,
+    pub num_non_exiting_tiles: Operand,
     /// `[max_permuted_rows, intermediate]` gated products, written.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The call structure the FC1 package's entry receives.
@@ -522,23 +522,23 @@ impl Op for RouteGemm {
 #[derive(Clone, Copy)]
 pub struct RouteGemmArgs {
     /// `[max_permuted_rows, intermediate]` FC1's gated products.
-    pub rows: TensorView,
+    pub rows: Operand,
     /// `[experts, hidden, intermediate]` expert weights.
-    pub weights: TensorView,
+    pub weights: Operand,
     /// `[tokens, top]` i32 route ids.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[max_tiles]` i32 expert of each tile.
-    pub tile_to_expert: TensorView,
+    pub tile_to_expert: Operand,
     /// `[max_tiles]` i32 live rows of each tile.
-    pub tile_to_limit: TensorView,
+    pub tile_to_limit: Operand,
     /// `[max_permuted_rows]` i32 expanded route of each permuted row.
-    pub permuted_to_expanded: TensorView,
+    pub permuted_to_expanded: Operand,
     /// `[1]` i32 live tiles.
-    pub num_non_exiting_tiles: TensorView,
+    pub num_non_exiting_tiles: Operand,
     /// `[max_permuted_rows, hidden]` every permuted row's expert product, written unweighted: row
     /// `p` of `out` is the product of the sort's permuted row `p`, which is also `out`'s row count
     /// here and the height the launch checks.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The call structure the FC2 package's entry receives.
@@ -676,42 +676,42 @@ pub struct GatherGemmNvfp4Args {
     /// what every kernel in the artifact with an E2M1 weight and a BF16 output does (their routing
     /// implementation is `Ldgsts` or `Tma`, never `NoRoute`). A route-major buffer here would be
     /// read as tokens and gathered a second time.
-    pub hidden: TensorView,
+    pub hidden: Operand,
     /// `[tokens, hidden/16]` the activations' block scales, one per sixteen elements of the
     /// contraction, of the descriptor's `scale` type in its `layout`.
-    pub hidden_scale: TensorView,
+    pub hidden_scale: Operand,
     /// `[tokens]` f32: the encoder's per-token scale factor. The artifact's FP4 kernels carry one
     /// beside the block scales (`Bb16tokFp32`), and it is the product's `perTokenScales` argument:
     /// a caller that passes the block scales alone leaves the kernel reading a null table.
-    pub hidden_token_scale: TensorView,
+    pub hidden_token_scale: Operand,
     /// `[experts, 2·intermediate, hidden/2]` U8: two E2M1 codes a byte along the contraction.
-    pub weights: TensorView,
+    pub weights: Operand,
     /// `[experts, ...]` the block scales in the descriptor's layout, one per sixteen elements.
-    pub scales: TensorView,
+    pub scales: Operand,
     /// `[2, experts]` f32, contiguous: each expert's tensor scales, one **per projection** in the
     /// fused reading order — row 0 is the value half (up), row 1 the gate half. A
     /// checkpoint carries two separate per-expert scalar tables, and the product's kernel reads each
     /// as its own array of `experts` floats, so the two halves are two *rows* here and not an
     /// interleaved `[experts, 2]`: an interleaved table cannot be handed to a reader that indexes
     /// `array[expert]`.
-    pub global_scale: TensorView,
+    pub global_scale: Operand,
     /// `[tiles]` i32: the expert a tile's rows belong to.
-    pub tile_to_expert: TensorView,
+    pub tile_to_expert: Operand,
     /// `[tiles]` i32: the local row limit of that tile.
-    pub tile_to_limit: TensorView,
+    pub tile_to_limit: Operand,
     /// `[routes]` i32: the token row each permuted row gathers, `-1` on a tile's padding. The
     /// product indexes the token-major activations with it, so an expanded route here would read
     /// past the last token.
-    pub permuted_to_token: TensorView,
+    pub permuted_to_token: Operand,
     /// `[1]` i32: the number of tiles that have work.
-    pub num_non_exiting_tiles: TensorView,
+    pub num_non_exiting_tiles: Operand,
     /// `[routes, intermediate]` the gated product.
-    pub out: TensorView,
+    pub out: Operand,
     /// `[bytes]` U8: scratch the program needs for its own bookkeeping. The size its tactic needs is
     /// the artifact's plan, not something `ops` can restate; a view shorter than the plan is refused
     /// by name at the point of use, never grown — a step that allocates is a host allocation inside a
     /// captured graph, and the address the pool baked is the wrong one the moment the step grows.
-    pub workspace: TensorView,
+    pub workspace: Operand,
 }
 
 /// Check the scratch view both encoded products carry.
@@ -722,7 +722,7 @@ pub struct GatherGemmNvfp4Args {
 /// the point of use by the entry, where a short buffer is a named refusal; it is never grown, because
 /// the step runs inside a captured graph and an allocation there lands at an address the pool did not
 /// bake into the capture.
-fn check_workspace(operator: &'static str, workspace: TensorView) -> Result<()> {
+fn check_workspace(operator: &'static str, workspace: Operand) -> Result<()> {
     workspace.require_rank(operator, 1)?;
     if workspace.dtype != DType::U8 {
         return Err(Error::argument(
@@ -1357,36 +1357,36 @@ pub struct RouteGemmNvfp4Args {
     /// `[routes, intermediate/2]` U8: the gated rows, encoded as `nvfp4_quantize` produces them —
     /// two E2M1 codes a byte along the contraction. FC1's epilogue is a BF16 row, so the encoding
     /// between the two products is a program of its own, not a wider operand of this one.
-    pub hidden: TensorView,
+    pub hidden: Operand,
     /// The rows' block scales, one per sixteen elements of the contraction, of the descriptor's
     /// `scale` type in its `layout`.
-    pub hidden_scale: TensorView,
+    pub hidden_scale: Operand,
     /// `[routes]` f32: the encoder's per-token scale factor, beside the block scales.
-    pub hidden_token_scale: TensorView,
+    pub hidden_token_scale: Operand,
     /// `[experts, hidden, intermediate/2]` U8: two E2M1 codes a byte along the contraction.
-    pub weights: TensorView,
+    pub weights: Operand,
     /// The block scales, one per sixteen elements of the contraction and one row per output row.
-    pub scales: TensorView,
+    pub scales: Operand,
     /// `[experts]` f32: each expert's tensor scale, one **per projection** — this product fuses a
     /// single projection, so the table is one array of `experts` floats, the shape a reader that
     /// indexes `array[expert]` takes. The values are the checkpoint's scales, factors the product
     /// multiplies, not their reciprocals: the operand's own reconstruction already carries the
     /// encoder's factor, so a reciprocal here would divide the scale out twice.
-    pub global_scale: TensorView,
+    pub global_scale: Operand,
     /// `[tiles]` i32: the expert a tile's rows belong to.
-    pub tile_to_expert: TensorView,
+    pub tile_to_expert: Operand,
     /// `[tiles]` i32: the local row limit of that tile.
-    pub tile_to_limit: TensorView,
+    pub tile_to_limit: Operand,
     /// `[routes]` i32: the gathered row of each route.
-    pub permuted_to_expanded: TensorView,
+    pub permuted_to_expanded: Operand,
     /// `[1]` i32: the number of tiles that have work.
-    pub num_non_exiting_tiles: TensorView,
+    pub num_non_exiting_tiles: Operand,
     /// `[routes, hidden]` the contracted rows, one per route: the `top` repeats are combined by
     /// `moe_unpermute`, not here.
-    pub out: TensorView,
+    pub out: Operand,
     /// `[bytes]` U8: scratch for the program's own bookkeeping, as FC1's is: the plan's size or more,
     /// refused at the point of use when it is short.
-    pub workspace: TensorView,
+    pub workspace: Operand,
 }
 
 /// FC2 of an encoded, block-scaled expert block.
@@ -1605,8 +1605,8 @@ impl Op for RouteGemmNvfp4 {
 mod nvfp4_launch_tests {
     use super::*;
 
-    fn table(dtype: DType, dims: &[u64]) -> TensorView {
-        TensorView::new(crate::tensor::DevicePtr::new(0), dtype, Shape::new(dims))
+    fn table(dtype: DType, dims: &[u64]) -> Operand {
+        Operand::new(crate::tensor::DevicePtr::new(0), dtype, Shape::new(dims))
     }
 
     fn fc1() -> GatherGemmNvfp4Descriptor {

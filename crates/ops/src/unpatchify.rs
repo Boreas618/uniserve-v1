@@ -39,7 +39,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView, row_writable};
+use crate::tensor::{DType, Shape, Operand, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -73,13 +73,13 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[tokens, channels · patch_volume]` the packed token rows.
-    pub tokens: TensorView,
+    pub tokens: Operand,
     /// `[channels]` the per-channel scale, present exactly when the descriptor's `affine` is set.
-    pub scale: Option<TensorView>,
+    pub scale: Option<Operand>,
     /// `[channels]` the per-channel bias, present exactly when the descriptor's `affine` is set.
-    pub bias: Option<TensorView>,
+    pub bias: Option<Operand>,
     /// `[channels, frames · patch_frames, height · patch_height, width · patch_width]` the raster.
-    pub out: TensorView,
+    pub out: Operand,
     /// The token grid: frames, rows and columns. A request's grid varies — a clip's length and its
     /// canvas are the request's — so it is a launch value and not a compiled one.
     pub frames: u32,
@@ -296,9 +296,9 @@ mod tests {
     }
 
     /// A contiguous view of `dims`, which is what every operand of an admitted launch is.
-    fn contiguous(dtype: DType, dims: &[u64]) -> TensorView {
+    fn contiguous(dtype: DType, dims: &[u64]) -> Operand {
         let shape = Shape::new(dims);
-        TensorView::with_strides(
+        Operand::with_strides(
             crate::tensor::DevicePtr::new(0x2000),
             dtype,
             shape,
@@ -307,7 +307,7 @@ mod tests {
     }
 
     fn grid() -> Args {
-        let view = TensorView::with_strides(
+        let view = Operand::with_strides(
             crate::tensor::DevicePtr::new(0x1000),
             DType::F16,
             Shape::new(&[1, 1]),
@@ -413,7 +413,7 @@ mod tests {
         // so the program would address the wrong voxels. This is the branch `require_row` adds over
         // `require_shape`.
         let shape = Shape::new(&[24, 37, 48, 84]);
-        launch.out = TensorView::with_strides(
+        launch.out = Operand::with_strides(
             crate::tensor::DevicePtr::new(0x3000),
             DType::F16,
             shape,
@@ -438,7 +438,7 @@ mod tests {
         launch.bias = Some(per_channel);
         let tile = launch.raster();
         let (rows, columns) = (3 * tile.dim(2), 3 * tile.dim(3));
-        launch.out = TensorView::with_strides(
+        launch.out = Operand::with_strides(
             crate::tensor::DevicePtr::new(0x3000),
             DType::F16,
             tile,

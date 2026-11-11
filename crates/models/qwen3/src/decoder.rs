@@ -39,7 +39,7 @@ use nn::layers::{
     Rounding, Spectrum,
 };
 use nn::weights::Scope;
-use nn::{DType, Forward, Shape, TensorView};
+use nn::{DType, Forward, Shape, Operand};
 
 use crate::config::{Config, Mixer, TextConfig};
 use crate::{Error, Result};
@@ -89,7 +89,7 @@ impl Mlp {
     }
 
     /// The block's output over `x`, `[rows, hidden]`, written into `update`.
-    fn forward_into(&self, f: &Forward, x: TensorView, update: TensorView) -> Result<()> {
+    fn forward_into(&self, f: &Forward, x: Operand, update: Operand) -> Result<()> {
         match self {
             Self::Dense(mlp) => mlp.forward_into(f, x, update)?,
             Self::Experts { routed, shared } => {
@@ -247,11 +247,11 @@ impl DecoderLayer {
     pub fn forward(
         &self,
         f: &Forward,
-        (hidden, residual): (TensorView, Option<TensorView>),
-        update: TensorView,
+        (hidden, residual): (Operand, Option<Operand>),
+        update: Operand,
         rope: RopeFactors<'_>,
         keys: Keys<'_>,
-    ) -> Result<(TensorView, TensorView)> {
+    ) -> Result<(Operand, Operand)> {
         f.scoped(|f| {
             let (normalized, residual) = match residual {
                 None => (self.input_layernorm.forward(f, hidden, None)?, hidden),
@@ -399,11 +399,11 @@ impl DecoderStack {
     pub fn forward<'k>(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        hidden: Operand,
         rope: RopeFactors<'_>,
         keys: impl Fn(usize) -> Result<Keys<'k>>,
-        mut after: impl FnMut(usize, TensorView) -> Result<()>,
-    ) -> Result<(TensorView, TensorView)> {
+        mut after: impl FnMut(usize, Operand) -> Result<()>,
+    ) -> Result<(Operand, Operand)> {
         let update = self.carried(f, hidden)?;
         let (mut hidden, mut residual) = (hidden, None);
         for (index, layer) in self.layers.iter().enumerate() {
@@ -421,7 +421,7 @@ impl DecoderStack {
 
     /// The buffer the layers' MLP outputs are carried in: `[tokens, hidden]` of `hidden`'s type,
     /// at the start of a region of the packed row class when a layer's product is packed.
-    fn carried(&self, f: &Forward, hidden: TensorView) -> Result<TensorView> {
+    fn carried(&self, f: &Forward, hidden: Operand) -> Result<Operand> {
         let tokens = hidden.shape.dim(0);
         let held = if self.layers.iter().any(|layer| layer.mlp.is_packed()) {
             let counted = u32::try_from(tokens)

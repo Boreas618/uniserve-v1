@@ -27,7 +27,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -68,9 +68,9 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[rows, heads, width]`, contiguous: the attended values.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[rows, output]`, contiguous, in the descriptor's element type.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The head average and the adaptive width pool of an attention projection.

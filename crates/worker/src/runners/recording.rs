@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 
 use crate::plan::Bucket;
 use crate::{Error, Result};
@@ -146,7 +146,7 @@ impl Walk {
     /// # Errors
     ///
     /// When `dtype` has no whole-byte size or the extent overflows.
-    pub fn placeholder(&self, dtype: DType, shape: Shape) -> Result<TensorView> {
+    pub fn placeholder(&self, dtype: DType, shape: Shape) -> Result<Operand> {
         Ok(self.placeholders.tensor(dtype, shape)?)
     }
 }
@@ -202,7 +202,7 @@ mod tests {
                     hidden: scratch,
                     // The gather reads the first eight row indices of the region's leading
                     // buffer, one per scratch row.
-                    rows: nn::TensorView::new(rows.ptr, DType::I32, Shape::new(&[8])),
+                    rows: nn::Operand::new(rows.ptr, DType::I32, Shape::new(&[8])),
                     out: scratch,
                 },
             )?;

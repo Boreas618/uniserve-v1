@@ -36,7 +36,7 @@ use std::sync::Arc;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, DevicePtr, Shape, TensorView};
+use crate::tensor::{DType, DevicePtr, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -169,15 +169,15 @@ pub struct ExchangeArgs {
     /// Rows of this launch's extent: the captured bucket's, of which `live` are the batch's.
     pub tokens: u32,
     /// `[tokens, hidden]` states to send.
-    pub state: TensorView,
+    pub state: Operand,
     /// `[tokens, top]` i32 expert ids.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[tokens, top]` FP32 route weights.
-    pub weights: TensorView,
+    pub weights: Operand,
     /// `[1]` i32 on the device: the rows of `tokens` the batch holds, or `None` for all of them.
-    pub live: Option<TensorView>,
+    pub live: Option<Operand>,
     /// `[tokens, hidden]` combined rows, written.
-    pub out: TensorView,
+    pub out: Operand,
     /// The layer's expert operands, for a fused launch.
     pub fused: Option<FusedLayer>,
     /// Ranks of the expert group.
@@ -458,19 +458,19 @@ pub struct TransportViews {
     /// The transport's handle.
     pub transport: ExchangeTransport,
     /// `[ranks * capacity, hidden]`: the rows this rank received.
-    pub states: TensorView,
+    pub states: Operand,
     /// `[ranks * capacity, top]` i32: their expert ids.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[ranks * capacity, top]` f32: their route weights.
-    pub weights: TensorView,
+    pub weights: Operand,
     /// `[ranks * capacity, hidden]`: where the rank's experts leave their sums.
-    pub combined: TensorView,
+    pub combined: Operand,
     /// `[1]` i32: the leading rows of those views this step holds.
-    pub live: TensorView,
+    pub live: Operand,
     /// `[capacity, hidden / 2]` u8: where a fused launch reads this rank's encoded rows.
-    pub packed: TensorView,
+    pub packed: Operand,
     /// `[capacity, hidden / 16]` block scales of those rows.
-    pub packed_scales: TensorView,
+    pub packed_scales: Operand,
     /// Whether one launch runs the whole expert layer.
     pub fused: bool,
 }
@@ -570,7 +570,7 @@ impl Transport {
         check(status, "info", &info.error)?;
         let [states, ids, weights, combined, live, packed, packed_scales] = self.shape.regions();
         let view = |pointer: *mut c_void, (dtype, shape): (DType, Shape)| {
-            TensorView::new(DevicePtr::new(pointer as u64), dtype, shape)
+            Operand::new(DevicePtr::new(pointer as u64), dtype, shape)
         };
         Ok(TransportViews {
             transport: self.handle(),
@@ -793,7 +793,7 @@ mod tests {
             dtype: DType::BF16,
         };
         let view = |dtype, dims: &[u64]| {
-            TensorView::new(
+            Operand::new(
                 crate::tensor::DevicePtr::new(0x1000),
                 dtype,
                 Shape::new(dims),

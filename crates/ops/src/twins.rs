@@ -20,7 +20,7 @@
 //! itself.
 
 use crate::platform::{Allocator, Buffer, PoolKind, Stream};
-use crate::tensor::{DType, DevicePtr, Shape, TensorView};
+use crate::tensor::{DType, DevicePtr, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Result, platform};
 
@@ -34,9 +34,9 @@ pub const ALIGNMENT: u64 = 256;
 #[derive(Clone, Copy, Debug)]
 pub struct Twin {
     /// Where the new implementation writes.
-    pub shadow: TensorView,
+    pub shadow: Operand,
     /// Where the old implementation writes, and what the comparison reads as the reference.
-    pub real: TensorView,
+    pub real: Operand,
 }
 
 /// The shadow buffers of one paired execution.
@@ -90,11 +90,11 @@ impl Twins {
     }
 
     /// A shadow buffer of the same geometry as `real`, recorded as its twin.
-    pub fn shadow_of(&mut self, real: TensorView) -> TensorView {
+    pub fn shadow_of(&mut self, real: Operand) -> Operand {
         match self.carve(real.shape, real.dtype) {
             Ok(address) => {
                 let shadow =
-                    TensorView::with_strides(address, real.dtype, real.shape, real.strides);
+                    Operand::with_strides(address, real.dtype, real.shape, real.strides);
                 self.pairs.push(Twin { shadow, real });
                 shadow
             }
@@ -110,7 +110,7 @@ impl Twins {
     ///
     /// The copy is asynchronous on `stream`: every launch after it on that stream sees the bytes, and
     /// a capture records the copy as a node like any other.
-    pub fn in_place(&mut self, real: TensorView, stream: &Stream) -> TensorView {
+    pub fn in_place(&mut self, real: Operand, stream: &Stream) -> Operand {
         match self.carve(real.shape, real.dtype) {
             Ok(address) => {
                 match real.byte_len() {
@@ -126,7 +126,7 @@ impl Twins {
                     }
                 }
                 let shadow =
-                    TensorView::with_strides(address, real.dtype, real.shape, real.strides);
+                    Operand::with_strides(address, real.dtype, real.shape, real.strides);
                 self.pairs.push(Twin { shadow, real });
                 shadow
             }
@@ -159,7 +159,7 @@ impl Twins {
             match copied {
                 Ok(address) => {
                     self.pairs[index].real =
-                        TensorView::with_strides(address, real.dtype, real.shape, real.strides);
+                        Operand::with_strides(address, real.dtype, real.shape, real.strides);
                 }
                 Err(error) => self.fail(error),
             }

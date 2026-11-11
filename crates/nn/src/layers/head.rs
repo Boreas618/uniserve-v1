@@ -9,7 +9,7 @@
 //! graph replays over a fixed row count.
 
 use ops::logits::{self, UnpadDescriptor, VocabUnpad};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::family::Split;
@@ -100,7 +100,7 @@ impl ParallelLMHead {
     ///
     /// When a view does not fit the head, the arena cannot hold the buffers, or an operator
     /// refuses.
-    pub fn forward(&self, f: &Forward, hidden: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, hidden: Operand) -> Result<Operand> {
         let rows = hidden.rows();
         let ranks = f.split().map_or(1, |split| split.ranks);
         // The projection itself: the same dense operator as any other linear layer, with the

@@ -12,7 +12,7 @@ use std::io::Read as _;
 use std::os::fd::AsRawFd as _;
 use std::path::Path;
 
-use nn::{Arena, Backing, DType, DevicePtr, Forward, Shape, TensorView, Weight};
+use nn::{Arena, Backing, DType, DevicePtr, Forward, Shape, Operand, Weight};
 use ops::{Generation, KernelEntry};
 use platform::{DeviceAllocation, DeviceId, Stream};
 use program_server::{
@@ -85,11 +85,11 @@ impl Bench {
     }
 
     /// A new device tensor of `dtype` and `dims`, row-major, its contents undefined.
-    pub(crate) fn tensor(&mut self, dtype: DType, dims: &[u64]) -> Outcome<TensorView> {
+    pub(crate) fn tensor(&mut self, dtype: DType, dims: &[u64]) -> Outcome<Operand> {
         let shape = Shape::new(dims);
         let bytes = shape.numel() * dtype.bytes().ok_or("an element type without a width")?;
         let buffer = DeviceAllocation::linear(DEVICE, bytes.max(1) as usize)?;
-        let view = TensorView::new(DevicePtr::new(buffer.address()), dtype, shape);
+        let view = Operand::new(DevicePtr::new(buffer.address()), dtype, shape);
         self.buffers.push(buffer);
         Ok(view)
     }
@@ -116,7 +116,7 @@ impl Bench {
         dtype: DType,
         dims: &[u64],
         bytes: &[u8],
-    ) -> Outcome<TensorView> {
+    ) -> Outcome<Operand> {
         let view = self.tensor(dtype, dims)?;
         if view.byte_len()? != bytes.len() as u64 {
             return Err(format!("{} bytes for a {dtype} tensor of {dims:?}", bytes.len()).into());
@@ -131,7 +131,7 @@ impl Bench {
         dtype: DType,
         dims: &[u64],
         values: &[f32],
-    ) -> Outcome<TensorView> {
+    ) -> Outcome<Operand> {
         let bytes = encode(dtype, values)?;
         self.upload(dtype, dims, &bytes)
     }
@@ -146,7 +146,7 @@ impl Bench {
     }
 
     /// The bytes of a row-major device tensor, after everything queued before.
-    pub(crate) fn download(&self, view: TensorView) -> Outcome<Vec<u8>> {
+    pub(crate) fn download(&self, view: Operand) -> Outcome<Vec<u8>> {
         if !view.is_row_major() {
             return Err("a strided view is read through the tensor it lies in".into());
         }

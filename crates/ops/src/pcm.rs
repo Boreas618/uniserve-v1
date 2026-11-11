@@ -26,7 +26,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -62,11 +62,11 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[samples]` the left channel.
-    pub left: TensorView,
+    pub left: Operand,
     /// `[samples]` the right channel.
-    pub right: TensorView,
+    pub right: Operand,
     /// `[samples, 2]` i16 interleaved output.
-    pub out: TensorView,
+    pub out: Operand,
     /// Samples per channel.
     pub samples: u32,
 }

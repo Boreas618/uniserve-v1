@@ -20,7 +20,7 @@
 //! attention `A` is any layer the model composes over the head-split rows; this layer owns the
 //! projections around it.
 
-use ops::{DType, Shape, Strides, TensorView};
+use ops::{DType, Shape, Strides, Operand};
 
 use crate::error::{Error, Result};
 use crate::family::{Projection, Split};
@@ -188,7 +188,7 @@ impl<A> UlyssesAttention<A> {
     ///
     /// When the gather refuses its views, the arena cannot hold them or the forward carries no
     /// split.
-    pub fn rows(&self, f: &Forward, normalized: TensorView) -> Result<TensorView> {
+    pub fn rows(&self, f: &Forward, normalized: Operand) -> Result<Operand> {
         if self.exchanges() && self.projection == Projection::Gather {
             self.require_split(f)?;
             let gathered = f.empty(
@@ -211,7 +211,7 @@ impl<A> UlyssesAttention<A> {
 
     /// Projection `index` of `rows` for every member's heads: one member's `[rows, local]` block
     /// after another in a fresh staging tensor, the exchange's send buffer.
-    fn project_members(&self, f: &Forward, index: usize, rows: TensorView) -> Result<TensorView> {
+    fn project_members(&self, f: &Forward, index: usize, rows: Operand) -> Result<Operand> {
         let local = self.local_width();
         let members = self.input(index)?.members.as_slice();
         let staging = f.empty(
@@ -243,7 +243,7 @@ impl<A> UlyssesAttention<A> {
     /// # Errors
     ///
     /// When a projection or the exchange refuses its views, or the arena cannot hold them.
-    pub fn project(&self, f: &Forward, index: usize, rows: TensorView) -> Result<TensorView> {
+    pub fn project(&self, f: &Forward, index: usize, rows: Operand) -> Result<Operand> {
         match self.input(index)?.members.as_slice() {
             [only] => only.forward(f, rows),
             _ => {
@@ -266,8 +266,8 @@ impl<A> UlyssesAttention<A> {
         &self,
         f: &Forward,
         index: usize,
-        rows: TensorView,
-    ) -> Result<(TensorView, Transfer)> {
+        rows: Operand,
+    ) -> Result<(Operand, Transfer)> {
         let staging = self.project_members(f, index, rows)?;
         let out = f.empty(staging.dtype, staging.shape)?;
         self.require_split(f)?;
@@ -295,7 +295,7 @@ impl<A> UlyssesAttention<A> {
     pub fn start_gather(
         &self,
         f: &Forward,
-        gathered: TensorView,
+        gathered: Operand,
         own: u64,
         first: u64,
         count: u64,
@@ -313,7 +313,7 @@ impl<A> UlyssesAttention<A> {
     ///
     /// When the exchange, the merge or the projection refuses its views, or the arena cannot hold
     /// them.
-    pub fn return_rows(&self, f: &Forward, attended: TensorView) -> Result<TensorView> {
+    pub fn return_rows(&self, f: &Forward, attended: Operand) -> Result<Operand> {
         if !self.exchanges() {
             return self.output.forward(f, attended);
         }
@@ -331,7 +331,7 @@ impl<A> UlyssesAttention<A> {
     ///
     /// When the payload is not equal blocks, the arena cannot hold the landing, or the forward
     /// carries no split.
-    pub fn start_return(&self, f: &Forward, payload: TensorView) -> Result<(TensorView, Transfer)> {
+    pub fn start_return(&self, f: &Forward, payload: Operand) -> Result<(Operand, Transfer)> {
         let landed = f.empty(payload.dtype, payload.shape)?;
         self.check_blocks(payload, landed)?;
         self.require_split(f)?;
@@ -350,8 +350,8 @@ impl<A> UlyssesAttention<A> {
         &self,
         f: &Forward,
         transfer: Transfer,
-        landed: TensorView,
-        destination: TensorView,
+        landed: Operand,
+        destination: Operand,
     ) -> Result<()> {
         self.finish(f, transfer)?;
         let merged = self.merge(f, landed)?;
@@ -382,7 +382,7 @@ impl<A> UlyssesAttention<A> {
 
     /// Sends block `m` of `send` to member `m` and leaves in block `m` of `recv` what member `m`
     /// sent here.
-    fn exchange(&self, f: &Forward, send: TensorView, recv: TensorView) -> Result<()> {
+    fn exchange(&self, f: &Forward, send: Operand, recv: Operand) -> Result<()> {
         self.check_blocks(send, recv)?;
         self.require_split(f)?;
         f.all_to_all(send, recv)
@@ -390,14 +390,14 @@ impl<A> UlyssesAttention<A> {
 
     /// The blocks of `received`, one per member, set side by side in a fresh
     /// `[rows, members · local]` tensor.
-    fn merge(&self, f: &Forward, received: TensorView) -> Result<TensorView> {
+    fn merge(&self, f: &Forward, received: Operand) -> Result<Operand> {
         let members = u64::from(self.split.size);
         let local = self.local_width();
         let rows = received.numel() / (members * local);
         let out = f.empty(received.dtype, Shape::new(&[rows, members * local]))?;
         let block = [members, rows, 1, local];
         let source = received.reshape(Shape::new(&block));
-        let destination = TensorView::with_strides(
+        let destination = Operand::with_strides(
             out.ptr,
             out.dtype,
             Shape::new(&block),
@@ -409,7 +409,7 @@ impl<A> UlyssesAttention<A> {
     }
 
     /// Refuses two buffers that are not the group's equal blocks of one element type.
-    fn check_blocks(&self, send: TensorView, recv: TensorView) -> Result<()> {
+    fn check_blocks(&self, send: Operand, recv: Operand) -> Result<()> {
         let members = u64::from(self.split.size);
         if send.numel() != recv.numel()
             || !send.numel().is_multiple_of(members)

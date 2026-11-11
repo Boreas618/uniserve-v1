@@ -20,7 +20,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -65,8 +65,8 @@ impl BlockShape {
     fn check(
         &self,
         operator: &'static str,
-        field: &TensorView,
-        blocks: &TensorView,
+        field: &Operand,
+        blocks: &Operand,
     ) -> Result<u64> {
         field.require_shape(operator, self.shape)?;
         if field.strides != self.strides {
@@ -125,11 +125,11 @@ pub type SnapshotDescriptor = BlockShape;
 #[derive(Clone, Copy)]
 pub struct SnapshotArgs {
     /// The field's block-major storage, at any strides.
-    pub field: TensorView,
+    pub field: Operand,
     /// `[count]` i64 device indices: the block each row of the snapshot takes.
-    pub blocks: TensorView,
+    pub blocks: Operand,
     /// `[count, width]`, contiguous: receives the selected blocks.
-    pub snapshot: TensorView,
+    pub snapshot: Operand,
 }
 
 /// Read selected blocks of a state bank into a contiguous snapshot.
@@ -210,11 +210,11 @@ pub type ScatterDescriptor = BlockShape;
 #[derive(Clone, Copy)]
 pub struct ScatterArgs {
     /// The field's block-major storage, at any strides; the selected blocks are overwritten.
-    pub field: TensorView,
+    pub field: Operand,
     /// `[count]` i64 device indices: the block each row of the snapshot goes to.
-    pub blocks: TensorView,
+    pub blocks: Operand,
     /// `[count, width]`, contiguous: the blocks to write.
-    pub snapshot: TensorView,
+    pub snapshot: Operand,
 }
 
 /// Write a contiguous snapshot into selected blocks of a state bank.

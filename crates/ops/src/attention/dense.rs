@@ -61,7 +61,7 @@ use super::{Mask, address, head_stride, row_stride, to_i64};
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -135,20 +135,20 @@ impl fmt::Display for DenseDescriptor {
 #[derive(Clone, Copy)]
 pub struct DenseArgs {
     /// `[q_tokens, q_heads, head_dim]` queries, packed by sequence.
-    pub query: TensorView,
+    pub query: Operand,
     /// `[kv_tokens, kv_heads, head_dim]` keys, packed by sequence.
-    pub key: TensorView,
+    pub key: Operand,
     /// `[kv_tokens, kv_heads, head_dim]` values.
-    pub value: TensorView,
+    pub value: Operand,
     /// `[batch + 1]` i32: the first query row of each sequence, then `q_tokens`.
     ///
     /// Both offsets are `None` exactly when the descriptor says the launch has none. One absent and
     /// one given is refused: they describe one sequence layout together.
-    pub cu_seq_lens_q: Option<TensorView>,
+    pub cu_seq_lens_q: Option<Operand>,
     /// `[batch + 1]` i32: the first key row of each sequence, then `kv_tokens`.
-    pub cu_seq_lens_k: Option<TensorView>,
+    pub cu_seq_lens_k: Option<Operand>,
     /// `[q_tokens, q_heads, head_dim]` output.
-    pub out: TensorView,
+    pub out: Operand,
     /// Softmax scale applied to `q · k` before the exponential.
     pub scale: f32,
     /// Inclusive history window in keys; `-1` for none.
@@ -540,8 +540,8 @@ impl Op for DenseAttention {
 fn sequence_layout(
     operator: &'static str,
     descriptor: &DenseDescriptor,
-    queries: Option<TensorView>,
-    keys: Option<TensorView>,
+    queries: Option<Operand>,
+    keys: Option<Operand>,
 ) -> Result<u64> {
     let offsets = match (queries, keys) {
         (Some(q), Some(k)) => Some((q, k)),
@@ -634,8 +634,8 @@ mod tests {
     }
 
     /// A view the validation reads without touching: an address of zero is never dereferenced here.
-    fn table(extent: u64) -> TensorView {
-        TensorView::new(
+    fn table(extent: u64) -> Operand {
+        Operand::new(
             crate::tensor::DevicePtr::new(0),
             DType::I32,
             Shape::new(&[extent]),

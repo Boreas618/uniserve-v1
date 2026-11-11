@@ -8,7 +8,7 @@
 //! heads as the input rows: both reductions land on the same output element, so one pass computes
 //! them, summed in FP32 and rounded once.
 
-use ops::TensorView;
+use ops::Operand;
 use ops::adaptive_pool::{self, AdaptivePool as AdaptivePoolOp};
 
 use crate::error::{Error, Result};
@@ -48,7 +48,7 @@ impl AdaptiveAvgPool2d {
     ///
     /// A view of another rank, extents wider than a descriptor holds, an arena that cannot hold
     /// the output, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, x: Operand) -> Result<Operand> {
         const OWNER: &str = "AdaptiveAvgPool2d";
         if x.shape.rank() != 3 {
             return Err(Error::shape(

@@ -23,7 +23,7 @@
 //! interval, so the block exposes its two modulated stages beside the whole forward. Each stage's
 //! intermediates are reserved from the forward's arena and handed back before it returns.
 
-use ops::{DType, DevicePtr, Shape, Strides, TensorView};
+use ops::{DType, DevicePtr, Shape, Strides, Operand};
 
 use crate::error::{Error, Result};
 use crate::family::Split;
@@ -48,7 +48,7 @@ const OUTPUT_VECTORS: u64 = 2;
 /// `table[p, k · width ..]`.
 #[derive(Clone, Copy, Debug)]
 pub struct ModulationTable {
-    table: TensorView,
+    table: Operand,
     width: u64,
     vectors: u64,
 }
@@ -60,7 +60,7 @@ pub struct RowModulation<'a> {
     /// The step's gathered modulation rows.
     pub table: &'a ModulationTable,
     /// `[rows]`: the parameter row of each activation row.
-    pub rows: TensorView,
+    pub rows: Operand,
 }
 
 /// The shift, scale and gate of one modulated stage.
@@ -80,7 +80,7 @@ impl ModulationTable {
     /// # Errors
     ///
     /// A table of another rank or width.
-    pub fn block(table: TensorView, width: u64) -> Result<Self> {
+    pub fn block(table: Operand, width: u64) -> Result<Self> {
         Self::new(table, width, BLOCK_VECTORS)
     }
 
@@ -89,11 +89,11 @@ impl ModulationTable {
     /// # Errors
     ///
     /// A table of another rank or width.
-    pub fn output(table: TensorView, width: u64) -> Result<Self> {
+    pub fn output(table: Operand, width: u64) -> Result<Self> {
         Self::new(table, width, OUTPUT_VECTORS)
     }
 
-    fn new(table: TensorView, width: u64, vectors: u64) -> Result<Self> {
+    fn new(table: Operand, width: u64, vectors: u64) -> Result<Self> {
         if table.shape.rank() != 2 || table.shape.last() != vectors * width {
             return Err(Error::shape(
                 "ModulationTable",
@@ -113,7 +113,7 @@ impl ModulationTable {
     /// Vector `index` of every parameter row, as a `[parameters, width]` row-strided weight.
     fn vector(&self, index: u64) -> Result<Weight> {
         let element = self.table.dtype.bytes().unwrap_or(1);
-        let view = TensorView::with_strides(
+        let view = Operand::with_strides(
             DevicePtr::new(self.table.ptr.address() + index * self.width * element),
             self.table.dtype,
             Shape::new(&[self.table.shape.dim(0), self.width]),
@@ -226,8 +226,8 @@ impl AdaLnBlock {
         &self,
         f: &Forward,
         modulation: RowModulation<'_>,
-        hidden: TensorView,
-    ) -> Result<TensorView> {
+        hidden: Operand,
+    ) -> Result<Operand> {
         self.attention_norm(modulation, hidden.dtype)?
             .forward(f, hidden, None)
     }
@@ -243,8 +243,8 @@ impl AdaLnBlock {
         &self,
         f: &Forward,
         modulation: RowModulation<'_>,
-        hidden: TensorView,
-        out: TensorView,
+        hidden: Operand,
+        out: Operand,
     ) -> Result<()> {
         self.attention_norm(modulation, hidden.dtype)?
             .forward_into(f, hidden, None, out)
@@ -284,8 +284,8 @@ impl AdaLnBlock {
         &self,
         f: &Forward,
         modulation: RowModulation<'_>,
-        hidden: TensorView,
-        update: TensorView,
+        hidden: Operand,
+        update: Operand,
     ) -> Result<()> {
         let attention = modulation.table.attention()?;
         let mlp = modulation.table.mlp()?;
@@ -338,8 +338,8 @@ impl AdaLnBlock {
         &self,
         f: &Forward,
         modulation: RowModulation<'_>,
-        hidden: TensorView,
-        attend: impl FnOnce(TensorView) -> Result<TensorView>,
+        hidden: Operand,
+        attend: impl FnOnce(Operand) -> Result<Operand>,
     ) -> Result<()> {
         f.scoped(|f| {
             let normalized = self.attention_input(f, modulation, hidden)?;
@@ -379,8 +379,8 @@ impl AdaLnOut {
         &self,
         f: &Forward,
         modulation: RowModulation<'_>,
-        hidden: TensorView,
-    ) -> Result<TensorView> {
+        hidden: Operand,
+    ) -> Result<Operand> {
         let (shift, scale) = modulation.table.shift_scale()?;
         RmsNorm::new(
             self.weight,

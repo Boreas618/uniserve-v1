@@ -517,7 +517,7 @@ impl Member {
     /// the member's mode, which is the backend the package is created for.
     pub fn recorded_views(
         &self,
-        mut placeholder: impl FnMut(ops::DType, ops::Shape) -> Result<ops::TensorView>,
+        mut placeholder: impl FnMut(ops::DType, ops::Shape) -> Result<ops::Operand>,
     ) -> Result<DispatchViews> {
         let [states, ids, weights, combined, live, packed, packed_scales] = self.shape.regions();
         let mut view = |(dtype, shape)| placeholder(dtype, shape);

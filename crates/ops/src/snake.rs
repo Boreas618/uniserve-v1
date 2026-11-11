@@ -33,7 +33,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -68,11 +68,11 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[rows, channels, width]`, row-major, the signal to activate.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[channels]` frequency `α`, as the checkpoint stores it.
-    pub alpha: TensorView,
+    pub alpha: Operand,
     /// `[rows, channels, width]`, row-major, the activated signal.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The periodic activation `x + sin²(α·x)/(α + 1e-9)`, one linear `α` per channel.

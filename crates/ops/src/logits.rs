@@ -12,7 +12,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -44,11 +44,11 @@ impl fmt::Display for GatherDescriptor {
 #[derive(Clone, Copy)]
 pub struct GatherArgs {
     /// `[tokens, columns]` hidden state of the whole batch.
-    pub hidden: TensorView,
+    pub hidden: Operand,
     /// `[rows]` i32 indices of the rows to keep, in request order.
-    pub rows: TensorView,
+    pub rows: Operand,
     /// `[count, columns]` the packed rows.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// Gather the last position of every request into one matrix.
@@ -156,9 +156,9 @@ impl fmt::Display for UnpadDescriptor {
 pub struct UnpadArgs {
     /// `[rows, padded]` the gathered logits: `ranks` shards of `[rows, padded / ranks]`, rank by
     /// rank, as a collective gather lays them.
-    pub gathered: TensorView,
+    pub gathered: Operand,
     /// `[rows, vocabulary]`.
-    pub out: TensorView,
+    pub out: Operand,
     /// The ranks whose shards the gather holds; one for an unsharded head.
     pub ranks: u32,
 }

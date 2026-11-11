@@ -146,7 +146,7 @@ use nn::layers::{
     Rounding, Transpose, WeightOrder,
 };
 use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Shape, TensorView};
+use nn::{DType, Shape, Operand};
 
 use nn::codec::{DacEncoder, DacSpec};
 
@@ -374,13 +374,13 @@ impl VideoEncoder {
     }
 }
 /// A `[channels, frames, rows, columns]` raster as the one sample a convolution reads.
-fn batched(view: TensorView) -> TensorView {
+fn batched(view: Operand) -> Operand {
     let dims = view.shape.dims();
     view.reshape(Shape::new(&[1, dims[0], dims[1], dims[2], dims[3]]))
 }
 
 /// A `[1, channels, frames, rows, columns]` sample as its raster.
-fn unbatched(view: TensorView) -> TensorView {
+fn unbatched(view: Operand) -> Operand {
     let dims = view.shape.dims();
     view.reshape(Shape::new(&[dims[1], dims[2], dims[3], dims[4]]))
 }
@@ -392,7 +392,7 @@ impl VideoEncoder {
     ///
     /// The one-by-one projection that follows the moment convolution runs once on the stitched
     /// raster ([`Self::project`]), as the reference's `quant_conv` reads the stitched moments.
-    pub fn encode_tile(&self, f: &Forward, pixels: TensorView) -> Result<TensorView> {
+    pub fn encode_tile(&self, f: &Forward, pixels: Operand) -> Result<Operand> {
         if pixels.shape.rank() != 5 || pixels.shape.dim(0) != 1 {
             return Err(Error::config(format!(
                 "the video encoder reads one [1, channels, frames, height, width] tile, not {:?}",
@@ -451,7 +451,7 @@ impl VideoEncoder {
     /// The stitched moments `[2 · latent_channels, frames, rows, columns]` projected to the
     /// posterior's two fields by `quant_conv`: one call, after the stitch, as the reference's
     /// `Encoder` runs it on the stitched moments.
-    pub fn project(&self, f: &Forward, moments: TensorView) -> Result<TensorView> {
+    pub fn project(&self, f: &Forward, moments: Operand) -> Result<Operand> {
         Ok(unbatched(self.moments.forward(f, batched(moments))?))
     }
 
@@ -465,9 +465,9 @@ impl VideoEncoder {
     pub fn posterior(
         &self,
         f: &Forward,
-        moments: TensorView,
-        noise: TensorView,
-    ) -> Result<TensorView> {
+        moments: Operand,
+        noise: Operand,
+    ) -> Result<Operand> {
         let drawn = self.sampler.sample(f, moments, noise)?;
         Ok(unbatched(self.normalize.forward(f, batched(drawn))?))
     }
@@ -650,7 +650,7 @@ impl AudioEncoder {
     /// whole number of hops, right-padded with zeros by the caller as the reference's
     /// `unpack_samples` does ([`padded_samples`]); the projection attends over the frame axis, so
     /// it runs once per batch row and never mixes them.
-    pub fn encode(&self, f: &Forward, samples: TensorView) -> Result<TensorView> {
+    pub fn encode(&self, f: &Forward, samples: Operand) -> Result<Operand> {
         let batch = Self::check_track(samples.shape)?;
         let length = samples.shape.dim(2);
         let frames = self.frames(length)?;
@@ -798,7 +798,7 @@ impl Projection {
     }
 
     /// Project `values` `[frames, latent_dim]` to a fresh `[frames, latent_channels]`.
-    fn forward(&self, f: &Forward, values: TensorView) -> Result<TensorView> {
+    fn forward(&self, f: &Forward, values: Operand) -> Result<Operand> {
         let frames = values.shape.dim(0);
         let head_dim = u64::from(self.attention.spec().head_dim);
         let heads = values.shape.dim(1) / head_dim;

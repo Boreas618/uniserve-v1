@@ -15,7 +15,7 @@ use nn::layers::{
 };
 use nn::quantization::{Declaration, KvCache, Scheme};
 use nn::weights::RetainedWeights;
-use nn::{Checkpoint, DType, DevicePtr, Shape, TensorView, WeightKey, WeightLoader};
+use nn::{Checkpoint, DType, DevicePtr, Shape, Operand, WeightKey, WeightLoader};
 
 /// The format's name for an element type.
 fn dtype_name(dtype: DType) -> &'static str {
@@ -101,7 +101,7 @@ impl RetainedWeights for Store {
 
 impl Store {
     /// The F32 values a view addresses.
-    fn values(&self, view: TensorView) -> Vec<f32> {
+    fn values(&self, view: Operand) -> Vec<f32> {
         let (_, bytes, _) = self
             .published
             .iter()

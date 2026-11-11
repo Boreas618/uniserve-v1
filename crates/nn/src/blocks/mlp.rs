@@ -6,7 +6,7 @@
 //! value half and then the gate half ([`GateUp`]); the gated product reads them as two views or as
 //! the packed rows, at the [`Rounding`] the consumer's baseline evaluates.
 
-use ops::TensorView;
+use ops::Operand;
 use ops::activation::Activation;
 
 use crate::error::Result;
@@ -112,7 +112,7 @@ impl GatedMlp {
     /// # Errors
     ///
     /// As [`Self::forward_into`], or an arena that cannot hold the output.
-    pub fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, x: Operand) -> Result<Operand> {
         // The down projection reserves its own output: a packed product's region holds the row
         // class it writes whole.
         let out = self.down.reserve(f, x)?;
@@ -131,7 +131,7 @@ impl GatedMlp {
     /// # Errors
     ///
     /// A view the projections refuse, or an arena that cannot hold the intermediates.
-    pub fn forward_into(&self, f: &Forward, x: TensorView, update: TensorView) -> Result<()> {
+    pub fn forward_into(&self, f: &Forward, x: Operand, update: Operand) -> Result<()> {
         f.scoped(|f| {
             let halves = match &self.inputs {
                 Inputs::Split { gate, up } => Halves::Split {
@@ -209,7 +209,7 @@ impl SharedExpert {
     /// # Errors
     ///
     /// A view a layer refuses, or an arena that cannot hold the intermediates.
-    pub fn forward(&self, f: &Forward, x: TensorView, inout: TensorView) -> Result<()> {
+    pub fn forward(&self, f: &Forward, x: Operand, inout: Operand) -> Result<()> {
         use ops::residual::{SigmoidGatedAdd, SigmoidGatedAddArgs, SigmoidGatedAddDescriptor};
 
         f.scoped(|f| {

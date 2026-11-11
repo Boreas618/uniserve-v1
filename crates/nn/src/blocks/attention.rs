@@ -30,7 +30,7 @@
 //! The query halves are gathered into a packed tensor for the normalization and rotation, and the
 //! gate halves are read where the projection wrote them.
 
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 
 use crate::capability::{KvLayer, KvView, TokenBatch};
 use crate::error::{Error, Result};
@@ -279,15 +279,15 @@ impl QkvAttention {
     fn split_gate(
         &self,
         f: &Forward,
-        projected: TensorView,
-    ) -> Result<(TensorView, Option<TensorView>)> {
+        projected: Operand,
+    ) -> Result<(Operand, Option<Operand>)> {
         let rows = projected.rows();
         let heads = u64::from(self.heads);
         let head_dim = u64::from(self.head_dim);
         let dtype = projected.dtype;
         // A head's query and gate sit side by side: the halves are two views of one head stride.
         let half = |offset: u64| {
-            TensorView::with_strides(
+            Operand::with_strides(
                 projected.offset_elements(offset),
                 dtype,
                 Shape::new(&[1, rows, heads, head_dim]),
@@ -308,7 +308,7 @@ impl QkvAttention {
             1,
         ];
         Copy::new(dtype, Access::Vector)?.forward(f, half(0), packed, &strides)?;
-        let gate = TensorView::with_strides(
+        let gate = Operand::with_strides(
             projected.offset_elements(head_dim),
             dtype,
             Shape::new(&[rows * heads, head_dim]),
@@ -318,7 +318,7 @@ impl QkvAttention {
     }
 
     /// `[rows, count · head_dim]` as `[rows, count, head_dim]`.
-    fn heads_of(&self, view: TensorView, count: u32) -> TensorView {
+    fn heads_of(&self, view: Operand, count: u32) -> Operand {
         view.reshape(Shape::new(&[
             view.rows(),
             u64::from(count),
@@ -341,10 +341,10 @@ impl QkvAttention {
     pub fn forward(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        hidden: Operand,
         rope: Option<RopeFactors<'_>>,
         keys: Keys<'_>,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         let flat = |rows: u64| Shape::new(&[rows, u64::from(self.output.k())]);
         // The output projection's rows are `hidden`'s, which is all its reservation reads.
         let out = self.output.reserve(f, hidden)?;
@@ -361,10 +361,10 @@ impl QkvAttention {
     fn attend(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        hidden: Operand,
         rope: Option<RopeFactors<'_>>,
         keys: Keys<'_>,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         let (projected, key, value) = self.qkv.forward(f, hidden)?;
         let (query, gate) = match self.gate {
             None => (self.heads_of(projected, self.heads), None),
@@ -401,7 +401,7 @@ impl QkvAttention {
             ) => {
                 // The norm is over one head's channels, so it reads each projection as one row
                 // per head.
-                let per_head = |view: TensorView| {
+                let per_head = |view: Operand| {
                     view.reshape(Shape::new(&[
                         view.numel() / u64::from(self.head_dim),
                         u64::from(self.head_dim),

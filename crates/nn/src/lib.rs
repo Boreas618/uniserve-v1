@@ -11,7 +11,7 @@
 //!
 //! ## The tensors
 //!
-//! [`TensorView`], [`Shape`], [`Strides`], [`DType`] and [`DevicePtr`] are [`ops`] types: they are
+//! [`Operand`], [`Shape`], [`Strides`], [`DType`] and [`DevicePtr`] are [`ops`] types: they are
 //! the ABI of an operator's arguments, and `nn` re-exports them rather than defining a second
 //! representation. A [`Weight`] pairs a view with the [`Backing`] the worker's retained storage
 //! gives it, so a layer's weights are plainly borrowed and plainly retained.
@@ -87,7 +87,7 @@ pub use layers::{
     LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding, ParallelLMHead, Residual,
     ResidualStream, RmsNorm, Rotary, Rounding, Scale, Silu, Snake,
 };
-pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
+pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, Operand};
 pub use proto::program::PhaseKind;
 pub use tensor::Backing;
 pub use weights::{

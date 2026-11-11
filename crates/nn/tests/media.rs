@@ -17,7 +17,7 @@ use nn::layers::{
 };
 use nn::tiling::{Axis, Blend, Grid, TiledDecode, TiledEncode, gather, voxels};
 use nn::vocoder::{BigVgan, BigVganSpec};
-use nn::{Arena, Checkpoint, DType, Forward, Shape, TensorView, WeightLoader};
+use nn::{Arena, Checkpoint, DType, Forward, Shape, Operand, WeightLoader};
 
 /// The programs a walk reported, as `(operator, key)` pairs.
 #[derive(Default)]
@@ -208,7 +208,7 @@ fn an_euler_step_gathers_its_coefficient_and_adds_the_scaled_velocity() {
     assert!(euler.forward(&f, sample, narrow, step).is_err());
     let short = arena.tensor(DType::F32, Shape::new(&[8, 3, 4, 4])).unwrap();
     assert!(euler.forward(&f, sample, short, step).is_err());
-    let strided = TensorView::with_strides(
+    let strided = Operand::with_strides(
         sample.ptr,
         DType::F32,
         Shape::new(&[16, 3, 4, 2]),
@@ -386,7 +386,7 @@ fn a_posterior_sample_reads_the_two_halves_of_its_moments() {
             .sample(&f, moments, raster(4, 2, DType::F32))
             .is_err()
     );
-    let overlapping = TensorView::with_strides(
+    let overlapping = Operand::with_strides(
         noise.ptr,
         DType::F32,
         noise.shape,

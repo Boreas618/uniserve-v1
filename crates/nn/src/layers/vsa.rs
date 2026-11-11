@@ -33,7 +33,7 @@
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::descriptor::Float;
 use ops::vsa::{self, MAX_MEMBERS, VsaZeroPadding};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -71,27 +71,27 @@ pub struct VsaSpec {
 #[derive(Clone, Copy)]
 pub struct VsaTables {
     /// `[tiles]` i32: the valid rows of each tile.
-    pub sizes: TensorView,
+    pub sizes: Operand,
     /// `[tiles]` i32: the segment each tile belongs to.
-    pub segments: TensorView,
+    pub segments: Operand,
     /// The segment-keep table, over-allocated to the tile count and read by segment index.
-    pub keep: TensorView,
+    pub keep: Operand,
 }
 
 /// The two branches [`VsaAttention::attend`] answers, which the gated fold combines.
 #[derive(Clone, Copy)]
 pub struct Branches {
     /// `[rows, heads · head_dim]`: the fine attention's rows, in the layer's output type.
-    pub fine: TensorView,
+    pub fine: Operand,
     /// `[heads, tiles, head_dim]`: one compressed row per (head, query tile), in the output type.
-    pub compressed: TensorView,
+    pub compressed: Operand,
 }
 
 /// Each tile's pooled query, key and value means, `[tiles, heads, head_dim]` FP32.
 struct Pooled {
-    query: TensorView,
-    key: TensorView,
-    value: TensorView,
+    query: Operand,
+    key: Operand,
+    value: Operand,
 }
 
 /// One layer's video sparse attention.
@@ -196,7 +196,7 @@ impl VsaAttention {
     pub fn attend(
         &self,
         f: &Forward,
-        (query, key, value): (TensorView, TensorView, TensorView),
+        (query, key, value): (Operand, Operand, Operand),
         gains: Option<(&Weight, &Weight)>,
         factors: Option<Factors>,
         tables: &VsaTables,
@@ -251,10 +251,10 @@ impl VsaAttention {
     fn fine(
         &self,
         f: &Forward,
-        (query, key, value): (TensorView, TensorView, TensorView),
-        (indices, counts): (TensorView, TensorView),
-        sizes: TensorView,
-    ) -> Result<TensorView> {
+        (query, key, value): (Operand, Operand, Operand),
+        (indices, counts): (Operand, Operand),
+        sizes: Operand,
+    ) -> Result<Operand> {
         let rows = query.shape.dim(0);
         let fine = f.empty(
             self.output,
@@ -329,8 +329,8 @@ impl VsaAttention {
         &self,
         query_weight: bool,
         key_weight: bool,
-        cosine: Option<TensorView>,
-        sine: Option<TensorView>,
+        cosine: Option<Operand>,
+        sine: Option<Operand>,
     ) -> Result<()> {
         if query_weight != key_weight {
             return Err(Error::shape(
@@ -407,10 +407,10 @@ impl VsaAttention {
     fn prepare(
         &self,
         f: &Forward,
-        (query, key, value): (TensorView, TensorView, TensorView),
+        (query, key, value): (Operand, Operand, Operand),
         gains: Option<(&Weight, &Weight)>,
         factors: Option<Factors>,
-        sizes: TensorView,
+        sizes: Operand,
     ) -> Result<Pooled> {
         let (query_weight, key_weight) = (gains.map(|(query, _)| query), gains.map(|(_, key)| key));
         let (cosine, sine) = (
@@ -472,9 +472,9 @@ impl VsaAttention {
     pub fn add_gated(
         &self,
         f: &Forward,
-        inout: TensorView,
-        compressed: TensorView,
-        gate: TensorView,
+        inout: Operand,
+        compressed: Operand,
+        gate: Operand,
     ) -> Result<()> {
         let descriptor = vsa::AddGatedTilesDescriptor {
             dtype: inout.dtype,
@@ -520,9 +520,9 @@ impl VsaAttention {
     pub fn compose(
         &self,
         f: &Forward,
-        payload: TensorView,
+        payload: Operand,
         branches: Branches,
-        gate: TensorView,
+        gate: Operand,
         interval: crate::layers::Interval,
         slots: &[u32],
     ) -> Result<()> {
@@ -586,9 +586,9 @@ impl VsaAttention {
     fn scores(
         &self,
         f: &Forward,
-        pooled_query: TensorView,
-        pooled_key: TensorView,
-    ) -> Result<TensorView> {
+        pooled_query: Operand,
+        pooled_key: Operand,
+    ) -> Result<Operand> {
         if pooled_query.shape.rank() != 3 {
             return Err(Error::shape(
                 "VsaAttention",
@@ -642,10 +642,10 @@ impl VsaAttention {
     fn compress(
         &self,
         f: &Forward,
-        scores: TensorView,
-        values: TensorView,
-        sizes: TensorView,
-    ) -> Result<TensorView> {
+        scores: Operand,
+        values: Operand,
+        sizes: Operand,
+    ) -> Result<Operand> {
         self.check_compress(scores, values, sizes)?;
         let out = f.empty(
             self.output,
@@ -673,9 +673,9 @@ impl VsaAttention {
     /// test asserts these, and [`Self::compress`] calls this first so the two cannot drift.
     fn check_compress(
         &self,
-        scores: TensorView,
-        values: TensorView,
-        sizes: TensorView,
+        scores: Operand,
+        values: Operand,
+        sizes: Operand,
     ) -> Result<()> {
         if self.max_tiles == 0 {
             return Err(Error::shape(
@@ -739,10 +739,10 @@ impl VsaAttention {
     fn select(
         &self,
         f: &Forward,
-        scores: TensorView,
+        scores: Operand,
         tables: &VsaTables,
         query_offset: u64,
-    ) -> Result<(TensorView, TensorView)> {
+    ) -> Result<(Operand, Operand)> {
         if scores.shape.rank() != 3 {
             return Err(Error::shape(
                 "VsaAttention",
@@ -802,8 +802,8 @@ mod tests {
     use super::*;
 
     /// A view of `shape` at a host address: these tests never launch, so the address is a marker.
-    fn view(dtype: DType, shape: &[u64]) -> TensorView {
-        TensorView::new(DevicePtr::new(0x1000), dtype, Shape::new(shape))
+    fn view(dtype: DType, shape: &[u64]) -> Operand {
+        Operand::new(DevicePtr::new(0x1000), dtype, Shape::new(shape))
     }
 
     /// A layer of `heads` heads `width` wide over `tile_rows`-row tiles, normalized and rotated as
@@ -1028,7 +1028,7 @@ mod tests {
         let (query, key, value) = (projection(), projection(), projection());
         let gain = || Weight {
             backing: crate::Backing::new(DevicePtr::new(0x8000), 256),
-            view: TensorView::new(DevicePtr::new(0x8000), DType::BF16, Shape::new(&[128])),
+            view: Operand::new(DevicePtr::new(0x8000), DType::BF16, Shape::new(&[128])),
         };
         let (query_gain, key_gain) = (gain(), gain());
         let factors = Factors {

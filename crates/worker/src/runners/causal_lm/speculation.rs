@@ -48,7 +48,7 @@ use ipc::philox::DrawAddress;
 use ipc::{DraftWork, TimingCounters};
 use nn::family::TextModel;
 use nn::{Forward, KvView, TokenBatch};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 use platform::DeviceId;
 use proto::program::PhaseKind;
 use proto::program::commit::{COMMIT_FIELDS, column, mode};
@@ -880,8 +880,8 @@ impl<M: TextModel> CausalLmRunner<M> {
         &mut self,
         forward: &Forward<'_>,
         plan: &Plan,
-        workspace: TensorView,
-    ) -> Result<TensorView> {
+        workspace: Operand,
+    ) -> Result<Operand> {
         let tokens = plan.tokens as u64;
         let attention_rows: usize = if plan.verify {
             plan.tokens
@@ -987,7 +987,7 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// Samples every row of the plan's sampling step through the sampling module: the greedy rows
     /// by the argmax, the others by their draws, each path over every row and each row read from
     /// its own path.
-    fn sample_rows(&self, forward: &Forward<'_>, plan: &Plan, hidden: TensorView) -> Result<()> {
+    fn sample_rows(&self, forward: &Forward<'_>, plan: &Plan, hidden: Operand) -> Result<()> {
         let rows = plan.samples.len() as u64;
         if rows == 0 {
             return Ok(());
@@ -1204,7 +1204,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         );
         let slots = u64::from(self.commit.slots);
         let args = ops::commit::CommitArgs {
-            columns: TensorView::with_strides(
+            columns: Operand::with_strides(
                 spec.table.device.ptr,
                 DType::I32,
                 Shape::new(&[COMMIT_FIELDS as u64, capacity]),
@@ -1215,7 +1215,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             active: spec.flags.extent(0..capacity),
             continuation: spec.continuation.extent(0..capacity),
             points: spec.points.extent(0..capacity),
-            future: TensorView::with_strides(
+            future: Operand::with_strides(
                 self.commit.future.device.ptr,
                 DType::I32,
                 Shape::new(&[slots, 1]),
@@ -1317,8 +1317,8 @@ impl<M: TextModel> CausalLmRunner<M> {
         forward: &Forward<'_>,
         plan: &Plan,
         entries: &[CallEntries],
-        hidden: TensorView,
-        workspace: TensorView,
+        hidden: Operand,
+        workspace: Operand,
     ) -> Result<Vec<Vec<u32>>> {
         let recording = !forward.launches();
         let pool = self
@@ -1452,7 +1452,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             .ok_or(Error::State("speculation"))?;
         let planes = self.kv.draft_planes()?;
         let page = pool.page;
-        let view = |tables: TensorView| -> [nn::KvGroup<'_>; 1] {
+        let view = |tables: Operand| -> [nn::KvGroup<'_>; 1] {
             [nn::KvGroup {
                 block_tables: tables,
                 page_size: page,
@@ -1520,15 +1520,15 @@ impl<M: TextModel> CausalLmRunner<M> {
             ids: DType::I32,
             pdl: nn::layers::launch::PDL,
         };
-        let proposal = |step: u32| -> TensorView {
+        let proposal = |step: u32| -> Operand {
             let at = u64::from(step) * pitch(calls);
-            TensorView::new(
+            Operand::new(
                 spec.proposals.device.offset_elements(at),
                 DType::I32,
                 Shape::new(&[calls]),
             )
         };
-        let propose = |step: u32, current: TensorView| -> Result<()> {
+        let propose = |step: u32, current: Operand| -> Result<()> {
             let logits = self
                 .model
                 .compute_logits(&chained, current)
@@ -1547,8 +1547,8 @@ impl<M: TextModel> CausalLmRunner<M> {
         let chained_groups = view(spec.chained_tables.shaped(&[calls, u64::from(spec.width)]));
         for step in 1..steps {
             let at = u64::from(step - 1) * pitch(calls);
-            let column = |column: &Column| -> TensorView {
-                TensorView::new(
+            let column = |column: &Column| -> Operand {
+                Operand::new(
                     column.device.offset_elements(at),
                     DType::I32,
                     Shape::new(&[calls]),
@@ -1665,18 +1665,18 @@ fn pitch(count: u64) -> u64 {
 }
 
 /// `forward` bounded by the token count at `live`: what a step's MoE sort reads.
-fn forward_with_live<'a>(forward: &Forward<'a>, live: TensorView) -> Forward<'a> {
+fn forward_with_live<'a>(forward: &Forward<'a>, live: Operand) -> Forward<'a> {
     forward.clone().with_live_tokens(live)
 }
 
 /// A view's start moved past its first `elements`: the column's entry the view names.
 trait Shifted {
-    fn shifted(self, elements: u64) -> TensorView;
+    fn shifted(self, elements: u64) -> Operand;
 }
 
-impl Shifted for TensorView {
-    fn shifted(self, elements: u64) -> TensorView {
-        TensorView::new(self.offset_elements(elements), self.dtype, self.shape)
+impl Shifted for Operand {
+    fn shifted(self, elements: u64) -> Operand {
+        Operand::new(self.offset_elements(elements), self.dtype, self.shape)
     }
 }
 

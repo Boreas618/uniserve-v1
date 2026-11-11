@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use nn::capability::{PatchFormat, Vision};
-use ops::{DType, TensorView};
+use ops::{DType, Operand};
 use platform::DeviceId;
 
 use crate::host::{HostAction, Lane, Outcome};
@@ -125,10 +125,10 @@ impl Features {
     }
 
     /// The `[rows, hidden]` view of slot `slot`.
-    fn view(&self, slot: u32, rows: u32, dtype: DType, hidden: u32) -> TensorView {
+    fn view(&self, slot: u32, rows: u32, dtype: DType, hidden: u32) -> Operand {
         let address =
             self.storage.address() + u64::from(slot) * u64::from(self.slot_rows) * self.row_bytes;
-        TensorView::new(
+        Operand::new(
             ops::DevicePtr::new(address),
             dtype,
             ops::Shape::new(&[u64::from(rows), u64::from(hidden)]),
@@ -187,7 +187,7 @@ pub(crate) struct Block {
     /// The batch's token index of its first row.
     pub(crate) token: u32,
     /// The feature rows.
-    pub(crate) features: TensorView,
+    pub(crate) features: Operand,
     /// The image's patch grid.
     pub(crate) grid: [u32; 3],
     /// The logical position of its first row.
@@ -405,7 +405,7 @@ impl Images {
         let mut held = Vec::new();
         let pixels = self.pinned(&patches, &mut held)?;
         let patch_rows: u64 = grid.iter().map(|extent| u64::from(*extent)).product();
-        let pixels = TensorView::new(
+        let pixels = Operand::new(
             ops::DevicePtr::new(pixels),
             self.format.dtype,
             ops::Shape::new(&[patch_rows, u64::from(self.format.width())]),
@@ -444,7 +444,7 @@ impl Images {
     fn copy_host(
         &self,
         index: usize,
-        features: TensorView,
+        features: Operand,
         import: bool,
         stream: &platform::Stream,
     ) -> Result<()> {

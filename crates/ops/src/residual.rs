@@ -30,7 +30,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -79,16 +79,16 @@ fn activation_of(key: Key, dtype: DType, activation: DType) -> Key {
 #[derive(Clone, Copy)]
 pub struct WeightedRmsNormArgs {
     /// `[rows, columns]`, contiguous.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[columns]`: the learned scale.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[rows, columns]`: receives the normalized rows.
-    pub out: TensorView,
+    pub out: Operand,
     /// The epsilon added to the mean square.
     pub eps: f32,
     /// `[rows]`, FP32: each row's largest normalized magnitude, present exactly when the descriptor
     /// records it.
-    pub partials: Option<TensorView>,
+    pub partials: Option<Operand>,
 }
 
 /// The weighted RMS normalization of whole rows.
@@ -196,21 +196,21 @@ impl fmt::Display for ScaledResidualRmsNormDescriptor {
 #[derive(Clone, Copy)]
 pub struct ScaledResidualRmsNormArgs {
     /// `[rows, columns]`, contiguous: the residual, updated in place.
-    pub hidden: TensorView,
+    pub hidden: Operand,
     /// `[rows, columns]`, contiguous: the block's output.
-    pub update: TensorView,
+    pub update: Operand,
     /// `[columns]`: the update's bias, present exactly when the descriptor adds one.
-    pub update_bias: Option<TensorView>,
+    pub update_bias: Option<Operand>,
     /// `[columns]` per channel, or `[1]` for one factor over the whole stream.
-    pub scale: TensorView,
+    pub scale: Operand,
     /// `[columns]`: the normalization's learned scale.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[rows, columns]`: receives the normalized unrounded sum.
-    pub out: TensorView,
+    pub out: Operand,
     /// The epsilon added to the mean square.
     pub eps: f32,
     /// `[rows]`, FP32: each row's largest normalized magnitude.
-    pub partials: Option<TensorView>,
+    pub partials: Option<Operand>,
 }
 
 /// Fold a channel-scaled update into the residual and store its RMS rows.
@@ -361,23 +361,23 @@ impl fmt::Display for ScaledResidualLayerNormDescriptor {
 #[derive(Clone, Copy)]
 pub struct ScaledResidualLayerNormArgs {
     /// `[rows, columns]`, contiguous: the residual, unchanged by the launch.
-    pub hidden: TensorView,
+    pub hidden: Operand,
     /// `[rows, columns]`, contiguous: the block's output.
-    pub update: TensorView,
+    pub update: Operand,
     /// `[columns]`: the update's bias, present exactly when the descriptor adds one.
-    pub update_bias: Option<TensorView>,
+    pub update_bias: Option<Operand>,
     /// `[columns]` per channel, or `[1]` for one factor over the whole stream.
-    pub scale: TensorView,
+    pub scale: Operand,
     /// `[columns]`: the normalization's learned scale.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[columns]`: the normalization's learned bias.
-    pub bias: TensorView,
+    pub bias: Operand,
     /// `[rows, columns]`: receives the normalized rows.
-    pub out: TensorView,
+    pub out: Operand,
     /// The epsilon added to the variance.
     pub eps: f32,
     /// `[rows]`, FP32: each row's largest normalized magnitude.
-    pub partials: Option<TensorView>,
+    pub partials: Option<Operand>,
 }
 
 /// Store the layer-normalized rows of a scaled residual without updating it.
@@ -524,13 +524,13 @@ impl fmt::Display for ScaledResidualDescriptor {
 #[derive(Clone, Copy)]
 pub struct ScaledResidualArgs {
     /// `[rows, columns]`, contiguous: the residual, updated in place.
-    pub hidden: TensorView,
+    pub hidden: Operand,
     /// `[rows, columns]`, contiguous: the block's output.
-    pub update: TensorView,
+    pub update: Operand,
     /// `[columns]`: the update's bias, present exactly when the descriptor adds one.
-    pub update_bias: Option<TensorView>,
+    pub update_bias: Option<Operand>,
     /// `[columns]` per channel, or `[1]` for one factor over the whole stream.
-    pub scale: TensorView,
+    pub scale: Operand,
 }
 
 /// Add a channel-scaled, optionally biased update into the residual.
@@ -658,7 +658,7 @@ fn check_descriptor(operator: &'static str, columns: u32, tile: u32) -> Result<(
 /// travels as a launch argument, so both forms are the same program and neither moves a key.
 fn scale_width(
     operator: &'static str,
-    scale: &TensorView,
+    scale: &Operand,
     dtype: DType,
     columns: u64,
 ) -> Result<u32> {
@@ -680,7 +680,7 @@ fn scale_width(
 
 /// Check an optional magnitude buffer against the descriptor's flag and the row count.
 fn matches(
-    partials: &Option<TensorView>,
+    partials: &Option<Operand>,
     expected: bool,
     operator: &'static str,
     what: &str,
@@ -731,11 +731,11 @@ impl fmt::Display for SigmoidGatedAddDescriptor {
 #[derive(Clone, Copy)]
 pub struct SigmoidGatedAddArgs {
     /// `[rows, columns]`, contiguous: the target, updated in place.
-    pub target: TensorView,
+    pub target: Operand,
     /// `[rows, columns]`, contiguous: the update the gate scales.
-    pub update: TensorView,
+    pub update: Operand,
     /// `[rows, 1]`, contiguous: each row's gate logit.
-    pub gate: TensorView,
+    pub gate: Operand,
 }
 
 /// `target[r] ← target[r] + sigmoid(gate[r]) · update[r]`: a row's update scaled by the sigmoid of
@@ -862,9 +862,9 @@ impl fmt::Display for ScaledAddDescriptor {
 #[derive(Clone, Copy)]
 pub struct ScaledAddArgs {
     /// `[rows, columns]`, contiguous: the target, updated in place.
-    pub target: TensorView,
+    pub target: Operand,
     /// `[rows, columns]`, contiguous: the source, the same shape as the target.
-    pub source: TensorView,
+    pub source: Operand,
     /// The source's coefficient, a host value: no upload, no view.
     pub alpha: f32,
     /// The target's coefficient, a host value.
@@ -1002,8 +1002,8 @@ mod scaled_add_tests {
     use super::*;
     use crate::DevicePtr;
 
-    fn view(dtype: DType, rows: u64, columns: u64) -> TensorView {
-        TensorView::new(DevicePtr::new(0x1000), dtype, Shape::new(&[rows, columns]))
+    fn view(dtype: DType, rows: u64, columns: u64) -> Operand {
+        Operand::new(DevicePtr::new(0x1000), dtype, Shape::new(&[rows, columns]))
     }
 
     fn descriptor(target: DType, source: DType) -> ScaledAddDescriptor {
@@ -1014,7 +1014,7 @@ mod scaled_add_tests {
         }
     }
 
-    fn args(target: TensorView, source: TensorView) -> ScaledAddArgs {
+    fn args(target: Operand, source: Operand) -> ScaledAddArgs {
         ScaledAddArgs {
             target,
             source,
@@ -1101,8 +1101,8 @@ mod scale_tests {
     use super::*;
     use crate::DevicePtr;
 
-    fn scale(shape: Shape) -> TensorView {
-        TensorView::new(DevicePtr::new(0x1000), DType::BF16, shape)
+    fn scale(shape: Shape) -> Operand {
+        Operand::new(DevicePtr::new(0x1000), DType::BF16, shape)
     }
 
     #[test]

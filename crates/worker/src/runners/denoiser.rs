@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 
 use ipc::TimingCounters;
 use nn::capability::{Conditioning, Denoiser, Latents, Step, VideoRequest, WarmRequest};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 use platform::DeviceId;
 use proto::video::{LatentShape, Layout};
 
@@ -419,9 +419,9 @@ struct Opening<'a> {
     /// The model's condition pieces of `stated`, in the order it packs them.
     pieces: &'a [nn::capability::ConditionPiece],
     /// `[elements]` the pixels of every condition, conditions in request order.
-    pixels: Option<TensorView>,
+    pixels: Option<Operand>,
     /// `[elements]` the soundtrack samples of every condition, conditions in request order.
-    samples: Option<TensorView>,
+    samples: Option<Operand>,
     /// Whether a latent preparation restored the request's trajectory: it then draws no noise and
     /// starts no schedule.
     restored: bool,
@@ -733,7 +733,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     }
 
     /// The video latents of request `index` of `bucket`, as a view of the runner's own column.
-    fn video_latents(&self, bucket: Bucket, index: u32) -> Result<TensorView> {
+    fn video_latents(&self, bucket: Bucket, index: u32) -> Result<Operand> {
         let layout = layout_of(bucket)?;
         let elements = numel(&layout.video)?;
         let view = self.columns.video.shaped(&[elements]);
@@ -743,7 +743,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     }
 
     /// The audio latents of request `index` of `bucket`, when the bucket's layout has a soundtrack.
-    fn audio_latents(&self, bucket: Bucket, index: u32) -> Result<Option<TensorView>> {
+    fn audio_latents(&self, bucket: Bucket, index: u32) -> Result<Option<Operand>> {
         let layout = layout_of(bucket)?;
         let Some(audio) = layout.audio else {
             return Ok(None);
@@ -885,7 +885,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
                     return Err(products::absent(request, kind));
                 };
                 let (copied, zeroed) = fills(request, kind, published.bytes, bytes)?;
-                let destination = TensorView::new(
+                let destination = Operand::new(
                     ops::DevicePtr::new(column.host.address() + u64::from(index) * stride),
                     self.shape.stack,
                     Shape::new(&[copied / element]),
@@ -1225,7 +1225,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         &self,
         row: &Pending,
         pieces: &[nn::capability::ConditionPiece],
-    ) -> Result<(Option<TensorView>, Option<TensorView>)> {
+    ) -> Result<(Option<Operand>, Option<Operand>)> {
         if pieces.is_empty() {
             return Ok((None, None));
         }
@@ -1233,7 +1233,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             .products
             .as_ref()
             .ok_or_else(|| products::no_store(row.request))?;
-        let region = |kind: Product, wanted: bool| -> Result<Option<TensorView>> {
+        let region = |kind: Product, wanted: bool| -> Result<Option<Operand>> {
             if !wanted {
                 return Ok(None);
             }
@@ -1278,7 +1278,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             pixel_at += piece.pixels.as_ref().map_or(0, |shape| elements(shape));
             sample_at += piece.track.as_ref().map_or(0, |shape| elements(shape));
         }
-        let view = |source: Option<TensorView>, at: u64, shape: &[u64]| -> Result<TensorView> {
+        let view = |source: Option<Operand>, at: u64, shape: &[u64]| -> Result<Operand> {
             let source = source.ok_or_else(|| {
                 Error::Invalid(
                     "a request states a condition piece the media reader left no region for".into(),
@@ -1396,7 +1396,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             .map_err(Error::from)?;
         // The media reader's regions hold every condition's pixels, then every condition's samples,
         // in its own element type.
-        let region = |extents: Vec<u64>| -> Result<Option<TensorView>> {
+        let region = |extents: Vec<u64>| -> Result<Option<Operand>> {
             match extents.iter().sum::<u64>() {
                 0 => Ok(None),
                 total => walk
@@ -2020,7 +2020,7 @@ fn trajectory_layout(layout: &Layout, dtype: DType) -> Result<StorageLayout> {
 /// The device ranges a trajectory's bytes lie in, in the order [`trajectory_layout`] lays them back
 /// to back: the video latent, then the audio latent.
 fn trajectory_regions(latents: &Latents) -> Result<Vec<(u64, u64)>> {
-    let region = |view: &TensorView| -> Result<(u64, u64)> {
+    let region = |view: &Operand| -> Result<(u64, u64)> {
         let bytes = view
             .dtype
             .bytes()
@@ -2318,7 +2318,7 @@ mod product_tests {
             _device: platform::DeviceId,
             _stream: StreamId,
             _written: Option<Arc<platform::Event>>,
-            _view: &TensorView,
+            _view: &Operand,
         ) -> Result<()> {
             // The presence rule reads the store; who published what is `Store::held`'s own setup.
             Ok(())
@@ -2349,7 +2349,7 @@ mod product_tests {
             &self,
             _request: ipc::RequestKey,
             _kind: Product,
-            _destination: &TensorView,
+            _destination: &Operand,
             _stream: &platform::Stream,
         ) -> Result<bool> {
             unreachable!("the presence rule never copies")
@@ -2365,11 +2365,11 @@ mod product_tests {
             kind: Product,
             _device: platform::DeviceId,
             _stream: StreamId,
-        ) -> Result<Option<TensorView>> {
+        ) -> Result<Option<Operand>> {
             Ok(self
                 .held
                 .contains(&kind)
-                .then(|| TensorView::new(ops::DevicePtr::new(0), DType::BF16, Shape::new(&[1, 1]))))
+                .then(|| Operand::new(ops::DevicePtr::new(0), DType::BF16, Shape::new(&[1, 1]))))
         }
     }
 

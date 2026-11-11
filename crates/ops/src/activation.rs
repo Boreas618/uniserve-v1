@@ -26,7 +26,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -108,11 +108,11 @@ impl fmt::Display for ActAndMulDescriptor {
 #[derive(Clone, Copy)]
 pub struct ActAndMulArgs {
     /// The gate half, its rows `gate_stride` elements apart and its last axis unit-strided.
-    pub gate: TensorView,
+    pub gate: Operand,
     /// The value half, its rows `value_stride` elements apart and its last axis unit-strided.
-    pub value: TensorView,
+    pub value: Operand,
     /// `[..., width]`, contiguous: receives `act(gate) · value`.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The activation of the gate half times the value half.
@@ -306,14 +306,14 @@ impl fmt::Display for ValueFirstSwigluDescriptor {
 #[derive(Clone, Copy)]
 pub struct ValueFirstSwigluArgs {
     /// `[..., 2 · width]`, contiguous, value half first: the packed projection.
-    pub value_gate: TensorView,
+    pub value_gate: Operand,
     /// `[2 · width]`, contiguous: the packed bias, present exactly when the descriptor adds one.
-    pub bias: Option<TensorView>,
+    pub bias: Option<Operand>,
     /// `[..., width]`, contiguous: receives `value · silu(gate)`.
-    pub out: TensorView,
+    pub out: Operand,
     /// `[programs]`, FP32: each program's largest output magnitude, present exactly when the
     /// descriptor asks for it.
-    pub partials: Option<TensorView>,
+    pub partials: Option<Operand>,
 }
 
 /// `value · silu(gate)` over a packed `[value, gate]` projection.
@@ -491,17 +491,17 @@ impl fmt::Display for SwigluDescriptor {
 #[derive(Clone, Copy)]
 pub struct SwigluArgs {
     /// The value half, its rows `value_stride` elements apart.
-    pub value: TensorView,
+    pub value: Operand,
     /// The gate half, its rows `gate_stride` elements apart.
-    pub gate: TensorView,
+    pub gate: Operand,
     /// `[width]`: the value half's bias, present exactly when the descriptor adds one.
-    pub value_bias: Option<TensorView>,
+    pub value_bias: Option<Operand>,
     /// `[width]`: the gate half's bias, present exactly when the descriptor adds one.
-    pub gate_bias: Option<TensorView>,
+    pub gate_bias: Option<Operand>,
     /// `[rows, width]`, contiguous: receives `(value + bias) · silu(gate + bias)`.
-    pub out: TensorView,
+    pub out: Operand,
     /// `[programs]`, FP32: each program's largest output magnitude.
-    pub partials: Option<TensorView>,
+    pub partials: Option<Operand>,
 }
 
 /// SwiGLU over separate value and gate views, each with its own bias.
@@ -673,9 +673,9 @@ impl fmt::Display for SiluDescriptor {
 #[derive(Clone, Copy)]
 pub struct SiluArgs {
     /// `[rows, columns]`, contiguous: the values to activate.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[rows, columns]`, contiguous, in the descriptor's element type.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The sigmoid linear unit on its own, `out = x / (1 + exp(−x))`.

@@ -37,7 +37,7 @@ use ops::moe::grouped::{
 };
 use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
-use ops::{DType, DevicePtr, Shape, TensorView};
+use ops::{DType, DevicePtr, Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::family::Split;
@@ -262,23 +262,23 @@ enum ExpertStacks {
 
 struct Routes {
     /// `[tokens, top]` i32: the weight row of each route.
-    local_ids: TensorView,
+    local_ids: Operand,
     /// `[tokens, top]` f32: the route's normalized weight.
-    weights: TensorView,
+    weights: Operand,
     /// The permuted rows the products write, padding included.
     rows: u64,
     /// `[max_tiles]` i32: the expert of each tile.
-    tile_to_expert: TensorView,
+    tile_to_expert: Operand,
     /// `[max_tiles]` i32: the live rows of each tile.
-    tile_to_limit: TensorView,
+    tile_to_limit: Operand,
     /// `[tokens, top]` i32: the permuted row of each expanded route.
-    expanded_to_permuted: TensorView,
+    expanded_to_permuted: Operand,
     /// `[max_permuted_rows]` i32: the expanded route of each permuted row.
-    permuted_to_expanded: TensorView,
+    permuted_to_expanded: Operand,
     /// `[max_permuted_rows]` i32: the token row each permuted row gathers.
-    permuted_to_token: TensorView,
+    permuted_to_token: Operand,
     /// `[1]` i32: the live tiles.
-    num_non_exiting_tiles: TensorView,
+    num_non_exiting_tiles: Operand,
 }
 
 /// A mixture-of-experts block over a colocated expert group.
@@ -964,7 +964,7 @@ impl Moe {
     /// # Errors
     ///
     /// Rows of another width, an arena that cannot hold the tensors, or an operator's refusal.
-    pub fn route(&self, f: &Forward, hidden: TensorView) -> Result<(TensorView, TensorView)> {
+    pub fn route(&self, f: &Forward, hidden: Operand) -> Result<(Operand, Operand)> {
         hidden
             .require_row("Moe::route", hidden.dtype, u64::from(self.hidden))
             .map_err(Error::from)?;
@@ -995,7 +995,7 @@ impl Moe {
     /// Every expert product a block can run starts here and differs only in the two multiplies, so
     /// the prefix is one path: a variant that multiplies something else still routes, sorts and
     /// combines identically, and a heavy quantized product cannot drift from the dense one.
-    fn routed(&self, f: &Forward, hidden: TensorView) -> Result<Routes> {
+    fn routed(&self, f: &Forward, hidden: Operand) -> Result<Routes> {
         let tokens = hidden.rows();
         let top = u64::from(self.top);
         let experts = u64::from(self.experts);
@@ -1049,7 +1049,7 @@ impl Moe {
     /// # Errors
     ///
     /// As [`Self::forward_into`], or an arena that cannot hold the output.
-    pub fn forward(&self, f: &Forward, hidden: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, hidden: Operand) -> Result<Operand> {
         let out = f.empty(
             hidden.dtype,
             Shape::new(&[hidden.rows(), u64::from(self.hidden)]),
@@ -1072,7 +1072,7 @@ impl Moe {
     ///
     /// When a view does not fit the block, an operator refuses, or a split block runs on a forward
     /// without a group.
-    pub fn forward_into(&self, f: &Forward, hidden: TensorView, update: TensorView) -> Result<()> {
+    pub fn forward_into(&self, f: &Forward, hidden: Operand, update: Operand) -> Result<()> {
         self.combine(f, hidden, update)?;
         if self.reduce > 1 {
             if f.split().is_none() {
@@ -1091,7 +1091,7 @@ impl Moe {
     }
 
     /// `out = Σ_routes weight · expert(hidden)` over this rank's experts and block.
-    fn combine(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
+    fn combine(&self, f: &Forward, hidden: Operand, out: Operand) -> Result<()> {
         if self.local != self.experts || f.dispatch().is_some() {
             return self.exchanged(f, hidden, out);
         }
@@ -1326,7 +1326,7 @@ impl Moe {
     /// calibrated activation scale cancels out of both the code and the reconstruction; the expert's
     /// own scales reach the product through its `[projections, experts]` table. No row-expansion
     /// operator appears: the encoded gather is token-major and expands as it multiplies.
-    fn forward_encoded(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
+    fn forward_encoded(&self, f: &Forward, hidden: Operand, out: Operand) -> Result<()> {
         let ExpertStacks::Encoded { up_gate, down } = &self.stacks else {
             return Err(Error::Unsupported(
                 "Moe::forward_encoded: the block's experts are dense".to_owned(),
@@ -1478,7 +1478,7 @@ impl Moe {
     ///
     /// Every buffer holds the most rows a rank may exchange, so a captured graph replays over
     /// the same addresses however the router routes a later batch.
-    fn exchanged(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
+    fn exchanged(&self, f: &Forward, hidden: Operand, out: Operand) -> Result<()> {
         let exchange = f.dispatch().ok_or_else(|| {
             Error::shape(
                 "Moe",
@@ -1589,9 +1589,9 @@ impl Moe {
         let width = u64::from(self.hidden);
         let top = u64::from(self.top);
         let base = DevicePtr::new(0);
-        let rows = TensorView::new(base, exchange.states.dtype, Shape::new(&[0, width]));
-        let ids = TensorView::new(base, DType::I32, Shape::new(&[0, top]));
-        let weights = TensorView::new(base, DType::F32, Shape::new(&[0, top]));
+        let rows = Operand::new(base, exchange.states.dtype, Shape::new(&[0, width]));
+        let ids = Operand::new(base, DType::I32, Shape::new(&[0, top]));
+        let weights = Operand::new(base, DType::F32, Shape::new(&[0, top]));
         self.exchange_routes(f, exchange, rows, ids, weights, rows)
     }
 
@@ -1601,10 +1601,10 @@ impl Moe {
         &self,
         f: &Forward,
         exchange: &DispatchViews,
-        hidden: TensorView,
-        sent: TensorView,
-        weights: TensorView,
-        out: TensorView,
+        hidden: Operand,
+        sent: Operand,
+        weights: Operand,
+        out: Operand,
     ) -> Result<()> {
         if exchange.fused {
             return self.fused_routes(f, exchange, hidden, sent, weights, out);
@@ -1627,7 +1627,7 @@ impl Moe {
         let received = u64::from(exchange.ranks) * u64::from(exchange.step_rows);
         let launch_tokens = u32::try_from(tokens)
             .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?;
-        let empty = TensorView::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
+        let empty = Operand::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
 
         // 3. Dispatch: each token's payload goes to the ranks that hold its experts.
         let exchange_descriptor = |mode: Mode| exchange::Descriptor {
@@ -1782,10 +1782,10 @@ impl Moe {
         &self,
         f: &Forward,
         exchange: &DispatchViews,
-        hidden: TensorView,
-        sent: TensorView,
-        weights: TensorView,
-        out: TensorView,
+        hidden: Operand,
+        sent: Operand,
+        weights: Operand,
+        out: Operand,
     ) -> Result<()> {
         let ExpertStacks::Encoded { up_gate, down } = &self.stacks else {
             return Err(Error::Unsupported(
@@ -1806,12 +1806,12 @@ impl Moe {
                 self.quantize_descriptor(hidden.dtype, self.hidden, ScaleLayout::Linear);
             let args = QuantizeArgs {
                 input: hidden,
-                values: TensorView::new(
+                values: Operand::new(
                     exchange.packed.ptr,
                     exchange.packed.dtype,
                     Shape::new(&[tokens, exchange.packed.shape.last()]),
                 ),
-                scales: TensorView::new(
+                scales: Operand::new(
                     exchange.packed_scales.ptr,
                     DType::U8,
                     Shape::new(&[tokens, exchange.packed_scales.shape.last()]),
@@ -1821,7 +1821,7 @@ impl Moe {
             };
             f.operate::<Nvfp4Quantize>(&descriptor, args)?;
         }
-        let empty = TensorView::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
+        let empty = Operand::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
         let address = |weight: &Weight| weight.view().ptr.address();
         let bytes = |weight: &Weight| weight.view().numel() / u64::from(self.local);
         let layer = exchange::FusedLayer {
@@ -1870,9 +1870,9 @@ impl Moe {
         f: &Forward,
         exchange: &DispatchViews,
         tokens: u32,
-        out: TensorView,
+        out: Operand,
     ) -> Result<()> {
-        let empty = TensorView::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
+        let empty = Operand::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
         let descriptor = exchange::Descriptor {
             mode: Mode::Combine,
             hidden: self.hidden,
@@ -1934,7 +1934,7 @@ pub(super) mod tests {
     fn weight(dtype: DType, shape: &[u64]) -> Weight {
         Weight {
             backing: Backing::new(DevicePtr::new(0x1_0000), 1 << 20),
-            view: TensorView::new(DevicePtr::new(0x1_0000), dtype, Shape::new(shape)),
+            view: Operand::new(DevicePtr::new(0x1_0000), dtype, Shape::new(shape)),
         }
     }
 

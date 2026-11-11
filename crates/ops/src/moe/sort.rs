@@ -29,7 +29,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -77,13 +77,13 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct SortArgs {
     /// `[tokens, top]` i32 route ids.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[tokens, top]` route weights, in the descriptor's scale dtype.
-    pub scales: TensorView,
+    pub scales: Operand,
     /// `[max_tiles]` i32: the expert each tile belongs to.
-    pub tile_to_expert: TensorView,
+    pub tile_to_expert: Operand,
     /// `[max_tiles]` i32: live rows of each tile.
-    pub tile_to_limit: TensorView,
+    pub tile_to_limit: Operand,
     /// `[tokens, top]` i32: permuted row of each expanded route, and `-1` for a route this rank does
     /// not hold, which the sort writes. The buffer needs no initial value.
     ///
@@ -91,21 +91,21 @@ pub struct SortArgs {
     /// bucket holds but the batch does not fill is a different subject - a row that is not live has no
     /// route for any rank to own - and it is not written at all today, because nothing in a launch
     /// knows how many of a bucket's rows the batch fills.
-    pub expanded_to_permuted: TensorView,
+    pub expanded_to_permuted: Operand,
     /// `[max_permuted_rows]` i32: expanded route of each permuted row.
-    pub permuted_to_expanded: TensorView,
+    pub permuted_to_expanded: Operand,
     /// `[max_permuted_rows]` i32: the token row each permuted row gathers, and `-1` on a tile's
     /// padding. It is the expanded route over `top`, written beside it, because a product that
     /// gathers its own rows indexes the token-major activations and takes no `top` to divide by.
-    pub permuted_to_token: TensorView,
+    pub permuted_to_token: Operand,
     /// `[1]` i32: padded **permuted** rows the GEMMs must cover.
     ///
     /// This is the tail of an expert's last tile, and it is not the same subject as a token row a batch
     /// does not fill: one is a permuted row inside a tile group, the other is a row of the batch's own
     /// extent. A reader who needs the second cannot read it from this count.
-    pub total_padded_tokens: TensorView,
+    pub total_padded_tokens: Operand,
     /// `[1]` i32: tiles that hold live rows.
-    pub num_non_exiting_tiles: TensorView,
+    pub num_non_exiting_tiles: Operand,
     /// `[1]` i32: the token rows **of this batch** that are live, device-resident.
     ///
     /// The subject is the batch's own rows, not the rows a buffer holds: `tokens` may be a bucket
@@ -126,7 +126,7 @@ pub struct SortArgs {
     /// a count at all ([`Descriptor::counted`]), so no cell doubles - and a module built before the
     /// count existed cannot be paired with this one, because two programs that disagree about what
     /// a padded row writes would report the pair's difference as a defect.
-    pub live_tokens: Option<TensorView>,
+    pub live_tokens: Option<Operand>,
     /// First logical expert this rank holds.
     pub local_offset: u32,
 }

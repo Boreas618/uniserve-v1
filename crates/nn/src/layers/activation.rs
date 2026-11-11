@@ -26,7 +26,7 @@
 //! but cannot see a shift inside one row, so this documentation is the obligation the caller holds.
 
 use ops::DType;
-use ops::TensorView;
+use ops::Operand;
 use ops::activation::{self, Activation};
 
 use crate::error::{Error, Result};
@@ -78,29 +78,29 @@ pub enum Halves {
     /// Two `[rows, width]` views, each with unit stride along its rows.
     Split {
         /// The half the activation applies to.
-        gate: TensorView,
+        gate: Operand,
         /// The half the activation multiplies.
-        value: TensorView,
+        value: Operand,
     },
     /// One `[rows, 2 · width]` projection holding the value half and then the gate half of each
     /// row, as a checkpoint that fuses `[up, gate]` value-first stores it.
-    ValueFirst(TensorView),
+    ValueFirst(Operand),
 }
 
 impl Halves {
     /// The gate and value halves of a value-first packed projection, as strided views of its rows:
     /// `value` at element zero and `gate` one half along, both striding over the packed row.
-    fn split(projection: TensorView) -> (TensorView, TensorView) {
+    fn split(projection: Operand) -> (Operand, Operand) {
         let width = projection.last() / 2;
         let shape = ops::Shape::new(&[projection.rows(), width]);
         let strides = projection.strides;
-        let value = TensorView::with_strides(
+        let value = Operand::with_strides(
             projection.element(&[0, 0]),
             projection.dtype,
             shape,
             strides,
         );
-        let gate = TensorView::with_strides(
+        let gate = Operand::with_strides(
             projection.element(&[0, width]),
             projection.dtype,
             shape,
@@ -165,7 +165,7 @@ impl GatedActivation {
     ///
     /// Halves of different extents, a bias of another width or packing than the input, an arena
     /// that cannot hold the output, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, input: Halves) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, input: Halves) -> Result<Operand> {
         let (dtype, rows, width) = match input {
             Halves::Split { gate, .. } => (gate.dtype, gate.rows(), gate.last()),
             Halves::ValueFirst(projection) => {
@@ -178,7 +178,7 @@ impl GatedActivation {
     }
 
     /// The product of `input`'s halves into `out`, `[rows, width]`.
-    fn launch(&self, f: &Forward, input: Halves, out: TensorView) -> Result<()> {
+    fn launch(&self, f: &Forward, input: Halves, out: Operand) -> Result<()> {
         const OWNER: &str = "GatedActivation";
         let width = out.shape.last();
         match (self.rounding, input) {
@@ -234,10 +234,10 @@ impl GatedActivation {
     fn act_and_mul(
         &self,
         f: &Forward,
-        gate: TensorView,
-        value: TensorView,
+        gate: Operand,
+        value: Operand,
         stepwise: bool,
-        out: TensorView,
+        out: Operand,
     ) -> Result<()> {
         let width = out.shape.last();
         let (gate_stride, value_stride) = (gate.strides.get(0), value.strides.get(0));
@@ -267,11 +267,11 @@ impl GatedActivation {
     fn swiglu(
         &self,
         f: &Forward,
-        gate: TensorView,
-        value: TensorView,
+        gate: Operand,
+        value: Operand,
         value_bias: Option<Weight>,
         gate_bias: Option<Weight>,
-        out: TensorView,
+        out: Operand,
     ) -> Result<()> {
         let width = out.shape.last();
         for (name, view) in [("value", value), ("gate", gate)] {
@@ -325,9 +325,9 @@ impl GatedActivation {
     fn value_first(
         &self,
         f: &Forward,
-        projection: TensorView,
+        projection: Operand,
         bias: Option<Weight>,
-        out: TensorView,
+        out: Operand,
     ) -> Result<()> {
         let width = out.shape.last();
         if projection.shape.last() != 2 * width {
@@ -406,7 +406,7 @@ impl Gelu {
     /// # Errors
     ///
     /// A view of another rank, an arena that cannot hold the output, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, x: Operand) -> Result<Operand> {
         if x.shape.rank() != 2 {
             return Err(Error::shape(
                 "Gelu",
@@ -460,7 +460,7 @@ impl Snake {
     /// # Errors
     ///
     /// Views of another extent, an arena that cannot hold the output, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, x: TensorView, alpha: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, x: Operand, alpha: Operand) -> Result<Operand> {
         if x.shape.rank() != 3 || x.shape.dim(1) != self.channels {
             return Err(Error::shape(
                 "Snake",
@@ -512,7 +512,7 @@ impl Silu {
     /// # Errors
     ///
     /// A view of another rank, an arena that cannot hold the output, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, x: Operand) -> Result<Operand> {
         if x.shape.rank() != 2 {
             return Err(Error::shape(
                 "Silu",

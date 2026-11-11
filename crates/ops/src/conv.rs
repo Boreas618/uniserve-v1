@@ -19,7 +19,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -137,13 +137,13 @@ const _: () = assert!(
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[n, c, …]`.
-    pub input: TensorView,
+    pub input: Operand,
     /// The filter.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[k]`, when the operation has a bias.
-    pub bias: Option<TensorView>,
+    pub bias: Option<Operand>,
     /// `[n, k, …]`.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The two layout obligations a convolution's arguments carry.
@@ -487,8 +487,8 @@ mod tests {
     use super::*;
     use crate::tensor::DevicePtr;
 
-    fn view(shape: &[u64], strides: &[u64]) -> TensorView {
-        TensorView::with_strides(
+    fn view(shape: &[u64], strides: &[u64]) -> Operand {
+        Operand::with_strides(
             DevicePtr::new(0x1000),
             DType::BF16,
             Shape::new(shape),
@@ -515,7 +515,7 @@ mod tests {
     }
 
     /// `[n, c, d, h, w]` with the channels innermost: the order a channels-last module derives.
-    fn channels_last(shape: &[u64]) -> TensorView {
+    fn channels_last(shape: &[u64]) -> Operand {
         let (c, d, h, w) = (shape[1], shape[2], shape[3], shape[4]);
         view(shape, &[d * h * w * c, 1, h * w * c, w * c, c])
     }

@@ -24,7 +24,7 @@ use std::mem::{offset_of, size_of};
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -73,7 +73,7 @@ impl FramePadDescriptor {
     /// channels-last source, a channels-last output, or any other pair walks fixed tiles of columns
     /// and channels, which coalesces in the layout the operands are stored in. The descriptor
     /// carries the result, so the caller and the compiled program agree on the variant.
-    pub fn tiles(values: &TensorView, out: &TensorView) -> (u32, u32) {
+    pub fn tiles(values: &Operand, out: &Operand) -> (u32, u32) {
         let contiguous_out = out.strides == Strides::row_major(out.shape);
         Self::tiles_of(values.strides.last() == 1, contiguous_out, out.shape.dim(4))
     }
@@ -95,10 +95,10 @@ impl FramePadDescriptor {
 pub struct FramePadArgs {
     /// `[batch, channels, frames, height, width]`, any strides, channel-first or
     /// channels-last: the kernel walks both operands through the strides it is given.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[batch, channels, frames + front, height + top + bottom, width + left + right]`, contiguous
     /// or channels-last.
-    pub out: TensorView,
+    pub out: Operand,
     /// Output rows above the source.
     pub top: u64,
     /// Output columns left of the source.
@@ -288,7 +288,7 @@ pub fn channels_last_strides(shape: Shape) -> Strides {
 /// order — the row-major one still steps the channel axis a whole frame — and the launch stores
 /// through whichever vector it was handed, so reading the extent instead of the vector would let one
 /// buffer run two ways in one deployment.
-pub fn is_channels_last(out: &TensorView) -> bool {
+pub fn is_channels_last(out: &Operand) -> bool {
     out.strides == channels_last_strides(out.shape) && out.strides != Strides::row_major(out.shape)
 }
 
@@ -304,7 +304,7 @@ pub fn is_channels_last(out: &TensorView) -> bool {
 ///
 /// The batch axis is not constrained — a view of a slice carries whatever step its buffer gives —
 /// because the entry is told it and never derives it.
-pub fn pixel_stride(values: &TensorView) -> Result<i64> {
+pub fn pixel_stride(values: &Operand) -> Result<i64> {
     let (channels, height, width) = (
         values.shape.dim(1),
         values.shape.dim(3),
@@ -414,11 +414,11 @@ impl fmt::Display for FrameMomentsDescriptor {
 pub struct FrameMomentsArgs {
     /// `[batch, channels, frames, height, width]` FP32, channel-first or channels-last: a
     /// frame's pixels are one step apart, which [`pixel_stride`] derives from the layout.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[batch · frames, groups]` FP32: receives each frame's group means.
-    pub mean: TensorView,
+    pub mean: Operand,
     /// `[batch · frames, groups]` FP32: receives each frame's reciprocal standard deviations.
-    pub rstd: TensorView,
+    pub rstd: Operand,
     /// Channels per normalization group.
     pub groups: u64,
 }
@@ -655,18 +655,18 @@ const _: () = assert!(size_of::<FrameNormPadCall>() == 216 + MESSAGE);
 #[derive(Clone, Copy)]
 pub struct FrameNormPadArgs {
     /// `[batch, channels, frames, height, width]` FP32, each frame's pixels contiguous.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[batch · frames, groups]` FP32: the frame's group means.
-    pub mean: TensorView,
+    pub mean: Operand,
     /// `[batch · frames, groups]` FP32: the frame's reciprocal standard deviations.
-    pub rstd: TensorView,
+    pub rstd: Operand,
     /// `[channels]` FP32: the learned weight, present exactly when the descriptor normalizes with
     /// the affine parameters.
-    pub weight: Option<TensorView>,
+    pub weight: Option<Operand>,
     /// `[channels]` FP32: the learned bias, on the same condition.
-    pub bias: Option<TensorView>,
+    pub bias: Option<Operand>,
     /// The padded output, contiguous or channels-last.
-    pub out: TensorView,
+    pub out: Operand,
     /// Channels per normalization group.
     pub groups: u64,
     /// Output rows above the source.
@@ -926,8 +926,8 @@ mod tests {
     use super::*;
     use crate::tensor::DevicePtr;
 
-    fn view(shape: &[u64], strides: &[u64]) -> TensorView {
-        TensorView::with_strides(
+    fn view(shape: &[u64], strides: &[u64]) -> Operand {
+        Operand::with_strides(
             DevicePtr::new(0x1000),
             DType::F32,
             Shape::new(shape),
@@ -937,11 +937,11 @@ mod tests {
 
     /// The same frame in the two layouts a video tensor is stored in: `[1, 4, 3, 2, 5]` is 120
     /// values either way and the pixel step is the only thing the layout changes.
-    fn channel_first() -> TensorView {
+    fn channel_first() -> Operand {
         view(&[1, 4, 3, 2, 5], &[120, 30, 10, 5, 1])
     }
 
-    fn channels_last() -> TensorView {
+    fn channels_last() -> Operand {
         view(&[1, 4, 3, 2, 5], &[120, 1, 40, 20, 4])
     }
 

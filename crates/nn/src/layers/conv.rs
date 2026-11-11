@@ -16,7 +16,7 @@ use ops::conv::{
     Args, Conv1d as Conv1dOp, Conv3d as Conv3dOp, ConvTranspose1d as ConvTranspose1dOp, Descriptor,
 };
 use ops::frame::{self, channels_last_strides};
-use ops::{Shape, TensorView};
+use ops::{Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -62,7 +62,7 @@ impl CausalPad {
 
     /// The padded extent of `values` `[batch, channels, frames, height, width]`, reserved in
     /// `values`' element type and storage order.
-    pub(crate) fn reserve(&self, f: &Forward, values: TensorView) -> Result<TensorView> {
+    pub(crate) fn reserve(&self, f: &Forward, values: Operand) -> Result<Operand> {
         if values.shape.rank() != 5 {
             return Err(Error::shape(
                 "CausalPad",
@@ -87,7 +87,7 @@ impl CausalPad {
     /// # Errors
     ///
     /// Operands of another rank, an arena that cannot hold the output, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, values: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, values: Operand) -> Result<Operand> {
         let out = self.reserve(f, values)?;
         // The block tiles are the operator's own split of the values' and the output's extents.
         let (block_pixels, block_channels) = frame::FramePadDescriptor::tiles(&values, &out);
@@ -118,10 +118,10 @@ pub(crate) fn frame(
     dtype: ops::DType,
     shape: Shape,
     channels_last: bool,
-) -> Result<TensorView> {
+) -> Result<Operand> {
     let packed = f.empty(dtype, shape)?;
     Ok(match channels_last {
-        true => TensorView::with_strides(packed.ptr, dtype, shape, channels_last_strides(shape)),
+        true => Operand::with_strides(packed.ptr, dtype, shape, channels_last_strides(shape)),
         false => packed,
     })
 }
@@ -273,7 +273,7 @@ impl<const N: usize> Convolution<N> {
     fn output_shape(
         &self,
         owner: &'static str,
-        input: TensorView,
+        input: Operand,
         transposed: bool,
     ) -> Result<Shape> {
         let dims = input.shape.dims();
@@ -315,8 +315,8 @@ impl<const N: usize> Convolution<N> {
         &self,
         f: &Forward,
         owner: &'static str,
-        input: TensorView,
-        out: TensorView,
+        input: Operand,
+        out: Operand,
         rank: u32,
         transposed: bool,
     ) -> Result<()> {
@@ -391,7 +391,7 @@ pub struct Conv3d {
 fn channels_last_storage(
     owner: &'static str,
     operand: &'static str,
-    view: TensorView,
+    view: Operand,
 ) -> Result<()> {
     if view.shape.rank() != 5 {
         return Err(Error::shape(
@@ -451,7 +451,7 @@ impl Conv3d {
     ///
     /// An input not stored as the spec states, an arena that cannot hold the output, or the
     /// operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<Operand> {
         if self.inner.spec.channels_last {
             channels_last_storage("Conv3d", "input", input)?;
         }
@@ -494,7 +494,7 @@ impl Conv1d {
     /// # Errors
     ///
     /// An arena that cannot hold the output, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<Operand> {
         let out = self.reserve(f, input)?;
         self.launch(f, input, out)?;
         Ok(out)
@@ -502,7 +502,7 @@ impl Conv1d {
 
     /// The output [`Self::forward`] writes for an input of `input`'s extents and element type,
     /// reserved without launching: a stack that keeps it across a scope reserves it first.
-    pub(crate) fn reserve(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub(crate) fn reserve(&self, f: &Forward, input: Operand) -> Result<Operand> {
         f.empty(
             input.dtype,
             self.inner.output_shape("Conv1d", input, false)?,
@@ -510,7 +510,7 @@ impl Conv1d {
     }
 
     /// The convolution of `input` into the reserved `out`.
-    pub(crate) fn launch(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+    pub(crate) fn launch(&self, f: &Forward, input: Operand, out: Operand) -> Result<()> {
         self.inner.launch(f, "Conv1d", input, out, 1, false)
     }
 }
@@ -537,7 +537,7 @@ impl ConvTranspose1d {
     /// # Errors
     ///
     /// An arena that cannot hold the output, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<Operand> {
         let shape = self.inner.output_shape("ConvTranspose1d", input, true)?;
         let out = f.empty(input.dtype, shape)?;
         self.inner
@@ -641,7 +641,7 @@ impl ResnetBlock3d {
     /// # Errors
     ///
     /// Operands of another shape, or an operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<Operand> {
         let dims = input.shape.dims();
         let spec = &self.spec;
         if dims.len() != 5 || dims[0] != 1 || dims[1] != u64::from(spec.in_channels) {
@@ -674,7 +674,7 @@ impl ResnetBlock3d {
             // rounded sum.
             let width = dims[4];
             let rows =
-                |view: TensorView| view.reshape(Shape::new(&[view.shape.numel() / width, width]));
+                |view: Operand| view.reshape(Shape::new(&[view.shape.numel() / width, width]));
             crate::layers::Residual::default().forward(f, rows(out), rows(residual), None)
         })?;
         Ok(out)
@@ -684,11 +684,11 @@ impl ResnetBlock3d {
 #[cfg(test)]
 mod tests {
     use super::{channels_last_storage, channels_last_strides};
-    use ops::tensor::{DType, DevicePtr, Shape, Strides, TensorView};
+    use ops::tensor::{DType, DevicePtr, Shape, Strides, Operand};
 
     /// The encoder's first convolution's operand: 3 channels, 19 frames, 258 x 258 pixels.
-    fn operand(strides: Strides) -> TensorView {
-        TensorView::with_strides(
+    fn operand(strides: Strides) -> Operand {
+        Operand::with_strides(
             DevicePtr::new(0x1_0000),
             DType::F32,
             Shape::new(&[1, 3, 19, 258, 258]),

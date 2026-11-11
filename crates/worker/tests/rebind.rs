@@ -42,7 +42,7 @@ use ipc::execution::{Shape as PlanShape, Variant};
 use nn::forward::Forward;
 use ops::{
     Arguments, CubinMetadata, DType, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op,
-    Shape, TensorView, Tolerance, Twins, descriptor,
+    Shape, Operand, Tolerance, Twins, descriptor,
 };
 use platform::{
     Allocator, Budget, Buffer, CaptureMode, Device, DeviceId, GraphNodeKind, PinnedBuffer,
@@ -92,7 +92,7 @@ impl fmt::Display for ProbeDescriptor {
 /// the same and the parameters are the only thing that moves.
 #[derive(Clone, Copy)]
 struct ProbeArgs {
-    data: TensorView,
+    data: Operand,
     count: u32,
     value: u32,
 }
@@ -252,7 +252,7 @@ fn a_rebound_bucket_launches_the_walk_s_parameters() {
     );
     // The probe reserves no activation, so its forward needs no arena.
     let arena = nn::Arena::new(DevicePtr::new(0), 0);
-    let data = TensorView::new(
+    let data = Operand::new(
         DevicePtr::new(buffer.address()),
         DType::I32,
         Shape::new(&[WORDS as u64]),
@@ -411,7 +411,7 @@ fn a_revert_after_a_recapture_replays_the_serving_generation_bitwise() {
         .allocate(PoolKind::Graph, BYTES)
         .expect("the successor's activation");
     let view = |buffer: &Buffer| {
-        TensorView::new(
+        Operand::new(
             DevicePtr::new(buffer.address()),
             DType::I32,
             Shape::new(&[WORDS as u64]),
@@ -599,7 +599,7 @@ fn a_commit_keeps_the_capture_an_unprepared_bucket_still_serves_from() {
         .allocate(PoolKind::Graph, BYTES)
         .expect("the untouched bucket's activation");
     let view = |buffer: &Buffer| {
-        TensorView::new(
+        Operand::new(
             DevicePtr::new(buffer.address()),
             DType::I32,
             Shape::new(&[WORDS as u64]),
@@ -767,7 +767,7 @@ fn a_revert_releases_the_whole_capture_set_of_the_failed_generation() {
     let buffer = allocator
         .allocate(PoolKind::Graph, BYTES)
         .expect("the bucket's activation");
-    let data = TensorView::new(
+    let data = Operand::new(
         DevicePtr::new(buffer.address()),
         DType::I32,
         Shape::new(&[WORDS as u64]),
@@ -872,7 +872,7 @@ fn a_programmatic_edge_is_a_different_structure() {
     };
     let key = descriptor::key(&descriptor);
     let arena = nn::Arena::new(DevicePtr::new(0), 0);
-    let data = TensorView::new(
+    let data = Operand::new(
         DevicePtr::new(buffer.address()),
         DType::I32,
         Shape::new(&[WORDS as u64]),

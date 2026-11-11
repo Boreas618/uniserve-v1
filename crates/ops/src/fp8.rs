@@ -15,7 +15,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -53,13 +53,13 @@ impl fmt::Display for Fp8GemmDescriptor {
 #[derive(Clone, Copy)]
 pub struct Fp8GemmArgs {
     /// `[m, k]`, unit-strided per row, rows any stride apart: the 16-bit activation.
-    pub input: TensorView,
+    pub input: Operand,
     /// `[n, k]` E4M3, contiguous: the weight, one row per output column.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[n]` in the output type, present exactly when the descriptor adds one.
-    pub bias: Option<TensorView>,
+    pub bias: Option<Operand>,
     /// `[m, n]`, contiguous: receives the product.
-    pub out: TensorView,
+    pub out: Operand,
     /// The calibration's static activation scale: an activation is divided by it before encoding.
     pub input_scale: f32,
     /// `input_scale · weight_scale`: the factor the FP32 accumulator is dequantized by.

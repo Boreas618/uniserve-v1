@@ -17,7 +17,7 @@
 use crate::{AudioVaeConfig, Error, Result};
 use nn::layers::{Bias, ChannelAffine, Conv1d, ConvSpec};
 use nn::vocoder::{BigVgan, BigVganSpec};
-use nn::{DType, DecodedMedia, Decoder, Forward, Shape, TensorView, WeightLoader};
+use nn::{DType, DecodedMedia, Decoder, Forward, Shape, Operand, WeightLoader};
 
 /// The alias-free activations' up- and down-sampling ratio: BigVGAN's, which the config does not
 /// state.
@@ -146,7 +146,7 @@ impl AudioDecoder {
     /// bytes of `[2 · frames, latent_channels]`, the first stereo channel's rows before the second's.
     /// The decoder's convolutions run along time, so each stereo channel's latent channels must
     /// become the outer axis: this is the reference's `reshape(2, frames, channels).permute(0, 2, 1)`.
-    fn channel_major(&self, f: &Forward, track: TensorView) -> Result<TensorView> {
+    fn channel_major(&self, f: &Forward, track: Operand) -> Result<Operand> {
         let channels = u64::from(self.config.latent_channels);
         let stereo = u64::from(PCM_CHANNELS);
         let shape = track.shape;
@@ -164,14 +164,14 @@ impl AudioDecoder {
         )?;
         // Four axes are what a block copy moves: `[stereo, channels, 1, frames]`.
         let block = Shape::new(&[stereo, channels, 1, frames]);
-        let source = TensorView::with_strides(
+        let source = Operand::with_strides(
             track.offset_elements(0),
             track.dtype,
             block,
             nn::Strides::new(&[frames * channels, 1, 1, channels]),
         );
         let strides = [channels * frames, frames, frames, 1];
-        let destination = TensorView::with_strides(
+        let destination = Operand::with_strides(
             major.offset_elements(0),
             major.dtype,
             block,
@@ -187,7 +187,7 @@ impl AudioDecoder {
     /// The two rows of the latent are the stereo pair the reference decodes; both hold the same
     /// latent, so the network's two output rows are equal. Every intermediate is FP32, and the
     /// length grows only through the generator's transposed convolutions.
-    pub fn forward(&self, f: &Forward, latents: TensorView, out: TensorView) -> Result<()> {
+    pub fn forward(&self, f: &Forward, latents: Operand, out: Operand) -> Result<()> {
         let shape = latents.shape;
         if shape.rank() != 3
             || shape.dim(0) != u64::from(PCM_CHANNELS)
@@ -243,7 +243,7 @@ impl Decoder for AudioDecoder {
         &self,
         f: &Forward,
         _layout: &proto::video::Layout,
-        latents: TensorView,
+        latents: Operand,
         out: DecodedMedia,
     ) -> nn::Result<()> {
         let audio = out.audio.ok_or_else(|| {

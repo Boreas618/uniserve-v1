@@ -31,7 +31,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, TensorView};
+use crate::tensor::{DType, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -78,9 +78,9 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args<'a> {
     /// The source view, read through its own strides.
-    pub source: TensorView,
+    pub source: Operand,
     /// The destination view, whose extents are the block's.
-    pub out: TensorView,
+    pub out: Operand,
     /// The destination's four strides, in the block's axis order.
     ///
     /// A launch value rather than a descriptor field, and stated by the caller rather than read off

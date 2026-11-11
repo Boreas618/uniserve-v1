@@ -15,7 +15,7 @@
 //! Whether they are is the block's [`ResidualForm`], because the two forms round differently: a
 //! fused join normalizes the unrounded FP32 sum, a separate join normalizes the stream it stored.
 
-use ops::{DType, TensorView};
+use ops::{DType, Operand};
 
 use crate::error::Result;
 use crate::family::Split;
@@ -40,7 +40,7 @@ pub enum ResidualForm {
 #[derive(Clone, Copy, Debug)]
 pub struct Pending {
     /// `[rows, width]`: the update.
-    pub update: TensorView,
+    pub update: Operand,
     /// `[width]`: the update's per-channel scale, when the block has one.
     pub scale: Option<Weight>,
 }
@@ -52,7 +52,7 @@ impl Pending {
     /// # Errors
     ///
     /// Views of another shape, or the operator's refusal.
-    pub fn join(&self, f: &Forward, stream: TensorView) -> Result<()> {
+    pub fn join(&self, f: &Forward, stream: Operand) -> Result<()> {
         let scale = self.scale.map_or(Scale::None, Scale::Channel);
         Residual::new(scale, None)?.forward(f, stream, self.update, None)?;
         Ok(())
@@ -145,10 +145,10 @@ impl PreNormBlock {
     pub fn forward(
         &self,
         f: &Forward,
-        stream: TensorView,
+        stream: Operand,
         pending: Option<Pending>,
-        carried: TensorView,
-        attend: impl FnOnce(TensorView) -> Result<TensorView>,
+        carried: Operand,
+        attend: impl FnOnce(Operand) -> Result<Operand>,
     ) -> Result<Pending> {
         f.scoped(|f| {
             let normalized = self.normalize(f, self.norm1, stream, pending)?;
@@ -171,9 +171,9 @@ impl PreNormBlock {
         &self,
         f: &Forward,
         weight: Weight,
-        stream: TensorView,
+        stream: Operand,
         pending: Option<Pending>,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         let plain = || {
             RmsNorm::new(
                 weight,

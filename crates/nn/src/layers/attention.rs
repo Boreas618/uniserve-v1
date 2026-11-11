@@ -15,7 +15,7 @@
 use ops::attention::dense::{DenseArgs, DenseAttention as DenseOp, DenseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention as PagedOp, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvWrite, KvWriteScaled};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 use proto::program::PhaseKind;
 
 use crate::capability::{KvGroup, KvLayer, TokenBatch};
@@ -52,9 +52,9 @@ pub struct DenseSpec {
 #[derive(Clone, Copy, Debug)]
 pub struct Varlen {
     /// The query rows of each sequence, accumulated from zero.
-    pub cu_q: TensorView,
+    pub cu_q: Operand,
     /// The key rows of each sequence, accumulated from zero.
-    pub cu_k: TensorView,
+    pub cu_k: Operand,
     /// The longest query sequence, when the caller wrote the tables and knows it: the launch sizes
     /// its schedule by it rather than by the packed row count, which for many equal sequences asks
     /// for that many times the programs it needs.
@@ -157,11 +157,11 @@ impl DenseAttention {
     pub fn forward(
         &self,
         f: &Forward,
-        query: TensorView,
-        key: TensorView,
-        value: TensorView,
+        query: Operand,
+        key: Operand,
+        value: Operand,
         varlen: Option<Varlen>,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         const OWNER: &str = "DenseAttention";
         let kv_tokens = key.shape.dim(0);
         let keys = match varlen {
@@ -275,7 +275,7 @@ impl PagedAttention {
     /// # Errors
     ///
     /// When the fill cannot be issued.
-    pub fn zero_counters(f: &Forward, workspace: TensorView) -> Result<()> {
+    pub fn zero_counters(f: &Forward, workspace: Operand) -> Result<()> {
         let bytes = workspace.numel() * workspace.dtype.bytes().unwrap_or(1);
         f.zero(workspace, bytes.min(COUNTER_BYTES))
     }
@@ -295,10 +295,10 @@ impl PagedAttention {
         f: &Forward,
         batch: &TokenBatch,
         cache: KvLayer<'_>,
-        query: TensorView,
-        key: TensorView,
-        value: TensorView,
-    ) -> Result<TensorView> {
+        query: Operand,
+        key: Operand,
+        value: Operand,
+    ) -> Result<Operand> {
         // One selection for both halves: the read is handed the planes the write was handed.
         let page = self.page_of(batch, cache.group)?;
         self.write(f, batch, cache.planes, page, key, value)?;
@@ -342,8 +342,8 @@ impl PagedAttention {
         batch: &TokenBatch,
         planes: &crate::capability::KvPlanes,
         page: u32,
-        key: TensorView,
-        value: TensorView,
+        key: Operand,
+        value: Operand,
     ) -> Result<()> {
         let head_dim = u64::from(self.spec.head_dim);
         let heads = u64::from(self.spec.kv_heads);
@@ -443,8 +443,8 @@ impl PagedAttention {
         batch: &TokenBatch,
         planes: &crate::capability::KvPlanes,
         page: u32,
-        key: TensorView,
-        value: TensorView,
+        key: Operand,
+        value: Operand,
     ) -> Result<()> {
         let descriptor = self.scaled_write_descriptor(key.dtype, page);
         let rows = u64::from(self.spec.kv_heads) * u64::from(self.spec.head_dim);
@@ -502,7 +502,7 @@ impl PagedAttention {
     /// another batch's pages there and the operator could not say so; the batch's arity is known
     /// here, and the refusal names it. This is the check the first decode run needed and did not
     /// have: a table built as a vector surfaced as `paged_attention: expected 2 axes, found 1`.
-    fn check_page_table(&self, table: TensorView, sequences: u64) -> Result<()> {
+    fn check_page_table(&self, table: Operand, sequences: u64) -> Result<()> {
         if table.shape.rank() != 2 || table.shape.dim(0) != sequences {
             return Err(Error::shape(
                 "PagedAttention::attend",
@@ -592,8 +592,8 @@ impl PagedAttention {
         batch: &TokenBatch,
         cache: KvLayer<'_>,
         page: u32,
-        query: TensorView,
-        out: TensorView,
+        query: Operand,
+        out: Operand,
     ) -> Result<()> {
         let (group, planes, workspace) = (cache.group, cache.planes, cache.workspace);
         // The batch's own parts are read by pointer arithmetic inside the programs, so they are
@@ -664,7 +664,7 @@ impl PagedAttention {
 /// scale every page of the sequence by one number — the last is the quiet one, since it type-checks,
 /// launches, and answers a plausible tensor. The write divides each page by the page's own FP32
 /// scale, so the reader's operand is a table of the same length: the pages of the plane in F32.
-fn page_scale(plane: TensorView, scale: Option<TensorView>) -> Result<Option<TensorView>> {
+fn page_scale(plane: Operand, scale: Option<Operand>) -> Result<Option<Operand>> {
     match (plane.dtype == ops::DType::F8E4M3, scale) {
         (true, Some(scale)) => {
             let pages = plane.shape.dim(0);
@@ -709,14 +709,14 @@ mod tests {
     fn a_page_scale_table_has_one_entry_per_page() {
         let pages = 16_u64;
         let plane = |dtype| {
-            TensorView::new(
+            Operand::new(
                 DevicePtr::new(0x1_0000),
                 dtype,
                 Shape::new(&[pages, 64, 8, 128]),
             )
         };
         let scale = |elements: u64, dtype| {
-            TensorView::new(DevicePtr::new(0x2_0000), dtype, Shape::new(&[elements]))
+            Operand::new(DevicePtr::new(0x2_0000), dtype, Shape::new(&[elements]))
         };
 
         assert!(page_scale(plane(DType::F8E4M3), Some(scale(pages, DType::F32))).is_ok());
@@ -766,7 +766,7 @@ mod tests {
     fn a_page_table_is_one_i32_row_per_sequence_of_its_batch() {
         let attention = paged(4, 40_960).unwrap();
         let table = |dtype: DType, shape: &[u64]| {
-            TensorView::new(DevicePtr::new(0x2_0000), dtype, Shape::new(shape))
+            Operand::new(DevicePtr::new(0x2_0000), dtype, Shape::new(shape))
         };
         assert!(
             attention
@@ -959,18 +959,18 @@ mod tests {
     #[test]
     fn a_planes_per_page_scale_follows_the_planes_element_type() {
         let pages = Shape::new(&[16, 1, 1, 1]);
-        let fp8 = TensorView::new(
+        let fp8 = Operand::new(
             DevicePtr::new(0x1000),
             DType::F8E4M3,
             Shape::new(&[16, 64, 8, 128]),
         );
-        let bf16 = TensorView::new(
+        let bf16 = Operand::new(
             DevicePtr::new(0x2000),
             DType::BF16,
             Shape::new(&[16, 64, 8, 128]),
         );
-        let first = TensorView::new(DevicePtr::new(0x3000), DType::F32, pages);
-        let second = TensorView::new(DevicePtr::new(0x4000), DType::F32, pages);
+        let first = Operand::new(DevicePtr::new(0x3000), DType::F32, pages);
+        let second = Operand::new(DevicePtr::new(0x4000), DType::F32, pages);
 
         assert_eq!(
             page_scale(fp8, Some(first)).unwrap().unwrap().ptr,

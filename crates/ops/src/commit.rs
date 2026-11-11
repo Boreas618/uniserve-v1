@@ -38,7 +38,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, TensorView};
+use crate::tensor::{DType, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -95,29 +95,29 @@ impl fmt::Display for CommitDescriptor {
 #[derive(Clone, Copy)]
 pub struct CommitArgs {
     /// `[8, capacity]` i64: the step's commit rows, `stride` elements between columns.
-    pub columns: TensorView,
+    pub columns: Operand,
     /// `[tasks]` i64: the sampled token of each task.
-    pub tokens: TensorView,
+    pub tokens: Operand,
     /// `[tasks]`: whether the task's sample is valid.
-    pub valid: TensorView,
+    pub valid: Operand,
     /// `[tasks]`: whether the task is active in this step.
-    pub active: TensorView,
+    pub active: Operand,
     /// `[tasks]` u8: whether the task continues.
-    pub continuation: TensorView,
+    pub continuation: Operand,
     /// `[tasks]`: the accepted span's length per task.
-    pub points: TensorView,
+    pub points: Operand,
     /// `[slots, width]` i64: the next input token goes to column 0.
-    pub future: TensorView,
+    pub future: Operand,
     /// `[slots]` u8: receives the continuation predicate.
-    pub predicates: TensorView,
+    pub predicates: Operand,
     /// `[slots]`: the slot's logical position.
-    pub logical: TensorView,
+    pub logical: Operand,
     /// `[slots]`: the slot's sampling position.
-    pub sampling: TensorView,
+    pub sampling: Operand,
     /// `[slots]` i32: the slot's verified length.
-    pub verified: TensorView,
+    pub verified: Operand,
     /// `[slots, vocab]` i32: accumulates the accepted tokens' penalty weights.
-    pub penalties: TensorView,
+    pub penalties: Operand,
     /// The step's commit rows.
     pub count: u64,
 }
@@ -342,7 +342,7 @@ impl Op for SlotCommit {
 fn check_type(
     operator: &'static str,
     name: &str,
-    view: &TensorView,
+    view: &Operand,
     expected: DType,
 ) -> Result<()> {
     if view.dtype != expected {
@@ -363,8 +363,8 @@ mod tests {
     const VOCAB: u64 = 8;
     const FUTURE: u64 = 16;
 
-    fn view(dtype: DType, shape: &[u64], strides: &[u64]) -> TensorView {
-        TensorView::with_strides(
+    fn view(dtype: DType, shape: &[u64], strides: &[u64]) -> Operand {
+        Operand::with_strides(
             DevicePtr::new(0x1000),
             dtype,
             Shape::new(shape),

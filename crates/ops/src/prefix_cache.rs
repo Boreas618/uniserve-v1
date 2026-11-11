@@ -60,7 +60,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -132,7 +132,7 @@ impl fmt::Display for ConversionDescriptor {
 #[derive(Clone, Copy)]
 pub struct ConversionArgs {
     /// `[scratch_bytes]` u8, contiguous: the workspace's scratch, holding the staged page.
-    pub scratch: TensorView,
+    pub scratch: Operand,
     /// `E`: elements of one field of the page, `layers · block_size · heads · head_dim`.
     pub elements: u64,
     /// `S`: scale entries of the page, `2 · layers · groups`; 0 for a dense page.
@@ -327,17 +327,17 @@ impl fmt::Display for CopyRegionDescriptor {
 #[derive(Clone, Copy)]
 pub struct CopyRegionArgs {
     /// `[columns, units, plane_bytes]` u8, contiguous: the field's stored values.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[columns, units]` f32: the field's per-unit scales, present exactly when the destination
     /// stores FP8.
-    pub scale: Option<TensorView>,
+    pub scale: Option<Operand>,
     /// `[columns, units]` u8: whether each column's rows of that unit were written.
-    pub initialized: TensorView,
+    pub initialized: Operand,
     /// `[units_per_page · columns, count, heads, head_dim]` f32, contiguous: the block
     /// `page_conversion` decoded, layer-major like the host page encoding.
-    pub source: TensorView,
+    pub source: Operand,
     /// `[units_per_page]` i32: the destination page's units, non-negative.
-    pub units: TensorView,
+    pub units: Operand,
     /// First destination token within the page.
     pub offset: u64,
     /// Tokens of the span.
@@ -532,8 +532,8 @@ mod tests {
     use super::*;
     use crate::DevicePtr;
 
-    fn view(dtype: DType, dims: &[u64]) -> TensorView {
-        TensorView::new(DevicePtr::new(0x1000), dtype, Shape::new(dims))
+    fn view(dtype: DType, dims: &[u64]) -> Operand {
+        Operand::new(DevicePtr::new(0x1000), dtype, Shape::new(dims))
     }
 
     /// Two layers of a 16-token page of four 64-wide heads, FP8 with one scale per field and layer.

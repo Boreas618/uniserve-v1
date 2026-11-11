@@ -31,7 +31,7 @@ use ops::frame::{self, FrameMoments, FrameNormPad};
 use ops::modulation::{self, ModulatedRmsNorm};
 use ops::norm::{self, AddRmsNorm, LayerNorm as LayerNormOp, RmsNorm as RmsNormOp};
 use ops::residual::{self, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -47,21 +47,21 @@ use crate::weights::{Scope, Weight};
 #[derive(Clone, Copy, Debug)]
 pub struct ResidualStream {
     /// The stream before the add.
-    pub input: TensorView,
+    pub input: Operand,
     /// The stream after the add.
-    pub output: TensorView,
+    pub output: Operand,
 }
 
 impl ResidualStream {
     /// A stream updated in place.
-    pub fn in_place(inout: TensorView) -> Self {
+    pub fn in_place(inout: Operand) -> Self {
         Self {
             input: inout,
             output: inout,
         }
     }
 
-    fn in_place_only(&self, owner: &'static str) -> Result<TensorView> {
+    fn in_place_only(&self, owner: &'static str) -> Result<Operand> {
         if !same(&self.input, &self.output) {
             return Err(Error::shape(
                 owner,
@@ -87,10 +87,10 @@ pub struct Modulation {
     /// [`ResidualStream`].
     pub gate: Option<Weight>,
     /// `[rows]`: the parameter row of each activation row.
-    pub rows: TensorView,
+    pub rows: Operand,
     /// `[rows, width]` in the output type: receives the stream's sum as well, for a block that
     /// reads it again after `x` has been overwritten.
-    pub retained: Option<TensorView>,
+    pub retained: Option<Operand>,
 }
 
 /// The stages a normalization fuses around its statistics; see the module table.
@@ -114,7 +114,7 @@ pub enum Epilogue {
 }
 
 /// Whether two views name the same elements.
-fn same(a: &TensorView, b: &TensorView) -> bool {
+fn same(a: &Operand, b: &Operand) -> bool {
     a.ptr == b.ptr && a.dtype == b.dtype && a.shape == b.shape && a.strides == b.strides
 }
 
@@ -180,8 +180,8 @@ fn check_epilogue(owner: &'static str, epilogue: &Epilogue, width: u32) -> Resul
 fn require_rows(
     owner: &'static str,
     name: &str,
-    view: &TensorView,
-    x: &TensorView,
+    view: &Operand,
+    x: &Operand,
     width: u32,
 ) -> Result<()> {
     view.require_row(owner, view.dtype, u64::from(width))
@@ -275,7 +275,7 @@ impl RmsNorm {
     }
 
     /// The per-channel scale.
-    pub fn weight(&self) -> TensorView {
+    pub fn weight(&self) -> Operand {
         self.weight.view()
     }
 
@@ -296,9 +296,9 @@ impl RmsNorm {
     pub fn forward(
         &self,
         f: &Forward,
-        x: TensorView,
+        x: Operand,
         residual: Option<ResidualStream>,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         let out = f.empty(self.output, x.shape)?;
         self.forward_into(f, x, residual, out)?;
         Ok(out)
@@ -314,9 +314,9 @@ impl RmsNorm {
     pub fn forward_into(
         &self,
         f: &Forward,
-        x: TensorView,
+        x: Operand,
         residual: Option<ResidualStream>,
-        out: TensorView,
+        out: Operand,
     ) -> Result<()> {
         const OWNER: &str = "RmsNorm";
         let width = self.columns;
@@ -446,9 +446,9 @@ impl RmsNorm {
         &self,
         f: &Forward,
         modulation: &Modulation,
-        x: TensorView,
+        x: Operand,
         stream: Option<ResidualStream>,
-        out: TensorView,
+        out: Operand,
     ) -> Result<()> {
         const OWNER: &str = "RmsNorm";
         // The operator reads the stream from `value` and writes the gated sum over its update
@@ -539,7 +539,7 @@ impl GatedRmsNorm {
     /// # Errors
     ///
     /// What the operator refuses, or an arena that cannot hold the output.
-    pub fn forward(&self, f: &Forward, x: TensorView, gate: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, x: Operand, gate: Operand) -> Result<Operand> {
         let out = f.empty(x.dtype, x.shape)?;
         f.operate::<norm::GatedRmsNorm>(
             &norm::GatedRmsNormDescriptor {
@@ -638,9 +638,9 @@ impl LayerNorm {
     pub fn forward(
         &self,
         f: &Forward,
-        x: TensorView,
+        x: Operand,
         residual: Option<ResidualStream>,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         const OWNER: &str = "LayerNorm";
         let width = self.columns;
         require_rows(OWNER, "x", &x, &x, width)?;
@@ -770,7 +770,7 @@ impl GroupNorm {
     /// # Errors
     ///
     /// Values of another rank, an arena that cannot hold the output, or the operators' refusals.
-    pub fn forward(&self, f: &Forward, values: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, values: Operand) -> Result<Operand> {
         if values.shape.rank() != 5 {
             return Err(Error::shape(
                 "GroupNorm",

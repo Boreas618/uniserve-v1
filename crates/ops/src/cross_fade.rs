@@ -32,7 +32,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, TensorView};
+use crate::tensor::{DType, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -73,12 +73,12 @@ impl fmt::Display for Descriptor {
 pub struct Args {
     /// `[channels, frames, height, width]` the tile already written, or the seam band of it: a view
     /// inside the raster, read through its own strides.
-    pub previous: TensorView,
+    pub previous: Operand,
     /// `[channels, frames, height, width]` the tile just decoded, or the seam band of it; may be the
     /// same buffer as `out`.
-    pub current: TensorView,
+    pub current: Operand,
     /// The blended tile, or the seam band written in place.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The seam between two decoded tiles.

@@ -30,7 +30,7 @@ use ops::fp4::{
 };
 use ops::fp8::{Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor};
 use ops::gemm::{self, Descriptor, Epilogue, Gemm, WeightOrder};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::family::Split;
@@ -459,7 +459,7 @@ impl Linear {
     }
 
     /// The weight view: the dense matrix, or the packed values of a packed projection.
-    pub fn weight(&self) -> TensorView {
+    pub fn weight(&self) -> Operand {
         match &self.form {
             Form::Dense { weight, .. } | Form::Fp8 { weight, .. } => weight.view(),
             Form::Packed(packed) => packed.values.view(),
@@ -481,7 +481,7 @@ impl Linear {
     ///
     /// When `input` does not fit the projection, an operator refuses, the arena cannot hold the
     /// output, or a row-parallel projection runs on a forward that carries no group.
-    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<Operand> {
         let out = self.reserve(f, input)?;
         self.launch(f, input, out)?;
         Ok(out)
@@ -490,7 +490,7 @@ impl Linear {
     /// The output [`Self::forward`] writes for `input`'s rows, in `input`'s element type, reserved
     /// without launching: a block that keeps the projection's output across a scope reserves it
     /// first and launches inside. Only `input`'s row count and element type are read.
-    pub(crate) fn reserve(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub(crate) fn reserve(&self, f: &Forward, input: Operand) -> Result<Operand> {
         let rows = input.rows();
         let held = if self.is_packed() {
             let counted = u32::try_from(rows)
@@ -506,7 +506,7 @@ impl Linear {
 
     /// Launch the product of `input` into `out`, `[m, n]`, whose region holds the packed row
     /// class when the weight is packed.
-    pub(crate) fn launch(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+    pub(crate) fn launch(&self, f: &Forward, input: Operand, out: Operand) -> Result<()> {
         let k = u64::from(self.k);
         let n = u64::from(self.n);
         input
@@ -601,8 +601,8 @@ impl Linear {
         &self,
         f: &Forward,
         packed: &Packed,
-        input: TensorView,
-        out: TensorView,
+        input: Operand,
+        out: Operand,
     ) -> Result<()> {
         let k = u64::from(self.k);
         let rows = input.rows();
@@ -735,9 +735,9 @@ fn weight_request(
 }
 
 /// The first rows of `buffer` as a row-major view of `dims`, at the buffer's address.
-fn prefix(buffer: TensorView, dims: &[u64]) -> TensorView {
+fn prefix(buffer: Operand, dims: &[u64]) -> Operand {
     let shape = Shape::new(dims);
-    TensorView::with_strides(
+    Operand::with_strides(
         buffer.ptr,
         buffer.dtype,
         shape,
@@ -935,8 +935,8 @@ impl QkvLinear {
     pub fn forward(
         &self,
         f: &Forward,
-        input: TensorView,
-    ) -> Result<(TensorView, TensorView, TensorView)> {
+        input: Operand,
+    ) -> Result<(Operand, Operand, Operand)> {
         Ok((
             self.query.forward(f, input)?,
             self.key.forward(f, input)?,
@@ -1016,7 +1016,7 @@ impl MergedColumnLinear {
     /// # Errors
     ///
     /// As [`Linear::forward`].
-    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<Operand> {
         self.linear.forward(f, input)
     }
 }
@@ -1031,7 +1031,7 @@ mod tests {
     fn weight(dtype: DType, shape: &[u64]) -> Weight {
         Weight {
             backing: Backing::new(DevicePtr::new(0x1_0000), 1 << 20),
-            view: TensorView::new(DevicePtr::new(0x1_0000), dtype, Shape::new(shape)),
+            view: Operand::new(DevicePtr::new(0x1_0000), dtype, Shape::new(shape)),
         }
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
         projection: &Linear,
         rows: u64,
         input: DType,
-    ) -> (Result<TensorView>, Vec<(String, String)>, u64) {
+    ) -> (Result<Operand>, Vec<(String, String)>, u64) {
         let arena = crate::Arena::counting();
         let f = Forward::recording(&arena);
         let activations = arena

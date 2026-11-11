@@ -35,7 +35,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -74,17 +74,17 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[in_side · in_side, channels]` the learned table.
-    pub table: TensorView,
+    pub table: Operand,
     /// `[points, 4]` i32 tap indices into the table's points.
     ///
     /// Every index must be below `in_side²`: the program does not range-check a table it cannot read
     /// on the host, so building taps inside the table is the caller's obligation and a table that
     /// violates it reads a neighbouring point rather than failing.
-    pub indices: TensorView,
+    pub indices: Operand,
     /// `[points, 4]` FP32 tap weights, normalized by the caller.
-    pub weights: TensorView,
+    pub weights: Operand,
     /// `[points, channels]` the resampled table.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// Bilinear resample of a learned position table.

@@ -13,7 +13,7 @@
 
 use nn::capability::{PixelNorm, Placed};
 use nn::tiling::{Axis, Blend, TemporalClips};
-use nn::{DType, Forward, TensorView};
+use nn::{DType, Forward, Operand};
 
 use crate::{Error, Result};
 
@@ -61,8 +61,8 @@ impl VideoPostprocessor {
     pub fn forward(
         &self,
         f: &Forward,
-        previous: Option<TensorView>,
-        clip: TensorView,
+        previous: Option<Operand>,
+        clip: Operand,
         last: bool,
     ) -> Result<Vec<Placed>> {
         check_clip(clip, &self.clips)?;
@@ -113,8 +113,8 @@ impl nn::capability::Splicer for VideoPostprocessor {
     fn splice(
         &self,
         f: &Forward,
-        previous: Option<TensorView>,
-        clip: TensorView,
+        previous: Option<Operand>,
+        clip: Operand,
         splice: nn::capability::Splice,
     ) -> nn::Result<Vec<Placed>> {
         if splice.overlap > self.clips.overlap {
@@ -147,7 +147,7 @@ impl nn::capability::Splicer for VideoPostprocessor {
 /// The decoder emits whole latent frames, so its raster runs past a clip's native frames, and the
 /// surplus leads: the reference left-pads a clip to the temporal compression and crops those
 /// frames from the decoded timeline (`decoded[:, :, padding:]`).
-fn cropped(clip: TensorView, clips: &TemporalClips) -> Result<TensorView> {
+fn cropped(clip: Operand, clips: &TemporalClips) -> Result<Operand> {
     let native = u64::from(clips.native());
     if clip.shape.rank() != 4 || clip.shape.dim(1) < native {
         return Err(Error::config(format!(
@@ -160,7 +160,7 @@ fn cropped(clip: TensorView, clips: &TemporalClips) -> Result<TensorView> {
 }
 
 /// Refuses a `clip` view that is not one clip's cropped decode, `[3, native, rows, columns]`.
-fn check_clip(clip: TensorView, clips: &TemporalClips) -> Result<()> {
+fn check_clip(clip: Operand, clips: &TemporalClips) -> Result<()> {
     if clip.shape.rank() != 4 || clip.shape.dim(0) != u64::from(RGB_CHANNELS) {
         return Err(Error::config(format!(
             "a decoded clip is [{RGB_CHANNELS}, frames, rows, columns], not {:?}",
@@ -179,7 +179,7 @@ fn check_clip(clip: TensorView, clips: &TemporalClips) -> Result<()> {
 
 /// The view of frames `start..stop` of `clip`, `[channels, frames, rows, columns]` at the clip's
 /// own strides: only the frames extent narrows.
-fn frames(clip: TensorView, (start, stop): (u32, u32)) -> Result<TensorView> {
+fn frames(clip: Operand, (start, stop): (u32, u32)) -> Result<Operand> {
     let held = clip.shape.dim(1);
     if start >= stop || u64::from(stop) > held {
         return Err(Error::config(format!(
@@ -191,8 +191,8 @@ fn frames(clip: TensorView, (start, stop): (u32, u32)) -> Result<TensorView> {
 
 /// Refuses a predecessor's tail that is not one contiguous block of `clip`'s raster and `dtype`.
 fn check_previous(
-    clip: TensorView,
-    previous: TensorView,
+    clip: Operand,
+    previous: Operand,
     dtype: DType,
     overlap: u32,
 ) -> Result<()> {
@@ -311,14 +311,14 @@ mod tests {
     }
 
     /// The clip raster test views are built on: one contiguous `[3, 25, rows, columns]` F16 block.
-    fn raster_view(height: u32, width: u32) -> TensorView {
+    fn raster_view(height: u32, width: u32) -> Operand {
         let shape = Shape::new(&[
             u64::from(RGB_CHANNELS),
             u64::from(clips().native()),
             u64::from(height),
             u64::from(width),
         ]);
-        TensorView::new(nn::DevicePtr::new(0), nn::DType::F16, shape)
+        Operand::new(nn::DevicePtr::new(0), nn::DType::F16, shape)
     }
 
     #[test]
@@ -355,13 +355,13 @@ mod tests {
     #[test]
     fn a_clip_view_refuses_a_raster_that_is_not_one_clip() {
         let clips = clips();
-        let short = TensorView::new(
+        let short = Operand::new(
             nn::DevicePtr::new(0),
             nn::DType::F16,
             Shape::new(&[3, 24, 4, 6]),
         );
         assert!(check_clip(short, &clips).is_err());
-        let grey = TensorView::new(
+        let grey = Operand::new(
             nn::DevicePtr::new(0),
             nn::DType::F16,
             Shape::new(&[1, u64::from(clips.native()), 4, 6]),

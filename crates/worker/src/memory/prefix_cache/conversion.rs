@@ -29,7 +29,7 @@ use ops::prefix_cache::{
     CacheCopyRegion, ConversionArgs, ConversionDescriptor, CopyRegionArgs, CopyRegionDescriptor,
     Field, PageConversion, scratch_bytes,
 };
-use ops::{DType, DevicePtr, Shape, TensorView};
+use ops::{DType, DevicePtr, Shape, Operand};
 use platform::{CopyBatch, DeviceId, SourceOrder};
 
 use super::host;
@@ -125,16 +125,16 @@ impl Programs {
 /// The device views one page's conversion launches over.
 struct PageViews {
     /// `[scratch_bytes]` u8.
-    scratch: TensorView,
+    scratch: Operand,
     /// The FP32 block of the scratch, `[layers, block_size, heads, head_dim]`.
-    block: TensorView,
+    block: Operand,
     /// Per field: the stored values `[columns, units, plane_bytes]` u8, the scales
     /// `[columns, units]` f32 of a quantized pool and the initialized flags `[columns, units]` u8.
-    values: [TensorView; 2],
-    scales: [Option<TensorView>; 2],
-    initialized: [TensorView; 2],
+    values: [Operand; 2],
+    scales: [Option<Operand>; 2],
+    initialized: [Operand; 2],
     /// The page's units, `[units_per_page]` i32.
-    units: TensorView,
+    units: Operand,
 }
 
 /// Launch the conversion of one staged page, already copied into the scratch, on `f`.
@@ -187,7 +187,7 @@ pub(crate) fn record(
     plan: &CachePlan,
     num_units: u32,
     f: &nn::Forward<'_>,
-    placeholder: &dyn Fn(DType, Shape) -> Result<TensorView>,
+    placeholder: &dyn Fn(DType, Shape) -> Result<Operand>,
 ) -> Result<()> {
     let Some(source) = plan.source_plan() else {
         return Ok(());
@@ -200,7 +200,7 @@ pub(crate) fn record(
     let cells = Shape::new(&[u64::from(plan.columns), u64::from(num_units)]);
     for group in &plan.groups {
         let programs = Programs::of(plan, source, group)?;
-        let field = |_: Field| -> Result<(TensorView, Option<TensorView>, TensorView)> {
+        let field = |_: Field| -> Result<(Operand, Option<Operand>, Operand)> {
             Ok((
                 placeholder(
                     DType::U8,
@@ -414,13 +414,13 @@ impl Conversion {
         let mut scales = Vec::with_capacity(2);
         let mut initialized = Vec::with_capacity(2);
         for name in super::planes::FIELDS {
-            values.push(TensorView::new(
+            values.push(Operand::new(
                 DevicePtr::new(field(&format!("{name}.values"))?),
                 DType::U8,
                 plane,
             ));
             scales.push(if self.plan.quantized {
-                Some(TensorView::new(
+                Some(Operand::new(
                     DevicePtr::new(field(&format!("{name}.scale"))?),
                     DType::F32,
                     cells,
@@ -429,7 +429,7 @@ impl Conversion {
                 None
             });
             // The flags are one byte per cell, which the kernel reads and raises as bytes.
-            initialized.push(TensorView::new(
+            initialized.push(Operand::new(
                 DevicePtr::new(field(&format!("{name}.initialized"))?),
                 DType::U8,
                 cells,
@@ -477,12 +477,12 @@ impl Conversion {
             // output is accepted.
             unsafe { issue.copy(&stage) }?;
             let page = PageViews {
-                scratch: TensorView::new(
+                scratch: Operand::new(
                     DevicePtr::new(scratch),
                     DType::U8,
                     Shape::new(&[self.scratch_bytes]),
                 ),
-                block: TensorView::new(
+                block: Operand::new(
                     DevicePtr::new(scratch + 16 * programs.elements),
                     DType::F32,
                     block_shape(plan),
@@ -490,7 +490,7 @@ impl Conversion {
                 values: [values[0], values[1]],
                 scales: [scales[0], scales[1]],
                 initialized: [initialized[0], initialized[1]],
-                units: TensorView::new(
+                units: Operand::new(
                     DevicePtr::new(self.units.address() + (row * stride * 4) as u64),
                     DType::I32,
                     Shape::new(&[u64::from(plan.units_per_page)]),

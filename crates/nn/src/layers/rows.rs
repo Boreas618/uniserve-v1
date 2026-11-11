@@ -23,7 +23,7 @@
 
 use ops::logits::{self, LogitsGather};
 use ops::rows::{self, Mode, Rows};
-use ops::{Shape, TensorView};
+use ops::{Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -33,7 +33,7 @@ use crate::layers::launch::PDL;
 const BLOCK: u32 = 1024;
 
 /// The width of `view`'s rows as a descriptor field.
-fn columns(owner: &'static str, view: &TensorView) -> Result<u32> {
+fn columns(owner: &'static str, view: &Operand) -> Result<u32> {
     u32::try_from(view.last()).map_err(|_| {
         Error::shape(
             owner,
@@ -46,7 +46,7 @@ fn columns(owner: &'static str, view: &TensorView) -> Result<u32> {
 }
 
 /// A flat `[count]` index view: the operators derive the row count from it and refuse more axes.
-fn flat(owner: &'static str, indices: &TensorView) -> Result<u64> {
+fn flat(owner: &'static str, indices: &Operand) -> Result<u64> {
     if indices.shape.rank() != 1 {
         return Err(Error::shape(
             owner,
@@ -73,9 +73,9 @@ impl IndexRows {
     pub fn gather(
         &self,
         f: &Forward,
-        source: TensorView,
-        indices: TensorView,
-    ) -> Result<TensorView> {
+        source: Operand,
+        indices: Operand,
+    ) -> Result<Operand> {
         const OWNER: &str = "IndexRows::gather";
         let count = flat(OWNER, &indices)?;
         let out = f.empty(source.dtype, Shape::new(&[count, source.last()]))?;
@@ -102,9 +102,9 @@ impl IndexRows {
     pub fn scatter(
         &self,
         f: &Forward,
-        source: TensorView,
-        indices: TensorView,
-        destination: TensorView,
+        source: Operand,
+        indices: Operand,
+        destination: Operand,
     ) -> Result<()> {
         Self::rows(f, Mode::Replace, source, indices, destination)
     }
@@ -117,9 +117,9 @@ impl IndexRows {
     pub fn scatter_add(
         &self,
         f: &Forward,
-        source: TensorView,
-        indices: TensorView,
-        destination: TensorView,
+        source: Operand,
+        indices: Operand,
+        destination: Operand,
     ) -> Result<()> {
         Self::rows(f, Mode::Add, source, indices, destination)
     }
@@ -128,9 +128,9 @@ impl IndexRows {
     fn rows(
         f: &Forward,
         mode: Mode,
-        source: TensorView,
-        indices: TensorView,
-        destination: TensorView,
+        source: Operand,
+        indices: Operand,
+        destination: Operand,
     ) -> Result<()> {
         let descriptor = rows::Descriptor {
             dtype: destination.dtype,

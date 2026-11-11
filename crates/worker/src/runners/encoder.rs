@@ -35,7 +35,7 @@ use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput, ImageShape,
     PatchFormat, TokenBatch, WarmPrompt,
 };
-use ops::{DType, TensorView};
+use ops::{DType, Operand};
 use platform::DeviceId;
 use proto::program::PhaseKind;
 
@@ -617,7 +617,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         bucket: Bucket,
         tokens: u32,
         images: &[ImageShape],
-        patches: TensorView,
+        patches: Operand,
     ) -> Result<()> {
         let layout = EncoderLayout {
             rows: tokens,

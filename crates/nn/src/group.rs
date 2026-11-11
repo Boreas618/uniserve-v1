@@ -25,10 +25,10 @@ use ops::platform::{CaptureStatus, DeviceRange, Event, EventFlags, PlatformDevic
 use ops::{CollectiveType, Communicator, ReduceOp, Stream};
 
 use crate::error::{Error, Result};
-use crate::tensor::TensorView;
+use crate::tensor::Operand;
 
 /// The bytes `view` addresses, as the collective's range type wants them.
-fn range(view: TensorView, bytes: usize) -> DeviceRange {
+fn range(view: Operand, bytes: usize) -> DeviceRange {
     DeviceRange::new(PlatformDevicePtr::from_address(view.ptr.address()), bytes)
 }
 
@@ -58,8 +58,8 @@ impl Transfer {
 /// The element count of one rank and the collective's element type, refusing views the
 /// communicator could not move.
 pub(crate) fn collective(
-    send: TensorView,
-    recv: TensorView,
+    send: Operand,
+    recv: Operand,
     collective: &'static str,
 ) -> Result<(usize, CollectiveType)> {
     if send.dtype != recv.dtype {
@@ -82,8 +82,8 @@ pub(crate) fn collective(
 /// The element counts of an all-gather over `ranks` members, `send`'s and the `ranks` times as
 /// many `recv` must hold, and its element type.
 pub(crate) fn gathered(
-    send: TensorView,
-    recv: TensorView,
+    send: Operand,
+    recv: Operand,
     ranks: u64,
 ) -> Result<(usize, usize, CollectiveType)> {
     let (count, dtype) = collective(send, send, "all_gather")?;
@@ -107,8 +107,8 @@ pub(crate) fn gathered(
 /// The element count of an all-to-all over `ranks` members, which both buffers hold as `ranks`
 /// equal blocks, and its element type.
 pub(crate) fn exchanged(
-    send: TensorView,
-    recv: TensorView,
+    send: Operand,
+    recv: Operand,
     ranks: u64,
 ) -> Result<(usize, CollectiveType)> {
     let (elements, dtype) = collective(send, recv, "all_to_all")?;
@@ -211,15 +211,15 @@ impl Group {
     /// Sum every rank's `view` into every rank's `view`, in place.
     ///
     /// `view` is the same shape and dtype on every rank; the collective is issued on `stream`.
-    pub(crate) fn all_reduce_sum(&self, view: TensorView, stream: &Stream) -> Result<()> {
+    pub(crate) fn all_reduce_sum(&self, view: Operand, stream: &Stream) -> Result<()> {
         self.all_reduce(view, view, ReduceOp::Sum, stream)
     }
 
     /// Reduce `send` from every rank into every rank's `recv` with `op`.
     pub(crate) fn all_reduce(
         &self,
-        send: TensorView,
-        recv: TensorView,
+        send: Operand,
+        recv: Operand,
         op: ReduceOp,
         stream: &Stream,
     ) -> Result<()> {
@@ -244,8 +244,8 @@ impl Group {
     /// `recv` holds `ranks` times `send`'s elements, in rank order.
     pub(crate) fn all_gather(
         &self,
-        send: TensorView,
-        recv: TensorView,
+        send: Operand,
+        recv: Operand,
         stream: &Stream,
     ) -> Result<()> {
         let (count, expected, dtype) = gathered(send, recv, self.ranks)?;
@@ -270,8 +270,8 @@ impl Group {
     /// block's elements.
     pub(crate) fn all_to_all(
         &self,
-        send: TensorView,
-        recv: TensorView,
+        send: Operand,
+        recv: Operand,
         stream: &Stream,
     ) -> Result<()> {
         let (elements, dtype) = exchanged(send, recv, self.ranks)?;
@@ -296,8 +296,8 @@ impl Group {
     /// transfer up ([`Self::finish`]). The buffers belong to the transfer until then.
     pub(crate) fn start_all_to_all(
         &self,
-        send: TensorView,
-        recv: TensorView,
+        send: Operand,
+        recv: Operand,
         stream: &Stream,
     ) -> Result<Transfer> {
         let issue = self.issue()?;
@@ -325,7 +325,7 @@ impl Group {
     /// once each interval's transfer is finished.
     pub(crate) fn start_gather_rows(
         &self,
-        gathered: TensorView,
+        gathered: Operand,
         owner_rows: u64,
         first: u64,
         count: u64,

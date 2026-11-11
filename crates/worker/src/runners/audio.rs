@@ -23,7 +23,7 @@
 use std::sync::{Arc, Mutex};
 
 use nn::capability::{DecodedMedia, Decoder};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 use platform::DeviceId;
 use proto::video::{LatentShape, Layout};
 
@@ -218,8 +218,8 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
     }
 
     /// The track's latents, `[frames, channels]`, as the model reads them.
-    fn latents(&self, audio: LatentShape) -> TensorView {
-        TensorView::new(
+    fn latents(&self, audio: LatentShape) -> Operand {
+        Operand::new(
             self.columns.latents.device.ptr,
             self.dtype,
             Shape::new(&[u64::from(audio.frames), u64::from(audio.channels)]),
@@ -227,9 +227,9 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
     }
 
     /// The PCM window the replay writes, `[samples, channels]`.
-    fn pcm(&self, audio: LatentShape) -> Result<TensorView> {
+    fn pcm(&self, audio: LatentShape) -> Result<Operand> {
         let (samples, channels) = self.model.pcm_window(&audio).map_err(Error::from)?;
-        Ok(TensorView::new(
+        Ok(Operand::new(
             self.columns.pcm.device.ptr,
             DType::I16,
             Shape::new(&[samples, u64::from(channels)]),

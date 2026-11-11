@@ -42,7 +42,7 @@ use nn::blocks::{ModulationTable, RowModulation};
 use nn::capability::{ConditionRole, VideoRequest};
 use nn::diffusion::{TimestepTable, TimestepTableSpec};
 use nn::family::{SequenceSplit, Split};
-use nn::{DType, Forward, Shape, TensorView, WeightLoader};
+use nn::{DType, Forward, Shape, Operand, WeightLoader};
 use proto::video::{LatentShape, Layout};
 
 use crate::attention::Visibility;
@@ -1047,7 +1047,7 @@ impl nn::capability::Denoiser for Denoiser {
         f: &Forward,
         seed: nn::capability::Seed,
         piece: &nn::capability::ConditionPiece,
-        out: TensorView,
+        out: Operand,
     ) -> nn::Result<()> {
         nn::Noise::new().draw(
             f,
@@ -1119,7 +1119,7 @@ impl nn::capability::Denoiser for Denoiser {
 
 /// Store the contiguous `source` into the contiguous `destination` of the same shape, rounding
 /// once into the destination's element type (`destination ← 1 · source`).
-fn store(f: &Forward, source: TensorView, destination: TensorView) -> Result<()> {
+fn store(f: &Forward, source: Operand, destination: Operand) -> Result<()> {
     Ok(nn::layers::Axpby.forward(f, destination, source, 1.0, 0.0)?)
 }
 
@@ -1133,7 +1133,7 @@ fn task_of(request: &VideoRequest<'_>) -> crate::VideoTask {
 }
 
 /// A rank-one row table as the rows of width one a row gather moves.
-fn one_column(view: TensorView) -> TensorView {
+fn one_column(view: Operand) -> Operand {
     view.reshape(Shape::new(&[view.numel(), 1]))
 }
 
@@ -1163,7 +1163,7 @@ impl Denoiser {
         &self,
         f: &Forward,
         media: &[nn::capability::MediaInput],
-        text: TensorView,
+        text: Operand,
     ) -> Result<()> {
         let encoders = self.encoders.as_ref().ok_or_else(|| {
             Error::config(
@@ -1243,7 +1243,7 @@ impl Denoiser {
         f: &Forward,
         piece: &nn::capability::MediaInput,
         encoders: &(crate::encoding::VideoEncoder, crate::encoding::AudioEncoder),
-        rows: TensorView,
+        rows: Operand,
     ) -> Result<()> {
         let pixels = piece.pixels.ok_or_else(|| {
             Error::config(format!(
@@ -1571,7 +1571,7 @@ impl Denoiser {
         // This rank owns one contiguous interval of the packed rows; a per-row table is cut to it.
         let local = tokens / shard;
         let first = u64::from(self.sequence.rank) * local;
-        let own = |table: TensorView| table.narrow(0, first, local);
+        let own = |table: Operand| table.narrow(0, first, local);
         let index = i32::try_from(step.index)
             .map_err(|_| Error::config(format!("evaluation {} exceeds i32", step.index)))?;
         let evaluation = f.upload(&[index], Shape::new(&[1]))?;
@@ -1636,7 +1636,7 @@ impl Denoiser {
         // The output: the step's final modulation, then each modality's head over its own rows.
         let output_table = ModulationTable::output(self.cache.output(f, entries)?, hidden_size)?;
         let groups = one_column(own(groups)?);
-        let velocity = |rows: (TensorView, TensorView), modality: Modality, width: u64| {
+        let velocity = |rows: (Operand, Operand), modality: Modality, width: u64| {
             let (indices, slots) = rows;
             let predicted = if slots.numel() > 0 {
                 let selected = nn::layers::IndexRows.gather(f, hidden, slots)?;
@@ -1688,10 +1688,10 @@ impl Denoiser {
     fn collected(
         &self,
         f: &Forward,
-        predicted: Option<TensorView>,
-        (slots, indices): (TensorView, TensorView),
+        predicted: Option<Operand>,
+        (slots, indices): (Operand, Operand),
         (width, local, tokens): (u64, u64, u64),
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         if self.sequence.size <= 1 {
             return predicted.ok_or_else(|| {
                 Error::config("one rank owns every row, and it predicted none".to_owned())

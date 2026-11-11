@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 
 use nn::KvPlanes;
-use ops::{DType, DevicePtr, Shape, Strides, TensorView};
+use ops::{DType, DevicePtr, Shape, Strides, Operand};
 use platform::{Buffer, PoolKind, Stream};
 
 use crate::arena::Pools;
@@ -118,8 +118,8 @@ impl Table {
     /// A bucket narrower than the table addresses its own prefix of it: inside a captured graph
     /// every per-sequence operand has the bucket's row count, and the page table is one of them -
     /// so the table's storage is the generation's widest bucket while the view is the bucket'a own.
-    fn view_rows(&self, rows: u32) -> TensorView {
-        TensorView::new(
+    fn view_rows(&self, rows: u32) -> Operand {
+        Operand::new(
             DevicePtr::new(self.buffer.address()),
             DType::I32,
             Shape::new(&[u64::from(rows), u64::from(self.width)]),
@@ -239,7 +239,7 @@ impl ResidentCache {
         slots: &[i32],
         pages: u32,
         scratch: &Scratch,
-    ) -> (TensorView, Vec<KvPlanes>) {
+    ) -> (Operand, Vec<KvPlanes>) {
         let layers = self
             .cache
             .lock()
@@ -263,7 +263,7 @@ impl ResidentCache {
         let rows = slots.len().max(1) as u32;
         match scratch.tables.get(group) {
             Some(table) => (
-                TensorView::new(
+                Operand::new(
                     DevicePtr::new(table.buffer.address()),
                     DType::I32,
                     Shape::new(&[u64::from(rows), u64::from(pages)]),
@@ -271,7 +271,7 @@ impl ResidentCache {
                 planes,
             ),
             None => (
-                TensorView::new(DevicePtr::new(0), DType::I32, Shape::new(&[0, 0])),
+                Operand::new(DevicePtr::new(0), DType::I32, Shape::new(&[0, 0])),
                 planes,
             ),
         }
@@ -282,7 +282,7 @@ impl ResidentCache {
     /// A row whose slot is negative serves no request and its row of the view is `-1`-filled; the
     /// attention kernel never reads past a row's `seq_lens`, so such a row is never dereferenced
     /// (the pool's tables reserve slot 0, which is why `-1` and not `0` is the absent row).
-    fn gather(&self, group: usize, slots: &[i32], stream: &Stream) -> Result<TensorView> {
+    fn gather(&self, group: usize, slots: &[i32], stream: &Stream) -> Result<Operand> {
         if self.tables.is_empty() {
             return Err(Error::State(
                 "the cache provider has no gather columns: the worker attaches the device's \
@@ -389,7 +389,7 @@ fn planes_of(layer: &LayerPlanes) -> Result<KvPlanes> {
 ///
 /// A plane is strided on purpose (a page's layers are columns of one storage), so the strides are
 /// carried over rather than recomputed row-major.
-fn view_of(view: &crate::memory::allocation::StorageView) -> Result<TensorView> {
+fn view_of(view: &crate::memory::allocation::StorageView) -> Result<Operand> {
     let dtype = view.dtype().to_ops().ok_or_else(|| {
         Error::Invalid(format!(
             "a cache plane of {:?} has no kernel operand type",
@@ -406,7 +406,7 @@ fn view_of(view: &crate::memory::allocation::StorageView) -> Result<TensorView> 
         .iter()
         .map(|stride| u64::try_from(*stride).unwrap_or(0))
         .collect();
-    Ok(TensorView::with_strides(
+    Ok(Operand::with_strides(
         DevicePtr::new(view.address()),
         dtype,
         Shape::new(&shape),
@@ -613,11 +613,11 @@ impl KvProvider for ResidentCache {
         self.dtype
     }
 
-    fn block_table(&self, group: usize, slots: &[i32], stream: &Stream) -> Result<TensorView> {
+    fn block_table(&self, group: usize, slots: &[i32], stream: &Stream) -> Result<Operand> {
         self.gather(group, slots, stream)
     }
 
-    fn table_source(&self, group: usize, rows: u32) -> Result<Option<(TensorView, TensorView)>> {
+    fn table_source(&self, group: usize, rows: u32) -> Result<Option<(Operand, Operand)>> {
         let table = self
             .tables
             .get(group)
@@ -631,7 +631,7 @@ impl KvProvider for ResidentCache {
         };
         let base = pooled.address() + group as u64 * u64::from(pool_rows) * u64::from(width) * 4;
         Ok(Some((
-            TensorView::new(
+            Operand::new(
                 DevicePtr::new(base),
                 DType::I32,
                 Shape::new(&[u64::from(pool_rows), u64::from(width)]),
@@ -640,7 +640,7 @@ impl KvProvider for ResidentCache {
         )))
     }
 
-    fn block_table_view(&self, group: usize, slots: &[i32]) -> Result<TensorView> {
+    fn block_table_view(&self, group: usize, slots: &[i32]) -> Result<Operand> {
         let table = self
             .tables
             .get(group)
@@ -698,7 +698,7 @@ impl KvProvider for ResidentCache {
         lengths: &[i32],
         pages: u32,
         stream: &Stream,
-    ) -> Result<(TensorView, Vec<KvPlanes>)> {
+    ) -> Result<(Operand, Vec<KvPlanes>)> {
         let rows = slots.len().max(1) as u32;
         let mut guard = self
             .scratch

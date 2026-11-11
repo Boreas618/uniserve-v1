@@ -14,7 +14,7 @@
 //!   must draw from `(seed, index)` whatever the buffer's shape is.
 
 use ops::noise::{self, KeySource, NoiseKind, PhiloxNoise as NoiseOp};
-use ops::{Shape, TensorView};
+use ops::{Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -46,7 +46,7 @@ fn flat_shape(shape: Shape) -> Shape {
 #[derive(Clone, Copy)]
 pub enum Key {
     /// `[rows]` i64 sampling keys, one per row: one independent stream per row of `out`.
-    Rows(TensorView),
+    Rows(Operand),
     /// One seed for the whole draw, over `out`'s flattened elements.
     Scalar(u64),
 }
@@ -106,7 +106,7 @@ impl Noise {
     pub fn draw(
         &self,
         f: &Forward,
-        mut latents: TensorView,
+        mut latents: Operand,
         key: Key,
         stage: u32,
         draw: u32,

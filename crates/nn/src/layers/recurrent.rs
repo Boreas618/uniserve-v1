@@ -13,7 +13,7 @@ use ops::recurrent::{
     GatedDeltaRule as GatedDeltaRuleOp, GatedDeltaRuleArgs, GatedDeltaRuleDescriptor, RowColumns,
     Trail,
 };
-use ops::{Shape, TensorView};
+use ops::{Shape, Operand};
 use proto::program::PhaseKind;
 
 use crate::capability::{StateView, TokenBatch};
@@ -47,11 +47,11 @@ fn rows(state: &StateView<'_>) -> RowColumns {
 #[derive(Clone, Copy)]
 pub struct FieldBanks {
     /// `[slots, …]`: the live state.
-    pub live: TensorView,
+    pub live: Operand,
     /// `[slots, …]`: the checkpoints rows keep.
-    pub checkpoint: TensorView,
+    pub checkpoint: Operand,
     /// `[tokens, …]`: the state after each token, for a batch that keeps a trail.
-    pub trail: Option<TensorView>,
+    pub trail: Option<Operand>,
 }
 
 /// The geometry of a [`CausalConv1d`].
@@ -106,8 +106,8 @@ impl CausalConv1d {
         f: &Forward,
         view: &StateView<'_>,
         banks: FieldBanks,
-        x: TensorView,
-    ) -> Result<TensorView> {
+        x: Operand,
+    ) -> Result<Operand> {
         let channels = u64::from(self.spec.channels);
         let out = f.empty(x.dtype, Shape::new(&[x.shape.dim(0), channels]))?;
         let width = u64::from(self.spec.width);
@@ -204,9 +204,9 @@ impl GatedDeltaRule {
         batch: &TokenBatch,
         view: &StateView<'_>,
         banks: FieldBanks,
-        (query, key, value): (TensorView, TensorView, TensorView),
-        (a, b): (TensorView, TensorView),
-    ) -> Result<TensorView> {
+        (query, key, value): (Operand, Operand, Operand),
+        (a, b): (Operand, Operand),
+    ) -> Result<Operand> {
         let (form, chunk) = match batch.phase {
             PhaseKind::Decode => (Form::Recurrent, 1),
             _ => (Form::Chunked, DELTA_RULE_CHUNK),

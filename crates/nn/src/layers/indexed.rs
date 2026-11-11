@@ -7,7 +7,7 @@
 //! with contents that change per evaluation.
 
 use ops::gemm::WeightOrder;
-use ops::{Shape, TensorView};
+use ops::{Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -76,7 +76,7 @@ impl StepIndexed {
     ///
     /// A step view the gather refuses, views the projection refuses, or an arena that cannot hold
     /// the rows.
-    pub fn forward(&self, f: &Forward, step: TensorView, input: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, step: Operand, input: Operand) -> Result<Operand> {
         let (inputs, outputs) = (u64::from(self.inputs), u64::from(self.outputs));
         let out = f.empty(input.dtype, Shape::new(&[input.rows(), outputs]))?;
         // The gathered rows are dead once the product is enqueued, so they live in a scope after

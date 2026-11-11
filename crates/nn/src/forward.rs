@@ -37,7 +37,7 @@ use ops::{Generation, Op, Route, Stream};
 use crate::error::{Error, Result};
 use crate::group::{self, Group, Transfer};
 use crate::layers::DispatchViews;
-use crate::tensor::{DType, DevicePtr, Shape, TensorView};
+use crate::tensor::{DType, DevicePtr, Shape, Operand};
 
 /// The alignment every arena reservation starts at.
 ///
@@ -172,7 +172,7 @@ impl Arena {
     }
 
     /// Reserve a contiguous row-major tensor of `shape` elements of `dtype`.
-    pub fn tensor(&self, dtype: DType, shape: Shape) -> Result<TensorView> {
+    pub fn tensor(&self, dtype: DType, shape: Shape) -> Result<Operand> {
         let bytes = dtype
             .bytes()
             .ok_or_else(|| {
@@ -187,7 +187,7 @@ impl Arena {
                     format!("{shape:?} elements overflow a byte count"),
                 )
             })?;
-        Ok(TensorView::new(self.reserve(bytes)?, dtype, shape))
+        Ok(Operand::new(self.reserve(bytes)?, dtype, shape))
     }
 }
 
@@ -327,7 +327,7 @@ pub struct Forward<'a> {
     /// token row needs to know which rows are real, and it cannot derive that from any shape: the
     /// arena is the bucket's. The value is device-resident because it changes per replay of one
     /// captured graph, and the buffer must outlive the bucket - a layer reads it on every replay.
-    live_tokens: Option<TensorView>,
+    live_tokens: Option<Operand>,
     /// Times the model's modules on the device, or `None`.
     ///
     /// A forward captured into a graph captures its probes, and every replay then runs them. Nothing
@@ -458,7 +458,7 @@ impl<'a> Forward<'a> {
     /// # Errors
     ///
     /// When the arena cannot hold the tensor, or `dtype` has no whole-byte size.
-    pub fn empty(&self, dtype: DType, shape: Shape) -> Result<TensorView> {
+    pub fn empty(&self, dtype: DType, shape: Shape) -> Result<Operand> {
         self.arena.tensor(dtype, shape)
     }
 
@@ -473,7 +473,7 @@ impl<'a> Forward<'a> {
     ///
     /// When `values` does not hold `shape`'s elements, a launching or staging forward has no
     /// staging region, or a region cannot hold the values.
-    pub fn upload<T: HostValue>(&self, values: &[T], shape: Shape) -> Result<TensorView> {
+    pub fn upload<T: HostValue>(&self, values: &[T], shape: Shape) -> Result<Operand> {
         if values.len() as u64 != shape.numel() {
             return Err(Error::shape(
                 "Forward::upload",
@@ -556,7 +556,7 @@ impl<'a> Forward<'a> {
     /// Fills the first `bytes` of `view` with zero, in stream order with this forward's launches.
     ///
     /// A recording forward has no stream and issues nothing, as it issues no launch.
-    pub fn zero(&self, view: TensorView, bytes: u64) -> Result<()> {
+    pub fn zero(&self, view: Operand, bytes: u64) -> Result<()> {
         let Some(stream) = self.stream else {
             return Ok(());
         };
@@ -623,7 +623,7 @@ impl<'a> Forward<'a> {
     /// # Errors
     ///
     /// When the forward has no split, or the communicator cannot move `view`'s element type.
-    pub fn all_reduce(&self, view: TensorView) -> Result<()> {
+    pub fn all_reduce(&self, view: Operand) -> Result<()> {
         match self.collective("all_reduce")? {
             Collective::Launch(group, stream) => group.all_reduce_sum(view, stream),
             Collective::Record(_) => group::collective(view, view, "all_reduce").map(drop),
@@ -638,7 +638,7 @@ impl<'a> Forward<'a> {
     /// # Errors
     ///
     /// When the forward has no split, or `recv` does not hold every member's `send`.
-    pub fn all_gather(&self, send: TensorView, recv: TensorView) -> Result<()> {
+    pub fn all_gather(&self, send: Operand, recv: Operand) -> Result<()> {
         match self.collective("all_gather")? {
             Collective::Launch(group, stream) => group.all_gather(send, recv, stream),
             Collective::Record(split) => group::gathered(send, recv, split.ranks).map(drop),
@@ -654,7 +654,7 @@ impl<'a> Forward<'a> {
     /// # Errors
     ///
     /// When the forward has no split, or the buffers are not equal blocks of one element type.
-    pub fn all_to_all(&self, send: TensorView, recv: TensorView) -> Result<()> {
+    pub fn all_to_all(&self, send: Operand, recv: Operand) -> Result<()> {
         match self.collective("all_to_all")? {
             Collective::Launch(group, stream) => group.all_to_all(send, recv, stream),
             Collective::Record(split) => group::exchanged(send, recv, split.ranks).map(drop),
@@ -670,7 +670,7 @@ impl<'a> Forward<'a> {
     /// # Errors
     ///
     /// As [`Self::all_to_all`].
-    pub fn start_all_to_all(&self, send: TensorView, recv: TensorView) -> Result<Transfer> {
+    pub fn start_all_to_all(&self, send: Operand, recv: Operand) -> Result<Transfer> {
         match self.collective("all_to_all")? {
             Collective::Launch(group, stream) => group.start_all_to_all(send, recv, stream),
             Collective::Record(split) => {
@@ -693,7 +693,7 @@ impl<'a> Forward<'a> {
     /// When the forward has no split, or the communicator cannot move `gathered`'s element type.
     pub fn start_gather_rows(
         &self,
-        gathered: TensorView,
+        gathered: Operand,
         owner_rows: u64,
         first: u64,
         count: u64,
@@ -769,7 +769,7 @@ impl<'a> Forward<'a> {
     /// The buffer is `[1]` i32 on the device and must outlive the bucket: a captured graph reads it
     /// on every replay, so a buffer reallocated per request is a dangling pointer in a graph that
     /// outlives the request.
-    pub fn with_live_tokens(mut self, tokens: TensorView) -> Self {
+    pub fn with_live_tokens(mut self, tokens: Operand) -> Self {
         self.live_tokens = Some(tokens);
         self
     }
@@ -805,7 +805,7 @@ impl<'a> Forward<'a> {
 
     /// The token rows of this batch that are live, `[1]` i32 on the device, when the caller stated
     /// them ([`Self::with_live_tokens`]).
-    pub fn live_tokens(&self) -> Option<TensorView> {
+    pub fn live_tokens(&self) -> Option<Operand> {
         self.live_tokens
     }
 

@@ -9,7 +9,7 @@
 //! descriptor holds the element type and the tile side, and nothing of the request's geometry.
 
 use ops::transpose::{self, Transpose as TransposeOp};
-use ops::{DType, TensorView};
+use ops::{DType, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -59,7 +59,7 @@ impl Transpose {
     ///
     /// A source of another rank or element type, an arena that cannot hold the output, or the
     /// operator's refusal.
-    pub fn forward(&self, f: &Forward, source: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, source: Operand) -> Result<Operand> {
         if source.shape.rank() != 2 {
             return Err(Error::shape(
                 "Transpose",

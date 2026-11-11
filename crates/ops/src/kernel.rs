@@ -264,7 +264,7 @@ impl Arguments {
     }
 
     /// The address a tensor view starts at.
-    pub fn view(&mut self, view: crate::tensor::TensorView) -> &mut Self {
+    pub fn view(&mut self, view: crate::tensor::Operand) -> &mut Self {
         self.pointer(view.ptr)
     }
 

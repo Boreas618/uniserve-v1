@@ -20,7 +20,7 @@ use nn::capability::{KvView, TokenBatch};
 use nn::family::{CacheShape, Drafter, ExpertOrder, Split};
 use nn::layers::{Bias, Linear, PagedAttention, Parallel, ResidualStream, RmsNorm, Rotary};
 use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Forward, Shape, TensorView};
+use nn::{DType, Forward, Shape, Operand};
 
 use crate::causal_lm::{expert_slots, text_spectrum};
 use crate::config::{Config, Mixer};
@@ -135,7 +135,7 @@ impl Mtp {
 
     /// `fc`'s input: the two normalized inputs side by side, `[tokens, 2·hidden]`, the embedding's
     /// in the first half and the hidden state's in the second.
-    fn join(&self, f: &Forward, embedded: TensorView, hidden: TensorView) -> Result<TensorView> {
+    fn join(&self, f: &Forward, embedded: Operand, hidden: Operand) -> Result<Operand> {
         let tokens = hidden.shape.dim(0);
         let width = u64::from(self.hidden);
         let joined = f.empty(hidden.dtype, Shape::new(&[tokens, 2, 1, width]))?;
@@ -167,9 +167,9 @@ impl Drafter for Mtp {
         f: &Forward,
         batch: &TokenBatch,
         cache: &KvView<'_>,
-        embedded: TensorView,
-        hidden: TensorView,
-    ) -> nn::Result<TensorView> {
+        embedded: Operand,
+        hidden: Operand,
+    ) -> nn::Result<Operand> {
         let tokens = batch.tokens();
         let width = u64::from(self.hidden);
         for (name, view) in [("embedded", embedded), ("hidden", hidden)] {

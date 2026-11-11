@@ -23,7 +23,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -101,17 +101,17 @@ impl fmt::Display for Descriptor {
 pub struct UnpermuteArgs {
     /// `[rows, hidden]` every route's expert product, in the descriptor's [`Layout`]: permuted (one
     /// row per permuted row, found through `expanded_to_permuted`) or expanded (`token · top + route`).
-    pub routes: TensorView,
+    pub routes: Operand,
     /// `[tokens, top]` i32: the permuted row of each `(token, route)` pair, `-1` when absent.
     ///
     /// The module reads `routes` as the **permuted** buffer through this map. The dense `route_gemm`
     /// writes the other convention - one row per expanded route - so a dense deployment's combine
     /// needs a module compiled for expanded input, and the layout is not yet a descriptor field.
-    pub expanded_to_permuted: TensorView,
+    pub expanded_to_permuted: Operand,
     /// `[tokens, top]` route weights, in the descriptor's scale dtype.
-    pub scales: TensorView,
+    pub scales: Operand,
     /// `[tokens, hidden]` combined rows, written.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The call structure the package's entry receives.

@@ -27,7 +27,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -74,19 +74,19 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[tokens, heads, head_dim]` keys.
-    pub key: TensorView,
+    pub key: Operand,
     /// `[tokens, heads, head_dim]` values.
-    pub value: TensorView,
+    pub value: Operand,
     /// `[pages, page, heads, head_dim]`.
-    pub key_cache: TensorView,
+    pub key_cache: Operand,
     /// `[pages, page, heads, head_dim]`.
-    pub value_cache: TensorView,
+    pub value_cache: Operand,
     /// `[tokens]` i32: the flat slot `page · page_size + offset` of each token, or `-1`.
-    pub slots: TensorView,
+    pub slots: Operand,
     /// `[pages, 1, 1, 1]` u8 initialization flags of the key cache.
-    pub key_initialized: TensorView,
+    pub key_initialized: Operand,
     /// `[pages, 1, 1, 1]` u8 initialization flags of the value cache.
-    pub value_initialized: TensorView,
+    pub value_initialized: Operand,
 }
 
 /// Scatter of the current tokens into the paged cache.
@@ -297,16 +297,16 @@ impl fmt::Display for ScaledWriteDescriptor {
 #[derive(Clone, Copy)]
 pub struct ScaledWriteArgs {
     /// `[tokens, heads · head_dim]` the layer's rotated keys or values, in full precision.
-    pub source: TensorView,
+    pub source: Operand,
     /// `[tokens]` i32: the flat slot `page · page_size + offset` of each token, or `-1`.
-    pub slots: TensorView,
+    pub slots: Operand,
     /// `[pages, 1, 1, 1]` f32: each page's scale, read for the growth rule and written back.
-    pub scales: TensorView,
+    pub scales: Operand,
     /// `[pages, page, heads, head_dim]` E4M3: the cache, read and rewritten for a page whose scale
     /// grew and written at the new rows for every other.
-    pub cache: TensorView,
+    pub cache: Operand,
     /// `[pages, 1, 1, 1]` u8 initialization flags, written with the scale in the same launch.
-    pub initialized: TensorView,
+    pub initialized: Operand,
 }
 
 /// The scale-deriving write into an FP8 cache.

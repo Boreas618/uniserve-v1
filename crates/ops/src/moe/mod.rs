@@ -55,7 +55,7 @@ pub fn max_permuted_rows(tokens: u64, top: u64, local_experts: u64, tile: u64) -
 }
 
 /// The elements between consecutive rows of a view.
-pub(crate) fn row_stride(view: &crate::tensor::TensorView) -> u64 {
+pub(crate) fn row_stride(view: &crate::tensor::Operand) -> u64 {
     if view.strides.rank() >= 2 {
         view.strides.get(view.strides.rank() - 2)
     } else {
@@ -71,7 +71,7 @@ pub(crate) fn row_stride(view: &crate::tensor::TensorView) -> u64 {
 /// batch produces.
 pub(crate) fn require_i32_vector(
     operator: &'static str,
-    view: &crate::tensor::TensorView,
+    view: &crate::tensor::Operand,
 ) -> crate::Result<()> {
     if view.dtype != crate::tensor::DType::I32 {
         return Err(crate::Error::argument(
@@ -109,7 +109,7 @@ pub(crate) fn dtype_code(dtype: crate::tensor::DType) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DType, DevicePtr, Shape, TensorView};
+    use crate::tensor::{DType, DevicePtr, Shape, Operand};
 
     /// A C++ entry's dtype numbers are the operator crate's, or the build says so here.
     ///
@@ -177,14 +177,14 @@ mod tests {
     /// by our own check with `expected 1 elements on the last axis, found 120`.
     #[test]
     fn a_metadata_vector_longer_than_one_element_is_accepted() {
-        let list = TensorView::new(DevicePtr::new(0x1000), DType::I32, Shape::new(&[120]));
+        let list = Operand::new(DevicePtr::new(0x1000), DType::I32, Shape::new(&[120]));
         assert!(require_i32_vector("moe_sort", &list).is_ok());
     }
 
     /// The same check still refuses what the entries cannot read.
     #[test]
     fn a_metadata_vector_of_the_wrong_element_type_is_refused() {
-        let list = TensorView::new(DevicePtr::new(0x1000), DType::BF16, Shape::new(&[120]));
+        let list = Operand::new(DevicePtr::new(0x1000), DType::BF16, Shape::new(&[120]));
         let error = require_i32_vector("moe_sort", &list).unwrap_err();
         assert!(
             error.to_string().contains("expected i32 metadata"),

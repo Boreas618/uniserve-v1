@@ -33,7 +33,7 @@ use crate::capability::{
     CausalLm, Decoder, Denoiser, Encoder, KvView, MediaFormat, Splicer, TokenBatch, Vision,
     WarmPrompt, WarmRequest,
 };
-use crate::{Checkpoint, DType, Forward, Result, TensorView, WeightLoader};
+use crate::{Checkpoint, DType, Forward, Result, Operand, WeightLoader};
 
 /// One model family a build serves: what execution loads of its checkpoints, beside how they
 /// declare it and what request processing serves ([`processing::Family`]).
@@ -357,9 +357,9 @@ pub trait Drafter: Send + Sync {
         f: &Forward,
         batch: &TokenBatch,
         cache: &KvView<'_>,
-        embedded: TensorView,
-        hidden: TensorView,
-    ) -> Result<TensorView>;
+        embedded: Operand,
+        hidden: Operand,
+    ) -> Result<Operand>;
 }
 
 /// The recurrent state a causal language model keeps per request slot, as one rank holds it: every

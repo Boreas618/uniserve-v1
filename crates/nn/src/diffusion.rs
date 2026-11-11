@@ -30,7 +30,7 @@
 //! indexed by the caller's step table. Every evaluation then launches against the same buffers, so
 //! one captured graph serves the whole trajectory; only the step table's index changes per replay.
 
-use ops::{DType, Shape, Strides, TensorView};
+use ops::{DType, Shape, Strides, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -207,9 +207,9 @@ impl Euler {
     pub fn forward(
         &self,
         f: &Forward,
-        sample: TensorView,
-        velocity: TensorView,
-        step: TensorView,
+        sample: Operand,
+        velocity: Operand,
+        step: Operand,
     ) -> Result<()> {
         let (sample, velocity) = (elements(sample)?, elements(velocity)?);
         if sample.shape != velocity.shape || sample.dtype != velocity.dtype {
@@ -241,7 +241,7 @@ impl Euler {
     /// # Errors
     ///
     /// A strided view, or the operator's refusal.
-    pub fn prepare_latents(&self, f: &Forward, sample: TensorView) -> Result<()> {
+    pub fn prepare_latents(&self, f: &Forward, sample: Operand) -> Result<()> {
         let Some(start) = self.start.as_ref() else {
             return Ok(());
         };
@@ -262,7 +262,7 @@ impl Euler {
 /// # Errors
 ///
 /// Views of different shapes, or the operator's refusal.
-pub fn add_noise(f: &Forward, sample: TensorView, noise: TensorView, t: f32) -> Result<()> {
+pub fn add_noise(f: &Forward, sample: Operand, noise: Operand, t: f32) -> Result<()> {
     Axpby.forward(f, sample, noise, 1.0 - t, t)
 }
 
@@ -405,7 +405,7 @@ impl TimestepTable {
     }
 
     /// `[entries, frequency_dim]` FP32: the embedding the model's projections read.
-    pub fn frequencies(&self) -> TensorView {
+    pub fn frequencies(&self) -> Operand {
         self.frequencies.view()
     }
 
@@ -415,7 +415,7 @@ impl TimestepTable {
     /// # Errors
     ///
     /// The gather's refusal, or an arena that cannot hold the entries.
-    pub fn entries_of(&self, f: &Forward, step: TensorView) -> Result<TensorView> {
+    pub fn entries_of(&self, f: &Forward, step: Operand) -> Result<Operand> {
         IndexRows.gather(f, self.entries.view(), step)
     }
 }
@@ -427,7 +427,7 @@ impl TimestepTable {
     /// # Errors
     ///
     /// A block the table does not hold.
-    pub fn layer_table(&self, layer: usize) -> Result<TensorView> {
+    pub fn layer_table(&self, layer: usize) -> Result<Operand> {
         let layers = self.layers.view();
         let count = layers.shape.dim(0);
         if layer as u64 >= count {
@@ -441,7 +441,7 @@ impl TimestepTable {
     }
 
     /// The final norm's `[entries, output_columns]` table, written once after the load.
-    pub fn output_table(&self) -> TensorView {
+    pub fn output_table(&self) -> Operand {
         self.output.view()
     }
 
@@ -451,7 +451,7 @@ impl TimestepTable {
     /// # Errors
     ///
     /// A block the table does not hold, the gather's refusal, or an arena that cannot hold the rows.
-    pub fn layer(&self, f: &Forward, layer: usize, entries: TensorView) -> Result<TensorView> {
+    pub fn layer(&self, f: &Forward, layer: usize, entries: Operand) -> Result<Operand> {
         IndexRows.gather(f, self.layer_table(layer)?, flat(entries))
     }
 
@@ -460,7 +460,7 @@ impl TimestepTable {
     /// # Errors
     ///
     /// The gather's refusal, or an arena that cannot hold the rows.
-    pub fn output(&self, f: &Forward, entries: TensorView) -> Result<TensorView> {
+    pub fn output(&self, f: &Forward, entries: Operand) -> Result<Operand> {
         IndexRows.gather(f, self.output.view(), flat(entries))
     }
 }
@@ -469,7 +469,7 @@ impl TimestepTable {
 ///
 /// [`TimestepTable::entries_of`] answers `[1, groups]`, one row of the entry table; the block and
 /// output gathers read the same bytes as `[groups]` indices.
-fn flat(entries: TensorView) -> TensorView {
+fn flat(entries: Operand) -> Operand {
     entries.reshape(Shape::new(&[entries.shape.numel()]))
 }
 
@@ -477,7 +477,7 @@ fn flat(entries: TensorView) -> TensorView {
 ///
 /// The step is elementwise, so the sample keeps its mathematical shape and the operator sees one
 /// element per row, the shape a `[1]` scale broadcasts over.
-fn elements(sample: TensorView) -> Result<TensorView> {
+fn elements(sample: Operand) -> Result<Operand> {
     if sample.strides != Strides::row_major(sample.shape) {
         return Err(Error::shape(
             "Euler",
@@ -488,7 +488,7 @@ fn elements(sample: TensorView) -> Result<TensorView> {
             ),
         ));
     }
-    Ok(TensorView::new(
+    Ok(Operand::new(
         sample.ptr,
         sample.dtype,
         Shape::new(&[sample.shape.numel(), 1]),

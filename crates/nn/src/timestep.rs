@@ -9,7 +9,7 @@
 //! where the references compute in f32. The row is every cosine and then every sine of the same
 //! angles (the GLIDE/DiT order, not an interleaving).
 
-use ops::TensorView;
+use ops::Operand;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -112,7 +112,7 @@ impl TimestepEmbedding {
     /// # Errors
     ///
     /// A view a projection refuses, or an arena that cannot hold the output and intermediates.
-    pub fn forward(&self, f: &Forward, embedding: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, embedding: Operand) -> Result<Operand> {
         // The second projection's rows are the embedding's, which is all its reservation reads.
         let out = self.second.reserve(f, embedding)?;
         f.scoped(|f| {

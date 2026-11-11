@@ -29,7 +29,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -150,18 +150,18 @@ impl fmt::Display for QuantizeDescriptor {
 #[derive(Clone, Copy)]
 pub struct QuantizeArgs {
     /// The activations, `[rows, columns]`, unit stride on the last axis.
-    pub input: TensorView,
+    pub input: Operand,
     /// The packed E2M1 values, `[rows, columns / 2]` bytes.
-    pub values: TensorView,
+    pub values: Operand,
     /// The E4M3 block scales, in the descriptor's layout.
-    pub scales: TensorView,
+    pub scales: Operand,
     /// `[1]` FP32: the encoder's global scale, the reciprocal of the checkpoint's activation tensor
     /// scale.
     ///
     /// A device operand rather than a launch scalar: the encoder is calibrated data of the tensor
     /// it encodes, published beside the weights, and the product that consumes the encoding reads
     /// it as each thread block starts — so a host value here would serialize the pair.
-    pub global_scale: TensorView,
+    pub global_scale: Operand,
     /// `[rows]` FP32: the row's **dequantization factor**, the number the product multiplies a
     /// block's E4M3 scale by.
     ///
@@ -174,7 +174,7 @@ pub struct QuantizeArgs {
     /// `block_amax * global_scale / 6`, so a dequantized element is
     /// `code * block_scale * token_scale`. This is a *data* output and not a descriptor field: the
     /// same module serves every row count, and no compilation depends on how many rows there are.
-    pub token_scale: TensorView,
+    pub token_scale: Operand,
 }
 
 /// Encoding activations into the checkpoint's E2M1 representation.
@@ -345,22 +345,22 @@ impl fmt::Display for GemmDescriptor {
 #[derive(Clone, Copy)]
 pub struct GemmArgs {
     /// The packed activations, `[m, k / 2]` bytes.
-    pub input: TensorView,
+    pub input: Operand,
     /// The packed weight, `[n, k / 2]` bytes, N×K.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// The activation scales, in the descriptor's layout, over `[m, k]`.
-    pub input_scales: TensorView,
+    pub input_scales: Operand,
     /// The weight scales, swizzled, over `[n, k]`.
-    pub weight_scales: TensorView,
+    pub weight_scales: Operand,
     /// `[1]` FP32: the product of the activation's and the weight's tensor scales.
     ///
     /// It is a device operand rather than a host scalar because the epilogue reads it as each
     /// thread block starts, before waiting for the kernel that computed it.
-    pub alpha: TensorView,
+    pub alpha: Operand,
     /// The bias, `[n]`, when the epilogue adds one.
-    pub bias: Option<TensorView>,
+    pub bias: Option<Operand>,
     /// The product, `[m, n]`.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The call structure `nvfp4_gemm/cute_dsl`'s entry takes, as its header declares it.
@@ -407,7 +407,7 @@ const _: () = assert!(
 /// The product reads either bit-for-bit, so the element type is the producer's declaration and not
 /// a property of the product. What a kernel does depend on is one byte per scale, which is what
 /// this states — pinning one declaration instead refused the other producer and cost a run.
-pub fn require_byte_scale(op: &'static str, view: TensorView, columns: u64) -> Result<()> {
+pub fn require_byte_scale(op: &'static str, view: Operand, columns: u64) -> Result<()> {
     if !matches!(view.dtype, DType::U8 | DType::F8E4M3) {
         return Err(Error::argument(
             op,

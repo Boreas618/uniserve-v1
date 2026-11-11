@@ -16,7 +16,7 @@
 
 use ops::modulation::{self, GatedResidual as GatedResidualOp};
 use ops::residual::{self, ScaledAdd, ScaledResidual};
-use ops::{DType, TensorView};
+use ops::{DType, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -130,10 +130,10 @@ impl Residual {
     pub fn forward(
         &self,
         f: &Forward,
-        residual: TensorView,
-        update: TensorView,
-        rows: Option<TensorView>,
-    ) -> Result<TensorView> {
+        residual: Operand,
+        update: Operand,
+        rows: Option<Operand>,
+    ) -> Result<Operand> {
         if rows.is_some() != matches!(self.scale, Scale::Row(_)) {
             return Err(Error::shape(
                 "Residual",
@@ -229,8 +229,8 @@ impl Axpby {
     pub fn forward(
         &self,
         f: &Forward,
-        inout: TensorView,
-        x: TensorView,
+        inout: Operand,
+        x: Operand,
         alpha: f32,
         beta: f32,
     ) -> Result<()> {
@@ -268,7 +268,7 @@ impl Cast {
     /// # Errors
     ///
     /// A view of another rank, an arena that cannot hold the output, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, x: TensorView, dtype: DType) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, x: Operand, dtype: DType) -> Result<Operand> {
         let out = f.empty(dtype, x.shape)?;
         Axpby.forward(f, out, x, 1.0, 0.0)?;
         Ok(out)

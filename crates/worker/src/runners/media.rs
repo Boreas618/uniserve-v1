@@ -968,20 +968,20 @@ impl MediaStage {
                 crate::Error::Invalid("a condition element has no whole-byte size".into())
             })?;
             let float = |buffer: &platform::PinnedBuffer| {
-                ops::TensorView::new(
+                ops::Operand::new(
                     ops::DevicePtr::new(buffer.address()),
                     CONDITION_MEDIA,
                     ops::Shape::new(&[buffer.len() as u64 / element]),
                 )
             };
-            let patch = |buffer: &platform::PinnedBuffer| -> Result<ops::TensorView> {
+            let patch = |buffer: &platform::PinnedBuffer| -> Result<ops::Operand> {
                 let dtype = format.patches.dtype;
                 let width = u64::from(format.patches.width());
                 let row = width
                     * dtype.bytes().ok_or_else(|| {
                         crate::Error::Invalid("a patch row has no whole-byte size".into())
                     })?;
-                Ok(ops::TensorView::new(
+                Ok(ops::Operand::new(
                     ops::DevicePtr::new(buffer.address()),
                     dtype,
                     ops::Shape::new(&[buffer.len() as u64 / row, width]),

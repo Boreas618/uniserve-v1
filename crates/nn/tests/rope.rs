@@ -8,7 +8,7 @@
 #![cfg(test)]
 
 use nn::layers::{Factors, Gains, Precision, QkNorm, Rotary, RotarySpec, Spectrum};
-use nn::{Arena, Checkpoint, DType, Forward, Shape, TensorView, WeightLoader};
+use nn::{Arena, Checkpoint, DType, Forward, Shape, Operand, WeightLoader};
 
 /// Runs `walk` with a capture sink installed and answers the operators it reported.
 fn launched<T>(walk: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
@@ -224,7 +224,7 @@ fn a_projection_of_another_head_count_is_refused() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let view =
-        |dims: &[u64]| -> TensorView { arena.tensor(DType::BF16, Shape::new(dims)).unwrap() };
+        |dims: &[u64]| -> Operand { arena.tensor(DType::BF16, Shape::new(dims)).unwrap() };
     let table = arena.tensor(DType::F32, Shape::new(&[3, 32])).unwrap();
     let factors = Factors {
         cosine: table,

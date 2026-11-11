@@ -258,7 +258,7 @@ use nn::layers::{
     Spectrum, Varlen,
 };
 use nn::weights::{Weight, WeightLoader};
-use nn::{DType, DecodedMedia, Decoder, Shape, TensorView};
+use nn::{DType, DecodedMedia, Decoder, Shape, Operand};
 use ops::gemm::WeightOrder;
 
 /// The element type of the decoder's projections and of the rows they read and write, and the type
@@ -684,7 +684,7 @@ impl VideoDecoder {
     /// order [`Decoder::latent_rows`] states. A tile's rows are its voxels, then the register
     /// rows, then the trailing zero row; every tile shares one tile's rotary positions, which the
     /// decode computes and uploads.
-    pub fn decode(&self, f: &Forward, canvas: &Canvas, latents: TensorView) -> Result<TensorView> {
+    pub fn decode(&self, f: &Forward, canvas: &Canvas, latents: Operand) -> Result<Operand> {
         let tile = tile(&self.config, canvas)?;
         let tiles = grid(&self.config, canvas)?.len() as u64;
         let (tile_rows, tile_voxels) = (tile.rows(), tile.voxels());
@@ -744,12 +744,12 @@ impl VideoDecoder {
         let carried = f.empty(ACTIVATION, Shape::new(&[rows, width]))?;
         let mut pending = None;
         for layer in &self.layers {
-            let attend = |normalized: TensorView| -> nn::Result<TensorView> {
+            let attend = |normalized: Operand| -> nn::Result<Operand> {
                 // The three column ranges of the merged projection, turned in place through its
                 // row stride: the keys and the values share one stride, as the reference has them.
                 let merged = layer.query_key_value.forward(f, normalized)?;
                 let projection = |index: u64| {
-                    TensorView::with_strides(
+                    Operand::with_strides(
                         merged.offset_elements(index * width),
                         merged.dtype,
                         Shape::new(&[rows, heads, head]),
@@ -826,9 +826,9 @@ impl Decoder for VideoDecoder {
         &self,
         f: &Forward,
         layout: &proto::video::Layout,
-        trajectory: TensorView,
+        trajectory: Operand,
         first: u32,
-        block: TensorView,
+        block: Operand,
     ) -> nn::Result<()> {
         // The trajectory a denoiser publishes is FP32 and this decoder restores it in FP32.
         if trajectory.dtype != STREAM || block.dtype != STREAM {
@@ -929,7 +929,7 @@ impl Decoder for VideoDecoder {
         &self,
         f: &Forward,
         _layout: &proto::video::Layout,
-        latents: TensorView,
+        latents: Operand,
         out: DecodedMedia,
     ) -> nn::Result<()> {
         let refuse = |problem: String| -> nn::Error { Error::config(problem).into() };
@@ -998,7 +998,7 @@ impl Decoder for VideoDecoder {
             video.shape,
             || Ok(VideoDecoder::decode(self, f, &clip, latents)?),
         )?;
-        let flat = |view: TensorView| {
+        let flat = |view: Operand| {
             view.reshape(Shape::new(&[
                 view.shape.numel() / view.shape.last(),
                 view.shape.last(),

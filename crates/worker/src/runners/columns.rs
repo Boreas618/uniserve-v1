@@ -5,7 +5,7 @@
 //! once on the runner's stream, and read by the captured graph through a view of the device buffer's
 //! address. Nothing here names a token or a cache.
 
-use ops::{DType, TensorView};
+use ops::{DType, Operand};
 use platform::DeviceId;
 
 use crate::{Error, Result};
@@ -17,7 +17,7 @@ use crate::{Error, Result};
 /// allocating: what 4.5 forbids is an allocation inside a step, not a copy into a fixed buffer.
 pub(crate) struct Column {
     /// The device buffer's view: what a captured graph addresses.
-    pub(crate) device: TensorView,
+    pub(crate) device: Operand,
     /// The pinned host side, and the allocation whose address `device` names until the column is
     /// [placed](Column::place).
     pub(crate) host: platform::PinnedBuffer,
@@ -49,7 +49,7 @@ impl Column {
             .checked_mul(numel)
             .ok_or_else(|| Error::Invalid("a batch column's extent overflows".into()))?;
         let host = platform::PinnedBuffer::new(device, bytes as usize)?;
-        let device = TensorView::new(
+        let device = Operand::new(
             ops::DevicePtr::new(host.address()),
             dtype,
             ops::Shape::new(&[numel]),
@@ -80,7 +80,7 @@ impl Column {
         unsafe {
             platform::memcpy_async(storage.address(), self.host.address(), bytes, stream)?;
         }
-        self.device = TensorView::new(
+        self.device = Operand::new(
             ops::DevicePtr::new(storage.address()),
             self.device.dtype,
             self.device.shape,
@@ -161,8 +161,8 @@ impl Column {
     }
 
     /// The first `elements` of the column, as a view the batch reads.
-    pub(crate) fn extent(&self, elements: std::ops::Range<u64>) -> TensorView {
-        TensorView::new(
+    pub(crate) fn extent(&self, elements: std::ops::Range<u64>) -> Operand {
+        Operand::new(
             self.device.ptr,
             self.device.dtype,
             ops::Shape::new(&[elements.end - elements.start]),
@@ -175,14 +175,14 @@ impl Column {
     /// `[rows, PARAMETER_COLUMNS]`, and a bucket narrower than the largest reads its rows from the
     /// column's head. Both views name the same base pointer, which is what a captured graph
     /// addresses, so the two differ in shape alone.
-    pub(crate) fn shaped(&self, shape: &[u64]) -> TensorView {
+    pub(crate) fn shaped(&self, shape: &[u64]) -> Operand {
         debug_assert!(
             shape.iter().product::<u64>() <= self.device.shape.dim(0),
             "a shaped view of {} elements does not fit a column of {}",
             shape.iter().product::<u64>(),
             self.device.shape.dim(0)
         );
-        TensorView::new(self.device.ptr, self.device.dtype, ops::Shape::new(shape))
+        Operand::new(self.device.ptr, self.device.dtype, ops::Shape::new(shape))
     }
 }
 
@@ -194,7 +194,7 @@ impl Column {
 /// there than in device memory.
 pub(crate) struct Region {
     /// What a captured graph addresses.
-    pub(crate) device: TensorView,
+    pub(crate) device: Operand,
     /// The allocation `device` names, held as long as a graph may address it.
     _storage: platform::DeviceAllocation,
 }
@@ -211,7 +211,7 @@ impl Region {
             .map_err(|_| Error::Invalid("a region is larger than memory".into()))?;
         let storage = platform::DeviceAllocation::linear(device, bytes)?;
         Ok(Self {
-            device: TensorView::new(
+            device: Operand::new(
                 ops::DevicePtr::new(storage.address()),
                 dtype,
                 ops::Shape::new(&[numel]),
@@ -221,8 +221,8 @@ impl Region {
     }
 
     /// The first `elements` of the region, as a view the batch reads.
-    pub(crate) fn extent(&self, elements: std::ops::Range<u64>) -> TensorView {
-        TensorView::new(
+    pub(crate) fn extent(&self, elements: std::ops::Range<u64>) -> Operand {
+        Operand::new(
             self.device.ptr,
             self.device.dtype,
             ops::Shape::new(&[elements.end - elements.start]),

@@ -28,7 +28,7 @@ use nn::capability::{
 };
 use nn::{Forward, Result};
 use ops::logits::{GatherArgs, GatherDescriptor, LogitsGather};
-use ops::{DType, Op, Shape, TensorView};
+use ops::{DType, Op, Shape, Operand};
 use platform::{Allocator, Budget, Device, DeviceId, PoolKind, Stream};
 use proto::video::{LatentShape, Layout};
 use worker::arena::Pools;
@@ -92,7 +92,7 @@ fn launch(f: &Forward<'_>, bytes: u64, columns: u32) -> Result<()> {
         GatherArgs {
             hidden: reserved,
             // One row index per gathered row, read from the start of the reserved rows.
-            rows: ops::TensorView::new(reserved.ptr, DType::I32, Shape::new(&[rows])),
+            rows: ops::Operand::new(reserved.ptr, DType::I32, Shape::new(&[rows])),
             out: reserved,
         },
     )
@@ -256,14 +256,14 @@ impl Decoder for Decoding {
         &self,
         f: &Forward,
         _: &Layout,
-        _: TensorView,
+        _: Operand,
         _: u32,
-        _: TensorView,
+        _: Operand,
     ) -> Result<()> {
         launch(f, 1024, 6)
     }
 
-    fn decode(&self, f: &Forward, _: &Layout, _: TensorView, _: DecodedMedia) -> Result<()> {
+    fn decode(&self, f: &Forward, _: &Layout, _: Operand, _: DecodedMedia) -> Result<()> {
         launch(f, 16384, 8)
     }
 }

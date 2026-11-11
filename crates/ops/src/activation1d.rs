@@ -43,7 +43,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -142,18 +142,18 @@ pub fn lowpass_length(width: u64, kernel: u64, ratio: u64) -> Result<u64> {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[channels, length]` the signal entering the block.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[channels]` SnakeBeta's `alpha`, in log space as the checkpoint stores it.
-    pub alpha: TensorView,
+    pub alpha: Operand,
     /// `[channels]` SnakeBeta's `beta`, in log space.
-    pub beta: TensorView,
+    pub beta: Operand,
     /// `[1, 1, kernel]` the transposed convolution's filter, one filter shared by every channel and
     /// expanded over channels by the program.
-    pub filter_up: TensorView,
+    pub filter_up: Operand,
     /// `[1, 1, kernel]` the low-pass's filter.
-    pub filter_down: TensorView,
+    pub filter_down: Operand,
     /// `[channels, length · ratio]` the result; the length is preserved by the chain.
-    pub out: TensorView,
+    pub out: Operand,
     /// Samples per channel entering the block.
     pub length: u32,
 }

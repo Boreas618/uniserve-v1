@@ -26,7 +26,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::{self, DevicePtr, Stream};
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -193,13 +193,13 @@ impl NativeCall for Call {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// Activations, `[m, k]`.
-    pub input: TensorView,
+    pub input: Operand,
     /// The weight, in the descriptor's order.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// The bias, `[n]`, when the epilogue adds one.
-    pub bias: Option<TensorView>,
+    pub bias: Option<Operand>,
     /// The product, `[m, n]`.
-    pub out: TensorView,
+    pub out: Operand,
     /// A scalar applied to the product before the epilogue.
     pub alpha: f32,
 }

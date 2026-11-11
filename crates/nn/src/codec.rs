@@ -17,7 +17,7 @@
 //! samples becomes `L / hop` frames, `hop` the product of the strides: the caller right-pads a
 //! track to a whole number of hops, as the reference does before it convolves.
 
-use ops::{Shape, TensorView};
+use ops::{Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -53,7 +53,7 @@ impl Activation {
         })
     }
 
-    fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
+    fn forward(&self, f: &Forward, x: Operand) -> Result<Operand> {
         self.snake.forward(f, x, self.alpha.view())
     }
 }
@@ -184,7 +184,7 @@ impl DacEncoder {
     ///
     /// A length that is not a whole number of hops, samples of another shape, or an operator's
     /// refusal.
-    pub fn forward(&self, f: &Forward, samples: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, samples: Operand) -> Result<Operand> {
         let length = samples.shape.dim(2);
         let hop = self.hop();
         if samples.shape.rank() != 3 || samples.shape.dim(1) != 1 || !length.is_multiple_of(hop) {
@@ -229,7 +229,7 @@ impl DacEncoder {
 }
 
 /// A contiguous `[batch, rows, columns]` view as `[batch · rows, columns]`.
-fn matrix(view: TensorView) -> TensorView {
+fn matrix(view: Operand) -> Operand {
     view.reshape(Shape::new(&[
         view.shape.dim(0) * view.shape.dim(1),
         view.shape.dim(2),

@@ -41,7 +41,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -94,11 +94,11 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[count, columns]` the rows to place.
-    pub source: TensorView,
+    pub source: Operand,
     /// `[rows, columns]` the sequence the rows land in.
-    pub destination: TensorView,
+    pub destination: Operand,
     /// `[count]` i32: the destination row of each source row.
-    pub indices: TensorView,
+    pub indices: Operand,
 }
 
 /// Row writes and accumulation.

@@ -38,7 +38,7 @@ use nn::layers::{
 };
 use nn::quantization::Declaration;
 use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Forward, TensorView, Weight};
+use nn::{DType, Forward, Operand, Weight};
 
 use crate::config::{Config, Mixer, QWEN3_MOE};
 use crate::decoder::{self, DecoderStack, Mlp};
@@ -382,7 +382,7 @@ pub(crate) fn expert_slots(
 }
 
 impl CausalLm for Qwen3ForCausalLm {
-    fn embed_input_ids(&self, f: &Forward, ids: TensorView) -> nn::Result<TensorView> {
+    fn embed_input_ids(&self, f: &Forward, ids: Operand) -> nn::Result<Operand> {
         self.embedding.forward(f, ids)
     }
 
@@ -393,8 +393,8 @@ impl CausalLm for Qwen3ForCausalLm {
         f: &Forward,
         batch: &TokenBatch,
         cache: &KvView<'_>,
-        hidden: TensorView,
-    ) -> nn::Result<TensorView> {
+        hidden: Operand,
+    ) -> nn::Result<Operand> {
         let tokens = batch.tokens();
         let width = u64::from(self.config.text.hidden_size);
         if hidden.shape.dims() != [tokens, width] || hidden.dtype != self.dtype {
@@ -439,7 +439,7 @@ impl CausalLm for Qwen3ForCausalLm {
         })?)
     }
 
-    fn compute_logits(&self, f: &Forward, hidden: TensorView) -> nn::Result<TensorView> {
+    fn compute_logits(&self, f: &Forward, hidden: Operand) -> nn::Result<Operand> {
         self.head.forward(f, hidden)
     }
 

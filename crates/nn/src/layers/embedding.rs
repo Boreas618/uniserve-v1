@@ -6,7 +6,7 @@
 //! embedding.
 
 use ops::embedding::{self, Descriptor, Embedding as EmbeddingOp};
-use ops::{DType, TensorView};
+use ops::{DType, Operand};
 
 use crate::error::{Error, Result};
 use crate::family::Split;
@@ -107,7 +107,7 @@ impl VocabParallelEmbedding {
     ///
     /// Ids that are not one column, an arena that cannot hold the rows, or a sharded table on a
     /// forward with no group.
-    pub fn forward(&self, f: &Forward, ids: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, ids: Operand) -> Result<Operand> {
         let hidden = u64::from(self.hidden);
         if ids.shape.rank() != 1 {
             return Err(Error::shape(

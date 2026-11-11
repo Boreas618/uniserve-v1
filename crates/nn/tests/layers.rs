@@ -11,7 +11,7 @@ use nn::{
     Activation, AdaptiveAvgPool2d, Arena, CausalPad, Conv3d, ConvSpec, DType, DevicePtr, Epilogue,
     Forward, GateBias, GatedActivation, GroupNorm, Halves, KvGroup, KvPlanes, KvView, LayerNorm,
     Linear, Modulation, Residual, ResidualStream, RmsNorm, Rounding, Scale, Shape, Snake,
-    TensorView, Weight,
+    Operand, Weight,
 };
 use ops::gemm::WeightOrder;
 
@@ -23,7 +23,7 @@ fn weight(dims: &[u64]) -> Weight {
     let backing = nn::Backing::new(DevicePtr::new(0x1_0000), elements * 4);
     Weight {
         backing,
-        view: TensorView::new(DevicePtr::new(0x1_0000), DType::F32, shape),
+        view: Operand::new(DevicePtr::new(0x1_0000), DType::F32, shape),
     }
 }
 
@@ -118,7 +118,7 @@ fn a_residual_writes_the_operand_its_scale_updates() {
 /// and bias are vectors of it, a modulation's tables are `[parameters, width]`.
 #[test]
 fn a_normalization_refuses_epilogue_parameters_of_another_width() {
-    let rows = TensorView::new(DevicePtr::new(0x1_0000), DType::I32, Shape::new(&[3]));
+    let rows = Operand::new(DevicePtr::new(0x1_0000), DType::I32, Shape::new(&[3]));
     let scaled = |scale: &[u64], bias: Option<&[u64]>| Epilogue::ScaledResidual {
         scale: weight(scale),
         bias: bias.map(weight),
@@ -233,7 +233,7 @@ fn a_normalization_reads_the_residual_stream_its_epilogue_folds() {
     let arena = Arena::counting();
     let f = Forward::recording(&arena);
     let view = |dtype, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
-    let held = |view: TensorView| Weight {
+    let held = |view: Operand| Weight {
         backing: nn::Backing::new(view.ptr, view.numel() * 2),
         view,
     };
@@ -408,9 +408,9 @@ fn a_group_normalization_writes_its_source_padded() {
 fn a_group_carries_each_layers_own_page_scales() {
     let pages = Shape::new(&[16, 1, 1, 1]);
     let planes_shape = Shape::new(&[16, 64, 8, 128]);
-    let fp8 = |address: u64| TensorView::new(DevicePtr::new(address), DType::F8E4M3, planes_shape);
-    let flags = |address: u64| TensorView::new(DevicePtr::new(address), DType::I32, pages);
-    let scale = |address: u64| TensorView::new(DevicePtr::new(address), DType::F32, pages);
+    let fp8 = |address: u64| Operand::new(DevicePtr::new(address), DType::F8E4M3, planes_shape);
+    let flags = |address: u64| Operand::new(DevicePtr::new(address), DType::I32, pages);
+    let scale = |address: u64| Operand::new(DevicePtr::new(address), DType::F32, pages);
     let planes = |base: u64| KvPlanes {
         key: fp8(base),
         value: fp8(base + 0x100),
@@ -420,7 +420,7 @@ fn a_group_carries_each_layers_own_page_scales() {
         value_scale: Some(scale(base + 0x500)),
     };
     let layers = [planes(0x1_0000), planes(0x2_0000)];
-    let table = TensorView::new(DevicePtr::new(0x3_0000), DType::I32, Shape::new(&[4, 8]));
+    let table = Operand::new(DevicePtr::new(0x3_0000), DType::I32, Shape::new(&[4, 8]));
     let groups = [KvGroup {
         block_tables: table,
         page_size: 64,
@@ -429,7 +429,7 @@ fn a_group_carries_each_layers_own_page_scales() {
     }];
     let view = KvView {
         groups: &groups,
-        workspace: TensorView::new(DevicePtr::new(0x40_0000), DType::U8, Shape::new(&[1 << 20])),
+        workspace: Operand::new(DevicePtr::new(0x40_0000), DType::U8, Shape::new(&[1 << 20])),
         state: None,
     };
 
@@ -479,14 +479,14 @@ fn an_adaptive_pool_reduces_its_rows_to_one_row_of_columns() {
 fn a_layer_reads_the_planes_its_own_index_names() {
     let plane = |marker: u64| {
         let page = |offset: u64| {
-            TensorView::new(
+            Operand::new(
                 DevicePtr::new(marker + offset),
                 DType::BF16,
                 Shape::new(&[2, 4, 2, 8]),
             )
         };
         let flag = |offset: u64| {
-            TensorView::new(
+            Operand::new(
                 DevicePtr::new(marker + offset),
                 DType::I32,
                 Shape::new(&[2, 1, 1, 1]),
@@ -504,7 +504,7 @@ fn a_layer_reads_the_planes_its_own_index_names() {
     let first = plane(0x10_0000);
     let second = plane(0x20_0000);
     let layers = [first, second];
-    let table = TensorView::new(DevicePtr::new(0x30_0000), DType::I32, Shape::new(&[1, 4]));
+    let table = Operand::new(DevicePtr::new(0x30_0000), DType::I32, Shape::new(&[1, 4]));
     let group = KvGroup {
         block_tables: table,
         page_size: 4,
@@ -514,7 +514,7 @@ fn a_layer_reads_the_planes_its_own_index_names() {
     let groups = [group];
     let cache = KvView {
         groups: &groups,
-        workspace: TensorView::new(DevicePtr::new(0x40_0000), DType::U8, Shape::new(&[1 << 20])),
+        workspace: Operand::new(DevicePtr::new(0x40_0000), DType::U8, Shape::new(&[1 << 20])),
         state: None,
     };
 
@@ -584,7 +584,7 @@ fn a_channels_last_convolution_launches_the_channels_first_program() {
         let view = |shape: Shape| {
             let reserved = arena.tensor(DType::F32, shape).unwrap();
             if channels_last {
-                TensorView::with_strides(reserved.ptr, reserved.dtype, shape, ndhwc(shape))
+                Operand::with_strides(reserved.ptr, reserved.dtype, shape, ndhwc(shape))
             } else {
                 reserved
             }

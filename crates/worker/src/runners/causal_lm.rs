@@ -25,7 +25,7 @@ use std::time::Instant;
 use ipc::{PhaseId, TimingCounters};
 use nn::family::TextModel;
 use nn::{CausalLm, Forward, KvView, TokenBatch};
-use ops::{DType, Generation, TensorView};
+use ops::{DType, Generation, Operand};
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
@@ -658,7 +658,7 @@ struct PendingCompare {
 #[derive(Clone, Copy)]
 struct Sampled {
     /// `[rows]` i32 sampled token ids, in the bucket's row order.
-    tokens: TensorView,
+    tokens: Operand,
     /// Each sampled id's scores under the raw logits.
     scores: Scores,
     /// `[tokens]` each token's prompt target's scores, in a bucket that scores its prompt.
@@ -780,7 +780,7 @@ pub trait KvProvider: Send + Sync {
 
     /// Where a graph gathers `rows` rows of `group`'s block table: the pooled table, indexed by
     /// slot, and the table attention reads. `None` from a provider whose table needs no gathering.
-    fn table_source(&self, group: usize, rows: u32) -> Result<Option<(TensorView, TensorView)>> {
+    fn table_source(&self, group: usize, rows: u32) -> Result<Option<(Operand, Operand)>> {
         let _ = (group, rows);
         Ok(None)
     }
@@ -881,7 +881,7 @@ pub trait KvProvider: Send + Sync {
         group: usize,
         slots: &[i32],
         stream: &platform::Stream,
-    ) -> Result<TensorView>;
+    ) -> Result<Operand>;
 
     /// The same table's view over `slots`' rows, with no copy issued.
     ///
@@ -889,7 +889,7 @@ pub trait KvProvider: Send + Sync {
     /// the pose's pool rows into the graph, and each replay would then overwrite the batch's table
     /// with them. A recording addresses the table through this view, and `block_table` fills it
     /// before each launch.
-    fn block_table_view(&self, group: usize, slots: &[i32]) -> Result<TensorView>;
+    fn block_table_view(&self, group: usize, slots: &[i32]) -> Result<Operand>;
 
     /// The plane views of `group`'s layers, in model order.
     fn planes(&self, group: usize) -> Result<Vec<nn::KvPlanes>>;
@@ -926,7 +926,7 @@ pub trait KvProvider: Send + Sync {
         lengths: &[i32],
         pages: u32,
         stream: &platform::Stream,
-    ) -> Result<(TensorView, Vec<nn::KvPlanes>)>;
+    ) -> Result<(Operand, Vec<nn::KvPlanes>)>;
 }
 
 /// A batch's cache installation, carried from the submitting thread to the device thread.
@@ -1091,8 +1091,8 @@ impl<M: CausalLm + ?Sized> CausalLm for Shared<M> {
     fn embed_input_ids(
         &self,
         f: &nn::Forward,
-        ids: ops::TensorView,
-    ) -> nn::Result<ops::TensorView> {
+        ids: ops::Operand,
+    ) -> nn::Result<ops::Operand> {
         self.0.embed_input_ids(f, ids)
     }
 
@@ -1101,16 +1101,16 @@ impl<M: CausalLm + ?Sized> CausalLm for Shared<M> {
         f: &nn::Forward,
         batch: &nn::TokenBatch,
         cache: &nn::KvView<'_>,
-        hidden: ops::TensorView,
-    ) -> nn::Result<ops::TensorView> {
+        hidden: ops::Operand,
+    ) -> nn::Result<ops::Operand> {
         self.0.forward(f, batch, cache, hidden)
     }
 
     fn compute_logits(
         &self,
         f: &nn::Forward,
-        hidden: ops::TensorView,
-    ) -> nn::Result<ops::TensorView> {
+        hidden: ops::Operand,
+    ) -> nn::Result<ops::Operand> {
         self.0.compute_logits(f, hidden)
     }
 
@@ -1540,7 +1540,7 @@ impl<M: TextModel> CausalLmRunner<M> {
 
     /// The `[axes, tokens]` rotary coordinates of a batch of `tokens` tokens with image rows, or
     /// of the recorded walk of one; `None` for a text batch.
-    fn rope_view(&self, tokens: u32) -> Option<TensorView> {
+    fn rope_view(&self, tokens: u32) -> Option<Operand> {
         match (&self.rope, self.model.vision()) {
             (Some(rope), Some(vision))
                 if !self.staging.vision().is_empty() || self.image_pose.get() =>
@@ -1552,7 +1552,7 @@ impl<M: TextModel> CausalLmRunner<M> {
     }
 
     /// Writes the staged prefill's image blocks into their rows of `hidden`, on this stream.
-    fn write_image_rows(&self, hidden: TensorView) -> Result<()> {
+    fn write_image_rows(&self, hidden: Operand) -> Result<()> {
         let blocks = self.blocks.borrow();
         if blocks.is_empty() {
             return Ok(());
@@ -2762,7 +2762,7 @@ impl<M: TextModel> CausalLmRunner<M> {
                     ));
                 }
                 let mut offset = 0;
-                let mut copy = |source: TensorView, bytes: usize| -> Result<()> {
+                let mut copy = |source: Operand, bytes: usize| -> Result<()> {
                     platform::memcpy_async(
                         readback.address() + offset as u64,
                         source.ptr.address(),
@@ -3172,7 +3172,7 @@ impl<M: TextModel> CausalLmRunner<M> {
     }
 
     /// The bucket's extent of the input ids, which the forward embeds before the stack.
-    fn input_ids(&self, bucket: Bucket) -> TensorView {
+    fn input_ids(&self, bucket: Bucket) -> Operand {
         self.columns.input_ids.extent(0..u64::from(bucket.tokens))
     }
 
@@ -3186,7 +3186,7 @@ impl<M: TextModel> CausalLmRunner<M> {
 
     /// The batch with `slot_mapping` in place of the served batch's cache slots: what a paired
     /// forward passes so its writes land in scratch pages (7.3).
-    fn token_batch_with(&self, bucket: Bucket, slot_mapping: TensorView) -> Result<TokenBatch> {
+    fn token_batch_with(&self, bucket: Bucket, slot_mapping: Operand) -> Result<TokenBatch> {
         Ok(TokenBatch {
             positions: self.columns.positions.extent(0..bucket.tokens as u64),
             slot_mapping,
@@ -3234,7 +3234,7 @@ impl<M: TextModel> CausalLmRunner<M> {
     )]
     fn with_kv_over<R>(
         &self,
-        workspace: TensorView,
+        workspace: Operand,
         slots: &[i32],
         scratch_pages: Option<(u32, &[i32])>,
         quiet: bool,
@@ -3526,7 +3526,7 @@ impl<M: TextModel> CausalLmRunner<M> {
     /// The step gathers the rows whose logits are wanted, projects them, and samples one token per
     /// row through the model's sampler; its working set comes from the bucket's arena, so a replay
     /// samples without a host round trip.
-    fn sample(&self, forward: &Forward<'_>, bucket: Bucket, hidden: TensorView) -> Result<()> {
+    fn sample(&self, forward: &Forward<'_>, bucket: Bucket, hidden: Operand) -> Result<()> {
         let Some(sampling) = &self.sampling else {
             return Err(Error::State(
                 "the runner has no sampler but the bucket samples",
@@ -3628,7 +3628,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         &self,
         forward: &Forward<'_>,
         bucket: Bucket,
-        hidden: TensorView,
+        hidden: Operand,
     ) -> Result<Option<Scores>> {
         if !bucket.variant.scores() {
             return Ok(None);
@@ -3698,7 +3698,7 @@ impl<M: TextModel> CausalLmRunner<M> {
             active: self.commit.active.extent(0..rows),
             continuation: self.commit.continuation.extent(0..1),
             points: self.commit.points.extent(0..1),
-            future: TensorView::with_strides(
+            future: Operand::with_strides(
                 self.commit.future.device.ptr,
                 DType::I32,
                 ops::Shape::new(&[slots, 1]),

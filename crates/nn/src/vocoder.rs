@@ -22,7 +22,7 @@
 //! final `tanh` or clamp is the caller's: a PCM step clamps as it quantizes.
 
 use ops::activation1d::{self, Activation1d as Activation1dOp};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -127,7 +127,7 @@ impl Activation1d {
     /// # Errors
     ///
     /// Operands of another shape or element type, an empty signal, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<Operand> {
         const OWNER: &str = "Activation1d";
         let descriptor = self.descriptor();
         let channels = u64::from(self.channels);
@@ -187,7 +187,7 @@ impl Activation1d {
             f.operate::<Activation1dOp>(
                 &descriptor,
                 activation1d::Args {
-                    values: TensorView::new(
+                    values: Operand::new(
                         input.ptr.offset(row * input_row),
                         self.dtype,
                         Shape::new(&[channels, u64::from(length)]),
@@ -196,7 +196,7 @@ impl Activation1d {
                     beta: self.beta.view(),
                     filter_up: self.filter_up.view(),
                     filter_down: self.filter_down.view(),
-                    out: TensorView::new(
+                    out: Operand::new(
                         out.ptr.offset(row * out_row),
                         self.dtype,
                         Shape::new(&[channels, expected]),
@@ -286,7 +286,7 @@ impl AmpBlock {
     /// # Errors
     ///
     /// An input of another shape, or an operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<Operand> {
         if input.shape.rank() != 3 || input.shape.dim(1) != u64::from(self.channels) {
             return Err(Error::shape(
                 "AmpBlock",
@@ -467,7 +467,7 @@ impl BigVgan {
     /// # Errors
     ///
     /// An input of another rank, or an operator's refusal.
-    pub fn forward(&self, f: &Forward, input: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<Operand> {
         if input.shape.rank() != 3 {
             return Err(Error::shape(
                 "BigVgan",
@@ -505,8 +505,8 @@ impl BigVgan {
         &self,
         f: &Forward,
         stage: &Stage,
-        input: TensorView,
-        accumulated: TensorView,
+        input: Operand,
+        accumulated: Operand,
     ) -> Result<()> {
         for (index, block) in stage.blocks.iter().enumerate() {
             f.scoped(|f| {
@@ -524,7 +524,7 @@ impl BigVgan {
 }
 
 /// A contiguous `[..., columns]` view as the `[rows, columns]` matrix the row-wise operators read.
-fn rows(view: TensorView) -> Result<TensorView> {
+fn rows(view: Operand) -> Result<Operand> {
     let columns = view.shape.dim(view.shape.rank() - 1);
     if columns == 0 {
         return Err(Error::shape("BigVgan", "a tensor of no column".to_owned()));

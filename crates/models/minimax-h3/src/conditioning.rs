@@ -28,7 +28,7 @@ use nn::blocks::{
 use nn::family::Split;
 use nn::layers::{Bias, Linear, Parallel, QkvBias, QkvNames, QkvSpec, RmsNorm, Rounding, Varlen};
 use nn::weights::WeightLoader;
-use nn::{DType, Forward, TensorView};
+use nn::{DType, Forward, Operand};
 
 use crate::config::TransformerConfig;
 use crate::{Error, Result};
@@ -164,9 +164,9 @@ impl TokenRefiner {
     pub fn forward(
         &self,
         f: &Forward,
-        features: TensorView,
+        features: Operand,
         document: Varlen,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         if features.shape.rank() != 2
             || features.shape.dim(0) == 0
             || features.shape.last() != u64::from(self.text_dim)

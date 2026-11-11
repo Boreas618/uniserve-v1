@@ -24,7 +24,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, TensorView};
+use crate::tensor::{DType, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -57,9 +57,9 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[rows, columns]` the source, contiguous.
-    pub input: TensorView,
+    pub input: Operand,
     /// `[columns, rows]` the destination, contiguous.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// Write a row-major matrix into the transposed row-major matrix.
@@ -71,7 +71,7 @@ pub struct Transpose;
 /// still moves as one contiguous run — so the comparison is axis by axis rather than against a
 /// row-major stride vector. Two axes that share an element are not packed and are refused by the
 /// same test, because the stride of the outer one is then too small.
-fn contiguous(view: &TensorView) -> bool {
+fn contiguous(view: &Operand) -> bool {
     let mut expected = 1;
     for axis in (0..view.shape.rank()).rev() {
         let extent = view.shape.dim(axis);
@@ -84,7 +84,7 @@ fn contiguous(view: &TensorView) -> bool {
 }
 
 /// Check that a view is a contiguous matrix of the descriptor's element type.
-fn matrix(view: &TensorView, name: &str, dtype: DType) -> Result<(u64, u64)> {
+fn matrix(view: &Operand, name: &str, dtype: DType) -> Result<(u64, u64)> {
     view.require_rank(Transpose::NAME, 2)?;
     if view.dtype != dtype {
         return Err(Error::argument(
@@ -213,8 +213,8 @@ mod tests {
         }
     }
 
-    fn view(dtype: DType, shape: &[u64], strides: &[u64]) -> TensorView {
-        TensorView::with_strides(
+    fn view(dtype: DType, shape: &[u64], strides: &[u64]) -> Operand {
+        Operand::with_strides(
             crate::tensor::DevicePtr::new(0x1000),
             dtype,
             Shape::new(shape),

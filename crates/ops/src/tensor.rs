@@ -16,7 +16,7 @@ use crate::{Error, Result, platform};
 /// `ops` carries addresses in its own type rather than as bare integers, so that a view's address
 /// cannot be confused with a scalar parameter and a byte offset cannot be added to an element
 /// count by accident. Arithmetic on it is in bytes ([`DevicePtr::offset`]); the element offset of a
-/// view goes through [`TensorView::offset_elements`].
+/// view goes through [`Operand::offset_elements`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DevicePtr(u64);
 
@@ -407,7 +407,7 @@ impl fmt::Debug for Strides {
 /// The outer strides are answered in axis order (`[channel, frame, row]` for a four-axis raster) so
 /// the operator can pass them as launch parameters; the innermost stride is 1 by the rule and never
 /// travels.
-pub fn row_writable(out: &TensorView, op: &'static str) -> Result<[u64; MAX_RANK]> {
+pub fn row_writable(out: &Operand, op: &'static str) -> Result<[u64; MAX_RANK]> {
     row_layout(out, op, "destination")
 }
 
@@ -418,11 +418,11 @@ pub fn row_writable(out: &TensorView, op: &'static str) -> Result<[u64; MAX_RANK
 /// view inside a larger buffer (a tile of a raster, or the seam band between two of them), so the
 /// operator needs its strides; a source whose last axis is not contiguous cannot be read a row at a
 /// time at all and is refused by name.
-pub fn row_readable(source: &TensorView, op: &'static str) -> Result<[u64; MAX_RANK]> {
+pub fn row_readable(source: &Operand, op: &'static str) -> Result<[u64; MAX_RANK]> {
     row_layout(source, op, "source")
 }
 
-fn row_layout(view: &TensorView, op: &'static str, role: &str) -> Result<[u64; MAX_RANK]> {
+fn row_layout(view: &Operand, op: &'static str, role: &str) -> Result<[u64; MAX_RANK]> {
     let out = view;
     let strides = out.strides.as_slice();
     if strides.last() != Some(&1) {
@@ -455,7 +455,7 @@ fn row_layout(view: &TensorView, op: &'static str, role: &str) -> Result<[u64; M
 ///
 /// An operator's `check` states the row rule and its `launch` reads the strides here, so the rule
 /// is checked once per call.
-pub fn outer_strides(view: &TensorView) -> [u64; MAX_RANK] {
+pub fn outer_strides(view: &Operand) -> [u64; MAX_RANK] {
     let strides = view.strides.as_slice();
     let mut outer = [0_u64; MAX_RANK];
     let axes = strides.len().saturating_sub(1);
@@ -470,14 +470,14 @@ pub fn outer_strides(view: &TensorView) -> [u64; MAX_RANK] {
 /// caller keeps it alive until the stream work reading it completes, including the replays of a
 /// captured graph.
 #[derive(Clone, Copy)]
-pub struct TensorView {
+pub struct Operand {
     pub ptr: DevicePtr,
     pub dtype: DType,
     pub shape: Shape,
     pub strides: Strides,
 }
 
-impl TensorView {
+impl Operand {
     /// A row-major view of `shape` elements of `dtype` at `ptr`.
     pub fn new(ptr: DevicePtr, dtype: DType, shape: Shape) -> Self {
         Self {
@@ -671,10 +671,10 @@ impl TensorView {
     }
 }
 
-impl fmt::Debug for TensorView {
+impl fmt::Debug for Operand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TensorView")
+            .debug_struct("Operand")
             .field("ptr", &self.ptr)
             .field("dtype", &self.dtype)
             .field("shape", &self.shape)
@@ -687,8 +687,8 @@ impl fmt::Debug for TensorView {
 mod tests {
     use super::*;
 
-    fn view(shape: &[u64], strides: &[u64]) -> TensorView {
-        TensorView {
+    fn view(shape: &[u64], strides: &[u64]) -> Operand {
+        Operand {
             ptr: DevicePtr::new(0x1000),
             dtype: DType::BF16,
             shape: Shape::new(shape),

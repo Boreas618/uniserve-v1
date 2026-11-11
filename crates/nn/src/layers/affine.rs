@@ -7,7 +7,7 @@
 //! (`ops::channel_affine`).
 
 use ops::channel_affine::{self, ChannelAffine as ChannelAffineOp};
-use ops::{Shape, Strides, TensorView};
+use ops::{Shape, Strides, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -53,7 +53,7 @@ impl ChannelAffine {
     ///
     /// A non-contiguous view, a channel axis past the rank or of another extent, an arena that
     /// cannot hold the output, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, x: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, x: Operand) -> Result<Operand> {
         const OWNER: &str = "ChannelAffine";
         let shape = x.shape;
         let channels = self.scale.shape().numel();
@@ -109,7 +109,7 @@ mod tests {
         let arena = Arena::counting();
         let f = Forward::recording(&arena);
         let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
-        let held = |view: TensorView| Weight {
+        let held = |view: Operand| Weight {
             backing: crate::Backing::new(view.ptr, view.numel() * 4),
             view,
         };
@@ -127,7 +127,7 @@ mod tests {
                 .is_err()
         );
 
-        let transposed = TensorView::with_strides(
+        let transposed = Operand::with_strides(
             rows.ptr,
             DType::F32,
             Shape::new(&[100, 24]),

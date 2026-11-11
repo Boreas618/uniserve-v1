@@ -16,7 +16,7 @@
 //! ([`GatedDeltaNet::state_fields`]). The block's intermediates are reserved from the forward's
 //! arena under a mark released before it returns.
 
-use ops::{DType, Shape, Strides, TensorView};
+use ops::{DType, Shape, Strides, Operand};
 
 use crate::capability::{StateView, TokenBatch};
 use crate::error::{Error, Result};
@@ -191,11 +191,11 @@ impl GatedDeltaNet {
     pub fn forward(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        hidden: Operand,
         batch: &TokenBatch,
         state: &StateView<'_>,
         layer: usize,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         let banks = state.layer(layer)?;
         let ([conv, recurrent], [conv_kept, recurrent_kept]) = (banks.live, banks.checkpoint)
         else {
@@ -249,7 +249,7 @@ impl GatedDeltaNet {
             // The convolved row is [q | k | v]: three head-major views of one row stride.
             let key_width = u64::from(spec.key_heads) * u64::from(spec.key_dim);
             let heads = |offset: u64, count: u32, dim: u32| {
-                TensorView::with_strides(
+                Operand::with_strides(
                     mixed.offset_elements(offset),
                     dtype,
                     Shape::new(&[tokens, u64::from(count), u64::from(dim)]),

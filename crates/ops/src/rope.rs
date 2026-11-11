@@ -20,7 +20,7 @@ use std::fmt;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -169,13 +169,13 @@ pub struct FactorsArgs {
     ///
     /// A sectioned rotation's positions are `[axes, tokens]` (or `[axes, …, tokens]`): one
     /// coordinate per axis per token, contiguous, so axis `a`'s coordinates start at `a * tokens`.
-    pub positions: TensorView,
+    pub positions: Operand,
     /// `[columns]`, the angle per rotated dimension, in radians per position unit.
-    pub frequencies: TensorView,
+    pub frequencies: Operand,
     /// `[tokens, columns]`, the cosine factors.
-    pub cosine: TensorView,
+    pub cosine: Operand,
     /// `[tokens, columns]`, the sine factors.
-    pub sine: TensorView,
+    pub sine: Operand,
 }
 
 /// Position to rotary factor.
@@ -494,21 +494,21 @@ fn launch_strided(
 #[derive(Clone, Copy)]
 pub struct QkNormRopeArgs {
     /// `[tokens, q_heads, head_dim]` queries, before normalization.
-    pub query: TensorView,
+    pub query: Operand,
     /// `[tokens, k_heads, head_dim]` keys, before normalization.
-    pub key: TensorView,
+    pub key: Operand,
     /// `[head_dim]`, the query normalization's scale; `None` when the descriptor is unweighted.
-    pub q_weight: Option<TensorView>,
+    pub q_weight: Option<Operand>,
     /// `[head_dim]`, the key normalization's scale; `None` when the descriptor is unweighted.
-    pub k_weight: Option<TensorView>,
+    pub k_weight: Option<Operand>,
     /// `[tokens, rotated/2]`, the cosine factors of each token's position.
-    pub cosine: TensorView,
+    pub cosine: Operand,
     /// `[tokens, rotated/2]`, the sine factors of each token's position.
-    pub sine: TensorView,
+    pub sine: Operand,
     /// `[tokens, q_heads, head_dim]` normalized, rotated queries.
-    pub q_out: TensorView,
+    pub q_out: Operand,
     /// `[tokens, k_heads, head_dim]` normalized, rotated keys.
-    pub k_out: TensorView,
+    pub k_out: Operand,
 }
 
 /// Per-head RMS normalization fused with the rotary rotation.
@@ -735,13 +735,13 @@ impl fmt::Display for RopeApplyDescriptor {
 #[derive(Clone, Copy)]
 pub struct RopeApplyArgs {
     /// `[tokens, heads, head_dim]`: the values to rotate.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[tokens, rotated/2]` FP32: the cosine factors of each token's position.
-    pub cosine: TensorView,
+    pub cosine: Operand,
     /// `[tokens, rotated/2]` FP32: the sine factors of each token's position.
-    pub sine: TensorView,
+    pub sine: Operand,
     /// `[tokens, heads, head_dim]`, in the descriptor's output type.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The rotary rotation alone: no normalization, and the unit-modulus scale is in the tables.

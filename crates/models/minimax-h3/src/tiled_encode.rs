@@ -14,14 +14,14 @@ use crate::packing::LATENT_COMPRESSION;
 use crate::video_vae::{MINIMUM_OVERLAP, TILE_PIXELS};
 use crate::{Error, Result};
 use nn::tiling::{Tile, TiledEncode};
-use nn::{DType, Forward, Shape, TensorView};
+use nn::{DType, Forward, Shape, Operand};
 
 /// A tile's block of a wider raster, `[channels, frames, height, width]` at the raster's strides,
 /// copied into a fresh packed `[1, channels, frames, height, width]` sample.
 ///
 /// The encoder's first pad reads each frame's rows in place, so it needs the tile's own row stride,
 /// and a block of a wider raster has the raster's.
-fn pack_tile(f: &Forward, block: TensorView) -> Result<TensorView> {
+fn pack_tile(f: &Forward, block: Operand) -> Result<Operand> {
     let dims = block.shape.dims();
     let (channels, frames, height, width) = (dims[0], dims[1], dims[2], dims[3]);
     let packed = f.empty(DType::F32, Shape::new(&[channels, frames, height, width]))?;
@@ -80,11 +80,11 @@ impl ClipEncoder {
         &self,
         f: &Forward,
         encoder: &VideoEncoder,
-        raster: TensorView,
+        raster: Operand,
         moments: (u64, u64),
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         let compression = u64::from(LATENT_COMPRESSION);
-        let encode = |index: usize| -> nn::Result<TensorView> {
+        let encode = |index: usize| -> nn::Result<Operand> {
             let tile = &self.tiles()[index];
             let block = raster
                 .narrow(

@@ -68,7 +68,7 @@ use super::{address, head_stride, row_stride, to_i64};
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -118,21 +118,21 @@ impl fmt::Display for SparseDescriptor {
 #[derive(Clone, Copy)]
 pub struct SparseArgs {
     /// `[query_rows, heads, head_dim]` queries; rows are whole tiles.
-    pub query: TensorView,
+    pub query: Operand,
     /// `[key_rows, heads, head_dim]` keys; rows are whole blocks.
-    pub key: TensorView,
+    pub key: Operand,
     /// `[key_rows, heads, head_dim]` values.
-    pub value: TensorView,
+    pub value: Operand,
     /// `[heads, query_tiles, selected]` i32: the key blocks each query tile reads first.
-    pub indices: TensorView,
+    pub indices: Operand,
     /// `[heads, query_tiles]` i32: how many of each row's indices are read.
-    pub counts: TensorView,
+    pub counts: Operand,
     /// `[key_blocks]` i32: valid rows of each key block.
-    pub valid: TensorView,
+    pub valid: Operand,
     /// `[heads, query_rows]` f32: the softmax normalizer, when the descriptor asks for it.
-    pub lse: Option<TensorView>,
+    pub lse: Option<Operand>,
     /// `[query_rows, heads, head_dim]` output.
-    pub out: TensorView,
+    pub out: Operand,
     /// Softmax scale applied to `q · k` before the exponential.
     pub scale: f32,
 }

@@ -14,7 +14,7 @@
 //! moments are one buffer cut by an offset and nothing is copied or transposed.
 
 use ops::posterior::{self, Posterior as PosteriorOp};
-use ops::{DType, Shape, Strides, TensorView};
+use ops::{DType, Shape, Strides, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -37,9 +37,9 @@ impl Posterior {
     pub fn sample(
         &self,
         f: &Forward,
-        moments: TensorView,
-        noise: TensorView,
-    ) -> Result<TensorView> {
+        moments: Operand,
+        noise: Operand,
+    ) -> Result<Operand> {
         const OWNER: &str = "Posterior";
         let channels = noise.shape.dims().first().copied().unwrap_or(0);
         if channels == 0 {
@@ -92,7 +92,7 @@ impl Posterior {
         // are exactly `channels` planes apart.
         let positions = out.shape.dims()[1..].iter().product::<u64>();
         let view = |ptr| {
-            TensorView::with_strides(
+            Operand::with_strides(
                 ptr,
                 DType::F32,
                 Shape::new(&[positions, channels]),

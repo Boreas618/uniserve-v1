@@ -215,12 +215,12 @@ mod tests {
     const WORDS: usize = 8;
 
     /// The words a forward over `staging` uploads into the arena's first tensor.
-    fn upload(forward: &nn::Forward<'_>, value: i32) -> crate::Result<ops::TensorView> {
+    fn upload(forward: &nn::Forward<'_>, value: i32) -> crate::Result<ops::Operand> {
         Ok(forward.upload(&[value; WORDS], Shape::new(&[WORDS as u64]))?)
     }
 
     /// Copies `view`'s words to the host behind the stream's earlier work.
-    fn read_back(view: ops::TensorView, host: &PinnedBuffer, stream: &Stream) {
+    fn read_back(view: ops::Operand, host: &PinnedBuffer, stream: &Stream) {
         // SAFETY: both ranges hold `WORDS` i32 and outlive the stream's drain below.
         unsafe {
             platform::memcpy_async(host.address(), view.ptr.address(), WORDS * 4, stream)

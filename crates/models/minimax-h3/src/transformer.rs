@@ -25,7 +25,7 @@ use nn::layers::{
     Rounding, Spectrum, StepIndexed,
 };
 use nn::weights::WeightLoader;
-use nn::{DType, Forward, Shape, TensorView};
+use nn::{DType, Forward, Shape, Operand};
 
 use crate::attention::{self, Visibility};
 use crate::config::{AttentionKind, TransformerConfig};
@@ -117,9 +117,9 @@ impl Layer {
         &self,
         f: &Forward,
         modulation: RowModulation<'_>,
-        hidden: TensorView,
+        hidden: Operand,
         (rotation, visibility): ((&Rotary, nn::layers::Factors), &Visibility),
-        (gathered, next): (Option<TensorView>, Option<(&Layer, RowModulation<'_>)>),
+        (gathered, next): (Option<Operand>, Option<(&Layer, RowModulation<'_>)>),
         arriving: &mut Vec<nn::Transfer>,
     ) -> Result<()> {
         let (attention::Layer::Sparse(sparse), Visibility::Sparse(tables)) =
@@ -431,7 +431,7 @@ impl Transformer {
     ///
     /// Every BF16 value is an FP32 value, so the widening is exact; it is where the reference's
     /// `Linear` casts the activation up before the product.
-    fn wide(&self, f: &Forward, source: TensorView) -> Result<TensorView> {
+    fn wide(&self, f: &Forward, source: Operand) -> Result<Operand> {
         if source.dtype == DType::F32 {
             return Ok(source);
         }
@@ -439,23 +439,23 @@ impl Transformer {
     }
 
     /// A video latent `[channels, frames, rows, columns]` as the DiT's `1x2x2` patch tokens.
-    pub fn patchify(&self, f: &Forward, latent: TensorView) -> Result<TensorView> {
+    pub fn patchify(&self, f: &Forward, latent: Operand) -> Result<Operand> {
         Ok(self.patch.patchify(f, latent)?)
     }
 
     /// Patch tokens back into a video latent of extents `raster`.
-    pub fn unpatchify(&self, f: &Forward, tokens: TensorView, raster: Shape) -> Result<TensorView> {
+    pub fn unpatchify(&self, f: &Forward, tokens: Operand, raster: Shape) -> Result<Operand> {
         Ok(self.patch.unpatchify(f, tokens, raster)?)
     }
 
     /// Video patch tokens projected into the hidden width, FP32.
-    pub fn project_video(&self, f: &Forward, tokens: TensorView) -> Result<TensorView> {
+    pub fn project_video(&self, f: &Forward, tokens: Operand) -> Result<Operand> {
         let wide = self.wide(f, tokens)?;
         Ok(self.patch.project(f, wide)?)
     }
 
     /// Audio latent rows projected into the hidden width, FP32.
-    pub fn project_audio(&self, f: &Forward, rows: TensorView) -> Result<TensorView> {
+    pub fn project_audio(&self, f: &Forward, rows: Operand) -> Result<Operand> {
         let wide = self.wide(f, rows)?;
         Ok(self.audio_proj_in.forward(f, wide)?)
     }
@@ -468,11 +468,11 @@ impl Transformer {
     pub fn velocity(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        hidden: Operand,
         modality: Modality,
         modulation: RowModulation<'_>,
-        (block, step): (u32, TensorView),
-    ) -> Result<TensorView> {
+        (block, step): (u32, Operand),
+    ) -> Result<Operand> {
         let normalized = self.norm_out.forward(f, modulation, hidden)?;
         let wide = self.wide(f, normalized)?;
         match &self.outputs {
@@ -504,9 +504,9 @@ impl Transformer {
     pub fn forward(
         &self,
         f: &Forward,
-        (adaln, entries): (&TimestepTable, TensorView),
-        hidden: TensorView,
-        rows: TensorView,
+        (adaln, entries): (&TimestepTable, Operand),
+        hidden: Operand,
+        rows: Operand,
         (factors, visibility): (nn::layers::Factors, &Visibility),
     ) -> Result<()> {
         let width = hidden.shape.last();

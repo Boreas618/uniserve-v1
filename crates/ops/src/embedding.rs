@@ -10,7 +10,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -51,11 +51,11 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[tokens]` token ids.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[rows, hidden]`, this shard's vocabulary rows.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[tokens, hidden]`; a token outside this shard's range is written as zeros.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// Vocabulary-sharded embedding lookup.

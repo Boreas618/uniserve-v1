@@ -27,7 +27,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, TensorView};
+use crate::tensor::{DType, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -73,13 +73,13 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[positions, channels]` f32: the mean half of the moments.
-    pub mean: TensorView,
+    pub mean: Operand,
     /// `[positions, channels]` f32: the log-variance half, clamped inside the kernel.
-    pub log_variance: TensorView,
+    pub log_variance: Operand,
     /// `[positions, channels]` f32: the draw, one per element.
-    pub noise: TensorView,
+    pub noise: Operand,
     /// `[positions, channels]` f32: the sample after the FP16 round trip.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The posterior sample of the encoder's moments.

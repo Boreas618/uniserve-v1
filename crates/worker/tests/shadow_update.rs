@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use nn::forward::Forward;
 use ops::{
     Arguments, CubinMetadata, DType, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op,
-    Shape, TensorView, Tolerance, Twins, descriptor,
+    Shape, Operand, Tolerance, Twins, descriptor,
 };
 use platform::{
     Allocator, Budget, Buffer, Device, DeviceId, PinnedBuffer, PoolKind, Stream, memcpy_async,
@@ -96,7 +96,7 @@ impl fmt::Display for ProbeDescriptor {
 /// One call's arguments: the activation and the two scalars the kernel reads.
 #[derive(Clone, Copy)]
 struct ProbeArgs {
-    data: TensorView,
+    data: Operand,
     count: u32,
     value: u32,
 }
@@ -245,7 +245,7 @@ fn a_paired_forward_accepts_agreement_and_refuses_a_wrong_kernel() {
     // The probe reserves no activation, so its forward needs no arena: the region is empty and any
     // reservation inside it would fail.
     let arena = nn::Arena::new(DevicePtr::new(0), 0);
-    let data = TensorView::new(
+    let data = Operand::new(
         DevicePtr::new(buffer.address()),
         DType::I32,
         Shape::new(&[WORDS as u64]),

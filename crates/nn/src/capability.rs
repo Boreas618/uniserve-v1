@@ -24,7 +24,7 @@ use proto::video::{LatentShape, Layout};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::tensor::{DType, TensorView};
+use crate::tensor::{DType, Operand};
 
 /// The device-side layout of one batch, as a model's layers read it.
 ///
@@ -34,15 +34,15 @@ use crate::tensor::{DType, TensorView};
 #[derive(Clone, Copy)]
 pub struct TokenBatch {
     /// `[tokens]` i32 rotary positions.
-    pub positions: TensorView,
+    pub positions: Operand,
     /// `[tokens]` i32 cache slots; `-1` writes nothing and initializes nothing.
-    pub slot_mapping: TensorView,
+    pub slot_mapping: Operand,
     /// `[rows]` i32 keys visible to each row's last query.
-    pub seq_lens: TensorView,
+    pub seq_lens: Operand,
     /// `[rows + 1]` i32 packed query offsets.
-    pub query_offsets: TensorView,
+    pub query_offsets: Operand,
     /// `[rows]` i32 hidden rows whose logits are produced.
-    pub logits_rows: TensorView,
+    pub logits_rows: Operand,
     /// Which phase this batch is.
     pub phase: PhaseKind,
     /// Tokens per cache page.
@@ -52,11 +52,11 @@ pub struct TokenBatch {
     /// The bound on keys any row of this batch reads: the attention descriptor's reduction length.
     pub max_kv_len: u32,
     /// `[rows]` i32 drafted-token counts, when the batch verifies speculative drafts.
-    pub draft_lens: Option<TensorView>,
+    pub draft_lens: Option<Operand>,
     /// `[axes, tokens]` i32 multi-axis rotary coordinates, axis-major, when the batch carries the
     /// rows of an image ([`Vision`]); `None` when every row is text, whose coordinate on every
     /// axis is its entry of `positions`.
-    pub rope_positions: Option<TensorView>,
+    pub rope_positions: Option<Operand>,
 }
 
 impl TokenBatch {
@@ -177,33 +177,33 @@ impl TokenBatch {
 #[derive(Clone, Copy)]
 pub struct KvPlanes {
     /// `[pages, page_size, kv_heads, head_dim]` cached keys.
-    pub key: TensorView,
+    pub key: Operand,
     /// `[pages, page_size, kv_heads, head_dim]` cached values.
-    pub value: TensorView,
+    pub value: Operand,
     /// `[pages, 1, 1, 1]` **u8**, one flag per page of `key`.
     ///
     /// One byte, not four: the plane is the layout and the Storage Server carries one
     /// byte per page, so `cache_copy_region` refuses anything but `DType::U8`
     /// (`prefix_cache.rs`). An `i32` view of this plane writes four bytes where one
     /// belongs and clobbers three neighbouring pages' flags with zeros.
-    pub key_initialized: TensorView,
+    pub key_initialized: Operand,
     /// `[pages, 1, 1, 1]` **u8**, one flag per page of `value`; one byte for the same reason.
-    pub value_initialized: TensorView,
+    pub value_initialized: Operand,
     /// `[pages, 1, 1, 1]` f32: each page's key scale, present exactly when `key` is FP8.
     ///
     /// An FP8 cache stores a page divided by its own scale and the attention kernel multiplies it
     /// back in FP32. The scale is one *layer's*: two layers of one group keep their caches apart and
     /// each carries its own, which is why it is here and not with the group's geometry.
-    pub key_scale: Option<TensorView>,
+    pub key_scale: Option<Operand>,
     /// `[pages, 1, 1, 1]` f32: each page's value scale, present exactly when `value` is FP8.
-    pub value_scale: Option<TensorView>,
+    pub value_scale: Option<Operand>,
 }
 
 /// The cache of one attention group: how rows address pages and where the pages are.
 #[derive(Clone, Copy)]
 pub struct KvGroup<'a> {
     /// `[rows, max_pages]` i32: each row's page ids.
-    pub block_tables: TensorView,
+    pub block_tables: Operand,
     /// Tokens per page; the same as the batch's `page_size`.
     pub page_size: u32,
     /// Element type of the group's pages: BF16, or FP8 for a group whose every layer is FP8.
@@ -224,7 +224,7 @@ pub struct KvView<'a> {
     /// `[bytes]` u8: the paged-attention program's transient scratch, which the runtime reserves
     /// for the forward at the size the loaded program needs. Its head holds the decode's arrival
     /// counters, which the model clears once per forward ([`crate::layers::PagedAttention::zero_counters`]).
-    pub workspace: TensorView,
+    pub workspace: Operand,
     /// The recurrent state of a model whose [`crate::family::TextModel::state`] declares one;
     /// `None` for a model that keeps none.
     pub state: Option<StateView<'a>>,
@@ -241,14 +241,14 @@ pub struct KvView<'a> {
 #[derive(Clone, Copy)]
 pub struct StateLayer<'a> {
     /// The live banks, in the layer's field order.
-    pub live: &'a [TensorView],
+    pub live: &'a [Operand],
     /// The checkpoint banks, in the same order and extents.
-    pub checkpoint: &'a [TensorView],
+    pub checkpoint: &'a [Operand],
     /// The trail banks of a batch that keeps one, in the same order: `[tokens, …]` per field, row
     /// `t` receiving the layer's state after the batch's token `t`. A speculative verification
     /// keeps one, because only after the forward does it learn after which of a row's tokens the
     /// slot's state stands; `None` for every other batch.
-    pub trail: Option<&'a [TensorView]>,
+    pub trail: Option<&'a [Operand]>,
 }
 
 /// The recurrent state a batch's rows read and advance.
@@ -260,15 +260,15 @@ pub struct StateLayer<'a> {
 #[derive(Clone, Copy)]
 pub struct StateView<'a> {
     /// `[rows + 1]` i32: the packed offsets of each state row's tokens in the batch.
-    pub query_offsets: TensorView,
+    pub query_offsets: Operand,
     /// `[rows]` i32: the tokens each state row has seen, its new ones included.
-    pub seq_lens: TensorView,
+    pub seq_lens: Operand,
     /// `[rows]` i32: each row's request slot in the banks; negative for a padding row, whose state
     /// is neither read nor written.
-    pub slots: TensorView,
+    pub slots: Operand,
     /// `[rows]` i32: the absolute token count after which each row's state is kept in the checkpoint
     /// banks, a page boundary inside the row's tokens or at its end; zero for a row that keeps none.
-    pub checkpoints: TensorView,
+    pub checkpoints: Operand,
     /// The recurrent layers, in the model's order of them.
     pub layers: &'a [StateLayer<'a>],
 }
@@ -351,13 +351,13 @@ pub struct KvLayer<'a> {
     /// The layer's planes.
     pub planes: &'a KvPlanes,
     /// The paged program's transient scratch ([`KvView::workspace`]).
-    pub workspace: TensorView,
+    pub workspace: Operand,
 }
 
 /// What an encoder reads: token ids, the attention layout of their packed rows, and any media.
 pub struct EncoderInputs<'a> {
     /// `[tokens]` token ids, of the dtype the embedding's descriptor names.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// The batch's positions, lengths and cache writes.
     pub batch: TokenBatch,
     /// The images of a multimodal tower, empty for a text-only encoder.
@@ -377,7 +377,7 @@ pub struct EncoderInputs<'a> {
 #[derive(Clone, Copy)]
 pub struct ImageInput {
     /// `[tokens, pixels]` packed patches, or `[channels, height, width]` rasters.
-    pub pixels: TensorView,
+    pub pixels: Operand,
 }
 
 /// One image's patch grid, as a layout names it.
@@ -411,7 +411,7 @@ pub struct EncoderLayout {
 /// What an encoder writes.
 pub struct EncoderOutputs {
     /// `[tokens, width]` encoded hidden states.
-    pub hidden: TensorView,
+    pub hidden: Operand,
 }
 
 /// A request a denoiser's graph is captured with before any request of its layout arrives.
@@ -612,9 +612,9 @@ pub struct Seed(pub u64);
 #[derive(Clone, Copy)]
 pub struct Latents {
     /// `[channels, frames, height, width]` video latents.
-    pub video: TensorView,
+    pub video: Operand,
     /// `[channels, steps]` audio latents, when the task has audio.
-    pub audio: Option<TensorView>,
+    pub audio: Option<Operand>,
 }
 
 /// Where a piece of raw media anchors in the generated clip.
@@ -652,15 +652,15 @@ pub struct MediaInput {
     /// `[channels, frames, height, width]` pixels, in the encoder's own channel order and
     /// normalisation, when the condition is visual. One frame for a still, which is one latent
     /// frame.
-    pub pixels: Option<TensorView>,
+    pub pixels: Option<Operand>,
     /// Samples in the encoder's shape, when the condition carries a soundtrack.
-    pub audio: Option<TensorView>,
+    pub audio: Option<Operand>,
     /// The condition's anchoring draw: `[channels, frames, height, width]` at the piece's own latent
     /// raster, FP32, when the piece is visual.
     ///
     /// The runner owns it, as it owns every draw of the request's noise stream - and it is drawn at
     /// latent resolution, so the conditioner patchifies it rather than reading rows.
-    pub noise: Option<TensorView>,
+    pub noise: Option<Operand>,
 }
 
 /// One piece of a request's conditions, as the packed conditioning holds it.
@@ -757,14 +757,14 @@ impl PatchFormat {
 #[derive(Clone, Copy)]
 pub struct Conditioning<'a> {
     /// `[rows, width]` encoded text.
-    pub text: TensorView,
+    pub text: Operand,
     /// `[rows, width]` the text encoder's own features, when the model has a conditioner between the
     /// encoder and the denoiser: [`Denoiser::prepare_conditioning`] folds this into `text`.
     ///
     /// Both buffers are the runner's, sized to the request's text capacity, and the conditioner runs
     /// in place over `text`. `None` when the model has no conditioner, or for a task whose
     /// conditioning is nothing but the encoder's features.
-    pub source: Option<TensorView>,
+    pub source: Option<Operand>,
     /// The raw media the request's conditions are built from, in the request's own order.
     ///
     /// [`Denoiser::prepare_conditioning`] encodes these and writes the condition rows of `text`;
@@ -772,9 +772,9 @@ pub struct Conditioning<'a> {
     /// buffers and the encoders' arena is its own forward, reset after the call.
     pub media: &'a [MediaInput],
     /// `[rows, …]` encoded reference media, when the task has references.
-    pub images: Option<TensorView>,
+    pub images: Option<Operand>,
     /// `[rows, …]` encoded reference audio, when the task has audio references.
-    pub audio: Option<TensorView>,
+    pub audio: Option<Operand>,
 }
 
 /// One denoising step's schedule values.
@@ -817,12 +817,12 @@ pub struct DecodedMedia {
     /// the layers that place a decoded tile - the unpatchify, the seam blends and the byte step - read
     /// a planar raster. A decoder writes this layout and does not transpose; the caller that needs
     /// `[frames, height, width, channels]` for a file converts once, where it writes.
-    pub video: Option<TensorView>,
+    pub video: Option<Operand>,
     /// `[channels, samples]` FP32 waveform, one row per channel, at the decoder's own sample rate.
     ///
     /// Planar, as the vocoder computes it; the runtime interleaves and quantizes it into the PCM a
     /// container carries, so no decoder holds a media byte format.
-    pub audio: Option<TensorView>,
+    pub audio: Option<Operand>,
 }
 
 /// How an RGB raster's values relate to pixel intensities in `[0, 1]`: per channel, red, green,
@@ -844,7 +844,7 @@ pub struct PixelNorm {
 pub struct Placed {
     /// `[3, frames, rows, columns]` normalized frames, in the decoder's element type: a view of the
     /// clip's own decode or of a fade the splice reserved from the forward's arena.
-    pub raster: TensorView,
+    pub raster: Operand,
     /// The frame of the splice's destination, counted from [`Splice::first`], that the raster's first
     /// frame becomes.
     pub frame: u32,
@@ -947,7 +947,7 @@ pub trait Denoiser {
         f: &Forward,
         seed: Seed,
         piece: &ConditionPiece,
-        out: TensorView,
+        out: Operand,
     ) -> Result<()> {
         let _ = (f, seed, out);
         Err(Error::Unsupported(format!(
@@ -1055,9 +1055,9 @@ pub trait Decoder {
         &self,
         f: &crate::Forward,
         layout: &Layout,
-        trajectory: TensorView,
+        trajectory: Operand,
         first: u32,
-        block: TensorView,
+        block: Operand,
     ) -> Result<()> {
         let _ = (f, layout, trajectory, first, block);
         Err(Error::Unsupported(
@@ -1130,7 +1130,7 @@ pub trait Decoder {
         &self,
         f: &Forward,
         layout: &Layout,
-        latents: TensorView,
+        latents: Operand,
         out: DecodedMedia,
     ) -> Result<()>;
 }
@@ -1176,8 +1176,8 @@ pub trait Splicer {
     fn splice(
         &self,
         f: &Forward,
-        previous: Option<TensorView>,
-        clip: TensorView,
+        previous: Option<Operand>,
+        clip: Operand,
         splice: Splice,
     ) -> Result<Vec<Placed>>;
 }
@@ -1188,7 +1188,7 @@ pub trait Splicer {
 /// worker uploads the [`TokenBatch`] views), so no method here converts or gathers on the host.
 pub trait CausalLm {
     /// The embeddings of `ids`, `[tokens, hidden]` in the model's activation type.
-    fn embed_input_ids(&self, f: &Forward, ids: TensorView) -> Result<TensorView>;
+    fn embed_input_ids(&self, f: &Forward, ids: Operand) -> Result<Operand>;
 
     /// Run the decoder stack over `hidden`, the batch's embeddings, reading and writing `cache`,
     /// and answer the final normalized hidden state, `[tokens, hidden]`.
@@ -1197,14 +1197,14 @@ pub trait CausalLm {
         f: &Forward,
         batch: &TokenBatch,
         cache: &KvView<'_>,
-        hidden: TensorView,
-    ) -> Result<TensorView>;
+        hidden: Operand,
+    ) -> Result<Operand>;
 
     /// The logits of the rows of `hidden`, `[rows, vocabulary]` FP32.
     ///
     /// `hidden` is the `[rows, hidden]` view of the rows named by `TokenBatch::logits_rows`; the
     /// worker gathered them.
-    fn compute_logits(&self, f: &Forward, hidden: TensorView) -> Result<TensorView>;
+    fn compute_logits(&self, f: &Forward, hidden: Operand) -> Result<Operand>;
 
     /// Runs every expert layer of one step with no tokens of this rank's own.
     ///
@@ -1272,8 +1272,8 @@ pub trait Vision {
         &self,
         f: &Forward,
         grid: [u32; 3],
-        pixels: TensorView,
-        out: TensorView,
+        pixels: Operand,
+        out: Operand,
     ) -> Result<()>;
 }
 
@@ -1353,8 +1353,8 @@ mod batch_tests {
 
     use super::*;
 
-    fn view(dtype: DType, shape: &[u64]) -> TensorView {
-        TensorView::new(DevicePtr::new(0x3_0000), dtype, Shape::new(shape))
+    fn view(dtype: DType, shape: &[u64]) -> Operand {
+        Operand::new(DevicePtr::new(0x3_0000), dtype, Shape::new(shape))
     }
 
     /// A batch of `rows` sequences, one token each, over `page_size`-token pages.

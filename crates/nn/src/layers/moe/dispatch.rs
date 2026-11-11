@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use ops::TensorView;
+use ops::Operand;
 use ops::moe::exchange::ExchangeTransport;
 
 /// The received rows of one expert-parallel exchange, and the transport that moves them.
@@ -41,20 +41,20 @@ pub struct DispatchViews {
     /// this many, so the received views are read to `ranks * step_rows` rows. At most `rank_rows`.
     pub step_rows: u32,
     /// `[ranks * rank_rows, hidden]` in the activation element type: the dispatched activations.
-    pub states: TensorView,
+    pub states: Operand,
     /// `[ranks * rank_rows, top]` i32: the experts each received row is routed to.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[ranks * rank_rows, top]` f32: the router weights of each received row.
-    pub weights: TensorView,
+    pub weights: Operand,
     /// `[ranks * rank_rows, hidden]` in the activation element type: where this rank's experts leave
     /// each received row's sum, for the combine to return.
-    pub combined: TensorView,
+    pub combined: Operand,
     /// `[1]` i32: the leading rows of these views the running step holds.
-    pub live: TensorView,
+    pub live: Operand,
     /// `[rank_rows, hidden / 2]` u8: where a fused launch reads this rank's encoded rows.
-    pub packed: TensorView,
+    pub packed: Operand,
     /// `[rank_rows, hidden / 16]` block scales of those rows.
-    pub packed_scales: TensorView,
+    pub packed_scales: Operand,
     /// One launch runs the whole expert layer, so the layer sorts and multiplies nothing itself.
     pub fused: bool,
     /// This rank holds no experts: it sends routes and takes sums back, and computes nothing.
@@ -101,8 +101,8 @@ impl DispatchViews {
     #[must_use]
     pub fn narrowed(&self) -> Self {
         let rows = u64::from(self.ranks) * u64::from(self.step_rows);
-        let head = |view: TensorView| {
-            TensorView::new(
+        let head = |view: Operand| {
+            Operand::new(
                 view.ptr,
                 view.dtype,
                 crate::Shape::new(&[rows, view.shape.last()]),
@@ -179,17 +179,17 @@ mod tests {
             attention: 0,
             rank_rows,
             step_rows: rank_rows,
-            states: TensorView::new(base, DType::BF16, Shape::new(&[rows, hidden])),
-            ids: TensorView::new(base, DType::I32, Shape::new(&[rows, top])),
-            weights: TensorView::new(base, DType::F32, Shape::new(&[rows, top])),
-            combined: TensorView::new(base, DType::BF16, Shape::new(&[rows, hidden])),
-            live: TensorView::new(base, DType::I32, Shape::new(&[1])),
-            packed: TensorView::new(
+            states: Operand::new(base, DType::BF16, Shape::new(&[rows, hidden])),
+            ids: Operand::new(base, DType::I32, Shape::new(&[rows, top])),
+            weights: Operand::new(base, DType::F32, Shape::new(&[rows, top])),
+            combined: Operand::new(base, DType::BF16, Shape::new(&[rows, hidden])),
+            live: Operand::new(base, DType::I32, Shape::new(&[1])),
+            packed: Operand::new(
                 base,
                 DType::U8,
                 Shape::new(&[u64::from(rank_rows), hidden / 2]),
             ),
-            packed_scales: TensorView::new(
+            packed_scales: Operand::new(
                 base,
                 DType::F8E4M3,
                 Shape::new(&[u64::from(rank_rows), hidden / 16]),

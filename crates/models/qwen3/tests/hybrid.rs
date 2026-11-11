@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use nn::PhaseKind;
 use nn::capability::{KvGroup, KvPlanes, KvView, StateLayer, StateView, TokenBatch};
 use nn::family::{CacheShape, Model, Split, TextModel, TextPlacement};
-use nn::{Checkpoint, DType, Shape, TensorView, WeightLoader};
+use nn::{Checkpoint, DType, Shape, Operand, WeightLoader};
 
 /// The checkpoint the test reads, from `UNISERVE_QWEN36_MODEL`.
 fn checkpoint_root() -> PathBuf {
@@ -52,7 +52,7 @@ fn recorded_forward(
 ) -> BTreeSet<(String, String)> {
     let arena = nn::Arena::counting();
     let f = nn::Forward::recording(&arena);
-    let tensor = |dtype: DType, dims: &[u64]| -> TensorView {
+    let tensor = |dtype: DType, dims: &[u64]| -> Operand {
         arena
             .tensor(dtype, Shape::new(dims))
             .unwrap_or_else(|error| panic!("a counting arena holds any reservation: {error}"))
@@ -107,7 +107,7 @@ fn recorded_forward(
         dims.extend(&field.dims);
         tensor(field.dtype, &dims)
     };
-    let banks: Vec<(Vec<TensorView>, Vec<TensorView>)> = (0..shape.layers)
+    let banks: Vec<(Vec<Operand>, Vec<Operand>)> = (0..shape.layers)
         .map(|_| {
             (
                 shape.fields.iter().map(bank).collect(),
@@ -121,7 +121,7 @@ fn recorded_forward(
         dims.extend(&field.dims);
         tensor(field.dtype, &dims)
     };
-    let trails: Vec<Vec<TensorView>> = (0..shape.layers)
+    let trails: Vec<Vec<Operand>> = (0..shape.layers)
         .map(|_| shape.fields.iter().map(trail_bank).collect())
         .collect();
     let state_rows = match state {
@@ -160,12 +160,12 @@ fn recorded_forward(
 
 /// The planes of `cache`'s layers for `rows` rows of `row_pages` pages of `page_size` tokens.
 fn planes(
-    tensor: &dyn Fn(DType, &[u64]) -> TensorView,
+    tensor: &dyn Fn(DType, &[u64]) -> Operand,
     cache: CacheShape,
     rows: u64,
     page_size: u32,
     row_pages: u64,
-) -> (TensorView, Vec<KvPlanes>) {
+) -> (Operand, Vec<KvPlanes>) {
     let pages = rows * row_pages;
     let shape = [
         pages,
@@ -199,7 +199,7 @@ fn recorded_draft(
         .unwrap_or_else(|| panic!("the model loaded its drafter"));
     let arena = nn::Arena::counting();
     let f = nn::Forward::recording(&arena);
-    let tensor = |dtype: DType, dims: &[u64]| -> TensorView {
+    let tensor = |dtype: DType, dims: &[u64]| -> Operand {
         arena
             .tensor(dtype, Shape::new(dims))
             .unwrap_or_else(|error| panic!("a counting arena holds any reservation: {error}"))

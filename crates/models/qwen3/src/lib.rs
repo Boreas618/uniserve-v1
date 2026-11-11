@@ -34,7 +34,7 @@ pub use vision::VisionTower;
 pub use vl::Qwen3VlModel;
 
 use nn::layers::{Access, Copy};
-use nn::{Forward, Shape, TensorView};
+use nn::{Forward, Shape, Operand};
 
 /// What this crate can fail with.
 #[derive(Debug, thiserror::Error)]
@@ -74,7 +74,7 @@ impl From<Error> for nn::Error {
 /// # Errors
 ///
 /// Views of other extents, element types or layouts, or the copy's refusal.
-pub(crate) fn write(f: &Forward, source: TensorView, destination: TensorView) -> Result<()> {
+pub(crate) fn write(f: &Forward, source: Operand, destination: Operand) -> Result<()> {
     if source.shape != destination.shape
         || source.dtype != destination.dtype
         || source.shape.rank() != 2
@@ -103,7 +103,7 @@ fn block(shape: Shape) -> Shape {
 
 /// Copy the four-axis block `source` into `destination`, each read through its own strides; whole
 /// vectors move when every stride but the last, the row and both addresses allow it.
-pub(crate) fn copy_block(f: &Forward, source: TensorView, destination: TensorView) -> Result<()> {
+pub(crate) fn copy_block(f: &Forward, source: Operand, destination: Operand) -> Result<()> {
     // `copy_block`'s wide form: strides and the row in whole runs of 16 elements, 16-byte addresses.
     const WIDE: u64 = 16;
     let strides = destination.strides.as_slice();
@@ -112,7 +112,7 @@ pub(crate) fn copy_block(f: &Forward, source: TensorView, destination: TensorVie
         *slot = i64::try_from(*stride)
             .map_err(|_| Error::Config(format!("a copy stride of {stride}")))?;
     }
-    let aligned = |view: &TensorView| {
+    let aligned = |view: &Operand| {
         view.strides.as_slice()[..3]
             .iter()
             .all(|stride| stride.is_multiple_of(WIDE))

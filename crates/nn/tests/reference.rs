@@ -27,7 +27,7 @@ use nn::layers::{
     Epilogue, Gain, GateBias, GatedActivation, Halves, Linear, ResidualStream, RmsNorm, Rounding,
     WeightOrder,
 };
-use nn::{DType, TensorView};
+use nn::{DType, Operand};
 use ops::Tolerance;
 use ops::activation::Activation;
 
@@ -292,7 +292,7 @@ fn a_gated_silu_matches_the_host_product_in_every_rounding_order() -> Outcome {
         (Rounding::ValueProduct, 4.0),
     ] {
         let layer = GatedActivation::new(Activation::Silu, rounding, GateBias::None)?;
-        let gate_view: TensorView = bench.values(dtype, &dims, &gate)?;
+        let gate_view: Operand = bench.values(dtype, &dims, &gate)?;
         let value_view = bench.values(dtype, &dims, &value)?;
         let out = bench.run(&|f| {
             layer.forward(

@@ -16,7 +16,7 @@ use nn::layers::{
     VsaTables,
 };
 use nn::weights::{Scope, Weight};
-use nn::{Forward, Shape, TensorView, Transfer};
+use nn::{Forward, Shape, Operand, Transfer};
 
 use crate::attention::heads;
 use crate::config::TransformerConfig;
@@ -115,7 +115,7 @@ impl Sparse {
     pub fn start_gather(
         &self,
         f: &Forward,
-        gathered: TensorView,
+        gathered: Operand,
         own: u64,
         (first, count): (u64, u64),
     ) -> Result<Transfer> {
@@ -141,10 +141,10 @@ impl Sparse {
     pub(crate) fn forward(
         &self,
         f: &Forward,
-        normalized: TensorView,
+        normalized: Operand,
         factors: Factors,
         tables: &VsaTables,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         if self.exchanges() {
             let own = normalized.rows();
             let output = f.empty(normalized.dtype, normalized.shape)?;
@@ -170,7 +170,7 @@ impl Sparse {
     }
 
     /// `[rows, local heads, head_dim]` of a `[rows, local heads · head_dim]` view.
-    fn headed(&self, view: TensorView) -> Shape {
+    fn headed(&self, view: Operand) -> Shape {
         heads(view, self.ulysses.local_heads(), self.head_dim)
     }
 
@@ -186,10 +186,10 @@ impl Sparse {
     pub fn attend(
         &self,
         f: &Forward,
-        rows: TensorView,
+        rows: Operand,
         factors: Factors,
         tables: &VsaTables,
-    ) -> Result<(Branches, TensorView, Option<Transfer>)> {
+    ) -> Result<(Branches, Operand, Option<Transfer>)> {
         let ulysses = &self.ulysses;
         let normalized = rows;
         let ([query, key, value, gate], pending) =
@@ -235,9 +235,9 @@ impl Sparse {
     pub fn deliver(
         &self,
         f: &Forward,
-        (branches, gate, pending): (Branches, TensorView, Option<Transfer>),
+        (branches, gate, pending): (Branches, Operand, Option<Transfer>),
         own: u64,
-    ) -> Result<Vec<(Interval, TensorView, Transfer)>> {
+    ) -> Result<Vec<(Interval, Operand, Transfer)>> {
         let ulysses = &self.ulysses;
         if let Some(pending) = pending {
             ulysses.finish(f, pending)?;
@@ -273,8 +273,8 @@ impl Sparse {
     pub fn receive(
         &self,
         f: &Forward,
-        (_, landed, transfer): (Interval, TensorView, Transfer),
-        destination: TensorView,
+        (_, landed, transfer): (Interval, Operand, Transfer),
+        destination: Operand,
     ) -> Result<()> {
         Ok(self.ulysses.receive(f, transfer, landed, destination)?)
     }

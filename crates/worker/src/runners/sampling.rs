@@ -105,7 +105,7 @@ use ops::sampler::{
     OrderDescriptor, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor, TopLogprobsArgs,
     TopLogprobsDescriptor,
 };
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 use proto::program::sampler::PARAMETER_COLUMNS;
 
 use nn::Forward;
@@ -128,7 +128,7 @@ fn refused(owner: &'static str, problem: impl Into<String>) -> Error {
 /// row being sampled, the slot whose history penalizes the row, and the slot's counts.
 pub struct SamplerState {
     /// `[slots, vocabulary]` i32: how many times each slot has already seen each token.
-    pub counts: TensorView,
+    pub counts: Operand,
     /// `[rows, PARAMETER_COLUMNS]` f32: temperature, top-k width, top-p, min-p, repetition,
     /// frequency and presence in [`proto::program::sampler::PARAMETER_COLUMNS`] order.
     ///
@@ -138,48 +138,48 @@ pub struct SamplerState {
     /// see. This doc and `Sampler::check` are the only two places in this
     /// crate that know the count, and the check uses the constant, so a column added to the
     /// operators needs nothing here.
-    pub parameters: TensorView,
+    pub parameters: Operand,
     /// `[rows]` i32: the slot each row belongs to.
-    pub slots: TensorView,
+    pub slots: Operand,
     /// `[rows, extras]` i32 tokens counted besides the slot's own history, when the state carries
     /// any; `-1` counts nothing.
-    pub extras: Option<TensorView>,
+    pub extras: Option<Operand>,
     /// `[slots, vocabulary]` f32 the slots' bias rows ([`Sampling::bias`]).
-    pub bias: TensorView,
+    pub bias: Operand,
     /// `[rows, 2]` i32 each row's adjustments: its bias flag and its ban mask's index
     /// ([`Adjustments`]).
-    pub adjustments: TensorView,
+    pub adjustments: Operand,
     /// `[masks, ceil(vocabulary / 32)]` i32 the batch's ban masks.
-    pub bans: TensorView,
+    pub bans: Operand,
 }
 
 /// The candidate working set of one sampling step, reserved from the forward's arena.
 pub struct Candidates {
     /// `[rows, vocabulary]` f32 penalized, temperature-scaled logits.
-    pub shaped: TensorView,
+    pub shaped: Operand,
     /// `[rows, width]` f32 the kept candidate logits, descending.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[rows, width]` i32 the vocabulary ids of the candidates.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[rows, width]` f32 the candidates' probabilities, in the reference's token order.
-    pub probabilities: TensorView,
+    pub probabilities: Operand,
     /// `[rows, width]` f32 the filtered candidates in ascending token id order, whole to the width:
     /// the slots no candidate took hold `-inf`, which carries no mass.
-    pub ordered_values: TensorView,
+    pub ordered_values: Operand,
     /// `[rows, width]` i32 the ids of `ordered_values`, in the same order, whole to the width: the
     /// slots no candidate took hold `-1`, which is outside every vocabulary. A slot is therefore
     /// never memory nothing wrote, and it cannot read as the legitimate token `0`.
-    pub ordered_ids: TensorView,
+    pub ordered_ids: Operand,
     /// `[rows]` i32: 1 when the row's candidates form a usable distribution.
-    pub valid: TensorView,
+    pub valid: Operand,
     /// `[rows, 4 · width + 2 · TOP_K_BINS]` i32: the ordering's scratch, which `top_k` fills.
-    pub scratch: TensorView,
+    pub scratch: Operand,
     /// `[rows, vocabulary]` i32: the id space's counts, which `candidate_order` owns for a launch.
     ///
     /// It is the size of the vocabulary and not of the candidate row because the ordering counts
     /// ranks rather than comparing candidates: a deployment with top-k disabled orders a row as wide
     /// as the vocabulary, and the quadratic form of that comparison was sixteen seconds a token.
-    pub counts: TensorView,
+    pub counts: Operand,
 }
 
 impl Candidates {
@@ -203,7 +203,7 @@ impl Candidates {
 /// What one sampling step wrote.
 pub struct Samples {
     /// `[rows]` the sampled token of each row.
-    pub tokens: TensorView,
+    pub tokens: Operand,
     /// The scores of each sampled token, when the step reports them.
     pub scores: Option<Scores>,
 }
@@ -233,10 +233,10 @@ impl Samples {
 #[derive(Clone, Copy, Debug)]
 pub struct Scores {
     /// `[rows]` f32 the token's log-probability.
-    pub logprobs: TensorView,
+    pub logprobs: Operand,
     /// `[rows]` i32 the token's one-based competition rank in its row, `0` for a row whose token
     /// names no position (`ops::sampler::LogprobGather`).
-    pub ranks: TensorView,
+    pub ranks: Operand,
     /// The row's most likely tokens, when the sampler reports any.
     pub top: Option<TopLogprobs>,
 }
@@ -246,13 +246,13 @@ pub struct Scores {
 #[derive(Clone, Copy, Debug)]
 pub struct TopLogprobs {
     /// `[rows, n]` f32 the candidates' log-probabilities, descending.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[rows, n]` i32 the candidates' ids.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[rows, chunks · n]` f32 and i32: each chunk's candidates, which the first selection writes
     /// and the second reads.
-    pub chunk_values: TensorView,
-    pub chunk_ids: TensorView,
+    pub chunk_values: Operand,
+    pub chunk_ids: Operand,
 }
 
 impl TopLogprobs {
@@ -260,8 +260,8 @@ impl TopLogprobs {
     /// their chunks' views beside them, from `values` and `ids` and `arena`.
     pub fn with_chunks(
         f: &Forward,
-        values: TensorView,
-        ids: TensorView,
+        values: Operand,
+        ids: Operand,
         rows: u64,
         vocabulary: u32,
         candidates: u32,
@@ -315,7 +315,7 @@ impl Scores {
 
     /// The scores of rows `start..start + count`: the same buffers, narrowed to those rows.
     pub fn rows(&self, start: u64, count: u64) -> Result<Self> {
-        let narrow = |view: TensorView| view.narrow(0, start, count).map_err(Error::from);
+        let narrow = |view: Operand| view.narrow(0, start, count).map_err(Error::from);
         Ok(Self {
             logprobs: narrow(self.logprobs)?,
             ranks: narrow(self.ranks)?,
@@ -483,9 +483,9 @@ impl Sampler {
     pub fn forward(
         &self,
         f: &Forward,
-        logits: TensorView,
+        logits: Operand,
         state: &SamplerState,
-        draws: TensorView,
+        draws: Operand,
         samples: &Samples,
     ) -> Result<()> {
         let vocabulary = u64::from(self.vocabulary);
@@ -572,9 +572,9 @@ impl Sampler {
     fn shape(
         &self,
         f: &Forward,
-        logits: TensorView,
+        logits: Operand,
         state: &SamplerState,
-        out: TensorView,
+        out: Operand,
     ) -> Result<()> {
         let shape = self.shape_descriptor(logits.dtype);
         let args = ShapeArgs {
@@ -603,8 +603,8 @@ impl Sampler {
     fn report(
         &self,
         f: &Forward,
-        logits: TensorView,
-        scratch: TensorView,
+        logits: Operand,
+        scratch: Operand,
         samples: &Samples,
     ) -> Result<()> {
         let Some(scores) = samples.scores else {
@@ -616,7 +616,7 @@ impl Sampler {
 
     /// Write `log_softmax` of each row of `logits` into `out`, a `[rows, vocabulary]` f32 view:
     /// the raw distribution a row's scores are read from.
-    pub fn log_softmax(&self, f: &Forward, logits: TensorView, out: TensorView) -> Result<()> {
+    pub fn log_softmax(&self, f: &Forward, logits: Operand, out: Operand) -> Result<()> {
         let softmax = self.log_softmax_descriptor(logits.dtype);
         let args = LogSoftmaxArgs { x: logits, out };
 
@@ -631,8 +631,8 @@ impl Sampler {
     pub fn score(
         &self,
         f: &Forward,
-        logprobabilities: TensorView,
-        tokens: TensorView,
+        logprobabilities: Operand,
+        tokens: Operand,
         scores: &Scores,
     ) -> Result<()> {
         let rows = logprobabilities.rows();
@@ -822,7 +822,7 @@ impl Sampler {
     /// It is private because the two paths are the whole of this layer's interface — a caller does not
     /// choose a half-step — but it is one method so the two paths cannot disagree about what a valid
     /// step is.
-    fn check(&self, logits: TensorView, state: &SamplerState, samples: &Samples) -> Result<u64> {
+    fn check(&self, logits: Operand, state: &SamplerState, samples: &Samples) -> Result<u64> {
         let vocabulary = u64::from(self.vocabulary);
         logits
             .require_row("Sampler", logits.dtype, vocabulary)
@@ -976,7 +976,7 @@ impl Sampler {
     pub fn greedy(
         &self,
         f: &Forward,
-        logits: TensorView,
+        logits: Operand,
         state: &SamplerState,
         samples: &Samples,
     ) -> Result<()> {
@@ -1391,8 +1391,8 @@ impl CommitColumns {
     }
 
     /// The `[COMMIT_FIELDS, capacity]` i32 view the kernel reads.
-    pub(crate) fn table_view(&self) -> TensorView {
-        TensorView::with_strides(
+    pub(crate) fn table_view(&self) -> Operand {
+        Operand::with_strides(
             self.table.device.ptr,
             DType::I32,
             ops::Shape::new(&[proto::program::commit::COMMIT_FIELDS as u64, self.capacity]),
@@ -1501,13 +1501,13 @@ pub(crate) struct Sampling {
     /// `[slots, vocabulary]` i32 counts of the tokens each slot has already seen, which the
     /// penalties subtract; zeroed once when the runner binds, started for each request that takes
     /// a slot ([`Self::start_counts`]) and advanced by `ops::commit`.
-    pub(crate) counts: TensorView,
+    pub(crate) counts: Operand,
     pub(crate) _counts: platform::DeviceAllocation,
     /// `[slots, vocabulary]` f32 each slot's bias row: the logit bias of its request's biased
     /// tokens, `-inf` outside its allowed set, `0` elsewhere. Zeroed when the runner binds and
     /// written by [`Self::install`]; a row reads it only when the batch flags it, and the scheduler
     /// flags a request's rows only once a batch at or before them installed its row.
-    pub(crate) bias: TensorView,
+    pub(crate) bias: Operand,
     _bias: platform::DeviceAllocation,
     /// The bias table's pinned host image, one row per slot, which an install writes and copies
     /// from. A slot's row is rewritten only by the next install of that slot, which belongs to a
@@ -1579,7 +1579,7 @@ impl Sampling {
             )?;
         }
         stream.synchronize()?;
-        let counts = TensorView::new(
+        let counts = Operand::new(
             ops::DevicePtr::new(allocation.address()),
             DType::I32,
             ops::Shape::new(&[u64::from(slots), u64::from(vocabulary)]),
@@ -1595,7 +1595,7 @@ impl Sampling {
             platform::memset_d32(bias_allocation.address(), 0, words, stream)?;
         }
         stream.synchronize()?;
-        let bias = TensorView::new(
+        let bias = Operand::new(
             ops::DevicePtr::new(bias_allocation.address()),
             DType::F32,
             ops::Shape::new(&[u64::from(slots), u64::from(vocabulary)]),
@@ -1771,13 +1771,13 @@ mod tests {
     use ops::DevicePtr;
 
     /// A view of `shape` at a host address: these tests never launch, so the address is a marker.
-    fn view(shape: &[u64]) -> TensorView {
-        TensorView::new(DevicePtr::new(0x1000), DType::F32, Shape::new(shape))
+    fn view(shape: &[u64]) -> Operand {
+        Operand::new(DevicePtr::new(0x1000), DType::F32, Shape::new(shape))
     }
 
     /// The state's own rows — the slot counts, the slot ids and the extra tokens — are integers.
-    fn ints(shape: &[u64]) -> TensorView {
-        TensorView::new(DevicePtr::new(0x1000), DType::I32, Shape::new(shape))
+    fn ints(shape: &[u64]) -> Operand {
+        Operand::new(DevicePtr::new(0x1000), DType::I32, Shape::new(shape))
     }
 
     #[test]
@@ -1904,9 +1904,9 @@ mod tests {
             bans: ints(&[1, 32]),
         };
         let samples = Samples {
-            tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
+            tokens: Operand::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
             scores: Some(Scores {
-                logprobs: TensorView::new(DevicePtr::new(0x2000), DType::F32, Shape::new(&[2])),
+                logprobs: Operand::new(DevicePtr::new(0x2000), DType::F32, Shape::new(&[2])),
                 ranks: ints(&[2]),
                 top: None,
             }),
@@ -1920,7 +1920,7 @@ mod tests {
             (view(&[2, 512]), "1024"),
             (view(&[0, 1_024]), "one row"),
             (
-                TensorView::new(DevicePtr::new(0x1000), DType::I32, Shape::new(&[2, 1_024])),
+                Operand::new(DevicePtr::new(0x1000), DType::I32, Shape::new(&[2, 1_024])),
                 "f32, bf16 or f16",
             ),
         ] {
@@ -2042,7 +2042,7 @@ mod tests {
             bans: ints(&[1, 32]),
         };
         let samples = Samples {
-            tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
+            tokens: Operand::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
             scores: None,
         };
         assert_eq!(
@@ -2052,7 +2052,7 @@ mod tests {
         // The tokens a greedy step writes are whatever type the sampler declares, and a step whose
         // output is a different one is refused by name rather than launched into a wrong view.
         let narrow = Samples {
-            tokens: TensorView::new(DevicePtr::new(0x2000), DType::I64, Shape::new(&[2])),
+            tokens: Operand::new(DevicePtr::new(0x2000), DType::I64, Shape::new(&[2])),
             scores: None,
         };
         let text = format!(

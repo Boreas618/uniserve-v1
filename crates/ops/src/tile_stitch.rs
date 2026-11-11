@@ -28,7 +28,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView, row_writable};
+use crate::tensor::{DType, Shape, Operand, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -69,13 +69,13 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[tiles · token_rows, channels · patch_frames · patch_side²]`: each tile's tokens in turn.
-    pub tokens: TensorView,
+    pub tokens: Operand,
     /// `[height, 3]` i32: each raster row's tile row, its row inside that tile and its seam.
-    pub rows: TensorView,
+    pub rows: Operand,
     /// `[width, 3]` i32: each raster column's tile column, its column inside that tile and its seam.
-    pub columns: TensorView,
+    pub columns: Operand,
     /// `[channels, frames, height, width]`: the clip's raster.
-    pub out: TensorView,
+    pub out: Operand,
     /// Tiles in one row of the grid.
     pub tile_columns: u32,
     /// Token rows between one tile's tokens and the next's.

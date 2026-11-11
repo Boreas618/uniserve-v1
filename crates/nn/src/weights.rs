@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ops::fp4::ScaleLayout;
 use ops::values::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};
@@ -876,7 +876,7 @@ pub struct Weight {
     /// The read-only region the view addresses.
     pub backing: Backing,
     /// The view the operator reads.
-    pub view: TensorView,
+    pub view: Operand,
 }
 
 impl Weight {
@@ -887,7 +887,7 @@ impl Weight {
     /// # Errors
     ///
     /// A view whose element type has no whole-byte size.
-    pub fn borrowed(view: TensorView) -> Result<Self> {
+    pub fn borrowed(view: Operand) -> Result<Self> {
         let element = view.dtype.bytes().ok_or_else(|| {
             Error::weight(
                 "",
@@ -901,7 +901,7 @@ impl Weight {
     }
 
     /// The operator-facing view.
-    pub fn view(&self) -> TensorView {
+    pub fn view(&self) -> Operand {
         self.view
     }
 
@@ -932,7 +932,7 @@ impl Weight {
         let bytes = shape.dim(1) * element;
         Ok(Self {
             backing: self.backing,
-            view: TensorView::new(
+            view: Operand::new(
                 self.view.ptr.offset(row * bytes),
                 self.view.dtype,
                 Shape::new(&[shape.dim(1)]),

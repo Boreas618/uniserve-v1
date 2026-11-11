@@ -28,7 +28,7 @@ use std::fmt;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -93,27 +93,27 @@ impl fmt::Display for ModulatedRmsNormDescriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[rows, width]`, contiguous: the activation row the mean square reduces.
-    pub value: TensorView,
+    pub value: Operand,
     /// `[rows, width]`, contiguous; receives the residual `value + gate[i] · update`.
-    pub update: Option<TensorView>,
+    pub update: Option<Operand>,
     /// `[parameters, width]`, unit-strided per channel: the gates of the gated update.
-    pub gate: Option<TensorView>,
+    pub gate: Option<Operand>,
     /// `[width]`: the learned scale of the normalized row.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[parameters, width]`, unit-strided per channel: the per-row shift.
-    pub shift: TensorView,
+    pub shift: Operand,
     /// `[parameters, width]`, unit-strided per channel: the per-row scale offset.
-    pub scale: TensorView,
+    pub scale: Operand,
     /// `[rows]`: the parameter row of each activation row.
-    pub row_indices: TensorView,
+    pub row_indices: Operand,
     /// `[rows, width]`, contiguous, in the descriptor's output type.
-    pub out: TensorView,
+    pub out: Operand,
     /// `[rows]`, FP32: the E4M3 dequantization scale of each row, present exactly when `out` is
     /// E4M3.
-    pub output_scale: Option<TensorView>,
+    pub output_scale: Option<Operand>,
     /// `[rows, width]`, contiguous, in the descriptor's output type; receives the normalized
     /// source row when the descriptor retains it.
-    pub retain: Option<TensorView>,
+    pub retain: Option<Operand>,
 }
 
 /// The indexed RMS modulation of a diffusion block.
@@ -380,13 +380,13 @@ impl fmt::Display for GatedResidualDescriptor {
 #[derive(Clone, Copy)]
 pub struct GatedResidualArgs {
     /// `[rows, width]`, contiguous: the residual stream.
-    pub hidden: TensorView,
+    pub hidden: Operand,
     /// `[rows, width]`, contiguous; receives `hidden + gate[i] · update`.
-    pub update: TensorView,
+    pub update: Operand,
     /// `[parameters, width]`, unit-strided per channel: the per-row gates.
-    pub gate: TensorView,
+    pub gate: Operand,
     /// `[rows]`: the parameter row of each activation row.
-    pub row_indices: TensorView,
+    pub row_indices: Operand,
 }
 
 /// The gated residual of a diffusion block.

@@ -19,7 +19,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -48,13 +48,13 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[batch, channels, positions]`, contiguous.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[channels]`: each channel's factor.
-    pub scale: TensorView,
+    pub scale: Operand,
     /// `[channels]`: each channel's offset, added after the product.
-    pub shift: TensorView,
+    pub shift: Operand,
     /// `[batch, channels, positions]`, contiguous: the result; it may be `x` itself.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The per-channel affine map.

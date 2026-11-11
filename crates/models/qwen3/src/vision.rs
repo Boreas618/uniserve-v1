@@ -39,7 +39,7 @@ use nn::layers::{
     Residual, Rotary, RotarySpec, Spectrum, Varlen,
 };
 use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Forward, Shape, TensorView, Weight};
+use nn::{DType, Forward, Shape, Operand, Weight};
 use ops::position::{Args as InterpolateArgs, Descriptor as InterpolateDescriptor};
 use processing::qwen_vl::ProcessorConfig;
 
@@ -184,7 +184,7 @@ impl VisionLayer {
     fn forward(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        hidden: Operand,
         rope: RopeFactors<'_>,
         varlen: Varlen,
         gelu: Gelu,
@@ -251,7 +251,7 @@ impl PatchMerger {
     }
 
     /// `hidden`'s patch rows merged: `[patches / merge², out_hidden]`.
-    fn forward(&self, f: &Forward, hidden: TensorView, gelu: Gelu) -> Result<TensorView> {
+    fn forward(&self, f: &Forward, hidden: Operand, gelu: Gelu) -> Result<Operand> {
         let width = u64::from(self.width);
         let merged = Shape::new(&[hidden.numel() / width, width]);
         let normalized = if self.normalizes_merged {
@@ -400,8 +400,8 @@ impl VisionTower {
         &self,
         f: &Forward,
         grid: [u32; 3],
-        pixels: TensorView,
-    ) -> Result<(TensorView, Vec<TensorView>)> {
+        pixels: Operand,
+    ) -> Result<(Operand, Vec<Operand>)> {
         let [time, height, width] = grid;
         let (patches, _) = self.rows(grid)?;
         if pixels.shape.dims() != [patches, u64::from(self.config.tubelet())] {
@@ -486,10 +486,10 @@ impl VisionTower {
     fn interpolate(
         &self,
         f: &Forward,
-        taps: TensorView,
-        weights: TensorView,
+        taps: Operand,
+        weights: Operand,
         patches: u64,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         let out = f.empty(
             self.dtype,
             Shape::new(&[patches, u64::from(self.config.hidden_size)]),
@@ -587,8 +587,8 @@ impl Vision for VisionTower {
         &self,
         f: &Forward,
         grid: [u32; 3],
-        pixels: TensorView,
-        out: TensorView,
+        pixels: Operand,
+        out: Operand,
     ) -> nn::Result<()> {
         f.scoped(|f| {
             let (features, _) = self.forward(f, grid, pixels)?;

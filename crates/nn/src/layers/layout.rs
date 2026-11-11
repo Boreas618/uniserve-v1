@@ -12,7 +12,7 @@
 use ops::copy_block::{self, CopyBlock, RANK};
 use ops::patch::{self, Patch};
 use ops::unpatchify::{self, Unpatchify};
-use ops::{DType, TensorView};
+use ops::{DType, Operand};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -65,8 +65,8 @@ impl Copy {
     pub fn forward(
         &self,
         f: &Forward,
-        source: TensorView,
-        destination: TensorView,
+        source: Operand,
+        destination: Operand,
         destination_strides: &[i64; RANK],
     ) -> Result<()> {
         for (name, view) in [("source", source), ("destination", destination)] {
@@ -184,7 +184,7 @@ impl Patchify {
     ///
     /// A latent that is not whole patches, a patch other than `1 × 2 × 2` (the one the `patch`
     /// operator packs), an arena that cannot hold the tokens, or the operator's refusal.
-    pub fn forward(&self, f: &Forward, latent: TensorView) -> Result<TensorView> {
+    pub fn forward(&self, f: &Forward, latent: Operand) -> Result<Operand> {
         if (self.temporal, self.spatial) != (1, 2) {
             return Err(Error::shape(
                 "Patchify",
@@ -229,9 +229,9 @@ impl Patchify {
     pub fn inverse(
         &self,
         f: &Forward,
-        tokens: TensorView,
+        tokens: Operand,
         raster: ops::Shape,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         let [frames, height, width] = self.grid(raster)?;
         let count = u64::from(frames) * u64::from(height) * u64::from(width);
         if tokens.shape.rank() != 2

@@ -41,7 +41,7 @@
 
 use std::f64::consts::PI;
 
-use ops::TensorView;
+use ops::Operand;
 use ops::rope::{
     FactorsArgs, FactorsDescriptor, MAX_AXES, QkNormRope, QkNormRopeArgs, QkNormRopeDescriptor,
     RopeApply, RopeApplyArgs, RopeApplyDescriptor, RotaryFactors, Rotation,
@@ -586,8 +586,8 @@ pub struct RotarySpec {
 /// The per-head gains of a fused q/k norm: one `[head_dim]` weight for the queries, one for the keys.
 #[derive(Clone, Copy, Debug)]
 pub struct Gains {
-    pub query: TensorView,
-    pub key: TensorView,
+    pub query: Operand,
+    pub key: Operand,
 }
 
 /// The cosine and sine tables a batch's tokens turn by: `[tokens, columns]` each, of one element
@@ -595,9 +595,9 @@ pub struct Gains {
 #[derive(Clone, Copy, Debug)]
 pub struct Factors {
     /// The cosine of each token's angle per rotated pair.
-    pub cosine: TensorView,
+    pub cosine: Operand,
     /// The sine of each token's angle per rotated pair.
-    pub sine: TensorView,
+    pub sine: Operand,
 }
 
 /// One stack's rotary embedding: the published spectrum, the factors of a batch and the rotation.
@@ -740,7 +740,7 @@ impl Rotary {
     ///
     /// A rotation built without its spectrum ([`Self::new`]), positions that are not one coordinate
     /// per axis and token, an arena that cannot hold the tables, or the operator's refusal.
-    pub fn factors(&self, f: &Forward, positions: TensorView) -> Result<Factors> {
+    pub fn factors(&self, f: &Forward, positions: Operand) -> Result<Factors> {
         let columns = u64::from(self.columns());
         let axes = u64::from(self.axes());
         if self.spectrum.axes().is_some()
@@ -796,11 +796,11 @@ impl Rotary {
     pub fn forward(
         &self,
         f: &Forward,
-        query: TensorView,
-        key: TensorView,
+        query: Operand,
+        key: Operand,
         gains: Option<Gains>,
         factors: Factors,
-    ) -> Result<(TensorView, TensorView)> {
+    ) -> Result<(Operand, Operand)> {
         let Factors { cosine, sine } = factors;
         let head_dim = u64::from(self.spec.head_dim);
         let heads = u64::from(self.spec.heads);
@@ -916,8 +916,8 @@ impl Rotary {
     pub fn rotate(
         &self,
         f: &Forward,
-        query: TensorView,
-        key: TensorView,
+        query: Operand,
+        key: Operand,
         factors: Factors,
     ) -> Result<()> {
         let Factors { cosine, sine } = factors;

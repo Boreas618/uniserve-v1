@@ -21,7 +21,7 @@
 
 use nn::diffusion::Euler;
 use nn::weights::WeightLoader;
-use nn::{Forward, TensorView};
+use nn::{Forward, Operand};
 
 use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
@@ -71,8 +71,8 @@ impl Solver {
         &self,
         f: &Forward,
         modality: Modality,
-        (sample, velocity): (TensorView, TensorView),
-        (evaluation, index): (u32, TensorView),
+        (sample, velocity): (Operand, Operand),
+        (evaluation, index): (u32, Operand),
     ) -> Result<()> {
         let steps = self.steps(modality);
         if evaluation >= steps {
@@ -88,7 +88,7 @@ impl Solver {
     ///
     /// The released and distilled grids start from unit noise, where this does nothing; a
     /// parallel-decoding student scales by its first node's sigma.
-    pub fn start(&self, f: &Forward, modality: Modality, sample: TensorView) -> Result<()> {
+    pub fn start(&self, f: &Forward, modality: Modality, sample: Operand) -> Result<()> {
         Ok(self.euler(modality).prepare_latents(f, sample)?)
     }
 

@@ -8,7 +8,7 @@
 use nn::blocks::{GateUp, GatedMlp, GatedMlpSpec};
 use nn::family::Split;
 use nn::layers::Rounding;
-use nn::{Arena, Checkpoint, DType, Forward, Shape, TensorView, WeightLoader};
+use nn::{Arena, Checkpoint, DType, Forward, Shape, Operand, WeightLoader};
 use ops::activation::Activation;
 
 /// Runs `walk` with a capture sink installed and answers the operators it reported, in order.
@@ -51,13 +51,13 @@ fn checkpoint(directory: &std::path::Path, tensors: &[(&str, &[u64])]) -> Checkp
 }
 
 /// A view of `dims` BF16 elements reserved from `arena`.
-fn view(arena: &Arena, dims: &[u64]) -> TensorView {
+fn view(arena: &Arena, dims: &[u64]) -> Operand {
     arena.tensor(DType::BF16, Shape::new(dims)).unwrap()
 }
 
 /// Asserts that of everything a call reserved after `used` bytes of `arena`, only its answer is
 /// still held: the answer is the call's first reservation and ends at the arena's cursor.
-fn keeps_only(arena: &Arena, used: u64, answer: TensorView) {
+fn keeps_only(arena: &Arena, used: u64, answer: Operand) {
     let start = arena.base().address() + used.next_multiple_of(nn::forward::ALIGNMENT);
     assert_eq!(
         answer.ptr.address(),
@@ -567,7 +567,7 @@ use nn::blocks::{AdaLnBlock, AdaLnOut, AdaLnSpec, ModulationTable, RowModulation
 use nn::diffusion::{TimestepTable, TimestepTableSpec};
 
 /// The step's gathered modulation of `parameters` rows of `vectors` vectors each.
-fn modulation(arena: &Arena, parameters: u64, vectors: u64) -> TensorView {
+fn modulation(arena: &Arena, parameters: u64, vectors: u64) -> Operand {
     view(arena, &[parameters, vectors * HIDDEN])
 }
 
@@ -893,7 +893,7 @@ fn a_pre_norm_block_joins_each_update_in_its_residual_form() {
         let (last, launches) = launched(|| -> nn::Result<Pending> {
             let mut pending = None;
             for _ in 0..2 {
-                let attend = |input: TensorView| {
+                let attend = |input: Operand| {
                     attended.push((input.shape, input.dtype));
                     Ok(input)
                 };

@@ -24,7 +24,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -68,11 +68,11 @@ fn centred(key: Key, centred: bool) -> Key {
 #[derive(Clone, Copy)]
 pub struct RmsNormArgs {
     /// `[rows, columns]`.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[columns]`, the per-channel scale.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[rows, columns]`.
-    pub out: TensorView,
+    pub out: Operand,
     /// The variance floor.
     pub eps: f32,
 }
@@ -168,15 +168,15 @@ impl fmt::Display for AddRmsNormDescriptor {
 #[derive(Clone, Copy)]
 pub struct AddRmsNormArgs {
     /// `[rows, columns]`, this layer's output before the residual add.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[rows, columns]`, the residual stream.
-    pub residual: TensorView,
+    pub residual: Operand,
     /// `[columns]`, the per-channel scale.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[rows, columns]`, the normalized row.
-    pub out: TensorView,
+    pub out: Operand,
     /// `[rows, columns]`, the updated residual `x + residual`.
-    pub residual_out: TensorView,
+    pub residual_out: Operand,
     /// The variance floor.
     pub eps: f32,
 }
@@ -277,14 +277,14 @@ impl fmt::Display for GatedRmsNormDescriptor {
 #[derive(Clone, Copy)]
 pub struct GatedRmsNormArgs {
     /// `[rows, columns]`, contiguous: the rows normalized.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[rows, columns]`, contiguous: the gate each normalized element is multiplied by through a
     /// SiLU.
-    pub gate: TensorView,
+    pub gate: Operand,
     /// `[columns]`, the per-channel scale.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[rows, columns]`, contiguous: receives `x · rsqrt(mean(x²) + eps) · weight · silu(gate)`.
-    pub out: TensorView,
+    pub out: Operand,
     /// The variance floor.
     pub eps: f32,
 }
@@ -407,13 +407,13 @@ impl fmt::Display for LayerNormDescriptor {
 #[derive(Clone, Copy)]
 pub struct LayerNormArgs {
     /// `[rows, columns]`.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[columns]`, the per-channel scale.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[columns]`, the per-channel shift, when the descriptor declares one.
-    pub bias: Option<TensorView>,
+    pub bias: Option<Operand>,
     /// `[rows, columns]`.
-    pub out: TensorView,
+    pub out: Operand,
     /// The variance floor.
     pub eps: f32,
 }
@@ -535,9 +535,9 @@ impl fmt::Display for SoftmaxDescriptor {
 #[derive(Clone, Copy)]
 pub struct SoftmaxArgs {
     /// `[rows, columns]`.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[rows, columns]`.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// Softmax over the last axis: a row that sums to one.

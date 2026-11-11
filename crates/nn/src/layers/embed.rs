@@ -11,7 +11,7 @@
 //! with noise), and the embedding unpacks a prediction back into a raster with the same
 //! tokenization.
 
-use ops::TensorView;
+use ops::Operand;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -65,7 +65,7 @@ impl PatchEmbed {
     }
 
     /// The projection's weight, whose element type is the embedding's.
-    pub fn weight(&self) -> TensorView {
+    pub fn weight(&self) -> Operand {
         self.proj.weight()
     }
 
@@ -74,7 +74,7 @@ impl PatchEmbed {
     /// # Errors
     ///
     /// As [`Patchify::forward`].
-    pub fn patchify(&self, f: &Forward, latent: TensorView) -> Result<TensorView> {
+    pub fn patchify(&self, f: &Forward, latent: Operand) -> Result<Operand> {
         self.patchify.forward(f, latent)
     }
 
@@ -83,7 +83,7 @@ impl PatchEmbed {
     /// # Errors
     ///
     /// As [`Linear::forward`].
-    pub fn project(&self, f: &Forward, tokens: TensorView) -> Result<TensorView> {
+    pub fn project(&self, f: &Forward, tokens: Operand) -> Result<Operand> {
         self.proj.forward(f, tokens)
     }
 
@@ -96,9 +96,9 @@ impl PatchEmbed {
     pub fn unpatchify(
         &self,
         f: &Forward,
-        tokens: TensorView,
+        tokens: Operand,
         raster: ops::Shape,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         self.patchify.inverse(f, tokens, raster)
     }
 }

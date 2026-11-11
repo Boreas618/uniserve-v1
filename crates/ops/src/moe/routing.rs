@@ -27,7 +27,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, DevicePtr, Shape, TensorView};
+use crate::tensor::{DType, DevicePtr, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -83,16 +83,16 @@ impl fmt::Display for TopkDescriptor {
 #[derive(Clone, Copy)]
 pub struct TopkArgs {
     /// `[tokens, experts]` router scores, unit stride on the expert axis.
-    pub scores: TensorView,
+    pub scores: Operand,
     /// `[experts]` per-expert scale multiplied into the weights, when the descriptor has one.
-    pub scale: Option<TensorView>,
+    pub scale: Option<Operand>,
     /// `[tokens, top]` i32 expert ids, written.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[tokens, top]` FP32 route weights, written.
-    pub weights: TensorView,
+    pub weights: Operand,
     /// `[experts]` i32 weight row of each logical expert, when the block's experts are not in
     /// logical order: `ids` then holds rows.
-    pub map: Option<TensorView>,
+    pub map: Option<Operand>,
 }
 
 /// The router's softmax top-k.

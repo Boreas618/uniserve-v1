@@ -89,7 +89,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, DevicePtr, Shape, TensorView};
+use crate::tensor::{DType, DevicePtr, Shape, Operand};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -194,26 +194,26 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[tokens, q_heads, head_dim]` queries, row-major on the last axis.
-    pub query: TensorView,
+    pub query: Operand,
     /// `[pages, page_size, kv_heads, head_dim]` cached keys.
-    pub key: TensorView,
+    pub key: Operand,
     /// `[pages, page_size, kv_heads, head_dim]` cached values.
-    pub value: TensorView,
+    pub value: Operand,
     /// `[pages, 1, 1, 1]` f32: each page's key scale, required for a quantized `kv` and absent
     /// otherwise. The page holds `key / scale`, and the kernel multiplies it back in FP32.
-    pub key_scale: Option<TensorView>,
+    pub key_scale: Option<Operand>,
     /// `[pages, 1, 1, 1]` f32: each page's value scale, as `key_scale`.
-    pub value_scale: Option<TensorView>,
+    pub value_scale: Option<Operand>,
     /// `[batch, max_pages]` i32: each row's pages.
-    pub page_table: TensorView,
+    pub page_table: Operand,
     /// `[batch]` i32: keys visible to the row's last query.
-    pub seq_lens: TensorView,
+    pub seq_lens: Operand,
     /// `[batch + 1]` i32: packed query offsets; empty at decode.
-    pub cum_seq_lens_q: TensorView,
+    pub cum_seq_lens_q: Operand,
     /// `[tokens, q_heads, head_dim]` output.
-    pub out: TensorView,
+    pub out: Operand,
     /// `[bytes]` u8 transient workspace of the program, zeroed before its first use.
-    pub workspace: TensorView,
+    pub workspace: Operand,
     /// Softmax scale applied to `q · k` before the exponential.
     pub scale: f32,
     /// Inclusive history window in keys; `-1` for none.
@@ -1054,7 +1054,7 @@ impl PagedAttention {
                 )
             })
         };
-        let stride = |name: &str, view: &TensorView, axis: usize| -> Result<i32> {
+        let stride = |name: &str, view: &Operand, axis: usize| -> Result<i32> {
             word(name, view.strides.get(axis))
         };
 
@@ -1185,17 +1185,17 @@ fn quantized(dtype: DType) -> bool {
 /// the head axis as the row axis states `head_dim` where the program expects `heads * head_dim`, and
 /// one element where it expects `head_dim`, which walks every head of a row two bytes into the row
 /// and breaks the sixteen-byte vector loads the sm100 programs are compiled for.
-pub(super) fn row_stride(view: &TensorView) -> u64 {
+pub(super) fn row_stride(view: &Operand) -> u64 {
     axis_stride(view, 2)
 }
 
 /// The elements between consecutive heads of a `[rows, heads, dim]` view.
-pub(super) fn head_stride(view: &TensorView) -> u64 {
+pub(super) fn head_stride(view: &Operand) -> u64 {
     axis_stride(view, 1)
 }
 
 /// The stride of the axis `from_last` positions from the last, or `0` when the view has no such axis.
-fn axis_stride(view: &TensorView, from_last: usize) -> u64 {
+fn axis_stride(view: &Operand, from_last: usize) -> u64 {
     let rank = view.strides.rank();
     match rank.checked_sub(from_last + 1) {
         Some(axis) => view.strides.get(axis),
@@ -1220,7 +1220,7 @@ pub(super) const ATTENTION_ALIGNMENT: u64 = 16;
 pub(super) fn check_vector_alignment(
     operator: &'static str,
     name: &str,
-    view: &TensorView,
+    view: &Operand,
 ) -> Result<()> {
     // A four-bit element type packs two elements a byte, so "sixteen bytes" is not a whole number of
     // its elements and the packages that read one state their own alignment.
@@ -1468,7 +1468,7 @@ mod tests {
     /// because the program then walks heads two bytes apart and its vector loads fault.
     #[test]
     fn a_rows_strides_are_the_rows_and_not_the_head() {
-        let view = TensorView::new(
+        let view = Operand::new(
             DevicePtr::new(0x1_0000),
             DType::BF16,
             Shape::new(&[15, 32, 128]),
@@ -1481,14 +1481,14 @@ mod tests {
     /// sixteen-byte unit is refused before the launch, naming the operand.
     #[test]
     fn a_misaligned_operand_is_refused_by_name() {
-        let ok = TensorView::new(
+        let ok = Operand::new(
             DevicePtr::new(0x1_0000),
             DType::BF16,
             Shape::new(&[15, 32, 128]),
         );
         check_vector_alignment("test", "query", &ok).unwrap();
 
-        let odd_base = TensorView::new(
+        let odd_base = Operand::new(
             DevicePtr::new(0x1_0002),
             DType::BF16,
             Shape::new(&[15, 32, 128]),
@@ -1500,7 +1500,7 @@ mod tests {
         );
 
         // A row of 100 elements of bf16 is 200 bytes: every second row starts four bytes off.
-        let narrow = TensorView::new(DevicePtr::new(0x1_0000), DType::BF16, Shape::new(&[4, 100]));
+        let narrow = Operand::new(DevicePtr::new(0x1_0000), DType::BF16, Shape::new(&[4, 100]));
         let refusal = check_vector_alignment("test", "key", &narrow).unwrap_err();
         assert!(format!("{refusal}").contains("stride of 100"), "{refusal}");
     }

@@ -29,7 +29,7 @@ use nn::layers::{
     DenseAttention, DenseSpec, Factors, Gains, Rotary, UlyssesAttention, UlyssesSpec, Varlen,
 };
 use nn::weights::{Weight, WeightLoader};
-use nn::{Forward, Shape, TensorView};
+use nn::{Forward, Shape, Operand};
 
 use crate::attention_sparse::Sparse;
 use crate::config::{AttentionKind, TransformerConfig};
@@ -85,10 +85,10 @@ impl Layer {
     pub fn forward(
         &self,
         f: &Forward,
-        normalized: TensorView,
+        normalized: Operand,
         (rotary, factors): (&Rotary, Factors),
         visibility: &Visibility,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         match (self, visibility) {
             (Self::Dense(dense), Visibility::Dense(visible)) => {
                 dense.forward(f, normalized, rotary, factors, *visible)
@@ -160,16 +160,16 @@ impl Dense {
     fn forward(
         &self,
         f: &Forward,
-        normalized: TensorView,
+        normalized: Operand,
         rotary: &Rotary,
         factors: Factors,
         visible: Varlen,
-    ) -> Result<TensorView> {
+    ) -> Result<Operand> {
         let ulysses = &self.ulysses;
         let rows = ulysses.rows(f, normalized)?;
         let [query, key, value] = [0, 1, 2].map(|index| ulysses.project(f, index, rows));
         let headed =
-            |view: TensorView| view.reshape(heads(view, ulysses.local_heads(), self.head_dim));
+            |view: Operand| view.reshape(heads(view, ulysses.local_heads(), self.head_dim));
         let (query, key) = rotary.forward(
             f,
             headed(query?),
@@ -191,7 +191,7 @@ impl Dense {
 
 /// A `[tokens, heads · head_dim]` view as `[tokens, heads, head_dim]`, the token axis taken from the
 /// view's own element count (the exchanged and the local path differ in rows).
-pub(crate) fn heads(view: TensorView, count: u32, head_dim: u32) -> Shape {
+pub(crate) fn heads(view: Operand, count: u32, head_dim: u32) -> Shape {
     let width = u64::from(count) * u64::from(head_dim);
     Shape::new(&[
         view.shape.numel() / width.max(1),

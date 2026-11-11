@@ -13,7 +13,7 @@ use nn::capability::PixelNorm;
 use nn::layers::launch::PDL;
 use ops::pcm::{self, PcmInterleave as PcmInterleaveOp};
 use ops::rgb::{self, CHANNELS, RgbBytes as RgbBytesOp};
-use ops::{DType, Shape, TensorView};
+use ops::{DType, Shape, Operand};
 use platform::DeviceId;
 
 use crate::runners::columns::{Column, encode_f32};
@@ -54,8 +54,8 @@ impl RgbBytes {
     }
 
     /// The `[3]` view of the means or, at `offset` three, of the standard deviations.
-    fn constant(&self, offset: u64) -> TensorView {
-        TensorView::new(
+    fn constant(&self, offset: u64) -> Operand {
+        Operand::new(
             self.constants.device.offset_elements(offset),
             DType::F32,
             Shape::new(&[u64::from(CHANNELS)]),
@@ -65,7 +65,7 @@ impl RgbBytes {
     /// Map `input [3, frames, rows, columns]` into `out [frames, rows, columns, 3]` bytes.
     ///
     /// Every extent is the views': the two shapes must describe one raster.
-    pub(crate) fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+    pub(crate) fn forward(&self, f: &Forward, input: Operand, out: Operand) -> Result<()> {
         let channels = u64::from(CHANNELS);
         let shape = input.shape;
         if shape.rank() != 4 || shape.dim(0) != channels {
@@ -127,7 +127,7 @@ const PCM_CHANNELS: u64 = 2;
 /// The two channels are addressed through `planes`' own stride, so a view into a larger buffer
 /// works as it stands; the sample count is the planes' last extent. FP32 only, because that is the
 /// type `pcm_interleave` is compiled for.
-pub(crate) fn interleave_pcm(f: &Forward, planes: TensorView, out: TensorView) -> Result<()> {
+pub(crate) fn interleave_pcm(f: &Forward, planes: Operand, out: Operand) -> Result<()> {
     if planes.shape.rank() != 2 || planes.shape.dim(0) != PCM_CHANNELS {
         return Err(refused(
             "PcmInterleave",
@@ -157,12 +157,12 @@ pub(crate) fn interleave_pcm(f: &Forward, planes: TensorView, out: TensorView) -
     // The second channel's view starts one channel stride into the planes, which is what makes a
     // strided pair work without a copy.
     let element = 4;
-    let second = TensorView::new(
+    let second = Operand::new(
         planes.ptr.offset(planes.strides.get(0) * element),
         DType::F32,
         Shape::new(&[samples]),
     );
-    let first = TensorView::new(planes.ptr, DType::F32, Shape::new(&[samples]));
+    let first = Operand::new(planes.ptr, DType::F32, Shape::new(&[samples]));
     let descriptor = pcm::Descriptor {
         dtype: DType::F32,
         block: pcm::BLOCK,

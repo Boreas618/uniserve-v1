@@ -51,7 +51,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -59,13 +59,13 @@ use crate::{Error, Op, Result, Twins};
 #[derive(Clone, Copy)]
 pub struct RowColumns {
     /// `[rows + 1]` i32: packed offsets of each row's new tokens.
-    pub query_offsets: TensorView,
+    pub query_offsets: Operand,
     /// `[rows]` i32: tokens each row has seen, its new ones included.
-    pub seq_lens: TensorView,
+    pub seq_lens: Operand,
     /// `[rows]` i32: each row's slot in the state banks; negative for a padding row.
-    pub slots: TensorView,
+    pub slots: Operand,
     /// `[rows]` i32: the absolute token count each row keeps a checkpoint at, zero for none.
-    pub checkpoints: TensorView,
+    pub checkpoints: Operand,
 }
 
 impl RowColumns {
@@ -100,12 +100,12 @@ impl RowColumns {
 #[derive(Clone, Copy)]
 pub struct Trail {
     /// `[rows, dims…]`, contiguous, with a row for every token of the batch.
-    pub bank: TensorView,
+    pub bank: Operand,
 }
 
 /// The trail operand of a launch and the flag the kernel tests: the bank, or the state bank itself
 /// and a cleared flag when the batch keeps none, which the kernel then never writes.
-fn trail_operand(trail: Option<Trail>, state: TensorView) -> (TensorView, i32) {
+fn trail_operand(trail: Option<Trail>, state: Operand) -> (Operand, i32) {
     match trail {
         Some(trail) => (trail.bank, 1),
         None => (state, 0),
@@ -138,7 +138,7 @@ fn check_trail(
 fn check_bank(
     operator: &'static str,
     name: &str,
-    bank: &TensorView,
+    bank: &Operand,
     dtype: DType,
     dims: &[u64],
 ) -> Result<u64> {
@@ -186,18 +186,18 @@ impl fmt::Display for CausalConv1dDescriptor {
 #[derive(Clone, Copy)]
 pub struct CausalConv1dArgs {
     /// `[tokens, channels]`, unit-strided per channel, rows any stride apart: the projected inputs.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[channels, width]`, contiguous: each channel's taps, the oldest input's first.
-    pub weight: TensorView,
+    pub weight: Operand,
     /// `[tokens, channels]`, contiguous: receives the activated convolution.
-    pub out: TensorView,
+    pub out: Operand,
     /// The batch's rows.
     pub rows: RowColumns,
     /// `[slots, width − 1, channels]`, contiguous: each slot's last inputs, oldest first; read for a
     /// row that continues and overwritten with the row's last inputs.
-    pub state: TensorView,
+    pub state: Operand,
     /// `[slots, width − 1, channels]`, contiguous: receives a row's inputs before its checkpoint.
-    pub checkpoint: TensorView,
+    pub checkpoint: Operand,
     /// `[tokens, width − 1, channels]`: receives, for each token, the inputs up to and including
     /// it, when the batch keeps a trail.
     pub trail: Option<Trail>,
@@ -400,31 +400,31 @@ impl fmt::Display for GatedDeltaRuleDescriptor {
 pub struct GatedDeltaRuleArgs {
     /// `[tokens, key_heads, key_dim]`: the convolved queries, heads contiguous, rows `row_stride`
     /// elements apart.
-    pub query: TensorView,
+    pub query: Operand,
     /// `[tokens, key_heads, key_dim]`: the convolved keys, rows as the queries'.
-    pub key: TensorView,
+    pub key: Operand,
     /// `[tokens, value_heads, value_dim]`: the convolved values, rows as the queries'.
-    pub value: TensorView,
+    pub value: Operand,
     /// `[tokens, value_heads]`, unit-strided per head: the decay's input projection.
-    pub a: TensorView,
+    pub a: Operand,
     /// `[tokens, value_heads]`, unit-strided per head, rows as `a`'s: the step size's projection.
-    pub b: TensorView,
+    pub b: Operand,
     /// `[value_heads]`: the log of each head's decay rate.
-    pub a_log: TensorView,
+    pub a_log: Operand,
     /// `[value_heads]`: the bias of each head's time step.
-    pub dt_bias: TensorView,
+    pub dt_bias: Operand,
     /// The batch's rows.
     pub rows: RowColumns,
     /// `[slots, value_heads, key_dim, value_dim]` FP32, contiguous: each slot's state, read for a
     /// row that continues and overwritten with the state after the row's last token.
-    pub state: TensorView,
+    pub state: Operand,
     /// `[slots, value_heads, key_dim, value_dim]` FP32, contiguous: receives a row's checkpoint.
-    pub checkpoint: TensorView,
+    pub checkpoint: Operand,
     /// `[tokens, value_heads, key_dim, value_dim]` FP32: receives the state after each token, when
     /// the batch keeps a trail; only [`Form::Recurrent`] keeps one.
     pub trail: Option<Trail>,
     /// `[tokens, value_heads, value_dim]`, contiguous: receives `q̂ᵀS` after each token.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The gated delta rule over a batch of rows that continue from their slots' states; see the module

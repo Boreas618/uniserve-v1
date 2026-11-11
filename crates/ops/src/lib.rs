@@ -143,6 +143,6 @@ pub use platform::zero_bytes;
 pub use platform::{
     CollectiveType, Communicator, DeviceRange, PlatformDevicePtr, ReduceOp, Stream, collective_type,
 };
-pub use tensor::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
+pub use tensor::{DType, DevicePtr, MAX_RANK, Shape, Strides, Operand};
 pub use tolerance::Tolerance;
 pub use twins::{Twin, Twins};

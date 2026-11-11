@@ -24,7 +24,7 @@ use std::fmt;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -67,9 +67,9 @@ impl fmt::Display for ZeroPaddingDescriptor {
 pub struct ZeroPaddingArgs {
     /// `[tiles · tile_rows, heads, width]`, unit column stride; rows past a tile's valid size become
     /// zeros.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[tiles]` i32: the valid rows of each tile.
-    pub sizes: TensorView,
+    pub sizes: Operand,
 }
 
 /// Zero the rows of every tile past its valid size.
@@ -172,11 +172,11 @@ impl fmt::Display for AddGatedTilesDescriptor {
 #[derive(Clone, Copy)]
 pub struct AddGatedTilesArgs {
     /// `[tiles · tile_rows, heads, width]`, unit column stride; receives the gated compression.
-    pub output: TensorView,
+    pub output: Operand,
     /// `[heads, tiles, width]`, unit column stride: each tile's compression.
-    pub compressed: TensorView,
+    pub compressed: Operand,
     /// `[tiles · tile_rows, heads, width]`, unit column stride: the per-row gate.
-    pub gate: TensorView,
+    pub gate: Operand,
 }
 
 /// Add each tile's gated compression to its rows, in place.
@@ -314,13 +314,13 @@ impl fmt::Display for ComposeGatedRowsDescriptor {
 #[derive(Clone, Copy)]
 pub struct ComposeGatedRowsArgs {
     /// `[members, count, heads, width]`, contiguous: receives the members' gated rows.
-    pub output: TensorView,
+    pub output: Operand,
     /// `[members · owner_rows, heads, width]`, unit column stride: the fine rows of every member.
-    pub fine: TensorView,
+    pub fine: Operand,
     /// `[heads, tiles, width]`, unit column stride: each tile's compression.
-    pub compressed: TensorView,
+    pub compressed: Operand,
     /// `[members · owner_rows, heads, width]`, unit column stride: the per-row gate.
-    pub gate: TensorView,
+    pub gate: Operand,
     /// Rows one member owns in `fine` and `gate`.
     pub owner_rows: u64,
     /// First row of the interval within each member's rows.
@@ -508,17 +508,17 @@ impl fmt::Display for SelectTilesDescriptor {
 #[derive(Clone, Copy)]
 pub struct SelectTilesArgs {
     /// `[heads, query tiles, tiles]` FP32, contiguous: the pooled (query tile, key tile) scores.
-    pub scores: TensorView,
+    pub scores: Operand,
     /// `[tiles]` i32: the segment of each key tile.
-    pub segments: TensorView,
+    pub segments: Operand,
     /// `[tiles]` i32: the valid rows of each key tile.
-    pub sizes: TensorView,
+    pub sizes: Operand,
     /// `[segments]` i32: how many tiles of each segment to keep.
-    pub keep: TensorView,
+    pub keep: Operand,
     /// `[heads, query tiles, tiles]` i32: receives each query tile's key tiles, kept first.
-    pub indices: TensorView,
+    pub indices: Operand,
     /// `[heads, query tiles]` i32: receives each query tile's kept-tile count.
-    pub counts: TensorView,
+    pub counts: Operand,
     /// The sequence tile of the scores' first query tile.
     pub query_offset: u64,
 }
@@ -708,27 +708,27 @@ impl fmt::Display for PrepareTilesDescriptor {
 pub struct PrepareTilesArgs {
     /// `[tiles · tile_rows, heads, width]`, unit column stride: the query rows, normalized and
     /// rotated in place.
-    pub query: TensorView,
+    pub query: Operand,
     /// The key rows, of the query's shape.
-    pub key: TensorView,
+    pub key: Operand,
     /// The value rows, of the query's shape.
-    pub value: TensorView,
+    pub value: Operand,
     /// `[width]`: the Q normalization weight, present exactly when the descriptor normalizes.
-    pub query_weight: Option<TensorView>,
+    pub query_weight: Option<Operand>,
     /// `[width]`: the K normalization weight, on the same condition.
-    pub key_weight: Option<TensorView>,
+    pub key_weight: Option<Operand>,
     /// `[rows, rotated / 2]`: the cosine factor table, on the same condition.
-    pub cosine: Option<TensorView>,
+    pub cosine: Option<Operand>,
     /// `[rows, rotated / 2]`: the sine factor table, on the same condition.
-    pub sine: Option<TensorView>,
+    pub sine: Option<Operand>,
     /// `[tiles]` i32: the valid rows of each tile.
-    pub sizes: TensorView,
+    pub sizes: Operand,
     /// `[tiles, heads, width]` FP32, contiguous: receives the query tiles' means.
-    pub pooled_query: TensorView,
+    pub pooled_query: Operand,
     /// Receives the key tiles' means.
-    pub pooled_key: TensorView,
+    pub pooled_key: Operand,
     /// Receives the value tiles' means.
-    pub pooled_value: TensorView,
+    pub pooled_value: Operand,
 }
 
 /// Normalize, rotate, zero and pool whole tiles of projected Q/K/V rows.
@@ -935,7 +935,7 @@ fn check_rows(
     dtype: DType,
     heads: u32,
     width: u32,
-    view: &TensorView,
+    view: &Operand,
 ) -> Result<()> {
     view.require_rank(operator, 3)?;
     if view.shape.dim(1) != u64::from(heads) || view.shape.dim(2) != u64::from(width) {
@@ -981,7 +981,7 @@ fn check_block(operator: &'static str, tile_rows: u32, block_rows: u32) -> Resul
 }
 
 /// A stride the kernel takes as an `int32`.
-fn stride(view: &TensorView, axis: usize) -> Result<i32> {
+fn stride(view: &Operand, axis: usize) -> Result<i32> {
     let stride = view.strides.get(axis);
     i32::try_from(stride)
         .map_err(|_| Error::Shape(format!("the stride {stride} does not fit int32")))
@@ -1033,11 +1033,11 @@ impl fmt::Display for ScoresDescriptor {
 pub struct ScoresArgs {
     /// `[query tiles, heads, width]` FP32: the pooled query rows, in the layout
     /// `vsa_prepare_tiles` writes them.
-    pub pooled_query: TensorView,
+    pub pooled_query: Operand,
     /// `[tiles, heads, width]` FP32: the pooled key rows, in that same layout.
-    pub pooled_key: TensorView,
+    pub pooled_key: Operand,
     /// `[heads, query tiles, tiles]` FP32: one dot product per (query tile, key tile).
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The query tiles one program of `vsa_scores` and `vsa_compress_pooled` holds: their packages' own
@@ -1274,18 +1274,18 @@ impl fmt::Display for CompressPooledDescriptor {
 #[derive(Clone, Copy)]
 pub struct CompressPooledArgs {
     /// `[heads, query tiles, tiles]` FP32: the pooled similarities, in `vsa_scores`' layout.
-    pub scores: TensorView,
+    pub scores: Operand,
     /// `[tiles, heads, width]` FP32: the pooled value rows, in `vsa_prepare_tiles`' layout.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[tiles]` i32: the live rows of each key tile.
     ///
     /// A tile of no live rows is invisible to the softmax — its score is masked, not merely zeroed —
     /// because a zeroed pooled value under a live score would still take weight and scale the sum
     /// of the others down.
-    pub sizes: TensorView,
+    pub sizes: Operand,
     /// `[heads, query tiles, width]` in the descriptor's element type: each query tile's
     /// tile-weighted mean of the pooled value rows, which `vsa_add_gated_tiles` gates and adds.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The compression branch of VSA: each query tile's softmax over the live key tiles weights their

@@ -1144,12 +1144,12 @@ impl CachePlanes {
     /// The state group's checkpoint planes, one view per field run: `[columns · units, plane_bytes]`
     /// bytes, plane `(column, unit)` at row `column · units + unit`, as the K/V planes lay their
     /// cells out. Empty for a pool without a state group.
-    pub fn state_views(&self) -> Vec<ops::TensorView> {
+    pub fn state_views(&self) -> Vec<ops::Operand> {
         let cells = u64::from(self.plan.columns) * u64::from(self.num_units);
         self.state
             .iter()
             .map(|storage| {
-                ops::TensorView::new(
+                ops::Operand::new(
                     ops::DevicePtr::new(storage.address()),
                     ops::DType::U8,
                     ops::Shape::new(&[cells, self.plan.plane_bytes]),

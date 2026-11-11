@@ -332,7 +332,7 @@ impl PrefixCache {
 
     /// The state group's checkpoint planes, one `[columns · units, plane_bytes]` byte view per field
     /// run ([`CachePlanes::state_views`]).
-    pub fn state_views(&self) -> Vec<ops::TensorView> {
+    pub fn state_views(&self) -> Vec<ops::Operand> {
         self.planes.state_views()
     }
 

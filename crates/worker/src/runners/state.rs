@@ -32,7 +32,7 @@ use nn::{Forward, StateLayer, StateView};
 use ops::block_copy::{
     BlockShape, COPY_BLOCK, CacheBlockScatter, CacheBlockSnapshot, ScatterArgs, SnapshotArgs,
 };
-use ops::{DType, DevicePtr, Shape, Strides, TensorView};
+use ops::{DType, DevicePtr, Shape, Strides, Operand};
 use platform::{Buffer, DeviceId, PoolKind};
 
 use crate::arena::Pools;
@@ -49,7 +49,7 @@ const RING: usize = 4;
 #[derive(Clone)]
 struct Pages {
     /// Each field run's planes, `[columns · units, plane_bytes]` bytes.
-    runs: Vec<TensorView>,
+    runs: Vec<Operand>,
     /// The pool's columns.
     columns: u32,
     /// The pool's units, the sentinel included.
@@ -70,11 +70,11 @@ pub fn bank_bytes(shape: &StateShape, slots: u32, trail: u32) -> u64 {
 #[derive(Clone, Copy)]
 pub(crate) struct StateRows {
     /// `[rows + 1]` i32 packed token offsets.
-    pub(crate) query_offsets: TensorView,
+    pub(crate) query_offsets: Operand,
     /// `[rows]` i32 tokens each row has seen.
-    pub(crate) seq_lens: TensorView,
+    pub(crate) seq_lens: Operand,
     /// `[rows]` i32 each row's slot.
-    pub(crate) slots: TensorView,
+    pub(crate) slots: Operand,
     /// The rows.
     pub(crate) count: u64,
 }
@@ -220,10 +220,10 @@ impl StateBanks {
     }
 
     /// A `[rows, dims…]` view of `buffer` in `field`'s type.
-    fn rows_of(buffer: &Buffer, field: &StateField, rows: u64) -> TensorView {
+    fn rows_of(buffer: &Buffer, field: &StateField, rows: u64) -> Operand {
         let mut dims = vec![rows];
         dims.extend(&field.dims);
-        TensorView::new(
+        Operand::new(
             DevicePtr::new(buffer.address()),
             field.dtype,
             Shape::new(&dims),
@@ -231,8 +231,8 @@ impl StateBanks {
     }
 
     /// A bank's bytes, one row per slot.
-    fn bank_bytes(&self, buffer: &Buffer, field: &StateField) -> TensorView {
-        TensorView::new(
+    fn bank_bytes(&self, buffer: &Buffer, field: &StateField) -> Operand {
+        Operand::new(
             DevicePtr::new(buffer.address()),
             DType::U8,
             Shape::new(&[self.rows, field.bytes()]),
@@ -258,14 +258,14 @@ impl StateBanks {
                     .into(),
             ));
         }
-        let bound = |banks: &[Buffer], rows: u64| -> Vec<TensorView> {
+        let bound = |banks: &[Buffer], rows: u64| -> Vec<Operand> {
             banks
                 .iter()
                 .zip(&self.shape.fields)
                 .map(|(buffer, field)| Self::rows_of(buffer, field, rows))
                 .collect()
         };
-        let views: Vec<(Vec<TensorView>, Vec<TensorView>, Vec<TensorView>)> = (0..self.live.len())
+        let views: Vec<(Vec<Operand>, Vec<Operand>, Vec<Operand>)> = (0..self.live.len())
             .map(|layer| {
                 (
                     bound(&self.live[layer], self.rows),
@@ -384,7 +384,7 @@ impl StateBanks {
     }
 
     /// The descriptor of a copy over `field`, a `[blocks, width]` byte view.
-    fn shape_of(field: &TensorView) -> BlockShape {
+    fn shape_of(field: &Operand) -> BlockShape {
         BlockShape {
             dtype: DType::U8,
             shape: field.shape,
@@ -446,7 +446,7 @@ impl StateBanks {
 
         for (index, cells) in plans.iter().enumerate() {
             let at = index as u64 * stride;
-            let slot = TensorView::new(base.offset_elements(at), DType::I64, Shape::new(&[1]));
+            let slot = Operand::new(base.offset_elements(at), DType::I64, Shape::new(&[1]));
             match direction {
                 StateDirection::Keep => {
                     self.banks_to_snapshot(f, slot)?;
@@ -468,8 +468,8 @@ impl StateBanks {
     }
 
     /// The snapshot's view of one field's planes: `[1, bytes]` from its first plane.
-    fn snapshot_field(&self, planes: StatePlanes) -> TensorView {
-        TensorView::new(
+    fn snapshot_field(&self, planes: StatePlanes) -> Operand {
+        Operand::new(
             DevicePtr::new(
                 self.snapshot.address() + u64::from(planes.first_plane) * self.plane_bytes,
             ),
@@ -479,7 +479,7 @@ impl StateBanks {
     }
 
     /// Gathers slot `slot`'s checkpoint banks into the snapshot, field by field.
-    fn banks_to_snapshot(&self, f: &Forward<'_>, slot: TensorView) -> Result<()> {
+    fn banks_to_snapshot(&self, f: &Forward<'_>, slot: Operand) -> Result<()> {
         for (layer, kept) in self.kept.iter().enumerate() {
             for ((buffer, field), planes) in
                 kept.iter().zip(&self.shape.fields).zip(&self.planes[layer])
@@ -499,7 +499,7 @@ impl StateBanks {
     }
 
     /// Scatters the snapshot into slot `slot`'s live banks, field by field.
-    fn snapshot_to_banks(&self, f: &Forward<'_>, slot: TensorView) -> Result<()> {
+    fn snapshot_to_banks(&self, f: &Forward<'_>, slot: Operand) -> Result<()> {
         for (layer, live) in self.live.iter().enumerate() {
             for ((buffer, field), planes) in
                 live.iter().zip(&self.shape.fields).zip(&self.planes[layer])
@@ -523,7 +523,7 @@ impl StateBanks {
     fn snapshot_to_pages(
         &self,
         f: &Forward<'_>,
-        base: TensorView,
+        base: Operand,
         first: u64,
         cells: &[(usize, i64)],
         into: bool,
@@ -540,12 +540,12 @@ impl StateBanks {
                 *self.pages.runs.get(run).ok_or_else(|| {
                     Error::Invariant(format!("a state page reaches field run {run}"))
                 })?;
-            let blocks = TensorView::new(
+            let blocks = Operand::new(
                 base.offset_elements(first + start as u64),
                 DType::I64,
                 Shape::new(&[count]),
             );
-            let snapshot = TensorView::new(
+            let snapshot = Operand::new(
                 DevicePtr::new(self.snapshot.address() + start as u64 * self.plane_bytes),
                 DType::U8,
                 Shape::new(&[count, self.plane_bytes]),

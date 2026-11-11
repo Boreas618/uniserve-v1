@@ -25,7 +25,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Strides, TensorView};
+use crate::tensor::{DType, Strides, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -80,9 +80,9 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[rows, columns]`, contiguous: the values to activate.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[rows, columns]`, contiguous, in the descriptor's element type.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The Gaussian error linear unit.

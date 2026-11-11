@@ -31,7 +31,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -96,9 +96,9 @@ impl fmt::Display for Descriptor {
 #[derive(Clone, Copy)]
 pub struct Args {
     /// The latent `[channels, frames, height, width]`.
-    pub x: TensorView,
+    pub x: Operand,
     /// The packed rows `[rows, channels · 4]`, `rows = frames · height/2 · width/2`.
-    pub out: TensorView,
+    pub out: Operand,
     /// Frames in the latent; the packed row count is `frames · rows_per_frame`.
     pub frames: u32,
     /// The latent's channels: `channels · 4` is a row's width.
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn a_row_is_the_channels_patch_and_a_frame_is_one_raster_of_them() {
         let view = |shape: &[u64]| {
-            TensorView::with_strides(
+            Operand::with_strides(
                 DevicePtr::new(0x1000),
                 DType::BF16,
                 Shape::new(shape),

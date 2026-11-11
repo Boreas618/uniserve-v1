@@ -37,7 +37,7 @@
 //! and so possibly the kernel a product selects, which is not provably the served arithmetic.
 
 use ops::tile_stitch::{self, TileStitch};
-use ops::{DType, Shape, Strides, TensorView};
+use ops::{DType, Shape, Strides, Operand};
 
 use crate::capability::Splice;
 use crate::error::{Error, Result};
@@ -308,11 +308,11 @@ pub fn voxels(tiles: &[Tile], frames: u32, height: u32, width: u32) -> Vec<u32> 
 pub fn gather(
     f: &Forward,
     tiles: &[Tile],
-    trajectory: TensorView,
+    trajectory: Operand,
     channels: u32,
     (height, width): (u32, u32),
     (first, frames): (u32, u32),
-) -> Result<TensorView> {
+) -> Result<Operand> {
     let channels = u64::from(channels);
     let (height, width) = (u64::from(height), u64::from(width));
     let plane = height * width;
@@ -347,14 +347,14 @@ pub fn gather(
         let (left, columns) = (u64::from(tile.columns.0), u64::from(tile.columns.1));
         let shape = Shape::new(&[channels, frames, rows, columns]);
         let start = u64::from(first) * plane + top * width + left;
-        let source = TensorView::with_strides(
+        let source = Operand::with_strides(
             trajectory.offset_elements(start),
             trajectory.dtype,
             shape,
             Strides::new(&[voxels, plane, width, 1]),
         );
         let strides = [1, rows * columns * channels, columns * channels, channels];
-        let destination = TensorView::with_strides(
+        let destination = Operand::with_strides(
             block.offset_elements(row * channels),
             block.dtype,
             shape,
@@ -434,9 +434,9 @@ impl Blend {
     pub fn forward(
         &self,
         f: &Forward,
-        previous: TensorView,
-        current: TensorView,
-    ) -> Result<TensorView> {
+        previous: Operand,
+        current: Operand,
+    ) -> Result<Operand> {
         let out = f.empty(self.dtype, previous.shape)?;
         self.launch(f, previous, current, out)?;
         Ok(out)
@@ -447,9 +447,9 @@ impl Blend {
     fn launch(
         &self,
         f: &Forward,
-        previous: TensorView,
-        current: TensorView,
-        out: TensorView,
+        previous: Operand,
+        current: Operand,
+        out: Operand,
     ) -> Result<()> {
         match self.axis {
             Axis::Rows | Axis::Columns => {
@@ -482,9 +482,9 @@ impl Blend {
     fn frames(
         &self,
         f: &Forward,
-        previous: TensorView,
-        current: TensorView,
-        out: TensorView,
+        previous: Operand,
+        current: Operand,
+        out: Operand,
     ) -> Result<()> {
         const OWNER: &str = "Blend";
         let extent = u64::from(self.extent);
@@ -512,8 +512,8 @@ impl Blend {
             let bytes = self.dtype.encode(&[value]).map_err(Error::from)?;
             Ok(self.dtype.decode(&bytes).map_err(Error::from)?[0])
         };
-        let frame = |view: TensorView, channel: u64, index: u64| {
-            TensorView::new(
+        let frame = |view: Operand, channel: u64, index: u64| {
+            Operand::new(
                 view.element(&[channel, index, 0, 0]),
                 view.dtype,
                 Shape::new(&[1, pixels]),
@@ -708,8 +708,8 @@ impl TiledEncode {
         &self,
         f: &Forward,
         (channels, frames): (u64, u64),
-        mut encode: impl FnMut(usize) -> Result<TensorView>,
-    ) -> Result<TensorView> {
+        mut encode: impl FnMut(usize) -> Result<Operand>,
+    ) -> Result<Operand> {
         const OWNER: &str = "TiledEncode";
         let (rank, ranks) = f
             .split()
@@ -732,7 +732,7 @@ impl TiledEncode {
             1 => own,
             _ => f.empty(self.dtype, stack(share * ranks))?,
         };
-        let block_of = |stack: TensorView, index: usize| {
+        let block_of = |stack: Operand, index: usize| {
             stack
                 .at(stack.offset_elements(index as u64 * elements))
                 .reshape(block)
@@ -800,7 +800,7 @@ impl TiledEncode {
     /// Place the run's first tile, which has no neighbour to fade against: its block is copied
     /// into the raster unchanged, as the reference's tile assembly copies a tile with no tile above
     /// or to its left.
-    fn place_first(&self, f: &Forward, tile: TensorView, out: TensorView) -> Result<()> {
+    fn place_first(&self, f: &Forward, tile: Operand, out: Operand) -> Result<()> {
         // `out` addresses the tile's region of the raster at the raster's strides.
         let strides: [i64; 4] = std::array::from_fn(|axis| out.strides.get(axis) as i64);
         self.first.forward(f, tile, out, &strides)
@@ -822,7 +822,7 @@ impl TiledEncode {
 }
 
 /// A view of `raster` holding `tile`'s block at the tile's place, at the raster's strides.
-fn place(raster: TensorView, tile: &Tile, block: Shape) -> Result<TensorView> {
+fn place(raster: Operand, tile: &Tile, block: Shape) -> Result<Operand> {
     let (rows, columns) = (u64::from(tile.rows.0), u64::from(tile.columns.0));
     if rows + block.dim(2) > raster.shape.dim(2) || columns + block.dim(3) > raster.shape.dim(3) {
         return Err(Error::shape(
@@ -834,7 +834,7 @@ fn place(raster: TensorView, tile: &Tile, block: Shape) -> Result<TensorView> {
             ),
         ));
     }
-    Ok(TensorView::with_strides(
+    Ok(Operand::with_strides(
         raster.element(&[0, 0, rows, columns]),
         raster.dtype,
         Shape::new(&[
@@ -909,8 +909,8 @@ impl TiledDecode {
         grid: &Grid,
         token_rows: u64,
         raster: Shape,
-        decode: impl FnOnce() -> Result<TensorView>,
-    ) -> Result<TensorView> {
+        decode: impl FnOnce() -> Result<Operand>,
+    ) -> Result<Operand> {
         const OWNER: &str = "TiledDecode";
         if raster.rank() != 4 || raster.dim(0) != u64::from(self.descriptor.channels) {
             return Err(Error::shape(
@@ -951,12 +951,12 @@ impl TiledDecode {
                 ));
             }
             let (tile_rows, tile_columns) = grid.tile(1);
-            let row_table = TensorView::new(
+            let row_table = Operand::new(
                 table.offset_elements(0),
                 table.dtype,
                 Shape::new(&[height, tile_stitch::TABLE_WIDTH]),
             );
-            let column_table = TensorView::new(
+            let column_table = Operand::new(
                 table.offset_elements(height * tile_stitch::TABLE_WIDTH),
                 table.dtype,
                 Shape::new(&[width, tile_stitch::TABLE_WIDTH]),

@@ -47,7 +47,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -87,26 +87,26 @@ impl fmt::Display for ShapeDescriptor {
 #[derive(Clone, Copy)]
 pub struct ShapeArgs {
     /// `[rows, vocabulary]` raw logits.
-    pub logits: TensorView,
+    pub logits: Operand,
     /// `[slots, vocabulary]` i32 counts of the tokens every slot has already seen.
-    pub counts: TensorView,
+    pub counts: Operand,
     /// `[rows]` i32: the slot whose counts each row reads.
-    pub slots: TensorView,
+    pub slots: Operand,
     /// `[rows, PARAMETER_COLUMNS]` f32 request parameters.
-    pub parameters: TensorView,
+    pub parameters: Operand,
     /// `[rows, extras]` i32 tokens counted besides the slot's, `-1` counting nothing.
-    pub extras: Option<TensorView>,
+    pub extras: Option<Operand>,
     /// `[slots, vocabulary]` f32 each slot's bias row: its request's logit bias, `-inf` outside its
     /// allowed set, `0` elsewhere. Read only by a row whose adjustment flag names it.
-    pub bias: TensorView,
+    pub bias: Operand,
     /// `[rows, 2]` i32 each row's adjustments: whether it adds its slot's bias row (`1`) or not
     /// (`0`), and the index of its ban mask among `bans`, `-1` for none.
-    pub adjustments: TensorView,
+    pub adjustments: Operand,
     /// `[masks, ceil(vocabulary / 32)]` i32 ban masks: bit `t % 32` of word `t / 32` set bans token
     /// `t`. Read only through a row's mask index.
-    pub bans: TensorView,
+    pub bans: Operand,
     /// `[rows, vocabulary]` FP32 shaped logits.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The words of one ban mask over a `vocabulary`-wide row: one bit per token.
@@ -286,14 +286,14 @@ impl fmt::Display for TopKDescriptor {
 #[derive(Clone, Copy)]
 pub struct TopKArgs {
     /// `[rows, vocabulary]` shaped logits.
-    pub logits: TensorView,
+    pub logits: Operand,
     /// `[rows, width]` the kept logits, descending; a tie keeps the lower vocabulary id first.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[rows, width]` the vocabulary ids of the kept logits.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// The ordering's scratch, [`top_k_workspace`]'s shape: `[rows, 4 · width + 2 · TOP_K_BINS]`
     /// i32. The plan reserves it; the program never grows one.
-    pub workspace: TensorView,
+    pub workspace: Operand,
 }
 
 /// The `width` largest logits of every row, sorted.
@@ -427,13 +427,13 @@ impl fmt::Display for FilterDescriptor {
 #[derive(Clone, Copy)]
 pub struct FilterArgs {
     /// `[rows, width]` FP32 candidates, descending; a dropped candidate is written as `-inf`.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[rows, width]` the vocabulary ids of the candidates.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[rows, PARAMETER_COLUMNS]` f32 request parameters.
-    pub parameters: TensorView,
+    pub parameters: Operand,
     /// `[rows]` i32: 1 when the row's kept candidates form a usable distribution.
-    pub valid: TensorView,
+    pub valid: Operand,
 }
 
 /// Apply the top-k width, the nucleus threshold and the min-p threshold to the candidates.
@@ -540,13 +540,13 @@ pub struct InverseCdfArgs {
     /// `[rows, width]` FP32 candidate probabilities, in the order the caller supplies them; the layer
     /// sorts by token id first, so the draw does not depend on
     /// the order the top-k kernel happened to produce.
-    pub probabilities: TensorView,
+    pub probabilities: Operand,
     /// `[rows, width]` the vocabulary ids of the candidates.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[rows]` f32 uniform draws in `[0, 1)`.
-    pub draws: TensorView,
+    pub draws: Operand,
     /// `[rows]` the chosen token of each row.
-    pub tokens: TensorView,
+    pub tokens: Operand,
 }
 
 /// One token per row, drawn from its candidate probabilities.
@@ -656,9 +656,9 @@ impl fmt::Display for ArgMaxDescriptor {
 #[derive(Clone, Copy)]
 pub struct ArgMaxArgs {
     /// `[rows, width]` logits or candidates.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[rows]` the index of each row's largest value, the lowest index among ties.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// The largest value's index, per row.
@@ -752,9 +752,9 @@ impl fmt::Display for LogSoftmaxDescriptor {
 #[derive(Clone, Copy)]
 pub struct LogSoftmaxArgs {
     /// `[rows, columns]`.
-    pub x: TensorView,
+    pub x: Operand,
     /// `[rows, columns]` FP32 log-probabilities.
-    pub out: TensorView,
+    pub out: Operand,
 }
 
 /// `log_softmax` over the last axis.
@@ -842,15 +842,15 @@ impl fmt::Display for LogprobDescriptor {
 #[derive(Clone, Copy)]
 pub struct LogprobArgs {
     /// `[rows, columns]` FP32 log-probabilities.
-    pub logprobabilities: TensorView,
+    pub logprobabilities: Operand,
     /// `[rows]` the tokens whose log-probability is reported; a negative token names no position.
-    pub tokens: TensorView,
+    pub tokens: Operand,
     /// `[rows]` FP32: the token's log-probability, `0` for a row whose token names no position.
-    pub out: TensorView,
+    pub out: Operand,
     /// `[rows]` i32: the token's one-based competition rank in its row - one plus the entries
     /// strictly above it, so tied entries share a rank - and `0` for a row whose token names no
     /// position.
-    pub ranks: TensorView,
+    pub ranks: Operand,
 }
 
 /// The log-probability of one chosen token per row, and its rank in the row.
@@ -967,13 +967,13 @@ pub fn top_logprobs_chunks(width: u64, tile: u32) -> u64 {
 #[derive(Clone, Copy)]
 pub struct TopLogprobsArgs {
     /// `[rows, width]` FP32 entries: log-probabilities, or a first launch's candidates.
-    pub values: TensorView,
+    pub values: Operand,
     /// `[rows, width]` i32 each entry's id, for an indirect launch.
-    pub ids: Option<TensorView>,
+    pub ids: Option<Operand>,
     /// `[rows, chunks · candidates]` FP32: each chunk's kept entries, the largest first.
-    pub out_values: TensorView,
+    pub out_values: Operand,
     /// `[rows, chunks · candidates]` i32: their ids, `-1` past a chunk's entries.
-    pub out_ids: TensorView,
+    pub out_ids: Operand,
 }
 
 /// The `candidates` largest entries of every chunk of every row, with their ids.
@@ -1105,9 +1105,9 @@ impl fmt::Display for OrderDescriptor {
 pub struct OrderArgs {
     /// `[rows, width]` the candidate values (probabilities or shaped logits — the permutation is the
     /// same for either).
-    pub values: TensorView,
+    pub values: Operand,
     /// `[rows, width]` the candidate token ids.
-    pub ids: TensorView,
+    pub ids: Operand,
     /// `[rows, width]` the values in ascending token order.
     ///
     /// Every slot of the row is written. A candidate's rank is the count of smaller ids before it,
@@ -1115,10 +1115,10 @@ pub struct OrderArgs {
     /// [`f32::NEG_INFINITY`] and id `-1`. A slot nothing wrote is therefore not a reading anyone has
     /// to interpret — it cannot be mistaken for the legitimate token `0`, and a draw does not select
     /// it because it carries no mass.
-    pub ordered_values: TensorView,
+    pub ordered_values: Operand,
     /// `[rows, width]` the ids in ascending token order, whole to the width as [`Self::ordered_values`]
     /// is: the counted candidates first, then `-1`.
-    pub ordered_ids: TensorView,
+    pub ordered_ids: Operand,
     /// `[rows, vocabulary]` i32 scratch, one count per token id and then the rank each id's next
     /// candidate takes.
     ///
@@ -1128,7 +1128,7 @@ pub struct OrderArgs {
     /// space's, and the program owns it for the duration of the launch. It doubles as the rank
     /// counter — each candidate takes the value its id holds and increments it — so two candidates
     /// with one id land in consecutive slots instead of overwriting each other.
-    pub counts: TensorView,
+    pub counts: Operand,
     /// The id space `counts` covers: the model's vocabulary.
     pub vocabulary: u64,
 }

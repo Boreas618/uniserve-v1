@@ -47,7 +47,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{DevicePtr, Error, Op, Result, Twins};
 
@@ -123,11 +123,11 @@ impl fmt::Display for NoiseDescriptor {
 #[derive(Clone, Copy)]
 pub struct NoiseArgs {
     /// `[rows, elements]`, contiguous: receives one standard normal sample per row.
-    pub out: TensorView,
+    pub out: Operand,
     /// `[rows]` i64: each row's sampling key as its bit pattern, from `ipc`'s
     /// `request_sampling_key`. Present under `KeySource::Rows` and `None` under
     /// `KeySource::Scalar`, where `key` replaces it; a mismatch of the two is refused.
-    pub keys: Option<TensorView>,
+    pub keys: Option<Operand>,
     /// The whole draw's key as its bit pattern, read under `KeySource::Scalar` only.
     pub key: u64,
     /// The processor stage the draw belongs to.
@@ -317,16 +317,16 @@ fn plan(descriptor: &NoiseDescriptor, args: NoiseArgs) -> Result<Plan> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn out(rows: u64, elements: u64) -> TensorView {
-        TensorView::new(
+    fn out(rows: u64, elements: u64) -> Operand {
+        Operand::new(
             DevicePtr::new(0x1000),
             DType::BF16,
             Shape::new(&[rows, elements]),
         )
     }
 
-    fn keys(rows: u64) -> TensorView {
-        TensorView::new(DevicePtr::new(0x2000), DType::I64, Shape::new(&[rows]))
+    fn keys(rows: u64) -> Operand {
+        Operand::new(DevicePtr::new(0x2000), DType::I64, Shape::new(&[rows]))
     }
 
     fn descriptor(source: KeySource) -> NoiseDescriptor {
@@ -338,7 +338,7 @@ mod tests {
         }
     }
 
-    fn args(out: TensorView, keys: Option<TensorView>, key: u64) -> NoiseArgs {
+    fn args(out: Operand, keys: Option<Operand>, key: u64) -> NoiseArgs {
         NoiseArgs {
             out,
             keys,

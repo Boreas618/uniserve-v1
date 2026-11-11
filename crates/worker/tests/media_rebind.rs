@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use nn::capability::{DecodedMedia, Decoder};
 use nn::{Forward, Result};
-use ops::{DType, TensorView};
+use ops::{DType, Operand};
 use platform::{Allocator, Budget, Device, DeviceId, PoolKind, Stream};
 use proto::video::{LatentShape, Layout};
 use worker::arena::Pools;
@@ -69,7 +69,7 @@ impl Decoder for Vocoder {
         Ok((u64::from(audio.frames) * 64, 2))
     }
 
-    fn decode(&self, _: &Forward, _: &Layout, _: TensorView, _: DecodedMedia) -> Result<()> {
+    fn decode(&self, _: &Forward, _: &Layout, _: Operand, _: DecodedMedia) -> Result<()> {
         Ok(())
     }
 }
