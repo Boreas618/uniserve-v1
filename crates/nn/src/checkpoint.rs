@@ -2,7 +2,7 @@
 //!
 //! The loader never converts a checkpoint's weights in place and never holds a whole shard in host
 //! memory: each shard is mapped read-only with `memmap2`, the `safetensors` crate parses its header
-//! through `read_header`, and one tensor's bytes are copied when a weight is converted. A shard is
+//! through `read_metadata`, and one tensor's bytes are copied when a weight is converted. A shard is
 //! mapped for the life of the [`Checkpoint`], which is the model's life; the mapping costs virtual
 //! address space, not resident memory.
 //!
@@ -36,10 +36,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::Mmap;
-use ops::Shape;
-use uniserve_tensor::DType;
 use safetensors::Dtype as FormatDtype;
 use safetensors::SafeTensors;
+use safetensors::tensor::Metadata;
+use uniserve_tensor::{DType, Shape};
 
 use crate::adapter::{Adapter, Fusion};
 use crate::error::{Error, Result};
@@ -49,6 +49,9 @@ use crate::error::{Error, Result};
 /// The kernel's clock tick is coarser than this on some filesystems, so a younger file may be
 /// rewritten under the same `ctime`; such a file gets an identity unique to this read.
 const SETTLED_NS: u128 = 1_000_000_000;
+
+/// The bytes of a shard before its header's JSON body: the body's length, as a `u64`.
+const HEADER_PREFIX: u64 = 8;
 
 /// The identity of one checkpoint file, as retained weights are keyed by it.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -191,35 +194,6 @@ pub struct TensorLocation {
     pub bytes: (u64, u64),
 }
 
-/// One tensor's bytes, read on the host.
-#[derive(Clone, Debug)]
-pub struct HostTensor {
-    /// The element type in the checkpoint.
-    pub dtype: DType,
-    /// The extents in the checkpoint.
-    pub shape: Shape,
-    /// The tensor's bytes, row-major.
-    pub bytes: Vec<u8>,
-}
-
-/// What a load asked a checkpoint for, and what it left alone.
-///
-/// Both lists are in name order, so a report can be diffed between two loads.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Reading {
-    /// The tensors a `read` asked for.
-    pub read: Vec<String>,
-    /// The tensors of the same set that no `read` asked for.
-    pub unread: Vec<String>,
-}
-
-impl Reading {
-    /// Whether every tensor the checkpoint holds was asked for.
-    pub fn is_complete(&self) -> bool {
-        self.unread.is_empty()
-    }
-}
-
 /// A checkpoint: its mapped shards and the tensors they hold, or a pipeline's stages.
 ///
 /// A flat checkpoint is one shard set; a *pipeline* root holds one subdirectory per stage
@@ -236,7 +210,7 @@ pub struct Checkpoint {
     files: Vec<CheckpointFile>,
     tensors: BTreeMap<String, TensorLocation>,
     stages: BTreeMap<String, Checkpoint>,
-    /// The tensors a `read` has asked this checkpoint for, so [`Checkpoint::reading`] can answer the
+    /// The tensors a `read` has asked this checkpoint for, so [`Checkpoint::reading`] can tell the
     /// other half of the question: what the load never touched.
     read: Mutex<BTreeSet<String>>,
     /// The adapter fused into this shard set's tensors ([`Checkpoint::attach`]).
@@ -278,19 +252,35 @@ impl Checkpoint {
                 source,
             })?;
             let identity = FileIdentity::of(&path)?;
-            let (header, entries, metadata) = read_header(&path, &map)?;
-            for (name, entry) in entries {
+            let (length, stated) =
+                SafeTensors::read_metadata(&map).map_err(|problem| Error::Checkpoint {
+                    path: path.clone(),
+                    problem: format!("the safetensors header does not parse: {problem}"),
+                })?;
+
+            // **The format crate returns the header's JSON length, not the payload's offset.**
+            // `read_metadata` reads the file's leading eight bytes as `n` and parses the body
+            // from `N_LEN..N_LEN + n` (`safetensors-0.8.0/src/tensor.rs`), so the payload starts
+            // at `N_LEN + n`. Adding `n` alone shifts every tensor eight bytes early, the right
+            // shape over the wrong bytes, which is why the read-back test asserts content and
+            // not length.
+            //
+            // **The subtraction cannot underflow, and this is the dependency, not an
+            // assumption.** The same crate refuses a header whose `8 + n` runs past the buffer
+            // (`InvalidHeaderLength`) and requires `payload_end + 8 + n == buffer_len` exactly
+            // (`MetadataIncompleteBuffer`). A version that relaxed either would let this line
+            // read past the file: a bump that changes those two checks must visit it.
+            let header = HEADER_PREFIX + length as u64;
+            let payload = map.len() as u64 - header;
+
+            let metadata = stated
+                .metadata()
+                .as_ref()
+                .map(|block| block.clone().into_iter().collect())
+                .unwrap_or_default();
+            for location in header_tensors(&path, &stated, file_index, payload)? {
                 if locations
-                    .insert(
-                        name.clone(),
-                        TensorLocation {
-                            file: file_index,
-                            tensor: name.clone(),
-                            dtype: entry.dtype,
-                            shape: entry.shape,
-                            bytes: entry.offsets,
-                        },
-                    )
+                    .insert(location.tensor.clone(), location)
                     .is_some()
                 {
                     return Err(Error::Checkpoint {
@@ -333,7 +323,7 @@ impl Checkpoint {
     /// deployment. Two roots of *one* root's shard set disagreeing is still an error, because that
     /// is a malformed checkpoint and no precedence can say which is meant.
     ///
-    /// [`Checkpoint::root`] answers the first root: the export's, which is the one a log names.
+    /// [`Checkpoint::root`] returns the first root: the export's, which is the one a log names.
     pub fn open_roots(roots: &[&Path]) -> Result<Self> {
         let mut roots = roots.iter();
         let first = roots.next().ok_or_else(|| Error::Checkpoint {
@@ -426,7 +416,7 @@ impl Checkpoint {
     /// Every directory this checkpoint spans, the first root's first.
     ///
     /// A pipeline's sidecars live in these directories rather than in a shard set: a processor has
-    /// no weights, so no stage answers for it.
+    /// no weights, so no stage holds it.
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
     }
@@ -476,7 +466,7 @@ impl Checkpoint {
     /// with the name of one tensor that carries it.
     ///
     /// Integer tensors (a table, an index) are not weights a precision describes and do not count.
-    /// A stage answers for its own shards; a pipeline root with no shards of its own answers
+    /// A stage lists its own shards'; a pipeline root with no shards of its own lists
     /// none.
     pub fn stored_types(&self) -> Vec<(DType, String)> {
         let mut found: Vec<(DType, String)> = Vec::new();
@@ -517,7 +507,10 @@ impl Checkpoint {
                     several.len(),
                     several
                         .iter()
-                        .map(|(dtype, example)| format!("{dtype} (such as `{example}`)", dtype = ops::abi::name(*dtype)))
+                        .map(|(dtype, example)| format!(
+                            "{dtype} (such as `{example}`)",
+                            dtype = ops::abi::name(*dtype)
+                        ))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -532,7 +525,7 @@ impl Checkpoint {
     /// pipeline's `model_index.json`, a stage's `vae/config.json`, a quantization
     /// declaration), and a checkpoint opened over an export and the base it continues reads each
     /// document from the export first. Whether an absent document is a refusal is the reader's
-    /// question, so absence is answered as `None`.
+    /// question, so absence is `None`.
     ///
     /// # Errors
     ///
@@ -624,26 +617,29 @@ impl Checkpoint {
         })
     }
 
-    /// Read the tensor named `name` into host memory.
-    pub fn read(&self, name: &str) -> Result<HostTensor> {
+    /// Reads the bytes of the tensor named `name` into host memory, row-major, in the element
+    /// type and extents [`Checkpoint::locate`] states for it; the fused value of a tensor an
+    /// attached adapter edits.
+    ///
+    /// # Errors
+    ///
+    /// When the checkpoint holds no tensor of the name.
+    pub fn read(&self, name: &str) -> Result<Vec<u8>> {
         let location = self.locate(name)?;
         if let Ok(mut read) = self.read.lock() {
             read.insert(name.to_owned());
         }
+
         let length = usize::try_from(location.bytes.1 - location.bytes.0)
             .map_err(|_| Error::weight(name, "the tensor's bytes are past usize::MAX"))?;
-        Ok(HostTensor {
-            dtype: location.dtype,
-            shape: location.shape,
-            bytes: self.payload(location, &[(0, length)])?,
-        })
+        self.payload(location, &[(0, length)])
     }
 
     /// The bytes `ranges` name of the tensor at `location`, concatenated in order: the shard's own
     /// bytes, or the fused value of a tensor an attached adapter edits.
     ///
     /// Each range is a half-open byte range within the tensor's own bytes. Every weight a load
-    /// publishes and every tensor [`Checkpoint::read`] answers is taken through here, so an
+    /// publishes and every tensor [`Checkpoint::read`] returns is taken through here, so an
     /// adapter's edit reaches every reader of the tensor, and a tensor no adapter edits is copied
     /// from its mapping unchanged.
     pub(crate) fn payload(
@@ -680,7 +676,7 @@ impl Checkpoint {
     }
 
     /// Fuse `adapter` into this checkpoint's tensors, or into the stage `stage` of a
-    /// pipeline root, and answer the adapted checkpoint.
+    /// pipeline root, and return the adapted checkpoint.
     ///
     /// From then on every byte read of a tensor the adapter edits is its fused value, a tensor the
     /// adapter assigns is one of the checkpoint's tensors, and every other tensor reads as it did
@@ -718,7 +714,7 @@ impl Checkpoint {
         self.adapter.as_ref()
     }
 
-    /// Append `files` to this checkpoint's files and answer the index the first one takes.
+    /// Append `files` to this checkpoint's files and return the index the first one takes.
     pub(crate) fn adopt(&mut self, files: Vec<CheckpointFile>) -> usize {
         let first = self.files.len();
         self.files.extend(files);
@@ -735,51 +731,44 @@ impl Checkpoint {
         (self.files, self.tensors)
     }
 
-    /// What a load has asked this checkpoint for, and what it has left alone.
+    /// The tensors a load has read from this checkpoint, and the tensors it has left alone, each
+    /// list in name order so two loads can be compared.
     ///
     /// A stage of a multi-stage export legitimately reads a subset of what its shards hold
-    /// — a second calibration scheme's per-layer `scale1`/`scale2`, a tied head, the calibration
-    /// fields of a layer the model runs dense — so a non-empty [`Reading::unread`] is a **report
-    /// and never a refusal**. It answers the one question a half-read export leaves open: when the
-    /// numbers are wrong, which tensors did nobody ask for. It is device-free: it needs the claims
-    /// the index states, not the tensors' values.
+    /// (a second calibration scheme's per-layer `scale1`/`scale2`, a tied head, the calibration
+    /// fields of a layer the model runs dense), so a non-empty second list is never a refusal. It
+    /// says, when the numbers are wrong, which tensors nobody asked for. It reads no tensor's
+    /// values.
     ///
-    /// A pipeline root holds no tensors of its own, so its answer is its stages', each name
-    /// qualified `stage/name` — two stages may hold one name each.
-    pub fn reading(&self) -> Reading {
+    /// A pipeline root holds no tensors of its own, so its lists are its stages', each name
+    /// qualified `stage/name`: two stages may hold one name each.
+    pub fn reading(&self) -> (Vec<String>, Vec<String>) {
+        let (mut read, mut unread) = (Vec::new(), Vec::new());
+
         if !self.stages.is_empty() {
-            let mut reading = Reading::default();
             for (name, stage) in &self.stages {
-                let one = stage.reading();
-                reading.read.extend(
-                    one.read
-                        .into_iter()
-                        .map(|tensor| format!("{name}/{tensor}")),
-                );
-                reading.unread.extend(
-                    one.unread
-                        .into_iter()
-                        .map(|tensor| format!("{name}/{tensor}")),
-                );
+                let (stage_read, stage_unread) = stage.reading();
+                read.extend(stage_read.iter().map(|tensor| format!("{name}/{tensor}")));
+                unread.extend(stage_unread.iter().map(|tensor| format!("{name}/{tensor}")));
             }
-            reading.read.sort();
-            reading.unread.sort();
-            return reading;
+            read.sort();
+            unread.sort();
+            return (read, unread);
         }
-        let read = self
+
+        let asked = self
             .read
             .lock()
             .map(|held| held.clone())
             .unwrap_or_default();
-        let mut answer = Reading::default();
         for name in self.tensors.keys() {
-            if read.contains(name) {
-                answer.read.push(name.clone());
+            if asked.contains(name) {
+                read.push(name.clone());
             } else {
-                answer.unread.push(name.clone());
+                unread.push(name.clone());
             }
         }
-        answer
+        (read, unread)
     }
 
     /// Borrow the bytes of `location` inside its mapped shard.
@@ -878,65 +867,32 @@ struct IndexFile {
     weight_map: BTreeMap<String, String>,
 }
 
-/// One tensor as a shard's header states it.
-struct HeaderTensor {
-    dtype: DType,
-    shape: Shape,
-    /// The byte range of the tensor inside the payload, which starts after the header.
-    offsets: (u64, u64),
-}
-
-/// Read one shard's header through the `safetensors` crate: the byte length of the header (its JSON
-/// body plus the eight-byte length that precedes it), every tensor it names, and its `__metadata__`
-/// block.
+/// Every tensor the header `stated` of shard `file` names, in name order, each with its element
+/// type, its extents and its byte range in a payload of `payload` bytes.
 ///
-/// The format's own reader is used rather than one written here. `read_metadata` parses the length
-/// and the header body, checks every tensor's byte range against its extents and element width, and
-/// answers the optional `__metadata__` block, which carries no tensor. **What stays ours is the element
-/// type**, because the crate's `Dtype` is the format's and ours is the operator ABI's: a type we
-/// cannot express is refused here, at open, with the tensor in the message, rather than reach a
-/// launch that would misread its bytes.
-#[allow(
-    clippy::type_complexity,
-    reason = "the header's three parts are one parse's answer, each with its own reader"
-)]
-fn read_header(
+/// The format's own crate parsed the header and checked every tensor's byte range against its
+/// extents and element width. **What stays this crate's is the element type**, because the
+/// format crate's `Dtype` is the format's and the tensor library's is what a kernel computes on:
+/// a type that cannot be expressed is refused here, at open, with the tensor in the message,
+/// before it could reach a launch that would misread its bytes.
+fn header_tensors(
     path: &Path,
-    bytes: &[u8],
-) -> Result<(u64, Vec<(String, HeaderTensor)>, BTreeMap<String, String>)> {
-    let (header, metadata) =
-        SafeTensors::read_metadata(bytes).map_err(|problem| Error::Checkpoint {
-            path: path.to_path_buf(),
-            problem: format!("the safetensors header does not parse: {problem}"),
-        })?;
-    // **The crate answers the header's JSON length, not the payload's offset.** `read_metadata`
-    // reads the file's leading eight bytes as `n` and parses the body from `N_LEN..N_LEN + n`,
-    // then answers `Ok((n, metadata))` (`safetensors-0.8.0/src/tensor.rs`), so the payload starts at
-    // `N_LEN + n`. Adding `n` alone shifts every tensor eight bytes early — the right shape over
-    // the wrong bytes, which is why the read-back test asserts content rather than length.
-    //
-    // **The subtraction below cannot underflow, and this is the dependency rather than an
-    // assumption.** The same crate refuses a header whose `8 + n` runs past the buffer
-    // (`buffer.get(N_LEN..stop)` returning `None` is `InvalidHeaderLength`) and requires
-    // `payload_end + 8 + n == buffer_len` exactly (`MetadataIncompleteBuffer`) — both in
-    // `safetensors-0.8.0/src/tensor.rs`. A version that relaxed either would let this line read past
-    // the file, which is why the version is named here: a bump that changes those two checks is the
-    // one that must visit this function.
-    const HEADER_PREFIX: u64 = 8;
-    let header = HEADER_PREFIX + header as u64;
-    let payload = bytes.len() as u64 - header;
+    stated: &Metadata,
+    file: usize,
+    payload: u64,
+) -> Result<Vec<TensorLocation>> {
+    // The crate lists its tensors in a hash map's order; the checkpoint keys them by name and two
+    // loads' readings are compared, so they are taken in name order here.
+    let mut entries = stated.tensors().into_iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-    // The crate answers its tensors in a hash map's order; the checkpoint keys them by name and a
-    // report is diffed between two loads, so they are taken in name order here.
-    let mut stated = metadata.tensors().into_iter().collect::<Vec<_>>();
-    stated.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut tensors = Vec::with_capacity(stated.len());
-    for (name, info) in stated {
+    let mut tensors = Vec::with_capacity(entries.len());
+    for (name, info) in entries {
         let dtype = element_type(path, &name, info.dtype)?;
         let shape = extents(path, &name, &info.shape)?;
         let start = info.data_offsets.0 as u64;
         let end = info.data_offsets.1 as u64;
+
         if start > end || end > payload {
             return Err(Error::Checkpoint {
                 path: path.to_path_buf(),
@@ -945,21 +901,15 @@ fn read_header(
                 ),
             });
         }
-        tensors.push((
-            name,
-            HeaderTensor {
-                dtype,
-                shape,
-                offsets: (start, end),
-            },
-        ));
+        tensors.push(TensorLocation {
+            file,
+            tensor: name,
+            dtype,
+            shape,
+            bytes: (start, end),
+        });
     }
-    let statements = metadata
-        .metadata()
-        .as_ref()
-        .map(|block| block.clone().into_iter().collect())
-        .unwrap_or_default();
-    Ok((header, tensors, statements))
+    Ok(tensors)
 }
 
 /// The operator ABI element type the format's `Dtype` names.
@@ -1010,26 +960,22 @@ fn element_type(path: &Path, tensor: &str, dtype: FormatDtype) -> Result<DType> 
     }
 }
 
-/// A shape the operator ABI can hold.
+/// The extents of a tensor a kernel argument can carry.
 ///
-/// The format allows any rank; the ABI's is a fixed maximum, so a shard of deeper tensors is refused
-/// by name rather than truncated to the axes that fit.
+/// The format allows any rank; a kernel argument's is a fixed maximum, so a shard of deeper
+/// tensors is refused by name instead of truncated to the axes that fit.
 fn extents(path: &Path, tensor: &str, dims: &[usize]) -> Result<Shape> {
     if dims.len() > ops::MAX_RANK {
         return Err(Error::Checkpoint {
             path: path.to_path_buf(),
             problem: format!(
-                "tensor `{tensor}` has {} axes, more than the ABI's {MAX_RANK}",
+                "tensor `{tensor}` has {} axes, more than a kernel argument's {MAX_RANK}",
                 dims.len(),
                 MAX_RANK = ops::MAX_RANK
             ),
         });
     }
-    let mut extents = [0_u64; ops::MAX_RANK];
-    for (axis, &extent) in dims.iter().enumerate() {
-        extents[axis] = extent as u64;
-    }
-    Ok(Shape::new(&extents[..dims.len()]))
+    Ok(Shape::from(dims))
 }
 
 #[cfg(test)]
@@ -1037,7 +983,7 @@ mod tests {
     use super::*;
 
     /// Write one shard of `tensors` — each `(name, dtype, shape, bytes)` — into `directory` and
-    /// answer the root to open.
+    /// return the root to open.
     ///
     /// The header is composed here from the format's own grammar (an eight-byte length, the JSON
     /// body, then the payload laid out in the order the offsets state), so the test states the
@@ -1114,7 +1060,7 @@ mod tests {
     /// states**, each with its own element type and extents, and a non-float tensor is named.
     ///
     /// The trap this pins is the one the crate's `read_metadata` makes easy to fall into: the
-    /// payload starts *after* the header's length, so a reader that adds the wrong offset answers a
+    /// payload starts *after* the header's length, so a reader that adds the wrong offset returns a
     /// slice of the right length for every tensor and every shape agrees. The bytes are therefore
     /// unlike the header's own text and unlike each other, and the integer tensor is checked because
     /// `names()` must keep its meaning for it: a parser that filtered to float types would make a
@@ -1148,15 +1094,23 @@ mod tests {
             "a non-float tensor is named like any other"
         );
 
-        let halfs_read = checkpoint.read("halfs").expect("halfs");
-        assert_eq!(halfs_read.dtype, DType::BF16, "the tensor's own type");
-        assert_eq!(halfs_read.shape, Shape::new(&[2, 3]), "its own extents");
-        assert_eq!(halfs_read.bytes, halfs, "the bytes the header points at");
+        let located = checkpoint.locate("halfs").expect("halfs");
+        assert_eq!(located.dtype, DType::BF16, "the tensor's own type");
+        assert_eq!(located.shape.dims(), [2, 3], "its own extents");
+        assert_eq!(
+            checkpoint.read("halfs").expect("halfs"),
+            halfs,
+            "the bytes the header points at"
+        );
 
-        let words_read = checkpoint.read("words").expect("words");
-        assert_eq!(words_read.dtype, DType::I32, "an integer keeps its type");
-        assert_eq!(words_read.shape, Shape::new(&[4]));
-        assert_eq!(words_read.bytes, words, "and its own bytes");
+        let located = checkpoint.locate("words").expect("words");
+        assert_eq!(located.dtype, DType::I32, "an integer keeps its type");
+        assert_eq!(located.shape.dims(), [4]);
+        assert_eq!(
+            checkpoint.read("words").expect("words"),
+            words,
+            "and its own bytes"
+        );
     }
 
     /// A shard whose tensor is a real format type the operator ABI does not speak is refused **at

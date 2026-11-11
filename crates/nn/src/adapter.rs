@@ -30,7 +30,7 @@
 //!
 //! An adapter is fused into the deployment's weights, once, at the loading boundary
 //! ([`crate::Checkpoint::attach`]): every byte a weight load or a host read takes of an edited
-//! tensor is the fused value, so a layer, a layout conversion and every computed table read the
+//! tensor is the fused value, so a module, a layout conversion and every computed table read the
 //! adapted parameter without knowing an adapter exists. For one element of an edited parameter
 //!
 //! ```text
@@ -54,6 +54,7 @@ use uniserve_tensor::DType;
 
 use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};
 use crate::error::{Error, Result};
+use crate::weights::{dim, last, numel};
 
 /// The container format this build reads.
 pub const FASTVIDEO_FORMAT: &str = "fastvideo-lora-v2";
@@ -235,7 +236,7 @@ impl Adapter {
             let up = shards.locate(up)?;
             if down.shape.rank() != 2
                 || up.shape.rank() != 2
-                || down.shape.dim(0) != up.shape.dim(1)
+                || dim(&down.shape, 0) != dim(&up.shape, 1)
             {
                 return Err(refuse(format!(
                     "`{target}`'s factors are {:?} and {:?}, not [rank, in] and [out, rank]",
@@ -244,11 +245,11 @@ impl Adapter {
                 )));
             }
             if let Some(rank) = rank
-                && down.shape.dim(0) != rank
+                && dim(&down.shape, 0) != rank
             {
                 return Err(refuse(format!(
                     "`{target}`'s factors have rank {}, and the adapter states rank {rank}",
-                    down.shape.dim(0)
+                    dim(&down.shape, 0)
                 )));
             }
         }
@@ -323,7 +324,7 @@ impl Adapter {
             let low_rank = match (&edit.up, &edit.down) {
                 (Some(up), Some(down)) => {
                     let (up, down) = (take(up), take(down));
-                    let expected = [up.shape.dim(0), down.shape.dim(1)];
+                    let expected = [dim(&up.shape, 0) as usize, dim(&down.shape, 1) as usize];
                     if base.shape.dims() != expected {
                         return Err(refuse(format!(
                             "`{target}` is {:?} and its factors make {expected:?}",
@@ -352,7 +353,8 @@ impl Adapter {
                 if !matches!(part.dtype, DType::BF16 | DType::F16 | DType::F32) {
                     return Err(refuse(format!(
                         "`{}` is {}, not a floating-point delta",
-                        part.tensor, ops::abi::name(part.dtype)
+                        part.tensor,
+                        ops::abi::name(part.dtype)
                     )));
                 }
             }
@@ -495,7 +497,7 @@ impl Fusion {
 }
 
 /// One run of elements of a parameter: row `row`, columns `first..last`, written at element
-/// `output` of the answer.
+/// `output` of the result.
 #[derive(Clone, Copy)]
 struct Run {
     row: u64,
@@ -521,7 +523,7 @@ pub(crate) fn fused(
     let columns = if base.shape.rank() == 0 {
         1
     } else {
-        base.shape.last()
+        last(&base.shape)
     };
     let decode = |location: &TensorLocation, from: usize, to: usize| -> Result<Vec<f32>> {
         let bytes = checkpoint.bytes(location)?;
@@ -543,7 +545,10 @@ pub(crate) fn fused(
         if from % element != 0 || to % element != 0 || to < from {
             return Err(Error::weight(
                 &base.tensor,
-                format!("bytes {from}..{to} are not whole {dtype} elements", dtype = ops::abi::name(dtype)),
+                format!(
+                    "bytes {from}..{to} are not whole {dtype} elements",
+                    dtype = ops::abi::name(dtype)
+                ),
             ));
         }
         let mut at = (from / element) as u64;
@@ -567,10 +572,10 @@ pub(crate) fn fused(
     // rank`, both a small fraction of the parameter.
     let factors = match &delta.low_rank {
         Some((up, down)) => {
-            let rank = down.shape.dim(0) as usize;
+            let rank = dim(&down.shape, 0) as usize;
             Some((
-                decode(up, 0, up.shape.numel() as usize)?,
-                decode(down, 0, down.shape.numel() as usize)?,
+                decode(up, 0, numel(&up.shape) as usize)?,
+                decode(down, 0, numel(&down.shape) as usize)?,
                 rank,
             ))
         }
@@ -583,7 +588,7 @@ pub(crate) fn fused(
         .min(runs.len().max(1));
     let per_thread = elements.div_ceil(threads.max(1)).max(1);
     // Runs are handed out in order until a worker holds its share, so each worker writes one
-    // contiguous slice of the answer.
+    // contiguous slice of the result.
     let mut batches: Vec<(&[Run], &mut [f32])> = Vec::with_capacity(threads);
     let mut rest_runs: &[Run] = &runs;
     let mut rest_values: &mut [f32] = &mut values;

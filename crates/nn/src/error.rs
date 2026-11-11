@@ -1,97 +1,87 @@
-//! What the shared computation library can fail with.
+//! What the neural-network library fails with.
 //!
-//! A layer propagates an operator's failure unchanged; it never falls back to another path. The
-//! loading boundary adds the failures of reading a checkpoint and converting a weight, and the
-//! forward's arena adds the one failure a static activation layout can have: a request that does not
-//! fit the region the worker reserved.
+//! A function or a module propagates the failure of the tensor operation or the launch it made,
+//! unchanged; nothing here retries or takes another path. The loading boundary adds the failures
+//! of reading a checkpoint and converting a weight, and a module adds the one failure of its own:
+//! a tensor whose shape or element type it was not loaded for.
+//!
+//! The tensor library carries a backend's failure, and this crate's, across its own interfaces
+//! (`Module::forward` returns the tensor library's result) as a boxed error. Converting back
+//! recovers the typed cause, so a failure that crossed a `Module::forward` matches as the variant
+//! it was raised as.
 
 use std::path::PathBuf;
 
-/// A failed layer call, checkpoint read or weight conversion.
+/// A failed function, module call, checkpoint read or weight conversion.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// An operator launch failed.
+    /// A tensor operation was refused: operands of other shapes, element types or devices than
+    /// the operation takes.
+    #[error(transparent)]
+    Tensor(uniserve_tensor::Error),
+
+    /// The device backend refused a call: a launch, an allocation, a collective or a profiler
+    /// range. A refused launch names its operator and its key.
+    #[error(transparent)]
+    Backend(#[from] backend::Error),
+
+    /// The kernel library refused a value outside a launch: a row count no packed product is
+    /// compiled for, an element type with no host encoding.
     #[error(transparent)]
     Ops(#[from] ops::Error),
-
-    /// One operator's launch failed, with the program it selected.
-    ///
-    /// A native entry reports its own failure by the name it was loaded under
-    /// (`native entry \`uniserve_gemm\` failed with status 1`), which says nothing about *which*
-    /// call it was: one operator is launched at many descriptor keys in one forward, and a runtime
-    /// refusal of one cell reads exactly like a refusal of another. The forward, which resolves the
-    /// program and holds the descriptor, is the only place both are in scope, so it names them here
-    /// rather than leaving a stop to be narrowed by guesswork.
-    #[error("operator `{operator}` descriptor {descriptor}: {source}")]
-    Launch {
-        /// The operator whose program failed, as its package names it.
-        operator: &'static str,
-        /// The descriptor key of the program that was selected.
-        descriptor: String,
-        /// What the launch failed with.
-        #[source]
-        source: ops::Error,
-    },
-
-    /// A call into the CUDA boundary failed.
-    #[error("platform: {0}")]
-    Platform(#[from] ops::platform::PlatformError),
 
     /// A file could not be read.
     #[error("io: {path}: {source}")]
     Io {
+        /// The file.
         path: PathBuf,
+        /// The operating system's failure.
         #[source]
         source: std::io::Error,
     },
 
     /// A checkpoint's index or configuration is not well formed.
     #[error("checkpoint {path}: {problem}")]
-    Checkpoint { path: PathBuf, problem: String },
+    Checkpoint {
+        /// The checkpoint's root or the file within it.
+        path: PathBuf,
+        /// What is wrong with it.
+        problem: String,
+    },
 
-    /// A tensor a caller asked for is not in the checkpoint.
+    /// A tensor a module asked for is not in the checkpoint.
     #[error("the checkpoint has no tensor `{0}`")]
     MissingTensor(String),
 
-    /// A weight request and what the checkpoint holds disagree.
+    /// What a module asked of a weight and what the checkpoint holds disagree.
     #[error("weight `{tensor}`: {problem}")]
-    Weight { tensor: String, problem: String },
-
-    /// The arena reserved for one captured bucket cannot hold what this forward asks of it.
-    #[error("arena: {needed} bytes requested at offset {at} of a {available}-byte region")]
-    Arena {
-        needed: u64,
-        at: u64,
-        available: u64,
+    Weight {
+        /// The weight's checkpoint name.
+        tensor: String,
+        /// The disagreement.
+        problem: String,
     },
 
-    /// The staging region lent to a forward cannot hold the values it uploads.
-    #[error("staging: {needed} bytes requested at offset {at} of a {available}-byte region")]
-    Staging {
-        needed: u64,
-        at: u64,
-        available: u64,
-    },
-
-    /// A view's shape, dtype or rank does not fit what the layer was built for.
+    /// A tensor's shape, element type or rank does not fit what the function or module takes.
     #[error("{owner}: {problem}")]
     Shape {
+        /// The function or module that refused.
         owner: &'static str,
+        /// What it was given and what it takes.
         problem: String,
     },
 
     /// A loader's policy does not describe the checkpoint it is asked to read.
     ///
     /// A policy (an element type, a quantization) is chosen once for a model; a stage whose
-    /// weights are not of that kind would be read as something it is not, which is a wrong answer
-    /// rather than a convenience.
+    /// weights are not of that kind would be read as something it is not.
     #[error("loader policy: {problem}")]
     Policy {
         /// What the policy asks for and what the checkpoint holds.
         problem: String,
     },
 
-    /// A capability of the design that this crate does not implement yet, named precisely.
+    /// A capability of the design that this crate does not implement, named precisely.
     #[error("unsupported: {0}")]
     Unsupported(String),
 
@@ -99,8 +89,8 @@ pub enum Error {
     /// values its reader accepts.
     ///
     /// `owner` is the document the field was read from (a sidecar's path, or the object within
-    /// it), `field` the key, and `problem` what the reader requires of it, so a refused checkpoint
-    /// says which value it would have to state.
+    /// it), `field` the key, and `problem` what the reader requires of it, so a refused
+    /// checkpoint says which value it would have to state.
     #[error("{owner}{separator}{field} {problem}", separator = if .field.is_empty() { "" } else { "." })]
     Config {
         /// The document or object the field belongs to.
@@ -134,19 +124,21 @@ impl Error {
         }
     }
 
+    /// A model family's failure, with the family's own error as the source.
+    pub fn model(
+        model: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self::Model {
+            model,
+            source: source.into(),
+        }
+    }
+
     /// A policy that does not describe the checkpoint.
     pub(crate) fn policy(problem: impl Into<String>) -> Self {
         Self::Policy {
             problem: problem.into(),
-        }
-    }
-
-    /// A failed launch, named by its operator and the program it selected.
-    pub(crate) fn launch(operator: &'static str, descriptor: String, source: ops::Error) -> Self {
-        Self::Launch {
-            operator,
-            descriptor,
-            source,
         }
     }
 
@@ -163,18 +155,7 @@ impl Error {
         }
     }
 
-    /// A model family's failure, with the family's own error as the source.
-    pub fn model(
-        model: &'static str,
-        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-    ) -> Self {
-        Self::Model {
-            model,
-            source: source.into(),
-        }
-    }
-
-    /// A disagreement between a weight request and the checkpoint.
+    /// A disagreement between what was asked of the weight `tensor` and the checkpoint.
     pub(crate) fn weight(tensor: &str, problem: impl Into<String>) -> Self {
         Self::Weight {
             tensor: tensor.to_owned(),
@@ -183,5 +164,81 @@ impl Error {
     }
 }
 
+impl From<uniserve_tensor::Error> for Error {
+    /// The tensor library's failure, with the typed cause recovered when the failure is one the
+    /// tensor library carried for this crate or for the backend.
+    fn from(error: uniserve_tensor::Error) -> Self {
+        match error {
+            // A captured backtrace wraps the failure it was taken for.
+            uniserve_tensor::Error::WithBacktrace { inner, backtrace } => {
+                match Self::from(*inner) {
+                    Self::Tensor(inner) => Self::Tensor(uniserve_tensor::Error::WithBacktrace {
+                        inner: Box::new(inner),
+                        backtrace,
+                    }),
+                    typed => typed,
+                }
+            }
+
+            uniserve_tensor::Error::Backend(source) => match source.downcast::<Self>() {
+                Ok(own) => *own,
+                Err(source) => match source.downcast::<backend::Error>() {
+                    Ok(backend) => Self::Backend(*backend),
+                    Err(source) => Self::Tensor(uniserve_tensor::Error::Backend(source)),
+                },
+            },
+
+            other => Self::Tensor(other),
+        }
+    }
+}
+
+impl From<Error> for uniserve_tensor::Error {
+    /// This crate's failure as the tensor library carries it across `Module::forward`.
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Tensor(error) => error,
+            Error::Backend(error) => error.into(),
+            other => Self::Backend(Box::new(other)),
+        }
+    }
+}
+
 /// A result of this crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn a_failure_carried_by_the_tensor_library_comes_back_as_the_variant_it_was_raised_as() {
+        let raised = Error::shape("rms_norm", "a weight of 4 elements for rows of 8");
+        let carried = uniserve_tensor::Error::from(raised);
+        assert!(matches!(
+            Error::from(carried),
+            Error::Shape {
+                owner: "rms_norm",
+                ..
+            }
+        ));
+
+        let backend = backend::Error::NoContext {
+            operation: "a launch",
+        };
+        let carried = uniserve_tensor::Error::from(Error::from(backend));
+        assert!(matches!(
+            Error::from(carried),
+            Error::Backend(backend::Error::NoContext { .. })
+        ));
+    }
+
+    #[test]
+    fn a_tensor_operation_s_own_refusal_stays_the_tensor_library_s() {
+        let refused = uniserve_tensor::Error::RequiresContiguous { op: "all_reduce" };
+        assert!(matches!(
+            Error::from(refused),
+            Error::Tensor(uniserve_tensor::Error::RequiresContiguous { .. })
+        ));
+    }
+}
