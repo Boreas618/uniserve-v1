@@ -10,6 +10,7 @@ publish = false
 # Models never depend on this crate; `nn` re-exports what they may use.
 [dependencies]
 ops.workspace = true
+uniserve-tensor.workspace = true
 thiserror.workspace = true
 
 [lints]

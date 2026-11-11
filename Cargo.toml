@@ -83,6 +83,9 @@ readme = "README.md"
 [workspace.dependencies]
 platform = { path = "crates/platform" }
 backend = { path = "crates/backend" }
+# The tensor library (github.com/Boreas618/uniserve-tensor). The local checkout stands in for
+# the pinned revision until the repository holds it (specs/tasks.md, T14).
+uniserve-tensor = { path = "/workspace/dev/uniserve-tensor" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 scheduler = { path = "crates/scheduler" }
