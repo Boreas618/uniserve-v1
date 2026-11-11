@@ -25,6 +25,7 @@ CHECKS = (
     "cast_check.py",
     "copy_strided_check.py",
     "fill_check.py",
+    "reduce_check.py",
 )
 
 

@@ -260,45 +260,50 @@ def same(label: str, got: torch.Tensor, expected: torch.Tensor) -> int:
     return got.numel()
 
 
-def merged(operands) -> tuple[list[int], list[list[int]]]:
+def merge(shape, strides) -> tuple[list[int], list[list[int]]]:
     """The extents and each operand's strides once the shared runs are merged.
 
-    The mirror of ``strided::merge_axes``: two adjacent axes merge when every
-    operand's outer stride is the inner extent times its inner stride, an
-    axis of one element merges with its neighbour whatever its stride, and an
-    operand of no axis is one axis of one element.
+    The mirror of ``strided::merge_axes``, over one ``shape`` and one stride
+    vector per operand: two adjacent axes merge when every operand's outer
+    stride is the inner extent times its inner stride, an axis of one element
+    merges with its neighbour whatever its stride, and an operand of no axis
+    is one axis of one element.
     """
-    shape = list(operands[0].shape)
-    assert all(list(operand.shape) == shape for operand in operands)
-
     # Built from the last axis outward: entry 0 is the innermost run.
     extents: list[int] = []
-    strides: list[list[int]] = [[] for _ in operands]
+    runs: list[list[int]] = [[] for _ in strides]
     for axis in reversed(range(len(shape))):
         extent = shape[axis]
-        steps = [operand.stride(axis) for operand in operands]
+        steps = [operand[axis] for operand in strides]
         together = bool(extents) and (
             extent == 1
             or extents[-1] == 1
             or all(
-                step == extents[-1] * merged_steps[-1]
-                for step, merged_steps in zip(steps, strides, strict=True)
+                step == extents[-1] * run[-1]
+                for step, run in zip(steps, runs, strict=True)
             )
         )
         if together:
             if extents[-1] == 1:
-                for step, merged_steps in zip(steps, strides, strict=True):
-                    merged_steps[-1] = step
+                for step, run in zip(steps, runs, strict=True):
+                    run[-1] = step
             extents[-1] *= extent
             continue
         extents.append(extent)
-        for step, merged_steps in zip(steps, strides, strict=True):
-            merged_steps.append(step)
+        for step, run in zip(steps, runs, strict=True):
+            run.append(step)
 
     if not extents:
         extents = [1]
-        strides = [[0] for _ in operands]
-    return extents[::-1], [steps[::-1] for steps in strides]
+        runs = [[0] for _ in strides]
+    return extents[::-1], [run[::-1] for run in runs]
+
+
+def merged(operands) -> tuple[list[int], list[list[int]]]:
+    """The merged extents and strides of tensors that share one shape."""
+    shape = list(operands[0].shape)
+    assert all(list(operand.shape) == shape for operand in operands)
+    return merge(shape, [list(operand.stride()) for operand in operands])
 
 
 def extent_words(extents) -> list[int]:

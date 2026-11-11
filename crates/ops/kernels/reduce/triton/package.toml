@@ -1,0 +1,48 @@
+# The reduce operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# A strided input folded along some of its axes into a contiguous output: a sum,
+# a minimum or a maximum over one or more axes, or the `u32` index of the first
+# least or greatest element along one. The kept axes and the reduced axes are
+# two index spaces, and the number of axes each traverses is compiled in with
+# the function and the element type; the extents, the strides and the length of
+# the reduction are launch words.
+#
+# One program folds `block / tile` outputs, a tile of each at a time. The tile
+# is the reduction's class (the least power of two that holds its length)
+# capped at the block, so the lengths a model reduces over share modules. The
+# key is the one `Descriptor`'s `Display` prints, e.g.
+# `function_sum_dtype_bf16_kept_1_reduced_1_tile_128_block_1024_pdl_false`.
+#
+# `src/strided.py` links the address arithmetic every tensor primitive shares,
+# under `kernels/tensor/triton/src/`; an installation copies the file the link
+# names.
+
+op = "reduce"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/reduce.py", "src/strided.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { function = ["sum", "min", "max", "argmin", "argmax"], dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], kept = { min = 1, max = 6 }, reduced = { min = 1, max = 6 }, tile = { power_of_two = true }, block = { power_of_two = true }, pdl = ["false", "true"] }
+
+[parameters]

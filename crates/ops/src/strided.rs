@@ -129,6 +129,12 @@ pub(crate) fn require_elements(
             ),
         ));
     }
+    require_words(operator, name, operand)
+}
+
+/// Check that the strides of the operand `name` fit the signed 64-bit words a program reads them
+/// as.
+pub(crate) fn require_words(operator: &'static str, name: &str, operand: &Operand) -> Result<()> {
     if let Some(stride) = operand
         .strides
         .as_slice()
@@ -341,6 +347,28 @@ pub(crate) fn rank<const N: usize>(operands: [Operand; N]) -> u8 {
     merge_axes(operands)
         .first()
         .map_or(1, |operand| operand.shape.rank() as u8)
+}
+
+/// The view of `operand` along the axes `keep` selects, at index zero of every other axis.
+pub(crate) fn select_axes(operand: &Operand, keep: impl Fn(usize) -> bool) -> Operand {
+    let mut dims = [0_u64; MAX_RANK];
+    let mut strides = [0_u64; MAX_RANK];
+    let mut axes = 0;
+
+    for axis in 0..operand.shape.rank() {
+        if keep(axis) {
+            dims[axes] = operand.shape.dim(axis);
+            strides[axes] = operand.strides.get(axis);
+            axes += 1;
+        }
+    }
+
+    Operand::with_strides(
+        operand.ptr,
+        operand.dtype,
+        Shape::new(&dims[..axes]),
+        Strides::new(&strides[..axes]),
+    )
 }
 
 /// Pack the extents of an index space: the words of slots 1 to `MAX_RANK − 1`, right-aligned,

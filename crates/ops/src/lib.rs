@@ -69,6 +69,7 @@
 //! | [`cast::Cast`] | `cast` | [`cast`] |
 //! | [`copy_strided::CopyStrided`] | `copy_strided` | [`copy_strided`] |
 //! | [`fill::Fill`] | `fill` | [`fill`] |
+//! | [`reduce::Reduce`] | `reduce` | [`reduce`] |
 //!
 //! ## Descriptor keys
 //!
@@ -132,6 +133,7 @@ pub mod position;
 pub mod posterior;
 pub mod prefix_cache;
 pub mod recurrent;
+pub mod reduce;
 pub mod residual;
 pub mod rgb;
 pub mod rope;

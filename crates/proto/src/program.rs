@@ -225,6 +225,7 @@ pub mod operator {
     pub const CAST: &str = "cast";
     pub const COPY_STRIDED: &str = "copy_strided";
     pub const FILL: &str = "fill";
+    pub const REDUCE: &str = "reduce";
 
     /// Every operator this build has, in a stable order for a package's coverage check.
     ///
@@ -323,6 +324,7 @@ pub mod operator {
         CAST,
         COPY_STRIDED,
         FILL,
+        REDUCE,
     ];
 
     /// `name`, interned, when this build has an operator by that name.
