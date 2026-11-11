@@ -150,7 +150,7 @@ impl Scheduler {
                 // preemption states or as lost, its trajectory not stored.
                 let cause = match decided {
                     Some(Terminal::Migrated { cause, .. }) => Some(*cause),
-                    None if self.config.canvas.is_none() => Some(MigrationCause::Loss),
+                    None if self.config.block_sampling.is_none() => Some(MigrationCause::Loss),
                     _ => None,
                 };
                 let terminal = match cause {
@@ -184,7 +184,7 @@ impl Scheduler {
     /// the same way, naming the trajectory it named before. The others are
     /// left to `abort_all_requests`.
     pub(crate) fn hand_back_requests(&mut self) {
-        if self.config.canvas.is_some() {
+        if self.config.block_sampling.is_some() {
             return;
         }
         let failure = self
@@ -241,9 +241,9 @@ impl Scheduler {
     /// Whether running request `id` leaves as migratable when the workers
     /// that hold it are lost: a token request that resumes from its
     /// generated tokens, not already finishing, on a deployment that does
-    /// not generate in canvases.
+    /// not generate in blocks.
     fn migrates_on_loss(&self, id: RequestId) -> bool {
-        self.config.canvas.is_none()
+        self.config.block_sampling.is_none()
             && !self.inflight.pending_finishes.contains_key(&id)
             && self.requests.tokens(&id).is_some()
             && !self.requests.finished(&id)
@@ -374,7 +374,7 @@ impl Scheduler {
         // unless an error finish is already pending, and defers an error
         // finish until its in-flight calls drain.
         let engine_id = self.engine_id;
-        let migrates = self.config.canvas.is_none()
+        let migrates = self.config.block_sampling.is_none()
             && loss
                 .execution
                 .as_ref()

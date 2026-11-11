@@ -852,7 +852,7 @@ impl Scheduler {
     /// migratable, for `cause`.
     ///
     /// A request resumes from the tokens and images it generated on a
-    /// deployment that does not generate in canvases. A waiting one ends at
+    /// deployment that does not generate in blocks. A waiting one ends at
     /// once. A running one stops scheduling, drops the decoder decisions it
     /// awaits, and ends
     /// once its calls in flight drain, after every token and image it
@@ -865,7 +865,7 @@ impl Scheduler {
     /// and which the engine that serves next continues. A request already
     /// finishing finishes. Video requests go on.
     pub(super) fn migrate_requests(&mut self, cause: MigrationCause) {
-        if self.config.canvas.is_some() {
+        if self.config.block_sampling.is_some() {
             return;
         }
         let waiting: Vec<RequestId> = self
@@ -901,7 +901,7 @@ impl Scheduler {
         cause: MigrationCause,
         select: impl Fn(RequestId) -> bool,
     ) {
-        if self.config.canvas.is_some() {
+        if self.config.block_sampling.is_some() {
             return;
         }
         for id in self.running.clone() {

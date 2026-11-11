@@ -153,11 +153,11 @@ pub(crate) fn groups(
     // Keeps the requests clients could submit, naming what it leaves out.
     let servable = |what: &str, requests: Vec<GenerationRequest>| {
         // A deployment with block sampling generates every request in
-        // canvases, so admission checks its canvas features.
-        let canvases = facts.canvas_sampling.is_some();
+        // blocks, so admission checks its block features.
+        let blocks = facts.block_sampling.is_some();
         let (kept, refused): (Vec<_>, Vec<_>) = requests.into_iter().partition(|request| {
-            let needs = if canvases {
-                request.canvas_features()
+            let needs = if blocks {
+                request.block_features()
             } else {
                 request.required_features()
             };
@@ -191,10 +191,10 @@ pub(crate) fn groups(
     }
 
     if info.diffusion_lm_step_rows > 0 {
-        let sampling = facts.canvas_sampling.context(
+        let sampling = facts.block_sampling.context(
             "workers report diffusion LM step rows but the deployment has no block sampling",
         )?;
-        let length = sampling.canvas_length as usize;
+        let length = sampling.block_length as usize;
         // Requests of different lengths stop stepping together once the
         // shortest finishes: each commits its block in its own batch, and
         // whether two of them step together again depends on timing. So each
@@ -203,7 +203,7 @@ pub(crate) fn groups(
             let blocks = if rows == 1 { 2 } else { 1 };
             let requests = servable(
                 "diffusion LM",
-                // The scheduler generates every such request in canvases of
+                // The scheduler generates every such request in blocks of
                 // the deployment's block sampling.
                 (0..rows).map(|_| und(blocks * length)).collect(),
             );
@@ -318,7 +318,7 @@ fn await_finish(core: &Warm, group: &str, stream: &mut EventRx) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use crate::{GenerationFeatures, GenerationLimits};
-    use ipc::CanvasSampling;
+    use ipc::BlockSampling;
 
     use super::*;
 
@@ -387,8 +387,8 @@ mod tests {
 
     #[test]
     fn a_diffusion_lm_steps_at_every_row_count_and_commits_a_block() {
-        let canvas = CanvasSampling {
-            canvas_length: 16,
+        let sampling = BlockSampling {
+            block_length: 16,
             max_steps: 2,
             entropy_bound: 0.1,
             t_min: 0.4,
@@ -411,7 +411,7 @@ mod tests {
             features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::TOKEN_DENOISING,
             ..model.generation_limits.clone()
         };
-        model.canvas_sampling = Some(canvas);
+        model.block_sampling = Some(sampling);
         let limits = model.generation_limits.clone();
 
         let groups = groups_of(&args, &info, &limits);
@@ -430,7 +430,7 @@ mod tests {
         let blocks: Vec<usize> = groups
             .iter()
             .filter(|group| group.what == "diffusion LM")
-            .map(|group| group.requests[0].max_und_tokens / canvas.canvas_length as usize)
+            .map(|group| group.requests[0].max_und_tokens / sampling.block_length as usize)
             .collect();
         assert_eq!(blocks, [1, 1, 2]);
     }

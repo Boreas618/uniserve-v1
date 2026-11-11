@@ -1852,7 +1852,7 @@ fn policy_usage(
 }
 
 /// The scheduling limits and policy `scheduling` states, with the engine's
-/// defaults for those it leaves out; the canvas is the scheduler's own.
+/// defaults for those it leaves out; the block is the scheduler's own.
 ///
 /// # Errors
 ///
@@ -1874,7 +1874,7 @@ fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<SchedulerConfig> 
             .max_queued_requests
             .map(|requests| requests as usize)
             .and_then(std::num::NonZeroUsize::new),
-        canvas: None,
+        block_sampling: None,
         draft_tokens: 0,
         // A `Configure` command states the scheduling limits, not the
         // deployment's graph catalog.

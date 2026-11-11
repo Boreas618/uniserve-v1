@@ -151,8 +151,8 @@ pub struct ExecutionDomainStats {
     /// Counters for every other media call: latent preparation, denoising,
     /// decoding, media encoding, and muxing.
     pub flow: DomainStats,
-    /// Counters for token-canvas denoising passes.
-    pub canvas: DomainStats,
+    /// Counters for token-block denoising passes.
+    pub block: DomainStats,
 }
 
 impl ExecutionDomainStats {
@@ -184,7 +184,7 @@ impl ExecutionDomainStats {
             ("prefill", &self.prefill),
             ("decode", &self.decode),
             ("flow", &self.flow),
-            ("canvas", &self.canvas),
+            ("block", &self.block),
         ]
     }
 

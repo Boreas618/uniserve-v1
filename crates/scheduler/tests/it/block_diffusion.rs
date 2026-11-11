@@ -21,8 +21,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ipc::execution::{Batch, BatchId, RowKind, Variant};
+use ipc::{BlockSampling, RequestId, SamplingParams};
 use ipc::{CallKind, ForwardMode};
-use ipc::{CanvasSampling, RequestId, SamplingParams};
 use scheduler::{CachePolicy, Event, FinishReason, GenerationRequest, MultimodalInputs};
 use scheduler::{CommandSender, EventRx, RejectionKind, SchedulerConfig};
 use testkit::{Accepted, FakeBatches};
@@ -32,8 +32,8 @@ const BLOCK: u32 = 16;
 /// Denoising steps a block runs at most.
 const MAX_STEPS: u32 = 4;
 /// The block-diffusion sampling the deployment is launched with.
-const SAMPLING: CanvasSampling = CanvasSampling {
-    canvas_length: BLOCK,
+const SAMPLING: BlockSampling = BlockSampling {
+    block_length: BLOCK,
     max_steps: MAX_STEPS,
     entropy_bound: 0.1,
     t_min: 0.4,
@@ -46,7 +46,7 @@ const SAMPLING: CanvasSampling = CanvasSampling {
 /// blocks.
 fn config() -> SchedulerConfig {
     SchedulerConfig {
-        canvas: Some(SAMPLING),
+        block_sampling: Some(SAMPLING),
         ..SchedulerConfig::default()
     }
 }

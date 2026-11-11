@@ -772,7 +772,7 @@ impl Scheduler {
                     image_cache,
                     state,
                     &record,
-                    self.config.canvas.as_ref(),
+                    self.config.block_sampling.as_ref(),
                 ) {
                     self.fail_after_inflight(id, rejection_cause(&call, &error));
                     continue;
@@ -898,10 +898,10 @@ impl Scheduler {
                         state.num_cache_units_sent = state
                             .num_cache_units_sent
                             .saturating_sub(u64::from(call.bounds.max_cache_units));
-                        let stop_observed = state.phase == Phase::CommitCanvas
+                        let stop_observed = state.phase == Phase::CommitBlock
                             && call
-                                .canvas
-                                .is_some_and(|step| step.block == state.canvas_block);
+                                .block_step
+                                .is_some_and(|step| step.block == state.block_index);
                         if !stop_observed {
                             state.speculative_chain_invalidated = has_unresolved_descendants;
                         }
@@ -929,7 +929,7 @@ impl Scheduler {
                     CallKind::Forward(ForwardMode::Prefill)
                         | CallKind::Forward(ForwardMode::Decode)
                         | CallKind::Forward(ForwardMode::Verify)
-                ) || call.canvas.is_some();
+                ) || call.block_step.is_some();
                 // With stop strings, push a placeholder decoder boundary before
                 // resolving, so a non-error finish reached while resolving
                 // waits for the frontend decoder's stop-string decision on this

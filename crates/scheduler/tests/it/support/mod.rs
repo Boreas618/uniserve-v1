@@ -125,7 +125,7 @@ pub(crate) fn text_pool(
 /// The model limits a deployment whose workers serve `calls` states.
 ///
 /// A token-denoising worker without text decode generates block-diffusion
-/// canvases over prompts that may carry encoded images; one that prepares
+/// blocks over prompts that may carry encoded images; one that prepares
 /// latents without decoding text serves video diffusion, which needs no
 /// generation feature. Any other vision- or latent-encoding worker reads
 /// images without bound, and the rest serve text.

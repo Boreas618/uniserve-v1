@@ -1,7 +1,7 @@
 //! Generation lifecycle state and worker-call preparation.
 //!
 //! A request advances through context ingestion, then either understanding
-//! decode or block-diffusion canvases of text ([`GenerationPhase`]).
+//! decode or block-diffusion blocks of text ([`GenerationPhase`]).
 //! [`TokenState`] holds the accepted progress of one admitted token request.
 //!
 //! Each `prepare_*` builder returns one call whose identities are placeholders
@@ -23,11 +23,11 @@ use crate::kv_cache::{BlockTable, CacheAllocation};
 use ipc::{ForwardMode, MediaCall};
 
 use crate::{GenerationRequest, ImageEncoderInput, ImageInput};
+use ipc::{BlockSampling, RequestId, SamplingParams};
 use ipc::{
-    Bounds, Call, CallId, CallKind, CallStatus, CanvasStep, DimBound, RequestKey, SamplingState,
+    BlockStep, Bounds, Call, CallId, CallKind, CallStatus, DimBound, RequestKey, SamplingState,
     ShapeBound, TensorRef, VisionInput,
 };
-use ipc::{CanvasSampling, RequestId, SamplingParams};
 use proto::tensor::DType;
 
 /// Builds an unstamped product reference for a prepared call output.
@@ -158,13 +158,13 @@ pub(crate) enum GenerationPhase {
     HandOff,
     /// Decode understanding (text) tokens.
     DecodeUnd,
-    /// Run one denoising step of a canvas-generating request's current block
+    /// Run one denoising step of a block-generating request's current block
     /// over its context. The step that stops the block reports the block's
     /// tokens.
-    Canvas,
+    Block,
     /// Write a stopped block's tokens into the request's context as a causal
-    /// prefill row (`TokenState::canvas_commit`); the next block reads them.
-    CommitCanvas,
+    /// prefill row (`TokenState::block_commit`); the next block reads them.
+    CommitBlock,
 }
 
 /// Image extension writes one latent input-image block with a call of its
@@ -178,8 +178,8 @@ pub(super) fn consumes_image_features(call: &Call) -> bool {
 /// Prompt extension, a context prefill, writes prompt tokens into the prefix cache together
 /// with the vision blocks of the input images between them
 /// (`Call::vision_inputs`): a prefill with no latent image extension. It
-/// samples the next token unless its request generates canvases, whose
-/// prompt only conditions its canvases. A canvas-generating request's block
+/// samples the next token unless its request generates blocks, whose
+/// prompt only conditions its blocks. A block-generating request's block
 /// commit is a prompt extension too, of the tokens of its stopped block.
 pub(super) fn is_prompt_extend(call: &Call) -> bool {
     call.kind == CallKind::Forward(ForwardMode::Prefill) && !consumes_image_features(call)
@@ -220,19 +220,19 @@ impl TokenState {
         }
 
         match call.kind {
-            // A block commit is prepared only in `CommitCanvas`, and a prompt
+            // A block commit is prepared only in `CommitBlock`, and a prompt
             // chunk never is; the committed block extends the context and
             // the next block starts at step zero.
             CallKind::Forward(ForwardMode::Prefill)
-                if is_prompt_extend(call) && self.phase == GenerationPhase::CommitCanvas =>
+                if is_prompt_extend(call) && self.phase == GenerationPhase::CommitBlock =>
             {
                 let count = call.input_token_ids.len().min(u32::MAX as usize) as u32;
                 self.logical_position = self.logical_position.saturating_add(count);
                 self.cache_visible_len = self.cache_visible_len.saturating_add(count);
-                self.canvas_block = self.canvas_block.saturating_add(1);
-                self.canvas_step = 0;
-                self.canvas_commit.clear();
-                self.phase = GenerationPhase::Canvas;
+                self.block_index = self.block_index.saturating_add(1);
+                self.block_step = 0;
+                self.block_commit.clear();
+                self.phase = GenerationPhase::Block;
             }
             // A context prefill writes its prompt tokens and the vision
             // blocks between them; an image's positions count once its last
@@ -280,15 +280,15 @@ impl TokenState {
                 self.logical_position = self.logical_position.saturating_add(count);
                 self.cache_visible_len = self.cache_visible_len.saturating_add(count);
             }
-            // A canvas step that reports no tokens leaves its block running;
+            // A block step that reports no tokens leaves its block running;
             // one that reports the block's tokens stopped it, and `output`
             // publishes them before the block is committed.
             CallKind::Forward(ForwardMode::TokenDenoising) => {
                 if record.committed_tokens.is_empty() {
-                    self.canvas_step = self.canvas_step.saturating_add(1);
+                    self.block_step = self.block_step.saturating_add(1);
                 } else {
-                    self.canvas_commit = record.committed_tokens.clone();
-                    self.phase = GenerationPhase::CommitCanvas;
+                    self.block_commit = record.committed_tokens.clone();
+                    self.phase = GenerationPhase::CommitBlock;
                 }
             }
             _ => {}
@@ -347,16 +347,16 @@ fn new_call(request: &GenerationRequest, kind: CallKind) -> Call {
     call
 }
 
-/// Outputs a context prefill: prompt tokens `start..end` and the vision
+/// Prepares a context prefill: prompt tokens `start..end` and the vision
 /// `blocks` of the input images between them, which write `block_tokens` cache
 /// tokens together, with a sampled-token output when this call ends the prompt
 /// and the request `samples` from its prompt, unless the context ends with a
 /// block of this call. A chunk before the prompt's end
 /// only writes the cache: it draws nothing from the request's stream, so a
 /// prompt split over several batches draws its first token once. A request
-/// samples nothing from its prompt on a deployment that generates canvases.
+/// samples nothing from its prompt on a deployment that generates blocks.
 ///
-/// The prompt of a canvas-generating request only conditions its canvases, so
+/// The prompt of a block-generating request only conditions its blocks, so
 /// its prefill samples nothing. A context that ends with an
 /// image block samples nothing either: understanding decode
 /// then starts from BOS, as after a trailing latent block. Fails with
@@ -413,42 +413,42 @@ pub(super) fn prepare_prompt(
     finish_call(request, call, prompt_positions)
 }
 
-/// Outputs denoising step `step` of the canvas-generating `request`'s block
+/// Prepares denoising step `step` of the block-generating `request`'s block
 /// `block`, the number of blocks already committed to its context, under the
-/// deployment's `canvas` sampling.
+/// deployment's block sampling.
 ///
-/// The call carries no tokens: the worker keeps the block's canvas and
-/// sampler state in the request's slot. Its `max_tokens` is the canvas
+/// The call carries no tokens: the worker keeps the block and its
+/// sampler state in the request's slot. Its `max_tokens` is the block
 /// length, which the step denoises and which a stopping step reports as its
 /// committed tokens; its completion payload bound covers those tokens at
 /// four bytes each. Its completion output is true while the block continues
 /// after the step: the predicate of the next step, which the scheduler may
 /// queue before this one resolves.
-pub(super) fn prepare_canvas_step(
+pub(super) fn prepare_block_step(
     request: &GenerationRequest,
-    canvas: &CanvasSampling,
+    sampling: &BlockSampling,
     block: u32,
     step: u32,
 ) -> Result<Call, CallError> {
     let mut call = new_call(request, CallKind::Forward(ForwardMode::TokenDenoising));
-    call.bounds.max_tokens = canvas.canvas_length;
-    call.canvas = Some(CanvasStep { block, step });
+    call.bounds.max_tokens = sampling.block_length;
+    call.block_step = Some(BlockStep { block, step });
     call.completion_output = Some(output_tensor(0, DType::U8));
     let mut call = finish_call(request, call, 0)?;
-    call.bounds.max_completion_bytes = u64::from(canvas.canvas_length).saturating_mul(4);
+    call.bounds.max_completion_bytes = u64::from(sampling.block_length).saturating_mul(4);
     Ok(call)
 }
 
-/// Outputs the commit of a stopped block's `tokens` to the context of the
-/// canvas-generating `request`: a prefill that writes them into the prefix cache, as causal
-/// prompt, and samples nothing. Fails with `EmptyCanvasCommit` for an empty
+/// Prepares the commit of a stopped block's `tokens` to the context of the
+/// block-generating `request`: a prefill that writes them into the prefix cache, as causal
+/// prompt, and samples nothing. Fails with `EmptyBlockCommit` for an empty
 /// block.
-pub(super) fn prepare_canvas_commit(
+pub(super) fn prepare_block_commit(
     request: &GenerationRequest,
     tokens: &[u32],
 ) -> Result<Call, CallError> {
     if tokens.is_empty() {
-        return Err(CallError::EmptyCanvasCommit);
+        return Err(CallError::EmptyBlockCommit);
     }
     let mut call = new_call(request, CallKind::Forward(ForwardMode::Prefill));
     call.bounds.max_tokens = u32::try_from(tokens.len())
@@ -457,7 +457,7 @@ pub(super) fn prepare_canvas_commit(
     finish_call(request, call, 0)
 }
 
-/// Outputs a sampled continuation; relay inputs leave host token values empty.
+/// Prepares a sampled continuation; relay inputs leave host token values empty.
 ///
 /// The call is a decode whose input is `input_token`, or nothing when
 /// `relay_input` continues from the predecessor's device-running token.
@@ -478,7 +478,7 @@ pub(super) fn prepare_decode(
     finish_call(request, call, 0)
 }
 
-/// Outputs the verification of a speculating request's next step: its
+/// Prepares the verification of a speculating request's next step: its
 /// committed `input_token` followed by `drafts`, the drafts its drafter
 /// proposed, of which the call commits the accepted prefix and the token
 /// after it, at most one more than their count; with no drafts it decodes
@@ -513,7 +513,7 @@ pub(crate) fn verify_drafts(call: &Call) -> &[u32] {
     }
 }
 
-/// Outputs a refill of the speculating `request`'s draft cache over `tokens`,
+/// Prepares a refill of the speculating `request`'s draft cache over `tokens`,
 /// which its cache holds from position `start` on: the target model
 /// evaluates them again, from the state checkpoint at `start`, and the
 /// drafter writes their draft cache entries, the last reading `lookahead`,
@@ -536,7 +536,7 @@ pub(super) fn prepare_refill(
     finish_call(request, call, 0)
 }
 
-/// Outputs the cache write of a latent input-image block, retaining an exact
+/// Prepares the cache write of a latent input-image block, retaining an exact
 /// token count only when the encoder supplies one.
 ///
 /// The call is a prefill that reads `feature` and may write up to the
@@ -641,8 +641,8 @@ pub(crate) enum CallError {
         end: u32,
         prompt_tokens: usize,
     },
-    #[error("a canvas commit carries no tokens")]
-    EmptyCanvasCommit,
+    #[error("a block commit carries no tokens")]
+    EmptyBlockCommit,
     #[error("image encoding requires image bytes")]
     MissingImageInput,
     #[error("product bound must be nonzero")]
@@ -703,15 +703,15 @@ pub(super) fn register_call(
 /// `image_cache` is the input frozen when the call was submitted
 /// (`InflightInput::Generation`). A predicated result is valid only when the
 /// call carried a predicate and the result reports no tokens and no products.
-/// `canvas` is the deployment's block-diffusion sampling, which bounds a
-/// canvas step's block. Returns the first violation found; the caller
+/// `block` is the deployment's block-diffusion sampling, which bounds a
+/// block step's block. Returns the first violation found; the caller
 /// finishes the request with an error on any `Err`.
 pub(crate) fn validate_generation_result(
     call: &Call,
     image_cache: Option<(u32, Option<u32>)>,
     state: &TokenState,
     record: &CallCompletion,
-    canvas: Option<&CanvasSampling>,
+    sampling: Option<&BlockSampling>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;
 
@@ -764,24 +764,25 @@ pub(crate) fn validate_generation_result(
         }
     }
 
-    // A canvas step reports no tokens while its block runs and the whole
+    // A block step reports no tokens while its block runs and the whole
     // block once it stops; the step at the block's step limit must stop it.
-    if let Some(step) = call.canvas {
+    if let Some(step) = call.block_step {
         let committed = record.committed_tokens.len();
         if committed != 0 && committed != call.bounds.max_tokens as usize {
             return Err(GenerationResultError::Token {
-                detail: "canvas_block_length_mismatch",
+                detail: "block_length_mismatch",
             });
         }
-        let last_step = canvas.is_none_or(|canvas| step.step.saturating_add(1) >= canvas.max_steps);
+        let last_step =
+            sampling.is_none_or(|sampling| step.step.saturating_add(1) >= sampling.max_steps);
         if committed == 0 && last_step {
             return Err(GenerationResultError::Progress {
-                detail: "canvas_step_limit_exceeded",
+                detail: "block_step_limit_exceeded",
             });
         }
         if !record.token_logprobs.is_empty() || !record.prompt_logprobs.is_empty() {
             return Err(GenerationResultError::Logprob {
-                detail: "unexpected_canvas_logprobs",
+                detail: "unexpected_block_logprobs",
             });
         }
         return Ok(());
@@ -1074,13 +1075,13 @@ pub(crate) struct TokenState {
     /// Request-local encoder outputs outside the encoder cache, freed by
     /// `Scheduler::free_consumed_products` or when the request finishes.
     pub(super) transient_encoder_products: Vec<TensorRef>,
-    /// Blocks a canvas-generating request has committed to its context.
-    pub(super) canvas_block: u32,
+    /// Blocks a block-generating request has committed to its context.
+    pub(super) block_index: u32,
     /// Accepted denoising steps of the current block.
-    pub(super) canvas_step: u32,
+    pub(super) block_step: u32,
     /// Tokens of the stopped block awaiting their commit
-    /// (`GenerationPhase::CommitCanvas`); empty otherwise.
-    pub(super) canvas_commit: Vec<u32>,
+    /// (`GenerationPhase::CommitBlock`); empty otherwise.
+    pub(super) block_commit: Vec<u32>,
     /// Cause of the first rejected worker result, which
     /// `Scheduler::fail_after_inflight` reports as the request's terminal
     /// error and its error finish logs.

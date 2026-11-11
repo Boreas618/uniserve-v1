@@ -14,7 +14,7 @@
 //! Products are named as the loaded stages declare them, so admission
 //! finds each product's output on the stage serving its call by name.
 //! A product laid out at the request's raster declares its raster axes, which
-//! admission binds to the graph's canvas. The graph holds sizes only: it never
+//! admission binds to the graph's resolution. The graph holds sizes only: it never
 //! inspects media.
 
 use crate::DiffusionRequest;
@@ -22,7 +22,7 @@ use ipc::MediaCall;
 
 /// A video raster in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Canvas {
+pub(crate) struct Resolution {
     pub(crate) width: u32,
     pub(crate) height: u32,
 }
@@ -70,7 +70,7 @@ pub(crate) struct VideoGraph {
     states: Vec<NodeState>,
     products: Vec<GraphProduct>,
     /// The generated video's raster.
-    canvas: Canvas,
+    resolution: Resolution,
     /// Denoiser rows of each temporal unit the visual latent encoding
     /// covers, condition by condition in request order.
     condition_units: Vec<u32>,
@@ -238,7 +238,7 @@ impl VideoGraph {
             states: vec![NodeState::Pending; calls.len()],
             calls,
             products,
-            canvas: Canvas {
+            resolution: Resolution {
                 width: request.sampling.width,
                 height: request.sampling.height,
             },
@@ -330,8 +330,8 @@ impl VideoGraph {
     }
 
     /// The generated video's raster, which binds every raster axis.
-    pub(crate) fn canvas(&self) -> Canvas {
-        self.canvas
+    pub(crate) fn resolution(&self) -> Resolution {
+        self.resolution
     }
 
     /// The product a call publishes under `name`.

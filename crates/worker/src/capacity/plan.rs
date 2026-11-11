@@ -592,7 +592,7 @@ mod tests {
                 generation_limits: Default::default(),
                 bos: 0,
                 eos: Vec::new(),
-                canvas_sampling: None,
+                block_sampling: None,
                 prefill_outputs: true,
             },
             parallel: proto::config::ParallelConfig {

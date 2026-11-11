@@ -22,7 +22,7 @@
 //! numerical call, bounded by the batch's call and token budgets and the
 //! workers' pools; a worker replays a captured graph for a call one holds
 //! and runs any other eagerly. A context prefill with vision blocks stages
-//! several forward rows; a pass's prefill rows, like its canvas rows, stay
+//! several forward rows; a pass's prefill rows, like its block rows, stay
 //! within the rows a worker stages per call (`PassRows`).
 
 mod call;
@@ -36,11 +36,11 @@ use ipc::{ForwardMode, MediaCall};
 use scheduling::guest::{DispatchOutput, PhaseId, PhaseKind};
 
 /// Forward rows a pass may still add to its numerical calls, within the rows
-/// a worker stages per call: canvas rows across its token-denoising calls,
+/// a worker stages per call: block rows across its token-denoising calls,
 /// and context rows across its prefill calls.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PassRows {
-    pub(super) canvas: usize,
+    pub(super) block: usize,
     pub(super) context: usize,
 }
 
@@ -206,7 +206,7 @@ impl Scheduler {
         // numerical rows, independently of the number of requests batched.
         let row_capacity = (self.info.max_batch_calls.min(self.info.request_slots) as usize).max(1);
         let mut rows_left = PassRows {
-            canvas: row_capacity,
+            block: row_capacity,
             context: row_capacity.min(self.config.max_batch.get()),
         };
         // What the media calls in flight occupy — their stage's media
@@ -410,8 +410,8 @@ impl Scheduler {
                 if prefill {
                     prefill_budget = prefill_budget.saturating_sub(cost);
                 }
-                if call.canvas.is_some() {
-                    rows_left.canvas = rows_left.canvas.saturating_sub(1);
+                if call.block_step.is_some() {
+                    rows_left.block = rows_left.block.saturating_sub(1);
                 } else if prefill {
                     rows_left.context = rows_left.context.saturating_sub(1);
                 }
@@ -863,13 +863,13 @@ impl Scheduler {
     ///
     /// The call kind is the output's - the phases this pass selected - and the extent is the
     /// worker's own response: `Batches::media` names the bucket its runner prepared the computation
-    /// into, and a batch captured for one canvas serves no other, so the mechanism asks instead of
+    /// into, and a batch captured for one block serves no other, so the mechanism asks instead of
     /// deriving. A computation the worker states no bucket for, or a request whose state this
     /// scheduler no longer holds, leaves the batch without columns; it is then refused at
-    /// submission by name rather than served at a canvas nothing captured.
+    /// submission by name rather than served at a block nothing captured.
     ///
     /// The per-request record is `ipc::execution::StagedRequest`: the request's conditioning
-    /// exactly as the model family prepared it, and the step, seed and canvas the request states.
+    /// exactly as the model family prepared it, and the step, seed and block the request states.
     /// What the model prepares on the device - the encoded conditioning rows, the latent
     /// trajectory - is not here, because the mechanism cannot read it and a placeholder for it
     /// would be an invented tensor.
@@ -892,9 +892,9 @@ impl Scheduler {
             return;
         };
         // Every media call states the same record: the request's conditioning and the step, seed,
-        // canvas and frame count a call of its request is addressed by. A denoising step reads all
+        // block and frame count a call of its request is addressed by. A denoising step reads all
         // of it; a decode reads the request and its frames, and the track's decoder the request; the
-        // host calls work at the request's canvas and frame count. What a call reads beyond the
+        // host calls work at the request's block and frame count. What a call reads beyond the
         // record is a product, which its runner takes from the store under the request's name.
         //
         // A text encoding also reads its prompt, as the token columns an encoder stages.
@@ -944,7 +944,7 @@ impl Scheduler {
             extent,
         };
         // The worker's response is the authority on the extent: it is the bucket its own runner
-        // prepared the computation into, and a batch captured for one canvas serves no other.
+        // prepared the computation into, and a batch captured for one block serves no other.
         let Some(extent) = self.worker.media(phase, &stated) else {
             tracing::debug!(
                 "a media batch is dropped: no device of this rank serves a {:?} computation of \
@@ -1150,8 +1150,8 @@ impl Scheduler {
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             // The hand-off copies the request's cache with no call.
             Phase::HandOff => return None,
-            Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
-            Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
+            Phase::Block => CallKind::Forward(ForwardMode::TokenDenoising),
+            Phase::CommitBlock => CallKind::Forward(ForwardMode::Prefill),
         })
     }
 }

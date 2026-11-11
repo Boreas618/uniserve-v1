@@ -67,10 +67,10 @@ impl Scheduler {
     ///
     /// Prompt text and input images still to ingest go through
     /// `next_context_call`; otherwise the request's next phase decides.
-    /// A canvas step takes one of the pass's canvas `rows`, and a context
+    /// A block step takes one of the pass's block `rows`, and a context
     /// prefill the segments that fit its context rows within `budget` tokens.
     /// Returns `None` when nothing can be prepared now, including when the
-    /// cache capacity a call needs or room for one whole canvas row is
+    /// cache capacity a call needs or room for one whole block row is
     /// unavailable.
     pub(crate) fn next_generation_call(
         &mut self,
@@ -78,7 +78,7 @@ impl Scheduler {
         budget: usize,
         rows: PassRows,
     ) -> Option<Call> {
-        let canvas_rows = rows.canvas;
+        let block_rows = rows.block;
         let (_, cache_visible_len) = self.scheduled_token_lengths(id)?;
         let context_pending = self.requests.tokens(&id).is_some_and(|st| {
             self.num_scheduled_prompt_tokens(id)
@@ -94,7 +94,7 @@ impl Scheduler {
         match phase {
             Phase::Prefill => {
                 let st = self.requests.tokens(&id)?;
-                let samples = self.config.canvas.is_none();
+                let samples = self.config.block_sampling.is_none();
                 let n = st.req.prompt_token_ids.len();
                 let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
                 // Chunked prefill with the clip rule: the chunk is bounded by
@@ -226,8 +226,8 @@ impl Scheduler {
             // The hand-off copies the request's cache with no call.
             Phase::HandOff => None,
             Phase::IngestState => self.next_context_call(id, budget, rows.context),
-            Phase::Canvas => {
-                // One step of the request's block is one read-only canvas row
+            Phase::Block => {
+                // One step of the request's block is one read-only block row
                 // of the pass. The next step may be queued behind the steps
                 // still in flight, predicated on the last one's completion:
                 // the worker runs it as a no-op once an earlier step stopped
@@ -240,14 +240,14 @@ impl Scheduler {
                 // chunk, or the previous block's commit, which makes the
                 // prepared step the next block's step zero.
                 let st = self.requests.tokens(&id)?;
-                let canvas = self.config.canvas?;
-                let canvas_length = canvas.canvas_length as usize;
+                let sampling = self.config.block_sampling?;
+                let block_length = sampling.block_length as usize;
                 let pending = self.inflight.num_pending_calls(id);
                 if (pending > 0
                     && !self
                         .can_queue_successor(id, CallKind::Forward(ForwardMode::TokenDenoising)))
-                    || canvas_rows == 0
-                    || canvas_length > budget
+                    || block_rows == 0
+                    || block_length > budget
                 {
                     return None;
                 }
@@ -260,30 +260,30 @@ impl Scheduler {
                         .iter()
                         .rev()
                         .take_while(|inflight| !is_prompt_extend(&inflight.call))
-                        .filter(|inflight| inflight.call.canvas.is_some())
+                        .filter(|inflight| inflight.call.block_step.is_some())
                         .count()
                 });
-                let commit_in_flight = st.phase == Phase::CommitCanvas
+                let commit_in_flight = st.phase == Phase::CommitBlock
                     && queued.is_some_and(|calls| {
                         calls
                             .iter()
                             .any(|inflight| is_prompt_extend(&inflight.call))
                     });
                 let (block, first_step) = if commit_in_flight {
-                    (st.canvas_block.saturating_add(1), 0)
+                    (st.block_index.saturating_add(1), 0)
                 } else {
-                    (st.canvas_block, st.canvas_step)
+                    (st.block_index, st.block_step)
                 };
                 let step =
                     first_step.saturating_add(u32::try_from(steps_in_flight).unwrap_or(u32::MAX));
-                if step >= canvas.max_steps {
+                if step >= sampling.max_steps {
                     return None;
                 }
                 self.prepare_call(id, |_scheduler, request| {
-                    generation::prepare_canvas_step(request, &canvas, block, step)
+                    generation::prepare_block_step(request, &sampling, block, step)
                 })
             }
-            Phase::CommitCanvas => {
+            Phase::CommitBlock => {
                 // The stopped block's tokens extend the context as one causal
                 // prefill row. The commit is prepared once the host accepts
                 // the step that stopped the block, queued without a predicate
@@ -291,7 +291,7 @@ impl Scheduler {
                 // (`follows_unconditionally`), so the worker launches it
                 // while they run.
                 let st = self.requests.tokens(&id)?;
-                let tokens = st.canvas_commit.clone();
+                let tokens = st.block_commit.clone();
                 if (self.inflight.has_pending_calls(id)
                     && !self.can_queue_successor(id, CallKind::Forward(ForwardMode::Prefill)))
                     || tokens.len() > budget
@@ -303,13 +303,13 @@ impl Scheduler {
                     return None;
                 }
                 self.prepare_call(id, |_scheduler, request| {
-                    generation::prepare_canvas_commit(request, &tokens)
+                    generation::prepare_block_commit(request, &tokens)
                 })
             }
         }
     }
 
-    /// Outputs the next context-ingest call within `budget` tokens.
+    /// Prepares the next context-ingest call within `budget` tokens.
     ///
     /// The context is the prompt with the blocks of its input images at their
     /// positions: each encoder of an image writes one block, in encoder order.
@@ -512,7 +512,7 @@ impl Scheduler {
         }
 
         let sampling_state = self.build_token_masks(id, 0);
-        let samples = self.config.canvas.is_none();
+        let samples = self.config.block_sampling.is_none();
         self.prepare_call(id, |_scheduler, request| {
             generation::prepare_prompt(
                 request,

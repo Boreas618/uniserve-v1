@@ -52,7 +52,7 @@ fn ar_decode_call() -> Call {
         draft: Default::default(),
         cache_input: None,
         input_token_ids: Vec::new(),
-        canvas: None,
+        block_step: None,
         sampling_state: None,
         request_key: request_key(),
         call_id: CallId::new(11, 0),

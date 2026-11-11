@@ -492,7 +492,7 @@ fn next_phase(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> Optio
 /// the call.
 /// The context length the request's next prefill must reach: its prompt, or
 /// the tokens its context already holds plus the block a commit writes. A
-/// canvas-generating request's commit extends the context past its prompt, and
+/// block-generating request's commit extends the context past its prompt, and
 /// the prefill that writes it is sized from this end.
 fn prefill_end(state: &TokenState) -> u32 {
     // The end of the context the next prefill must reach. A migrated request's
@@ -519,7 +519,7 @@ fn prefill_end(state: &TokenState) -> u32 {
         };
         cursor = next;
     }
-    let commit = u32::try_from(state.canvas_commit.len()).unwrap_or(u32::MAX);
+    let commit = u32::try_from(state.block_commit.len()).unwrap_or(u32::MAX);
     prompt
         .saturating_add(blocks)
         .max(state.cache_visible_len.saturating_add(commit))
@@ -544,12 +544,12 @@ fn next_tokens(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> u32 
             let drafts = scheduler.verify_drafts(id, state.cache_visible_len).len();
             u32::try_from(1 + drafts).unwrap_or(u32::MAX)
         }
-        // A canvas step spends a whole canvas of a step's token budget, the
+        // A block step spends a whole block of a step's token budget, the
         // same bound the deployment was checked against.
         Some(CallKind::Forward(ForwardMode::TokenDenoising)) => scheduler
             .config
-            .canvas
-            .map_or(0, |canvas| canvas.canvas_length),
+            .block_sampling
+            .map_or(0, |sampling| sampling.block_length),
         Some(CallKind::Media(_)) => 1,
     }
 }

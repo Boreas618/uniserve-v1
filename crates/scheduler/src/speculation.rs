@@ -377,7 +377,7 @@ impl Scheduler {
             .then_some(state.draft.valid as usize)
     }
 
-    /// Outputs the next chunk of `id`'s refill within `budget` tokens.
+    /// Prepares the next chunk of `id`'s refill within `budget` tokens.
     ///
     /// The chunk evaluates the request's tokens from the end of its valid
     /// draft cache, where its state tables keep a checkpoint (or from the

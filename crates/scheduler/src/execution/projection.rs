@@ -150,10 +150,10 @@ impl Scheduler {
                             .iter()
                             .any(|inflight| is_prompt_extend(&inflight.call))
                     });
-                    if state.phase == Phase::CommitCanvas && !behind_commit {
-                        Phase::CommitCanvas
+                    if state.phase == Phase::CommitBlock && !behind_commit {
+                        Phase::CommitBlock
                     } else {
-                        Phase::Canvas
+                        Phase::Block
                     }
                 }
                 // A latent input-image block: context ingestion continues
@@ -166,7 +166,7 @@ impl Scheduler {
             None => state.phase,
         };
         Some(match phase {
-            // A complete prompt conditions a canvas-generating request's
+            // A complete prompt conditions a block-generating request's
             // blocks; any other request decodes from it. A block commit also
             // projects here, since it extends the context the same way, and
             // the next block follows it.
@@ -176,8 +176,8 @@ impl Scheduler {
                     && self.num_scheduled_images(id)?
                         >= state.req.multimodal_inputs.images.len() =>
             {
-                if self.config.canvas.is_some() {
-                    Phase::Canvas
+                if self.config.block_sampling.is_some() {
+                    Phase::Block
                 } else if self.decodes_elsewhere(id) {
                     Phase::HandOff
                 } else {
@@ -356,7 +356,7 @@ impl Scheduler {
     /// is, and so carries no predicate.
     ///
     /// Two successors follow unconditionally:
-    /// - The canvas pass that follows the prefill completing a context (a
+    /// - The block pass that follows the prefill completing a context (a
     ///   block's first step), since the prefill cannot stop the request.
     ///   The pass reads the prefix cache the prefill writes, and only
     ///   the worker's device order puts the write first: the worker runs the
@@ -367,8 +367,8 @@ impl Scheduler {
     ///   flight. The host has accepted the step that stopped the block, so
     ///   every step behind it is a no-op whose completion is false, and the
     ///   commit runs regardless. The commit writes the block's tokens to cache
-    ///   positions `[P, P + canvas)`, where `P` is the context length each
-    ///   step of the block reads; a canvas step reads cache below `P` and writes
+    ///   positions `[P, P + block)`, where `P` is the context length each
+    ///   step of the block reads; a block step reads cache below `P` and writes
     ///   none, so the commit's writes never overlap what those steps read.
     ///   Each rank also runs the commit after them in submission order on
     ///   its device stream, under data and expert parallelism alike.
@@ -385,11 +385,11 @@ impl Scheduler {
             CallKind::Forward(ForwardMode::TokenDenoising) => is_prompt_extend(&predecessor.call),
             CallKind::Forward(ForwardMode::Prefill) => {
                 self.requests.tokens(&id).is_some_and(|state| {
-                    state.phase == Phase::CommitCanvas
+                    state.phase == Phase::CommitBlock
                         && predecessor
                             .call
-                            .canvas
-                            .is_some_and(|step| step.block == state.canvas_block)
+                            .block_step
+                            .is_some_and(|step| step.block == state.block_index)
                 })
             }
             _ => false,
@@ -416,8 +416,8 @@ impl Scheduler {
             Phase::Prefill | Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             // The hand-off copies the request's cache with no call.
             Phase::HandOff => return None,
-            Phase::Canvas => CallKind::Forward(ForwardMode::TokenDenoising),
-            Phase::CommitCanvas => CallKind::Forward(ForwardMode::Prefill),
+            Phase::Block => CallKind::Forward(ForwardMode::TokenDenoising),
+            Phase::CommitBlock => CallKind::Forward(ForwardMode::Prefill),
             Phase::IngestState => return None,
         })
     }

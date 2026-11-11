@@ -36,7 +36,7 @@ fn resolve_generation_limits(
     if supports(CallKind::Media(MediaCall::LatentEncoding)) {
         available.insert(crate::GenerationFeatures::LATENT_ENCODE);
     }
-    // A canvas denoises over a prompt the same worker's prefill cached.
+    // A block denoises over a prompt the same worker's prefill cached.
     if supports(CallKind::Forward(ForwardMode::Prefill))
         && supports(CallKind::Forward(ForwardMode::TokenDenoising))
     {
@@ -161,17 +161,17 @@ impl Scheduler {
                 .min(proto::config::positive(max_batch_calls.max(1)));
         }
 
-        // A canvas step and a block commit each spend a whole canvas of one
-        // scheduling step's token budget, so the deployment's canvas must
+        // A block step and a block commit each spend a whole block of one
+        // scheduling step's token budget, so the deployment's block must
         // fit it.
-        if let Some(canvas) = config.canvas {
-            if let Some(parameter) = canvas.invalid_parameter() {
+        if let Some(sampling) = config.block_sampling {
+            if let Some(parameter) = sampling.invalid_parameter() {
                 anyhow::bail!("block-diffusion sampling parameter `{parameter}` is out of range");
             }
             anyhow::ensure!(
-                canvas.canvas_length as usize <= config.max_num_batched_tokens,
-                "a {}-token generation canvas exceeds the {}-token step budget",
-                canvas.canvas_length,
+                sampling.block_length as usize <= config.max_num_batched_tokens,
+                "a {}-token generation block exceeds the {}-token step budget",
+                sampling.block_length,
                 config.max_num_batched_tokens
             );
         }
@@ -274,7 +274,7 @@ impl Scheduler {
     }
 
     /// Takes `limits`' scheduling limits and policy from the next step on;
-    /// the canvas stays. The limits must lie within the batch the workers
+    /// the block stays. The limits must lie within the batch the workers
     /// were started for: the running requests within their request rows,
     /// a step's tokens and calls within their batch. A change of policy
     /// reorders the waiting queue by it, as if each request had been queued
@@ -282,7 +282,7 @@ impl Scheduler {
     ///
     /// # Errors
     ///
-    /// Names the first limit beyond the workers' batch, or the canvas the
+    /// Names the first limit beyond the workers' batch, or the block the
     /// step budget no longer holds; the scheduler keeps its limits.
     pub(super) fn reconfigure(&mut self, limits: SchedulerConfig) -> Result<(), String> {
         let info = &self.info;
@@ -312,12 +312,12 @@ impl Scheduler {
         if calls > 0 && limits.max_batch > proto::config::positive(calls) {
             return Err(beyond("max_batch", limits.max_batch.get(), calls));
         }
-        if let Some(canvas) = self.config.canvas
-            && canvas.canvas_length as usize > limits.max_num_batched_tokens.max(1)
+        if let Some(sampling) = self.config.block_sampling
+            && sampling.block_length as usize > limits.max_num_batched_tokens.max(1)
         {
             return Err(format!(
-                "a {}-token generation canvas exceeds the {}-token step budget",
-                canvas.canvas_length, limits.max_num_batched_tokens
+                "a {}-token generation block exceeds the {}-token step budget",
+                sampling.block_length, limits.max_num_batched_tokens
             ));
         }
         // The queue keeps no order of its own: the waiting requests are a
@@ -336,7 +336,7 @@ impl Scheduler {
             max_queued_requests: limits
                 .max_queued_requests
                 .map(|bound| bound.max(proto::config::positive(1))),
-            canvas: self.config.canvas,
+            block_sampling: self.config.block_sampling,
             // The draft limit is the epoch's; the refill policy is a
             // scheduling choice.
             draft_tokens: self.config.draft_tokens,

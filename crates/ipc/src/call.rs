@@ -40,7 +40,7 @@ impl RequestKey {
 /// The numerical mode of a token model forward.
 ///
 /// `Prefill`, `Decode` and `Verify` extend a request's prefix cache causally.
-/// `TokenDenoising` runs one denoising pass over rows of a token canvas that
+/// `TokenDenoising` runs one denoising pass over rows of a token block that
 /// read the request's cached prefix without writing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -170,21 +170,21 @@ impl CallCoordinates {
     }
 }
 
-/// One denoising step of a block-diffusion request's canvas on the device.
+/// One denoising step of a block-diffusion request's block on the device.
 ///
 /// The deployment's launch configuration fixes the sampling
-/// (`EngineConfig::canvas_sampling`); the worker holds the canvas, its
+/// (`EngineConfig::block_sampling`); the worker holds the block, its
 /// self-conditioning input and its stopping history in the request's slot.
 /// `block` counts the blocks already committed to the request's context and
-/// `step` the steps already run on this canvas; step zero starts the canvas
-/// from random tokens. The step that stops the canvas, by convergence or by
-/// reaching the launched step limit, reports the canvas's argmax tokens as
+/// `step` the steps already run on this block; step zero starts the block
+/// from random tokens. The step that stops the block, by convergence or by
+/// reaching the launched step limit, reports the block's argmax tokens as
 /// its committed tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct CanvasStep {
-    /// Blocks committed to the request's context before this canvas.
+pub struct BlockStep {
+    /// Blocks committed to the request's context before this block.
     pub block: u32,
-    /// Denoising steps already run on this canvas.
+    /// Denoising steps already run on this block.
     pub step: u32,
 }
 
@@ -283,11 +283,11 @@ pub struct Call {
     pub sampling_state: Option<SamplingState>,
     /// Host-known prompt, draft, or decode input tokens in model input order.
     /// Empty when continuation reads its predecessor's device token, and for
-    /// a token-denoising call, which denoises its canvas on the device.
+    /// a token-denoising call, which denoises its block on the device.
     pub input_token_ids: Vec<u32>,
     /// The step a token-denoising call runs on its request's generation
-    /// canvas; absent for every other call.
-    pub canvas: Option<CanvasStep>,
+    /// block; absent for every other call.
+    pub block_step: Option<BlockStep>,
     /// Encoded source image in base64, consumed by a vision or latent encoder.
     /// Dispatch and in-flight matching share these immutable bytes.
     pub input_image: Option<std::sync::Arc<str>>,
@@ -436,7 +436,7 @@ impl Call {
             predicate: None,
             sampling_state: None,
             input_token_ids: Vec::new(),
-            canvas: None,
+            block_step: None,
             input_image: None,
             cache_input: None,
             draft: DraftWork::default(),
@@ -558,21 +558,21 @@ impl Call {
         );
 
         // A token-denoising call runs one step of its request's running
-        // generation canvas of `max_tokens` tokens, and produces no sampled
+        // generation block of `max_tokens` tokens, and produces no sampled
         // token output.
         let denoises = self.kind == CallKind::Forward(ForwardMode::TokenDenoising);
         ensure_valid!(
-            self.canvas.is_some() == denoises,
-            "a token-denoising call carries a canvas step, and no other call does"
+            self.block_step.is_some() == denoises,
+            "a token-denoising call carries a block step, and no other call does"
         );
         ensure_valid!(
             !denoises || self.token_output.is_none(),
             "token denoising samples no token output"
         );
-        if self.canvas.is_some() {
+        if self.block_step.is_some() {
             ensure_valid!(
                 self.input_token_ids.is_empty() && self.bounds.max_tokens > 0,
-                "a canvas step denoises its canvas on the device of max_tokens tokens"
+                "a block step denoises its block on the device of max_tokens tokens"
             );
         }
 

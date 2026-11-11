@@ -817,7 +817,7 @@ pub struct BatchColumns {
     /// [`crate::CallStatus::Predicated`], so the mechanism may queue a step behind the one in
     /// flight without knowing whether that one stops the block.
     #[serde(default)]
-    pub block_steps: Vec<crate::CanvasStep>,
+    pub block_steps: Vec<crate::BlockStep>,
 }
 
 /// One request slot a batch starts a request's sampling state on.
@@ -956,7 +956,7 @@ impl MediaColumns {
     ///
     /// The rules are the family's own: one set of inputs per request, no token column a language
     /// model reads, and - except for an encode, which is sized by rows and tokens - an extent,
-    /// because a bucket captured for one canvas serves no other.
+    /// because a bucket captured for one resolution serves no other.
     pub fn check(&self) -> ValidationResult<()> {
         let computation = self.computation;
         if !computation.stated() {
@@ -976,7 +976,7 @@ impl MediaColumns {
         // Three computations are sized by no extent at all: an encode by rows and tokens, and the
         // artifact's two host calls by the request's own products - an audio track's samples come
         // from the decoder's window, and a mux reads what the encodes already wrote. A device
-        // computation, by contrast, is captured for one canvas, so a batch that states none cannot
+        // computation, by contrast, is captured for one resolution, so a batch that states none cannot
         // say which graph serves it.
         let host = matches!(
             computation.variant(),
@@ -985,7 +985,7 @@ impl MediaColumns {
         );
         if computation.extent == Extent::None && !host {
             return Err(ValidationError::message(format!(
-                "a {:?} batch states no extent: its kernels are captured for one canvas, and a                  batch cannot say which",
+                "a {:?} batch states no extent: its kernels are captured for one resolution, and a                  batch cannot say which",
                 computation.call
             )));
         }
@@ -996,7 +996,7 @@ impl MediaColumns {
     ///
     /// The mechanism owns the computation and, per request, the request's own stated parameters:
     /// its conditioning as the model family prepared it, the diffusion step it runs, and the seed
-    /// and canvas its noise is drawn from. It does not own what the model prepares on the device
+    /// and resolution its noise is drawn from. It does not own what the model prepares on the device
     /// — the encoded conditioning rows, the latent trajectory — so a staged set carries the first
     /// and never a placeholder for the second.
     pub fn staged(computation: Computation, requests: &[StagedRequest]) -> MediaColumns {
@@ -1037,7 +1037,7 @@ impl MediaColumns {
 ///
 /// The record is the mechanism-to-model seam for one request of a media computation, and it holds
 /// what the mechanism owns and nothing else: the request's conditioning exactly as the model family
-/// prepared it, the diffusion step the batch is, the seed and canvas the request states, and the
+/// prepared it, the diffusion step the batch is, the seed and resolution the request states, and the
 /// request's identity. The model's own device-side preparation (the encoded conditioning rows, the
 /// latent trajectory) is the model's and is not carried here, because a mechanism that filled it
 /// would be inventing either a tensor it cannot read or a shape the model never stated.
@@ -1075,7 +1075,7 @@ pub struct StagedRequest {
     pub steps: u32,
     /// The request's noise seed: the draw is addressed by it and the element's index.
     pub seed: u64,
-    /// The output raster's width: the request's canvas.
+    /// The output raster's width: the request's resolution.
     pub width: u32,
     /// The output raster's height.
     pub height: u32,
@@ -1497,7 +1497,7 @@ impl Variant {
     ///
     /// The artifact's three host calls capture no graph: their work is encoding and muxing, which
     /// the process's media thread pool does. A bucket of one states which device serves the call and never
-    /// an extent, so no canvas narrows it.
+    /// an extent, so no resolution narrows it.
     pub const fn host(self) -> bool {
         matches!(
             self,
@@ -1667,7 +1667,7 @@ pub enum Extent {
     /// One denoising step's latent layout (`Layout`).
     Latents(Layout),
     /// What a request asks for, which the mechanism states to find its bucket: the output frames and
-    /// the canvas. A layout's frame count is the request's own, because the video's extent sets the
+    /// the resolution. A layout's frame count is the request's own, because the video's extent sets the
     /// sparse selection budget and the audio timeline, so a longer bucket is not a padded one.
     Request {
         /// Output frames after the model's alignment.
@@ -2103,7 +2103,7 @@ mod media_tests {
 
     /// A media batch's columns are the model's prepared buffers, one set per request, and the
     /// family's rules are its own: a computation no variant states, a request count the batch does
-    /// not carry, and a denoising step without its canvas are each refused before a launch - while
+    /// not carry, and a denoising step without its resolution are each refused before a launch - while
     /// an encode, which is sized by rows and tokens, states no extent and is accepted.
     #[test]
     fn a_media_batch_states_one_set_of_inputs_per_request_and_its_own_extent() {
@@ -2117,9 +2117,9 @@ mod media_tests {
             inputs: vec![vec![vec![0u8; 64]]],
         };
         assert_eq!(denoise.bytes(), 64);
-        denoise.check().expect("one request, its canvas stated");
+        denoise.check().expect("one request, its resolution stated");
 
-        // A mux reads what the encodes already wrote, so no canvas sizes it: a **host** call
+        // A mux reads what the encodes already wrote, so no resolution sizes it: a **host** call
         // states `Extent::None` and is accepted, which is what separates it from the device
         // computation whose extent is asserted below. The case that used to sit here made muxing
         // the example of a call no variant states, and that stopped being true when it gained one.
@@ -2134,7 +2134,7 @@ mod media_tests {
         };
         muxed
             .check()
-            .expect("a host call is sized by the request's own products, not a canvas");
+            .expect("a host call is sized by the request's own products, not a resolution");
         assert_eq!(muxed.bytes(), 0, "a mux stages no extent of its own");
 
         let wrong_rows = MediaColumns {
@@ -2149,7 +2149,7 @@ mod media_tests {
             "the refusal names the count: {refusal}"
         );
 
-        let no_canvas = MediaColumns {
+        let no_resolution = MediaColumns {
             computation: Computation {
                 call: crate::MediaCall::Denoising,
                 rows: 1,
@@ -2158,9 +2158,9 @@ mod media_tests {
             },
             ..denoise.clone()
         };
-        let refusal = no_canvas
+        let refusal = no_resolution
             .check()
-            .expect_err("a denoising step states its canvas");
+            .expect_err("a denoising step states its resolution");
         assert!(
             refusal.to_string().contains("states no extent"),
             "the refusal names the missing extent: {refusal}"

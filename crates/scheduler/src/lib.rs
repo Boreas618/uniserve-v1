@@ -200,7 +200,7 @@ enum BatchKind {
     /// Every forward prefill, and text, vision, and latent encoding.
     Prefill,
     /// Calls that advance admitted requests without growing their prompt:
-    /// token decode, speculative verification, and canvas denoising.
+    /// token decode, speculative verification, and block denoising.
     Decode,
     /// Latent preparation, denoising, video and audio decoding, video and
     /// audio encoding, muxing, and transfers.
@@ -594,7 +594,7 @@ const OUTPUT_TERMINAL_RESERVE: usize = 2;
 struct CacheLengths {
     /// Tokens the call's cache-writing forward row appends: the prompt slice
     /// length, the feature write's token capacity, or one for decode and
-    /// verify. Zero for a canvas step, which only reads the request's
+    /// verify. Zero for a block step, which only reads the request's
     /// prefix cache.
     input: u32,
     /// Scheduled visible cache length before the call.

@@ -55,16 +55,16 @@ pub(super) enum MediaOutputError {
         stage: String,
         product: &'static str,
     },
-    /// A raster-laid output lacks a static axis for one side of the canvas.
+    /// A raster-laid output lacks a static axis for one side of the resolution.
     #[error("{product} of stage {stage} has no static {side} axis")]
     RasterAxis {
         stage: String,
         product: &'static str,
         side: &'static str,
     },
-    /// The request's canvas side is zero or exceeds the declared extent.
+    /// A side of the request's resolution is zero or exceeds the declared extent.
     #[error(
-        "{product} of stage {stage} holds a {side} of at most {max} pixels, the request's canvas has {extent}"
+        "{product} of stage {stage} holds a {side} of at most {max} pixels, the request's resolution has {extent}"
     )]
     Raster {
         stage: String,
@@ -194,7 +194,7 @@ impl Scheduler {
     ///
     /// Refuses, with the client's message, a request when the runtime has no
     /// prefix cache, the request fails validation, a unit the scheduler never
-    /// splits (a generation canvas, an input image's vision block) exceeds the step token budget, the worker lacks a required
+    /// splits (a generation block, an input image's vision block) exceeds the step token budget, the worker lacks a required
     /// generation feature, or `validate_resources` or `max_cache_tokens`
     /// fails against `generation_limits`.
     pub(super) fn validate_submission(&self, req: &GenerationRequest) -> Result<usize, String> {
@@ -204,16 +204,16 @@ impl Scheduler {
         if let Err(error) = req.validate() {
             return Err(format!("invalid generation request: {error:?}"));
         }
-        // A request the deployment generates in canvases names the seed its
+        // A request the deployment generates in blocks names the seed its
         // draws follow.
-        if self.config.canvas.is_some() {
+        if self.config.block_sampling.is_some() {
             if req.sampling.seed.is_none() {
                 return Err(format!(
                     "invalid generation request: {:?}",
-                    GenerationRequestError::UnseededCanvas
+                    GenerationRequestError::UnseededBlock
                 ));
             }
-            // A canvas's committed blocks are tokens, but the denoising state
+            // A request's committed blocks are tokens, but the denoising state
             // of the block in progress is not.
             if req.is_migrated() {
                 return Err(
@@ -280,7 +280,7 @@ impl Scheduler {
         }
         // A prefill group hands a request's cache to a decode group once,
         // after its prompt: such a deployment generates text.
-        if self.splits_prefill() && self.config.canvas.is_some() {
+        if self.splits_prefill() && self.config.block_sampling.is_some() {
             return Err("a deployment of prefill and decode groups generates text only".into());
         }
         // Resource validation includes the cache bound, so a request that passes
@@ -358,9 +358,9 @@ impl Scheduler {
             encoder_cache_pins: Vec::new(),
             host_encoding: None,
             transient_encoder_products: Vec::new(),
-            canvas_block: 0,
-            canvas_step: 0,
-            canvas_commit: Vec::new(),
+            block_index: 0,
+            block_step: 0,
+            block_commit: Vec::new(),
             output: RequestOutput::new(event_tx),
             failure: None,
             prompt_tokens,
@@ -378,7 +378,7 @@ impl Scheduler {
     /// as the extent of its output's device-sized axis, which must not exceed
     /// the declared maximum; a product without one keeps its declared
     /// extent there. An output declaring raster axes takes the request's
-    /// canvas height and width in them, each at most the declared extent.
+    /// height and width in them, each at most the declared extent.
     /// Returns one entry per product: its name, stage, output index,
     /// dtype and shape bound.
     ///
@@ -387,7 +387,7 @@ impl Scheduler {
     /// Returns a [`MediaOutputError`] naming the product when no stage
     /// serves its call, the stage declares no output of that name, the output has
     /// no device-sized axis for a request extent, or the request's extent or
-    /// canvas is zero or exceeds the declared maximum. `add_request`
+    /// resolution is zero or exceeds the declared maximum. `add_request`
     /// rejects such a request, and `admit_video` calls this again to size the
     /// reservation.
     fn media_outputs(&self, graph: &VideoGraph) -> Result<Vec<MediaOutput>, MediaOutputError> {
@@ -418,14 +418,14 @@ impl Scheduler {
                     product: product.name,
                 })?;
             let mut shape = output.shape_bound.clone();
-            // A product laid out at the request's raster holds the canvas in
+            // A product laid out at the request's raster holds the resolution in
             // its raster axes, whose declared extents are the largest the
             // worker admits.
             if let Some(raster) = output.raster_axes {
-                let canvas = graph.canvas();
+                let resolution = graph.resolution();
                 for (axis, extent, side) in [
-                    (raster.height, canvas.height, "height"),
-                    (raster.width, canvas.width, "width"),
+                    (raster.height, resolution.height, "height"),
+                    (raster.width, resolution.width, "width"),
                 ] {
                     let Some(DimBound::Static(max)) = shape.dims.get(axis as usize).copied() else {
                         return Err(MediaOutputError::RasterAxis {
@@ -846,9 +846,9 @@ impl Scheduler {
         &self,
         request: &GenerationRequest,
     ) -> Option<crate::GenerationFeatures> {
-        // A block-diffusion runtime generates every request in canvases.
-        let features = if self.config.canvas.is_some() {
-            request.canvas_features()
+        // A block-diffusion runtime generates every request in blocks.
+        let features = if self.config.block_sampling.is_some() {
+            request.block_features()
         } else {
             request.required_features()
         };

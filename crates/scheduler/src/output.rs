@@ -324,7 +324,7 @@ impl Scheduler {
                         .is_some_and(|state| state.image_encoder_index == 0);
 
                     // Writing the last image of a fully consumed prompt
-                    // starts a canvas-generating request's first block, or
+                    // starts a block-generating request's first block, or
                     // understanding decode from BOS.
                     if is_final_step
                         && self.requests.tokens(&id).is_some_and(|st| {
@@ -334,10 +334,10 @@ impl Scheduler {
                         })
                     {
                         let bos = self.special_tokens.bos;
-                        let generates_canvases = self.config.canvas.is_some();
+                        let generates_blocks = self.config.block_sampling.is_some();
                         if let Some(st) = self.requests.tokens_mut(&id) {
-                            if generates_canvases {
-                                st.phase = Phase::Canvas;
+                            if generates_blocks {
+                                st.phase = Phase::Block;
                             } else {
                                 st.next_token = bos;
                                 st.phase = Phase::DecodeUnd;
@@ -369,13 +369,13 @@ impl Scheduler {
                     return;
                 }
 
-                // A canvas-generating request's complete prompt samples
+                // A block-generating request's complete prompt samples
                 // nothing, and nor does each of its block commits, which
                 // extend the context the same way; the next block follows.
-                if self.config.canvas.is_some()
+                if self.config.block_sampling.is_some()
                     && let Some(st) = self.requests.tokens_mut(&id)
                 {
-                    st.phase = Phase::Canvas;
+                    st.phase = Phase::Block;
                     return;
                 }
 
@@ -436,12 +436,12 @@ impl Scheduler {
                     }
                 }
             }
-            // A canvas step that stopped its block left the block's tokens
+            // A block step that stopped its block left the block's tokens
             // for their commit; they are published first, in order, and the
             // request finishes on the first that ends it.
             CallKind::Forward(ForwardMode::TokenDenoising) => {
                 let tokens = match self.requests.tokens(&id) {
-                    Some(st) if st.phase == Phase::CommitCanvas => st.canvas_commit.clone(),
+                    Some(st) if st.phase == Phase::CommitBlock => st.block_commit.clone(),
                     _ => return,
                 };
                 self.emit_or_finish_block(id, &tokens);
@@ -740,7 +740,7 @@ impl Scheduler {
         }
     }
 
-    /// Resolves the stop conditions of a stopped canvas block's tokens in
+    /// Resolves the stop conditions of a stopped block's tokens in
     /// order and publishes the visible ones as one event.
     ///
     /// Every token counts toward `num_generated_tokens` and is resolved as
@@ -1057,7 +1057,7 @@ impl Scheduler {
             .record(views::finished(request, terminal.end()));
         self.watchdog.finished(request);
         if terminal.migration().is_some()
-            && self.config.canvas.is_none()
+            && self.config.block_sampling.is_none()
             && self
                 .requests
                 .tokens(&id)
@@ -1247,9 +1247,9 @@ impl Scheduler {
     /// `immutable` also publishes the last partial page, and requires all
     /// writes of this request to have drained permanently.
     pub(super) fn advance_request_cache(&mut self, id: RequestId, immutable: bool) {
-        // A canvas deployment's requests write blocks, not their generated
+        // A block deployment's requests write blocks, not their generated
         // tokens in order.
-        let tokens_in_order = self.config.canvas.is_none();
+        let tokens_in_order = self.config.block_sampling.is_none();
         // While a refill restores the request's draft cache, its state
         // tables keep the checkpoint the refill continues from.
         let refill_cursor = self.refill_cursor(id);

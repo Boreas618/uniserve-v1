@@ -535,7 +535,7 @@ pub(crate) fn columns(
         if matches!(kind, RowKind::Decode | RowKind::Verify) && !sampled {
             return None;
         }
-        if (kind == RowKind::Denoise) != call.canvas.is_some() {
+        if (kind == RowKind::Denoise) != call.block_step.is_some() {
             return None;
         }
         let mode = match kind {
@@ -621,9 +621,9 @@ pub(crate) fn columns(
     }
 
     // A batch denoises blocks or it does not: one batch is one phase.
-    let block_steps: Vec<ipc::CanvasStep> = requests
+    let block_steps: Vec<ipc::BlockStep> = requests
         .iter()
-        .filter_map(|(call, _)| call.canvas)
+        .filter_map(|(call, _)| call.block_step)
         .collect();
     if !block_steps.is_empty() && block_steps.len() != requests.len() {
         return None;

@@ -610,8 +610,8 @@ fn a_full_waiting_queue_rejects_a_video_request_as_overloaded() {
     );
 }
 
-/// The canvas of the fixture's conditions.
-const CONDITION_CANVAS: Canvas = Canvas {
+/// The resolution of the fixture's conditions.
+const CONDITION_RESOLUTION: Canvas = Canvas {
     width: 64,
     height: 32,
 };
@@ -619,8 +619,9 @@ const CONDITION_CANVAS: Canvas = Canvas {
 /// A `ref2va` request with an image reference, a three-unit video reference
 /// with its soundtrack and an audio reference.
 fn reference_request(id: u64) -> Request {
-    let pixels =
-        |frames: u64| frames * u64::from(CONDITION_CANVAS.width * CONDITION_CANVAS.height) * 3;
+    let pixels = |frames: u64| {
+        frames * u64::from(CONDITION_RESOLUTION.width * CONDITION_RESOLUTION.height) * 3
+    };
     let conditions = vec![
         // The image, one frame the conditioner reads as one 2x4 grid.
         ConditionExtent {
@@ -818,21 +819,21 @@ fn a_request_the_worker_refuses_is_rejected_with_its_reason() {
     served.assert_completed(RequestId(2));
 }
 
-/// A `t2va` request of two media units at `canvas`.
-fn canvas_request(id: u64, canvas: Canvas) -> Request {
+/// A `t2va` request of two media units at `resolution`.
+fn request_at(id: u64, resolution: Canvas) -> Request {
     let Request::Diffusion(mut request) = video_request(id, 2) else {
         unreachable!("the fixture is a video request");
     };
-    request.sampling.width = canvas.width;
-    request.sampling.height = canvas.height;
+    request.sampling.width = resolution.width;
+    request.sampling.height = resolution.height;
     Request::Diffusion(request)
 }
 
-/// Each video request is served at its own canvas when the decoder's
-/// declared raster holds it, and a canvas beyond that raster is refused,
+/// Each video request is served at its own resolution when the decoder's
+/// declared raster holds it, and a resolution beyond that raster is refused,
 /// naming the product and both extents.
 #[test]
-fn decoded_media_units_are_reserved_at_each_request_canvas() {
+fn decoded_media_units_are_reserved_at_each_request_resolution() {
     let wide = Canvas {
         width: 24,
         height: 16,
@@ -848,9 +849,9 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
     let served = serve(
         video_pool(2, 2, 1),
         vec![
-            canvas_request(1, wide),
-            canvas_request(2, tall),
-            canvas_request(3, oversized),
+            request_at(1, wide),
+            request_at(2, tall),
+            request_at(3, oversized),
         ],
     );
 
@@ -876,6 +877,6 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
                 && message.contains(&oversized.width.to_string()),
             "{message}"
         ),
-        events => panic!("the oversized canvas was not refused: {events:?}"),
+        events => panic!("the oversized resolution was not refused: {events:?}"),
     }
 }

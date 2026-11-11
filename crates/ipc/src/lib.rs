@@ -127,7 +127,7 @@ pub use phase::PhaseId;
 pub use program::ProgramCommand;
 pub use proto::report::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
 pub use proto::request::{
-    CanvasSampling, DiffusionSamplingParams, PrefixCacheDtype, PrefixCacheDtypeParseError,
+    BlockSampling, DiffusionSamplingParams, PrefixCacheDtype, PrefixCacheDtypeParseError,
     RequestId, SamplingParams, SamplingParamsError, StandbyStorage, TokenLogprob,
 };
 pub use request::*;

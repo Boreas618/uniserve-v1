@@ -907,7 +907,7 @@ impl Leader {
         // No model this daemon serves generates canvases: canvas sampling
         // reaches a worker with the request that needs it, and every prefill
         // returns the outputs its caller asked for.
-        model.canvas_sampling = None;
+        model.block_sampling = None;
         model.prefill_outputs = true;
         // Video workers prepare exactly the configured sizes, refusing one
         // their model does not generate, and report them back as the only

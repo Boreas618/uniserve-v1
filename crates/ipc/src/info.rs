@@ -416,7 +416,7 @@ pub struct OutputInfo {
     /// actual shape is known.
     pub shape_bound: ShapeBound,
     /// The axes holding a video request's raster, for a result laid out at
-    /// the request's canvas. Their extents in `shape_bound` are the largest
+    /// the request's resolution. Their extents in `shape_bound` are the largest
     /// height and width the worker admits; a request binds them to its own.
     pub raster_axes: Option<RasterAxes>,
 }
@@ -424,9 +424,9 @@ pub struct OutputInfo {
 /// The two axes of a result that hold a video request's raster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RasterAxes {
-    /// Axis holding the canvas height in pixels.
+    /// Axis holding the resolution height in pixels.
     pub height: u32,
-    /// Axis holding the canvas width in pixels.
+    /// Axis holding the resolution width in pixels.
     pub width: u32,
 }
 

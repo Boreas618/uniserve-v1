@@ -71,7 +71,7 @@ pub enum Event {
         logprob: Option<f32>,
     },
     /// Publishes generated text tokens committed together, in order, such as
-    /// a stopped block-diffusion canvas; they carry no log probabilities.
+    /// a stopped block-diffusion block; they carry no log probabilities.
     /// Consumers treat them as consecutive `TextToken`s.
     TextTokens {
         /// Vocabulary token identities.
@@ -351,7 +351,7 @@ impl DiffusionRequest {
     /// Checks the request's own consistency.
     ///
     /// The prompt is nonempty and its token count fits in `u32`; the frame
-    /// and media-unit counts and the canvas are positive; a request states
+    /// and media-unit counts and the resolution are positive; a request states
     /// condition rows exactly when it carries conditions; and the task is
     /// named and the conditioning present.
     ///
@@ -417,7 +417,7 @@ pub enum DiffusionRequestError {
     /// The tokenized prompt contains no tokens.
     #[error("media prompt tokens must not be empty")]
     EmptyPromptTokens,
-    /// A frame, media-unit, or step count or a canvas side is zero, or the
+    /// A frame, media-unit, or step count or a side of the resolution is zero, or the
     /// prompt token count exceeds `u32::MAX`.
     #[error("diffusion parameters are invalid")]
     InvalidSampling,
@@ -433,7 +433,7 @@ pub enum DiffusionRequestError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
-    /// Token generation: autoregressive text or block-diffusion canvases. Boxed, as it is several times
+    /// Token generation: autoregressive text or block-diffusion blocks. Boxed, as it is several times
     /// the size of a diffusion request.
     Generation(Box<super::GenerationRequest>),
     /// Video diffusion.

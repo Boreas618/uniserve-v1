@@ -165,9 +165,9 @@ impl Scheduler {
             None
         };
 
-        // A generation step denoises the request's canvas on the device of
+        // A generation step denoises the request's block on the device of
         // `max_tokens` tokens, one read-only forward row below.
-        let canvas_lengths = if call.canvas.is_some() {
+        let block_lengths = if call.block_step.is_some() {
             vec![call.bounds.max_tokens]
         } else {
             Vec::new()
@@ -288,10 +288,10 @@ impl Scheduler {
                     call.draft.refill.is_none(),
                 );
             }
-            // One read-only row per canvas: it attends to the visible prefix
-            // and its own canvas, and persists nothing.
-            for canvas in &canvas_lengths {
-                layout.push(lengths.visible + canvas, *canvas, false);
+            // One read-only row per block: it attends to the visible prefix
+            // and its own block, and persists nothing.
+            for length in &block_lengths {
+                layout.push(lengths.visible + length, *length, false);
             }
         }
 
