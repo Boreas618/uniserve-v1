@@ -195,7 +195,7 @@ mod tests {
 
     const BASE: u64 = 0x1000_0000;
 
-    /// Runs a fixed forward-like sequence and answers every address it received.
+    /// Runs a fixed forward-like sequence and returns every address it received.
     fn forward(allocator: &Allocator) -> Vec<u64> {
         let (a, reset) = allocator.allocate(1000).unwrap();
         let (b, _) = allocator.allocate(300).unwrap();
