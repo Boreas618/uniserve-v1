@@ -177,7 +177,9 @@ fn zeros(shape: &Shape, dtype: DType, asked: Option<usize>) -> Result<CudaStorag
 
 /// The host-to-device copy: a storage of the thread's context with the elements of `storage`.
 ///
-/// The block comes from the context's allocator, and the bytes are written into the context's
+/// The block comes from the context's allocator at addresses no tensor of this forward had, so
+/// an input copy issued before a replay is not overwritten by the replay's earlier kernels; the
+/// bytes are written into the context's
 /// input buffer and copied, recorded as an input copy or only counted, as the context is
 /// ([`input::copy_to_device`]).
 ///
@@ -196,7 +198,7 @@ fn from_host(storage: &CpuStorage, asked: Option<usize>) -> Result<CudaStorage> 
     }
 
     let bytes = host_bytes(storage);
-    let device = CudaStorage::allocate(bytes.len() as u64, storage.dtype(), asked)?;
+    let device = CudaStorage::allocate_unused(bytes.len() as u64, storage.dtype(), asked)?;
 
     // SAFETY: the address is the block just allocated for exactly these bytes. The storage that
     // owns it is returned to the caller's tensor, which the forward keeps for as long as a

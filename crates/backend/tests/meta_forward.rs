@@ -708,3 +708,59 @@ fn zeros_asked_through_either_device_are_meta_under_a_meta_context() {
         ])
     );
 }
+
+#[test]
+fn a_host_to_device_copy_takes_memory_no_earlier_tensor_of_the_forward_had() {
+    let context = Context::meta(None);
+    context.reset();
+    let _guard = context.enter();
+
+    // A tensor of four blocks is computed and dropped, so its addresses are free again.
+    let dropped = input((4, 64), DType::F32).affine(2.0, 0.0).unwrap();
+    assert_eq!(context.peak(), 1024);
+    drop(dropped);
+
+    // The copy's destination must hold its value from before the replay's first kernel, which
+    // an address the dropped tensor's kernel writes cannot: it lies past everything so far.
+    let copied = Tensor::from_vec(vec![1_u8; 256], 256, &Device::Cpu)
+        .unwrap()
+        .to_device(&meta())
+        .unwrap();
+    assert_eq!(context.peak(), 1280);
+
+    // An ordinary tensor still reuses what the dropped one gave back.
+    let reused = input((4, 64), DType::F32).affine(2.0, 0.0).unwrap();
+    assert_eq!(context.peak(), 1280);
+    drop((copied, reused));
+}
+
+#[test]
+fn a_tensor_moved_to_the_device_under_a_meta_context_is_on_the_meta_device() {
+    let context = Context::meta(None);
+    context.reset();
+    let _guard = context.enter();
+
+    let moved = Tensor::from_vec(vec![1_u8; 8], 8, &Device::Cpu)
+        .unwrap()
+        .to_device(&cuda(0))
+        .unwrap();
+
+    assert!(moved.device().same_device(&meta()));
+    assert_eq!(
+        format!("{:?}", moved.device().location()),
+        format!("{:?}", meta().location())
+    );
+}
+
+#[test]
+fn a_weight_and_a_meta_tensor_concatenate() {
+    let context = Context::meta(None);
+    context.reset();
+    let _guard = context.enter();
+
+    let weight = retained(0x1000, (2, 4), DType::F32, &cuda(0)).unwrap();
+    let joined = Tensor::cat(&[&weight, &input((3, 4), DType::F32)], 0).unwrap();
+
+    assert_eq!(joined.dims(), [5, 4]);
+    assert!(joined.device().same_device(&meta()));
+}

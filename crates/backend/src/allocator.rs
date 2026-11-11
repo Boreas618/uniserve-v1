@@ -43,8 +43,12 @@ pub struct Allocator {
 struct Blocks {
     /// How many resets the region has seen; a block names the reset it was allocated under.
     resets: u64,
-    /// The first offset never handed out since the reset.
+    /// The offset below which blocks are in use or free; everything from here on is unused or
+    /// was given back.
     top: u64,
+    /// The furthest end of any block handed out since the reset: no address from here on has
+    /// been written by this forward.
+    reached: u64,
     /// The furthest `top` reached under any reset.
     peak: u64,
     /// `(bytes, offset)` of every free block, so the first entry at or above a size is the
@@ -102,6 +106,44 @@ impl Allocator {
                 capacity: self.capacity,
             })?;
         blocks.top = end;
+        blocks.reached = blocks.reached.max(end);
+        blocks.peak = blocks.peak.max(end);
+        Ok((self.base + offset, blocks.resets))
+    }
+
+    /// A block of at least `bytes` bytes at addresses no block has had since the reset.
+    ///
+    /// The destination of a host-to-device copy takes its memory here. A captured graph's input
+    /// copies are issued before the graph replays, so their destinations must hold their values
+    /// from before the first node until their consumers read them: an address an earlier tensor
+    /// of the forward had would be overwritten by that tensor's kernels during the replay.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] when the unused end of the region does not hold the block.
+    pub fn allocate_unused(&self, bytes: u64) -> Result<(u64, u64)> {
+        let needed = rounded(bytes);
+        let mut blocks = self.lock();
+
+        let offset = blocks.reached;
+        let end = offset
+            .checked_add(needed)
+            .filter(|end| *end <= self.capacity)
+            .ok_or(Error::OutOfMemory {
+                needed,
+                used: blocks.reached,
+                capacity: self.capacity,
+            })?;
+
+        // What was given back between `top` and the block stays available to later tensors.
+        // No free block ends at `top`, so this one has no free neighbour to merge with.
+        let top = blocks.top;
+        if offset > top {
+            blocks.insert(top, offset - top);
+        }
+
+        blocks.top = end;
+        blocks.reached = end;
         blocks.peak = blocks.peak.max(end);
         Ok((self.base + offset, blocks.resets))
     }
@@ -146,6 +188,7 @@ impl Allocator {
         let mut blocks = self.lock();
         blocks.resets += 1;
         blocks.top = 0;
+        blocks.reached = 0;
         blocks.by_size.clear();
         blocks.by_offset.clear();
     }
@@ -280,6 +323,42 @@ mod tests {
         // Had the stale block been freed into the region, this would receive `first`'s address.
         let (third, _) = allocator.allocate(256).unwrap();
         assert_eq!((first, second, third), (BASE, BASE + 256, BASE + 512));
+    }
+
+    #[test]
+    fn an_unused_block_takes_no_address_an_earlier_block_had() {
+        let allocator = Allocator::new(BASE, 1 << 20);
+        let (a, reset) = allocator.allocate(512).unwrap();
+        let (b, _) = allocator.allocate(256).unwrap();
+        allocator.free(b, 256, reset);
+        allocator.free(a, 512, reset);
+        assert_eq!(allocator.used(), 0);
+
+        // An ordinary block reuses the start of the region; an unused one lies past both.
+        let (unused, _) = allocator.allocate_unused(256).unwrap();
+        assert_eq!(unused, BASE + 768);
+
+        // The addresses given back before it still serve later tensors.
+        assert_eq!(allocator.allocate(768).unwrap().0, BASE);
+        assert_eq!(allocator.peak(), 1024);
+    }
+
+    #[test]
+    fn unused_blocks_follow_one_another_and_repeat_after_a_reset() {
+        let allocator = Allocator::new(BASE, 1 << 20);
+        let sequence = |allocator: &Allocator| {
+            let (a, reset) = allocator.allocate(300).unwrap();
+            let (first, _) = allocator.allocate_unused(100).unwrap();
+            allocator.free(a, 300, reset);
+            let (second, _) = allocator.allocate_unused(100).unwrap();
+            let (b, _) = allocator.allocate(300).unwrap();
+            [a, first, second, b]
+        };
+
+        let before = sequence(&allocator);
+        assert_eq!(before, [BASE, BASE + 512, BASE + 768, BASE]);
+        allocator.reset();
+        assert_eq!(sequence(&allocator), before);
     }
 
     #[test]

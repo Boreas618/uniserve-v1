@@ -60,6 +60,22 @@ impl CudaStorage {
     /// [`Error::NoContext`]; [`Error::WrongDevice`] when a launching context computes on another
     /// GPU than `asked`; [`Error::OutOfMemory`].
     pub(crate) fn allocate(bytes: u64, dtype: DType, asked: Option<usize>) -> Result<Self> {
+        Self::from_allocator(bytes, dtype, asked, Allocator::allocate)
+    }
+
+    /// As [`CudaStorage::allocate`], at addresses no storage of this forward had
+    /// ([`Allocator::allocate_unused`]): the destination of a host-to-device copy.
+    pub(crate) fn allocate_unused(bytes: u64, dtype: DType, asked: Option<usize>) -> Result<Self> {
+        Self::from_allocator(bytes, dtype, asked, Allocator::allocate_unused)
+    }
+
+    /// A storage whose block `take` gives from the thread's context's allocator.
+    fn from_allocator(
+        bytes: u64,
+        dtype: DType,
+        asked: Option<usize>,
+        take: fn(&Allocator, u64) -> Result<(u64, u64)>,
+    ) -> Result<Self> {
         let context = context::current("an allocation")?;
         let gpu = context.ordinal();
 
@@ -70,7 +86,7 @@ impl CudaStorage {
         }
 
         let allocator = Arc::clone(context.allocator());
-        let (address, reset) = allocator.allocate(bytes)?;
+        let (address, reset) = take(&allocator, bytes)?;
 
         Ok(Self {
             address,
