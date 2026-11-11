@@ -90,12 +90,14 @@ def launch_entry(package):
 
 
 def descriptor_field(key, field):
-    """The value a descriptor key gives one field, such as its input type."""
-    tokens = key.split("_")
-    for at, token in enumerate(tokens[:-1]):
-        if token == field:
-            return tokens[at + 1]
-    raise SystemExit(f"the descriptor {key} names no {field}")
+    """The value the descriptor's fields give one field, such as its input type.
+
+    The Build Server read the key and states its fields in ``UNISERVE_FIELDS``.
+    """
+    fields = json.loads(os.environ.get("UNISERVE_FIELDS") or "{}")
+    if field not in fields:
+        raise SystemExit(f"the descriptor {key} names no {field}")
+    return fields[field]
 
 
 def element_type(key, field):

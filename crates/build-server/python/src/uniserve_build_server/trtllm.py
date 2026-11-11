@@ -404,7 +404,7 @@ def build_routed_gemm(
     with `cuMemsetD32Async`.
     """
     root, descriptor, target, out = package.arguments()
-    fields = package.fields(root, descriptor)
+    fields = package.fields()
     data = distribution(FUSED_MOE_RUNNER)
     out.mkdir(parents=True, exist_ok=True)
     staging = pathlib.Path(tempfile.mkdtemp(prefix="uniserve-trtllm-bmm-"))

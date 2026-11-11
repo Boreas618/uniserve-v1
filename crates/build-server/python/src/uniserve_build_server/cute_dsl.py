@@ -126,7 +126,7 @@ def compile_one(
     # The compile describes the architecture itself: the target names it, so
     # no device is read and none is needed.
     os.environ["CUTE_DSL_ARCH"] = target
-    fields = package.fields(root, key)
+    fields = package.fields()
     try:
         stated = spec(
             fields, package.manifest(root).get("parameters", {}), target

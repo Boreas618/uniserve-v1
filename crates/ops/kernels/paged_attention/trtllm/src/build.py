@@ -153,7 +153,7 @@ def publish_cubins(names, artifact, out):
 def main():
     """Compile one descriptor into ``module.so`` with its cubins."""
     root, descriptor, target, out = package.arguments()
-    fields = package.fields(root, descriptor)
+    fields = package.fields()
     data = trtllm.distribution(FMHA_RUNNER)
     out.mkdir(parents=True, exist_ok=True)
     # The artifact is the build's input, not the module: it is staged where the

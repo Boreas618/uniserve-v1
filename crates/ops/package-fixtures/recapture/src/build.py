@@ -73,12 +73,14 @@ def arguments():
 
 
 def field(key, name):
-    """The value a descriptor key gives one field, such as its input type."""
-    tokens = key.split("_")
-    for at, token in enumerate(tokens[:-1]):
-        if token == name:
-            return tokens[at + 1]
-    raise SystemExit(f"the descriptor {key} names no {name}")
+    """The value the descriptor's fields give one field, such as its input type.
+
+    The Build Server read the key and states its fields in ``UNISERVE_FIELDS``.
+    """
+    fields = json.loads(os.environ.get("UNISERVE_FIELDS") or "{}")
+    if name not in fields:
+        raise SystemExit(f"the descriptor {key} names no {name}")
+    return fields[name]
 
 
 def element_type(key, name):

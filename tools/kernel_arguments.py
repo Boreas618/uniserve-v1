@@ -845,7 +845,7 @@ def sweep(
             continue
         try:
             # The key is read as the package's build reads it, by the shared driver's parser.
-            fields = driver_package.fields(package, descriptor)
+            fields = driver_package.read_fields(package, descriptor)
         except SystemExit:
             gaps.append(
                 f"{op}/{backend} {descriptor}: no declared shape parses this key"

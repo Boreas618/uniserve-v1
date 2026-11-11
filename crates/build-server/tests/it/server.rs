@@ -61,6 +61,7 @@ fn config(temporary: &Path, upstream: Option<&Path>) -> ServerConfig {
             writable: true,
         }],
         upstream: upstream.map(Path::to_path_buf),
+        read_only_stores: Vec::new(),
         limits: Limits::default(),
         toolchains: ToolchainConfig {
             nvcc: None,
@@ -567,4 +568,138 @@ fn resolve_refuses_a_descriptor_the_revision_does_not_cover() {
         ),
         Err(Error::UnsupportedDescriptor { .. })
     ));
+}
+
+/// The manifest of an engine package: a crate cargo builds to one executable.
+const ENGINE: &str = r#"
+op = "engine"
+backend = "uniserve"
+interface_version = 1
+
+[toolchain]
+kind = "cargo"
+version = "1.99.1"
+
+[module]
+form = "executable"
+
+[source]
+kind = "cargo"
+files = []
+binary = "uniserve-engine"
+"#;
+
+/// A module set resolves from a store a release shipped, with no toolchain on the host: the
+/// server serves the store's package revisions and their modules read-only, selects among them,
+/// builds nothing, writes nothing into the shipped store, and numbers its own installations
+/// after the shipped revisions.
+#[test]
+fn a_module_set_resolves_from_a_shipped_store_with_no_toolchain() {
+    let temporary = tempfile::tempdir().unwrap();
+    let shipped = temporary.path().join("shipped");
+
+    // What `build --store` leaves: the installed revisions with their records, and the modules
+    // built from them under the digest of those records.
+    let kernel = shipped.join("packages/rms_norm/triton/1");
+    package(&kernel);
+    let kernel_inputs = record(&kernel);
+    let kernel_module = shipped.join(format!(
+        "modules/rms_norm/triton/1/{kernel_inputs}/sm_100a/dtype_bf16"
+    ));
+    std::fs::create_dir_all(&kernel_module).unwrap();
+    std::fs::write(kernel_module.join("module.cubin"), b"a cubin").unwrap();
+    std::fs::write(
+        kernel_module.join("metadata.json"),
+        br#"{"name": "rms_norm"}"#,
+    )
+    .unwrap();
+    std::fs::write(kernel_module.join(".committed"), b"interface_version = 1\n").unwrap();
+
+    let engine = shipped.join("packages/engine/uniserve/1");
+    std::fs::create_dir_all(&engine).unwrap();
+    std::fs::write(engine.join("package.toml"), ENGINE).unwrap();
+    let engine_inputs = record(&engine);
+    let host = Target::host();
+    let engine_module = shipped.join(format!(
+        "modules/engine/uniserve/1/{engine_inputs}/{host}/default"
+    ));
+    std::fs::create_dir_all(&engine_module).unwrap();
+    std::fs::write(engine_module.join("uniserve-engine"), b"an executable").unwrap();
+    std::fs::write(engine_module.join(".committed"), b"interface_version = 1\n").unwrap();
+
+    // A host with no compiler at all, and roots of its own that hold nothing.
+    let mut configuration = config(temporary.path(), None);
+    configuration.read_only_stores = vec![shipped.clone()];
+    configuration.toolchains.cargo = Some(PathBuf::from("/no/toolchain/cargo"));
+    let server = BuildServer::open(&configuration).unwrap();
+
+    // The apply's selection: every candidate of each interface is a shipped revision.
+    let candidates = |op: &str| {
+        server
+            .cover(&build_server::CoverRequest {
+                op: op.to_owned(),
+                targets: Vec::new(),
+                keys: Vec::new(),
+                named: Vec::new(),
+                fixed: Vec::new(),
+            })
+            .unwrap()
+            .candidates
+            .into_iter()
+            .map(|package| (package.backend, package.revision))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(candidates("rms_norm"), vec![("triton".to_owned(), 1)]);
+    assert_eq!(candidates("engine"), vec![("uniserve".to_owned(), 1)]);
+
+    // Each module of the set resolves from the shipped store; nothing is queued to build.
+    let revision = |backend: &str| PackageRevision {
+        backend: backend.to_owned(),
+        revision: 1,
+        arguments: toml::Table::new(),
+    };
+    let mut progress = Vec::new();
+    let kernel = server
+        .resolve(
+            "rms_norm",
+            &revision("triton"),
+            &Target::new("sm_100a"),
+            "dtype_bf16",
+            &mut |step| progress.push(step),
+        )
+        .expect("the shipped kernel module resolves");
+    assert_eq!(kernel.interface_version, 1);
+    assert_eq!(kernel.files.len(), 2);
+    let engine = server
+        .resolve(
+            "engine",
+            &revision("uniserve"),
+            &host,
+            build_server::manifest::SINGLE_KEY,
+            &mut |step| progress.push(step),
+        )
+        .expect("the shipped engine module resolves");
+    assert_eq!(engine.files[0].path, engine_module.join("uniserve-engine"));
+    assert!(progress.is_empty(), "a module the store holds is not built");
+
+    // The shipped store is read, never written, and the host's own roots stay empty.
+    assert!(
+        std::fs::read_dir(&configuration.store_roots[0].path)
+            .unwrap()
+            .next()
+            .is_none()
+    );
+
+    // An installation on this host numbers after the shipped revision and lands in its own
+    // package root.
+    let source = package(&temporary.path().join("source"));
+    let installed = server.install(&source).unwrap();
+    assert_eq!(installed.package.revision, 2);
+    assert!(
+        configuration
+            .package_root
+            .join("rms_norm/triton/2/package.toml")
+            .is_file()
+    );
+    assert!(!shipped.join("packages/rms_norm/triton/2").exists());
 }

@@ -91,6 +91,7 @@ fn settings_survive_the_command_line() {
             PathBuf::from("/shared/uniserve/modules"),
         ],
         upstream: Some(PathBuf::from("/run/uniserve/leader.sock")),
+        read_only_stores: Vec::new(),
         targets: vec!["sm_100a".into(), "sm_90a".into()],
         max_jobs: Some(2),
         host_reserve: Some(1 << 30),

@@ -34,12 +34,13 @@ The Build Server runs `<interpreter> <package>/<source.script>` with the package
 |---|---|
 | `UNISERVE_OP`, `UNISERVE_BACKEND` | the operator and backend of the module's store path |
 | `UNISERVE_DESCRIPTOR` | the descriptor key, such as `dtype_bf16_width_2048_layout_contiguous` |
+| `UNISERVE_FIELDS` | the key's fields as the Build Server read them: a JSON object of dimension to value, such as `{"dtype": "bf16", "width": "2048", "layout": "contiguous"}` |
 | `UNISERVE_TARGET` | the target of the module's store path, such as `sm_100a` |
 | `UNISERVE_PACKAGE` | the package root |
 | `UNISERVE_OUT` | the build's output directory; the script writes `module.cubin` and its metadata JSON there, or `module.so` for a native module |
 | `MAX_JOBS` | the compile queue's limit on parallel compilers |
 
-The script reads the descriptor's parameter values out of its own manifest through `uniserve_build_server.package.fields`, so the keys a package accepts are exactly the descriptor range its `[kernel.descriptors]` declares: a dimension's enumerated values, or, for a dimension declared by a constraint table (`{ multiple = 16 }`, `{ power_of_two = true }`, `{ separator = "x" }`, `{ bits = 32 }`; the grammar is `Dimension` in `crates/build-server/src/manifest.rs`), the text up to the next `_` when it meets the constraint. A manifest with several `[[kernel.descriptors]]` shapes is read against each in turn.
+The script takes the descriptor's values from `uniserve_build_server.package.fields()`: the Build Server reads the key against the package's `[kernel.descriptors]` once (`Descriptors::fields` in `crates/build-server/src/manifest.rs`, the one reader of the key grammar) and states the fields as a JSON object in `UNISERVE_FIELDS`, in the key's order, so no script reads a key's text. The keys a package accepts are exactly the descriptor range its `[kernel.descriptors]` declares: a dimension's enumerated values, or, for a dimension declared by a constraint table (`{ multiple = 16 }`, `{ power_of_two = true }`, `{ separator = "x" }`, `{ bits = 32 }`; the grammar is `Dimension` in the same file), the text up to the next `_` when it meets the constraint. A manifest with several `[[kernel.descriptors]]` shapes is read against each in turn. A direct run of a script states the object as `--fields`, which `uniserve build-server fields <package> <key>` prints; a tool that needs a key's fields outside a build asks that command (`package.read_fields`).
 
 A Triton or CuTe DSL package's script states only what one descriptor of its kernel needs, `spec(fields, parameters, target)`, and hands it to the shared driver:
 

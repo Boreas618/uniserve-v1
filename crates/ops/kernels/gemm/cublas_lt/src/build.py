@@ -16,6 +16,7 @@ module is one point of the operator's descriptor matrix. The library itself is
 cuBLASLt, which the module links and the deployment provides.
 """
 
+import json
 import os
 import pathlib
 import subprocess
@@ -34,13 +35,14 @@ EPILOGUES = {"none": "0", "bias": "1"}
 
 
 def parse(descriptor: str) -> dict[str, str]:
-    """The descriptor key's `name_value` pairs, in the order it declares them."""
-    # A descriptor key joins `name_value` pairs with underscores, and neither a
-    # name nor a value here contains one, so the tokens pair up in order.
-    tokens = descriptor.split("_")
-    if len(tokens) % 2 != 0:
-        raise SystemExit(f"the descriptor {descriptor!r} does not pair names with values")
-    return {tokens[index]: tokens[index + 1] for index in range(0, len(tokens), 2)}
+    """The descriptor's fields, as the Build Server read them from its key."""
+    stated = os.environ.get("UNISERVE_FIELDS")
+    if not stated:
+        raise SystemExit(
+            f"the descriptor {descriptor!r} has no fields: the Build Server states them in "
+            "UNISERVE_FIELDS"
+        )
+    return json.loads(stated)
 
 
 def definitions(fields: dict[str, str]) -> list[str]:

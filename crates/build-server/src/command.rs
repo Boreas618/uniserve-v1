@@ -13,6 +13,9 @@
 //!   modules.
 //! - `resolve <op> <backend> <revision>`: prints where the store holds one
 //!   module's files, building the module first when it is missing.
+//! - `fields <package> <key>`: prints the fields a package's declared
+//!   dimensions read a descriptor key into, for a tool that needs them outside
+//!   a build.
 //! - `build --keys <file> --package <dir>`: fills a store directory with the
 //!   modules of descriptor key lists and of single-module packages (a policy,
 //!   the engine), with a Build Server of its own for the length of the build
@@ -35,7 +38,7 @@ use crate::server::{BuildServer, ServerConfig};
 use crate::store::Root;
 use crate::target::{Device, Target};
 use crate::toolchain::ToolchainConfig;
-use crate::{Error, Result, default_socket};
+use crate::{Error, Manifest, Result, default_socket};
 
 /// The `build-server` command's arguments.
 #[derive(Debug, clap::Parser)]
@@ -86,6 +89,14 @@ pub enum Command {
         /// The module's key; the key of a single-module package when unset.
         #[arg(long, value_name = "KEY")]
         key: Option<String>,
+    },
+    /// Read a descriptor key against a package's declared dimensions and
+    /// print its fields as a JSON object, as a build script is handed them.
+    Fields {
+        /// The package directory.
+        package: PathBuf,
+        /// The descriptor key.
+        key: String,
     },
     /// Build the modules of descriptor key lists and of single-module
     /// packages into a store directory.
@@ -175,6 +186,12 @@ pub struct Settings {
     #[arg(long, value_name = "PATH")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream: Option<PathBuf>,
+    /// A store this server serves and never writes: a directory `build
+    /// --store` made, such as the one a release ships. Its packages and
+    /// modules are served with no toolchain; repeatable.
+    #[arg(long = "read-only-store", value_name = "DIR")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub read_only_stores: Vec<PathBuf>,
     /// A target this host builds for, such as `sm_100a`; the architectures
     /// of this host's devices when none is given.
     #[arg(long = "target", value_name = "NAME")]
@@ -233,6 +250,9 @@ impl Settings {
         }
         if let Some(upstream) = &self.upstream {
             push("upstream", path(upstream));
+        }
+        for store in &self.read_only_stores {
+            push("read-only-store", path(store));
         }
         for target in &self.targets {
             push("target", target.clone());
@@ -297,6 +317,12 @@ impl Settings {
             package_root: absolute(package_root),
             store_roots,
             upstream: self.upstream.clone().map(absolute),
+            read_only_stores: self
+                .read_only_stores
+                .iter()
+                .cloned()
+                .map(absolute)
+                .collect(),
             limits,
             toolchains: ToolchainConfig {
                 nvcc: self.nvcc.clone().map(absolute),
@@ -416,6 +442,26 @@ pub fn run(args: Args, host: HostTargets<'_>) -> Result<()> {
             }
             Ok(())
         }
+        Command::Fields { package, key } => {
+            let manifest = Manifest::load(&package).map_err(|source| Error::Manifest {
+                package: package.clone(),
+                source: Box::new(source),
+            })?;
+            let fields = manifest
+                .fields(&key)
+                .ok_or_else(|| Error::UnsupportedDescriptor {
+                    op: manifest.op.clone(),
+                    backend: manifest.backend.clone(),
+                    revision: 0,
+                    descriptor: key.clone(),
+                })?;
+            let fields: serde_json::Map<String, serde_json::Value> = fields
+                .into_iter()
+                .map(|(dimension, value)| (dimension, serde_json::Value::String(value)))
+                .collect();
+            println!("{}", serde_json::Value::Object(fields));
+            Ok(())
+        }
         Command::Build(build) => run_build(*build, host),
     }
 }
@@ -460,8 +506,8 @@ fn run_build(args: BuildArgs, host: HostTargets<'_>) -> Result<()> {
     std::fs::create_dir_all(&store)?;
     let settings = Settings {
         socket: Some(store.join("build-server.sock")),
-        package_root: Some(store.join("packages")),
-        store_roots: vec![store.join("modules")],
+        package_root: Some(store.join(crate::build::PACKAGES)),
+        store_roots: vec![store.join(crate::build::MODULES)],
         targets: args.target.iter().cloned().collect(),
         max_jobs: args.max_jobs,
         nvcc: args.nvcc,

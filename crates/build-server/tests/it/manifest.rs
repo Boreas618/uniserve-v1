@@ -74,6 +74,43 @@ fn a_manifest_says_what_the_package_is_and_how_it_is_built() {
     );
 }
 
+/// A key is read into its fields once, by the manifest: in the key's order, a value that holds
+/// an underscore or another dimension's name is one value, a constraint's value ends at the next
+/// underscore, and a key that does not read whole has no fields.
+#[test]
+fn a_key_is_read_into_the_fields_a_build_script_is_handed() {
+    let descriptors = r#"{ dimensions = { dtype = ["bf16", "f32"], layout = ["contiguous", "block_major"], block = { power_of_two = true }, shape = { separator = "x" }, epsilon = { bits = 32 } } }"#;
+    let root = package(&generic(descriptors), &["src/scatter.py", "src/build.py"]);
+    let manifest = Manifest::load(root.path()).unwrap();
+    let fields = |key: &str| {
+        manifest.fields(key).map(|fields| {
+            fields
+                .into_iter()
+                .map(|(dimension, value)| format!("{dimension}={value}"))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    assert_eq!(
+        fields("layout_block_major_dtype_bf16_block_64_shape_2048x64_epsilon_0x358637bd"),
+        Some(vec![
+            "layout=block_major".to_owned(),
+            "dtype=bf16".to_owned(),
+            "block=64".to_owned(),
+            "shape=2048x64".to_owned(),
+            "epsilon=0x358637bd".to_owned(),
+        ])
+    );
+    // A dimension the key leaves out is absent, not refused.
+    assert_eq!(fields("dtype_f32"), Some(vec!["dtype=f32".to_owned()]));
+    // A value its dimension does not admit, an undeclared dimension and a dangling name.
+    assert_eq!(fields("dtype_f16"), None);
+    assert_eq!(fields("dtype_bf16_block_48"), None);
+    assert_eq!(fields("dtype_bf16_page_64"), None);
+    assert_eq!(fields("dtype_bf16_block"), None);
+    assert!(!manifest.covers("dtype_bf16_block_48"));
+}
+
 /// The engine package of this tree: a crate cargo builds to one executable for the host's
 /// platform, under the one key of a package that fills a whole interface.
 #[test]

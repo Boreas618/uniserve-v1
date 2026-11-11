@@ -472,6 +472,7 @@ fn configuration(temporary: &Path, toolchains: ToolchainConfig) -> Outcome<Serve
             writable: true,
         }],
         upstream: None,
+        read_only_stores: Vec::new(),
         limits: Limits::default(),
         toolchains,
         devices: vec![Device {
@@ -981,6 +982,7 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) -> Out
             writable: true,
         }],
         upstream: None,
+        read_only_stores: Vec::new(),
         limits: Limits::default(),
         toolchains: ToolchainConfig {
             nvcc: None,

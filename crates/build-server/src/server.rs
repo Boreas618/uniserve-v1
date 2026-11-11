@@ -96,6 +96,13 @@ pub struct ServerConfig {
     /// upstream: an `install` here is refused and names it (design section
     /// 6.3). `None` on the upstream itself.
     pub upstream: Option<PathBuf>,
+    /// Stores this server serves and never writes, each a directory a store
+    /// build made (`packages` and `modules`, [`crate::build`]): the one a
+    /// release ships with the modules of its own packages. Their revisions
+    /// are served beside the package root's and their modules are found
+    /// beside the store roots', so a host serves them with no toolchain and
+    /// builds nothing.
+    pub read_only_stores: Vec<PathBuf>,
     /// The queue's limits (design section 6.2).
     pub limits: Limits,
     /// Where this host's toolchains are.
@@ -124,9 +131,33 @@ impl BuildServer {
     /// from the package root, discovers the toolchains and opens the store.
     /// The compile queue's driver starts with [`Self::serve`].
     pub fn open(config: &ServerConfig) -> Result<BuildServer> {
-        let store = Arc::new(Store::open(config.store_roots.clone())?);
+        let mut roots = config.store_roots.clone();
+        let mut packages = load_packages(&config.package_root)?;
+        for store in &config.read_only_stores {
+            roots.push(Root {
+                path: store.join(crate::build::MODULES),
+                writable: false,
+            });
+            for (revision, package) in load_packages(&store.join(crate::build::PACKAGES))? {
+                // A revision this host installed holds its number: installs
+                // number after every revision the server serves, so the two
+                // meet only when a store is added under revisions installed
+                // before it, and the host's own is the one its records name.
+                if packages.contains_key(&revision) {
+                    tracing::warn!(
+                        store = %store.display(),
+                        op = %revision.0,
+                        backend = %revision.1,
+                        revision = revision.2,
+                        "a read-only store's revision is hidden by one of the package root"
+                    );
+                    continue;
+                }
+                packages.insert(revision, package);
+            }
+        }
+        let store = Arc::new(Store::open(roots)?);
         let toolchains = Arc::new(Toolchains::discover(&config.toolchains)?);
-        let packages = load_packages(&config.package_root)?;
         let queue = Queue::new(Arc::clone(&store), Arc::clone(&toolchains), config.limits);
         Ok(BuildServer {
             socket: config.socket.clone(),

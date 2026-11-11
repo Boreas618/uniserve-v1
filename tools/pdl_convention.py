@@ -84,11 +84,10 @@ def declares_pdl(operator, key):
             placed = False
             for dimensions in tables:
                 try:
-                    fields = driver_package.read_key(key, dimensions)
-                # A package's key reader ends a key it cannot place with `SystemExit`, which is
-                # not an `Exception`: without the wider catch the checker stops at the first
-                # table that does not fit and never reaches the one that does.
-                except BaseException:
+                    fields = driver_package.read_fields(source.parent, key)
+                # The Build Server's reader places the key against the package's shapes; a key
+                # none of them reads is not this package's.
+                except ValueError:
                     continue
                 placed = True
                 described = module.spec(fields, manifest.get('parameters', {}), 'sm_100a')

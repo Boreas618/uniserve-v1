@@ -20,7 +20,6 @@ import argparse
 import json
 import os
 import pathlib
-import re
 import subprocess
 import sys
 
@@ -60,11 +59,14 @@ def arguments():
 
 
 def block_of(descriptor):
-    """The sparse block size a descriptor names, from its `block` field."""
-    named = re.search(r"(?:^|_)block_(\d+)(?:_|$)", descriptor)
-    if named is None:
+    """The sparse block size a descriptor names, from its `block` field.
+
+    The Build Server read the key and states its fields in ``UNISERVE_FIELDS``.
+    """
+    fields = json.loads(os.environ.get("UNISERVE_FIELDS") or "{}")
+    if "block" not in fields:
         raise SystemExit(f"the descriptor {descriptor!r} names no block size")
-    block = int(named.group(1))
+    block = int(fields["block"])
     if block not in BLOCKS:
         raise SystemExit(f"the kernel knows block sizes {BLOCKS}, not {block}")
     return block

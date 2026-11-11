@@ -324,7 +324,14 @@ impl DescriptorShapes {
     /// Whether the package covers the descriptor whose key this is: it covers
     /// one of the package's shapes.
     pub fn covers(&self, key: &str) -> bool {
-        self.shapes().iter().any(|shape| shape.covers(key))
+        self.fields(key).is_some()
+    }
+
+    /// The fields of the descriptor whose key this is, each a dimension and
+    /// its value in the key's order, as the first shape that reads the key
+    /// whole reads it; `None` when no shape does.
+    pub fn fields(&self, key: &str) -> Option<Vec<(String, String)>> {
+        self.shapes().iter().find_map(|shape| shape.fields(key))
     }
 }
 
@@ -352,23 +359,65 @@ pub struct Descriptors {
 }
 
 impl Descriptors {
-    /// Whether the package covers the descriptor whose key this is.
-    ///
-    /// The key must split into `dimension_value` pairs of declared dimensions,
-    /// each value admitted by its dimension; an undeclared dimension, or a
-    /// value its dimension does not admit, leaves the descriptor uncovered, and
-    /// `prepare` fails (design section 5.2).
+    /// Whether the package covers the descriptor whose key this is: the key
+    /// reads whole against the declared dimensions ([`Self::fields`]). An
+    /// undeclared dimension, or a value its dimension does not admit, leaves
+    /// the descriptor uncovered, and `prepare` fails (design section 5.2).
     pub fn covers(&self, key: &str) -> bool {
+        self.fields(key).is_some()
+    }
+
+    /// Reads a descriptor key into its fields, each a dimension and its value
+    /// in the key's order, or `None` when the key does not read whole.
+    ///
+    /// This is the one reader of the key grammar: coverage is whether it reads
+    /// a key, and a build script is handed what it read. A key is
+    /// `dimension_value` pairs joined with `_`, in whatever order the operator
+    /// prints them. Names and enumerated values may hold `_`, so a field is
+    /// the longest declared name the rest starts with, and its value the
+    /// longest enumerated value that follows it whole or, for a dimension
+    /// declared by a constraint, the text up to the next `_` when it meets
+    /// the constraint: no integer, extent tuple or bit pattern holds one. A
+    /// declared dimension the key leaves out is not refused: the package's
+    /// compilation answers for a field it needs and the key lacks.
+    pub fn fields(&self, key: &str) -> Option<Vec<(String, String)>> {
         if self.dimensions.is_empty() {
-            return false;
+            return None;
         }
-        split_key(&self.dimensions, key).is_some_and(|pairs| {
-            pairs.iter().all(|(dimension, value)| {
-                self.dimensions
-                    .get(dimension)
-                    .is_some_and(|declared| declared.admits(value))
-            })
-        })
+        let mut names: Vec<&str> = self.dimensions.keys().map(String::as_str).collect();
+        names.sort_by_key(|name| std::cmp::Reverse(name.len()));
+
+        let mut fields = Vec::new();
+        let mut rest = key;
+        while !rest.is_empty() {
+            let name = names.iter().find(|name| {
+                rest.strip_prefix(**name)
+                    .is_some_and(|after| after.starts_with('_'))
+            })?;
+            let after = &rest[name.len() + 1..];
+            let value = match self.dimensions.get(*name)? {
+                Dimension::Values(values) => values
+                    .iter()
+                    .filter(|value| {
+                        after
+                            .strip_prefix(value.as_str())
+                            .is_some_and(|tail| tail.is_empty() || tail.starts_with('_'))
+                    })
+                    .max_by_key(|value| value.len())?
+                    .as_str(),
+                Dimension::Constraint(constraint) => {
+                    let value = after.split('_').next().unwrap_or_default();
+                    constraint.admits(value).then_some(value)?
+                }
+            };
+            if value.is_empty() {
+                return None;
+            }
+            fields.push(((*name).to_owned(), value.to_owned()));
+            let tail = &after[value.len()..];
+            rest = tail.strip_prefix('_').unwrap_or(tail);
+        }
+        Some(fields)
     }
 }
 
@@ -527,39 +576,6 @@ fn admits_bits(bits: u32, text: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         && (digits == "0" || !digits.starts_with('0'))
-}
-
-/// Splits a descriptor key into its `dimension_value` pairs, given the
-/// dimensions the package declares. The declared dimension names are matched
-/// longest first at each position, and a value runs to the next matched
-/// dimension.
-fn split_key<'a>(
-    dimensions: &BTreeMap<String, Dimension>,
-    key: &'a str,
-) -> Option<Vec<(String, &'a str)>> {
-    let mut names: Vec<&str> = dimensions.keys().map(String::as_str).collect();
-    names.sort_by_key(|name| std::cmp::Reverse(name.len()));
-    let mut pairs = Vec::new();
-    let mut rest = key;
-    while !rest.is_empty() {
-        let name = names.iter().find(|name| rest.starts_with(**name))?;
-        let after = rest[name.len()..].strip_prefix('_')?;
-        // The value runs to the next place where a declared dimension name is
-        // followed by a value, so a value may itself hold another dimension's
-        // name.
-        let end = names
-            .iter()
-            .filter_map(|next| after.find(&format!("_{next}_")))
-            .min()
-            .unwrap_or(after.len());
-        let value = &after[..end];
-        if value.is_empty() {
-            return None;
-        }
-        pairs.push(((*name).to_owned(), value));
-        rest = after[end..].strip_prefix('_').unwrap_or_default();
-    }
-    Some(pairs)
 }
 
 /// The kernel package a package provides, and what picks a kernel for a
@@ -780,6 +796,17 @@ impl Manifest {
         match &self.kernel {
             Some(kernel) => kernel.descriptors.covers(key),
             None => key == SINGLE_KEY,
+        }
+    }
+
+    /// The fields of the descriptor whose key this is, as the package's
+    /// declared dimensions read it ([`Descriptors::fields`]): what a build
+    /// script is handed in place of the key's text. `None` for a key the
+    /// package does not cover; a package of one module has no field.
+    pub fn fields(&self, key: &str) -> Option<Vec<(String, String)>> {
+        match &self.kernel {
+            Some(kernel) => kernel.descriptors.fields(key),
+            None => (key == SINGLE_KEY).then(Vec::new),
         }
     }
 

@@ -61,6 +61,7 @@ fn config(temporary: &Path) -> ServerConfig {
             writable: true,
         }],
         upstream: None,
+        read_only_stores: Vec::new(),
         limits: Limits::default(),
         toolchains: ToolchainConfig {
             nvcc: None,

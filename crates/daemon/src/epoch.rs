@@ -1049,6 +1049,7 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
     serde_json::json!({
         "epoch": epoch,
         "engine_config": serde_json::to_value(&record.config).unwrap_or(Value::Null),
+        "engine": package_report(&record.engine),
         "kernels": kernels,
         "policy": package_report(&record.policy),
         "previous_kernels": previous,

@@ -55,6 +55,12 @@ use proto::module::ModuleSlot;
 /// module holds. No backend means the key did not build.
 pub type Report<'a> = dyn FnMut(&str, &str, &[(String, usize)]) + 'a;
 
+/// The directory of a store that holds its installed package revisions.
+pub const PACKAGES: &str = "packages";
+
+/// The directory of a store that holds its committed modules.
+pub const MODULES: &str = "modules";
+
 /// Reads key lists: `operator<TAB>key` per line, blank lines and `#` comments
 /// skipped. Answers each line's operator and key.
 ///

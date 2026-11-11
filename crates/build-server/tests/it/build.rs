@@ -69,6 +69,7 @@ fn configuration(temporary: &Path, toolchains: ToolchainConfig) -> ServerConfig 
             writable: true,
         }],
         upstream: None,
+        read_only_stores: Vec::new(),
         limits: Limits::default(),
         toolchains,
         devices: vec![Device {
@@ -388,6 +389,7 @@ fn a_policy_is_built_from_its_installed_snapshot() {
             writable: true,
         }],
         upstream: None,
+        read_only_stores: Vec::new(),
         limits: Limits::default(),
         toolchains: ToolchainConfig {
             nvcc: None,

@@ -5,14 +5,20 @@ entries a native module must export.
 
 The Build Server runs a package's ``src/build.py`` with its working directory
 the package root and ``UNISERVE_PACKAGE``, ``UNISERVE_DESCRIPTOR``,
-``UNISERVE_TARGET`` and ``UNISERVE_OUT`` in the environment (``UNISERVE_NVCC``
-too for a CUDA package); a direct run states the same four as ``--package``,
-``--descriptor``, ``--target`` and ``--out``.
+``UNISERVE_FIELDS``, ``UNISERVE_TARGET`` and ``UNISERVE_OUT`` in the
+environment (``UNISERVE_NVCC`` too for a CUDA package); a direct run states
+the same five as ``--package``, ``--descriptor``, ``--fields``, ``--target``
+and ``--out``.
+
+The key grammar is the Build Server's alone (``Descriptors::fields``,
+``crates/build-server/src/manifest.rs``): a script is handed the fields the
+server read from the key and never reads the key's text.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import subprocess
@@ -26,7 +32,7 @@ def arguments() -> tuple[pathlib.Path, str, str, pathlib.Path]:
     reader.add_argument("--descriptor")
     reader.add_argument("--target")
     reader.add_argument("--out")
-    known = reader.parse_args()
+    known, _ = reader.parse_known_args()
     values = {
         "package": known.package or os.environ.get("UNISERVE_PACKAGE"),
         "descriptor": (
@@ -51,123 +57,53 @@ def manifest(package: pathlib.Path) -> dict:
     return tomllib.loads((package / "package.toml").read_text())
 
 
-def fields(package: pathlib.Path, key: str) -> dict[str, str]:
-    """A descriptor key read into ``{dimension: value}``.
+def fields() -> dict[str, str]:
+    """The descriptor's fields, as the Build Server read them from its key.
 
-    The dimensions are the manifest's ``[kernel.descriptors]``: one table, or
-    several ``[[kernel.descriptors]]`` shapes when an operator prints some
-    fields only for the variant that has them (a narrowed rotation names its
-    width, a sectioned one its axes). The key is read against each shape in
-    turn and the first that reads it whole answers.
-
-    A key is ``field_value`` pairs joined with ``_``, in whatever order the
-    operator prints them. Names and declared values may contain ``_``, so a
-    field is the longest declared name the rest starts with and a value the
-    longest declared value that follows it whole, or, for a dimension declared
-    by a constraint table, the text up to the next ``_`` when it meets the
-    constraint.
-
-    A declared dimension the key leaves out is not refused here, which is the
-    rule the Build Server's coverage (``Descriptors::covers``) applies: the
-    package's compilation answers for a field it needs and the key lacks.
+    The server reads a key against the package's ``[kernel.descriptors]`` and
+    hands the build ``{dimension: value}`` as a JSON object in
+    ``UNISERVE_FIELDS``, in the key's order; a direct run states the same
+    object as ``--fields``, which ``uniserve build-server fields <package>
+    <key>`` prints. A dimension the key leaves out is absent: the package's
+    compilation answers for a field it needs and the key lacks.
     """
-    declared = manifest(package)["kernel"]["descriptors"]
-    shapes = declared if isinstance(declared, list) else [declared]
-    refusals = []
-    for shape in shapes:
-        dimensions = shape.get("dimensions") or {}
-        if not dimensions:
-            continue
-        try:
-            return read_key(key, dimensions)
-        except DescriptorKeyError as refusal:
-            refusals.append(str(refusal))
-    raise SystemExit(
-        f"{key}: no declared descriptor shape reads it: " + "; ".join(refusals)
+    reader = argparse.ArgumentParser()
+    reader.add_argument("--fields")
+    known, _ = reader.parse_known_args()
+    stated = known.fields or os.environ.get("UNISERVE_FIELDS")
+    if not stated:
+        raise SystemExit(
+            "missing fields: the Build Server states them in UNISERVE_FIELDS, "
+            "and `uniserve build-server fields <package> <key>` prints them"
+        )
+    return json.loads(stated)
+
+
+def read_fields(package: pathlib.Path, key: str) -> dict[str, str]:
+    """A descriptor key's fields, read by the Build Server's executable.
+
+    For a tool that needs a key's fields outside a build: it asks the same
+    reader a build is handed its fields by (``uniserve build-server fields``),
+    through the executable ``UNISERVE_BINARY`` names (``uniserve`` on the
+    search path when unset).
+
+    Raises:
+        ValueError: If the package's declared dimensions do not read the key.
+    """
+    answered = subprocess.run(
+        [
+            os.environ.get("UNISERVE_BINARY", "uniserve"),
+            "build-server",
+            "fields",
+            str(package),
+            key,
+        ],
+        capture_output=True,
+        text=True,
     )
-
-
-class DescriptorKeyError(ValueError):
-    """A key one descriptor shape does not read."""
-
-
-def read_key(key: str, dimensions: dict) -> dict[str, str]:
-    """``key`` read against one shape's ``dimensions``.
-
-    Raises :class:`DescriptorKeyError` when the shape does not read it.
-    """
-    names = sorted(dimensions, key=len, reverse=True)
-    found: dict[str, str] = {}
-    remaining = key
-    while remaining:
-        name = next(
-            (one for one in names if remaining.startswith(one + "_")), None
-        )
-        if name is None:
-            raise DescriptorKeyError(
-                f"no dimension among {names} starts {remaining!r}"
-            )
-        rest = remaining[len(name) + 1 :]
-        value = declared_value(dimensions[name], rest)
-        if value is None:
-            raise DescriptorKeyError(f"{name} admits no value at {rest!r}")
-        found[name] = value
-        remaining = rest[len(value) :].removeprefix("_")
-    return found
-
-
-def declared_value(declared, rest: str) -> str | None:
-    """The value a declared dimension reads at the start of ``rest``, or None.
-
-    An enumeration reads the longest of its values that ``rest`` starts with
-    whole. A constraint table (``{ multiple = 16 }``, ``{ bits = 32 }``,
-    ``{ separator = "x" }``) reads the text up to the next ``_``, which no
-    integer, extent tuple or float bit pattern holds, and admits it when it
-    meets the constraint, as the Build Server's manifest does.
-    """
-    if isinstance(declared, list):
-        return next(
-            (
-                one
-                for one in sorted(declared, key=len, reverse=True)
-                if rest == one or rest.startswith(one + "_")
-            ),
-            None,
-        )
-    value = rest.split("_", 1)[0]
-    return value if admits(declared, value) else None
-
-
-def admits(constraint: dict, value: str) -> bool:
-    """Whether ``value``, as a key spells it, meets a constraint table."""
-    if "bits" in constraint:
-        # A float enters a key as its bit pattern: `0x`, then lowercase
-        # hexadecimal without leading zeros.
-        digits = value.removeprefix("0x")
-        return (
-            value.startswith("0x")
-            and 0 < len(digits) <= constraint["bits"] // 4
-            and all(digit in "0123456789abcdef" for digit in digits)
-            and (digits == "0" or not digits.startswith("0"))
-        )
-    separator = constraint.get("separator")
-    for part in value.split(separator) if separator else [value]:
-        # An integer enters a key in canonical decimal: `064` names nothing.
-        if not part or any(digit not in "0123456789" for digit in part):
-            return False
-        if part != "0" and part.startswith("0"):
-            return False
-        number = int(part)
-        if number < constraint.get("min", 1):
-            return False
-        if number > constraint.get("max", number):
-            return False
-        if number % constraint.get("multiple", 1) != 0:
-            return False
-        power = number > 0 and number & (number - 1) == 0
-        if constraint.get("power_of_two") and not power:
-            return False
-    return True
+    if answered.returncode != 0:
+        raise ValueError(f"{key}: {answered.stderr.strip()}")
+    return json.loads(answered.stdout)
 
 
 def nvcc() -> tuple[str, str]:

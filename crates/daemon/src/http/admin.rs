@@ -861,6 +861,10 @@ fn modules_report(modules: &crate::epoch::ModuleSet) -> serde_json::Value {
         })
         .collect::<Vec<_>>();
     json!({
+        "engine": {
+            "backend": modules.engine.backend,
+            "revision": modules.engine.revision,
+        },
         "kernels": kernels,
         "policy": {
             "backend": modules.policy.backend,

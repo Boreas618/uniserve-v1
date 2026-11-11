@@ -62,7 +62,7 @@ def described(spec: Spec, root: pathlib.Path, key: str, target: str) -> dict:
     A dimension the spec needs and the key leaves out is refused by name, as
     the key's own parse would refuse a misspelled one.
     """
-    fields = package.fields(root, key)
+    fields = package.fields()
     try:
         return spec(
             fields, package.manifest(root).get("parameters", {}), target

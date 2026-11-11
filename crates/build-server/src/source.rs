@@ -152,15 +152,31 @@ impl PackageSource {
     }
 
     /// The environment the Build Server passes to a compile script: the
-    /// package root, the descriptor key, the output directory and the
-    /// toolchain's own variables.
+    /// package root, the descriptor key and its fields, the target, the
+    /// output directory and the toolchain's own variables.
+    ///
+    /// `UNISERVE_FIELDS` is the key as the manifest's declared dimensions read
+    /// it ([`Manifest::fields`]): a JSON object of dimension to value, in the
+    /// key's order. A script takes its descriptor's values from there and
+    /// never reads the key's text, so the key grammar is read in one place.
     pub fn environment(
         &self,
         key: &str,
         target: &Target,
         dir: &Workspace,
     ) -> Vec<(OsString, OsString)> {
+        let fields: serde_json::Map<String, serde_json::Value> = self
+            .manifest
+            .fields(key)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(dimension, value)| (dimension, serde_json::Value::String(value)))
+            .collect();
         vec![
+            (
+                "UNISERVE_FIELDS".into(),
+                serde_json::Value::Object(fields).to_string().into(),
+            ),
             ("UNISERVE_OP".into(), self.manifest.op.clone().into()),
             (
                 "UNISERVE_BACKEND".into(),
@@ -1287,6 +1303,30 @@ dimensions = {{ dtype = ["bf16"] }}
             std::fs::read(workspace.path().join("launch.json")).unwrap(),
             br#"{"name": "vendor"}"#
         );
+    }
+
+    /// A build's environment states the key's fields as the manifest read them, in the key's
+    /// order, so a compile script reads no key.
+    #[test]
+    fn a_build_is_handed_the_fields_of_its_key() {
+        let directory = tempfile::tempdir().unwrap();
+        vendor_package(directory.path(), Some("launch.json"));
+        let manifest = Manifest::load(directory.path()).unwrap();
+        let package = PackageSource::new(directory.path().to_path_buf(), manifest);
+        let workspace = Workspace::new().unwrap();
+
+        let environment = package.environment("dtype_bf16", &Target::new("sm_100a"), &workspace);
+        let stated = |name: &str| {
+            environment
+                .iter()
+                .find(|(variable, _)| variable == name)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            stated("UNISERVE_FIELDS").as_deref(),
+            Some(r#"{"dtype":"bf16"}"#)
+        );
+        assert_eq!(stated("UNISERVE_DESCRIPTOR").as_deref(), Some("dtype_bf16"));
     }
 
     #[test]
