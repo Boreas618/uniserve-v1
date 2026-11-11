@@ -1,4 +1,4 @@
-# The vsa_scores operator's Triton backend: design 5.2's program package.
+# The vsa_scores operator's Triton backend: design 5.2's package.
 #
 # The step between VSA's pooling and its selection: one dot product per (head, query tile, key tile)
 # over the pooled per-head means, written as the contiguous FP32
@@ -8,6 +8,7 @@
 
 op = "vsa_scores"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

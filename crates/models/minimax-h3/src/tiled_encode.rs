@@ -14,7 +14,7 @@ use crate::packing::LATENT_COMPRESSION;
 use crate::video_vae::{MINIMUM_OVERLAP, TILE_PIXELS};
 use crate::{Error, Result};
 use nn::tiling::{Tile, TiledEncode};
-use nn::{DType, Forward, Shape, Operand};
+use nn::{DType, Forward, Operand, Shape};
 
 /// A tile's block of a wider raster, `[channels, frames, height, width]` at the raster's strides,
 /// copied into a fresh packed `[1, channels, frames, height, width]` sample.

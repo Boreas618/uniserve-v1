@@ -56,7 +56,7 @@ pub(crate) struct Serving {
     scheduler: Scheduler,
     /// Ends the scheduler's wait when a command arrives.
     waker: scheduler::CommandWaker,
-    program: scheduler::PolicyProgram,
+    program: scheduler::PolicyPackage,
     /// The policy's module, read when the scheduler was built: the first read
     /// of a process builds it, which no case's deadline should span.
     source: Arc<dyn scheduler::PolicySource + Send + Sync>,

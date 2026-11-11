@@ -30,7 +30,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -96,7 +96,7 @@ pub struct Args {
 pub struct KvWrite;
 
 impl Op for KvWrite {
-    const NAME: &'static str = proto::program::operator::KV_WRITE;
+    const NAME: &'static str = proto::module::operator::KV_WRITE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -116,7 +116,8 @@ impl Op for KvWrite {
                 Self::NAME,
                 format!(
                     "this writes a {} cache from {} values; an FP8 cache is filled by kv_write_scaled",
-                    abi::name(descriptor.kv), abi::name(descriptor.dtype)
+                    abi::name(descriptor.kv),
+                    abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -129,7 +130,9 @@ impl Op for KvWrite {
                 Self::NAME,
                 format!(
                     "expected {} keys and values, found {} and {}",
-                    abi::name(descriptor.dtype), abi::name(args.key.dtype), abi::name(args.value.dtype)
+                    abi::name(descriptor.dtype),
+                    abi::name(args.key.dtype),
+                    abi::name(args.value.dtype)
                 ),
             ));
         }
@@ -148,7 +151,11 @@ impl Op for KvWrite {
             if cache.dtype != descriptor.kv {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected a {} cache, found {}", abi::name(descriptor.kv), abi::name(cache.dtype)),
+                    format!(
+                        "expected a {} cache, found {}",
+                        abi::name(descriptor.kv),
+                        abi::name(cache.dtype)
+                    ),
                 ));
             }
             if cache.shape.dim(1) != page
@@ -316,7 +323,7 @@ pub struct ScaledWriteArgs {
 pub struct KvWriteScaled;
 
 impl Op for KvWriteScaled {
-    const NAME: &'static str = proto::program::operator::KV_WRITE_SCALED;
+    const NAME: &'static str = proto::module::operator::KV_WRITE_SCALED;
 
     type Descriptor = ScaledWriteDescriptor;
     type Args<'a> = ScaledWriteArgs;
@@ -341,7 +348,8 @@ impl Op for KvWriteScaled {
                 Self::NAME,
                 format!(
                     "expected {} source, found {}",
-                    abi::name(descriptor.dtype), abi::name(args.source.dtype)
+                    abi::name(descriptor.dtype),
+                    abi::name(args.source.dtype)
                 ),
             ));
         }
@@ -365,7 +373,10 @@ impl Op for KvWriteScaled {
         if args.cache.dtype != DType::F8E4M3 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected an e4m3 cache, found {}", abi::name(args.cache.dtype)),
+                format!(
+                    "expected an e4m3 cache, found {}",
+                    abi::name(args.cache.dtype)
+                ),
             ));
         }
         if args.cache.shape.dim(1) != page
@@ -391,7 +402,8 @@ impl Op for KvWriteScaled {
                 Self::NAME,
                 format!(
                     "expected {} page scales, found {}",
-                    abi::name(descriptor.scale), abi::name(args.scales.dtype)
+                    abi::name(descriptor.scale),
+                    abi::name(args.scales.dtype)
                 ),
             ));
         }

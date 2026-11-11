@@ -1,6 +1,6 @@
 //! The policy's parameters and the limits it declares.
 //!
-//! A scheduling policy is a program with arguments (design §5.1). The
+//! A scheduling policy is a package with arguments (design §5.1). The
 //! arguments that shape scheduling are [`Parameters`]: the process hands them
 //! to the policy at instantiation, and the policy returns its [`Limits`] once
 //! at instantiation. The mechanism checks the limits against the build

@@ -11,7 +11,7 @@
 //! limits, and one `observe` and one `dispatch` per step: `observe == step` and
 //! `dispatch == step + 1`.
 //!
-//! So the epoch here runs the real `fcfs` program over a pool that responds to every
+//! So the epoch here runs the real `fcfs` package over a pool that responds to every
 //! batch, serves a request through it, and then reads the counts. A mechanism
 //! that asked a step's halves twice, or asked a decision outside a step, would
 //! report it in the arithmetic; a policy that failed would report itself.
@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use ipc::SamplingParams;
 use ipc::execution::Batches;
 use scheduler::{
-    BatchCapacity, Event, GenerationRequest, Parameters, PolicyProgram, PolicySource, Progress,
+    BatchCapacity, Event, GenerationRequest, Parameters, PolicyPackage, PolicySource, Progress,
     SchedulerConfig, SchedulerHandle, Stage,
 };
 use scheduling::Call;
@@ -60,16 +60,16 @@ fn serving() -> FakeBatches {
         .with_extent(Extent::OnePast)
 }
 
-/// The program the epoch serves under, its arguments the capacity this pool was
+/// The package the epoch serves under, its arguments the capacity this pool was
 /// built for.
-fn program(pool: &FakeBatches) -> PolicyProgram {
+fn package(pool: &FakeBatches) -> PolicyPackage {
     let rank = pool
         .inventory()
         .first()
         .and_then(|pool| pool.ranks.first())
         .expect("the pool states its ranks");
     let ceilings = scheduler::ceilings_of(BatchCapacity::of(rank));
-    PolicyProgram {
+    PolicyPackage {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: Parameters {
@@ -109,7 +109,7 @@ fn text_request(id: u64, prompt: usize, max_tokens: usize) -> GenerationRequest 
 fn install(handle: &SchedulerHandle, serving: &FakeBatches) {
     let source: Arc<dyn PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    response(handle.precopy_policy(program(serving), source)).expect("the policy is precopied");
+    response(handle.precopy_policy(package(serving), source)).expect("the policy is precopied");
     response(handle.stage(Stage::Switchover)).expect("the policy serves");
 }
 
@@ -143,7 +143,7 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
 
     // The trial asks the decision set once on the state that exists now - a
     // `dispatch` and no `observe`, since observing a step's events is the step's
-    // - and a trial leaves the program as it found it, so the candidate a
+    // - and a trial leaves the package as it found it, so the candidate a
     // switchover adopts is a second instance of the same module. The trial's
     // calls are the epoch's policy's and count (§7.3), from the instance that
     // made them, while the serving instance starts its own life: two
@@ -174,7 +174,7 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
         "the limits are declared once in each instance's life"
     );
 
-    // Requests make the epoch step: the real program admits them, the pool
+    // Requests make the epoch step: the real package admits them, the pool
     // responds to their batches, and every step is one `observe` and one
     // `dispatch`.
     handle

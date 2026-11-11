@@ -144,16 +144,9 @@ struct Takeover {
     /// not reopen admissions (§7.5.1), and the in-process hold alone would
     /// reopen them once the frontend serves.
     frontend_paused: bool,
-    /// The programs the serving epoch runs. A configuration names a part of
+    /// The modules the serving epoch runs. A configuration names a part of
     /// them and the store fills the rest, so the successor cannot derive them.
-    programs: Option<HandedPrograms>,
-}
-
-/// The programs of the epoch a takeover continues.
-#[derive(Debug, Serialize, Deserialize)]
-struct HandedPrograms {
-    kernels: Vec<(crate::epoch::KernelKey, proto::program::Program)>,
-    policy: proto::program::Program,
+    modules: Option<proto::module::ModuleSet>,
 }
 
 /// One replica's control connection and executing epoch. Descriptors follow
@@ -447,9 +440,12 @@ impl Restarter {
                     jobs: job_records,
                     then: then.map(|request| *request),
                     frontend_paused: leader.status().paused,
-                    programs: leader.epochs().serving().map(|(_, record)| HandedPrograms {
-                        kernels: record.kernels.into_iter().collect(),
-                        policy: record.policy,
+                    modules: leader.epochs().serving().map(|(_, record)| {
+                        proto::module::ModuleSet {
+                            engine: record.engine,
+                            kernels: record.kernels,
+                            policy: record.policy,
+                        }
                     }),
                 })),
                 &borrowed,
@@ -729,7 +725,7 @@ async fn prepared_successor(
         prepare.processes.clone(),
         config.host_identity.clone(),
         config.served_model_name().to_owned(),
-        crate::engine::control::ensure_program_server(&config.program_config)?,
+        crate::engine::control::ensure_build_server(&config.build_config)?,
     )?;
     send(
         channel,
@@ -763,7 +759,7 @@ async fn prepared_successor(
         jobs,
         then,
         frontend_paused,
-        programs,
+        modules,
     } = *takeover;
     let mut descriptors = descriptors.into_iter();
     let mut next = || {
@@ -875,7 +871,7 @@ async fn prepared_successor(
     );
     // The successor adopts the epoch that serves (§2.5, §7.4, §7.5).
     {
-        let (record, process) = adopted_epoch(served_epoch, handed.engine, &options, programs)?;
+        let (record, process) = adopted_epoch(served_epoch, handed.engine, &options, modules)?;
         epoch_records.record(served_epoch, record);
         let mut processes = epoch_records.processes();
         processes.push(process);
@@ -896,7 +892,7 @@ async fn prepared_successor(
     first.adopt_unavailable(handed.unavailable);
     // §2.5 continues across the handoff: the successor adopts the engines and
     // then keeps a standby of its own, or the deployment would serve without one
-    // until the next restart. The epoch's programs serve already, so it prepares
+    // until the next restart. The epoch's modules serve already, so it prepares
     // from them as soon as it parks.
     first.prepare_standby();
     first.start_standby();
@@ -1066,11 +1062,11 @@ async fn prepared_successor(
 }
 
 /// The epoch record and the process row of an epoch a restarting daemon
-/// adopts: the build config and the programs the adopted configuration
+/// adopts: the build config and the modules the adopted configuration
 /// fills, serving, at the launch generation the child reported (which is the
 /// identity it runs under, §7.4). The record's own generation stays `None`:
 /// that field is the MODEL generation the adopted child numbers for its
-/// programs, and a daemon that adopted it never saw that number — the launch
+/// modules, and a daemon that adopted it never saw that number — the launch
 /// generation belongs to the process row alone.
 ///
 /// Without the record the epoch layer says no epoch serves and refuses the
@@ -1080,20 +1076,15 @@ fn adopted_epoch(
     epoch: u64,
     engine: u64,
     options: &crate::options::ServerArgs,
-    programs: Option<HandedPrograms>,
+    modules: Option<proto::module::ModuleSet>,
 ) -> anyhow::Result<(crate::epoch::EpochRecord, crate::epoch::ManagedProcess)> {
     let deployment = crate::epoch::Epoch::of(options.clone())?;
-    let (kernels, policy) = match programs {
-        Some(programs) => (programs.kernels.into_iter().collect(), programs.policy),
-        None => (
-            deployment.programs.kernels.clone(),
-            deployment.programs.policy.clone(),
-        ),
-    };
+    let modules = modules.unwrap_or_else(|| deployment.modules.clone());
     let record = crate::epoch::EpochRecord {
         config: deployment.engine.clone(),
-        kernels,
-        policy,
+        engine: modules.engine,
+        kernels: modules.kernels,
+        policy: modules.policy,
         previous_kernels: std::collections::BTreeMap::new(),
         previous_policy: None,
         status: crate::epoch::Status::Serving,

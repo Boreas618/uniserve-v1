@@ -14,7 +14,7 @@
 //! - the node's resident memory ([`Memory`]);
 //! - the blocking pool host work runs on ([`ThreadPool`]),
 //!
-//! and drives the program-layer update between them: precopy on the blocking pool and the
+//! and drives the generation update between them: precopy on the blocking pool and the
 //! workers, shadow execution against the schedulers' resident requests, switchover at a batch
 //! boundary, probation, commit or revert, and purge after the old generation's last batch.
 //! `docs/architecture.md` states the threads (The threads of a main process) and the epoch switch
@@ -24,12 +24,12 @@
 //! carries `Emitted` events, and the tokens come back with the scheduler's completed batch in
 //! logits order.
 //!
-//! ## The daemon's program-layer sequence
+//! ## The daemon's generation sequence
 //!
 //! A standby main process starts, and the daemon then drives one update per generation through
-//! the process interface's program commands ([`ipc::ProgramCommand`]), at no other entry point:
+//! the process interface's package commands ([`ipc::GenerationCommand`]), at no other entry point:
 //!
-//! 1. `Precopy { generation, programs, policy }`: the programs of the new generation, as revisions.
+//! 1. `Precopy { generation, packages, policy }`: the packages of the new generation, as revisions.
 //!    Each node prepares it (module `precopy`) and answers `Precopied { generation }`, or
 //!    `PrecopyFailed`, which discards the generation and leaves serving on the old one.
 //! 2. `Switchover { generation }`: the node swaps at the next batch boundary and answers
@@ -41,19 +41,19 @@
 //!    fails is reported as `PolicyReverted`, and a stall, a device fault or non-finite logits on
 //!    probation revert the update automatically ([`ipc::UpdateFailure`]).
 //!
-//! Nothing program-content crosses that protocol: a node resolves its modules from the Program
-//! Server itself (`crate::programs`).
+//! No module content crosses that protocol: a node resolves its modules from the Build
+//! Server itself (`crate::modules`).
 //!
 //! ## Modules
 //!
 //! - `launch`, `claim`, `ranks`, `start`: the launch file, the handshake, the Storage Server
 //!   claim, the ranks' load and the process's start and close.
-//! - `record`: a start that records the programs its devices launch and serves nothing
+//! - `record`: a start that records the packages its devices launch and serves nothing
 //!   ([`record()`]).
 //! - `serve`, `commands`, `requests`, `reports`, `operations`, `weights`: the serve loop and
 //!   what it serves - the daemon's messages, requests and their event streams,
 //!   reports and metrics, storage commands and weight updates.
-//! - `policy`, `installs`, `precopy`, `switchover`: the program-layer update.
+//! - `policy`, `installs`, `precopy`, `switchover`: the generation update.
 //! - `epoch`: the epoch layer's drain, resume, promotion and admission.
 
 mod claim;
@@ -79,9 +79,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use build_server::{Client, Target};
 use ipc::execution::Outcome;
 use ipc::execution::Submission;
-use program_server::{Client, Target};
 use update::HotUpdate;
 use worker::blocking::ThreadPool;
 use worker::control::Control;
@@ -91,7 +91,7 @@ use worker::memory::Memory;
 use worker::memory::retained::Retained;
 use worker::watchdog::Watchdog;
 
-use crate::programs::modules::ModuleWork;
+use crate::modules::load::ModuleWork;
 use crate::rank::buckets::PrefillBound;
 use epoch::Draining;
 use launch::{ProcessInterface, read_engine_args};
@@ -209,7 +209,7 @@ pub(crate) struct MainProcess {
     /// command channel carries the mutation.
     schedulers: Vec<scheduler::SchedulerHandle>,
     /// The routing policy that names the scheduler of every request when this node holds several
-    /// (`requests::route`): the control thread's instance of the epoch's policy program, switched
+    /// (`requests::route`): the control thread's instance of the epoch's policy package, switched
     /// with the schedulers' instances.
     router: scheduler::Router,
     /// The route instance the running precopy prepares on a thread of its own, taken by the
@@ -239,14 +239,14 @@ pub(crate) struct MainProcess {
     /// hold one beside the control thread without a lock.
     storage: Vec<Arc<Retained>>,
     blocking: ThreadPool,
-    /// The blocking lane the Program Server's selection and the module loads run on.
+    /// The blocking lane the Build Server's selection and the module loads run on.
     modules: Lane<ModuleWork>,
-    /// The program-layer update's phases and bookkeeping.
+    /// The generation update's phases and bookkeeping.
     update: HotUpdate,
     /// The stall and sticky-error rules of the control thread.
     watchdog: Watchdog,
-    /// The Program Server client, shared with the module-load lane.
-    programs: Arc<Mutex<Client>>,
+    /// The Build Server client, shared with the module-load lane.
+    packages: Arc<Mutex<Client>>,
     /// The precopy between serve passes, if one is in flight.
     precopy: Option<Precopy>,
     /// The warmups a switchover queued, one per device, with the generation each was queued for.
@@ -254,7 +254,7 @@ pub(crate) struct MainProcess {
     /// own, one bucket per queue turn behind serving, and a model with many buckets warms for
     /// minutes, which the daemon's wait for `Switched` follows through the `Warming` reports.
     warming: Vec<(u32, Submission, u64)>,
-    /// When this process stated itself as `Ready` or `Standby`, and how many program-layer
+    /// When this process stated itself as `Ready` or `Standby`, and how many generation
     /// commands it has been given since the epoch began: a process that was read as ready and is
     /// given no command looks exactly like one that is working, from the daemon's side and from
     /// its own.
@@ -300,9 +300,9 @@ pub(crate) struct MainProcess {
     )>,
     /// What this node resolves a module for.
     targets: Vec<Target>,
-    /// The Program Server's socket, which a policy's source resolves its module through.
-    program_server: PathBuf,
-    /// The daemon's process interface: the claim, the program-layer reports and every command the
+    /// The Build Server's socket, which a policy's source resolves its module through.
+    build_server: PathBuf,
+    /// The daemon's process interface: the claim, the generation reports and every command the
     /// daemon sends this epoch.
     process: ProcessInterface,
     /// Set by the daemon's `Shutdown`: the epoch ends at the end of this pass.
@@ -403,7 +403,7 @@ fn device_command(
 }
 
 impl MainProcess {
-    /// The program generation this process holds and would serve from now on.
+    /// The module generation this process holds and would serve from now on.
     ///
     /// A prepared generation is the one a switchover takes, so it is what a promotion is about. With
     /// none prepared this is `HotUpdate`'s current generation, which is the daemon's own number from

@@ -88,7 +88,7 @@ pub struct Args {
 pub struct CrossFade;
 
 impl Op for CrossFade {
-    const NAME: &'static str = proto::program::operator::CROSS_FADE;
+    const NAME: &'static str = proto::module::operator::CROSS_FADE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -152,7 +152,11 @@ impl Op for CrossFade {
             if view.dtype != descriptor.dtype {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected {} {name}, found {}", abi::name(descriptor.dtype), abi::name(view.dtype)),
+                    format!(
+                        "expected {} {name}, found {}",
+                        abi::name(descriptor.dtype),
+                        abi::name(view.dtype)
+                    ),
                 ));
             }
         }
@@ -162,7 +166,8 @@ impl Op for CrossFade {
                 Self::NAME,
                 format!(
                     "expected {} out, found {}",
-                    abi::name(descriptor.dtype), abi::name(args.out.dtype)
+                    abi::name(descriptor.dtype),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }

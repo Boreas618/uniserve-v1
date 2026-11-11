@@ -19,7 +19,7 @@
 //! page geometry and its per-layer key/value planes. A model with one attention type has one group;
 //! a model whose blocks attend differently has one per group.
 
-use proto::program::PhaseKind;
+use proto::module::PhaseKind;
 use proto::video::{LatentShape, Layout};
 
 use crate::error::{Error, Result};
@@ -124,7 +124,11 @@ impl TokenBatch {
             if view.dtype != dtype {
                 return Err(Error::shape(
                     "TokenBatch",
-                    format!("{name} is {}, not {dtype}", ops::abi::name(view.dtype), dtype = ops::abi::name(dtype)),
+                    format!(
+                        "{name} is {}, not {dtype}",
+                        ops::abi::name(view.dtype),
+                        dtype = ops::abi::name(dtype)
+                    ),
                 ));
             }
         }

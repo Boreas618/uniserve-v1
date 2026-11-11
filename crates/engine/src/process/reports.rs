@@ -1,66 +1,66 @@
 //! What this process states to its daemon: the schedulers' and devices' counters once a second,
-//! the program-layer reports, and the engine's state and description on the request interface.
+//! the generation reports, and the engine's state and description on the request interface.
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use ipc::ProgramStatus;
+use ipc::GenerationStatus;
 use worker::control::Control;
 
 use super::MainProcess;
 
-/// The name of a program-layer status, for the line that says which step was answered.
-pub(super) fn status_name(status: &ProgramStatus) -> &'static str {
+/// The name of a generation status, for the line that says which step was answered.
+pub(super) fn status_name(status: &GenerationStatus) -> &'static str {
     match status {
-        ProgramStatus::Precopied { .. } => "precopied",
-        ProgramStatus::PrecopyFailed { .. } => "precopy_failed",
-        ProgramStatus::Switched { .. } => "switched",
-        ProgramStatus::Warming { .. } => "warming",
-        ProgramStatus::Committed { .. } => "committed",
-        ProgramStatus::Reverted { .. } => "reverted",
-        ProgramStatus::Purged { .. } => "purged",
-        ProgramStatus::PolicyReverted { .. } => "policy_reverted",
-        ProgramStatus::Failed { .. } => "failed",
+        GenerationStatus::Precopied { .. } => "precopied",
+        GenerationStatus::PrecopyFailed { .. } => "precopy_failed",
+        GenerationStatus::Switched { .. } => "switched",
+        GenerationStatus::Warming { .. } => "warming",
+        GenerationStatus::Committed { .. } => "committed",
+        GenerationStatus::Reverted { .. } => "reverted",
+        GenerationStatus::Purged { .. } => "purged",
+        GenerationStatus::PolicyReverted { .. } => "policy_reverted",
+        GenerationStatus::Failed { .. } => "failed",
     }
 }
 
-/// The report one program-layer status states.
+/// The report one generation status states.
 ///
 /// A status the daemon learns another way - none today - answers `None`, and the caller logs it
 /// instead of inventing a report.
-fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
+fn report_of(status: &GenerationStatus) -> Option<proto::process::Report> {
     use proto::process::report::Kind;
 
     let kind = match status {
-        ProgramStatus::Precopied {
+        GenerationStatus::Precopied {
             generation,
             uncompared,
         } => Kind::Precopied(proto::process::Precopied {
             generation: *generation,
             uncompared: uncompared.clone(),
         }),
-        ProgramStatus::PrecopyFailed { failure, .. } => {
+        GenerationStatus::PrecopyFailed { failure, .. } => {
             Kind::PrecopyFailed(proto::process::PrecopyFailed {
                 reason: failure.reason(),
             })
         }
-        ProgramStatus::Switched { generation } => Kind::Switched(proto::process::Switched {
+        GenerationStatus::Switched { generation } => Kind::Switched(proto::process::Switched {
             generation: *generation,
         }),
-        ProgramStatus::Warming { generation, step } => Kind::Warming(proto::process::Warming {
+        GenerationStatus::Warming { generation, step } => Kind::Warming(proto::process::Warming {
             generation: *generation,
             step: step.clone(),
         }),
-        ProgramStatus::Committed { .. } => Kind::Committed(proto::process::Committed {}),
-        ProgramStatus::Reverted { reason, .. } => Kind::Reverted(proto::process::Reverted {
+        GenerationStatus::Committed { .. } => Kind::Committed(proto::process::Committed {}),
+        GenerationStatus::Reverted { reason, .. } => Kind::Reverted(proto::process::Reverted {
             reason: reason.clone(),
         }),
-        ProgramStatus::Purged { generation } => Kind::Purged(proto::process::Purged {
+        GenerationStatus::Purged { generation } => Kind::Purged(proto::process::Purged {
             generation: *generation,
         }),
         // A policy that failed is reported with the backend and revision it came from, so the
         // daemon's record takes the previous policy back.
-        ProgramStatus::PolicyReverted {
+        GenerationStatus::PolicyReverted {
             scheduler,
             backend,
             revision,
@@ -76,7 +76,7 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
         // A probation failure is not a fault of the device: the revert that follows it states the
         // generation it left and the first error, so reporting it twice would name a device the
         // failure did not happen on.
-        ProgramStatus::Failed { .. } => return None,
+        GenerationStatus::Failed { .. } => return None,
     };
     Some(proto::process::Report { kind: Some(kind) })
 }
@@ -280,15 +280,15 @@ impl MainProcess {
         }
     }
 
-    /// Reports a program-layer status to the daemon.
-    pub(super) fn report(&mut self, status: ProgramStatus) {
-        // The program layer's answers, in the vocabulary the daemon's epoch record reads: a precopy
+    /// Reports a generation status to the daemon.
+    pub(super) fn report(&mut self, status: GenerationStatus) {
+        // The generation layer's answers, in the vocabulary the daemon's epoch record reads: a precopy
         // that finished, the switchover, the commit, the revert and the purge, each naming its
         // generation, and a failure carrying the first error. The daemon needs no answer to any of
         // them; it marks the epoch's state with what it is told, and the probation's rules are
         // applied on these reports.
         let Some(report) = report_of(&status) else {
-            tracing::debug!(?status, "a program-layer status needs no report");
+            tracing::debug!(?status, "a generation status needs no report");
             return;
         };
         self.send_report(report);

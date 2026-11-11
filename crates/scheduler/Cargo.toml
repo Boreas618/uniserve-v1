@@ -14,7 +14,7 @@ proto.workspace = true
 # The scheduler's wait: one `poll` over its wake and its Storage Server connections.
 rustix.workspace = true
 scheduling.workspace = true
-program-server.workspace = true
+build-server.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 storage.workspace = true

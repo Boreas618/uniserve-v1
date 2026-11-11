@@ -1,4 +1,4 @@
-# The cross_fade operator's Triton backend: design 5.2's program package.
+# The cross_fade operator's Triton backend: design 5.2's package.
 #
 # One module per descriptor: the seam between two decoded video tiles, blended over the leading
 # `extent` positions of the height (axis 2) or the width (axis 3) of a
@@ -12,6 +12,7 @@
 
 op = "cross_fade"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

@@ -1,4 +1,4 @@
-# The expert_exchange operator's alltoall backend: design 5.2's program package.
+# The expert_exchange operator's alltoall backend: design 5.2's package.
 #
 # One native module per descriptor: the transport's lifecycle and the launch of
 # both directions of the exchange (`ops::moe::exchange`, the one call structure of
@@ -19,6 +19,7 @@
 
 op = "expert_exchange"
 backend = "alltoall"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

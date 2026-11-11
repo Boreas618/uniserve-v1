@@ -1,6 +1,6 @@
 //! Shadow buffers for shadow execution.
 //!
-//! During a program-layer update, the new kernel of an operator runs beside the old one on the same
+//! During a generation update, the new kernel of an operator runs beside the old one on the same
 //! inputs: the old kernel writes the real outputs, the new one writes twins of them, and the two are
 //! compared within the operator's [`Tolerance`]. Because the
 //! new kernel's result is never fed on, the difference of one operator does not accumulate through
@@ -23,7 +23,7 @@ use uniserve_tensor::DType;
 
 use crate::abi;
 use crate::platform::{Allocator, Buffer, PoolKind, Stream};
-use crate::tensor::{DevicePtr, Shape, Operand};
+use crate::tensor::{DevicePtr, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Result, platform};
 
@@ -96,8 +96,7 @@ impl Twins {
     pub fn shadow_of(&mut self, real: Operand) -> Operand {
         match self.carve(real.shape, real.dtype) {
             Ok(address) => {
-                let shadow =
-                    Operand::with_strides(address, real.dtype, real.shape, real.strides);
+                let shadow = Operand::with_strides(address, real.dtype, real.shape, real.strides);
                 self.pairs.push(Twin { shadow, real });
                 shadow
             }
@@ -128,8 +127,7 @@ impl Twins {
                         return real;
                     }
                 }
-                let shadow =
-                    Operand::with_strides(address, real.dtype, real.shape, real.strides);
+                let shadow = Operand::with_strides(address, real.dtype, real.shape, real.strides);
                 self.pairs.push(Twin { shadow, real });
                 shadow
             }

@@ -30,7 +30,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DevicePtr, Shape, Operand};
+use crate::tensor::{DevicePtr, Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -114,7 +114,7 @@ impl TopkSoftmax {
 }
 
 impl Op for TopkSoftmax {
-    const NAME: &'static str = proto::program::operator::TOPK_SOFTMAX;
+    const NAME: &'static str = proto::module::operator::TOPK_SOFTMAX;
 
     type Descriptor = TopkDescriptor;
     type Args<'a> = TopkArgs;
@@ -127,7 +127,10 @@ impl Op for TopkSoftmax {
         if !matches!(descriptor.scores, DType::F32 | DType::BF16 | DType::F16) {
             return Err(Error::Unsupported {
                 operator: Self::NAME,
-                problem: format!("scores of {} are not routeable", abi::name(descriptor.scores)),
+                problem: format!(
+                    "scores of {} are not routeable",
+                    abi::name(descriptor.scores)
+                ),
             });
         }
         if descriptor.experts == 0 || descriptor.experts > MAX_EXPERTS {
@@ -163,7 +166,10 @@ impl Op for TopkSoftmax {
         if args.weights.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected FP32 weights, found {}", abi::name(args.weights.dtype)),
+                format!(
+                    "expected FP32 weights, found {}",
+                    abi::name(args.weights.dtype)
+                ),
             ));
         }
 

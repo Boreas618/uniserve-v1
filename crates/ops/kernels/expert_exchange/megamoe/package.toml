@@ -1,9 +1,9 @@
-# The expert_exchange operator's megamoe backend: design 5.2's program package.
+# The expert_exchange operator's megamoe backend: design 5.2's package.
 #
 # FlashInfer's fused MegaMoE kernel: one launch per layer exchanges the tokens, runs the
-# experts and combines. Its sources are the `megamoe` pin of `uniserve_program_server.fetch`
+# experts and combines. Its sources are the `megamoe` pin of `uniserve_build_server.fetch`
 # (FlashInfer 0.6.18's `moe_ep/kernel_src/cutedsl_megamoe/src`, from the distribution the
-# Program Server's environment locks) with `patches/megamoe.patch` applied: the
+# Build Server's environment locks) with `patches/megamoe.patch` applied: the
 # tanh-approximated GELU gate and the token exchange's peer-metadata stride.
 # The `flashinfer-python` version is the pin's, so it is declared below and a change of it
 # is a new revision. `src/build.py` compiles it with the CuTe DSL
@@ -15,6 +15,7 @@
 
 op = "expert_exchange"
 backend = "megamoe"
+interface_version = 1
 
 [toolchain]
 kind = "cute_dsl"

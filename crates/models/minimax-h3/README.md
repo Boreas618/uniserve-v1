@@ -4,7 +4,7 @@ MiniMax-H3 and FastH3 in Rust: the model library for the three tasks `t2va`, `fl
 
 ## Public entry
 
-The crate's entry is its family value, `minimax_h3::family::FAMILY` (an `nn::family::Family`), which `src/main.rs` registers once: its main processes load the family through the `nn::family::Catalogue` and its daemon serves the family's request side (`Family::request`, a `processing::Family`) through the `processing::Catalogue`, both built from that one list. It claims the diffusers modular pipeline class `MiniMaxH3ModularPipeline` and states both contracts:
+The crate's entry is its family value, `minimax_h3::family::FAMILY` (an `nn::family::Family`), which the engine executable (`crates/engine/src/main.rs`) registers once: its main processes load the family through the `nn::family::Catalogue`. The daemon serves the family's request side (`Family::request`, the `processing::Family` that `processing::minimax_h3::FAMILY` states) through the `processing::Registry` of `processing::FAMILIES`, and links no model. It claims the diffusers modular pipeline class `MiniMaxH3ModularPipeline` and states both sides:
 
 - to execution, a video family (`nn::family::VideoFamily`): `open` reads and normalizes the checkpoint's sidecars once into a [`Config`](src/config/mod.rs), and `load` builds the blocks the deployment places on a rank from that configuration, its [`Partition`](src/partition.rs) (the denoiser's Ulysses sequence split and the text encoder's tensor-parallel position) and its serving bounds, returning an `nn::family::VideoModel`;
 - to request processing, its video processor (`minimax_h3::processing`), which holds a request to the model's canvas, frame and condition rules over the family-neutral rules of `crates/processing`.

@@ -1,4 +1,4 @@
-# The frame_norm_pad operator's CUDA backend: design 5.2's program package.
+# The frame_norm_pad operator's CUDA backend: design 5.2's package.
 #
 # One native module per descriptor: `pad(silu(group_norm(frame)))` for a video
 # convolution's input (`ops::frame::FrameNormPadCall`, 728 bytes), written in one pass
@@ -11,6 +11,7 @@
 
 op = "frame_norm_pad"
 backend = "nvcc"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

@@ -35,7 +35,7 @@ from tests.python.e2e.http_helpers import (
     host_asset,
     require_uniserve_binary,
     server_process,
-    worker_executable,
+    engine_selection,
 )
 from uniserve_eval.transport.video import inspect_video_bytes
 
@@ -102,8 +102,7 @@ def _command(model, deployment, port, inputs, options) -> list[str]:
         model,
         "--worker-groups",
         str(ROOT / "configs" / "minimax_h3" / deployment),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--served-model-name",
         "MiniMax-H3",
         "--port",

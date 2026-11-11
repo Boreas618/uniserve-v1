@@ -23,10 +23,10 @@
 use std::sync::{Arc, Mutex};
 
 use nn::capability::{DecodedMedia, Decoder};
-use ops::{Shape, Operand};
-use uniserve_tensor::DType;
+use ops::{Operand, Shape};
 use platform::DeviceId;
 use proto::video::{LatentShape, Layout};
+use uniserve_tensor::DType;
 
 use crate::batch::{Job, Jobs, answered};
 use crate::plan::{Bucket, Buckets};

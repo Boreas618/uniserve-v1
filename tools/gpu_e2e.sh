@@ -5,28 +5,30 @@
 #
 #   tools/gpu_e2e.sh [--memcheck] [pytest arguments...]
 #
-# The script builds the release `uniserve` executable, which serves every process of a test
-# deployment (the daemon and its workers alike), the scheduling policy precompiler and the
-# `uniserve-manager` the admin API's tests attach beside the executable, and
-# exports them as `UNISERVE_BINARY`, `UNISERVE_WORKER_EXECUTABLE` and
-# `UNISERVE_SCHEDULING_PRECOMPILE`; when the environment names both `UNISERVE_BINARY` and
-# `UNISERVE_SCHEDULING_PRECOMPILE`, as a host sharing another host's build does, it uses them
-# and builds nothing. It puts the NCCL this project pins on the loader's path
+# The script builds the release `uniserve` executable, which is a test deployment's daemon and
+# its host services, the scheduling policy precompiler and the `uniserve-manager` the admin API's
+# tests attach beside the executable, and exports them as `UNISERVE_BINARY` and
+# `UNISERVE_SCHEDULING_PRECOMPILE`; when the environment names both, as a host sharing another
+# host's build does, it uses them and builds nothing. A deployment's main processes run the engine
+# package (`crates/engine`), which each test module's Build Server installs and builds with cargo
+# from the installed snapshot: that build reads `UNISERVE_FFMPEG_DIR`, `LIBCLANG_PATH` and
+# `CUDA_HOME` from this environment, and cargo keeps what it compiled between runs. It puts the NCCL this project pins on the loader's path
 # (`tools/check_nccl.sh`), sets the gate `UNISERVE_RUN_GPU_E2E=1`, and runs pytest with one
 # worker per GPU (pytest-xdist); each case leases the GPUs it serves on
 # (`tests/python/e2e/conftest.py`). pytest's temporary directory, which holds every server's log,
 # and the JUnit report go to `artifacts/e2e/<UTC time>/` unless `UNISERVE_E2E_ARTIFACTS` names
 # another directory.
 #
-# `--memcheck` runs every main process under compute-sanitizer's memcheck
-# (`tests/python/sanitizer/memcheck-worker`) and writes its logs to `$SANITIZER_LOGS`
-# (`<artifacts>/memcheck` by default).
+# `--memcheck` runs every main process under compute-sanitizer's memcheck: the deployments
+# select the engine package `memcheck` (`tests/python/sanitizer`), whose executable runs the
+# release `uniserve-engine` this script builds under the sanitizer, and its logs go to
+# `$SANITIZER_LOGS` (`<artifacts>/memcheck` by default).
 #
 # Host facts come from the environment: the checkpoints and inputs the tests name
 # (docs/testing.md lists them; a case whose asset is unset is skipped, naming the variable),
 # `UNISERVE_FFMPEG_DIR` for the build, `UNISERVE_E2E_DEVICES` to restrict the GPUs, and
 # `UNISERVE_E2E_WORKERS` for another worker count. `PYTHON` and `CARGO` name the interpreter
-# command and cargo, as in the justfile; `MAX_JOBS` caps the Program Server's kernel compilations
+# command and cargo, as in the justfile; `MAX_JOBS` caps the Build Server's kernel compilations
 # (16 when unset).
 set -euo pipefail
 
@@ -60,13 +62,16 @@ mkdir -p "$artifacts"
 if [ "$memcheck" = 1 ]; then
     export SANITIZER_LOGS=${SANITIZER_LOGS:-$artifacts/memcheck}
     mkdir -p "$SANITIZER_LOGS"
-    export UNISERVE_WORKER_EXECUTABLE=$root/tests/python/sanitizer/memcheck-worker
-    export UNISERVE_MEMCHECK_TARGET=$UNISERVE_BINARY
+    # The engine the sanitizer runs: the tree's own, built here unless the environment names one.
+    if [ -z "${UNISERVE_MEMCHECK_TARGET:-}" ]; then
+        "$cargo" build --release -p engine --bin uniserve-engine
+        export UNISERVE_MEMCHECK_TARGET=${CARGO_TARGET_DIR:-$root/target}/release/uniserve-engine
+    fi
+    export UNISERVE_ENGINE=memcheck
+    export UNISERVE_ENGINE_PACKAGE=$root/tests/python/sanitizer
     # A main process under memcheck takes more of the device and runs slower.
     export UNISERVE_E2E_SET=${UNISERVE_E2E_SET:-"mem_fraction_static=0.6 worker_config.watchdog_timeout=2h"}
     export UNISERVE_E2E_TIME_SCALE=${UNISERVE_E2E_TIME_SCALE:-20}
-else
-    export UNISERVE_WORKER_EXECUTABLE=$UNISERVE_BINARY
 fi
 
 # The environment the tests run in: its NCCL, checked against the pin, is the one a serving

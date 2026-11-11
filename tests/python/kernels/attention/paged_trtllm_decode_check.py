@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run one BF16 paged decode through the built trtllm module and check it.
 
-This is the GPU check the Program Server cannot do on a build host: it loads
+This is the GPU check the Build Server cannot do on a build host: it loads
 the module the store holds exactly as a runner does (``module.so`` plus the
 ``cubins/`` beside it), calls the operator's entry with the call structure of
 ``crates/ops/src/attention/mod.rs`` (784 bytes, ``error`` at 272), and compares
@@ -10,8 +10,8 @@ the module's output with exact attention computed in torch.
     python decode_check.py <module_dir> [--page 64] [--batch 8] [--len 3000]
 
 ``<module_dir>`` is what ``resolve`` hands a runner: ``module.so`` and
-``cubins/``. Run it on the GPU host with the Program Server's own environment
-(``crates/program-server/python/.venv/bin/python``), which has torch.
+``cubins/``. Run it on the GPU host with the Build Server's own environment
+(``crates/build-server/python/.venv/bin/python``), which has torch.
 
 The kernel the module loads is logged when ``UNISERVE_CUBIN_LOG`` names a file:
 the module appends the cubin name its launcher asked for, and this script

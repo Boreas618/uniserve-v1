@@ -174,11 +174,11 @@ where
 }
 
 impl PolicyInstance {
-    /// Instantiates `module`, constructs the policy from the program's
+    /// Instantiates `module`, constructs the policy from the package's
     /// `parameters`, drives `init` with `state`, and reads the policy's limits
     /// once and checks them against the build config's `ceilings`.
     ///
-    /// A policy put in place of another starts here: the program arguments
+    /// A policy put in place of another starts here: the package arguments
     /// construct it and the whole state is its `init`, so it knows every
     /// request, cache page, encoding and replica that already exists (§4.4).
     /// Its own soft state starts empty, which is what makes a mid-flight swap

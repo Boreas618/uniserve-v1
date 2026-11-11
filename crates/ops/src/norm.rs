@@ -27,7 +27,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Strides, Operand};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -84,7 +84,7 @@ pub struct RmsNormArgs {
 pub struct RmsNorm;
 
 impl Op for RmsNorm {
-    const NAME: &'static str = proto::program::operator::RMS_NORM;
+    const NAME: &'static str = proto::module::operator::RMS_NORM;
 
     type Descriptor = RmsNormDescriptor;
     type Args<'a> = RmsNormArgs;
@@ -188,7 +188,7 @@ pub struct AddRmsNormArgs {
 pub struct AddRmsNorm;
 
 impl Op for AddRmsNorm {
-    const NAME: &'static str = proto::program::operator::ADD_RMS_NORM;
+    const NAME: &'static str = proto::module::operator::ADD_RMS_NORM;
 
     type Descriptor = AddRmsNormDescriptor;
     type Args<'a> = AddRmsNormArgs;
@@ -300,7 +300,7 @@ pub struct GatedRmsNormArgs {
 pub struct GatedRmsNorm;
 
 impl Op for GatedRmsNorm {
-    const NAME: &'static str = proto::program::operator::GATED_RMS_NORM;
+    const NAME: &'static str = proto::module::operator::GATED_RMS_NORM;
 
     type Descriptor = GatedRmsNormDescriptor;
     type Args<'a> = GatedRmsNormArgs;
@@ -425,7 +425,7 @@ pub struct LayerNormArgs {
 pub struct LayerNorm;
 
 impl Op for LayerNorm {
-    const NAME: &'static str = proto::program::operator::LAYER_NORM;
+    const NAME: &'static str = proto::module::operator::LAYER_NORM;
 
     type Descriptor = LayerNormDescriptor;
     type Args<'a> = LayerNormArgs;
@@ -547,7 +547,7 @@ pub struct SoftmaxArgs {
 pub struct Softmax;
 
 impl Op for Softmax {
-    const NAME: &'static str = proto::program::operator::SOFTMAX;
+    const NAME: &'static str = proto::module::operator::SOFTMAX;
 
     type Descriptor = SoftmaxDescriptor;
     type Args<'a> = SoftmaxArgs;

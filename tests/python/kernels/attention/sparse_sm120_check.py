@@ -12,8 +12,8 @@ module's output and normalizer with the operator's own definition computed in to
 The module is FlashInfer's SM120 kernel, whose tile is 64 rows in both domains, so ``--block``
 must be 64 and the run needs an SM120/SM121 device (a GB200 or an RTX 50-series part — not the
 SM100 the other backends run on). The kernel always writes the normalizer, and it is the natural
-logarithm the operator promises, so the check compares it as well. Run it with the Program
-Server's own environment (``crates/program-server/python/.venv/bin/python``), which has torch.
+logarithm the operator promises, so the check compares it as well. Run it with the Build
+Server's own environment (``crates/build-server/python/.venv/bin/python``), which has torch.
 """
 
 import argparse

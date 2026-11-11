@@ -104,7 +104,7 @@ impl Driver {
     }
 
     /// Runs the epoch layer of a change into the switch slot, or answers
-    /// `Ok(None)` when the change is another layer's (host, programs alone, or
+    /// `Ok(None)` when the change is another layer's (host, modules alone, or
     /// nothing) — the caller then takes its other path.
     pub(crate) fn apply(
         &self,
@@ -168,11 +168,11 @@ impl Driver {
         self.lock().switch.is_none()
     }
 
-    /// States that the running switch's target on `host` is given its programs by the daemon.
-    pub(crate) fn await_programs(&self, host: &str) {
+    /// States that the running switch's target on `host` is given its modules by the daemon.
+    pub(crate) fn await_modules(&self, host: &str) {
         let mut state = self.lock();
         if let Some(running) = state.switch.as_mut() {
-            running.await_programs([host.to_owned()]);
+            running.await_modules([host.to_owned()]);
         }
     }
 
@@ -189,14 +189,14 @@ impl Driver {
         self.lock().warming = Some(warming);
     }
 
-    /// The Program Servers selected what the running switch's target executes.
-    pub(crate) fn pin(&self, programs: &crate::epoch::FilledPrograms) {
+    /// The Build Servers selected what the running switch's target executes.
+    pub(crate) fn pin(&self, modules: &crate::epoch::ModuleSet) {
         if let Some(running) = self.lock().switch.as_mut() {
-            running.pin(programs);
+            running.pin(modules);
         }
     }
 
-    /// The running switch's target on `host` took its programs.
+    /// The running switch's target on `host` took its modules.
     pub(crate) fn handed(&self, host: &str) {
         let mut state = self.lock();
         let State { roster, switch, .. } = &mut *state;
@@ -251,7 +251,7 @@ impl Driver {
         self.lock().trial = Some(trial);
     }
 
-    /// The trial of a program-layer update ended: what it read stays as the
+    /// The trial of a generation update ended: what it read stays as the
     /// report of the last update.
     pub(crate) fn end_trial(&self, report: Value) {
         let mut state = self.lock();
@@ -321,7 +321,7 @@ impl Driver {
         self.report().or_else(|| {
             let state = self.lock();
             if state.trial.is_some() {
-                let update = serde_json::json!({ "change": "program", "phase": "probation" });
+                let update = serde_json::json!({ "change": "generation", "phase": "probation" });
                 return Some(state.completed(update));
             }
             state.last.clone()

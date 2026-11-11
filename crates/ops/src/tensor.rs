@@ -1,7 +1,7 @@
 //! The kernel argument an operator's launch code is written in: a device address, an element
 //! type, and inline extents and strides.
 //!
-//! [`Operand`] is what a kernel program's tensor parameters are made of. Its element type is the
+//! [`Operand`] is what a kernel package's tensor parameters are made of. Its element type is the
 //! tensor library's `DType`, whose number and spelling for a package [`crate::abi`] states; its
 //! [`Shape`] and [`Strides`] are inline arrays of at most [`MAX_RANK`] axes, so that an operand
 //! is `Copy` and an operator's argument struct can be rebound without allocating. Everything
@@ -477,7 +477,9 @@ impl Operand {
                 operator,
                 format!(
                     "expected {} elements, found {} in the view {:?}",
-                    abi::name(dtype), abi::name(self.dtype), self.shape
+                    abi::name(dtype),
+                    abi::name(self.dtype),
+                    self.shape
                 ),
             ));
         }

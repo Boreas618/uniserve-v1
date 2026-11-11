@@ -161,12 +161,7 @@ impl TokenRefiner {
     /// The refined prompt: `features` `[rows, text_dim]` in, a fresh `[rows, hidden_size]` out.
     ///
     /// `document` names the one document: queries over every padded row, keys over the prompt's.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        features: Operand,
-        document: Varlen,
-    ) -> Result<Operand> {
+    pub fn forward(&self, f: &Forward, features: Operand, document: Varlen) -> Result<Operand> {
         if features.shape.rank() != 2
             || features.shape.dim(0) == 0
             || features.shape.last() != u64::from(self.text_dim)

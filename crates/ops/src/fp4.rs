@@ -11,7 +11,7 @@
 //! nvfp4_gemm       a dense product over packed weights, a packed activation and one FP32 alpha
 //! ```
 //!
-//! Both are kernel programs whose arithmetic is the vendor kernel's (FlashInfer's quantizer and
+//! Both are kernel packages whose arithmetic is the vendor kernel's (FlashInfer's quantizer and
 //! CUTLASS's or cuDNN's FP4 product, which the design asks for as programs of their own); what this
 //! module fixes is the descriptor of a compilation, the argument list, the scale layouts and the
 //! tolerance between two implementations of the same variant.
@@ -32,7 +32,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -184,7 +184,7 @@ pub struct QuantizeArgs {
 pub struct Nvfp4Quantize;
 
 impl Op for Nvfp4Quantize {
-    const NAME: &'static str = proto::program::operator::NVFP4_QUANTIZE;
+    const NAME: &'static str = proto::module::operator::NVFP4_QUANTIZE;
 
     type Descriptor = QuantizeDescriptor;
     type Args<'a> = QuantizeArgs;
@@ -436,7 +436,8 @@ pub fn check_gemm(descriptor: &GemmDescriptor) -> Result<()> {
             Nvfp4Gemm::NAME,
             format!(
                 "an NVFP4 product takes U8 packed bytes and an f8e4m3 block scale, not {} and {}",
-                abi::name(descriptor.packed), abi::name(descriptor.scale)
+                abi::name(descriptor.packed),
+                abi::name(descriptor.scale)
             ),
         ));
     }
@@ -447,7 +448,7 @@ pub fn check_gemm(descriptor: &GemmDescriptor) -> Result<()> {
 pub struct Nvfp4Gemm;
 
 impl Op for Nvfp4Gemm {
-    const NAME: &'static str = proto::program::operator::NVFP4_GEMM;
+    const NAME: &'static str = proto::module::operator::NVFP4_GEMM;
 
     type Descriptor = GemmDescriptor;
     type Args<'a> = GemmArgs;
@@ -504,7 +505,8 @@ impl Op for Nvfp4Gemm {
                 Self::NAME,
                 format!(
                     "expected {} output, found {}",
-                    abi::name(descriptor.output), abi::name(args.out.dtype)
+                    abi::name(descriptor.output),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }

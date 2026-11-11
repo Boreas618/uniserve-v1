@@ -6,7 +6,7 @@ value.
 """
 
 import logprob_gather as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The largest tile a program holds in registers in one step.
 LANES = 4096

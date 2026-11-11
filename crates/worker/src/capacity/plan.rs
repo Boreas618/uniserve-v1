@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use std::sync::Arc;
 
-use ipc::{CallKind, StageInfo, MainProcessEndpoint, MainProcessInfo, MediaCall};
+use ipc::{CallKind, MainProcessEndpoint, MainProcessInfo, MediaCall, StageInfo};
 use proto::config::EngineConfig;
 
 use super::{ArenaCapacity, CacheCapacity, CacheDemand, TokenBounds, call_window};

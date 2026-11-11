@@ -168,7 +168,7 @@ impl MainProcess {
             }
         }
         self.update.prepared.clear();
-        self.update.prepared_programs.clear();
+        self.update.prepared_packages.clear();
         Ok(())
     }
 
@@ -209,7 +209,7 @@ impl MainProcess {
                 kind: Some(proto::process::report::Kind::Promoted(
                     proto::process::Promoted {
                         generation: self.control.engine(),
-                        program_generation: self.served_generation(),
+                        module_generation: self.served_generation(),
                     },
                 )),
             });
@@ -268,7 +268,7 @@ impl MainProcess {
         // and it is refused here, by name, before admission opens: `Promoted` followed
         // by a first request that finds no graph would tell the daemon the promotion
         // succeeded and move the frontend onto a process with no kernels.
-        // A standby that took the epoch's programs serves them already: its precopy, switchover
+        // A standby that took the epoch's packages serves them already: its precopy, switchover
         // and commit ran when the daemon handed them over, so its generation is the serving one.
         let held = self.update.prepared.len()
             + self
@@ -318,7 +318,7 @@ impl MainProcess {
             self.pending_serve = true;
         }
         // The two numbers answer different questions and both are needed: the launch
-        // generation is what the epoch layer promotes a child by, and the program
+        // generation is what the epoch layer promotes a child by, and the package
         // generation is the one this process holds - the fact the daemon compares with
         // its own before it moves the frontend, so a promotion of a generation the
         // epoch has reverted is refused there instead of served here.
@@ -326,7 +326,7 @@ impl MainProcess {
             kind: Some(proto::process::report::Kind::Promoted(
                 proto::process::Promoted {
                     generation: self.control.engine(),
-                    program_generation: self.served_generation(),
+                    module_generation: self.served_generation(),
                 },
             )),
         });

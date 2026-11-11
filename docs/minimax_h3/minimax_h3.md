@@ -23,11 +23,11 @@ export CUDA_HOME=/usr/local/cuda
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$CUDA_HOME/bin:$PATH"
 
 uv sync --locked --python /usr/bin/python3.12 --extra gpu
-uv sync --locked --python /usr/bin/python3.12 --project crates/program-server/python
+uv sync --locked --python /usr/bin/python3.12 --project crates/build-server/python
 source .venv/bin/activate
 ```
 
-The first sync builds the `uniserve` executable and installs the NCCL and CUPTI libraries serving loads. The second creates the Program Server's own environment, the locked compilers of the kernel programs (Triton, the CuTe DSL, FlashInfer and FlashAttention-4); the Program Server compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the host's CUDA toolkit.
+The first sync builds the `uniserve` executable and installs the NCCL and CUPTI libraries serving loads. The second creates the Build Server's own environment, the locked compilers of the kernel packages (Triton, the CuTe DSL, FlashInfer and FlashAttention-4); the Build Server compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the host's CUDA toolkit.
 
 ## Checkpoints
 
@@ -299,7 +299,7 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 
 | Symptom | Remedy |
 | --- | --- |
-| A kernel program's compile error in the Program Server's log | Check CUDA 13 `nvcc`, `CUDA_HOME` and the C++ build tools, and run the Program Server's `uv sync` above again. |
+| A kernel package's compile error in the Build Server's log | Check CUDA 13 `nvcc`, `CUDA_HOME` and the C++ build tools, and run the Build Server's `uv sync` above again. |
 | `unsupported FastH3 checkpoint` | Use a checkpoint from the table above; the message names the `fastvideo_inference.json` field it cannot serve. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `quantization` for a packed NVFP4 checkpoint. |
 | `nvfp4 conversion requires an SM100-class CUDA device` | Use `quality` or FP8 overrides on Hopper. |

@@ -25,7 +25,7 @@ use nn::layers::{
     Rounding, Spectrum, StepIndexed,
 };
 use nn::weights::WeightLoader;
-use nn::{DType, Forward, Shape, Operand};
+use nn::{DType, Forward, Operand, Shape};
 
 use crate::attention::{self, Visibility};
 use crate::config::{AttentionKind, TransformerConfig};
@@ -258,7 +258,8 @@ fn fuse_modality(
     if bias.dtype != dtype {
         return Err(Error::checkpoint(format!(
             "{name}'s weight is {dtype} and its bias {}",
-            ops::abi::name(bias.dtype), dtype = ops::abi::name(dtype)
+            ops::abi::name(bias.dtype),
+            dtype = ops::abi::name(dtype)
         )));
     }
     let values = ops::values::decode(dtype, &weight.bytes).map_err(nn::Error::from)?;

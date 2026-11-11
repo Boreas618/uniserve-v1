@@ -380,6 +380,18 @@ impl DenoiserInfo {
 /// `Serving::Video(&processing::minimax_h3::H3Family)`.
 pub struct H3Family;
 
+/// The pipeline class a MiniMax-H3 checkpoint declares (`model_index.json`'s `_class_name`).
+pub const PIPELINE_CLASS: &str = "MiniMaxH3ModularPipeline";
+
+/// The MiniMax-H3 family as request processing serves it: a diffusers modular pipeline, served
+/// through its video processor ([`H3Family`]).
+pub const FAMILY: crate::Family = crate::Family {
+    id: "minimax_h3",
+    model_types: &[],
+    classes: &[PIPELINE_CLASS],
+    serving: crate::Serving::Video(&H3Family),
+};
+
 impl VideoFamily for H3Family {
     fn processor_files(&self) -> &'static [(&'static str, &'static str)] {
         PROCESSOR_FILES

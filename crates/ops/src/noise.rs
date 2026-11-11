@@ -50,7 +50,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::{self, Stream};
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{DevicePtr, Error, Op, Result, Twins};
 
@@ -151,7 +151,7 @@ pub struct NoiseArgs {
 pub struct PhiloxNoise;
 
 impl Op for PhiloxNoise {
-    const NAME: &'static str = proto::program::operator::PHILOX_NOISE;
+    const NAME: &'static str = proto::module::operator::PHILOX_NOISE;
 
     type Descriptor = NoiseDescriptor;
     type Args<'a> = NoiseArgs;
@@ -178,7 +178,8 @@ impl Op for PhiloxNoise {
                 Self::NAME,
                 format!(
                     "expected {} noise, found {}",
-                    abi::name(descriptor.dtype), abi::name(args.out.dtype)
+                    abi::name(descriptor.dtype),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }
@@ -227,7 +228,9 @@ impl Op for PhiloxNoise {
             // Philox is integer arithmetic, so the uniforms agree bit for bit; the normal then costs
             // the logarithm, the square root, the angle and its cosine or sine before the store
             // rounds into the output type.
-            NoiseKind::Normal => Tolerance::new(0.0, 4.0 * tolerance::unit_roundoff(descriptor.dtype) as f32),
+            NoiseKind::Normal => {
+                Tolerance::new(0.0, 4.0 * tolerance::unit_roundoff(descriptor.dtype) as f32)
+            }
             // A 24-bit value scaled by 2^-24 is exact in FP32 and rounds once into a narrower output.
             NoiseKind::Uniform => Tolerance::exact(),
         }
@@ -239,7 +242,7 @@ impl Op for PhiloxNoise {
 ///
 /// One program indexes one element by this, so an odd offset draws the high half of a word first and
 /// two draws at adjacent offsets reproduce one longer draw. It is the host statement of the rule the
-/// kernel program applies, and the tests below pin it to the chained-stream property.
+/// kernel package applies, and the tests below pin it to the chained-stream property.
 pub const fn word_and_half(offset: u64, index: u64) -> (u64, u32) {
     let element = offset + index;
     (element / 2, (element % 2) as u32)

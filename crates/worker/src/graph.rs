@@ -1,7 +1,7 @@
 //! The captured graphs one runner holds, by bucket and generation.
 //!
 //! A runner serves every batch from a graph captured for a bucket. During a
-//! program-layer update it holds the graphs of two generations at once: the ones it is serving
+//! generation update it holds the graphs of two generations at once: the ones it is serving
 //! from and the ones precopy is preparing for the next generation (7.3). Both are keyed by
 //! `(bucket, generation)`, which is what lets purge find the graphs that still reference the old
 //! generation's kernels.
@@ -143,7 +143,7 @@ impl Graphs {
     /// The smallest captured bucket that holds `shape` and belongs to `generation`, or, when that
     /// generation prepared none, to the newest generation older than it that did.
     ///
-    /// The fallback is the program-layer update's own rule rather than a convenience: a bucket is
+    /// The fallback is the generation update's own rule rather than a convenience: a bucket is
     /// prepared for a new generation only when an operator it launches changed, so a bucket that
     /// launches none of them has no graph of the new generation and, by construction, runs exactly
     /// the programs it ran in the last generation that named it - the same `Arc<Kernel>`s, whose
@@ -171,7 +171,7 @@ impl Graphs {
 
     /// The buckets of `generation` whose graph launches `operator`, in bucket order.
     ///
-    /// A program-layer update rebinds or recaptures exactly these buckets for a changed operator
+    /// A generation update rebinds or recaptures exactly these buckets for a changed operator
     /// (4.5, 7.3); a bucket whose graph never launches the operator keeps its executable.
     pub fn using(&self, operator: &'static str, generation: u64) -> Vec<Bucket> {
         let mut buckets: Vec<Bucket> = self

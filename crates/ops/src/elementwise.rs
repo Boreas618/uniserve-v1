@@ -263,7 +263,7 @@ fn pack_scalar(arguments: &mut Arguments, dtype: DType, scalar: f64) {
 }
 
 impl Op for ElementwiseUnary {
-    const NAME: &'static str = proto::program::operator::ELEMENTWISE_UNARY;
+    const NAME: &'static str = proto::module::operator::ELEMENTWISE_UNARY;
 
     type Descriptor = UnaryDescriptor;
     type Args<'a> = UnaryArgs;
@@ -275,7 +275,8 @@ impl Op for ElementwiseUnary {
                 Self::NAME,
                 format!(
                     "{} is not closed over the integers and the descriptor's dtype is {}",
-                    descriptor.function, abi::name(descriptor.dtype)
+                    descriptor.function,
+                    abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -477,7 +478,7 @@ pub struct BinaryArgs {
 pub struct ElementwiseBinary;
 
 impl Op for ElementwiseBinary {
-    const NAME: &'static str = proto::program::operator::ELEMENTWISE_BINARY;
+    const NAME: &'static str = proto::module::operator::ELEMENTWISE_BINARY;
 
     type Descriptor = BinaryDescriptor;
     type Args<'a> = BinaryArgs;
@@ -607,7 +608,7 @@ pub struct WhereArgs {
 pub struct ElementwiseWhere;
 
 impl Op for ElementwiseWhere {
-    const NAME: &'static str = proto::program::operator::ELEMENTWISE_WHERE;
+    const NAME: &'static str = proto::module::operator::ELEMENTWISE_WHERE;
 
     type Descriptor = WhereDescriptor;
     type Args<'a> = WhereArgs;

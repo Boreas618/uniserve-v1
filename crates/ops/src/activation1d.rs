@@ -46,7 +46,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -165,7 +165,7 @@ pub struct Args {
 pub struct Activation1d;
 
 impl Op for Activation1d {
-    const NAME: &'static str = proto::program::operator::AUDIO_ACTIVATION;
+    const NAME: &'static str = proto::module::operator::AUDIO_ACTIVATION;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -212,7 +212,11 @@ impl Op for Activation1d {
             if view.dtype != descriptor.dtype {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected {} {name}, found {}", abi::name(descriptor.dtype), abi::name(view.dtype)),
+                    format!(
+                        "expected {} {name}, found {}",
+                        abi::name(descriptor.dtype),
+                        abi::name(view.dtype)
+                    ),
                 ));
             }
         }

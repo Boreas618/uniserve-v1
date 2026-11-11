@@ -1,4 +1,4 @@
-# The rows operator's Triton backend: design 5.2's program package.
+# The rows operator's Triton backend: design 5.2's package.
 #
 # Place or accumulate the rows a model picks out by index. `replace` copies a source row into the
 # destination row its index names; `add` accumulates it with one rounding into the destination's
@@ -11,6 +11,7 @@
 
 op = "rows"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

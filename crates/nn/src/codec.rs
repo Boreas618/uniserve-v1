@@ -17,7 +17,7 @@
 //! samples becomes `L / hop` frames, `hop` the product of the strides: the caller right-pads a
 //! track to a whole number of hops, as the reference does before it convolves.
 
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;

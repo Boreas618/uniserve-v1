@@ -39,7 +39,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{DevicePtr, Shape, Operand};
+use crate::tensor::{DevicePtr, Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -614,7 +614,7 @@ fn check(status: i32, entry: &str, error: &[u8; 512]) -> Result<()> {
 pub struct ExpertExchange;
 
 impl Op for ExpertExchange {
-    const NAME: &'static str = proto::program::operator::EXPERT_EXCHANGE;
+    const NAME: &'static str = proto::module::operator::EXPERT_EXCHANGE;
 
     type Descriptor = Descriptor;
     type Args<'a> = ExchangeArgs;
@@ -647,7 +647,10 @@ impl Op for ExpertExchange {
             if live.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected an i32 live count, found {}", abi::name(live.dtype)),
+                    format!(
+                        "expected an i32 live count, found {}",
+                        abi::name(live.dtype)
+                    ),
                 ));
             }
         }

@@ -7,10 +7,10 @@ SM90a tile is fixed at 128 rows in both directions, which is the only block it s
 
 The kernel is CuTe and CUTLASS source, so nvcc needs their headers. They come from
 `CUTLASS_PATH` when it is set, else from the CUTLASS that ships with the FlashInfer of the
-interpreter running the build, which is the Program Server's own; the header directory that was
+interpreter running the build, which is the Build Server's own; the header directory that was
 used is printed with the build's result, so a revision says what it was compiled against.
 
-The Program Server runs this script with its own Python environment, its working directory the
+The Build Server runs this script with its own Python environment, its working directory the
 package root, and `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and
 `UNISERVE_OUT` in the environment; `--package`, `--descriptor`, `--target` and `--out` name
 the same values on the command line.
@@ -80,7 +80,7 @@ def main():
     """Compile the kernel for one descriptor into ``module.so``."""
     package, descriptor, target, out = arguments()
     out.mkdir(parents=True, exist_ok=True)
-    # The nvcc the Program Server checked against this package's declared version.
+    # The nvcc the Build Server checked against this package's declared version.
     compiler = os.environ["UNISERVE_NVCC"]
     cutlass = cutlass_include()
 

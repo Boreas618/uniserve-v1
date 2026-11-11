@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `vsa_prepare_tiles` on a device and check it against the tree's own reference.
 
-    crates/program-server/python/.venv/bin/python prepare_check.py [--package DIR] [--device cuda]
+    crates/build-server/python/.venv/bin/python prepare_check.py [--package DIR] [--device cuda]
 
 **This check needs a GPU, and the reason is in the kernel rather than in this script.** The
 stepwise normalize-and-rotate recipe stores bits, so the package spells its arithmetic as PTX:

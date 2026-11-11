@@ -1,6 +1,9 @@
-# The workspace's root package is the `uniserve` executable: every UniServe
-# process is one of its commands, each a module under `src/`. The libraries
-# are the members under `crates/`, a crate per process boundary or interface.
+# The workspace's root package is the `uniserve` executable, the fixed base of
+# a deployment: the daemon, the Storage Server and the Build Server are its
+# commands, each a module under `src/`. The engine is the executable of its own
+# package (`crates/engine`, `uniserve-engine`), which the Build Server builds.
+# The libraries are the members under `crates/`, a crate per process boundary
+# or interface.
 [workspace]
 resolver = "3"
 members = [
@@ -20,7 +23,7 @@ members = [
     "crates/nn",
     "crates/ops",
     "crates/processing",
-    "crates/program-server",
+    "crates/build-server",
     "crates/proto",
     "crates/scheduling",
     "crates/scheduling/guest",
@@ -44,17 +47,13 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 daemon.workspace = true
-engine.workspace = true
 libc.workspace = true
 mimalloc.workspace = true
-minimax-h3.workspace = true
-nn.workspace = true
 # The request-processing side of the families, which the daemon serves.
 processing.workspace = true
-# The host's devices, whose architectures a Program Server this executable runs builds for.
+# The host's devices, whose architectures a Build Server this executable runs builds for.
 platform.workspace = true
-program-server.workspace = true
-qwen3.workspace = true
+build-server.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 service.workspace = true
@@ -99,7 +98,7 @@ qwen3 = { path = "crates/models/qwen3" }
 minimax-h3 = { path = "crates/models/minimax-h3" }
 nixl = { path = "crates/nixl" }
 processing = { path = "crates/processing" }
-program-server = { path = "crates/program-server" }
+build-server = { path = "crates/build-server" }
 proto = { path = "crates/proto" }
 scheduling = { path = "crates/scheduling" }
 testkit = { path = "crates/testkit" }

@@ -8,7 +8,7 @@ count.
 
 import nvfp4_quantize as kernels
 import triton
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The element types the operator encodes, as Triton spells them.
 DTYPES = {"bf16": "*bf16", "f16": "*fp16"}

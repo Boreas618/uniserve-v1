@@ -4,7 +4,7 @@
 //! `crate::process` is the main process itself: the control thread, the device workers, the
 //! schedulers and the hot update. Everything it needs *before* it can start a thread comes from an
 //! epoch's configuration - which devices, which buckets are captured, how much of each device the
-//! graphs may map, which blocking pools exist, which Program Server socket and targets this rank
+//! graphs may map, which blocking pools exist, which Build Server socket and targets this rank
 //! speaks to - and none of that belongs in `proto::config::EngineConfig`: the config fixes the epoch
 //! and must not learn how the worker assembles its devices, its buckets or its graphs. It also
 //! does not hold every input, because half of what the main process needs is a property of the node
@@ -33,9 +33,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use uniserve_tensor::DType;
+use build_server::Target;
 use platform::DeviceId;
-use program_server::Target;
+use uniserve_tensor::DType;
 use worker::blocking::{BlockingKind, LaneLimits, Limits};
 use worker::device::GraphStorage;
 use worker::memory::Memory;
@@ -217,7 +217,7 @@ pub(crate) struct RankGroups {
 impl ModelRunner {
     /// The epoch `build` builds, with this node's arguments resolved against it.
     ///
-    /// The devices and the Program Server socket are the node's, not the epoch's: the daemon
+    /// The devices and the Build Server socket are the node's, not the epoch's: the daemon
     /// starts every rank of a node with the ordinals that rank serves, and a main process that
     /// guessed its devices from the epoch's parallelism would capture graphs on another rank's
     /// device.
@@ -617,7 +617,7 @@ impl ModelRunner {
     ///
     /// The build config sizes no pool - a blocking lane's width follows the work it carries, not
     /// the epoch - so the bounds are derived from what the node has: the checkpoint's own reader
-    /// count for the lane that maps weights and installs programs, and the host's parallelism for
+    /// count for the lane that maps weights and installs packages, and the host's parallelism for
     /// the lane that handles media. A lane whose bound is
     /// narrower than the work in flight queues it; it never drops it.
     pub(crate) fn blocking_limits(&self) -> Limits {
@@ -645,9 +645,9 @@ impl ModelRunner {
         Limits::new(lanes)
     }
 
-    /// The Program Server's socket, which the rank's program client connects to.
-    pub(crate) fn program_server(&self) -> &Path {
-        Path::new(&self.launch.program_server)
+    /// The Build Server's socket, which the rank's package client connects to.
+    pub(crate) fn build_server(&self) -> &Path {
+        Path::new(&self.launch.build_server)
     }
 
     /// This rank's ordinal inside its group.
@@ -737,7 +737,7 @@ impl ModelRunner {
         Ok((args, limits))
     }
 
-    /// The Program Server's targets this rank resolves a module for.
+    /// The Build Server's targets this rank resolves a module for.
     pub(crate) fn targets(&self) -> &[Target] {
         &self.targets
     }

@@ -34,7 +34,7 @@ from tests.python.e2e.http_helpers import (
     host_asset,
     require_uniserve_binary,
     server_process,
-    worker_executable,
+    engine_selection,
 )
 
 pytestmark = [
@@ -135,8 +135,7 @@ def test_requests_are_served_by_the_replicas_the_policy_routes_them_to(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--data-parallel-size",
         "2",
         "--set",

@@ -7,7 +7,7 @@ the whole row.
 """
 
 import inverse_cdf as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: Candidate id dtypes.
 IDS = {"i32": "i32", "i64": "i64"}

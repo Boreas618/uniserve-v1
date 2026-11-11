@@ -37,7 +37,7 @@
 //! and so possibly the kernel a product selects, which is not provably the served arithmetic.
 
 use ops::tile_stitch::{self, TileStitch};
-use ops::{Shape, Strides, Operand};
+use ops::{Operand, Shape, Strides};
 use uniserve_tensor::DType;
 
 use crate::capability::Splice;
@@ -432,12 +432,7 @@ impl Blend {
     ///
     /// Views the blend's operators refuse, frame operands of another channel count or extent, or
     /// an arena that cannot hold the answer.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        previous: Operand,
-        current: Operand,
-    ) -> Result<Operand> {
+    pub fn forward(&self, f: &Forward, previous: Operand, current: Operand) -> Result<Operand> {
         let out = f.empty(self.dtype, previous.shape)?;
         self.launch(f, previous, current, out)?;
         Ok(out)
@@ -445,13 +440,7 @@ impl Blend {
 
     /// The blend of `previous` and `current` into `out`, which along rows or columns may be any
     /// view of their shape (a tile's region of a raster, or `current` itself).
-    fn launch(
-        &self,
-        f: &Forward,
-        previous: Operand,
-        current: Operand,
-        out: Operand,
-    ) -> Result<()> {
+    fn launch(&self, f: &Forward, previous: Operand, current: Operand, out: Operand) -> Result<()> {
         match self.axis {
             Axis::Rows | Axis::Columns => {
                 let descriptor = ops::cross_fade::Descriptor {
@@ -480,13 +469,7 @@ impl Blend {
     /// The stepwise frame rule: per channel and frame `i`, `out = previous · (1 - w) + current · w`
     /// with `w = i / extent`, each of the ramp, its complement, both products and the sum rounded
     /// to the element type, as three `axpby` launches.
-    fn frames(
-        &self,
-        f: &Forward,
-        previous: Operand,
-        current: Operand,
-        out: Operand,
-    ) -> Result<()> {
+    fn frames(&self, f: &Forward, previous: Operand, current: Operand, out: Operand) -> Result<()> {
         const OWNER: &str = "Blend";
         let extent = u64::from(self.extent);
         let channels = out.shape.dim(0);

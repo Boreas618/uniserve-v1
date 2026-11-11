@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use uniserve_tensor::DType;
 use platform::DeviceId;
+use uniserve_tensor::DType;
 use worker::capacity::{graph_scratch_bytes, graph_storage_bytes, quota};
 use worker::device::GraphStorage;
 use worker::memory::Memory;
@@ -14,7 +14,7 @@ use super::video::prompt_capacity;
 use super::{Loaded, ModelRunner};
 
 /// Tokens one page of a causal language model's paged cache holds: the largest page the attention
-/// programs read. The model reads it from the cache it is handed (`nn::KvGroup::page_size`).
+/// packages read. The model reads it from the cache it is handed (`nn::KvGroup::page_size`).
 pub(crate) const PAGE_TOKENS: u32 = 64;
 
 impl ModelRunner {

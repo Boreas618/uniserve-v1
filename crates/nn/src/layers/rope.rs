@@ -674,7 +674,11 @@ impl Rotary {
     }
 
     /// The factor table's descriptor, for positions of `positions` and a table of `factors`.
-    fn factors_descriptor(&self, positions: uniserve_tensor::DType, factors: uniserve_tensor::DType) -> FactorsDescriptor {
+    fn factors_descriptor(
+        &self,
+        positions: uniserve_tensor::DType,
+        factors: uniserve_tensor::DType,
+    ) -> FactorsDescriptor {
         let axes = self.spectrum.axes();
         FactorsDescriptor {
             dtype: factors,

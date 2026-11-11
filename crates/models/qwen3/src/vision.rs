@@ -39,7 +39,7 @@ use nn::layers::{
     Residual, Rotary, RotarySpec, Spectrum, Varlen,
 };
 use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Forward, Shape, Operand, Weight};
+use nn::{DType, Forward, Operand, Shape, Weight};
 use ops::position::{Args as InterpolateArgs, Descriptor as InterpolateDescriptor};
 use processing::qwen_vl::ProcessorConfig;
 

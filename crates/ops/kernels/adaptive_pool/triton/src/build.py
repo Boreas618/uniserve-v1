@@ -12,7 +12,7 @@ serves every frame count.
 """
 
 import adaptive_pool as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: Triton's element type for each element type the operator accepts, as the
 #: signature spells a pointer to it.

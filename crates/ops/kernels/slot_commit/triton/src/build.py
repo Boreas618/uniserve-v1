@@ -8,7 +8,7 @@ one module serves every step of that shape.
 
 import slot_commit as kernels
 import triton.language as tl
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The element types a descriptor may name, as Triton spells them.
 DTYPES = {

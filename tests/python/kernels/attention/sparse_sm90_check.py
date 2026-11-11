@@ -12,7 +12,7 @@ module's output with the operator's own definition computed in torch.
 The block size must be the one the module was compiled for: this backend's kernel tile is
 128 rows in both directions. The normalizer is not requested, because this backend's kernel
 writes none. Run it on the GB200 with the
-Program Server's own environment (``crates/program-server/python/.venv/bin/python``),
+Build Server's own environment (``crates/build-server/python/.venv/bin/python``),
 which has torch.
 """
 

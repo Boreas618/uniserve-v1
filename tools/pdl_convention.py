@@ -29,10 +29,10 @@ REPOSITORY = pathlib.Path(__file__).resolve().parents[1]
 OPS = REPOSITORY / 'crates/ops/src'
 KERNELS = REPOSITORY / 'crates/ops/kernels'
 
-# A package's `build.py` imports its compile driver from the Program Server's Python package, so
+# A package's `build.py` imports its compile driver from the Build Server's Python package, so
 # the package's source is importable from this tree whichever interpreter runs the tool.
-sys.path.insert(0, str(REPOSITORY / 'crates/program-server/python/src'))
-from uniserve_program_server import package as program_package  # noqa: E402
+sys.path.insert(0, str(REPOSITORY / 'crates/build-server/python/src'))
+from uniserve_build_server import package as driver_package  # noqa: E402
 
 
 def packs_pdl(operator):
@@ -84,11 +84,10 @@ def declares_pdl(operator, key):
             placed = False
             for dimensions in tables:
                 try:
-                    fields = program_package.read_key(key, dimensions)
-                # A package's key reader ends a key it cannot place with `SystemExit`, which is
-                # not an `Exception`: without the wider catch the checker stops at the first
-                # table that does not fit and never reaches the one that does.
-                except BaseException:
+                    fields = driver_package.read_fields(source.parent, key)
+                # The Build Server's reader places the key against the package's shapes; a key
+                # none of them reads is not this package's.
+                except ValueError:
                     continue
                 placed = True
                 described = module.spec(fields, manifest.get('parameters', {}), 'sm_100a')

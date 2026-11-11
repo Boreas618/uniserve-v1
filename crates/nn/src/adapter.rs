@@ -352,7 +352,8 @@ impl Adapter {
                 if !matches!(part.dtype, DType::BF16 | DType::F16 | DType::F32) {
                     return Err(refuse(format!(
                         "`{}` is {}, not a floating-point delta",
-                        part.tensor, ops::abi::name(part.dtype)
+                        part.tensor,
+                        ops::abi::name(part.dtype)
                     )));
                 }
             }
@@ -543,7 +544,10 @@ pub(crate) fn fused(
         if from % element != 0 || to % element != 0 || to < from {
             return Err(Error::weight(
                 &base.tensor,
-                format!("bytes {from}..{to} are not whole {dtype} elements", dtype = ops::abi::name(dtype)),
+                format!(
+                    "bytes {from}..{to} are not whole {dtype} elements",
+                    dtype = ops::abi::name(dtype)
+                ),
             ));
         }
         let mut at = (from / element) as u64;

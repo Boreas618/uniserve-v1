@@ -31,7 +31,7 @@ pub struct PolicyModule {
 }
 
 impl PolicyModule {
-    /// Loads the bytes the Program Server serves for a policy program: the
+    /// Loads the bytes the Build Server serves for a policy package: the
     /// precompiled artifact when the bytes are one (§5.3, "按本机 CPU 预编译"),
     /// the wasm32 binary otherwise.
     pub fn load(engine: &Engine, bytes: &[u8]) -> Result<Self, PolicyError> {
@@ -62,14 +62,14 @@ impl PolicyModule {
     /// Loads an artifact [`Engine::precompile`] produced.
     ///
     /// `Module::deserialize` is unsafe because wasmtime trusts the artifact's
-    /// code and its metadata; these bytes come from the Program Server's module
-    /// store, whose paths are named by the program's backend, revision and
+    /// code and its metadata; these bytes come from the Build Server's module
+    /// store, whose paths are named by the package's backend, revision and
     /// target (§5.3) and whose content an `install` put there (§6.3), so this
     /// code trusts the store exactly as the mechanism trusts the kernels it
     /// loads from it.
     pub fn from_precompiled(engine: &Engine, bytes: &[u8]) -> Result<Self, PolicyError> {
         // Safety: the artifact was precompiled by an engine configured as this
-        // one, and it comes from the Program Server's store (§5.3); an artifact
+        // one, and it comes from the Build Server's store (§5.3); an artifact
         // of another engine or another format is rejected by `deserialize`.
         let module = unsafe { Module::deserialize(engine.inner(), bytes) }.map_err(|error| {
             PolicyError::Load {
@@ -84,7 +84,7 @@ impl PolicyModule {
 
     /// Makes one instance of this module from `init`, and reads its limits.
     ///
-    /// `init` carries the program's arguments and the whole state at this
+    /// `init` carries the package's arguments and the whole state at this
     /// moment, so a policy installed in place of another knows every request,
     /// cache page, encoding and replica that already exists (§4.4); its own
     /// soft state starts empty. `ceilings` are the build config's, which the

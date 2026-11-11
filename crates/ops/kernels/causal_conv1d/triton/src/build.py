@@ -3,14 +3,14 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel
 function, its argument signature in the order the operator launches them, the
 compile-time values the descriptor gives, and the compilation options. The
-Program Server's Triton source drives ``uniserve_program_server.triton`` with it.
+Build Server's Triton source drives ``uniserve_build_server.triton`` with it.
 
 The channel count, the tap count and the channel block are the key's; the token
 tile one program walks at a time is this package's.
 """
 
 import causal_conv1d as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The floating dtypes of the inputs, the taps, the output and the state banks, as Triton spells
 #: them in an argument signature.

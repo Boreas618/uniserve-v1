@@ -1,4 +1,4 @@
-# The cache_copy_region operator's Triton backend: design 5.2's program package.
+# The cache_copy_region operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one architecture of
 # `[kernel.architectures]`, built by `src/build.py`.
@@ -22,6 +22,7 @@
 
 op = "cache_copy_region"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

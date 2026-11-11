@@ -1,6 +1,6 @@
-//! The vocabulary of a program-layer update.
+//! The vocabulary of a generation update.
 //!
-//! A program-layer update moves through precopy, switchover, probation and
+//! A generation update moves through precopy, switchover, probation and
 //! commit or revert, and ends with a purge. The daemon drives it and every main
 //! process of the epoch takes part, so the names below travel: the daemon and
 //! the main processes of one epoch are one build and exchange them over the ipc
@@ -8,9 +8,9 @@
 //! its append-only Protobuf (`crates/proto`) so that a later build of the daemon
 //! keeps serving the main processes of this one.
 //!
-//! Only the vocabulary lives here. The commands that carry programs are in
-//! [`crate::program`], because a `Precopy` names the [`Program`] set to install,
-//! and a program is defined by the Program Server (§5.1).
+//! Only the vocabulary lives here. The commands that carry packages are in
+//! [`crate::generation`], because a `Precopy` names the [`PackageRevision`] set to install,
+//! and a package is defined by the Build Server (§5.1).
 
 use crate::{RequestKey, Stall};
 
@@ -94,7 +94,7 @@ impl UpdateFailure {
     }
 }
 
-/// What a main process reports of a program-layer update to the daemon and to
+/// What a main process reports of a generation update to the daemon and to
 /// the scheduler of its epoch (§7.3).
 ///
 /// Every status names the generation it is about. A `Failed` and a
@@ -102,7 +102,7 @@ impl UpdateFailure {
 /// command that caused them.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProgramStatus {
+pub enum GenerationStatus {
     /// Precopy finished: the new generation is loaded, rebound or recaptured,
     /// and its shadow batches are within tolerance. Serving is unchanged.
     Precopied {

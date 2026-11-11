@@ -9,7 +9,7 @@ the descriptor's configurations can select published beside the module in
 
 Steps:
 1. stage the pinned `trtllm-gen-fmha` artifact's generated
-   `flashInferMetaInfo.h` (`uniserve_program_server.trtllm.stage`, which
+   `flashInferMetaInfo.h` (`uniserve_build_server.trtllm.stage`, which
    verifies every file against the pin);
 2. read the artifact's kernel table and keep the entries the descriptor can
    select — the element types, `head_dim`, `page`, the mask and the phase, on
@@ -40,7 +40,7 @@ import subprocess
 import sys
 import tempfile
 
-from uniserve_program_server import package, trtllm
+from uniserve_build_server import package, trtllm
 
 #: The operator's element types, as the artifact names them in a kernel.
 NAMES = {"bf16": "Bfloat16", "f16": "Fp16", "f8e4m3": "E4m3", "f4e2m1": "E2m1"}
@@ -153,7 +153,7 @@ def publish_cubins(names, artifact, out):
 def main():
     """Compile one descriptor into ``module.so`` with its cubins."""
     root, descriptor, target, out = package.arguments()
-    fields = package.fields(root, descriptor)
+    fields = package.fields()
     data = trtllm.distribution(FMHA_RUNNER)
     out.mkdir(parents=True, exist_ok=True)
     # The artifact is the build's input, not the module: it is staged where the

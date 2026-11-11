@@ -3,7 +3,7 @@
 ``spec`` states what this package's kernel needs for one descriptor: the kernel
 function, its argument signature in the order the operator launches them, the
 compile-time values the descriptor dimensions give, and the compilation options.
-The Program Server's Triton source drives ``uniserve_program_server.triton`` with it.
+The Build Server's Triton source drives ``uniserve_build_server.triton`` with it.
 
 Two things are compiled in. ``BLOCK``, the samples one program converts, so the
 grid a launch computes and the module agree. And ``PDL``: a module compiled for
@@ -16,7 +16,7 @@ The output is always i16 and is never in the key.
 """
 
 import pcm_interleave as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 
 def warps_of(block):

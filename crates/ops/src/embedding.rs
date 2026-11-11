@@ -13,7 +13,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -65,7 +65,7 @@ pub struct Args {
 pub struct Embedding;
 
 impl Op for Embedding {
-    const NAME: &'static str = proto::program::operator::EMBEDDING;
+    const NAME: &'static str = proto::module::operator::EMBEDDING;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -74,7 +74,11 @@ impl Op for Embedding {
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected {} ids, found {}", abi::name(descriptor.ids), abi::name(args.ids.dtype)),
+                format!(
+                    "expected {} ids, found {}",
+                    abi::name(descriptor.ids),
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         args.ids.require_rank(Self::NAME, 1)?;

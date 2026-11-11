@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Check `page_conversion`'s kernel: its scale rows on Triton's interpreter, its decode on a device.
 
-    crates/program-server/python/.venv/bin/python page_conversion_check.py            # interpreter
-    crates/program-server/python/.venv/bin/python page_conversion_check.py --device   # a device
+    crates/build-server/python/.venv/bin/python page_conversion_check.py            # interpreter
+    crates/build-server/python/.venv/bin/python page_conversion_check.py --device   # a device
 
 The script has two halves because the two things it checks lie in different places.
 

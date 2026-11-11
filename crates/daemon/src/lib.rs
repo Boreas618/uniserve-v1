@@ -23,20 +23,20 @@
 //! - `metrics`: the Prometheus registry the daemon exports;
 //! - `restart`: the hot restart that hands a deployment to a successor
 //!   daemon;
-//! - `programs`: the launches of a deployment's main processes for a start
-//!   that records the programs they launch (`uniserve programs`).
+//! - `modules`: the launches of a deployment's main processes for a start
+//!   that records the modules they launch (`uniserve modules`).
 
 pub mod engine;
 pub mod epoch;
 pub mod experts;
 pub mod http;
 mod interference;
+pub mod keys;
 mod leader;
 pub mod metrics;
 pub mod migration;
 pub mod options;
 pub mod profiling;
-pub mod programs;
 pub mod restart;
 pub mod standby;
 pub mod supervision;

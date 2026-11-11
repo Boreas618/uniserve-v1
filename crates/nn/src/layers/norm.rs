@@ -31,7 +31,7 @@ use ops::frame::{self, FrameMoments, FrameNormPad};
 use ops::modulation::{self, ModulatedRmsNorm};
 use ops::norm::{self, AddRmsNorm, LayerNorm as LayerNormOp, RmsNorm as RmsNormOp};
 use ops::residual::{self, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm};
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
@@ -343,7 +343,8 @@ impl RmsNorm {
                 OWNER,
                 format!(
                     "this form writes its input's {} and the normalization was built for {}",
-                    ops::abi::name(x.dtype), ops::abi::name(self.output)
+                    ops::abi::name(x.dtype),
+                    ops::abi::name(self.output)
                 ),
             ));
         }

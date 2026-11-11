@@ -1,4 +1,4 @@
-//! The program-layer update after its precopy: the switchover at a batch boundary and the warmup
+//! The generation update after its precopy: the switchover at a batch boundary and the warmup
 //! it queues, probation, the commit, the revert to the generation that served before, and the
 //! purge of a generation after its last batch.
 
@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use ipc::execution::Outcome;
-use ipc::{ProgramStatus, UpdateFailure};
+use ipc::{GenerationStatus, UpdateFailure};
 
 use super::MainProcess;
 use super::device_command;
@@ -19,13 +19,13 @@ use super::device_command;
 /// nothing to warm has nothing to wait for.
 #[derive(Debug)]
 enum SwitchoverAnswer {
-    Now(ProgramStatus),
+    Now(GenerationStatus),
     AfterTheWarmup,
 }
 
 fn switchover_answer(warming: usize, generation: u64) -> SwitchoverAnswer {
     if warming == 0 {
-        SwitchoverAnswer::Now(ProgramStatus::Switched { generation })
+        SwitchoverAnswer::Now(GenerationStatus::Switched { generation })
     } else {
         SwitchoverAnswer::AfterTheWarmup
     }
@@ -37,14 +37,17 @@ fn switchover_answer(warming: usize, generation: u64) -> SwitchoverAnswer {
 /// one message behind the revert that its own rollback threshold caused, so its commit arrives after
 /// the update ended. The state that holds is the one before the update - it serves, nothing was
 /// committed - and that is the answer. A protocol message never ends a process that can still serve.
-fn answer_commit(update: &mut crate::process::update::HotUpdate, generation: u64) -> ProgramStatus {
-    // An epoch switch commits its target, whose programs were committed when the daemon handed them
+fn answer_commit(
+    update: &mut crate::process::update::HotUpdate,
+    generation: u64,
+) -> GenerationStatus {
+    // An epoch switch commits its target, whose packages were committed when the daemon handed them
     // over: the generation it names already serves with nothing on trial, so the answer is that.
     if update.current() == generation && matches!(update.phase(), super::update::Phase::Serving) {
-        return ProgramStatus::Committed { generation };
+        return GenerationStatus::Committed { generation };
     }
     match update.commit(generation) {
-        Ok(()) => ProgramStatus::Committed { generation },
+        Ok(()) => GenerationStatus::Committed { generation },
         Err(error) => {
             tracing::warn!(
                 generation,
@@ -52,7 +55,7 @@ fn answer_commit(update: &mut crate::process::update::HotUpdate, generation: u64
                 %error,
                 "a commit names a generation that is not on probation"
             );
-            ProgramStatus::Reverted {
+            GenerationStatus::Reverted {
                 generation,
                 reason: format!(
                     "the commit names a generation that is not in flight ({error}): generation {} \
@@ -146,7 +149,7 @@ impl MainProcess {
                 generation,
                 "answering the switchover now that admission is open"
             );
-            self.answer(ProgramStatus::Switched { generation });
+            self.answer(GenerationStatus::Switched { generation });
         }
         Ok(None)
     }
@@ -191,7 +194,7 @@ impl MainProcess {
             .first()
             .map_or(0, |(_, _, generation)| *generation);
         // The daemon reads progress, not an answer: the peer that asked is told `Switched` alone.
-        self.answer(ProgramStatus::Warming { generation, step });
+        self.answer(GenerationStatus::Warming { generation, step });
     }
 
     /// The switchover: cut over at the batch boundary whose step the scheduler put
@@ -200,7 +203,7 @@ impl MainProcess {
         &mut self,
         generation: u64,
         step: Option<u64>,
-    ) -> Result<Option<ProgramStatus>> {
+    ) -> Result<Option<GenerationStatus>> {
         // A switchover to a generation this process never prepared cannot succeed, and cutting the
         // devices over to try it costs a live graph rebuild to end where it started: it is refused
         // before any device is touched, and the generation that serves keeps serving.
@@ -232,7 +235,7 @@ impl MainProcess {
             })
         };
         if let Some(reason) = refused {
-            return Ok(Some(ProgramStatus::PrecopyFailed {
+            return Ok(Some(GenerationStatus::PrecopyFailed {
                 generation,
                 failure: UpdateFailure::Precopy { reason },
             }));
@@ -279,16 +282,16 @@ impl MainProcess {
             &mut self.update.generations,
             std::mem::take(&mut self.update.prepared),
         );
-        // The programs move with the generations, as one record: the next precopy's changed set is
-        // measured against what serves, and a revert serves the programs the retired pair holds.
-        self.update.retired_programs = std::mem::replace(
-            &mut self.update.serving_programs,
-            std::mem::take(&mut self.update.prepared_programs),
+        // The packages move with the generations, as one record: the next precopy's changed set is
+        // measured against what serves, and a revert serves the packages the retired pair holds.
+        self.update.retired_packages = std::mem::replace(
+            &mut self.update.serving_packages,
+            std::mem::take(&mut self.update.prepared_packages),
         );
 
         // The first request served on a generation must not pay for a capture, so every
         // captured bucket of the generation that just took over runs once, here, between batches.
-        // A switchover later in the epoch warms the buckets the new kernel programs changed; the
+        // A switchover later in the epoch warms the buckets the new kernel packages changed; the
         // first one also warms the buckets no update touched, because until now nothing served
         // them.
         // The warmups are queued, not waited for: each is a device job that runs one bucket per
@@ -308,12 +311,12 @@ impl MainProcess {
                         batch: None,
                     };
                     if let Some(ending) = self.failure(failure)? {
-                        return Ok(Some(ProgramStatus::Failed {
+                        return Ok(Some(GenerationStatus::Failed {
                             generation,
                             failure: ending,
                         }));
                     }
-                    return Ok(Some(ProgramStatus::Switched { generation }));
+                    return Ok(Some(GenerationStatus::Switched { generation }));
                 }
             }
         }
@@ -360,15 +363,15 @@ impl MainProcess {
 
     /// The commit: probation ended in a commit; the previous generation is kept
     /// until its purge.
-    pub(super) fn commit(&mut self, generation: u64) -> Result<ProgramStatus> {
+    pub(super) fn commit(&mut self, generation: u64) -> Result<GenerationStatus> {
         let status = answer_commit(&mut self.update, generation);
-        if matches!(status, ProgramStatus::Committed { .. }) {
+        if matches!(status, GenerationStatus::Committed { .. }) {
             // Probation ended in a commit, so the generation before the update can never serve
             // again. Its graphs and kernels live until the purge, which is the worker's book to
-            // keep - and the programs it was built from go with the record of it, since no revert
+            // keep - and the packages it was built from go with the record of it, since no revert
             // can serve it.
             self.update.retired.clear();
-            self.update.retired_programs.clear();
+            self.update.retired_packages.clear();
             self.commit_policy(generation);
             // A standby commits the generation it captured while it parks: its graphs exist now,
             // and their storage is kept as the daemon decided for the failure domain.
@@ -434,7 +437,7 @@ impl MainProcess {
         &mut self,
         generation: u64,
         failure: UpdateFailure,
-    ) -> Result<ProgramStatus> {
+    ) -> Result<GenerationStatus> {
         // The answers of a switchover this revert undoes no longer decide anything.
         self.policy_answers.clear();
         // The phase before the call decides what a device does with the update's generation: a
@@ -443,8 +446,8 @@ impl MainProcess {
         // machine answers `Serving` either way once the call returns, so the phase is read first.
         let phase = self.update.phase();
         if let Err(error) = self.update.revert(generation, failure.clone()) {
-            tracing::error!(%error, "reverting a program-layer update failed");
-            return Ok(ProgramStatus::Failed {
+            tracing::error!(%error, "reverting a generation update failed");
+            return Ok(GenerationStatus::Failed {
                 generation,
                 failure,
             });
@@ -459,10 +462,10 @@ impl MainProcess {
         let kept = !self.update.retired.is_empty();
         if kept {
             self.update.generations = std::mem::take(&mut self.update.retired);
-            self.update.serving_programs = std::mem::take(&mut self.update.retired_programs);
+            self.update.serving_packages = std::mem::take(&mut self.update.retired_packages);
         }
         self.update.prepared.clear();
-        self.update.prepared_programs.clear();
+        self.update.prepared_packages.clear();
         // The warmups still queued warm the generation this revert went back from: what runs when
         // they reach the device is the generation that serves, so nothing hangs - the list is what
         // stopped describing serving, and a failure read from a stale entry would revert an update
@@ -515,7 +518,7 @@ impl MainProcess {
         // finished going back and no batch of it can be in flight.
         if matches!(phase, super::update::Phase::Probation { .. }) {
             match self.purge(generation) {
-                Ok(ProgramStatus::Purged { .. }) => {}
+                Ok(GenerationStatus::Purged { .. }) => {}
                 Ok(other) => tracing::warn!(
                     ?other,
                     "the generation the revert went back from was not released"
@@ -527,7 +530,7 @@ impl MainProcess {
                 }
             }
         }
-        Ok(ProgramStatus::Reverted {
+        Ok(GenerationStatus::Reverted {
             generation,
             reason: failure.reason(),
         })
@@ -537,12 +540,12 @@ impl MainProcess {
     /// batch completed. The worker's queue orders the purge behind every batch
     /// it already holds, and `Captured` keeps each kernel alive until the graph
     /// that uses it is rebound or destroyed.
-    pub(super) fn purge(&mut self, generation: u64) -> Result<ProgramStatus> {
+    pub(super) fn purge(&mut self, generation: u64) -> Result<GenerationStatus> {
         // A purge releases what this process holds of a generation, so a number it has already
         // released is answered rather than refused: the revert below releases a reverted generation
         // itself, and a daemon that later purges the same number asks for a release that happened.
         if self.released.contains(&generation) {
-            return Ok(ProgramStatus::Purged { generation });
+            return Ok(GenerationStatus::Purged { generation });
         }
         if let Err(error) = self.update.request_purge(generation) {
             // A purge for a generation this process holds nothing of - one it never built, or one a
@@ -551,9 +554,9 @@ impl MainProcess {
             // store-side mistake; neither is a reason to end a serving process.
             tracing::warn!(generation, %error, "a purge names a generation no update holds");
             self.released.insert(generation);
-            return Ok(ProgramStatus::Purged { generation });
+            return Ok(GenerationStatus::Purged { generation });
         }
-        // A purge has no policy half: the scheduling policy is one program per epoch and its
+        // A purge has no policy half: the scheduling policy is one package per epoch and its
         // modules are released with the scheduler, not with a generation's graphs.
         for worker in &self.workers {
             let device = worker.device();
@@ -566,7 +569,7 @@ impl MainProcess {
                     error: error.to_string(),
                     batch: None,
                 };
-                return Ok(ProgramStatus::Failed {
+                return Ok(GenerationStatus::Failed {
                     generation,
                     failure,
                 });
@@ -579,7 +582,7 @@ impl MainProcess {
             tracing::warn!(generation, %error, "a purged generation no update held");
         }
         self.released.insert(generation);
-        Ok(ProgramStatus::Purged { generation })
+        Ok(GenerationStatus::Purged { generation })
     }
 }
 
@@ -607,14 +610,14 @@ mod tests {
         update
     }
 
-    /// An epoch switch's commit reaches a target whose programs were committed at their handover:
+    /// An epoch switch's commit reaches a target whose packages were committed at their handover:
     /// the generation it names serves with nothing on trial, so it is answered as committed: the
     /// switch waits for that acknowledgement before the previous epoch's process ends.
     #[test]
     fn a_commit_of_the_generation_that_serves_is_committed() {
         let mut update = update_on_probation_then_reverted();
         match answer_commit(&mut update, 1) {
-            ProgramStatus::Committed { generation } => assert_eq!(generation, 1),
+            GenerationStatus::Committed { generation } => assert_eq!(generation, 1),
             other => panic!("a commit of what serves answered {other:?}"),
         }
     }
@@ -626,7 +629,7 @@ mod tests {
     fn a_commit_after_a_revert_answers_with_the_generation_that_serves() {
         let mut update = update_on_probation_then_reverted();
         match answer_commit(&mut update, 2) {
-            ProgramStatus::Reverted { generation, reason } => {
+            GenerationStatus::Reverted { generation, reason } => {
                 assert_eq!(generation, 2);
                 assert!(
                     reason.contains("not in flight"),
@@ -651,7 +654,7 @@ mod tests {
     /// commit, a second revert and a second precopy each name a generation no longer in flight, and
     /// the machine answers each without leaving the generation that serves.
     #[test]
-    fn the_program_commands_after_a_revert_all_name_what_they_cannot_apply() {
+    fn the_package_commands_after_a_revert_all_name_what_they_cannot_apply() {
         let mut update = update_on_probation_then_reverted();
         update
             .request_purge(2)

@@ -331,7 +331,7 @@ mod tests {
         assert!(failure.reason.contains("2 of the 4"), "{failure:?}");
     }
 
-    /// A program-layer update's watch hands the passed threshold over once, and
+    /// A generation update's watch hands the passed threshold over once, and
     /// a watch whose update ended reverts nothing.
     #[tokio::test]
     async fn the_watch_reverts_once_and_ends_with_its_update() {

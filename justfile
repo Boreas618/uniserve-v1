@@ -26,8 +26,16 @@ lint: fmt clippy
     {{python}} -m ruff format --check uniserve_eval tests
     {{python}} -m mypy
 
-# Fast Python tests (CPU only)
+# Fast Python tests (CPU only). The tensor primitives' checks read a descriptor key's fields with
+# the base executable (`uniserve build-server fields`), which is built here unless
+# `UNISERVE_BINARY` names one.
 test-python-fast:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "${UNISERVE_BINARY:-}" ]; then
+        {{cargo}} build -p uniserve --bin uniserve
+        export UNISERVE_BINARY=${CARGO_TARGET_DIR:-$PWD/target}/debug/uniserve
+    fi
     {{python}} -m pytest -m "unit and not gpu"
 
 # The missing-state tests (GPU) with every main process under compute-sanitizer's

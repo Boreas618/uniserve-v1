@@ -6,6 +6,7 @@
 
 op = "scheduling"
 backend = "priority"
+interface_version = 1
 
 [toolchain]
 kind = "wasm"
@@ -25,9 +26,10 @@ max_batch = 128
 max_num_batched_tokens = 8192
 prefetch_min_tokens = 256
 
-# The package's build script: it compiles the crate to wasm32 and writes the raw
-# module the Program Server precompiles (design §5.2, §6.2).
+# The package is this crate: the Build Server snapshots it with the guest crate
+# it depends on when it is installed, builds it for wasm32 from that snapshot
+# and precompiles the module for the host's CPU. The crate's files are the ones
+# cargo resolves from `Cargo.toml`, so none is listed here.
 [source]
 kind = "wasm"
-files = ["Cargo.toml", "src/lib.rs", "src/build.py"]
-script = "src/build.py"
+files = []

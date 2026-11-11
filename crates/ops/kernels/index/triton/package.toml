@@ -1,8 +1,8 @@
-# The index operator's Triton backend: design 5.2's program package.
+# The index operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # Elements read or written at the positions an index tensor names along one
 # axis. `gather` reads the source at the indexed positions; `scatter_set` and
@@ -27,6 +27,7 @@
 
 op = "index"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

@@ -6,19 +6,34 @@ license.workspace = true
 publish = false
 
 # A node's main process for one epoch: its control thread, its schedulers,
-# one executor per device and its blocking pool, and the program-layer
-# update between them. It dispatches by computational capability and names no
-# concrete model: the executable hands it the model families it serves.
+# one executor per device and its blocking pool, and the generation
+# update between them. The library dispatches by computational capability and
+# names no concrete model; the package's executable, `uniserve-engine`
+# (`src/main.rs`), registers the model families it loads.
+#
+# The crate is the engine package (`package.toml`): the Build Server builds
+# the executable from a snapshot of this crate and the crates it depends on.
+[[bin]]
+name = "uniserve-engine"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 crossbeam-channel.workspace = true
 ipc.workspace = true
+libc.workspace = true
+mimalloc.workspace = true
+# The model families the executable loads.
+minimax-h3.workspace = true
+qwen3.workspace = true
+service.workspace = true
 nn.workspace = true
 ops.workspace = true
 # The element type of a kernel operand (`DType`).
 uniserve-tensor.workspace = true
 platform.workspace = true
-program-server.workspace = true
+build-server.workspace = true
 proto.workspace = true
 scheduler.workspace = true
 serde_json.workspace = true
@@ -31,8 +46,8 @@ worker.workspace = true
 # A test states the serving a family it resolves names.
 processing.workspace = true
 tempfile.workspace = true
-# A test states the arguments a deployment pinned on a program, which are a TOML table
-# (`proto::program::Program`).
+# A test states the arguments a deployment pinned on a package, which are a TOML table
+# (`proto::module::Package`).
 toml.workspace = true
 
 [lints]

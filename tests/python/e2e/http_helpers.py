@@ -29,9 +29,9 @@ from uniserve_eval.transport.sse import iter_sse_events
 # than the host has.
 HOST_CACHE_GIB = 16
 
-#: The attention program the suite's Qwen3 deployments serve: trtllm-gen, the
-#: program these deployments' shapes take on Blackwell.
-# Explicit until the Program Server selects a program left at `auto` (W4).
+#: The attention package the suite's Qwen3 deployments serve: trtllm-gen, the
+#: package these deployments' shapes take on Blackwell.
+# Explicit until the Build Server selects a package left at `auto` (W4).
 ATTENTION_BACKEND = "trtllm"
 
 #: What ``UNISERVE_QWEN3_MODEL`` names.
@@ -138,17 +138,92 @@ def require_uniserve_binary() -> Path:
     return path
 
 
-def worker_executable() -> Path:
-    """The `uniserve` executable a test server's workers run as.
+def engine_selection() -> list[str]:
+    """The `serve` arguments that select a test server's engine package.
 
-    `UNISERVE_WORKER_EXECUTABLE` names it, such as the sanitizer's wrapper;
-    otherwise the workers run the binary the daemon runs
-    (:func:`require_uniserve_binary`), so a server never mixes two builds.
+    The tree's own engine package (`uniserve`, `crates/engine`) is the
+    default and needs no argument: every test's Build Server holds it.
+    `UNISERVE_ENGINE` names another installed engine package, such as the
+    sanitizer's wrapper (`UNISERVE_ENGINE_PACKAGE` is its directory, which
+    the test's Build Server installs).
     """
-    configured = os.environ.get("UNISERVE_WORKER_EXECUTABLE")
+    configured = os.environ.get("UNISERVE_ENGINE")
     if configured:
-        return Path(configured)
-    return require_uniserve_binary()
+        return ["--set", f"worker_config.engine={configured}"]
+    return []
+
+
+def build_server_socket() -> Path:
+    """The socket of the Build Server the module's deployments use."""
+    assert _BUILD_SERVER is not None, "the module started no Build Server"
+    return _BUILD_SERVER
+
+
+def engine_revision() -> str:
+    """An assignment that selects a new revision of the tree's engine.
+
+    The revision is installed now at the module's Build Server. It runs the
+    same code as the serving one under another revision, which is a change
+    of the epoch's engine and of nothing else.
+    """
+    revision = install_engine(build_server_socket())
+    return f"worker_config.engine_revision={revision}"
+
+
+def engine_executable(socket: Path, revision: int) -> Path:
+    """The executable of the tree's engine package at `revision`.
+
+    The Build Server builds the module when its store misses it, and names
+    the file in its store.
+    """
+    resolved = subprocess.run(
+        [
+            str(require_uniserve_binary()),
+            "build-server",
+            "resolve",
+            "--socket",
+            str(socket),
+            "engine",
+            "uniserve",
+            str(revision),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return Path(resolved.stdout.splitlines()[0])
+
+
+def install_engine(socket: Path, package: Path | None = None) -> int:
+    """Installs an engine package at a Build Server and returns its revision.
+
+    Args:
+        socket: The Build Server's socket.
+        package: The package directory; the tree's own engine package when
+            omitted. A new revision of an unchanged package runs the same
+            code, which is what a test applies
+            (`worker_config.engine_revision`) to change the epoch's engine
+            and nothing else.
+
+    Returns:
+        The revision the Build Server numbered the installation.
+    """
+    directory = package or Path.cwd() / "crates/engine"
+    installed = subprocess.run(
+        [
+            str(require_uniserve_binary()),
+            "build-server",
+            "install",
+            "--socket",
+            str(socket),
+            str(directory),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # `engine <backend> revision <n>`.
+    return int(installed.stdout.split()[-1])
 
 
 def wait_until(
@@ -207,22 +282,22 @@ def qwen3_checkpoint() -> str:
     return str(host_asset("UNISERVE_QWEN3_MODEL", QWEN3_CHECKPOINT))
 
 
-#: The Program Server every deployment that names none is given
-#: (:func:`programs_from`).
-_PROGRAM_SERVER: Path | None = None
+#: The Build Server every deployment that names none is given
+#: (:func:`modules_from`).
+_BUILD_SERVER: Path | None = None
 
 
 @contextmanager
-def programs_from(server: Path) -> Iterator[None]:
-    """Give every deployment started in the block the Program Server whose
-    socket is `server`, unless it names one itself (``program_config.socket``).
+def modules_from(server: Path) -> Iterator[None]:
+    """Give every deployment started in the block the Build Server whose
+    socket is `server`, unless it names one itself (``build_config.socket``).
     """  # noqa: D205
-    global _PROGRAM_SERVER
-    previous, _PROGRAM_SERVER = _PROGRAM_SERVER, server
+    global _BUILD_SERVER
+    previous, _BUILD_SERVER = _BUILD_SERVER, server
     try:
         yield
     finally:
-        _PROGRAM_SERVER = previous
+        _BUILD_SERVER = previous
 
 
 def log_tail(log_path: Path | None, lines: int = 40) -> str:
@@ -280,7 +355,7 @@ def _serves_a_deployment(args: list[str]) -> bool:
     """Whether `args` starts a deployment: the `serve` subcommand of the one
     executable.
 
-    The subcommand is the second word. `uniserve program-server serve` and
+    The subcommand is the second word. `uniserve build-server serve` and
     `uniserve storage-server serve` are other commands: `serve` is theirs too,
     and they take no deployment options.
     """  # noqa: D205
@@ -293,16 +368,16 @@ def start_server(
     """Start `args` in a session of its own, its output to `log_path`.
 
     A deployment that sizes no host KV cache (``kv_cache_config.host_*``) holds
-    `HOST_CACHE_GIB` of it; one that names no Program Server is given the
-    module's (:func:`programs_from`); and every deployment adds `E2E_SET`.
+    `HOST_CACHE_GIB` of it; one that names no Build Server is given the
+    module's (:func:`modules_from`); and every deployment adds `E2E_SET`.
     """
     if _serves_a_deployment(args):
-        named = any("program_config.socket" in arg for arg in args)
-        if not named and _PROGRAM_SERVER is not None:
+        named = any("build_config.socket" in arg for arg in args)
+        if not named and _BUILD_SERVER is not None:
             args = [
                 *args,
                 "--set",
-                f"program_config.socket={_PROGRAM_SERVER}",
+                f"build_config.socket={_BUILD_SERVER}",
             ]
         sized = any("kv_cache_config.host_" in arg for arg in args)
         if not sized:
@@ -449,7 +524,7 @@ def second_host(
             "LD_LIBRARY_PATH",
             "PYTHONPATH",
             "MAX_JOBS",
-            "UNISERVE_PROGRAM_SERVER_PYTHON",
+            "UNISERVE_BUILD_SERVER_PYTHON",
             "FLASHINFER_WORKSPACE_BASE",
             "UCX_NET_DEVICES",
         )
@@ -469,7 +544,7 @@ def second_host(
         f"{command_prefix}{shlex.quote(str(require_uniserve_binary()))} "
         "serve --nnodes 2 "
         f"--node-rank 1 --dist-init-addr {address} --host-identity rank-1 "
-        f"--worker-executable {shlex.quote(str(worker_executable()))}"
+        f"{shlex.join(engine_selection())}"
     )
     if arguments:
         remote += " " + shlex.join(arguments)

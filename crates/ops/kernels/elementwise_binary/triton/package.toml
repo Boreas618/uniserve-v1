@@ -1,9 +1,9 @@
-# The elementwise_binary operator's Triton backend: design 5.2's program
+# The elementwise_binary operator's Triton backend: design 5.2's
 # package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # `out[i] = lhs[i] o rhs[i]` over two inputs read through their strides, into a
 # contiguous output: arithmetic in the inputs' element type, or a comparison
@@ -19,6 +19,7 @@
 
 op = "elementwise_binary"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

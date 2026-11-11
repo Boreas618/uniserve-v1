@@ -7,7 +7,7 @@
 //! (`ops::channel_affine`).
 
 use ops::channel_affine::{self, ChannelAffine as ChannelAffineOp};
-use ops::{Shape, Strides, Operand};
+use ops::{Operand, Shape, Strides};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;

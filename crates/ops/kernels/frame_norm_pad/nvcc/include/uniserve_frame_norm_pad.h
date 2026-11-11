@@ -1,7 +1,7 @@
 // The call structure of `frame_norm_pad`: the operator's `FrameNormPadCall`,
 // field for field and offset for offset.
 //
-// The Program Server reads the entry's answer and its error message from this
+// The Build Server reads the entry's answer and its error message from this
 // structure, and `crates/ops/src/frame.rs` asserts the same offsets on its side.
 
 #ifndef UNISERVE_FRAME_NORM_PAD_H

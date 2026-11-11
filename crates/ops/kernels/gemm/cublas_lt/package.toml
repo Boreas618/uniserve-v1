@@ -1,4 +1,4 @@
-# The gemm operator's cuBLASLt backend: design 5.2's program package.
+# The gemm operator's cuBLASLt backend: design 5.2's package.
 #
 # One native module per descriptor: the module's host code runs one dense
 # product through cuBLASLt, and the element types, the weight order and the
@@ -13,6 +13,7 @@
 
 op = "gemm"
 backend = "cublas_lt"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

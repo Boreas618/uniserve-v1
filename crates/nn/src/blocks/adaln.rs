@@ -23,7 +23,7 @@
 //! interval, so the block exposes its two modulated stages beside the whole forward. Each stage's
 //! intermediates are reserved from the forward's arena and handed back before it returns.
 
-use ops::{DevicePtr, Shape, Strides, Operand};
+use ops::{DevicePtr, Operand, Shape, Strides};
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};

@@ -26,8 +26,8 @@ use ipc::{PhaseId, TimingCounters};
 use nn::family::TextModel;
 use nn::{CausalLm, Forward, KvView, TokenBatch};
 use ops::{Generation, Operand};
-use uniserve_tensor::DType;
 use platform::DeviceId;
+use uniserve_tensor::DType;
 
 use crate::arena::{Pools, StreamId};
 use crate::batch::{Job, Jobs};
@@ -118,7 +118,7 @@ impl Staging {
         self.checkpoints = vec![0; largest.rows as usize];
         self.state_copies = Vec::new();
         self.parameters =
-            vec![0.0; largest.rows as usize * proto::program::sampler::PARAMETER_COLUMNS as usize];
+            vec![0.0; largest.rows as usize * proto::module::sampler::PARAMETER_COLUMNS as usize];
         self.draws = vec![ipc::philox::DrawAddress::default(); largest.rows as usize];
         self.adjustments.reserve(largest.rows as usize, vocabulary);
         self.fresh_slots = Vec::with_capacity(largest.rows as usize);
@@ -218,7 +218,7 @@ impl Staging {
         self.drafts.extend_from_slice(&columns.drafts);
         self.vision.clear();
         self.vision.extend_from_slice(&columns.vision);
-        let parameters = proto::program::sampler::PARAMETER_COLUMNS as usize;
+        let parameters = proto::module::sampler::PARAMETER_COLUMNS as usize;
         self.parameters[..rows * parameters]
             .copy_from_slice(&columns.parameters[..rows * parameters]);
         // A greedy row keeps one candidate: its largest. A greedy bucket argmaxes and reads no
@@ -227,8 +227,8 @@ impl Staging {
         // of the row's shaped logits with ties to the lowest id (`top_k` orders ties by id), the
         // token the greedy launch sequence chooses.
         for row in self.parameters[..rows * parameters].chunks_exact_mut(parameters) {
-            if row[proto::program::sampler::TEMPERATURE as usize] == 0.0 {
-                row[proto::program::sampler::TOP_K as usize] = 1.0;
+            if row[proto::module::sampler::TEMPERATURE as usize] == 0.0 {
+                row[proto::module::sampler::TOP_K as usize] = 1.0;
             }
         }
         if columns.draws.len() != rows {
@@ -322,7 +322,7 @@ impl Staging {
         // step, so a step writes fixed addresses (4.5).
         self.commit.clear();
         if !columns.commit.is_empty() {
-            let fields = proto::program::commit::COMMIT_FIELDS;
+            let fields = proto::module::commit::COMMIT_FIELDS;
             if columns.commit.len() != fields * calls {
                 return Err(Error::Invariant(format!(
                     "the commit table holds {} values, {fields} fields of {calls} calls",
@@ -397,7 +397,7 @@ impl Staging {
 
     /// The staged sampling parameters, row-major.
     pub fn parameters(&self, rows: usize) -> &[f32] {
-        let parameters = proto::program::sampler::PARAMETER_COLUMNS as usize;
+        let parameters = proto::module::sampler::PARAMETER_COLUMNS as usize;
         &self.parameters[..rows * parameters]
     }
 
@@ -547,7 +547,7 @@ impl Columns {
     /// `vocabulary` as the width of the logits row the greedy first token is taken from.
     fn new(device: DeviceId, buckets: &Buckets, vocabulary: u32) -> Result<Self> {
         let (tokens, rows) = column_extents(buckets)?;
-        let parameters = rows * u64::from(proto::program::sampler::PARAMETER_COLUMNS);
+        let parameters = rows * u64::from(proto::module::sampler::PARAMETER_COLUMNS);
         Ok(Self {
             positions: Column::new(device, DType::I32, tokens)?,
             input_ids: Column::new(device, DType::I32, tokens)?,
@@ -1090,11 +1090,7 @@ impl<M: ?Sized> Clone for Shared<M> {
 }
 
 impl<M: CausalLm + ?Sized> CausalLm for Shared<M> {
-    fn embed_input_ids(
-        &self,
-        f: &nn::Forward,
-        ids: ops::Operand,
-    ) -> nn::Result<ops::Operand> {
+    fn embed_input_ids(&self, f: &nn::Forward, ids: ops::Operand) -> nn::Result<ops::Operand> {
         self.0.embed_input_ids(f, ids)
     }
 
@@ -1108,11 +1104,7 @@ impl<M: CausalLm + ?Sized> CausalLm for Shared<M> {
         self.0.forward(f, batch, cache, hidden)
     }
 
-    fn compute_logits(
-        &self,
-        f: &nn::Forward,
-        hidden: ops::Operand,
-    ) -> nn::Result<ops::Operand> {
+    fn compute_logits(&self, f: &nn::Forward, hidden: ops::Operand) -> nn::Result<ops::Operand> {
         self.0.compute_logits(f, hidden)
     }
 
@@ -1436,7 +1428,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         self.shadow = Some(shadow);
     }
 
-    /// Records that a program-layer update could not compare `entry` (7.3 step 2), once.
+    /// Records that a generation update could not compare `entry` (7.3 step 2), once.
     ///
     /// The same operator is shadowed once per bucket the update's requests occupy, so the record
     /// keeps the first statement of each fact and drops its repeats.
@@ -3196,8 +3188,8 @@ impl<M: TextModel> CausalLmRunner<M> {
             query_offsets: self.columns.query_offsets.extent(0..bucket.rows as u64 + 1),
             logits_rows: self.columns.logits_rows.extent(0..bucket.rows as u64),
             phase: match bucket.variant.is_decode() {
-                true => proto::program::PhaseKind::Decode,
-                false => proto::program::PhaseKind::Prefill,
+                true => proto::module::PhaseKind::Decode,
+                false => proto::module::PhaseKind::Prefill,
             },
             page_size: self.kv.page_size(),
             num_tokens: bucket.tokens,
@@ -3554,7 +3546,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         let parameters = self
             .columns
             .parameters
-            .shaped(&[rows, u64::from(proto::program::sampler::PARAMETER_COLUMNS)]);
+            .shaped(&[rows, u64::from(proto::module::sampler::PARAMETER_COLUMNS)]);
         let slots = self.columns.slots.shaped(&[rows]);
         let words = u64::from(ops::sampler::ban_words(self.model.vocabulary()));
         let state = SamplerState {
@@ -4072,12 +4064,12 @@ fn warm_span(bucket: Bucket) -> (Vec<i32>, Vec<i32>) {
 /// `TOP_K` 0 keeps every candidate, `TOP_P` 1 keeps all of the nucleus, `MIN_P` 0 keeps every
 /// candidate above it, and the three penalties are 0. The token the pose draws is discarded.
 fn warm_parameters(rows: usize) -> Vec<f32> {
-    let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
+    let columns = proto::module::sampler::PARAMETER_COLUMNS as usize;
     let mut parameters = vec![0.0; rows * columns];
     for row in 0..rows {
         let row = &mut parameters[row * columns..(row + 1) * columns];
-        row[proto::program::sampler::TEMPERATURE as usize] = 1.0;
-        row[proto::program::sampler::TOP_P as usize] = 1.0;
+        row[proto::module::sampler::TEMPERATURE as usize] = 1.0;
+        row[proto::module::sampler::TOP_P as usize] = 1.0;
     }
     parameters
 }
@@ -4098,8 +4090,8 @@ fn refuse_drawn_rows_in_greedy_bucket(
     if !variant.greedy() {
         return Ok(());
     }
-    let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
-    let temperature = proto::program::sampler::TEMPERATURE as usize;
+    let columns = proto::module::sampler::PARAMETER_COLUMNS as usize;
+    let temperature = proto::module::sampler::TEMPERATURE as usize;
     let rows = parameters.len() / columns;
     for (row, stated) in parameters.chunks_exact(columns).enumerate() {
         if stated[temperature] == 0.0 {
@@ -4256,9 +4248,9 @@ mod tests {
     /// the request stated it. A greedy bucket still refuses a drawn row, by the bucket and the row.
     #[test]
     fn a_drawing_bucket_serves_greedy_rows_as_their_largest_candidate() -> Result<()> {
-        let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
-        let temperature = proto::program::sampler::TEMPERATURE as usize;
-        let top_k = proto::program::sampler::TOP_K as usize;
+        let columns = proto::module::sampler::PARAMETER_COLUMNS as usize;
+        let temperature = proto::module::sampler::TEMPERATURE as usize;
+        let top_k = proto::module::sampler::TOP_K as usize;
         let buckets = Buckets::new([Bucket::decode(4, Variant::DecodeSampled)]);
         let mut staging = Staging::new();
         staging.reserve(&buckets, VOCABULARY_UNDER_TEST)?;
@@ -4348,7 +4340,7 @@ mod tests {
     /// column a fixture states is the row's destination slot, and the rest keep zero.
     fn committed(slots: &[i64]) -> Vec<i64> {
         let rows = slots.len();
-        let mut table = vec![0_i64; proto::program::commit::COMMIT_FIELDS * rows];
+        let mut table = vec![0_i64; proto::module::commit::COMMIT_FIELDS * rows];
         table[..rows].copy_from_slice(slots);
         table
     }
@@ -4379,7 +4371,7 @@ mod tests {
             input_ids: vec![7, 8],
             targets: Vec::new(),
             slots: vec![0, 1],
-            parameters: vec![0.0; 2 * proto::program::sampler::PARAMETER_COLUMNS as usize],
+            parameters: vec![0.0; 2 * proto::module::sampler::PARAMETER_COLUMNS as usize],
             draws: vec![ipc::philox::DrawAddress::default(); 2],
             commit: committed(&[0, 1]),
             page_size: 16,
@@ -4412,7 +4404,7 @@ mod tests {
             input_ids: vec![1, 2, 3],
             targets: Vec::new(),
             slots: vec![0],
-            parameters: vec![0.0; proto::program::sampler::PARAMETER_COLUMNS as usize],
+            parameters: vec![0.0; proto::module::sampler::PARAMETER_COLUMNS as usize],
             draws: vec![ipc::philox::DrawAddress::default()],
             commit: committed(&[0]),
             page_size: 16,
@@ -4549,7 +4541,7 @@ mod tests {
             input_ids: (0..tokens).map(|token| token + 1).collect(),
             targets: Vec::new(),
             slots: vec![0],
-            parameters: vec![0.0; proto::program::sampler::PARAMETER_COLUMNS as usize],
+            parameters: vec![0.0; proto::module::sampler::PARAMETER_COLUMNS as usize],
             draws: vec![ipc::philox::DrawAddress::default()],
             commit: committed(&[0]),
             page_size: 16,
@@ -4628,7 +4620,7 @@ mod tests {
         assert_eq!(&staging.slots(rows)[2..], &[-1; 6]);
         assert_eq!(&staging.logits_rows()[2..], &[-1; 6]);
         assert!(
-            staging.parameters(rows)[2 * proto::program::sampler::PARAMETER_COLUMNS as usize..]
+            staging.parameters(rows)[2 * proto::module::sampler::PARAMETER_COLUMNS as usize..]
                 .iter()
                 .all(|value| *value == 0.0),
             "an empty row states sampling parameters"
@@ -4670,19 +4662,16 @@ mod tests {
         assert_eq!(commit_block(5), 8);
 
         // The mechanism's `[fields, rows]` table, column-major, becomes `[fields, capacity]`.
-        let mut staged = vec![0_i64; proto::program::commit::COMMIT_FIELDS * rows];
+        let mut staged = vec![0_i64; proto::module::commit::COMMIT_FIELDS * rows];
         for row in 0..rows {
-            staged[proto::program::commit::column::SLOT * rows + row] = row as i64 + 7;
-            staged[proto::program::commit::column::MODE * rows + row] =
-                proto::program::commit::mode::DECODE;
+            staged[proto::module::commit::column::SLOT * rows + row] = row as i64 + 7;
+            staged[proto::module::commit::column::MODE * rows + row] =
+                proto::module::commit::mode::DECODE;
         }
         let table = commit_table(&staged, rows, capacity)?;
-        assert_eq!(
-            table.len(),
-            proto::program::commit::COMMIT_FIELDS * capacity
-        );
-        let slots = &table[proto::program::commit::column::SLOT * capacity
-            ..(proto::program::commit::column::SLOT + 1) * capacity];
+        assert_eq!(table.len(), proto::module::commit::COMMIT_FIELDS * capacity);
+        let slots = &table[proto::module::commit::column::SLOT * capacity
+            ..(proto::module::commit::column::SLOT + 1) * capacity];
         assert_eq!(&slots[..rows], &[7, 8, 9]);
         // The row past the batch is **inert**, not zero: a zero slot is slot 0, a real destination,
         // so a launch that ever ran over the whole capacity would commit phantom tokens into the
@@ -4727,11 +4716,11 @@ mod tests {
     fn a_warm_pose_commits_nothing_but_is_recorded() {
         let rows = 5;
         let table = inert_commit(rows);
-        assert_eq!(table.len(), proto::program::commit::COMMIT_FIELDS * rows);
-        for field in 0..proto::program::commit::COMMIT_FIELDS {
+        assert_eq!(table.len(), proto::module::commit::COMMIT_FIELDS * rows);
+        for field in 0..proto::module::commit::COMMIT_FIELDS {
             let column = &table[field * rows..(field + 1) * rows];
-            if field == proto::program::commit::column::SLOT
-                || field == proto::program::commit::column::TASK
+            if field == proto::module::commit::column::SLOT
+                || field == proto::module::commit::column::TASK
             {
                 assert_eq!(column, &[-1_i64; 5], "field {field} names no destination");
             } else {
@@ -5089,7 +5078,7 @@ mod sampled_output_tests {
     #[test]
     #[ignore = "requires a CUDA device"]
     fn a_narrower_sampling_bucket_reads_its_own_rows() {
-        let columns = u64::from(proto::program::sampler::PARAMETER_COLUMNS);
+        let columns = u64::from(proto::module::sampler::PARAMETER_COLUMNS);
         let largest = 8;
         let narrow = 2;
         let parameters = Column::new(platform::DeviceId(0), DType::F32, largest * columns)
@@ -5122,14 +5111,14 @@ mod sampled_output_tests {
     /// candidate kept, so the capture walks the whole candidate width a served draw may need.
     #[test]
     fn a_warm_pose_states_a_draw_a_sampled_bucket_can_make() {
-        let columns = proto::program::sampler::PARAMETER_COLUMNS as usize;
+        let columns = proto::module::sampler::PARAMETER_COLUMNS as usize;
         let parameters = warm_parameters(2);
         assert_eq!(parameters.len(), 2 * columns, "a row per row");
         for row in 0..2 {
             let row = &parameters[row * columns..(row + 1) * columns];
-            assert_eq!(row[proto::program::sampler::TEMPERATURE as usize], 1.0);
-            assert_eq!(row[proto::program::sampler::TOP_P as usize], 1.0);
-            assert_eq!(row[proto::program::sampler::TOP_K as usize], 0.0);
+            assert_eq!(row[proto::module::sampler::TEMPERATURE as usize], 1.0);
+            assert_eq!(row[proto::module::sampler::TOP_P as usize], 1.0);
+            assert_eq!(row[proto::module::sampler::TOP_K as usize], 0.0);
         }
     }
 }

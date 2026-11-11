@@ -9,7 +9,7 @@
 //! graph replays over a fixed row count.
 
 use ops::logits::{self, UnpadDescriptor, VocabUnpad};
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};

@@ -1,4 +1,4 @@
-# The paged_attention operator's trtllm backend: design 5.2's program package.
+# The paged_attention operator's trtllm backend: design 5.2's package.
 #
 # One native module per descriptor: trtllm-gen's FMHA launch code and kernel table,
 # compiled against the artifact's generated header, with the cubins this
@@ -11,11 +11,12 @@
 #
 # The manifest records where the kernels come from: `[toolchain] packages` names
 # the FlashInfer distribution that carries the launch code, and
-# `[parameters] artifact` the pinned trtllm-gen artifact the Program Server's
+# `[parameters] artifact` the pinned trtllm-gen artifact the Build Server's
 # fetcher verifies before the build reads it.
 
 op = "paged_attention"
 backend = "trtllm"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

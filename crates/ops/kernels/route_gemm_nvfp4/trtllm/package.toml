@@ -1,4 +1,4 @@
-# The route_gemm_nvfp4 operator's trtllm-gen backend: design 5.2's program package.
+# The route_gemm_nvfp4 operator's trtllm-gen backend: design 5.2's package.
 #
 # One native module per descriptor: the trtllm-gen batched-GEMM launch code that
 # FLASHINFER_MOE calls for a routed, block-scaled second matrix (`Gemm2::Runner`),
@@ -13,6 +13,7 @@
 
 op = "route_gemm_nvfp4"
 backend = "trtllm"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

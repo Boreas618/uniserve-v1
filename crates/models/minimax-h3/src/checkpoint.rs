@@ -45,7 +45,7 @@ pub fn dit_tasks(stage: Stage) -> Vec<VideoTask> {
 ///
 /// A task export such as `MiniMax-H3/FL2VA` states `MiniMaxH3Pipeline` and names a `video_vae`
 /// directory; it is not a pipeline root.
-pub const PIPELINE_CLASS: &str = "MiniMaxH3ModularPipeline";
+pub const PIPELINE_CLASS: &str = processing::minimax_h3::PIPELINE_CLASS;
 
 /// The base model a FastH3 adapter states it edits.
 pub const FASTH3_BASE_MODEL: &str = "MiniMaxAI/MiniMax-H3";

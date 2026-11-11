@@ -1,14 +1,14 @@
-//! The interface between Rust and kernel programs: operators and their launch code, the kernels a
+//! The interface between Rust and kernel packages: operators and their launch code, the kernels a
 //! program compiles into, the generation of kernels a runner serves, and the shadow buffers and
 //! tolerances that decide whether a new implementation may replace an old one.
 //!
 //! ## The chain this crate sits in
 //!
 //! `runner → model → layer → operator → kernel`. Each operator here is one Rust
-//! type with a name, a descriptor, and an argument struct; a kernel program — a Triton package, a
+//! type with a name, a descriptor, and an argument struct; a kernel package — a Triton package, a
 //! CuTe DSL package, a CUDA C++ package or a native library — fills that operator, and
 //! `uniserve engine` resolves the programs the epoch record names and hands the modules to
-//! [`Kernel`]. `ops` depends on `platform`, on the program vocabulary of `proto` (operator
+//! [`Kernel`]. `ops` depends on `platform`, on the module vocabulary of `proto` (operator
 //! names and phases) and on the tensor library for the element type of an operand, whose number
 //! and spelling in the package ABI [`abi`] states: it launches what it is given, allocates
 //! nothing that outlives a launch, owns no model and knows no layer.
@@ -88,7 +88,7 @@
 //! operator, and never from a measurement of the pair being compared.
 
 /// This crate's kernel packages, one directory per operator and backend: a tree
-/// of this crate's own, which the model crates' tests and the Program Server's
+/// of this crate's own, which the model crates' tests and the Build Server's
 /// tools read.
 pub const KERNELS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels");
 

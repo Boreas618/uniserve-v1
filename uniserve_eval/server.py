@@ -5,7 +5,7 @@
 stderr go to its own log file.
 
 A `uniserve serve` process starts the host services it needs -- the Storage
-Server and the Program Server -- in its runtime directory
+Server and the Build Server -- in its runtime directory
 (`$XDG_RUNTIME_DIR/uniserve`) as detached processes that outlive it, and the
 Storage Server holds the deployment's host and device storage until it
 stops. A deployment therefore runs under a runtime directory of its own,

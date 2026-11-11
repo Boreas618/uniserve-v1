@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::update::Action;
 use anyhow::{Result, bail};
-use ipc::{ProgramStatus, UpdateFailure};
+use ipc::{GenerationStatus, UpdateFailure};
 use worker::control::Ready;
 use worker::device::Probe;
 use worker::watchdog::Running;
@@ -25,7 +25,7 @@ const PROBATION_POLL: Duration = Duration::from_millis(100);
 /// How long a serve pass sleeps while a precopy, a warmup or a drain is in flight.
 const TRANSITION_POLL: Duration = Duration::from_millis(1);
 
-/// The window a daemon gives one program-layer command before it gives up on it, as this process
+/// The window a daemon gives one generation command before it gives up on it, as this process
 /// must assume it (`crates/daemon/src/engine/control.rs`'s `COMMAND_TIMEOUT`): the engine does not
 /// know that constant, it knows that its own reports must arrive inside the window or a run says
 /// nothing but a timeout.
@@ -33,7 +33,7 @@ const DAEMON_COMMAND_WINDOW: Duration = Duration::from_secs(120);
 
 /// A wait of the control path: when it began and when it was last reported.
 ///
-/// Every step of the program-layer update is polled rather than blocked on, so a step that never
+/// Every step of the generation update is polled rather than blocked on, so a step that never
 /// advances is a run that hangs without a line. Each such wait reports itself by name, generation
 /// and elapsed time once per stall bound, and never ends the epoch: the command's own failure path
 /// decides, and a deadline that killed would be a second failure beside the one being chased.
@@ -126,7 +126,7 @@ impl MainProcess {
             {
                 due = due.min(Instant::now() + PROBATION_POLL);
             }
-            // A transition moves one stage a pass, and what ends a stage is a device, a Program
+            // A transition moves one stage a pass, and what ends a stage is a device, a Build
             // Server or a scheduler rather than a socket. Passes run back to back while one is in
             // flight, so each stage costs what its work costs: a recovery is made of these stages,
             // and a client's stream stands still for all of them.
@@ -167,7 +167,7 @@ impl MainProcess {
             // What the admitted requests produced since the last pass.
             self.forward_events();
 
-            // The daemon's commands for this epoch: the program layer's stages, the epoch layer's
+            // The daemon's commands for this epoch: the generation layer's stages, the epoch layer's
             // park and serve, and the shutdown. They arrive on the process interface, so a pass
             // that did not look for them would never see an update.
             while let Some(command) = self.process.take_command()? {
@@ -285,7 +285,7 @@ impl MainProcess {
         Ok(None)
     }
 
-    /// Applies the program-layer update's decision table to `failure`: a precopy failure discards
+    /// Applies the generation update's decision table to `failure`: a precopy failure discards
     /// the new generation and serving goes on; a failure on probation reverts
     /// the update; anything else ends the epoch's service. Returns the failure
     /// that ends service, if any.
@@ -299,7 +299,7 @@ impl MainProcess {
                     // serving process is not ended over bookkeeping that moved on.
                     tracing::warn!(generation, %error, "a precopy failure arrived for no precopy");
                 }
-                self.report(ProgramStatus::PrecopyFailed {
+                self.report(GenerationStatus::PrecopyFailed {
                     generation,
                     failure,
                 });
@@ -369,7 +369,7 @@ impl MainProcess {
     }
 
     /// Reports the two waits of the epoch's start when they outlast a stall bound: the daemon's
-    /// first program-layer command, and this node's warmup. Neither fails anything - the failures
+    /// first generation command, and this node's warmup. Neither fails anything - the failures
     /// they precede state themselves - but a run that hangs here now says what it was waiting for.
     fn note_waits(&mut self) {
         let now = Instant::now();
@@ -377,7 +377,7 @@ impl MainProcess {
         self.command_wait
             .note(self.announced_at.is_some() && self.commands_seen == 0, now);
         self.command_wait
-            .report("the daemon's first program-layer command", 0, bound, now);
+            .report("the daemon's first generation command", 0, bound, now);
         // The report is due inside the daemon's own window for the switchover this warmup answers: a
         // wait reported later is a wait nobody reads, because the daemon gives up first and the log
         // says only that something timed out.

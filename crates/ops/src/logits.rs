@@ -15,7 +15,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -58,7 +58,7 @@ pub struct GatherArgs {
 pub struct LogitsGather;
 
 impl Op for LogitsGather {
-    const NAME: &'static str = proto::program::operator::LOGITS_GATHER;
+    const NAME: &'static str = proto::module::operator::LOGITS_GATHER;
 
     type Descriptor = GatherDescriptor;
     type Args<'a> = GatherArgs;
@@ -71,7 +71,10 @@ impl Op for LogitsGather {
         if args.rows.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 row indices, found {}", abi::name(args.rows.dtype)),
+                format!(
+                    "expected i32 row indices, found {}",
+                    abi::name(args.rows.dtype)
+                ),
             ));
         }
         let count = args.rows.shape.dim(0);
@@ -170,7 +173,7 @@ pub struct UnpadArgs {
 pub struct VocabUnpad;
 
 impl Op for VocabUnpad {
-    const NAME: &'static str = proto::program::operator::VOCAB_UNPAD;
+    const NAME: &'static str = proto::module::operator::VOCAB_UNPAD;
 
     type Descriptor = UnpadDescriptor;
     type Args<'a> = UnpadArgs;
@@ -204,7 +207,10 @@ impl Op for VocabUnpad {
                 Self::NAME,
                 format!(
                     "expected {} logits gathered into {}, found {} and {}",
-                    abi::name(descriptor.dtype), abi::name(descriptor.output), abi::name(args.gathered.dtype), abi::name(args.out.dtype)
+                    abi::name(descriptor.dtype),
+                    abi::name(descriptor.output),
+                    abi::name(args.gathered.dtype),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }
@@ -247,7 +253,8 @@ impl Op for VocabUnpad {
         // A row's leading `vocabulary` columns are copied out of a wider row; no arithmetic, so the
         // only rounding is the store's. Widening is exact; a narrowing pair rounds once into the
         // output type and the bound is that one rounding.
-        if tolerance::unit_roundoff(descriptor.output) <= tolerance::unit_roundoff(descriptor.dtype) {
+        if tolerance::unit_roundoff(descriptor.output) <= tolerance::unit_roundoff(descriptor.dtype)
+        {
             Tolerance::exact()
         } else {
             Tolerance::rounding(1, descriptor.dtype, descriptor.output)

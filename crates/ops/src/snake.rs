@@ -18,7 +18,7 @@
 //! parameters, so folding them behind a flag would make one operator read a weight the other's
 //! checkpoint does not have.
 //!
-//! The program is a kernel program: one
+//! The program is a kernel package: one
 //! element of `out` per thread, the channel taken from the linear index so each thread reads one
 //! `α`. `x` and `out` must be row-major, which is what the convolution that feeds the activation
 //! produces.
@@ -36,7 +36,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Strides, Operand};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -82,7 +82,7 @@ pub struct Args {
 pub struct Snake;
 
 impl Op for Snake {
-    const NAME: &'static str = proto::program::operator::SNAKE;
+    const NAME: &'static str = proto::module::operator::SNAKE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

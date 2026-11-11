@@ -1,8 +1,8 @@
 //! Sampling: shaping the logits of a request, choosing among its candidates, and reading back the
 //! selected values.
 //!
-//! The steps are separate operators because each is one kernel program and each is replaced on its
-//! own during a program-layer update; the `Sampler` layer calls them in this order:
+//! The steps are separate operators because each is one kernel package and each is replaced on its
+//! own during a generation update; the `Sampler` layer calls them in this order:
 //!
 //! 1. `logits_shape` applies the request's logit adjustments, then its penalties, and divides by its
 //!    temperature. The adjustments come first, in vLLM's order (allowed set, bad words and the
@@ -50,11 +50,11 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-use proto::program::sampler::PARAMETER_COLUMNS;
+use proto::module::sampler::PARAMETER_COLUMNS;
 
 /// One compilation of `logits_shape`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -121,7 +121,7 @@ pub const fn ban_words(vocabulary: u32) -> u32 {
 pub struct LogitsShape;
 
 impl Op for LogitsShape {
-    const NAME: &'static str = proto::program::operator::LOGITS_SHAPE;
+    const NAME: &'static str = proto::module::operator::LOGITS_SHAPE;
 
     type Descriptor = ShapeDescriptor;
     type Args<'a> = ShapeArgs;
@@ -303,7 +303,7 @@ pub struct TopKArgs {
 pub struct TopK;
 
 impl Op for TopK {
-    const NAME: &'static str = proto::program::operator::TOP_K;
+    const NAME: &'static str = proto::module::operator::TOP_K;
 
     type Descriptor = TopKDescriptor;
     type Args<'a> = TopKArgs;
@@ -357,7 +357,11 @@ impl Op for TopK {
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected {} ids, found {}", abi::name(descriptor.ids), abi::name(args.ids.dtype)),
+                format!(
+                    "expected {} ids, found {}",
+                    abi::name(descriptor.ids),
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         Ok(())
@@ -443,7 +447,7 @@ pub struct FilterArgs {
 pub struct FilterCandidates;
 
 impl Op for FilterCandidates {
-    const NAME: &'static str = proto::program::operator::FILTER_CANDIDATES;
+    const NAME: &'static str = proto::module::operator::FILTER_CANDIDATES;
 
     type Descriptor = FilterDescriptor;
     type Args<'a> = FilterArgs;
@@ -457,7 +461,11 @@ impl Op for FilterCandidates {
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected {} ids, found {}", abi::name(descriptor.ids), abi::name(args.ids.dtype)),
+                format!(
+                    "expected {} ids, found {}",
+                    abi::name(descriptor.ids),
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         args.parameters.require_shape(
@@ -468,7 +476,10 @@ impl Op for FilterCandidates {
         if args.valid.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 validity flags, found {}", abi::name(args.valid.dtype)),
+                format!(
+                    "expected i32 validity flags, found {}",
+                    abi::name(args.valid.dtype)
+                ),
             ));
         }
         Ok(())
@@ -556,7 +567,7 @@ pub struct InverseCdfArgs {
 pub struct InverseCdf;
 
 impl Op for InverseCdf {
-    const NAME: &'static str = proto::program::operator::INVERSE_CDF;
+    const NAME: &'static str = proto::module::operator::INVERSE_CDF;
 
     type Descriptor = InverseCdfDescriptor;
     type Args<'a> = InverseCdfArgs;
@@ -571,7 +582,11 @@ impl Op for InverseCdf {
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected {} ids, found {}", abi::name(descriptor.ids), abi::name(args.ids.dtype)),
+                format!(
+                    "expected {} ids, found {}",
+                    abi::name(descriptor.ids),
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         args.draws.require_shape(Self::NAME, Shape::new(&[rows]))?;
@@ -587,7 +602,8 @@ impl Op for InverseCdf {
                 Self::NAME,
                 format!(
                     "expected {} tokens, found {}",
-                    abi::name(descriptor.tokens), abi::name(args.tokens.dtype)
+                    abi::name(descriptor.tokens),
+                    abi::name(args.tokens.dtype)
                 ),
             ));
         }
@@ -676,7 +692,7 @@ pub struct ArgMaxArgs {
 pub struct ArgMax;
 
 impl Op for ArgMax {
-    const NAME: &'static str = proto::program::operator::ARGMAX;
+    const NAME: &'static str = proto::module::operator::ARGMAX;
 
     type Descriptor = ArgMaxDescriptor;
     type Args<'a> = ArgMaxArgs;
@@ -690,7 +706,11 @@ impl Op for ArgMax {
         if args.out.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected {} ids, found {}", abi::name(descriptor.ids), abi::name(args.out.dtype)),
+                format!(
+                    "expected {} ids, found {}",
+                    abi::name(descriptor.ids),
+                    abi::name(args.out.dtype)
+                ),
             ));
         }
         Ok(())
@@ -764,7 +784,7 @@ pub struct LogSoftmaxArgs {
 pub struct LogSoftmax;
 
 impl Op for LogSoftmax {
-    const NAME: &'static str = proto::program::operator::LOG_SOFTMAX;
+    const NAME: &'static str = proto::module::operator::LOG_SOFTMAX;
 
     type Descriptor = LogSoftmaxDescriptor;
     type Args<'a> = LogSoftmaxArgs;
@@ -860,7 +880,7 @@ pub struct LogprobArgs {
 pub struct LogprobGather;
 
 impl Op for LogprobGather {
-    const NAME: &'static str = proto::program::operator::LOGPROB_GATHER;
+    const NAME: &'static str = proto::module::operator::LOGPROB_GATHER;
 
     type Descriptor = LogprobDescriptor;
     type Args<'a> = LogprobArgs;
@@ -876,7 +896,8 @@ impl Op for LogprobGather {
                 Self::NAME,
                 format!(
                     "expected {} tokens, found {}",
-                    abi::name(descriptor.ids), abi::name(args.tokens.dtype)
+                    abi::name(descriptor.ids),
+                    abi::name(args.tokens.dtype)
                 ),
             ));
         }
@@ -884,7 +905,10 @@ impl Op for LogprobGather {
         if args.out.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected f32 log-probabilities, found {}", abi::name(args.out.dtype)),
+                format!(
+                    "expected f32 log-probabilities, found {}",
+                    abi::name(args.out.dtype)
+                ),
             ));
         }
         args.ranks.require_shape(Self::NAME, Shape::new(&[rows]))?;
@@ -987,7 +1011,7 @@ pub struct TopLogprobsArgs {
 pub struct TopLogprobs;
 
 impl Op for TopLogprobs {
-    const NAME: &'static str = proto::program::operator::TOP_LOGPROBS;
+    const NAME: &'static str = proto::module::operator::TOP_LOGPROBS;
 
     type Descriptor = TopLogprobsDescriptor;
     type Args<'a> = TopLogprobsArgs;
@@ -1156,7 +1180,7 @@ pub struct OrderArgs {
 pub struct CandidateOrder;
 
 impl Op for CandidateOrder {
-    const NAME: &'static str = proto::program::operator::CANDIDATE_ORDER;
+    const NAME: &'static str = proto::module::operator::CANDIDATE_ORDER;
 
     type Descriptor = OrderDescriptor;
     type Args<'a> = OrderArgs;
@@ -1214,7 +1238,8 @@ impl Op for CandidateOrder {
                 Self::NAME,
                 format!(
                     "the counts are i32 over [{rows}, {}], the view says {}",
-                    args.vocabulary, abi::name(args.counts.dtype)
+                    args.vocabulary,
+                    abi::name(args.counts.dtype)
                 ),
             ));
         }

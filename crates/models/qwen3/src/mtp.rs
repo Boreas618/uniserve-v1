@@ -20,7 +20,7 @@ use nn::capability::{KvView, TokenBatch};
 use nn::family::{CacheShape, Drafter, ExpertOrder, Split};
 use nn::layers::{Bias, Linear, PagedAttention, Parallel, ResidualStream, RmsNorm, Rotary};
 use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Forward, Shape, Operand};
+use nn::{DType, Forward, Operand, Shape};
 
 use crate::causal_lm::{expert_slots, text_spectrum};
 use crate::config::{Config, Mixer};

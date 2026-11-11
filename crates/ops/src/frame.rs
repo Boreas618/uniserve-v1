@@ -27,7 +27,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Strides, Operand};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -114,7 +114,7 @@ pub struct FramePadArgs {
 pub struct FramePad;
 
 impl Op for FramePad {
-    const NAME: &'static str = proto::program::operator::FRAME_PAD;
+    const NAME: &'static str = proto::module::operator::FRAME_PAD;
 
     type Descriptor = FramePadDescriptor;
     type Args<'a> = FramePadArgs;
@@ -127,7 +127,9 @@ impl Op for FramePad {
                 Self::NAME,
                 format!(
                     "expected {} values and output, found {} and {}",
-                    abi::name(descriptor.dtype), abi::name(args.values.dtype), abi::name(args.out.dtype)
+                    abi::name(descriptor.dtype),
+                    abi::name(args.values.dtype),
+                    abi::name(args.out.dtype)
                 ),
             ));
         }
@@ -408,7 +410,9 @@ impl fmt::Display for FrameMomentsDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The epsilon is absent on purpose: it travels in the call, so the key would name several
         // cells for one program.
-        Key::new().field("dtype", abi::name(self.dtype)).finish(formatter)
+        Key::new()
+            .field("dtype", abi::name(self.dtype))
+            .finish(formatter)
     }
 }
 
@@ -430,7 +434,7 @@ pub struct FrameMomentsArgs {
 pub struct FrameMoments;
 
 impl Op for FrameMoments {
-    const NAME: &'static str = proto::program::operator::FRAME_MOMENTS;
+    const NAME: &'static str = proto::module::operator::FRAME_MOMENTS;
 
     type Descriptor = FrameMomentsDescriptor;
     type Args<'a> = FrameMomentsArgs;
@@ -571,7 +575,9 @@ impl fmt::Display for FrameNormPadDescriptor {
         // Three fields are absent on purpose: the object derives the order and the normalization
         // branch at run time and treats a one-pixel frame as one case among the rest, so naming any
         // of them would key several cells to one program.
-        Key::new().field("dtype", abi::name(self.dtype)).finish(formatter)
+        Key::new()
+            .field("dtype", abi::name(self.dtype))
+            .finish(formatter)
     }
 }
 
@@ -686,7 +692,7 @@ pub struct FrameNormPadArgs {
 pub struct FrameNormPad;
 
 impl Op for FrameNormPad {
-    const NAME: &'static str = proto::program::operator::FRAME_NORM_PAD;
+    const NAME: &'static str = proto::module::operator::FRAME_NORM_PAD;
 
     type Descriptor = FrameNormPadDescriptor;
     type Args<'a> = FrameNormPadArgs;

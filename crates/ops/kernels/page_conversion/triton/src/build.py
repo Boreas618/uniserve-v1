@@ -9,7 +9,7 @@ page of that geometry.
 
 import page_conversion as kernels
 import triton.language as tl
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The stored element type: what the raw areas hold.
 SOURCES = {

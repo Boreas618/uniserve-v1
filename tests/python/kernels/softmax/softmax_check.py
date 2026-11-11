@@ -11,7 +11,7 @@ stores the exponentials' share of their sum in the input's type, while `log_soft
 the row in `STEP`-wide tiles — so a tile larger than a program's registers costs more steps,
 not a bigger block — and stores the log-probability in FP32 whatever the input's type. The
 same file is kept in both packages, byte for byte, and a test in
-`crates/program-server/tests/it/packages.rs` holds them together.
+`crates/build-server/tests/it/packages.rs` holds them together.
 
 The cases are what a row reduction can get wrong: the shapes the fixture's keys name, a
 width far below the tile where almost every lane is masked, a width far above it - the row is

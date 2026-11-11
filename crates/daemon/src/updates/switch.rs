@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use proto::process::{self, Report, Spawn};
 
-use crate::epoch::{EpochRecord, Epochs, Failure, FilledPrograms, Status, Update};
+use crate::epoch::{EpochRecord, Epochs, Failure, ModuleSet, Status, Update};
 use crate::options::PreviousEpoch;
 
 /// A node of the deployment the switch starts main processes on.
@@ -67,17 +67,16 @@ pub(crate) struct Node {
     pub(crate) rank: u32,
 }
 
-/// How the target epoch's main processes are started: the executable, the
-/// build identity it must report when the daemon knows it, and its arguments
-/// and environment.
+/// How the target epoch's main processes are started: the build identity
+/// they must report when the daemon knows it, and their launch and
+/// environment. The executable is the engine package the launch's module set
+/// names, which each node's daemon resolves at its own Build Server.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Start {
-    /// The target main process's executable.
-    pub(crate) executable: String,
-    /// The build identity the target must report in its `Hello`: `Some` when
-    /// the executable is the daemon's own (`proto::BUILD`), `None` for
-    /// another executable, whose first child's `Hello` fixes it and every
-    /// other child must then report the same.
+    /// The build identity the target must report in its `Hello`, when the
+    /// daemon knows it before the first child connects. `None` leaves it to
+    /// the first child's `Hello`, which fixes it: every other child must then
+    /// report the same.
     pub(crate) build: Option<String>,
     /// The launch a process of this epoch is started with: the contents of
     /// its launch file, which the adapter writes for the process it starts
@@ -290,8 +289,8 @@ pub(crate) struct Switch {
     update: Update,
     /// The target epoch's number, which the record is kept under.
     target: u64,
-    /// The hosts whose targets the daemon has yet to give their programs.
-    awaiting_programs: BTreeSet<String>,
+    /// The hosts whose targets the daemon has yet to give their modules.
+    awaiting_modules: BTreeSet<String>,
     /// The previous epoch's number, which `Serve` and `Drain` name.
     previous: u64,
     /// The epoch the previous epoch executes, whose storage a claim retires
@@ -425,7 +424,7 @@ impl Switch {
             build: start.build,
             requests,
             phase: Phase::Preparing,
-            awaiting_programs: BTreeSet::new(),
+            awaiting_modules: BTreeSet::new(),
             retire: discarded,
             park_sent: BTreeSet::new(),
             parked: BTreeSet::new(),
@@ -478,12 +477,12 @@ impl Switch {
         self.failure.as_ref()
     }
 
-    /// The Program Servers selected `programs` for the target: an update names backends, and a
+    /// The Build Servers selected `modules` for the target: an update names backends, and a
     /// process that joins the epoch later is handed what its record names, where a revision of
     /// zero names no package.
-    pub(crate) fn pin(&mut self, programs: &FilledPrograms) {
-        self.record.kernels = programs.kernels.clone();
-        self.record.policy = programs.policy.clone();
+    pub(crate) fn pin(&mut self, modules: &ModuleSet) {
+        self.record.kernels = modules.kernels.clone();
+        self.record.policy = modules.policy.clone();
         self.epochs.record(self.target, self.record.clone());
     }
 
@@ -569,9 +568,10 @@ impl Switch {
                 group: self.group.clone(),
                 rank: node.rank,
                 generation: self.spawn_generation,
-                executable: self.start.executable.clone(),
-                // The adapter states the launch file for this process and
-                // its arguments: they are its to state.
+                // The node's daemon resolves the engine package the launch
+                // names; the adapter states the launch file for this process
+                // and its arguments: they are its to state.
+                executable: String::new(),
                 arguments: Vec::new(),
                 environment: self.start.environment.clone(),
                 inherit: Vec::new(),
@@ -641,15 +641,15 @@ impl Switch {
             .all(|node| self.parked.contains(&node.host))
     }
 
-    /// States that `hosts`' targets are given their programs by the daemon, so none of them is
+    /// States that `hosts`' targets are given their modules by the daemon, so none of them is
     /// promoted before it holds them: a target parks before any `Precopy` names a generation.
-    pub(crate) fn await_programs(&mut self, hosts: impl IntoIterator<Item = String>) {
-        self.awaiting_programs.extend(hosts);
+    pub(crate) fn await_modules(&mut self, hosts: impl IntoIterator<Item = String>) {
+        self.awaiting_modules.extend(hosts);
     }
 
-    /// `host`'s target took its programs.
+    /// `host`'s target took its modules.
     pub(crate) fn handed(&mut self, roster: &mut impl Roster, host: &str) {
-        self.awaiting_programs.remove(host);
+        self.awaiting_modules.remove(host);
         self.progress(roster);
     }
 
@@ -938,7 +938,7 @@ impl Switch {
             }
         }
         if !self.relaunch_due.is_empty() {
-            // The record is what a process started now reads its programs
+            // The record is what a process started now reads its modules
             // from: the target's stands no more.
             self.record.status = Status::Purged;
             self.epochs.record(self.target, self.record.clone());
@@ -1152,27 +1152,27 @@ impl Switch {
                 self.parked(roster, &host, parked.generation);
             }
             (Phase::Promoting, Some(Kind::Promoted(promoted))) if self.is_target(generation) => {
-                // The programs the promotion reports are the ones the process
+                // The modules the promotion reports are the ones the process
                 // holds, and the epoch serves the ones its children prepared
                 // (`EpochRecord::generation`). A standby whose precopy the
                 // epoch reverted holds an older generation, and moving the
-                // frontend onto it would serve programs the epoch no longer
+                // frontend onto it would serve modules the epoch no longer
                 // runs — refused here, with the frontend left where it is and
                 // the target abandoned rather than reverted. An unstated `0`
-                // is a process that holds no programs, which is the behaviour
+                // is a process that holds no modules, which is the behaviour
                 // a minor-4 engine has.
-                let held = promoted.program_generation;
+                let held = promoted.module_generation;
                 if let (true, Some(epoch)) = (held != 0, self.record.generation)
                     && held != epoch
                 {
                     self.failed(
                         roster,
                         Failure {
-                            kind: "stale_programs".to_owned(),
+                            kind: "stale_packages".to_owned(),
                             reason: format!(
-                                "the promoted process on {host} holds program generation \
+                                "the promoted process on {host} holds module generation \
                                      {held} and this epoch's is {epoch}: the frontend is not \
-                                     moved onto programs the epoch does not serve"
+                                     moved onto modules the epoch does not serve"
                             ),
                             device: None,
                         },
@@ -1265,7 +1265,7 @@ impl Switch {
         let hosts: BTreeSet<String> = self.nodes.iter().map(|node| node.host.clone()).collect();
         match self.phase {
             Phase::Preparing
-                if hosts.is_subset(&self.parked) && self.awaiting_programs.is_empty() =>
+                if hosts.is_subset(&self.parked) && self.awaiting_modules.is_empty() =>
             {
                 self.phase = Phase::Promoting;
                 self.switchover_started = Some(Instant::now());

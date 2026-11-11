@@ -4,7 +4,7 @@ The kernel is FlashInfer's `BlockSparseAttnForwardSm120Blk64` — a CuTe DSL ker
 64-row tiles in both the query and the key domain, grouped queries against their keys, GQA, a
 128-wide head. It is not a kernel source this package owns: FlashInfer ships the kernel and a
 torch-shaped wrapper (`bsa_attn_sm120_blk64_fwd`) that validates tensors, permutes them into the
-kernel's layouts and compiles it on first use. A Program Server module cannot take a torch caller,
+kernel's layouts and compiles it on first use. A Build Server module cannot take a torch caller,
 so this module drives the kernel once at build time and keeps what it produced:
 
 1. describe the call with fake tensors *on the CPU* — the kernel only reads shapes, strides and

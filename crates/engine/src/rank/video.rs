@@ -148,8 +148,8 @@ impl ModelRunner {
         // Server, maps none.
         let reports = report.is_some();
         let longest = u64::from(capacities.iter().copied().max().unwrap_or(0));
-        let element = ops::abi::bytes(dtype)
-            .context("the encoder's states have no whole-byte element")?;
+        let element =
+            ops::abi::bytes(dtype).context("the encoder's states have no whole-byte element")?;
         let (encoder, encoder_info) = match client {
             Some(client) => {
                 let (pool, info) = worker::memory::encoders::EncoderHostPool::start(

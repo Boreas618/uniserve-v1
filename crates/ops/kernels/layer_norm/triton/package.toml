@@ -1,8 +1,8 @@
-# The layer_norm operator's Triton backend: design 5.2's program package.
+# The layer_norm operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # Whether the layer has a bias is part of the compilation: a program without one
 # reads two affine parameters and skips an addition. The key is the one
@@ -12,6 +12,7 @@
 
 op = "layer_norm"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

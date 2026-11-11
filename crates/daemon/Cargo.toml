@@ -20,9 +20,9 @@ frontend.workspace = true
 futures.workspace = true
 http-body.workspace = true
 libc.workspace = true
-# The Program Server's client, which an epoch's programs are selected with
-# (`epoch`, the program layer of a change).
-program-server.workspace = true
+# The Build Server's client, which an epoch's modules are selected with
+# (`epoch`, the generation layer of a change).
+build-server.workspace = true
 prometheus-client.workspace = true
 prost.workspace = true
 processing.workspace = true

@@ -175,7 +175,8 @@ impl Projections {
             return Err(Error::config(format!(
                 "the AdaLN timestep pair computes in {time_type} over a {} embedding; the \
                  reference pins both to FP32",
-                ops::abi::name(embedding.dtype), time_type = ops::abi::name(time_type)
+                ops::abi::name(embedding.dtype),
+                time_type = ops::abi::name(time_type)
             )));
         }
         let dtype = self.dtype();
@@ -183,7 +184,8 @@ impl Projections {
         if output_table.dtype != dtype {
             return Err(Error::config(format!(
                 "the AdaLN tables are {} and the projections' weights are {dtype}",
-                ops::abi::name(output_table.dtype), dtype = ops::abi::name(dtype)
+                ops::abi::name(output_table.dtype),
+                dtype = ops::abi::name(dtype)
             )));
         }
 

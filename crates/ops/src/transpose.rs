@@ -93,10 +93,10 @@ fn matrix(view: &Operand, name: &str, dtype: DType) -> Result<(u64, u64)> {
         return Err(Error::argument(
             Transpose::NAME,
             format!(
-                        "expected {} {name}, found {}",
-                        abi::name(dtype),
-                        abi::name(view.dtype)
-                    ),
+                "expected {} {name}, found {}",
+                abi::name(dtype),
+                abi::name(view.dtype)
+            ),
         ));
     }
     if !contiguous(view) {
@@ -121,7 +121,7 @@ fn matrix(view: &Operand, name: &str, dtype: DType) -> Result<(u64, u64)> {
 }
 
 impl Op for Transpose {
-    const NAME: &'static str = proto::program::operator::TRANSPOSE;
+    const NAME: &'static str = proto::module::operator::TRANSPOSE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

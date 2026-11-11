@@ -74,7 +74,7 @@ fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
         .and_then(|inventory| inventory.ranks.first())
         .expect("the pool states its ranks");
     let ceilings = scheduler::ceilings_of(BatchCapacity::of(rank));
-    let program = scheduler::PolicyProgram {
+    let package = scheduler::PolicyPackage {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: scheduler::Parameters {
@@ -90,7 +90,7 @@ fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
     };
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(support::policy_module()));
-    response("the precopy", handle.precopy_policy(program, source))
+    response("the precopy", handle.precopy_policy(package, source))
         .expect("the policy is precopied");
     response("the switchover", handle.stage(Stage::Switchover)).expect("the policy serves");
 }

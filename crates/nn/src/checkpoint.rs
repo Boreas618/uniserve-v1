@@ -37,9 +37,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::Mmap;
 use ops::Shape;
-use uniserve_tensor::DType;
 use safetensors::Dtype as FormatDtype;
 use safetensors::SafeTensors;
+use uniserve_tensor::DType;
 
 use crate::adapter::{Adapter, Fusion};
 use crate::error::{Error, Result};
@@ -517,7 +517,10 @@ impl Checkpoint {
                     several.len(),
                     several
                         .iter()
-                        .map(|(dtype, example)| format!("{dtype} (such as `{example}`)", dtype = ops::abi::name(*dtype)))
+                        .map(|(dtype, example)| format!(
+                            "{dtype} (such as `{example}`)",
+                            dtype = ops::abi::name(*dtype)
+                        ))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),

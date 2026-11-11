@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `qk_norm_rope`'s kernel and check per-head normalization plus rotation, on the CPU.
 
-    crates/program-server/python/.venv/bin/python qk_norm_rope_check.py [--package DIR]
+    crates/build-server/python/.venv/bin/python qk_norm_rope_check.py [--package DIR]
 
 One program normalizes and rotates the query heads and then the key heads of a block of tokens:
 

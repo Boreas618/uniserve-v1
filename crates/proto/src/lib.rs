@@ -12,19 +12,19 @@
 //! - [`report`]: the schedulers' statistics an engine reports to its daemon.
 //! - [`profile`]: the profiling sessions the leader daemon starts on the
 //!   workers, JSON in worker hooks.
-//! - [`program`]: the programs an epoch fills its operators with, the phases
+//! - [`module`]: the package revisions an epoch fills its operators with, the phases
 //!   and slots they fill, and the operators a build has.
 //!
 //! Each connection opens with a hello exchange that compares
-//! [`PROTOCOL_MAJOR`]. [`Connection`] carries the messages,
+//! [`ENGINE_INTERFACE_VERSION`]. [`Connection`] carries the messages,
 //! one frame each, over a Unix socket on one node or TCP between nodes.
 
 pub mod catalog;
 pub mod config;
 mod connection;
 mod media;
+pub mod module;
 pub mod profile;
-pub mod program;
 pub mod report;
 pub mod request;
 mod shared_memory;
@@ -48,9 +48,18 @@ pub mod handoff {
     include!(concat!(env!("OUT_DIR"), "/uniserve.handoff.rs"));
 }
 
-/// The interfaces' version: peers of different versions refuse each other.
-/// It changes whenever a message changes.
-pub const PROTOCOL_MAJOR: u32 = 4;
+/// The version of the engine interface: every message an engine exchanges with
+/// the daemon (the process and request interfaces), the Storage Server and the
+/// Build Server. The interface has this one version. The engine package's
+/// manifest states it, an engine sends it in its hello, and a daemon refuses
+/// an engine built for another version. A change that only adds messages or
+/// fields leaves the version; any other change raises it.
+pub const ENGINE_INTERFACE_VERSION: u32 = 1;
+
+/// The environment variable that names a supervised process's lifeline: the
+/// descriptor number of the read end of a pipe whose write end its daemon
+/// holds. The process ends once the pipe does.
+pub const LIFELINE_ENV: &str = "UNISERVE_LIFELINE";
 
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled

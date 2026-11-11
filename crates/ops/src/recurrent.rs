@@ -54,7 +54,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Strides, Operand};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -219,7 +219,7 @@ pub struct CausalConv1dArgs {
 pub struct CausalConv1d;
 
 impl Op for CausalConv1d {
-    const NAME: &'static str = proto::program::operator::CAUSAL_CONV1D;
+    const NAME: &'static str = proto::module::operator::CAUSAL_CONV1D;
 
     type Descriptor = CausalConv1dDescriptor;
     type Args<'a> = CausalConv1dArgs;
@@ -444,7 +444,7 @@ pub struct GatedDeltaRuleArgs {
 pub struct GatedDeltaRule;
 
 impl Op for GatedDeltaRule {
-    const NAME: &'static str = proto::program::operator::GATED_DELTA_RULE;
+    const NAME: &'static str = proto::module::operator::GATED_DELTA_RULE;
 
     type Descriptor = GatedDeltaRuleDescriptor;
     type Args<'a> = GatedDeltaRuleArgs;

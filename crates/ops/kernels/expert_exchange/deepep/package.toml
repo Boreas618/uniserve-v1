@@ -1,7 +1,7 @@
-# The expert_exchange operator's deepep backend: design 5.2's program package.
+# The expert_exchange operator's deepep backend: design 5.2's package.
 #
 # DeepEP's elastic dispatch and combine, its kernels unchanged at deepseek-ai/DeepEP
-# commit b306af0 (the `deepep` pin of `uniserve_program_server.fetch`), with the host
+# commit b306af0 (the `deepep` pin of `uniserve_build_server.fetch`), with the host
 # code `src/exchange.cu` states in place of its Python extension and its run-time
 # compiler: a descriptor fixes every template argument, so a serving host compiles
 # nothing. The kernels are built against the device communicator of the NCCL this
@@ -13,6 +13,7 @@
 
 op = "expert_exchange"
 backend = "deepep"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

@@ -1,8 +1,8 @@
-# The gelu operator's Triton backend: design 5.2's program package.
+# The gelu operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # The approximation is part of the compilation: PyTorch's exact erf form and its
 # tanh form evaluate different formulas, and the module holds one. The key is the
@@ -12,6 +12,7 @@
 
 op = "gelu"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

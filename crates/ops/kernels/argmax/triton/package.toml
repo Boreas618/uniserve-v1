@@ -1,4 +1,4 @@
-# The argmax operator's Triton backend: design 5.2's program package.
+# The argmax operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py`.
@@ -8,6 +8,7 @@
 
 op = "argmax"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

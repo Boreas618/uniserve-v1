@@ -3,8 +3,8 @@
 ``spec`` states what this package's kernel needs for one descriptor: the
 kernel function, its argument signature in the order the operator launches
 them, the compile-time values the descriptor dimensions give, and the
-compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The values' element type, the condition's and the number of axes are compiled
 in. The shape and the three inputs' strides are words, so one module serves
@@ -13,7 +13,7 @@ every shape and every broadcast that traverses ``rank`` axes.
 
 import elementwise_where as kernels
 import strided
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 
 def spec(fields, parameters, target):

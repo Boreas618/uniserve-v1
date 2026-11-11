@@ -1,8 +1,8 @@
-# The topk_softmax operator's CUDA backend: design 5.2's program package.
+# The topk_softmax operator's CUDA backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # The module is a cubin. The descriptor bakes the scores a lane walks (the
 # expert count in whole warps) and the renormalizing butterfly's width (the
@@ -12,6 +12,7 @@
 
 op = "topk_softmax"
 backend = "nvcc"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

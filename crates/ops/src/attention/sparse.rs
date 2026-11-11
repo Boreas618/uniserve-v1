@@ -69,10 +69,10 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
-use uniserve_tensor::DType;
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
+use uniserve_tensor::DType;
 
 /// The largest value magnitude the sparse attention bound's absolute term is written for.
 ///
@@ -296,7 +296,7 @@ impl NativeCall for SparseCall {
 pub struct SparseAttention;
 
 impl Op for SparseAttention {
-    const NAME: &'static str = proto::program::operator::SPARSE_ATTENTION;
+    const NAME: &'static str = proto::module::operator::SPARSE_ATTENTION;
 
     type Descriptor = SparseDescriptor;
     type Args<'a> = SparseArgs;
@@ -401,7 +401,10 @@ impl Op for SparseAttention {
         if args.counts.dtype != DType::I32 {
             return Err(Error::argument(
                 operator,
-                format!("expected i32 counts, found {}", abi::name(args.counts.dtype)),
+                format!(
+                    "expected i32 counts, found {}",
+                    abi::name(args.counts.dtype)
+                ),
             ));
         }
         args.valid
@@ -409,7 +412,10 @@ impl Op for SparseAttention {
         if args.valid.dtype != DType::I32 {
             return Err(Error::argument(
                 operator,
-                format!("expected i32 valid sizes, found {}", abi::name(args.valid.dtype)),
+                format!(
+                    "expected i32 valid sizes, found {}",
+                    abi::name(args.valid.dtype)
+                ),
             ));
         }
         match (descriptor.lse, args.lse) {

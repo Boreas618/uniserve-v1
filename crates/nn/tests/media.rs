@@ -17,7 +17,7 @@ use nn::layers::{
 };
 use nn::tiling::{Axis, Blend, Grid, TiledDecode, TiledEncode, gather, voxels};
 use nn::vocoder::{BigVgan, BigVganSpec};
-use nn::{Arena, Checkpoint, DType, Forward, Shape, Operand, WeightLoader};
+use nn::{Arena, Checkpoint, DType, Forward, Operand, Shape, WeightLoader};
 
 /// The programs a walk reported, as `(operator, key)` pairs.
 #[derive(Default)]

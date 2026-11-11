@@ -112,7 +112,7 @@ pub(crate) fn serving_core(name: &str) -> SchedulerHandle {
 /// Starts a scheduler of the launch `args` over `fake` through the serving
 /// door, as an engine process starts one per rank, with the epoch's policy
 /// installed ([`policy_on`]): a scheduler with no policy decides nothing, and a
-/// fixture's engine has no Program Server to give it one.
+/// fixture's engine has no Build Server to give it one.
 pub(crate) fn fake_core(
     args: proto::config::EngineArgs,
     fake: Arc<FakeBatches>,
@@ -133,9 +133,9 @@ pub(crate) fn fake_core(
 /// steps (§7.3 steps 2 and 3): `Precopy`, then the switchover at a batch
 /// boundary.
 ///
-/// A deployed scheduler takes its policy from the Program Server while its
+/// A deployed scheduler takes its policy from the Build Server while its
 /// epoch starts; a fixture's has none, so every fixture that submits a
-/// request needs this. The program is the real module this tree builds, with
+/// request needs this. The package is the real module this tree builds, with
 /// the arguments of `core`'s own batch capacity — the limits it declares fit
 /// the ceilings the mechanism checks them against, so the precopy is answered
 /// with success rather than a refusal that would hide behind a fixture.
@@ -144,10 +144,10 @@ pub(crate) fn fake_core(
 /// states the command that builds the module.
 pub(crate) fn policy_on(core: &SchedulerHandle) {
     let capacity = scheduler::BatchCapacity::of(core.info());
-    let (program, module) = packaged_policy(capacity);
+    let (package, module) = packaged_policy(capacity);
     let source: std::sync::Arc<dyn scheduler::PolicySource + Send + Sync> =
         std::sync::Arc::new(scheduler::PolicyBytes::new(module));
-    core.precopy_policy(program, source)
+    core.precopy_policy(package, source)
         .recv_timeout(POLICY_ANSWER)
         .expect("the policy precopy is answered within the bound")
         .expect("the packaged policy's limits fit the scheduler's capacity");
@@ -185,7 +185,7 @@ pub(crate) const POLICY_BUILD: std::time::Duration = std::time::Duration::from_s
 /// service cannot.
 pub(crate) fn packaged_policy(
     capacity: scheduler::BatchCapacity,
-) -> (scheduler::PolicyProgram, Vec<u8>) {
+) -> (scheduler::PolicyPackage, Vec<u8>) {
     let (answered, answer) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = answered.send(testkit::packaged_policy(capacity));
@@ -233,13 +233,13 @@ pub(crate) fn fake_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     };
     let model_name = first.model_name().to_owned();
     // The control thread routes every submission by an instance of the same
-    // program the schedulers carry: `policy_on` installed it on each core, and
+    // package the schedulers carry: `policy_on` installed it on each core, and
     // the engine installs it here for the route. Without one the engine has no
     // policy to route a request with and refuses every submission.
     let policy = {
-        let (program, module) = packaged_policy(scheduler::BatchCapacity::of(first.info()));
+        let (package, module) = packaged_policy(scheduler::BatchCapacity::of(first.info()));
         testkit::EpochPolicy {
-            program,
+            package,
             module: std::sync::Arc::new(scheduler::PolicyBytes::new(module)),
         }
     };

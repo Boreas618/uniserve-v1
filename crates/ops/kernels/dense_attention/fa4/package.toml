@@ -1,4 +1,4 @@
-# The dense_attention operator's fa4 backend: design 5.2's program package.
+# The dense_attention operator's fa4 backend: design 5.2's package.
 #
 # One native module per descriptor: FlashAttention 4's Blackwell dense forward pass
 # over packed sequences, compiled through the vendor's own selection
@@ -13,9 +13,10 @@
 
 op = "dense_attention"
 backend = "fa4"
+interface_version = 1
 
 # The CuTe DSL this package is written for, as the toolchain reports it (`cutlass.__version__`);
-# the Program Server refuses a package whose version no host here has, so this must name the
+# the Build Server refuses a package whose version no host here has, so this must name the
 # environment the tree installs.
 [toolchain]
 kind = "cute_dsl"

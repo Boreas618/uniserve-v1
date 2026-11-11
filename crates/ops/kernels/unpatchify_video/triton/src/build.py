@@ -2,8 +2,8 @@
 
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
-dimensions give, and the compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+dimensions give, and the compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 Nothing of the raster is baked in: the channels, the token grid, the patch, the destination's three
 outer strides and the block all travel as words, so one module of a form serves every clip and every canvas, and a request shape the
@@ -14,7 +14,7 @@ operator before it reaches the kernel.
 """
 
 import unpatchify_video as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The element types the tokens, the scale, the bias and the raster may have.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}

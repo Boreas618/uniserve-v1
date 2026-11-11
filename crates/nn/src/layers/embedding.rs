@@ -5,8 +5,8 @@
 //! the layer all-reduces the result when it is sharded: the sum over ranks is the token's
 //! embedding.
 
-use ops::embedding::{self, Descriptor, Embedding as EmbeddingOp};
 use ops::Operand;
+use ops::embedding::{self, Descriptor, Embedding as EmbeddingOp};
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};

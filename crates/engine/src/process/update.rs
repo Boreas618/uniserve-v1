@@ -1,4 +1,4 @@
-//! The program-layer update inside one main process: its phases, its
+//! The generation update inside one main process: its phases, its
 //! bookkeeping and its decisions.
 //!
 //! The phases are the virtual machine's live-migration phases: precopy prepares
@@ -8,13 +8,13 @@
 //!
 //! This module is the main process's one record of the update - the generation
 //! numbers, the phase, and the devices' serving, prepared and retired
-//! generations with the programs each was built from - and its decision table.
-//! It calls no driver, no scheduler and no Program Server:
+//! generations with the packages each was built from - and its decision table.
+//! It calls no driver, no scheduler and no Build Server:
 //!
 //! - the precopy driver (`process::precopy`) resolves modules, builds each
 //!   device's `ops::Generation` and calls each rank's `precopy`;
 //! - the scheduler switches the policy at the batch boundary;
-//! - the control thread reports [`ipc::ProgramStatus`] and the daemon drives
+//! - the control thread reports [`ipc::GenerationStatus`] and the daemon drives
 //!   commit and revert.
 //!
 //! Keeping the phases here, without those parties, is what lets the rules of
@@ -28,11 +28,11 @@ use std::sync::Arc;
 
 use ipc::UpdateFailure;
 use ops::Generation;
-use proto::program::Programs;
+use proto::module::Packages;
 
 use worker::{Error, Result};
 
-/// What the main process is doing of the program layer.
+/// What the main process is doing of the generation layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     /// One generation serves and no update is in flight.
@@ -89,7 +89,7 @@ pub(crate) enum Action {
     Epoch,
 }
 
-/// One main process's program-layer update: which generation serves, which one
+/// One main process's generation update: which generation serves, which one
 /// is being installed, and what is left to purge.
 #[derive(Debug)]
 pub(crate) struct HotUpdate {
@@ -134,16 +134,16 @@ pub(crate) struct HotUpdate {
     pub(super) retired: Vec<Arc<Generation>>,
     /// The generation each device serves now, in `workers` order.
     pub(super) generations: Vec<Arc<Generation>>,
-    /// The kernel programs the serving generation was built from, by slot. The shadow
+    /// The kernel packages the serving generation was built from, by slot. The shadow
     /// pass pairs a *changed* operator's kernel with the one serving, so "changed" is a fact about
-    /// programs and never about generation numbers.
-    pub(super) serving_programs: Programs,
-    /// The programs of the generation `retired` holds: a revert serves that generation again, and
-    /// the changed set of the update after it is measured against the programs it serves under.
-    pub(super) retired_programs: Programs,
-    /// The programs of the generation `prepared` holds, waiting for the switchover to make them
+    /// packages and never about generation numbers.
+    pub(super) serving_packages: Packages,
+    /// The packages of the generation `retired` holds: a revert serves that generation again, and
+    /// the changed set of the update after it is measured against the packages it serves under.
+    pub(super) retired_packages: Packages,
+    /// The packages of the generation `prepared` holds, waiting for the switchover to make them
     /// serving.
-    pub(super) prepared_programs: Programs,
+    pub(super) prepared_packages: Packages,
 }
 
 impl HotUpdate {
@@ -162,9 +162,9 @@ impl HotUpdate {
             prepared: Vec::new(),
             retired: Vec::new(),
             generations: Vec::new(),
-            serving_programs: Programs::new(),
-            retired_programs: Programs::new(),
-            prepared_programs: Programs::new(),
+            serving_packages: Packages::new(),
+            retired_packages: Packages::new(),
+            prepared_packages: Packages::new(),
         }
     }
 
@@ -207,7 +207,7 @@ impl HotUpdate {
     /// refused, so a replayed command cannot move time backwards.
     pub(crate) fn begin_precopy(&mut self, generation: u64) -> Result<()> {
         if self.phase.updating() {
-            return Err(Error::State("a program-layer update is already in flight"));
+            return Err(Error::State("a generation update is already in flight"));
         }
         if generation <= self.current {
             return Err(Error::Invalid(format!(
@@ -433,8 +433,8 @@ impl HotUpdate {
 /// log record names the command; the state names the phase it found.
 fn unexpected(phase: Phase) -> Error {
     Error::State(match phase {
-        Phase::Serving => "no program-layer update is in flight",
-        _ => "the program-layer update is in another phase",
+        Phase::Serving => "no generation update is in flight",
+        _ => "the generation update is in another phase",
     })
 }
 

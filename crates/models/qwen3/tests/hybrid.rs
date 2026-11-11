@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use nn::PhaseKind;
 use nn::capability::{KvGroup, KvPlanes, KvView, StateLayer, StateView, TokenBatch};
 use nn::family::{CacheShape, Model, Split, TextModel, TextPlacement};
-use nn::{Checkpoint, DType, Shape, Operand, WeightLoader};
+use nn::{Checkpoint, DType, Operand, Shape, WeightLoader};
 
 /// The checkpoint the test reads, from `UNISERVE_QWEN36_MODEL`.
 fn checkpoint_root() -> PathBuf {

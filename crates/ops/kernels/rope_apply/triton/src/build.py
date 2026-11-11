@@ -9,7 +9,7 @@ narrower than the head.
 
 import rope_apply as kernels
 import triton
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The element types the operator's values and outputs take.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}

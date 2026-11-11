@@ -51,7 +51,7 @@ fn a_follower_joins_without_a_model() {
         executable: env!("CARGO_BIN_EXE_uniserve").into(),
         join_timeout: Duration::from_secs(10),
         devices: || Ok(Vec::new()),
-        program_server: program_server::command::Settings::default(),
+        build_server: build_server::command::Settings::default(),
     })
     .unwrap();
     assert!(leader.address().is_some());

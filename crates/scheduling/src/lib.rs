@@ -48,7 +48,7 @@ pub use scheduling_guest::Policy;
 pub use scheduling_guest::wire::Call;
 
 /// The wasmtime version this crate is built against, which a policy package
-/// declares in its `[toolchain]` and which the Program Server's
+/// declares in its `[toolchain]` and which the Build Server's
 /// `scheduling-precompile` reports (§5.2, §5.3).
 ///
 /// A precompiled module carries wasmtime's own artifact format and the
@@ -76,7 +76,7 @@ mod tests {
     }
 
     /// The default policies' packages declare the same wasmtime version: the
-    /// Program Server precompiles a package with the toolchain its manifest
+    /// Build Server precompiles a package with the toolchain its manifest
     /// names, and a module precompiled by another version does not load.
     #[test]
     fn the_default_policies_declare_the_same_wasmtime_version() {

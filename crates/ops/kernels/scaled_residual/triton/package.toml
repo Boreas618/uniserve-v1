@@ -1,8 +1,8 @@
-# The scaled_residual operator's Triton backend: design 5.2's program package.
+# The scaled_residual operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # The descriptor is the residual update's own: the element type, the row width, the
 # element tile one program walks, and whether the update carries a bias. The key is
@@ -11,6 +11,7 @@
 
 op = "scaled_residual"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

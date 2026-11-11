@@ -56,7 +56,7 @@
 //! which the worker's `check` and its staging both read: compare a column
 //! with the wrong one of the three and a legitimate batch is refused.
 //!
-//! - **commit**: the eight columns `proto::program::commit::column` names, one row per
+//! - **commit**: the eight columns `proto::module::commit::column` names, one row per
 //!   call: how the step advances the slot's device state. A decode advances by
 //!   its sampled token; a prefill that samples installs its token at the host
 //!   coordinates; a prefill that samples nothing only states its cache extent;
@@ -78,7 +78,7 @@ use ipc::execution::{
     StateDirection,
 };
 use ipc::{Call, CallKind, ForwardMode};
-use proto::program::commit;
+use proto::module::commit;
 use proto::request::SamplingParams;
 
 use super::slots;
@@ -158,7 +158,7 @@ const fn row_kind(kind: CallKind) -> Option<RowKind> {
 
 /// The sampler's parameter columns of one row.
 ///
-/// The order is `proto::program::sampler`'s, which fixes it for the kernels that read the
+/// The order is `proto::module::sampler`'s, which fixes it for the kernels that read the
 /// table (`PARAMETER_COLUMNS` columns per row): temperature, the top-k width,
 /// the nucleus threshold, the min-p threshold, then the repetition, frequency
 /// and presence penalties. The eighth column is named by no op — the sampler
@@ -236,12 +236,12 @@ impl StatePages {
     }
 }
 
-/// The sampler's columns per row (`proto::program::sampler::PARAMETER_COLUMNS`).
-pub(crate) const SAMPLER_PARAMETERS: usize = proto::program::sampler::PARAMETER_COLUMNS as usize;
+/// The sampler's columns per row (`proto::module::sampler::PARAMETER_COLUMNS`).
+pub(crate) const SAMPLER_PARAMETERS: usize = proto::module::sampler::PARAMETER_COLUMNS as usize;
 
 /// The column of a row's parameters that states its temperature
-/// (`proto::program::sampler::TEMPERATURE`).
-const TEMPERATURE_COLUMN: usize = proto::program::sampler::TEMPERATURE as usize;
+/// (`proto::module::sampler::TEMPERATURE`).
+const TEMPERATURE_COLUMN: usize = proto::module::sampler::TEMPERATURE as usize;
 
 /// The columns of the batch formed by `requests`, whose calls' rows embed the
 /// tokens `inputs` states for them and sample with the parameters `sampling`

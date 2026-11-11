@@ -62,7 +62,7 @@ mod worker;
 pub use crate::core::{SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,
-    EventSendError, EventTx, HookBarrier, PolicyPrograms, StageApplied, StreamCancelCause,
+    EventSendError, EventTx, HookBarrier, PolicyPackages, StageApplied, StreamCancelCause,
     Submission, SubmitError, Wake, WeightsInFlight,
 };
 pub use crate::worker::{
@@ -108,8 +108,8 @@ pub(crate) mod stats_report;
 pub use epoch::{GroupCache, ParkedCache};
 use ipc::ForwardMode;
 pub use policy::{
-    Arrival, BatchCapacity, Candidate, Limits, PREFETCH_FLOOR_TOKENS, Parameters, PolicyBytes,
-    PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress,
+    Arrival, BatchCapacity, Candidate, Limits, ModuleSource, PREFETCH_FLOOR_TOKENS, Parameters,
+    PolicyBytes, PolicyPackage, PolicyReverted, PolicySlot, PolicySource, PolicyUsage, Progress,
     RouteRefusal, RouteTrial, Router, Stage, TrialState, Validators, arrival_view, ceilings_of,
 };
 pub use proto::config::{

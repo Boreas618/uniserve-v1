@@ -3,7 +3,7 @@
 //! On the leader (node rank 0) the daemon also serves the deployment's
 //! application: the HTTP and OpenAI API, input and output processing, facts
 //! and migration. Every node's daemon supervises the node's processes, holds
-//! the node's Storage Server claim and makes sure its host's Program Server
+//! the node's Storage Server claim and makes sure its host's Build Server
 //! serves.
 //!
 //! A daemon started as the successor of one this build replaces
@@ -64,7 +64,7 @@ async fn serve(
         return daemon::node(
             config.admin_config,
             config.server_config,
-            config.program_config,
+            config.build_config,
             crate::served()?,
             crate::idle_devices,
             crate::shutdown_signal(),
@@ -73,7 +73,7 @@ async fn serve(
     }
     info!(model = %config.model(),
         resident_requests = config.max_running_requests,
-        worker_executable = %config.worker_config.executable.display(), "resolved serving options");
+        engine = %config.worker_config.engine, "resolved serving options");
     daemon::serve(
         config,
         stated,

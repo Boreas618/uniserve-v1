@@ -22,7 +22,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Strides, Operand};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -64,7 +64,7 @@ pub struct Args {
 pub struct ChannelAffine;
 
 impl Op for ChannelAffine {
-    const NAME: &'static str = proto::program::operator::CHANNEL_AFFINE;
+    const NAME: &'static str = proto::module::operator::CHANNEL_AFFINE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

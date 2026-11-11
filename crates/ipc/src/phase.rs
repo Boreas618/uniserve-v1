@@ -5,12 +5,12 @@
 //! it: a batch names the phase it is, and a runner declares the phases it
 //! serves. The engine owns the mapping from a model's `(BlockName, PhaseKind)`
 //! to a [`PhaseId`]; nothing on the other side of the crossing needs to know a
-//! block or a kernel program.
+//! block or a kernel package.
 //!
 //! The number is opaque on purpose. A scheduling policy runs as wasm and must
 //! not link CUDA or `ops`, so the identifier it carries is a plain number; a
-//! kernel-program selection key (`proto::program::PhaseKind`) is a different thing and
-//! stays where programs are selected.
+//! kernel-package selection key (`proto::module::PhaseKind`) is a different thing and
+//! stays where packages are selected.
 
 use std::fmt;
 

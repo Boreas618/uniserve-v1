@@ -37,8 +37,8 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 # The recorded-walk capture case builds its generation through nn's device bench, which asks a
-# running Program Server for the kernels a walk records.
-program-server.workspace = true
+# running Build Server for the kernels a walk records.
+build-server.workspace = true
 
 [lints]
 workspace = true

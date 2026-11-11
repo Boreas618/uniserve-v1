@@ -1,23 +1,23 @@
 //! Shared layers and the kernels they launch, run on a device against a host reference.
 //!
 //! Each case draws fixed-seed inputs, rounds them to the layer's element type, runs the layer's
-//! forward on the device with the kernels a Program Server builds for it, and compares every output
+//! forward on the device with the kernels a Build Server builds for it, and compares every output
 //! element with the same computation evaluated in `f64` on the host from the rounded inputs. The
 //! bound is the operator's own tolerance (`ops::Op::tolerance`, written from the reduction length,
 //! the accumulation type and the output type; `ops::tolerance` states its derivation), which bounds
 //! the distance between two correct implementations, so a host reference evaluated more exactly than
 //! either lies inside it.
 //!
-//! The cases need one GPU (`CUDA_VISIBLE_DEVICES`) and a running Program Server whose socket
-//! `UNISERVE_PROGRAM_SERVER_SOCKET` names; the server builds any module its store lacks on first
+//! The cases need one GPU (`CUDA_VISIBLE_DEVICES`) and a running Build Server whose socket
+//! `UNISERVE_BUILD_SERVER_SOCKET` names; the server builds any module its store lacks on first
 //! use:
 //!
 //! ```text
-//! uniserve program-server serve --daemon --socket <socket> \
+//! uniserve build-server serve --daemon --socket <socket> \
 //!     --package-root <store>/packages --store-root <store>/modules --target sm_100a \
-//!     --wasm <bin>/scheduling-precompile --python crates/program-server/python/.venv/bin/python \
+//!     --wasm <bin>/scheduling-precompile --python crates/build-server/python/.venv/bin/python \
 //!     --max-jobs 16
-//! UNISERVE_PROGRAM_SERVER_SOCKET=<socket> CUDA_VISIBLE_DEVICES=0 \
+//! UNISERVE_BUILD_SERVER_SOCKET=<socket> CUDA_VISIBLE_DEVICES=0 \
 //!     cargo test -p nn --test reference -- --ignored --test-threads=1
 //! ```
 
@@ -86,7 +86,7 @@ fn compare(
 /// `out[r, j] = Σ_i x[r, i] · w[j, i] + b[j]`. The operator's bound is the mixed-sign dot product's
 /// over `k` terms accumulated in FP32 and rounded once to BF16.
 #[test]
-#[ignore = "requires a CUDA device and a Program Server (UNISERVE_PROGRAM_SERVER_SOCKET)"]
+#[ignore = "requires a CUDA device and a Build Server (UNISERVE_BUILD_SERVER_SOCKET)"]
 fn a_linear_layer_matches_the_host_product() -> Outcome {
     let (rows, k, n) = (48_usize, 512_usize, 320_usize);
     let dtype = DType::BF16;
@@ -149,7 +149,7 @@ fn rms_reference(x: &[f32], weight: &[f32], eps: f64, gain: Gain) -> Vec<f64> {
 /// over rows of a width that is not a power of two. The operator's bound is a scale-type reduction
 /// of `columns` squares in FP32, rounded once to BF16.
 #[test]
-#[ignore = "requires a CUDA device and a Program Server (UNISERVE_PROGRAM_SERVER_SOCKET)"]
+#[ignore = "requires a CUDA device and a Build Server (UNISERVE_BUILD_SERVER_SOCKET)"]
 fn an_rms_norm_matches_the_host_normalization() -> Outcome {
     let (rows, width) = (33_usize, 1536_usize);
     let dtype = DType::BF16;
@@ -199,7 +199,7 @@ fn an_rms_norm_matches_the_host_normalization() -> Outcome {
 /// rounded once, and the normalized row is that of the unrounded sum. The operator's bound is the
 /// row's squares and the one add, in FP32, rounded once to BF16.
 #[test]
-#[ignore = "requires a CUDA device and a Program Server (UNISERVE_PROGRAM_SERVER_SOCKET)"]
+#[ignore = "requires a CUDA device and a Build Server (UNISERVE_BUILD_SERVER_SOCKET)"]
 fn a_residual_rms_norm_matches_the_host_add_and_normalization() -> Outcome {
     let (rows, width) = (17_usize, 2048_usize);
     let dtype = DType::BF16;
@@ -273,7 +273,7 @@ fn gated_silu(gate: &[f32], value: &[f32]) -> Vec<f64> {
 /// host product. The operators' bound is a few roundings of the output type and no reduction: three
 /// for `act_and_mul`'s SiLU, four for the SwiGLU order.
 #[test]
-#[ignore = "requires a CUDA device and a Program Server (UNISERVE_PROGRAM_SERVER_SOCKET)"]
+#[ignore = "requires a CUDA device and a Build Server (UNISERVE_BUILD_SERVER_SOCKET)"]
 fn a_gated_silu_matches_the_host_product_in_every_rounding_order() -> Outcome {
     let (rows, width) = (24_usize, 1408_usize);
     let dtype = DType::BF16;

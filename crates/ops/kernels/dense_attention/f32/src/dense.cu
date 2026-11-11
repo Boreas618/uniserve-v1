@@ -2,7 +2,7 @@
 //
 // The `dense_attention` operator's `f32` backend: the FP32 attention of the audio
 // encoder and the VSA compression branch (design 9, "FP32 attention: cuBLASLt
-// SGEMM and a softmax kernel program"). A native module whose entry
+// SGEMM and a softmax kernel package"). A native module whose entry
 // `uniserve_dense_attention` runs one call — packed sequences, no cache, no page
 // table.
 //
@@ -74,7 +74,7 @@
 
 // The export name and the mask, defined by `src/build.py` from the package's
 // manifest and the descriptor. The defaults keep this file readable by itself and
-// are never what a module the Program Server builds carries.
+// are never what a module the Build Server builds carries.
 #ifndef UNISERVE_ENTRY
 #define UNISERVE_ENTRY uniserve_dense_attention
 #endif

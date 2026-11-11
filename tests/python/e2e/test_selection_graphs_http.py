@@ -27,7 +27,7 @@ from tests.python.e2e.http_helpers import (
     qwen3_checkpoint,
     require_uniserve_binary,
     server_process,
-    worker_executable,
+    engine_selection,
 )
 
 pytestmark = [
@@ -64,8 +64,7 @@ def graphs(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--set",
         "dtype=bfloat16",
         "--set",

@@ -1,8 +1,8 @@
-# The frame_pad operator's Triton backend: design 5.2's program package.
+# The frame_pad operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # The descriptor is the padding's own tile: the element type, whether the rows and
 # columns beside the source are mirrored rather than replicated, and the columns
@@ -17,6 +17,7 @@
 
 op = "frame_pad"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

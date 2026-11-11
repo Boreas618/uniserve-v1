@@ -6,7 +6,7 @@ program loops over the row's tiles, so no block covers the whole row.
 """
 
 import filter_candidates as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The candidate id dtype: read by the operators after this one.
 IDS = {"i32": "i32", "i64": "i64"}

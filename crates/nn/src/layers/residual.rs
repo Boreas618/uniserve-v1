@@ -14,9 +14,9 @@
 //! mathematics and never the kernel. An all-ones channel scale is not a fourth form: it rounds
 //! exactly as the unscaled add does, so a block whose scale is one has no scale.
 
+use ops::Operand;
 use ops::modulation::{self, GatedResidual as GatedResidualOp};
 use ops::residual::{self, ScaledAdd, ScaledResidual};
-use ops::Operand;
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};

@@ -28,7 +28,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Strides, Operand};
+use crate::tensor::{Operand, Strides};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -92,7 +92,7 @@ pub struct Args {
 pub struct Gelu;
 
 impl Op for Gelu {
-    const NAME: &'static str = proto::program::operator::GELU;
+    const NAME: &'static str = proto::module::operator::GELU;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

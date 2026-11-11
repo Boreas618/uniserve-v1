@@ -33,7 +33,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -98,7 +98,7 @@ pub struct WeightedRmsNormArgs {
 pub struct WeightedRmsNorm;
 
 impl Op for WeightedRmsNorm {
-    const NAME: &'static str = proto::program::operator::WEIGHTED_RMS_NORM;
+    const NAME: &'static str = proto::module::operator::WEIGHTED_RMS_NORM;
 
     type Descriptor = WeightedRmsNormDescriptor;
     type Args<'a> = WeightedRmsNormArgs;
@@ -220,7 +220,7 @@ pub struct ScaledResidualRmsNormArgs {
 pub struct ScaledResidualRmsNorm;
 
 impl Op for ScaledResidualRmsNorm {
-    const NAME: &'static str = proto::program::operator::SCALED_RESIDUAL_RMS_NORM;
+    const NAME: &'static str = proto::module::operator::SCALED_RESIDUAL_RMS_NORM;
 
     type Descriptor = ScaledResidualRmsNormDescriptor;
     type Args<'a> = ScaledResidualRmsNormArgs;
@@ -387,7 +387,7 @@ pub struct ScaledResidualLayerNormArgs {
 pub struct ScaledResidualLayerNorm;
 
 impl Op for ScaledResidualLayerNorm {
-    const NAME: &'static str = proto::program::operator::SCALED_RESIDUAL_LAYER_NORM;
+    const NAME: &'static str = proto::module::operator::SCALED_RESIDUAL_LAYER_NORM;
 
     type Descriptor = ScaledResidualLayerNormDescriptor;
     type Args<'a> = ScaledResidualLayerNormArgs;
@@ -540,7 +540,7 @@ pub struct ScaledResidualArgs {
 pub struct ScaledResidual;
 
 impl Op for ScaledResidual {
-    const NAME: &'static str = proto::program::operator::SCALED_RESIDUAL;
+    const NAME: &'static str = proto::module::operator::SCALED_RESIDUAL;
 
     type Descriptor = ScaledResidualDescriptor;
     type Args<'a> = ScaledResidualArgs;
@@ -659,12 +659,7 @@ fn check_descriptor(operator: &'static str, columns: u32, tile: u32) -> Result<(
 /// per-step upload. So a scale of one element is the broadcast form: the kernel indexes it by
 /// `element % scale_width`, which is the column for `[columns]` and index 0 for `[1]`. The width
 /// travels as a launch argument, so both forms are the same program and neither moves a key.
-fn scale_width(
-    operator: &'static str,
-    scale: &Operand,
-    dtype: DType,
-    columns: u64,
-) -> Result<u32> {
+fn scale_width(operator: &'static str, scale: &Operand, dtype: DType, columns: u64) -> Result<u32> {
     let width = scale.shape.numel();
     if scale.shape.rank() != 1 || (width != 1 && width != columns) {
         return Err(Error::argument(
@@ -748,7 +743,7 @@ pub struct SigmoidGatedAddArgs {
 pub struct SigmoidGatedAdd;
 
 impl Op for SigmoidGatedAdd {
-    const NAME: &'static str = proto::program::operator::SIGMOID_GATED_ADD;
+    const NAME: &'static str = proto::module::operator::SIGMOID_GATED_ADD;
 
     type Descriptor = SigmoidGatedAddDescriptor;
     type Args<'a> = SigmoidGatedAddArgs;
@@ -826,8 +821,8 @@ impl Op for SigmoidGatedAdd {
         // relative to the output's largest magnitude.
         Tolerance {
             atol: 0.0,
-            rtol: (2.0 * tolerance::unit_roundoff(descriptor.dtype) + 4.0 * tolerance::unit_roundoff(DType::F32))
-                as f32,
+            rtol: (2.0 * tolerance::unit_roundoff(descriptor.dtype)
+                + 4.0 * tolerance::unit_roundoff(DType::F32)) as f32,
             cancels: true,
         }
     }
@@ -888,7 +883,7 @@ pub struct ScaledAddArgs {
 pub struct ScaledAdd;
 
 impl Op for ScaledAdd {
-    const NAME: &'static str = proto::program::operator::SCALED_ADD;
+    const NAME: &'static str = proto::module::operator::SCALED_ADD;
 
     type Descriptor = ScaledAddDescriptor;
     type Args<'a> = ScaledAddArgs;
@@ -1094,7 +1089,8 @@ mod scaled_add_tests {
     #[test]
     fn the_bound_is_the_targets_two_roundings_plus_the_sources_representation() {
         let bound = <ScaledAdd as Op>::tolerance(&descriptor(DType::BF16, DType::F32));
-        let expected = 2.0 * tolerance::unit_roundoff(DType::BF16) as f32 + tolerance::unit_roundoff(DType::F32) as f32;
+        let expected = 2.0 * tolerance::unit_roundoff(DType::BF16) as f32
+            + tolerance::unit_roundoff(DType::F32) as f32;
         assert_eq!(bound.rtol, expected);
         assert_eq!(bound.atol, 0.0);
     }

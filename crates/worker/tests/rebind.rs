@@ -12,7 +12,7 @@
 //!   correctly and can never be rebound - the state the slice was in while the operator launches went
 //!   unreported;
 //! - **the node table names the operator and its descriptor key**, so `Graphs::using` can say which
-//!   buckets launch an operator a program update changes;
+//!   buckets launch an operator a generation update changes;
 //! - **a rebound graph launches the walk's parameters, not the ones it was captured with.** The probe
 //!   adds `value` to every word, so the captured graph leaves 7s and the rebound one leaves 21s: if
 //!   `rebind_launch` set nothing, the replay yields the captured value and this test fails.
@@ -40,12 +40,15 @@ use std::sync::{Arc, Mutex};
 
 use ipc::execution::{Shape as PlanShape, Variant};
 use nn::forward::Forward;
-use ops::{Arguments, CubinMetadata, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op, Shape, Operand, Tolerance, Twins, descriptor};
-use uniserve_tensor::DType;
+use ops::{
+    Arguments, CubinMetadata, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op, Operand,
+    Shape, Tolerance, Twins, descriptor,
+};
 use platform::{
     Allocator, Budget, Buffer, CaptureMode, Device, DeviceId, GraphNodeKind, PinnedBuffer,
     PoolKind, Stream, memcpy_async, memset_d32,
 };
+use uniserve_tensor::DType;
 use worker::captured::Captured;
 use worker::graph::Graphs;
 use worker::plan::Bucket;
@@ -230,7 +233,7 @@ fn a_rebound_bucket_launches_the_walk_s_parameters() {
         words: WORDS as u32,
     };
     let key = descriptor::key(&descriptor);
-    // The serving generation and the one a program update prepares. The keys are the same - the two
+    // The serving generation and the one a generation update prepares. The keys are the same - the two
     // programs are keyed by the same descriptor - so what the rebind moves is the parameters.
     let serving = Generation::new(
         1,
@@ -552,7 +555,7 @@ fn a_revert_after_a_recapture_replays_the_serving_generation_bitwise() {
         replay(&serving, &serving_buffer),
         reference,
         "the rebind reached the serving generation's graph: its parameters are one executable's, \
-         not the template's, which is what makes a revert possible after a program update"
+         not the template's, which is what makes a revert possible after a generation update"
     );
 }
 

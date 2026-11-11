@@ -84,7 +84,7 @@ pub struct Args {
 pub struct CopyStrided;
 
 impl Op for CopyStrided {
-    const NAME: &'static str = proto::program::operator::COPY_STRIDED;
+    const NAME: &'static str = proto::module::operator::COPY_STRIDED;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

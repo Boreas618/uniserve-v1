@@ -14,8 +14,8 @@ and pixels, then ``rsqrt(var + eps)``.
                             [--height 9] [--width 7] [--epsilon 1e-6] [--cpu-only]
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory with ``module.so``. Run it on
-the GPU host with the Program Server's own environment
-(``crates/program-server/python/.venv/bin/python``), which has torch. Without a device,
+the GPU host with the Build Server's own environment
+(``crates/build-server/python/.venv/bin/python``), which has torch. Without a device,
 ``--cpu-only`` checks the call structure and the entry's refusal on the host.
 
 **The strides are the model's layout.** The check builds `[1, channels, frames, height, width]`

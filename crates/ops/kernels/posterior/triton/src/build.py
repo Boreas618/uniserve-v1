@@ -11,7 +11,7 @@ throughout and the FP16 round trip is inside the kernel.
 """
 
 import posterior as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: Triton's element type for the one element type this operator computes in.
 POINTER = "*fp32"

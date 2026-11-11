@@ -30,7 +30,7 @@
 //! The query halves are gathered into a packed tensor for the normalization and rotation, and the
 //! gate halves are read where the projection wrote them.
 
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
 use uniserve_tensor::DType;
 
 use crate::capability::{KvLayer, KvView, TokenBatch};
@@ -277,11 +277,7 @@ impl QkvAttention {
     /// A gated projection `[rows, heads · 2 · head_dim]` as its packed queries
     /// `[rows, heads, head_dim]`, gathered from the projection, and its gates
     /// `[rows · heads, head_dim]`, read in place.
-    fn split_gate(
-        &self,
-        f: &Forward,
-        projected: Operand,
-    ) -> Result<(Operand, Option<Operand>)> {
+    fn split_gate(&self, f: &Forward, projected: Operand) -> Result<(Operand, Option<Operand>)> {
         let rows = projected.rows();
         let heads = u64::from(self.heads);
         let head_dim = u64::from(self.head_dim);

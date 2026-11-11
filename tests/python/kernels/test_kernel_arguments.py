@@ -28,7 +28,7 @@ KEYS = "UNISERVE_KERNEL_KEYS"
 STORE = "UNISERVE_KERNEL_STORE"
 
 #: The architecture the store was built for, as the GPU tests name it.
-TARGET = "UNISERVE_PROGRAM_TARGET"
+TARGET = "UNISERVE_MODULE_TARGET"
 
 
 @pytest.mark.parametrize("native", [False, True], ids=["cells", "native"])

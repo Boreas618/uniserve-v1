@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `gelu`'s kernel and check both of PyTorch's GELU forms, on the CPU.
 
-    TRITON_INTERPRET=1 crates/program-server/python/.venv/bin/python gelu_check.py [--package DIR]
+    TRITON_INTERPRET=1 crates/build-server/python/.venv/bin/python gelu_check.py [--package DIR]
 
 ```text
 exact:  0.5 · x · (1 + erf(x / √2))

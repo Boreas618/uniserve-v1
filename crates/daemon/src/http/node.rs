@@ -60,9 +60,9 @@ struct Node {
     /// The token that brings the current deployment down.
     current: Mutex<Option<CancellationToken>>,
     server: ServerConfig,
-    /// The host's Program Server, which a deployment that configures none resolves its programs
+    /// The host's Build Server, which a deployment that configures none resolves its modules
     /// at.
-    program_config: program_server::command::Settings,
+    build_config: build_server::command::Settings,
     /// The model families the executable serves.
     families: processing::Registry,
     /// Reads this host's idle devices, for each deployment's daemon.
@@ -83,7 +83,7 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub async fn node(
     admin: AdminConfig,
     server: ServerConfig,
-    program_config: program_server::command::Settings,
+    build_config: build_server::command::Settings,
     families: processing::Registry,
     devices: crate::supervision::DeviceProbe,
     shutdown: CancellationToken,
@@ -97,7 +97,7 @@ pub async fn node(
         last_error: Mutex::new(None),
         current: Mutex::new(None),
         server: server.clone(),
-        program_config,
+        build_config,
         families,
         devices,
     });
@@ -217,8 +217,8 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
     }
     // The node's server serves the deployment's routes.
     config.server_config = node.server.clone();
-    if config.program_config == program_server::command::Settings::default() {
-        config.program_config = node.program_config.clone();
+    if config.build_config == build_server::command::Settings::default() {
+        config.build_config = node.build_config.clone();
     }
     if let Err(error) = config.validate(&stated) {
         return ApiError::invalid_request(format!("{error:#}"), Some("config")).into_response();
@@ -293,7 +293,7 @@ async fn serve_deployment(
         .context("starting the epoch layer's thread")?;
     let served = async {
         // The daemon's channel down to the main processes, which the epoch's
-        // first program switch commands through.
+        // first package switch commands through.
         let commands = daemon.commands();
         let engine = tokio::select! {
             engine = Leader::start(&node.families, config, stated, address, commands.as_ref(), updates) => {

@@ -65,13 +65,13 @@ OPTIONS = (
 
 @pytest.fixture(scope="module")
 def served(
-    tmp_path_factory: pytest.TempPathFactory, program_server: Path
+    tmp_path_factory: pytest.TempPathFactory, build_server: Path
 ) -> Iterator[str]:
     """A Qwen3 deployment serving with fence probes on its transformer
     layers, which the module's tests share.
     """  # noqa: D205
     with serve(
-        tmp_path_factory.mktemp("served"), OPTIONS, program_server
+        tmp_path_factory.mktemp("served"), OPTIONS, build_server
     ) as base_url:
         yield base_url
 

@@ -68,9 +68,9 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
     stop_storage_server,
-    worker_executable,
+    engine_selection,
 )
-from tests.python.e2e.program_server import remote_program_server
+from tests.python.e2e.build_server import remote_build_server
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
@@ -185,8 +185,7 @@ def _serve_command(
         host,
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--set",
         "dtype=bfloat16",
         "--set",
@@ -229,7 +228,7 @@ def _environment() -> dict[str, str]:
             "LD_LIBRARY_PATH",
             "PYTHONPATH",
             "MAX_JOBS",
-            "UNISERVE_PROGRAM_SERVER_PYTHON",
+            "UNISERVE_BUILD_SERVER_PYTHON",
             "FLASHINFER_WORKSPACE_BASE",
             "UCX_NET_DEVICES",
         )
@@ -253,7 +252,7 @@ def _follower_deployment(
     log: Path, port: int, devices: str, extra: list[str]
 ) -> Iterator[tuple[str, str]]:
     """Deployment B on the second host, its own Storage Server started first
-    with a TCP endpoint and NIXL, and its own Program Server.
+    with a TCP endpoint and NIXL, and its own Build Server.
 
     Yields B's HTTP base URL and its runtime directory there; on exit it
     stops the daemon and the Storage Server, keeping their logs beside `log`.
@@ -272,10 +271,10 @@ def _follower_deployment(
         f"mkdir -p -m 700 {runtime}/uniserve && env {environment} "
         + shlex.join(_storage_command(socket, f"{address}:0"))
     )
-    with remote_program_server(FOLLOWER) as programs:
+    with remote_build_server(FOLLOWER) as modules:
         command = _serve_command(qwen3_checkpoint(), port, "0.0.0.0") + [
             "--set",
-            f"program_config.socket={programs}",
+            f"build_config.socket={modules}",
             *extra,
         ]
         remote = (

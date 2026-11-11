@@ -30,10 +30,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use nn::capability::{Clip, DecodedMedia, Decoder, Splicer};
-use ops::{Shape, Operand};
-use uniserve_tensor::DType;
+use ops::{Operand, Shape};
 use platform::DeviceId;
 use proto::video::Layout;
+use uniserve_tensor::DType;
 
 use crate::arena::Pools;
 use crate::batch::{Job, Jobs, answered};
@@ -566,11 +566,16 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         if published.dtype != self.latent {
             return Err(Error::Invalid(format!(
                 "the decoder reads its latents as {} and the denoiser published {}",
-                ops::abi::name(self.latent), ops::abi::name(published.dtype)
+                ops::abi::name(self.latent),
+                ops::abi::name(published.dtype)
             )));
         }
-        let element = ops::abi::bytes(published.dtype)
-            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", ops::abi::name(published.dtype))))?;
+        let element = ops::abi::bytes(published.dtype).ok_or_else(|| {
+            Error::Invalid(format!(
+                "{} has no whole-byte size",
+                ops::abi::name(published.dtype)
+            ))
+        })?;
         let elements = published.bytes / element;
         if self
             .trajectory
@@ -583,8 +588,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             .trajectory
             .as_ref()
             .ok_or_else(|| Error::Invariant("the trajectory column was just sized".into()))?;
-        let destination =
-            Operand::new(column.device.ptr, published.dtype, Shape::new(&[elements]));
+        let destination = Operand::new(column.device.ptr, published.dtype, Shape::new(&[elements]));
         if !store.copy_into(request, Product::VideoLatents, &destination, &self.stream)? {
             return Err(crate::runners::products::absent(
                 request,
@@ -1060,11 +1064,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
     /// happen before the next decode, which writes over the clip's column. Both columns are pinned
     /// host memory, which the driver's `cuMemcpyAsync` copies on the host once the stream drains, so
     /// the copy is a kernel: a memcpy here held the device thread for the whole decode.
-    fn keep_tail(
-        &self,
-        forward: &nn::Forward<'_>,
-        splicing: &Splicing,
-    ) -> Result<Option<Operand>> {
+    fn keep_tail(&self, forward: &nn::Forward<'_>, splicing: &Splicing) -> Result<Option<Operand>> {
         let overlap = splicing.successor;
         let Some(tail) = splicing.tail else {
             return Ok(None);

@@ -47,10 +47,10 @@ REPOSITORY = pathlib.Path(__file__).resolve().parents[1]
 OPS = REPOSITORY / "crates/ops/src"
 KERNELS = REPOSITORY / "crates/ops/kernels"
 
-# A package's `build.py` imports its compile driver from the Program Server's Python package, so
+# A package's `build.py` imports its compile driver from the Build Server's Python package, so
 # the package's source is importable from this tree whichever interpreter runs the tool.
-sys.path.insert(0, str(REPOSITORY / "crates/program-server/python/src"))
-from uniserve_program_server import package as program_package  # noqa: E402
+sys.path.insert(0, str(REPOSITORY / "crates/build-server/python/src"))
+from uniserve_build_server import package as driver_package  # noqa: E402
 
 #: The parameters the compiler's launcher appends to every Triton kernel.
 IMPLICIT = 2
@@ -144,25 +144,6 @@ def packed(operator):
 
 
 
-def split_key_or_none(dimensions, key):
-    """The key's pairs when every dimension it names is declared, else None."""
-    if not dimensions:
-        return None
-    names = sorted(dimensions, key=len, reverse=True)
-    rest, pairs = key, []
-    while rest:
-        name = next((n for n in names if rest.startswith(n) and rest[len(n):].startswith("_")), None)
-        if name is None:
-            return None
-        after = rest[len(name) + 1:]
-        ends = [end for end in (after.find("_" + n + "_") for n in names) if end >= 0]
-        end = min(ends) if ends else len(after)
-        if not after[:end]:
-            return None
-        pairs.append((name, after[:end]))
-        rest = after[end:].lstrip("_")
-    return pairs
-
 def module_parameters(operator, key):
     """The parameter count a module's PTX declares, and its declared signature's length."""
     for manifest_path in KERNELS.glob(f"{operator}/*/package.toml"):
@@ -170,27 +151,12 @@ def module_parameters(operator, key):
         if not (source / "build.py").exists():
             continue
         manifest = tomllib.loads(manifest_path.read_text())
-        descriptors = manifest.get("kernel", {}).get("descriptors", {})
-        # A package may declare one table of shapes or one per shape (`[[kernel.descriptors]]`);
-        # a key is parsed against the table of the shape it covers.
-        if isinstance(descriptors, list):
-            tables = descriptors
-        else:
-            tables = [descriptors] if descriptors else []
-        dimensions = {}
-        for table in tables:
-            names = table.get("dimensions") or {}
-            if split_key_or_none(names, key) is not None:
-                dimensions = names
-                break
-        if not dimensions and tables:
-            dimensions = tables[0].get("dimensions") or {}
         sys.path.insert(0, str(source))
         try:
             spec_module = importlib.util.spec_from_file_location("build", source / "build.py")
             module = importlib.util.module_from_spec(spec_module)
             spec_module.loader.exec_module(module)
-            fields = program_package.read_key(key, dimensions)
+            fields = driver_package.read_fields(source.parent, key)
             described = module.spec(fields, manifest.get("parameters", {}), "sm_100a")
             import triton
             from triton.backends.compiler import GPUTarget
@@ -212,7 +178,7 @@ def module_parameters(operator, key):
                 if line.strip().startswith(".param")
             )
             return parameters, declared
-        except (SystemExit, program_package.DescriptorKeyError) as error:
+        except (SystemExit, ValueError) as error:
             # The key reader refused the key: the row is not covered by that package, so
             # there is no module to compare against.
             return f"not covered: {error}", None

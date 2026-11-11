@@ -1,4 +1,4 @@
-// Three program generations of one operator, and the deviation the test reads.
+// Three module generations of one operator, and the deviation the test reads.
 //
 // The operator adds `value` to each word of the activation, in the word's own integer domain.
 // `probe_exact` and `probe_equivalent` compute the same number - the same addition with the

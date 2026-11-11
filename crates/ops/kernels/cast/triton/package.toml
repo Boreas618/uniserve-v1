@@ -1,8 +1,8 @@
-# The cast operator's Triton backend: design 5.2's program package.
+# The cast operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # `out[i] = convert(x[i])` over an input read through its strides, into a
 # contiguous output of another element type: low bits between integers, a
@@ -21,6 +21,7 @@
 
 op = "cast"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

@@ -1,5 +1,5 @@
-//! A recorded start: the programs a deployment's main process launches, read from the start a
-//! serving process makes, with nothing served (`uniserve programs`).
+//! A recorded start: the packages a deployment's main process launches, read from the start a
+//! serving process makes, with nothing served (`uniserve packages`).
 //!
 //! [`record`] takes the launch a serving main process is started with and runs its start to the
 //! point where every device's worker has recorded its runners' walk ([`Worker::recorded`]): the
@@ -12,7 +12,7 @@
 //!   resident memory is storage of this process's own;
 //! - no NCCL communicator: a parallel group states its split ([`nn::Group::recording`]), which is
 //!   all a recording forward reads of it;
-//! - no Program Server, scheduler, shadow region or warmup.
+//! - no Build Server, scheduler, shadow region or warmup.
 //!
 //! The devices are used: the resident memory, the graph pools and the runners' columns are device
 //! allocations, as they are when a serving process starts. Because no weight is mapped, the
@@ -32,10 +32,10 @@ use super::launch::Epoch;
 use super::ranks::{Backing, Meeting, load_ranks};
 use crate::rank::ModelRunner;
 
-/// Every program a main process launches: descriptor keys by operator name (`ops::Op::NAME`).
+/// Every package a main process launches: descriptor keys by operator name (`ops::Op::NAME`).
 pub type Recorded = BTreeMap<String, BTreeSet<String>>;
 
-/// Records the programs the main process `launch` describes would launch, the union of its
+/// Records the packages the main process `launch` describes would launch, the union of its
 /// devices' recorded walks, and releases everything it started. Its checkpoint is served by the
 /// family of `catalogue` that claims the class it declares.
 ///

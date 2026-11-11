@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `vsa_select_tiles` and check it against the operator's stated ranking, on the CPU.
 
-    TRITON_INTERPRET=1 crates/program-server/python/.venv/bin/python selection_check.py [--package DIR]
+    TRITON_INTERPRET=1 crates/build-server/python/.venv/bin/python selection_check.py [--package DIR]
 
 The output is indices and counts, and the operator declares them **exact**: the selection is a total
 order over the scores, not an approximation of one. So the reference here is not the tree's other

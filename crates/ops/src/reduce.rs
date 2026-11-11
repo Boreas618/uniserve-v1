@@ -180,7 +180,7 @@ fn split(x: &Operand, axes: &[usize]) -> (Operand, Operand) {
 }
 
 impl Op for Reduce {
-    const NAME: &'static str = proto::program::operator::REDUCE;
+    const NAME: &'static str = proto::module::operator::REDUCE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args<'a>;
@@ -310,7 +310,11 @@ impl Op for Reduce {
         if descriptor.function == Function::Sum && dtype.is_float() {
             // Terms of either sign accumulated in the computing type, in whatever order a program
             // takes them, and rounded once into the element type: the bound of the class.
-            return Tolerance::dot(u64::from(descriptor.reduction), tolerance::accumulate(dtype), dtype);
+            return Tolerance::dot(
+                u64::from(descriptor.reduction),
+                tolerance::accumulate(dtype),
+                dtype,
+            );
         }
         // An integer sum wraps the same way in any order; a minimum or a maximum is one of the
         // input's values, and an index that differs names another element.

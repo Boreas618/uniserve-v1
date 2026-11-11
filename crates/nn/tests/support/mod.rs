@@ -1,5 +1,5 @@
 //! What the device cases of nn's integration tests share: fixed-seed inputs, the element codecs
-//! of the float types, and a bench that runs a layer's forward on a device with kernels a Program
+//! of the float types, and a bench that runs a layer's forward on a device with kernels a Build
 //! Server supplies.
 //!
 //! Each test file that declares `mod support;` compiles its own copy and uses part of it.
@@ -10,7 +10,7 @@ use ops::values::{f16_to_f32, f32_to_bf16, f32_to_f16};
 
 pub(crate) mod device;
 
-/// Every harness failure: a missing asset, a refused launch, a device or Program Server error.
+/// Every harness failure: a missing asset, a refused launch, a device or Build Server error.
 pub(crate) type Outcome<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 // ---- Fixed-seed inputs ----------------------------------------------------------------------
@@ -72,7 +72,13 @@ pub(crate) fn encode(dtype: DType, values: &[f32]) -> Outcome<Vec<u8>> {
             .iter()
             .flat_map(|value| f32_to_bf16(*value).to_le_bytes())
             .collect(),
-        other => return Err(format!("no float encoding for {other}", other = ops::abi::name(other)).into()),
+        other => {
+            return Err(format!(
+                "no float encoding for {other}",
+                other = ops::abi::name(other)
+            )
+            .into());
+        }
     })
 }
 
@@ -97,6 +103,12 @@ pub(crate) fn decode(dtype: DType, bytes: &[u8]) -> Outcome<Vec<f32>> {
             .iter()
             .map(|half| f32::from_bits(u32::from(u16::from_le_bytes(*half)) << 16))
             .collect(),
-        other => return Err(format!("no float decoding for {other}", other = ops::abi::name(other)).into()),
+        other => {
+            return Err(format!(
+                "no float decoding for {other}",
+                other = ops::abi::name(other)
+            )
+            .into());
+        }
     })
 }

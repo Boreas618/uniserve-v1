@@ -1,7 +1,7 @@
 //! Shadow execution: run a changed operator's new kernel beside its old one and compare.
 //!
-//! Precopy checks a program-layer update on real work before switchover: for
-//! every operator whose kernel program changed, one paired forward runs on the batch's stream
+//! Precopy checks a generation update on real work before switchover: for
+//! every operator whose kernel package changed, one paired forward runs on the batch's stream
 //! without a graph, where the old kernel writes the real outputs and the new one writes twins
 //! (`Op::shadow`), and the two results are compared element by element within `Op::tolerance`.
 //!
@@ -32,8 +32,8 @@
 use std::sync::Arc;
 
 use ops::{Operand, Tolerance, Twins};
-use uniserve_tensor::DType;
 use platform::{DeviceId, PinnedBuffer, Stream};
+use uniserve_tensor::DType;
 
 use crate::{Error, Result};
 

@@ -15,9 +15,9 @@
 use ops::attention::dense::{DenseArgs, DenseAttention as DenseOp, DenseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention as PagedOp, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvWrite, KvWriteScaled};
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
+use proto::module::PhaseKind;
 use uniserve_tensor::DType;
-use proto::program::PhaseKind;
 
 use crate::capability::{KvGroup, KvLayer, TokenBatch};
 #[cfg(any(doc, test))]
@@ -412,7 +412,9 @@ impl PagedAttention {
                     format!(
                         "the cache is {} keys and {} values over {} projections: a cache is the \
                          projections' own type or E4M3 in both planes",
-                        ops::abi::name(planes.key.dtype), ops::abi::name(planes.value.dtype), ops::abi::name(key.dtype)
+                        ops::abi::name(planes.key.dtype),
+                        ops::abi::name(planes.value.dtype),
+                        ops::abi::name(key.dtype)
                     ),
                 ));
             }
@@ -517,7 +519,10 @@ impl PagedAttention {
         if table.dtype != DType::I32 {
             return Err(Error::shape(
                 "PagedAttention::attend",
-                format!("the page table is {} pages, not i32", ops::abi::name(table.dtype)),
+                format!(
+                    "the page table is {} pages, not i32",
+                    ops::abi::name(table.dtype)
+                ),
             ));
         }
         Ok(())

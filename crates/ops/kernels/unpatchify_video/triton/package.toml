@@ -1,4 +1,4 @@
-# The unpatchify_video operator's Triton backend: design 5.2's program package.
+# The unpatchify_video operator's Triton backend: design 5.2's package.
 #
 # One cubin per descriptor: the video VAE decoder's planar raster built from the diffusion
 # transformer's packed tokens, a token's channel-major patch scattered into place, with the
@@ -10,6 +10,7 @@
 
 op = "unpatchify_video"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

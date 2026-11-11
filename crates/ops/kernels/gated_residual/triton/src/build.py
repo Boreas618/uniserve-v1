@@ -2,8 +2,8 @@
 
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
-dimensions give, and the compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+dimensions give, and the compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The element count and the row width are baked in — the kernel masks its tile with the count and
 recovers each element's row from the width — so a descriptor is a compilation. The gate row stride
@@ -11,7 +11,7 @@ is an int32 launch argument.
 """
 
 import gated_residual as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The tile one launch walks, the operator's `GATED_BLOCK`.
 BLOCK = 1024

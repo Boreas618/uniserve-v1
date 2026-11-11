@@ -3,7 +3,7 @@
 // This is `at::native::WelfordData` and `at::native::WelfordOps` from
 // `ATen/native/SharedReduceOps.h`, device parts only and under this module's own
 // namespace: the reference kernel reuses them so its mean and its second central
-// moment associate exactly as `torch.var_mean` does, and a module that the Program
+// moment associate exactly as `torch.var_mean` does, and a module that the Build
 // Server `dlopen`s cannot link torch. The arithmetic is unchanged, operation for
 // operation, because the point of carrying it is the order of its additions.
 

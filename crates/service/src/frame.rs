@@ -10,7 +10,7 @@
 //! - a **descriptor frame** is an 8-byte header, the payload's length and the number of
 //!   descriptors that travel with it (two `u32`), the payload, and one carrier byte for every
 //!   further [`MAX_DESCRIPTORS`] descriptors. The host services' connections (the Storage Server,
-//!   MessagePack; the Program Server, Protobuf) carry these.
+//!   MessagePack; the Build Server, Protobuf) carry these.
 //!
 //! Descriptors cross with `SCM_RIGHTS`, at most [`MAX_DESCRIPTORS`] per `sendmsg`: a descriptor
 //! frame's first chunk rides on its first byte and each later chunk on its own carrier byte

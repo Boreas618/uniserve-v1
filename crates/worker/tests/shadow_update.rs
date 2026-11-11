@@ -26,8 +26,8 @@
 //! (default `sm_100a`).
 //!
 //! The update's other two paths are measured at the process level instead, by the delivery test of
-//! the slice (`tests/python/e2e/test_program_update_http.py`, the caller's run): rebind and
-//! recapture there are driven by the Program Server's packages and a real serving deployment, and a
+//! the slice (`tests/python/e2e/test_generation_update_http.py`, the caller's run): rebind and
+//! recapture there are driven by the Build Server's packages and a real serving deployment, and a
 //! Rust test that fabricated a rebind's node parameters would measure its own fabrication - the walk
 //! that computes them (`ops::capture::launched`) has no caller yet.
 
@@ -42,12 +42,15 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use nn::forward::Forward;
-use ops::{Arguments, CubinMetadata, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op, Shape, Operand, Tolerance, Twins, descriptor};
-use uniserve_tensor::DType;
+use ops::{
+    Arguments, CubinMetadata, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op, Operand,
+    Shape, Tolerance, Twins, descriptor,
+};
 use platform::{
     Allocator, Budget, Buffer, Device, DeviceId, PinnedBuffer, PoolKind, Stream, memcpy_async,
     memset_d32,
 };
+use uniserve_tensor::DType;
 use worker::shadow::{Pairing, Shadow};
 
 const DEVICE: DeviceId = DeviceId(0);

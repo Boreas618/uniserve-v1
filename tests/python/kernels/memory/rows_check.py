@@ -5,7 +5,7 @@ The kernel is Triton, so the interpreter runs it: this is the arithmetic check a
 without a device, and it is the only one the fixture's cells get here (the store's own build proves
 that each cell compiles, not what it computes).
 
-    TRITON_INTERPRET=1 crates/program-server/python/.venv/bin/python rows_check.py [--package DIR]
+    TRITON_INTERPRET=1 crates/build-server/python/.venv/bin/python rows_check.py [--package DIR]
 
 `replace` copies a source row into the destination row its index names, so it is exact; `add`
 accumulates with one rounding into the destination's dtype. Both are compared **bit for bit**: the

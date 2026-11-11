@@ -42,7 +42,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand, row_writable};
+use crate::tensor::{Operand, Shape, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -168,7 +168,8 @@ impl Args {
                 Unpatchify::NAME,
                 format!(
                     "expected {} tokens, found {}",
-                    abi::name(descriptor.dtype), abi::name(self.tokens.dtype)
+                    abi::name(descriptor.dtype),
+                    abi::name(self.tokens.dtype)
                 ),
             ));
         }
@@ -201,7 +202,11 @@ impl Args {
                 if view.dtype != descriptor.dtype {
                     return Err(Error::argument(
                         Unpatchify::NAME,
-                        format!("expected {} {name}, found {}", abi::name(descriptor.dtype), abi::name(view.dtype)),
+                        format!(
+                            "expected {} {name}, found {}",
+                            abi::name(descriptor.dtype),
+                            abi::name(view.dtype)
+                        ),
                     ));
                 }
             }
@@ -217,7 +222,7 @@ impl Args {
 pub struct Unpatchify;
 
 impl Op for Unpatchify {
-    const NAME: &'static str = proto::program::operator::UNPATCHIFY_VIDEO;
+    const NAME: &'static str = proto::module::operator::UNPATCHIFY_VIDEO;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

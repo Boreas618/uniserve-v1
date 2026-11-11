@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `frame_pad`'s kernel and check the causal padding of a video frame batch, on the CPU.
 
-    crates/program-server/python/.venv/bin/python frame_pad_check.py [--package DIR]
+    crates/build-server/python/.venv/bin/python frame_pad_check.py [--package DIR]
 
 The source is `[batch, channels, frames, height, width]` with its width contiguous; the output is the
 same batch and channels over more frames, rows and columns, and equals the two-step `F.pad` result

@@ -1,8 +1,8 @@
-# The copy_strided operator's Triton backend: design 5.2's program package.
+# The copy_strided operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # `destination[i] = source[i]`: a source read through its strides, moved into a
 # row-major window — a contiguous tensor, or a block of a larger one. That is a
@@ -20,6 +20,7 @@
 
 op = "copy_strided"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

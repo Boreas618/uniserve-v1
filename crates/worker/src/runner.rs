@@ -6,7 +6,7 @@
 //! gives it `&mut self` and no synchronization.
 //!
 //! [`Runner`] is the design's trait verbatim. Its `precopy`, `switchover` and `purge` are the
-//! runner's half of the program-layer update (7.3): precopy prepares the next generation's graphs
+//! runner's half of the generation update (7.3): precopy prepares the next generation's graphs
 //! from the current one, switchover takes effect at a batch boundary, and purge releases the graphs
 //! that still reference a replaced generation after its last batch.
 
@@ -115,7 +115,7 @@ pub trait Runner: Send {
         Ok(false)
     }
 
-    /// Hands the runner the device's record of the operators a program-layer update could not
+    /// Hands the runner the device's record of the operators a generation update could not
     /// compare (7.3 step 2).
     ///
     /// The record lives on the device worker because the control thread reports it when a

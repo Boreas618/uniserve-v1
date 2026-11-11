@@ -20,7 +20,7 @@
 //! attention `A` is any layer the model composes over the head-split rows; this layer owns the
 //! projections around it.
 
-use ops::{Shape, Strides, Operand};
+use ops::{Operand, Shape, Strides};
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};

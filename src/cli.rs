@@ -2,13 +2,13 @@
 //!
 //! One executable runs every UniServe process, each as a command. The public
 //! commands are `serve` (a node's daemon, and on the leader the application),
-//! `programs` (the key list a deployment's main processes launch),
-//! `storage-server` (a host's Storage Server) and `program-server` (a host's
-//! Program Server); the host services' commands are their crates' own
-//! (`storage_server::command`, `program_server::command`). `engine` (a node's
+//! `keys` (the key list a deployment's main processes launch),
+//! `storage-server` (a host's Storage Server) and `build-server` (a host's
+//! Build Server); the host services' commands are their crates' own
+//! (`storage_server::command`, `build_server::command`). `engine` (a node's
 //! main process for one epoch) is started by the daemon and hidden from the
 //! help. The binary's own options, its log levels, are global; each command
-//! declares its own. `serve` and `programs` take the serving command line
+//! declares its own. `serve` and `keys` take the serving command line
 //! (`daemon::options::ServerArgs`), which resolves one configuration from a
 //! `--config` file, a few flags and `--set` assignments.
 
@@ -29,10 +29,10 @@ pub(crate) struct Cli {
 #[derive(Debug, Clone, Args)]
 #[command(next_help_heading = "Logging")]
 pub(crate) struct LogLevels {
-    /// Log level of UniServe components, such as `info` or `debug`.
+    /// Log level of UniServe's own code, such as `info` or `debug`.
     #[arg(long, global = true)]
     pub log_level: Option<String>,
-    /// Log level of the HTTP server components.
+    /// Log level of the HTTP server libraries.
     #[arg(long, global = true)]
     pub log_level_http: Option<String>,
 }
@@ -49,30 +49,22 @@ pub(crate) enum Command {
         override_usage = "uniserve serve [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
     Serve(Box<ServerArgs>),
-    /// Print the programs the deployment's main processes launch, as the key
-    /// list `uniserve program-server build --keys` reads (`operator<TAB>key`
+    /// Print the modules the deployment's main processes launch, as the key
+    /// list `uniserve build-server build --keys` reads (`operator<TAB>key`
     /// lines, sorted, each once), and exit. Takes `serve`'s options and starts
     /// the deployment's ranks on this node's devices as `serve` does, loading
     /// the model from its checkpoint's headers; no weight is read, and no
-    /// daemon, Storage Server, communicator or Program Server is started.
+    /// daemon, Storage Server, communicator or Build Server is started.
     #[command(
-        override_usage = "uniserve programs MODEL [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
+        override_usage = "uniserve keys MODEL [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
-    Programs(Box<ServerArgs>),
-    /// Run the main process of this node and epoch: its schedulers and the
-    /// request interface.
-    #[command(hide = true)]
-    Engine {
-        /// The launch file the daemon wrote for this engine process (`proto::config::EngineArgs`).
-        #[arg(long)]
-        launch: std::path::PathBuf,
-    },
+    Keys(Box<ServerArgs>),
     /// The Storage Server of this host and the operator's commands against
     /// it.
     StorageServer(Box<storage_server::command::Args>),
-    /// The Program Server of this host and the operator's commands against
+    /// The Build Server of this host and the operator's commands against
     /// it.
-    ProgramServer(Box<program_server::command::Args>),
+    BuildServer(Box<build_server::command::Args>),
 }
 
 #[cfg(test)]
@@ -97,32 +89,30 @@ mod tests {
         );
     }
 
-    /// Every process of a deployment is one of this binary's commands, and
-    /// the commands that the daemon starts are not in the help.
+    /// Every process of the fixed base is one of this binary's commands.
     #[test]
     fn each_process_is_a_command() {
         for (args, expected) in [
             (vec!["uniserve", "serve", "model"], "serve"),
-            (vec!["uniserve", "programs", "model"], "programs"),
+            (vec!["uniserve", "keys", "model"], "keys"),
             (vec!["uniserve", "storage-server", "list"], "storage-server"),
-            (vec!["uniserve", "program-server", "list"], "program-server"),
+            (vec!["uniserve", "build-server", "list"], "build-server"),
         ] {
             let cli = Cli::try_parse_from(args).expect("parses");
             let name = match cli.command {
                 Command::Serve(_) => "serve",
-                Command::Programs(_) => "programs",
+                Command::Keys(_) => "keys",
                 Command::StorageServer(_) => "storage-server",
-                Command::ProgramServer(_) => "program-server",
-                Command::Engine { .. } => "other",
+                Command::BuildServer(_) => "build-server",
             };
             assert_eq!(name, expected);
         }
     }
 
-    /// `programs` takes `serve`'s options and resolves them to the same configuration, so the
+    /// `keys` takes `serve`'s options and resolves them to the same configuration, so the
     /// key list it prints is the one of the deployment `serve` starts with the same command line.
     #[test]
-    fn programs_resolves_the_serving_configuration() {
+    fn keys_resolves_the_serving_configuration() {
         let resolve = |command: &str| {
             let matches = <Cli as clap::CommandFactory>::command().get_matches_from([
                 "uniserve",
@@ -140,19 +130,16 @@ mod tests {
             let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).expect("parses");
             let (_, command_matches) = matches.subcommand().expect("a command");
             let args = match cli.command {
-                Command::Serve(args) | Command::Programs(args) => args,
+                Command::Serve(args) | Command::Keys(args) => args,
                 _ => panic!("{command} takes the serving options"),
             };
             args.resolve(command_matches)
                 .expect("the options resolve")
                 .0
         };
-        let programs = resolve("programs");
-        assert_eq!(programs, resolve("serve"));
-        assert_eq!(programs.model.as_deref(), Some("/models/qwen3"));
-        assert_eq!(
-            programs.max_model_len.map(|length| length.get()),
-            Some(2048)
-        );
+        let keys = resolve("keys");
+        assert_eq!(keys, resolve("serve"));
+        assert_eq!(keys.model.as_deref(), Some("/models/qwen3"));
+        assert_eq!(keys.max_model_len.map(|length| length.get()), Some(2048));
     }
 }

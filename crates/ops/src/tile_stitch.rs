@@ -31,7 +31,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand, row_writable};
+use crate::tensor::{Operand, Shape, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -93,7 +93,7 @@ pub struct Args {
 pub struct TileStitch;
 
 impl Op for TileStitch {
-    const NAME: &'static str = proto::program::operator::TILE_STITCH;
+    const NAME: &'static str = proto::module::operator::TILE_STITCH;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

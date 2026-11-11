@@ -78,7 +78,7 @@ pub struct Args {
 pub struct Fill;
 
 impl Op for Fill {
-    const NAME: &'static str = proto::program::operator::FILL;
+    const NAME: &'static str = proto::module::operator::FILL;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -103,7 +103,8 @@ impl Op for Fill {
                 Self::NAME,
                 format!(
                     "the bits {:#x} do not fit a {} element of {width} bits",
-                    args.bits, abi::name(descriptor.dtype)
+                    args.bits,
+                    abi::name(descriptor.dtype)
                 ),
             ));
         }

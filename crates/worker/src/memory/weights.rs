@@ -9,7 +9,7 @@
 //! layout the reading operator declares, and the region inside the logical tensor. Two rules come
 //! with it (§8):
 //!
-//! - a **program layer's** backend or revision is not part of the key: a generation update changes
+//! - a **generation layer's** backend or revision is not part of the key: a generation update changes
 //!   which module reads a weight, not what the weight is, so the update keeps the storage warm;
 //! - anything that changes the mathematics, the precision or the format is a build-config change,
 //!   and then `dtype`, `layout` or `quantization` move the key with it.

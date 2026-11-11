@@ -285,7 +285,7 @@ impl Joins {
                     .then(|| format!("node rank {} is taken", member.node_rank))
                 });
             let welcome = Welcome {
-                major: proto::PROTOCOL_MAJOR,
+                major: proto::ENGINE_INTERFACE_VERSION,
                 build: proto::BUILD.to_owned(),
                 refusal: refusal.clone().unwrap_or_default(),
                 nodes: Vec::new(),
@@ -754,7 +754,7 @@ pub(crate) fn run_leader(
                                 };
                             }
                             let welcome = Welcome {
-                                major: proto::PROTOCOL_MAJOR,
+                                major: proto::ENGINE_INTERFACE_VERSION,
                                 build: proto::BUILD.to_owned(),
                                 refusal: refusal.clone().unwrap_or_default(),
                                 nodes: nodes.clone(),
@@ -1638,11 +1638,11 @@ pub(crate) fn resume(
 /// Why a hello is refused, when it is: another major version, or a peer of
 /// the wrong kind for the socket it reached.
 pub(crate) fn refusal(hello: &Hello, accepts: impl Fn(&hello::Peer) -> bool) -> Option<String> {
-    if hello.major != proto::PROTOCOL_MAJOR {
+    if hello.major != proto::ENGINE_INTERFACE_VERSION {
         return Some(format!(
             "the peer speaks major version {} and this daemon {}",
             hello.major,
-            proto::PROTOCOL_MAJOR
+            proto::ENGINE_INTERFACE_VERSION
         ));
     }
     match &hello.peer {

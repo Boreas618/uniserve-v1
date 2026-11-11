@@ -14,7 +14,7 @@ among cuDNN's proposals or fails naming it. Without such data the module takes
 the heuristic's first proposal, which is stable for the cuDNN version the
 package's toolchain pins.
 
-The Program Server runs this script with its own Python environment, its working
+The Build Server runs this script with its own Python environment, its working
 directory the package root, and `UNISERVE_OP`, `UNISERVE_BACKEND`,
 `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE`, `UNISERVE_OUT` and
 `MAX_JOBS` in the environment.
@@ -90,12 +90,14 @@ def launch_entry(package):
 
 
 def descriptor_field(key, field):
-    """The value a descriptor key gives one field, such as its input type."""
-    tokens = key.split("_")
-    for at, token in enumerate(tokens[:-1]):
-        if token == field:
-            return tokens[at + 1]
-    raise SystemExit(f"the descriptor {key} names no {field}")
+    """The value the descriptor's fields give one field, such as its input type.
+
+    The Build Server read the key and states its fields in ``UNISERVE_FIELDS``.
+    """
+    fields = json.loads(os.environ.get("UNISERVE_FIELDS") or "{}")
+    if field not in fields:
+        raise SystemExit(f"the descriptor {key} names no {field}")
+    return fields[field]
 
 
 def element_type(key, field):
@@ -121,7 +123,7 @@ def main():
     """Compile the convolution for one descriptor into ``module.so``."""
     package, descriptor, target, out = arguments()
     out.mkdir(parents=True, exist_ok=True)
-    # The nvcc the Program Server checked against this package's declared version.
+    # The nvcc the Build Server checked against this package's declared version.
     compiler = os.environ["UNISERVE_NVCC"]
     entry = launch_entry(package)
 

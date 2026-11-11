@@ -17,8 +17,8 @@ must then have ``-2`` in all ``top`` of its route map entries; unset passes no c
 row live.
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory with
-``module.so``. Run it on the GPU host with the Program Server's own environment
-(``crates/program-server/python/.venv/bin/python``), which has torch.
+``module.so``. Run it on the GPU host with the Build Server's own environment
+(``crates/build-server/python/.venv/bin/python``), which has torch.
 
 The reference is the order the design states and TensorRT-LLM implements
 (``cpp/tensorrt_llm/kernels/moe/trtllmGen/routing/RoutingKernel.cuh``): routes

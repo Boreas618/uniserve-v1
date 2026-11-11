@@ -1,8 +1,8 @@
-# The pcm_interleave operator's Triton backend: design 5.2's program package.
+# The pcm_interleave operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one architecture
 # of `[kernel.architectures]`, built by `src/build.py` (the compile driver the
-# Program Server runs for one descriptor and target).
+# Build Server runs for one descriptor and target).
 #
 # This is the audio decoder's last step: two float channels to interleaved 16-bit
 # PCM, `round_half_to_even(clamp(x, -1, 1) · 32767)` with ties to the even
@@ -15,6 +15,7 @@
 
 op = "pcm_interleave"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

@@ -24,7 +24,7 @@ from tests.python.e2e.http_helpers import (
     second_host,
     server_process,
     t2va_request,
-    worker_executable,
+    engine_selection,
     written_deployment,
 )
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
@@ -330,8 +330,7 @@ def test_component_bindings_release_cancelled_requests(
         "127.0.0.1",
         "--port",
         str(port),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--worker-groups",
         str(written_deployment(tmp_path, workers)),
         "--max-running-requests",
@@ -475,8 +474,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
         model,
         "--worker-groups",
         str(deployment),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--served-model-name",
         "FastH3",
         "--port",

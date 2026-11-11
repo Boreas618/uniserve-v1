@@ -11,7 +11,7 @@ magnitude for a later quantization. `value_first_swiglu` reads a **packed projec
 rows start with the value half and end with the gate half, one bias of `2 · width`; `swiglu`
 reads separate value and gate views, each with its own bias and its own row stride. The same
 file is kept in both packages, byte for byte, and a test in
-`crates/program-server/tests/it/packages.rs` holds the copies together.
+`crates/build-server/tests/it/packages.rs` holds the copies together.
 
 Cases. Random values; gates swept to ±80, where the sigmoid has saturated and `silu` of a very
 negative gate is already ~1e-35 while `exp(-gate)` is still finite in FP32; and a zeroed row,

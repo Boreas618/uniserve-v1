@@ -26,7 +26,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -199,7 +199,7 @@ impl NativeCall for Call {
 pub struct MoeUnpermute;
 
 impl Op for MoeUnpermute {
-    const NAME: &'static str = proto::program::operator::MOE_UNPERMUTE;
+    const NAME: &'static str = proto::module::operator::MOE_UNPERMUTE;
 
     type Descriptor = Descriptor;
     type Args<'a> = UnpermuteArgs;
@@ -236,7 +236,8 @@ impl Op for MoeUnpermute {
                 Self::NAME,
                 format!(
                     "expected {} route weights, found {}",
-                    abi::name(descriptor.scales), abi::name(args.scales.dtype)
+                    abi::name(descriptor.scales),
+                    abi::name(args.scales.dtype)
                 ),
             ));
         }

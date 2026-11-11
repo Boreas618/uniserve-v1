@@ -19,7 +19,7 @@
 //! row of a small device table, written once per batch before the first page's kernels.
 //!
 //! A rank's recorded walk states the two operators' descriptors ([`record`]), so the epoch's
-//! program set holds their modules beside the forwards'.
+//! module set holds their modules beside the forwards'.
 
 use std::sync::Arc;
 
@@ -29,9 +29,9 @@ use ops::prefix_cache::{
     CacheCopyRegion, ConversionArgs, ConversionDescriptor, CopyRegionArgs, CopyRegionDescriptor,
     Field, PageConversion, scratch_bytes,
 };
-use ops::{DevicePtr, Shape, Operand};
-use uniserve_tensor::DType;
+use ops::{DevicePtr, Operand, Shape};
 use platform::{CopyBatch, DeviceId, SourceOrder};
+use uniserve_tensor::DType;
 
 use super::host;
 use super::plan::{CacheGroupPlan, CachePlan};
@@ -540,7 +540,7 @@ mod tests {
     }
 
     /// A rank's recorded walk states one `page_conversion` and one `cache_copy_region` per field
-    /// of its converted loads, so the epoch's program set holds their modules; a pool that loads
+    /// of its converted loads, so the epoch's module set holds their modules; a pool that loads
     /// only its own pages states none.
     #[test]
     fn a_converting_pool_states_its_page_load_programs() {

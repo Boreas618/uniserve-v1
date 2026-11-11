@@ -15,7 +15,7 @@ String values in server and benchmark tables may reference the process
 environment as `${NAME}` or `${NAME:-default}`; see `expand_environment`.
 
 Every path a profile states is relative to its `root` unless absolute: the
-server executable and `--worker-executable` (`server_launch`), the artifact
+server executable (`server_launch`), the artifact
 root, and a benchmark's `dataset_path`, `load.warmup_manifest`,
 `load.priming_manifest`, `video.media_dir` and `video.reference_root`
 (`_resolve_paths`). The loaded `BenchmarkPoint` carries them as absolute
@@ -321,13 +321,9 @@ def server_launch(
             are written against.
 
     Returns:
-        A launch whose executable and any `--worker-executable` value are
-        absolute paths, whose working directory is `root`, and whose
-        environment is a copy of the profile's. Environment references are
-        not checked here.
-
-    Raises:
-        ValueError: If `--worker-executable` is the last command element.
+        A launch whose executable is an absolute path, whose working
+        directory is `root`, and whose environment is a copy of the
+        profile's. Environment references are not checked here.
     """
     command = list(server.command)
     selected_executable = (
@@ -337,28 +333,10 @@ def server_launch(
         selected_executable = root / selected_executable
     command[0] = str(selected_executable.absolute())
 
-    _resolve_command_path(command, "--worker-executable", root)
     # A server runs in the tree its profile is written against, so a relative
     # path it was given -- a deployment configuration, a dataset -- resolves
     # the same way there as it reads in the file.
     return ServerLaunch(tuple(command), root, dict(server.environment))
-
-
-def _resolve_command_path(command: list[str], option: str, base: Path) -> None:
-    """Make the path argument for a command option absolute in place.
-
-    Only the first occurrence of `option` is resolved, and a command without
-    it is left unchanged.
-    """
-    try:
-        value_index = command.index(option) + 1
-    except ValueError:
-        return
-    if value_index >= len(command):
-        raise ValueError(f"{option} requires a path")
-    path = Path(command[value_index])
-    if not path.is_absolute():
-        command[value_index] = str((base / path).absolute())
 
 
 def _server_profile(name: str, raw: Any) -> ServerProfile:

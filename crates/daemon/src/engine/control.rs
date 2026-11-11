@@ -67,48 +67,30 @@ fn main_process_environment() -> std::collections::HashMap<String, String> {
         .collect()
 }
 
-/// Starts the engine processes of one deployment.
-/// Whether `executable` is this process's own binary, by canonical path: a
-/// bare name is looked up by the operating system, not by us, and counts as
-/// another executable.
-fn own_executable(executable: &str) -> bool {
-    let path = std::path::Path::new(executable);
-    if !path.is_absolute() {
-        return false;
-    }
-    let Ok(own) = std::env::current_exe() else {
-        return false;
-    };
-    let own = std::fs::canonicalize(&own).unwrap_or(own);
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) == own
-}
-
-/// How long a Program Server this daemon starts may take to listen: it
+/// How long a Build Server this daemon starts may take to listen: it
 /// discovers its toolchains, which imports the compilers of its Python
 /// environment, and loads every installed package first.
-const PROGRAM_SERVER_START: std::time::Duration = std::time::Duration::from_secs(120);
+const BUILD_SERVER_START: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Makes sure this host's Program Server serves on the socket `settings`
-/// names, and returns that socket: when none serves, the Program Server is
+/// Makes sure this host's Build Server serves on the socket `settings`
+/// names, and returns that socket: when none serves, the Build Server is
 /// started with `settings` as a host service of this executable
 /// (`service::ensure`), which outlives this daemon.
 ///
 /// # Errors
 ///
-/// Fails when no Program Server serves and none can be started.
-pub fn ensure_program_server(
-    settings: &program_server::command::Settings,
-) -> anyhow::Result<PathBuf> {
+/// Fails when no Build Server serves and none can be started.
+pub fn ensure_build_server(settings: &build_server::command::Settings) -> anyhow::Result<PathBuf> {
     let socket = settings.socket();
     let executable = std::env::current_exe().context("locating this executable")?;
     ::service::ensure(
         &executable,
-        "program-server",
+        "build-server",
         &socket,
         &settings.arguments(),
-        PROGRAM_SERVER_START,
+        BUILD_SERVER_START,
     )
-    .context("starting this host's Program Server")?;
+    .context("starting this host's Build Server")?;
     Ok(socket)
 }
 
@@ -123,9 +105,9 @@ pub struct EngineControl {
     host: String,
     /// The deployment the engines serve.
     deployment: String,
-    /// This node's Program Server socket, which every engine process is told
+    /// This node's Build Server socket, which every engine process is told
     /// to resolve an epoch's modules from (§5.3, §7.3).
-    program_server: PathBuf,
+    build_server: PathBuf,
     next_engine: AtomicU64,
     /// Engine handoffs can connect in any order. Reading and assigning
     /// their greetings is serialized; each client keeps its buffered reader.
@@ -135,8 +117,8 @@ pub struct EngineControl {
 impl EngineControl {
     /// Binds the request socket at `socket` for the engines of `deployment`,
     /// which run on host `host` through the daemon whose process socket is
-    /// `processes` and resolve their modules at the Program Server on
-    /// `program_server` ([`ensure_program_server`]).
+    /// `processes` and resolve their modules at the Build Server on
+    /// `build_server` ([`ensure_build_server`]).
     ///
     /// # Errors
     ///
@@ -146,7 +128,7 @@ impl EngineControl {
         processes: String,
         host: String,
         deployment: String,
-        program_server: PathBuf,
+        build_server: PathBuf,
     ) -> anyhow::Result<Self> {
         // A socket a stopped daemon left behind is replaced.
         let _ = std::fs::remove_file(socket);
@@ -166,7 +148,7 @@ impl EngineControl {
             processes,
             host,
             deployment,
-            program_server,
+            build_server,
             next_engine: AtomicU64::new(1),
             incoming: std::sync::Mutex::new(BTreeMap::new()),
         })
@@ -246,7 +228,7 @@ impl EngineControl {
         let interfaces = Interfaces {
             requests: &self.request_address,
             processes: &self.processes,
-            program_server: &self.program_server,
+            build_server: &self.build_server,
         };
         let mut launches = hosts
             .iter()
@@ -360,11 +342,11 @@ impl EngineControl {
         control: &mut Connection,
     ) -> anyhow::Result<(Connection, Connection)> {
         let (reader, mut writer, hello) = self.accept(engine, Some(control))?;
-        let refusal = if hello.major != proto::PROTOCOL_MAJOR {
+        let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
             format!(
                 "the engine speaks major version {} and this daemon {}",
                 hello.major,
-                proto::PROTOCOL_MAJOR
+                proto::ENGINE_INTERFACE_VERSION
             )
         } else if hello.engine != engine {
             format!("engine {} connected for engine {engine}", hello.engine)
@@ -372,7 +354,7 @@ impl EngineControl {
             String::new()
         };
         writer.send(&wire::Welcome {
-            major: proto::PROTOCOL_MAJOR,
+            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
         })?;
@@ -386,6 +368,11 @@ impl EngineControl {
     /// The host this control's engines run on.
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// This node's Build Server socket.
+    pub fn build_server(&self) -> &std::path::Path {
+        &self.build_server
     }
 
     pub fn request_address(&self) -> &str {
@@ -412,17 +399,17 @@ impl EngineControl {
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         let (mut reader, mut writer, hello) = self.accept(engine, None)?;
-        let refusal = if hello.major != proto::PROTOCOL_MAJOR {
+        let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
             format!(
                 "the engine speaks major version {} and this daemon {}",
                 hello.major,
-                proto::PROTOCOL_MAJOR
+                proto::ENGINE_INTERFACE_VERSION
             )
         } else {
             String::new()
         };
         writer.send(&wire::Welcome {
-            major: proto::PROTOCOL_MAJOR,
+            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
         })?;
@@ -478,11 +465,11 @@ impl EngineControl {
     ) -> anyhow::Result<EngineClient> {
         self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
         let (mut reader, mut writer, hello) = self.accept(engine, control.as_mut())?;
-        let refusal = if hello.major != proto::PROTOCOL_MAJOR {
+        let refusal = if hello.major != proto::ENGINE_INTERFACE_VERSION {
             format!(
                 "the engine speaks major version {} and this daemon {}",
                 hello.major,
-                proto::PROTOCOL_MAJOR
+                proto::ENGINE_INTERFACE_VERSION
             )
         } else if hello.engine != engine {
             format!(
@@ -493,7 +480,7 @@ impl EngineControl {
             String::new()
         };
         writer.send(&wire::Welcome {
-            major: proto::PROTOCOL_MAJOR,
+            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
         })?;
@@ -533,7 +520,7 @@ impl EngineControl {
         let mut control = Connection::connect(&self.processes)
             .with_context(|| format!("connecting to the daemon at {}", self.processes))?;
         control.send(&process::Hello {
-            major: proto::PROTOCOL_MAJOR,
+            major: proto::ENGINE_INTERFACE_VERSION,
             build: proto::BUILD.to_owned(),
             peer: Some(hello::Peer::Engine(process::Engine {
                 deployment: self.deployment.clone(),
@@ -690,7 +677,7 @@ impl EngineControl {
             &Interfaces {
                 requests: &self.request_address,
                 processes: &self.processes,
-                program_server: &self.program_server,
+                build_server: &self.build_server,
             },
         )
     }
@@ -714,15 +701,11 @@ impl EngineControl {
              epochs by a relaunch"
         );
         let launch = self.launch(args.clone(), engine)?;
-        let executable = launch
-            .engine_config
-            .worker
-            .executable
-            .to_string_lossy()
-            .into_owned();
         Ok(crate::updates::switch::Start {
-            build: own_executable(&executable).then(|| proto::BUILD.to_owned()),
-            executable,
+            // The engine is a package's executable, never this daemon's: its
+            // first child's `Hello` states the build every other child must
+            // report.
+            build: None,
             launch,
             environment: main_process_environment(),
         })
@@ -743,12 +726,6 @@ impl EngineControl {
             "a remote engine needs the deployment's network control address"
         );
 
-        let executable = launch
-            .engine_config
-            .worker
-            .executable
-            .to_string_lossy()
-            .into_owned();
         control.send(&process::Upstream {
             kind: Some(upstream::Kind::Request(process::Request {
                 id: 1,
@@ -757,8 +734,10 @@ impl EngineControl {
                     group: ENGINE_GROUP.to_owned(),
                     rank: launch.rank,
                     generation: engine,
-                    executable,
-                    arguments: vec!["engine".to_owned()],
+                    // The node that starts the process resolves the engine
+                    // package its launch names at its own Build Server.
+                    executable: String::new(),
+                    arguments: Vec::new(),
                     environment: main_process_environment(),
                     inherit,
                     // The node that starts the process writes its launch file.
@@ -1010,38 +989,38 @@ fn exited(control: &mut Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One host's Program Server and the targets that host's devices build for
+/// One host's Build Server and the targets that host's devices build for
 /// (§5.1, §5.3, §6.3).
 #[derive(Debug, Clone)]
-pub struct ProgramServer {
+pub struct BuildServer {
     /// The host's identity in the deployment.
     pub host: String,
-    /// Its Program Server's socket.
+    /// Its Build Server's socket.
     pub socket: PathBuf,
     /// The targets its devices compile for, which `prepare` builds the
     /// epoch's modules for.
-    pub targets: Vec<program_server::Target>,
+    pub targets: Vec<build_server::Target>,
 }
 
-/// Selects the programs `filled` names at every host's Program Server
+/// Selects the modules `filled` names at every host's Build Server
 /// (§5.1, §6.3):
 ///
 /// The leader host selects each slot's backend at its latest installed
 /// revision (`Selector::Latest`), which is the revision the epoch record
-/// pins. Every other host is then asked for exactly those programs
+/// pins. Every other host is then asked for exactly those modules
 /// (`Selector::Fixed`): the same revision names the same module on every
 /// host, so a follower that lacks it fails the call rather than choosing
 /// another.
 ///
-/// The answer is `filled` with each program's revision and the parameters
-/// the Program Server selected for it, which is what the epoch record keeps
+/// The answer is `filled` with each package's revision and the parameters
+/// the Build Server selected for it, which is what the epoch record keeps
 /// and what `Precopy` sends to the main processes.
 ///
-/// The step of the Program Server exchange the daemon is in.
+/// The step of the Build Server exchange the daemon is in.
 ///
 /// The exchange waits twice in a way this crate cannot bound: the client opens
-/// its socket, and reads the answer a Program Server may never send, with no
-/// deadline (`crates/program-server/src/protocol.rs`: `Connection::connect` and
+/// its socket, and reads the answer a Build Server may never send, with no
+/// deadline (`crates/build-server/src/protocol.rs`: `Connection::connect` and
 /// `Connection::receive`). Whoever times the call out reads the step recorded
 /// here, so a deadline names the wait rather than the phase (§7.3 step 1).
 #[derive(Clone)]
@@ -1060,11 +1039,11 @@ impl Default for PrepareSteps {
 }
 
 impl PrepareSteps {
-    /// A record of an exchange that has not reached a Program Server yet.
+    /// A record of an exchange that has not reached a Build Server yet.
     pub fn new() -> Self {
         Self(std::sync::Arc::new(std::sync::Mutex::new(PrepareStep {
             host: String::new(),
-            what: "about to reach its first Program Server",
+            what: "about to reach its first Build Server",
         })))
     }
 
@@ -1088,153 +1067,200 @@ impl PrepareSteps {
 
 /// # Errors
 ///
-/// Fails when a host has no Program Server in `servers`, when a Program
+/// Fails when a host has no Build Server in `servers`, when a Build
 /// Server refuses or cannot build a module, and when a follower answers a
-/// program other than the one the leader pinned.
+/// package other than the one the leader pinned.
 pub fn prepare_epoch(
-    servers: &[ProgramServer],
+    servers: &[BuildServer],
     leader: &str,
-    filled: &crate::epoch::FilledPrograms,
-    descriptors: &[program_server::Descriptors],
+    filled: &crate::epoch::ModuleSet,
+    descriptors: &[build_server::Descriptors],
     steps: &PrepareSteps,
-) -> anyhow::Result<crate::epoch::FilledPrograms> {
+) -> anyhow::Result<crate::epoch::ModuleSet> {
     let leader_server = servers
         .iter()
         .find(|server| server.host == leader)
-        .with_context(|| format!("no Program Server for the leader host {leader}"))?;
+        .with_context(|| format!("no Build Server for the leader host {leader}"))?;
     tracing::info!(
         leader = %leader,
         servers = servers.len(),
         kernels = filled.kernels.len(),
         policy = %filled.policy.backend,
-        "resolving the epoch's programs at its Program Servers"
+        "resolving the epoch's modules at its Build Servers"
     );
-    let pinned = prepare_at(leader_server, Selector::Latest, filled, descriptors, steps)?;
+    let pinned = prepare_at(leader_server, filled, descriptors, steps)?;
     for server in servers {
         if server.host == leader {
             continue;
         }
-        let selected = prepare_at(server, Selector::Fixed, filled, descriptors, steps)?;
+        let selected = prepare_at(server, filled, descriptors, steps)?;
         anyhow::ensure!(
             selected == pinned,
-            "the Program Server of {} selected other programs than the leader's",
+            "the Build Server of {} selected other modules than the leader's",
             server.host
         );
     }
     tracing::info!(
         kernels = pinned.kernels.len(),
         policy = %pinned.policy.backend,
-        "the epoch's programs are resolved"
+        "the epoch's modules are resolved"
     );
     Ok(pinned)
 }
 
-/// `filled` with the packages the leader's store holds for every operator the deployment names
-/// nothing for: the generation's full program set.
+/// `filled` as a fixed module set: every package it names at the revision the leader's Build
+/// Server selects for it, and every installed kernel package of every operator at its selected
+/// revision.
 ///
-/// A deployment names the operators its configuration selects a backend for; for every other
-/// operator the Program Server selects, for each descriptor key, among its packages (`cover`). So
-/// what such an operator runs is decided by the packages the store holds, and the epoch's record
-/// keeps them - each backend's latest installed revision, one slot per backend with that backend
-/// as its part - so a revision installed for one of them is a program change a configuration
-/// comparison sees. These slots are not named to a main process (`ProgramSwitch::precopy`): they
-/// are what the selection chooses among, not a choice.
+/// This is the one selection of an apply. The daemon asks `cover` for each interface the
+/// deployment uses: the engine, the scheduling policy and every kernel operator of this build.
+/// A package the deployment names takes the revision it states, else its latest installed one.
+/// Every candidate of an operator is recorded as well, one slot per package with the package as
+/// its part: for each descriptor key the main process later asks `cover` to select among exactly
+/// these revisions, so a package or a revision installed after this call is run by nobody until
+/// a configuration is applied again, and a later revision of one of them is a package change a
+/// configuration comparison sees.
 ///
 /// # Errors
 ///
-/// Fails when the leader's Program Server cannot be reached or answers no listing.
-pub fn with_store_programs(
-    servers: &[ProgramServer],
+/// Fails when the leader's Build Server cannot be reached, or holds no package, or not the
+/// revision, the deployment names for an interface.
+pub fn with_store_modules(
+    servers: &[BuildServer],
     leader: &str,
-    filled: &crate::epoch::FilledPrograms,
-) -> anyhow::Result<crate::epoch::FilledPrograms> {
+    filled: &crate::epoch::ModuleSet,
+) -> anyhow::Result<crate::epoch::ModuleSet> {
     let leader_server = servers
         .iter()
         .find(|server| server.host == leader)
-        .with_context(|| format!("no Program Server for the leader host {leader}"))?;
-    let mut client = program_server::Client::connect(&leader_server.socket).with_context(|| {
+        .with_context(|| format!("no Build Server for the leader host {leader}"))?;
+    let mut client = build_server::Client::connect(&leader_server.socket).with_context(|| {
         format!(
-            "connecting to the Program Server of {} at {}",
+            "connecting to the Build Server of {} at {}",
             leader_server.host,
             leader_server.socket.display()
         )
     })?;
-    let listing = client
-        .list()
-        .with_context(|| format!("reading the store of {}", leader_server.host))?;
+
     let mut complete = filled.clone();
-    for package in listing.packages {
-        if package.op == POLICY_SLOT
-            || proto::program::operator::named(&package.op).is_none()
-            || filled.kernels.keys().any(|slot| slot.op == package.op)
-        {
-            continue;
+    fix_revision(&mut client, proto::module::ENGINE, &mut complete.engine)?;
+    fix_revision(&mut client, POLICY_SLOT, &mut complete.policy)?;
+    for (slot, package) in &mut complete.kernels {
+        fix_revision(&mut client, &slot.op, package)?;
+    }
+    for operator in proto::module::operator::ALL {
+        for candidate in candidates(&mut client, operator, &[])? {
+            complete.kernels.insert(
+                proto::module::ModuleSlot {
+                    op: candidate.op,
+                    phase: None,
+                    part: Some(candidate.backend.clone()),
+                },
+                proto::module::PackageRevision {
+                    backend: candidate.backend,
+                    revision: candidate.revision,
+                    arguments: toml::Table::new(),
+                },
+            );
         }
-        // Each backend's latest revision: `prepare` selects the same one for the slot.
-        complete.kernels.insert(
-            proto::program::ProgramSlot {
-                op: package.op,
-                phase: None,
-                part: Some(package.backend.clone()),
-            },
-            proto::program::Program {
-                backend: package.backend,
-                revision: 0,
-                arguments: toml::Table::new(),
-            },
-        );
     }
     Ok(complete)
 }
 
-/// How one host's `prepare` names the program that fills an operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Selector {
-    /// The backend's latest installed revision.
-    Latest,
-    /// Exactly this program, revision and all.
-    Fixed,
+/// The candidates the Build Server selects among for `op`, given what the deployment prefers:
+/// every installed package of the interface, each at its latest revision or the one `preferred`
+/// states.
+fn candidates(
+    client: &mut build_server::Client,
+    op: &str,
+    preferred: &[build_server::Preference],
+) -> anyhow::Result<Vec<build_server::protocol::Package>> {
+    let coverage = client
+        .cover(&build_server::CoverRequest {
+            op: op.to_owned(),
+            // No target: a module set fixes revisions for every host of the deployment, and each
+            // main process selects among them for its own devices.
+            targets: Vec::new(),
+            keys: Vec::new(),
+            preferred: preferred.to_vec(),
+            fixed: Vec::new(),
+        })
+        .with_context(|| format!("asking the Build Server for the packages of {op}"))?;
+    Ok(coverage.candidates)
 }
 
-/// Runs `prepare` at one host's Program Server, selecting each slot the way
-/// `selector` says, and answers the epoch's programs with the revisions and
-/// parameters it selected.
+/// Fixes the revision of the package `package` names for `op`: the one it states, checked, or
+/// its latest installed one.
+fn fix_revision(
+    client: &mut build_server::Client,
+    op: &str,
+    package: &mut proto::module::PackageRevision,
+) -> anyhow::Result<()> {
+    let stated = build_server::Preference {
+        phase: None,
+        backend: package.backend.clone(),
+        revision: (package.revision != 0).then_some(package.revision),
+    };
+    let selected = candidates(client, op, &[stated])?
+        .into_iter()
+        .find(|candidate| candidate.backend == package.backend)
+        .with_context(|| format!("no {op} package {} is installed", package.backend))?;
+    package.revision = selected.revision;
+    Ok(())
+}
+
+/// Runs `prepare` at one host's Build Server for the module set `filled`,
+/// whose revisions are fixed, and answers it with the parameters each
+/// package runs with: its manifest's defaults under the deployment's
+/// arguments.
 fn prepare_at(
-    server: &ProgramServer,
-    selector: Selector,
-    filled: &crate::epoch::FilledPrograms,
-    descriptors: &[program_server::Descriptors],
+    server: &BuildServer,
+    filled: &crate::epoch::ModuleSet,
+    descriptors: &[build_server::Descriptors],
     steps: &PrepareSteps,
-) -> anyhow::Result<crate::epoch::FilledPrograms> {
-    let policy_slot = proto::program::ProgramSlot::all(POLICY_SLOT);
-    let mut requests = Vec::with_capacity(filled.kernels.len() + 1);
-    for (slot, program) in &filled.kernels {
-        requests.push(program_server::ProgramRequest {
+) -> anyhow::Result<crate::epoch::ModuleSet> {
+    let policy_slot = proto::module::ModuleSlot::all(POLICY_SLOT);
+    let engine_slot = proto::module::ModuleSlot::all(proto::module::ENGINE);
+    let mut requests = Vec::with_capacity(filled.kernels.len() + 2);
+    for (slot, package) in &filled.kernels {
+        requests.push(build_server::PackageRequest {
             slot: slot.clone(),
-            selector: selected(selector, program),
+            selector: build_server::Selector::Fixed(package.clone()),
         });
     }
-    requests.push(program_server::ProgramRequest {
+    requests.push(build_server::PackageRequest {
         slot: policy_slot.clone(),
-        selector: selected(selector, &filled.policy),
+        selector: build_server::Selector::Fixed(filled.policy.clone()),
     });
-    let request = program_server::PrepareRequest {
+    requests.push(build_server::PackageRequest {
+        slot: engine_slot.clone(),
+        selector: build_server::Selector::Fixed(filled.engine.clone()),
+    });
+    // The engine's one module is built here, on every host, before any node
+    // starts a main process from it: a host whose store misses it builds the
+    // executable for its own platform now, while nothing waits on a start.
+    let mut descriptors = descriptors.to_vec();
+    descriptors.push(build_server::Descriptors {
+        slot: engine_slot.clone(),
+        keys: vec![proto::module::SINGLE_KEY.to_owned()],
+    });
+    let request = build_server::PrepareRequest {
         targets: server.targets.clone(),
-        programs: requests,
-        descriptors: descriptors.to_vec(),
+        packages: requests,
+        descriptors,
     };
     // Before the connect, not after it: a daemon that blocks opening the
     // socket names the host it was reaching from this line alone, and the
     // server it never reached logs nothing at all.
-    steps.at(&server.host, "opening its connection to a Program Server");
+    steps.at(&server.host, "opening its connection to a Build Server");
     tracing::info!(
         host = %server.host,
         socket = %server.socket.display(),
-        "connecting to a Program Server"
+        "connecting to a Build Server"
     );
-    let mut client = program_server::Client::connect(&server.socket).with_context(|| {
+    let mut client = build_server::Client::connect(&server.socket).with_context(|| {
         format!(
-            "connecting to the Program Server of {} at {}",
+            "connecting to the Build Server of {} at {}",
             server.host,
             server.socket.display()
         )
@@ -1243,8 +1269,8 @@ fn prepare_at(
         host = %server.host,
         socket = %server.socket.display(),
         targets = ?server.targets,
-        programs = request.programs.len(),
-        "asking a Program Server to prepare the epoch's programs"
+        modules = request.packages.len(),
+        "asking a Build Server to prepare the epoch's modules"
     );
     // A cold prepare builds every module it was asked for, which on this host
     // is minutes per package; the server reports each step as it goes. At
@@ -1252,81 +1278,123 @@ fn prepare_at(
     // that was working looked exactly like one that had died. The three states
     // that change what a reader waits for are at `info`, and `Queued` — one
     // line per module before anything happens — stays at `debug`.
-    let mut progress = |step: program_server::Progress| {
+    let mut progress = |step: build_server::Progress| {
         let building = matches!(
             step.state,
-            program_server::BuildState::Building
-                | program_server::BuildState::Committed
-                | program_server::BuildState::Failed(_)
+            build_server::BuildState::Building
+                | build_server::BuildState::Committed
+                | build_server::BuildState::Failed(_)
         );
         if building {
             tracing::info!(
                 host = %server.host,
                 module = %step.path,
                 state = ?step.state,
-                "preparing a program's module"
+                "preparing a package's module"
             );
         } else {
             tracing::debug!(
                 host = %server.host,
                 module = %step.path,
                 state = ?step.state,
-                "a program's module is queued"
+                "a package's module is queued"
             );
         }
     };
     steps.at(
         &server.host,
-        "waiting for a Program Server's answer to the prepare",
+        "waiting for a Build Server's answer to the prepare",
     );
     let prepared = client
         .prepare(&request, &mut progress)
-        .with_context(|| format!("preparing the epoch's programs at {}", server.host))?;
-    steps.at(
-        &server.host,
-        "reading the programs a Program Server selected",
-    );
+        .with_context(|| format!("preparing the epoch's modules at {}", server.host))?;
+    steps.at(&server.host, "reading the modules a Build Server selected");
     tracing::info!(
         host = %server.host,
-        prepared = prepared.programs.len(),
-        "a Program Server answered"
+        prepared = prepared.len(),
+        "a Build Server answered"
     );
     let mut kernels = BTreeMap::new();
     let mut policy = None;
-    for chosen in prepared.programs {
-        if chosen.slot == policy_slot {
-            policy = Some(chosen.program);
+    let mut engine = None;
+    for (slot, package) in prepared {
+        if slot == policy_slot {
+            policy = Some(package);
+        } else if slot == engine_slot {
+            engine = Some(package);
         } else {
-            kernels.insert(chosen.slot, chosen.program);
+            kernels.insert(slot, package);
         }
     }
-    let policy = policy.context("the Program Server selected no scheduling program")?;
+    let policy = policy.context("the Build Server selected no scheduling policy package")?;
+    let engine = engine.context("the Build Server selected no engine package")?;
     anyhow::ensure!(
         kernels.len() == filled.kernels.len(),
-        "the Program Server of {} selected programs for {} of the {} slots asked",
+        "the Build Server of {} selected modules for {} of the {} slots asked",
         server.host,
         kernels.len(),
         filled.kernels.len()
     );
-    Ok(crate::epoch::FilledPrograms { kernels, policy })
+    Ok(crate::epoch::ModuleSet {
+        engine,
+        kernels,
+        policy,
+    })
 }
 
-/// The slot the scheduling program fills: the name the policy packages state
+/// The slot the scheduling policy package fills: the name the policy packages state
 /// as their `op` (`crates/scheduling/policies/<backend>/package.toml`). The
 /// scheduling interface is not an operator (§5.1): the epoch record keeps its
-/// program beside the kernels' rather than among them, so `prepare` names it
+/// package beside the kernels' rather than among them, so `prepare` names it
 /// by this slot and the daemon takes it back out.
 const POLICY_SLOT: &str = "scheduling";
 
-/// The selector a `prepare` request uses for `program`.
-fn selected(selector: Selector, program: &proto::program::Program) -> program_server::Selector {
-    match selector {
-        Selector::Latest => program_server::Selector::Latest {
-            backend: program.backend.clone(),
-            arguments: program.arguments.clone(),
-        },
-        Selector::Fixed => program_server::Selector::Fixed(program.clone()),
-    }
+/// Fixes the engine package `engine` names at the Build Server on `socket`: its latest installed
+/// revision, or the one it states, with its module built for this host.
+///
+/// A main process is started from the engine's module, so this selection comes before any other
+/// of an epoch's: the launch file names the revision it answers, and every node's daemon resolves
+/// that revision at its own Build Server.
+///
+/// # Errors
+///
+/// Fails when the Build Server cannot be reached, holds no such engine package or revision, or
+/// cannot build it.
+pub fn select_engine(
+    socket: &std::path::Path,
+    engine: &proto::module::PackageRevision,
+) -> anyhow::Result<proto::module::PackageRevision> {
+    let mut client = build_server::Client::connect(socket)
+        .with_context(|| format!("connecting to the Build Server at {}", socket.display()))?;
+    let mut engine = engine.clone();
+    fix_revision(&mut client, proto::module::ENGINE, &mut engine)?;
+
+    let slot = proto::module::ModuleSlot::all(proto::module::ENGINE);
+    let request = build_server::PrepareRequest {
+        targets: Vec::new(),
+        packages: vec![build_server::PackageRequest {
+            slot: slot.clone(),
+            selector: build_server::Selector::Fixed(engine.clone()),
+        }],
+        descriptors: vec![build_server::Descriptors {
+            slot,
+            keys: vec![proto::module::SINGLE_KEY.to_owned()],
+        }],
+    };
+    let prepared = client
+        .prepare(&request, &mut |step| {
+            tracing::info!(
+                path = %step.path,
+                state = ?step.state,
+                "the Build Server prepares the engine's module"
+            );
+        })
+        .with_context(|| format!("selecting the engine package {}", engine.backend))?;
+    prepared
+        .into_iter()
+        .next()
+        .map(|(_, package)| package)
+        .context("the Build Server selected no engine package")
 }
 
 /// One epoch's main process on a node, and the daemon's process connection
@@ -1341,7 +1409,7 @@ pub struct EpochProcess {
     pub engine: u64,
 }
 
-/// How long a main process takes to prepare a generation's programs: it
+/// How long a main process takes to prepare a generation's modules: it
 /// resolves and loads the modules, instantiates the policy, rebinds or
 /// recaptures the graphs and shadows the replaced operators (§7.3 step 2).
 const PRECOPY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -1361,7 +1429,7 @@ impl crate::interference::Throttle for EngineControl {
 /// that stops moving, never on how many captures a deployment has.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The program layer of a change (§7.3): it moves the serving main processes
+/// The generation layer of a change (§7.3): it moves the serving main processes
 /// from the generation an epoch runs to the one `prepare` selected, keeps
 /// the previous generation through the probation, and ends the probation.
 ///
@@ -1375,19 +1443,19 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// fault, a stalled job, non-finite logits or a fatal policy revert fails
 /// the update with the first such failure ([`Update::fail`]), and
 /// acknowledgements are matched to the command that waits for them.
-pub struct ProgramSwitch<'a> {
+pub struct GenerationSwitch<'a> {
     /// The daemon's command channel to the main processes (§2.3).
     commands: &'a crate::supervision::ProcessCommands,
     processes: Vec<EpochProcess>,
     update: crate::epoch::Update,
-    /// The program generation each main process numbered for the precopy it
+    /// The module generation each main process numbered for the precopy it
     /// answered, in the processes' order: the main process numbers its
     /// generations, the daemon sends them back in `Switchover` and `Purge`.
     /// Empty before a precopy.
     generations: Vec<u64>,
 }
 
-impl<'a> ProgramSwitch<'a> {
+impl<'a> GenerationSwitch<'a> {
     /// A switch of `processes`, the serving epoch's main processes, for
     /// `update`, commanded through the daemon's channel to them.
     pub fn new(
@@ -1435,8 +1503,8 @@ impl<'a> ProgramSwitch<'a> {
         &self.processes
     }
 
-    /// Prepares the next program generation in every main process: the kernel
-    /// programs and the scheduling program, resolved and loaded, the policy
+    /// Prepares the next module generation in every main process: the kernel
+    /// packages and the scheduling policy package, resolved and loaded, the policy
     /// instantiated and trialled, the graphs rebound or recaptured and the
     /// replaced operators shadowed (§7.3 step 2). A main process that cannot
     /// prepare them answers `PrecopyFailed` and keeps serving the generation
@@ -1448,20 +1516,19 @@ impl<'a> ProgramSwitch<'a> {
     /// fault report it sent meanwhile.
     pub fn precopy(
         &mut self,
-        programs: &BTreeMap<crate::epoch::KernelKey, crate::epoch::Program>,
-        policy: &crate::epoch::Program,
+        modules: &BTreeMap<crate::epoch::KernelKey, crate::epoch::PackageRevision>,
+        policy: &crate::epoch::PackageRevision,
     ) -> Result<(), crate::epoch::Failure> {
-        // A slot with a part is a package the store holds for an operator the deployment names
-        // nothing for (`with_store_programs`): the record keeps it, and the main process's
-        // selection chooses among such packages itself, so it is not named.
+        // The whole fixed set is stated: a slot with a part is a candidate the main process's
+        // selection chooses among for each key (`with_store_modules`), at the revision the
+        // set fixed for it.
         let command = process::Command {
             kind: Some(command::Kind::Precopy(process::Precopy {
-                kernels: programs
+                kernels: modules
                     .iter()
-                    .filter(|(slot, _)| slot.part.is_none())
-                    .map(|(slot, program)| crate::epoch::kernel_to_wire(slot, program))
+                    .map(|(slot, package)| crate::epoch::kernel_to_wire(slot, package))
                     .collect(),
-                policy: Some(crate::epoch::program_to_wire(policy)),
+                policy: Some(crate::epoch::package_to_wire(policy)),
             })),
         };
         let Self {
@@ -1857,8 +1924,8 @@ pub(crate) struct Interfaces<'a> {
     pub(crate) requests: &'a str,
     /// The daemon's process interface.
     pub(crate) processes: &'a str,
-    /// The Program Server's socket.
-    pub(crate) program_server: &'a Path,
+    /// The Build Server's socket.
+    pub(crate) build_server: &'a Path,
 }
 
 /// The launch file's contents for the scheduler node's process `engine`: `args`, with the
@@ -1953,7 +2020,7 @@ pub(crate) fn world_hosts(config: &proto::config::EngineConfig) -> anyhow::Resul
 
 /// The launch file's contents for the process `engine` on `host`, in a world of `world_size`
 /// ranks: `args`, with the process's place and the interfaces `interfaces` states. The node that
-/// starts it states its own Program Server (`Spawn::launch`).
+/// starts it states its own Build Server (`Spawn::launch`).
 fn place_on(
     mut args: EngineArgs,
     engine: u64,
@@ -1979,7 +2046,7 @@ fn place_on(
     args.requests = interfaces.requests.to_owned();
     args.processes = interfaces.processes.to_owned();
     args.engine = engine;
-    args.program_server = interfaces.program_server.display().to_string();
+    args.build_server = interfaces.build_server.display().to_string();
     args.devices = host.devices.clone();
     args.group = ENGINE_GROUP.to_owned();
     args.rank = host.first;
@@ -2063,7 +2130,7 @@ mod tests {
         let interfaces = Interfaces {
             requests: "",
             processes: "",
-            program_server: Path::new(""),
+            build_server: Path::new(""),
         };
 
         let placed = place(args, 1, &interfaces).expect("the process places");
@@ -2076,7 +2143,7 @@ mod tests {
         assert!(placed.scheduler_node);
         assert!(placed.world.is_none());
         assert!(placed.requests.is_empty() && placed.processes.is_empty());
-        assert!(placed.program_server.is_empty());
+        assert!(placed.build_server.is_empty());
     }
 
     /// A worker group whose ranks spread over two hosts is one main process per host, the engine
@@ -2109,21 +2176,20 @@ mod tests {
         );
     }
 
-    /// An epoch's start names this daemon's own build only for its own binary,
-    /// and starts the process with the launch file alone: another executable's
-    /// children fix their identity with their first `Hello` (§7.4).
+    /// An epoch's start carries the launch file alone and names no build: the
+    /// engine is a package's executable, whose children fix their identity
+    /// with their first `Hello` (§7.4).
     #[test]
-    fn an_epoch_start_names_the_build_of_the_daemons_own_executable() {
+    fn an_epoch_start_carries_the_launch_and_names_no_build() {
         let directory = tempfile::tempdir().unwrap();
         let control = EngineControl::new(
             &directory.path().join("requests.sock"),
             "unix:/run/processes.sock".into(),
             "rank-0".into(),
             "model".into(),
-            std::path::PathBuf::from("/run/program-server.sock"),
+            std::path::PathBuf::from("/run/build-server.sock"),
         )
         .unwrap();
-        let own = std::env::current_exe().unwrap();
         // The deployment's own engine configuration, as the options resolve it, on this control's
         // host: an epoch's start reads the ranks it places.
         let mut options = ServerArgs {
@@ -2134,13 +2200,12 @@ mod tests {
         };
         options.device_config.devices = vec![0];
         options.device_config.queue_depth = std::num::NonZeroUsize::new(4).unwrap();
-        options.worker_config.executable = own;
         let mut args =
             EngineArgs::new(options.engine_config().expect("the configuration resolves"));
         args.epoch = 3;
 
         let start = control.epoch_start(&args, 9).unwrap();
-        assert_eq!(start.build, Some(proto::BUILD.to_owned()));
+        assert_eq!(start.build, None);
         // The file is the adapter's to write for the process it starts; the
         // start carries its contents, with this process's generation.
         assert_eq!(start.launch.engine, 9);
@@ -2161,15 +2226,9 @@ mod tests {
         let standby = control.epoch_start(&args, 10).unwrap();
         assert!(standby.launch.standby());
         assert_eq!(standby.launch.epoch, 3);
-        args.predecessor = None;
-
-        args.engine_config.worker.executable = std::path::PathBuf::from("/opt/uniserve-b");
-        let other = control.epoch_start(&args, 9).unwrap();
-        assert_eq!(other.build, None);
-        assert_eq!(other.executable, "/opt/uniserve-b");
     }
 
-    /// An update of the default deployment's filled programs, for the switch to
+    /// An update of the default deployment's filled modules, for the switch to
     /// move.
     fn update() -> crate::epoch::Update {
         crate::epoch::Update::new(
@@ -2178,7 +2237,7 @@ mod tests {
         )
     }
 
-    /// The program layer moves every main process through the generations each
+    /// The generation layer moves every main process through the generations each
     /// one numbered for itself (§7.3): the precopy, then the switchover to the
     /// generation that process answered with, then the commit, and the purge of
     /// the generation each one executes.
@@ -2188,14 +2247,14 @@ mod tests {
             main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
         let target =
             crate::epoch::Epoch::of(ServerArgs::default()).expect("the configuration resolves");
-        let mut switch = ProgramSwitch::new(
+        let mut switch = GenerationSwitch::new(
             &processes,
             vec![process("rank-0", 7), process("rank-1", 8)],
             update(),
         );
         switch
-            .precopy(&target.programs.kernels, &target.programs.policy)
-            .expect("both main processes prepared the programs");
+            .precopy(&target.modules.kernels, &target.modules.policy)
+            .expect("both main processes prepared the modules");
         switch
             .switchover()
             .expect("both switched to what they prepared");
@@ -2243,7 +2302,7 @@ mod tests {
         );
     }
 
-    /// A main process that cannot prepare the programs fails the update and
+    /// A main process that cannot prepare the modules fails the update and
     /// keeps serving the generation it runs: nothing is switched, and the update
     /// is not unavailable, since nothing reverted (§7.3 step 2).
     #[test]
@@ -2257,13 +2316,13 @@ mod tests {
         ]);
         let target =
             crate::epoch::Epoch::of(ServerArgs::default()).expect("the configuration resolves");
-        let mut switch = ProgramSwitch::new(
+        let mut switch = GenerationSwitch::new(
             &processes,
             vec![process("rank-0", 7), process("rank-1", 8)],
             update(),
         );
         let failure = switch
-            .precopy(&target.programs.kernels, &target.programs.policy)
+            .precopy(&target.modules.kernels, &target.modules.policy)
             .expect_err("a refused precopy fails");
         assert_eq!(failure.kind, "precopy_failed");
         assert!(
@@ -2283,7 +2342,7 @@ mod tests {
         assert!(switch.update().unavailable().is_none());
     }
 
-    /// A main process's fault while the programs are prepared fails the update
+    /// A main process's fault while the modules are prepared fails the update
     /// with that first failure, and a reverted update stays unavailable until
     /// `force` is asked for (§7.3 step 4).
     #[test]
@@ -2300,9 +2359,9 @@ mod tests {
         )]);
         let target =
             crate::epoch::Epoch::of(ServerArgs::default()).expect("the configuration resolves");
-        let mut switch = ProgramSwitch::new(&processes, vec![process("rank-0", 7)], update());
+        let mut switch = GenerationSwitch::new(&processes, vec![process("rank-0", 7)], update());
         let failure = switch
-            .precopy(&target.programs.kernels, &target.programs.policy)
+            .precopy(&target.modules.kernels, &target.modules.policy)
             .expect_err("a fault fails the update");
         assert_eq!(failure.kind, "sticky");
         switch
@@ -2319,7 +2378,7 @@ mod tests {
     /// A scheduling policy that fails reports `PolicyReverted` without being
     /// asked, and that report is the update's first failure (§4.4).
     #[test]
-    fn a_policy_revert_while_the_programs_are_prepared_fails_the_update() {
+    fn a_policy_revert_while_the_modules_are_prepared_fails_the_update() {
         let (processes, _) = main_processes(vec![(
             7,
             Answer::Reports(|| process::Report {
@@ -2334,9 +2393,9 @@ mod tests {
         )]);
         let target =
             crate::epoch::Epoch::of(ServerArgs::default()).expect("the configuration resolves");
-        let mut switch = ProgramSwitch::new(&processes, vec![process("rank-0", 7)], update());
+        let mut switch = GenerationSwitch::new(&processes, vec![process("rank-0", 7)], update());
         let failure = switch
-            .precopy(&target.programs.kernels, &target.programs.policy)
+            .precopy(&target.modules.kernels, &target.modules.policy)
             .expect_err("a policy revert fails the update");
         assert_eq!(failure.kind, "policy_reverted");
         assert!(failure.reason.contains("priority"), "{}", failure.reason);

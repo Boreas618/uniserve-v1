@@ -1,8 +1,8 @@
-# The fp8_gemm operator's Triton backend: design 5.2's program package.
+# The fp8_gemm operator's Triton backend: design 5.2's package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
-# driver the Program Server runs for one descriptor and target).
+# driver the Build Server runs for one descriptor and target).
 #
 # One program computes one output tile of a per-tensor FP8 product: the 16-bit
 # activation tile is encoded to E4M3 by its static scale as it is loaded, the
@@ -12,6 +12,7 @@
 
 op = "fp8_gemm"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

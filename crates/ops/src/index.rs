@@ -217,7 +217,7 @@ fn require_alike_off_axis(
 }
 
 impl Op for Index {
-    const NAME: &'static str = proto::program::operator::INDEX;
+    const NAME: &'static str = proto::module::operator::INDEX;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;

@@ -2,8 +2,8 @@
 
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
-dimensions give, and the compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+dimensions give, and the compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The key-tile lane width is the whole descriptor: it bounds the tiles one query tile ranks, and the
 kernel reduces over those lanes. The tile count, the query-tile count and the window offset are
@@ -11,7 +11,7 @@ launch words.
 """
 
 import vsa_select_tiles as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 
 def spec(fields, parameters, target):

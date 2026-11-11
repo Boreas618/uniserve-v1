@@ -8,8 +8,8 @@
 //! Both extents are **launch values**, so one compiled program serves every clip length: the
 //! descriptor holds the element type and the tile side, and nothing of the request's geometry.
 
-use ops::transpose::{self, Transpose as TransposeOp};
 use ops::Operand;
+use ops::transpose::{self, Transpose as TransposeOp};
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
@@ -31,7 +31,10 @@ impl Transpose {
         if ops::abi::bytes(dtype).is_none() {
             return Err(Error::shape(
                 "Transpose",
-                format!("{dtype} has no whole-byte element size to move", dtype = ops::abi::name(dtype)),
+                format!(
+                    "{dtype} has no whole-byte element size to move",
+                    dtype = ops::abi::name(dtype)
+                ),
             ));
         }
         Ok(Self { dtype })
@@ -76,7 +79,8 @@ impl Transpose {
                 "Transpose",
                 format!(
                     "the source is {}, the layer was built for {}",
-                    ops::abi::name(source.dtype), ops::abi::name(self.dtype)
+                    ops::abi::name(source.dtype),
+                    ops::abi::name(self.dtype)
                 ),
             ));
         }

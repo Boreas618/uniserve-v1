@@ -63,7 +63,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Strides, Operand};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -150,7 +150,7 @@ pub struct ConversionArgs {
 pub struct PageConversion;
 
 impl Op for PageConversion {
-    const NAME: &'static str = proto::program::operator::PAGE_CONVERSION;
+    const NAME: &'static str = proto::module::operator::PAGE_CONVERSION;
 
     type Descriptor = ConversionDescriptor;
     type Args<'a> = ConversionArgs;
@@ -188,7 +188,10 @@ impl Op for PageConversion {
         if args.scratch.dtype != DType::U8 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("the scratch is {}, not raw bytes", abi::name(args.scratch.dtype)),
+                format!(
+                    "the scratch is {}, not raw bytes",
+                    abi::name(args.scratch.dtype)
+                ),
             ));
         }
         let needed = scratch_bytes(args.elements, args.scales);
@@ -277,12 +280,13 @@ impl Op for PageConversion {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // One rounded multiply per stored value: the source's own writes rounded the same way, and a
         // narrow compute type rounds the product once more into the FP32 block.
-        let extra =
-            if tolerance::unit_roundoff(descriptor.compute) > f64::from(tolerance::unit_roundoff(DType::F32) as f32) {
-                1.0
-            } else {
-                0.0
-            };
+        let extra = if tolerance::unit_roundoff(descriptor.compute)
+            > f64::from(tolerance::unit_roundoff(DType::F32) as f32)
+        {
+            1.0
+        } else {
+            0.0
+        };
         Tolerance::new(
             0.0,
             (1.0 + extra) * tolerance::unit_roundoff(descriptor.compute) as f32,
@@ -351,7 +355,7 @@ pub struct CopyRegionArgs {
 pub struct CacheCopyRegion;
 
 impl Op for CacheCopyRegion {
-    const NAME: &'static str = proto::program::operator::CACHE_COPY_REGION;
+    const NAME: &'static str = proto::module::operator::CACHE_COPY_REGION;
 
     type Descriptor = CopyRegionDescriptor;
     type Args<'a> = CopyRegionArgs;
@@ -526,7 +530,10 @@ impl Op for CacheCopyRegion {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The destination encodes each written value once into its stored type; scaling the unit up
         // rescales the resident values, one rounding each.
-        Tolerance::new(0.0, 2.0 * tolerance::unit_roundoff(descriptor.element) as f32)
+        Tolerance::new(
+            0.0,
+            2.0 * tolerance::unit_roundoff(descriptor.element) as f32,
+        )
     }
 }
 

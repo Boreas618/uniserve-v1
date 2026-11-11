@@ -15,6 +15,7 @@
 
 op = "paged_attention"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

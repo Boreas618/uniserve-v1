@@ -11,7 +11,7 @@ output's point count is the launch's word, so one module serves every target gri
 """
 
 import position_interpolate as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The element types the table and the output are stored in; the taps accumulate in FP32.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}

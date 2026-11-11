@@ -10,7 +10,7 @@ whether the axes interleave. The token count is a runtime word.
 import struct
 
 import rotary_factors as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: Element types of the factor tables and of the positions.
 DTYPES = {"f32": "fp32", "bf16": "bf16", "f16": "fp16"}

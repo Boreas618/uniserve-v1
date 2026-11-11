@@ -2,12 +2,12 @@
 
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature, the order the operator launches them in, the compile-time values the descriptor
-dimensions give, and the compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+dimensions give, and the compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 """
 
 import vsa_zero_padding as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The floating dtypes a row may have: the descriptor prints `DType`'s names and Triton
 #: spells FP16 `fp16` and FP32 `fp32`.

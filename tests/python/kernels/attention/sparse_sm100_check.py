@@ -10,7 +10,7 @@ module's output and normalizer with the operator's own definition computed in to
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory holding ``module.so``.
 The block size must be the one the module was compiled for. Run it on the GB200 with the
-Program Server's own environment (``crates/program-server/python/.venv/bin/python``),
+Build Server's own environment (``crates/build-server/python/.venv/bin/python``),
 which has torch.
 """
 

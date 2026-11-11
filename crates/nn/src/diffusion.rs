@@ -30,7 +30,7 @@
 //! indexed by the caller's step table. Every evaluation then launches against the same buffers, so
 //! one captured graph serves the whole trajectory; only the step table's index changes per replay.
 
-use ops::{Shape, Strides, Operand};
+use ops::{Operand, Shape, Strides};
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};

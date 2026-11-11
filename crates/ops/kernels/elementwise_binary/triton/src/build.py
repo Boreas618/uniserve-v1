@@ -3,8 +3,8 @@
 ``spec`` states what this package's kernel needs for one descriptor: the
 kernel function, its argument signature in the order the operator launches
 them, the compile-time values the descriptor dimensions give, and the
-compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The function, the element type and the number of axes are compiled in. The shape
 and both inputs' strides are words, so one module serves every shape and every
@@ -14,7 +14,7 @@ the inputs hold.
 
 import elementwise_binary as kernels
 import strided
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The functions whose output is a ``u8`` truth value.
 COMPARISONS = ("eq", "ne", "lt", "le", "gt", "ge")

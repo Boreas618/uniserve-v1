@@ -37,7 +37,7 @@ use ops::{Generation, Op, Route, Stream};
 use crate::error::{Error, Result};
 use crate::group::{self, Group, Transfer};
 use crate::layers::DispatchViews;
-use crate::tensor::{DevicePtr, Shape, Operand};
+use crate::tensor::{DevicePtr, Operand, Shape};
 use uniserve_tensor::DType;
 
 /// The alignment every arena reservation starts at.
@@ -177,7 +177,8 @@ impl Arena {
         let bytes = ops::abi::bytes(dtype)
             .ok_or_else(|| {
                 Error::Unsupported(format!(
-                    "{dtype} elements are sub-byte; their storage layout names their bytes", dtype = ops::abi::name(dtype)
+                    "{dtype} elements are sub-byte; their storage layout names their bytes",
+                    dtype = ops::abi::name(dtype)
                 ))
             })?
             .checked_mul(shape.numel())
@@ -850,7 +851,7 @@ impl<'a> Forward<'a> {
 
     /// Tell the capture sink, when one is installed, that `O`'s program just launched.
     ///
-    /// A capture records the graph nodes each operator launch added, and a program update rebinds
+    /// A capture records the graph nodes each operator launch added, and a generation update rebinds
     /// one operator's parameters at a time through that table. The key is
     /// formatted only when a sink will read it: every launch of a serving step passes through here,
     /// and a capture is the exception, not the rule.

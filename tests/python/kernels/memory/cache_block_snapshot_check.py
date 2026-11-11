@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `cache_block_snapshot` on Triton's interpreter and check the rows it reads out.
 
-    crates/program-server/python/.venv/bin/python snapshot_check.py [--package DIR]
+    crates/build-server/python/.venv/bin/python snapshot_check.py [--package DIR]
 
 The first half of the prefix cache's block copy: ``snapshot[row, :] = field[blocks[row], :]``, so the
 second half can write the same blocks elsewhere without a host read between the two launches. It reads

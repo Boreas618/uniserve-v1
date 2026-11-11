@@ -9,8 +9,8 @@ build-backend = "setuptools.build_meta"
 # The repository holds no Python package of its own. This project is what
 # `uv sync` builds and installs: the `uniserve` executable, onto the
 # environment's `bin/`, with the development, test and evaluation tools beside
-# it. The Program Server keeps its own environment
-# (`crates/program-server/python`), the one place a compiler runs Python.
+# it. The Build Server keeps its own environment
+# (`crates/build-server/python`), the one place a compiler runs Python.
 [project]
 name = "uniserve"
 version = "2.0.0"
@@ -82,7 +82,7 @@ packages = []
 # `uniserve`: `serve` (a node's daemon), `frontend` (the deployment's
 # application process), `engine` (a node's main process), `storage` (a host's
 # Storage Server) and `rules` (the model-family request rules a plan asks
-# for), plus the `program-server` entry a Program Server starts with. It is a
+# for), plus the `build-server` entry a Build Server starts with. It is a
 # binary rather than a Python extension module, and serving runs it, so it
 # builds with Cargo's release profile even for an editable install, where
 # setuptools-rust would otherwise choose a debug build.

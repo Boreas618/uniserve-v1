@@ -190,12 +190,7 @@ fn frames(clip: Operand, (start, stop): (u32, u32)) -> Result<Operand> {
 }
 
 /// Refuses a predecessor's tail that is not one contiguous block of `clip`'s raster and `dtype`.
-fn check_previous(
-    clip: Operand,
-    previous: Operand,
-    dtype: DType,
-    overlap: u32,
-) -> Result<()> {
+fn check_previous(clip: Operand, previous: Operand, dtype: DType, overlap: u32) -> Result<()> {
     let shape = [
         u64::from(RGB_CHANNELS),
         u64::from(overlap),
@@ -206,7 +201,8 @@ fn check_previous(
         return Err(Error::config(format!(
             "a predecessor's tail is {shape:?} {dtype} and the view is {:?} {}",
             previous.shape.dims(),
-            ops::abi::name(previous.dtype), dtype = ops::abi::name(dtype)
+            ops::abi::name(previous.dtype),
+            dtype = ops::abi::name(dtype)
         )));
     }
     Ok(())

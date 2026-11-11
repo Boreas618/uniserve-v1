@@ -92,7 +92,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::{self, Stream};
-use crate::tensor::{DevicePtr, Shape, Operand};
+use crate::tensor::{DevicePtr, Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -426,7 +426,7 @@ impl NativeCall for Call {
 pub struct PagedAttention;
 
 impl Op for PagedAttention {
-    const NAME: &'static str = proto::program::operator::PAGED_ATTENTION;
+    const NAME: &'static str = proto::module::operator::PAGED_ATTENTION;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -466,7 +466,8 @@ impl Op for PagedAttention {
                     Self::NAME,
                     format!(
                         "expected {} cached keys and values, found {}",
-                        abi::name(descriptor.key_value), abi::name(cache.dtype)
+                        abi::name(descriptor.key_value),
+                        abi::name(cache.dtype)
                     ),
                 ));
             }
@@ -503,7 +504,10 @@ impl Op for PagedAttention {
         if args.page_table.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 pages, found {}", abi::name(args.page_table.dtype)),
+                format!(
+                    "expected i32 pages, found {}",
+                    abi::name(args.page_table.dtype)
+                ),
             ));
         }
         let batch = args.page_table.shape.dim(0);
@@ -520,7 +524,10 @@ impl Op for PagedAttention {
         if args.seq_lens.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 lengths, found {}", abi::name(args.seq_lens.dtype)),
+                format!(
+                    "expected i32 lengths, found {}",
+                    abi::name(args.seq_lens.dtype)
+                ),
             ));
         }
 

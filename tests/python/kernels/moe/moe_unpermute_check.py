@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the `moe_unpermute` module on a device and check the combine it writes.
 
-    crates/program-server/python/.venv/bin/python combine_check.py <module_dir> [--tokens N]
+    crates/build-server/python/.venv/bin/python combine_check.py <module_dir> [--tokens N]
 
 `<module_dir>` is what `resolve` hands a runner: the directory holding `module.so`. The module is
 compiled for one descriptor of the fixture —
@@ -62,14 +62,14 @@ FIXTURE_KEY = "hidden_2048_top_8_experts_128_input_bf16_scales_f32_output_bf16"
 def find_module(op, backend, key):
     """The directory holding `module.so` for a descriptor, so a bare run needs no argument.
 
-    Searched in the order a caller is likely to have it: `$UNISERVE_PROGRAM_STORE` or
+    Searched in the order a caller is likely to have it: `$UNISERVE_MODULE_STORE` or
     `$UNISERVE_MODULE_DIR` if set, then a store under the working tree (`.local/`, `artifacts/`,
     `target/`), then the cache. Failing that the message names the argument instead of guessing.
     """
     roots = [
         pathlib.Path(value)
         for value in (
-            os.environ.get("UNISERVE_PROGRAM_STORE"),
+            os.environ.get("UNISERVE_MODULE_STORE"),
             os.environ.get("UNISERVE_MODULE_DIR"),
             os.environ.get("UNISERVE_STORE"),
         )
@@ -97,7 +97,7 @@ def find_module(op, backend, key):
                 return hit.parent
     raise SystemExit(
         f"no module for {op} {key} was found under {[str(root) for root in roots]}: pass the "
-        f"directory `resolve` hands a runner, or set $UNISERVE_PROGRAM_STORE"
+        f"directory `resolve` hands a runner, or set $UNISERVE_MODULE_STORE"
     )
 
 
@@ -313,7 +313,7 @@ def main() -> int:
         nargs="?",
         default=None,
         help="the module directory `resolve` hands a runner; omitted, the fixture's own module is "
-        "found under $UNISERVE_PROGRAM_STORE or a store in the working tree",
+        "found under $UNISERVE_MODULE_STORE or a store in the working tree",
     )
     parser.add_argument(
         "--expect-key",

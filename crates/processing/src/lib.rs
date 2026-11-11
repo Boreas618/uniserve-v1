@@ -42,7 +42,7 @@ mod video;
 mod vocabulary;
 
 pub use canvas::{CanvasError, CanvasRule, CoverCrop, cover_crop};
-pub use family::{Family, Registry, RegistryError};
+pub use family::{FAMILIES, Family, Registry, RegistryError};
 pub use frames::{ClipSpan, FrameClips, requested_frames};
 pub use image::{ImageBlock, ImageFamily, ImageProcessor};
 pub use media::{

@@ -25,9 +25,9 @@
 //! a later read has not reached yet; the operators' shape and stride checks refuse mismatched extents
 //! but cannot see a shift inside one row, so this documentation is the obligation the caller holds.
 
-use uniserve_tensor::DType;
 use ops::Operand;
 use ops::activation::{self, Activation};
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;

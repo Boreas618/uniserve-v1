@@ -85,10 +85,13 @@ fn emit_source_digest() -> io::Result<()> {
     }
     // The workspace's root package is the `uniserve` executable: its manifest
     // is the workspace manifest (`ROOT_FILES`) and its sources are the root
-    // `src/`.
+    // `src/`. The snapshot an engine package is built from is a workspace
+    // without a root package, so it has none.
     let root_sources = PathBuf::from("src");
-    watched.push(root_sources.clone());
-    list_files(&root, &root_sources, &mut inputs)?;
+    if root.join(&root_sources).is_dir() {
+        watched.push(root_sources.clone());
+        list_files(&root, &root_sources, &mut inputs)?;
+    }
     inputs.sort();
     inputs.dedup();
 

@@ -9,6 +9,7 @@ The numerical checks of the kernel packages under `crates/ops/kernels` live in `
 | Variable | What it names | Tests |
 | --- | --- | --- |
 | `UNISERVE_KERNEL_MODULES` | A directory of built modules, `<op>/<backend>/` holding the module of the descriptor the check's defaults describe (a check comparing two builds reads named subdirectories, such as `dense_attention/f32/causal`) | the module checks of the native and cubin packages, among them the `topk_softmax` router's launch |
+| `UNISERVE_BINARY` | The base executable, whose `build-server fields` reads a descriptor key against its package's manifest; `uniserve` on the search path when unset. `just test-python-fast` builds it and sets the variable | the tensor primitives' checks (`tests/python/kernels/tensor`), which launch the module a key names |
 | `UNISERVE_KERNEL_KEYS`, `UNISERVE_KERNEL_STORE` | A key fixture and the store built from it | `test_kernel_arguments.py`, which compares every built cell's arguments with its operator's |
 
 ## GPU end-to-end tests
@@ -20,7 +21,7 @@ The HTTP tests under `tests/python/e2e` start real servers on the host's GPUs. `
 - it runs pytest with one worker per GPU (pytest-xdist), and each case leases the GPUs it serves on, so independent cases run beside one another on different GPUs while a case that observes host-wide state runs alone; the cases of a module that serves one deployment for all of them stay on one worker;
 - it writes pytest's temporary directory, which holds every server's log, and a JUnit report to `artifacts/e2e/<UTC time>/`.
 
-Every module starts its own Program Server with every kernel package of the tree installed, and each deployment of the module resolves its programs there; the Program Server compiles a kernel the first time a deployment asks for it, so a module's first deployment takes longer.
+Every module starts its own Build Server with every kernel package of the tree installed, and each deployment of the module resolves its modules there; the Build Server compiles a kernel the first time a deployment asks for it, so a module's first deployment takes longer.
 
 A plain `pytest` skips the GPU end-to-end tests: they run only when `UNISERVE_RUN_GPU_E2E=1`, which the recipes set. A test whose host asset is unset is skipped with a reason naming the variable, so a run on a host without an asset reports what it did not test; a variable that names a path that does not exist fails the test.
 
@@ -51,15 +52,15 @@ These name the checkpoints and inputs of the host. Set the ones the host has; th
 | `UNISERVE_E2E_DEVICES` | every GPU `nvidia-smi` lists | The GPU ordinals the run may lease, comma-separated; a case that needs more is skipped |
 | `UNISERVE_E2E_WORKERS` | the number of those GPUs | pytest-xdist workers |
 | `UNISERVE_E2E_ARTIFACTS` | `artifacts/e2e/<UTC time>` | Where the run's temporary directory and JUnit report go |
-| `MAX_JOBS` | `16` | Kernel compilations a Program Server runs at once |
+| `MAX_JOBS` | `16` | Kernel compilations a Build Server runs at once |
 | `UNISERVE_E2E_SET` | none | `PATH=VALUE` assignments every test deployment adds to its options |
 | `UNISERVE_E2E_TIME_SCALE` | `1` | The factor every wait of a test is stretched by |
-| `UNISERVE_PROGRAM_SERVER_PYTHON` | `crates/program-server/python/.venv/bin/python` | The Program Server's interpreter, which `uv sync --locked --project crates/program-server/python` creates |
-| `UNISERVE_PROGRAM_TARGET` | the served GPU's `sm_{major}{minor}a` | The target the Program Server builds kernels for |
-| `UNISERVE_PROGRAM_REBIND_PACKAGE`, `UNISERVE_PROGRAM_RECAPTURE_PACKAGE`, `UNISERVE_PROGRAM_POLICY_PACKAGE`, `UNISERVE_PROGRAM_WRONG_PACKAGE` | the packages under `crates/ops/program-fixtures` | The packages `test_program_update_http.py` installs |
+| `UNISERVE_BUILD_SERVER_PYTHON` | `crates/build-server/python/.venv/bin/python` | The Build Server's interpreter, which `uv sync --locked --project crates/build-server/python` creates |
+| `UNISERVE_MODULE_TARGET` | the served GPU's `sm_{major}{minor}a` | The target the Build Server builds kernels for |
+| `UNISERVE_REBIND_PACKAGE`, `UNISERVE_RECAPTURE_PACKAGE`, `UNISERVE_POLICY_PACKAGE`, `UNISERVE_WRONG_PACKAGE` | the kernel packages under `crates/ops/package-fixtures` and the policy package `crates/scheduling/policies/fixture` | The packages `test_generation_update_http.py` installs |
 | `SANITIZER_LOGS`, `COMPUTE_SANITIZER` | the run's `memcheck/`, `compute-sanitizer` | Where memcheck writes and which sanitizer runs (`just test-python-sanitizer`) |
 
-`tools/gpu_e2e.sh` sets `UNISERVE_RUN_GPU_E2E`, `UNISERVE_BINARY`, `UNISERVE_WORKER_EXECUTABLE`, `UNISERVE_SCHEDULING_PRECOMPILE`, `UNISERVE_MEMCHECK_TARGET` and `VIRTUAL_ENV` itself. A case's lease sets `UNISERVE_WORLD_DEVICES` to the GPUs it holds, comma-separated, and every test takes its devices from it (`http_helpers.granted_devices`); `cuda:N` ranks in a test's deployment index those GPUs.
+`tools/gpu_e2e.sh` sets `UNISERVE_RUN_GPU_E2E`, `UNISERVE_BINARY`, `UNISERVE_SCHEDULING_PRECOMPILE`, `UNISERVE_MEMCHECK_TARGET` and `VIRTUAL_ENV` itself. A case's lease sets `UNISERVE_WORLD_DEVICES` to the GPUs it holds, comma-separated, and every test takes its devices from it (`http_helpers.granted_devices`); `cuda:N` ranks in a test's deployment index those GPUs.
 
 ### Two hosts
 
@@ -67,7 +68,7 @@ The eight-rank layouts of `test_h3_parallel_http.py` run on this host and a seco
 
 ### A build shared by several hosts
 
-Hosts that mount the same checkout can run different modules at once from one build: build on one host (`tools/gpu_e2e.sh` builds when it runs there, or `cargo build --release -p uniserve --bin uniserve -p scheduling --bin scheduling-precompile -p manager --bin uniserve-manager`), and on the others name the executables with `UNISERVE_BINARY` and `UNISERVE_SCHEDULING_PRECOMPILE`, which makes `tools/gpu_e2e.sh` build nothing. The executable records the FFmpeg prefix it was linked against as its run path, so that prefix must lie on the shared filesystem too. Each host still needs the Rust toolchain with its dependencies fetched (`cargo fetch --locked`), because a module's Program Server builds the scheduling policy for `wasm32-unknown-unknown` offline, and the Program Server's environment.
+Hosts that mount the same checkout can run different modules at once from one build: build on one host (`tools/gpu_e2e.sh` builds when it runs there, or `cargo build --release -p uniserve --bin uniserve -p scheduling --bin scheduling-precompile -p manager --bin uniserve-manager`), and on the others name the executables with `UNISERVE_BINARY` and `UNISERVE_SCHEDULING_PRECOMPILE`, which makes `tools/gpu_e2e.sh` build nothing. The executable records the FFmpeg prefix it was linked against as its run path, so that prefix must lie on the shared filesystem too. Each host still needs the Rust toolchain with its dependencies fetched (`cargo fetch --locked`), because a module's Build Server builds the scheduling policy for `wasm32-unknown-unknown` offline, and the Build Server's environment.
 
 ### Example
 

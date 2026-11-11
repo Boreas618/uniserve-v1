@@ -97,8 +97,8 @@ pub struct Arrival<K: Order> {
 }
 
 impl<K: Order> From<Parameters> for Arrival<K> {
-    /// The program's arguments construct the policy (design §5.1: the arguments
-    /// are part of the program); the state arrives in `init`.
+    /// The package's arguments construct the policy (design §5.1: the arguments
+    /// are part of the package); the state arrives in `init`.
     fn from(parameters: Parameters) -> Self {
         Self {
             limits: Limits::from_parameters(&parameters),
@@ -687,7 +687,7 @@ mod tests {
     use crate::view::{EncodingView, PageView, PhaseView, RankView, ReplicaView, Snapshot};
 
     /// Drives an `Arrival` the way the mechanism does: construct it from the
-    /// program's arguments, then initialize it with the snapshot.
+    /// package's arguments, then initialize it with the snapshot.
     trait FromInstantiation {
         fn instantiate(&mut self, init: &Instantiation);
     }

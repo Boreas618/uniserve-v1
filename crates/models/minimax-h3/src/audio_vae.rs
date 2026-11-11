@@ -17,7 +17,7 @@
 use crate::{AudioVaeConfig, Error, Result};
 use nn::layers::{Bias, ChannelAffine, Conv1d, ConvSpec};
 use nn::vocoder::{BigVgan, BigVganSpec};
-use nn::{DType, DecodedMedia, Decoder, Forward, Shape, Operand, WeightLoader};
+use nn::{DType, DecodedMedia, Decoder, Forward, Operand, Shape, WeightLoader};
 
 /// The alias-free activations' up- and down-sampling ratio: BigVGAN's, which the config does not
 /// state.

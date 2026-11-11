@@ -32,7 +32,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -242,7 +242,7 @@ impl NativeCall for Call {
 pub struct MoeSort;
 
 impl Op for MoeSort {
-    const NAME: &'static str = proto::program::operator::MOE_SORT;
+    const NAME: &'static str = proto::module::operator::MOE_SORT;
 
     type Descriptor = Descriptor;
     type Args<'a> = SortArgs;
@@ -263,7 +263,10 @@ impl Op for MoeSort {
         if args.ids.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 route ids, found {}", abi::name(args.ids.dtype)),
+                format!(
+                    "expected i32 route ids, found {}",
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         if args.scales.dtype != descriptor.scales {
@@ -271,14 +274,18 @@ impl Op for MoeSort {
                 Self::NAME,
                 format!(
                     "expected {} route weights, found {}",
-                    abi::name(descriptor.scales), abi::name(args.scales.dtype)
+                    abi::name(descriptor.scales),
+                    abi::name(args.scales.dtype)
                 ),
             ));
         }
         if !matches!(descriptor.scales, DType::F32 | DType::BF16 | DType::F16) {
             return Err(Error::Unsupported {
                 operator: Self::NAME,
-                problem: format!("{} route weights are not a sort weight", abi::name(descriptor.scales)),
+                problem: format!(
+                    "{} route weights are not a sort weight",
+                    abi::name(descriptor.scales)
+                ),
             });
         }
         for view in [&args.tile_to_expert, &args.tile_to_limit] {

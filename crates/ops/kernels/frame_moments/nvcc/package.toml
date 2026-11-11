@@ -1,4 +1,4 @@
-# The frame_moments operator's CUDA backend: design 5.2's program package.
+# The frame_moments operator's CUDA backend: design 5.2's package.
 #
 # One native module per descriptor: the per-frame group statistics of a video
 # convolution's input (`ops::frame::FrameMomentsCall`, 600 bytes), computed with
@@ -6,12 +6,13 @@
 # variance are bit for bit `torch.var_mean`'s over the same row.
 #
 # The module is a shared object carrying the two ATen reductions the reference
-# reuses, vendored under this package's own namespace because a module the Program
+# reuses, vendored under this package's own namespace because a module the Build
 # Server `dlopen`s cannot link torch. The descriptor names the element type and the
 # variance's epsilon, which the call also carries.
 
 op = "frame_moments"
 backend = "nvcc"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

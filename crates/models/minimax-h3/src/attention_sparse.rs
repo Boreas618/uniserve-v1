@@ -16,7 +16,7 @@ use nn::layers::{
     VsaTables,
 };
 use nn::weights::{Scope, Weight};
-use nn::{Forward, Shape, Operand, Transfer};
+use nn::{Forward, Operand, Shape, Transfer};
 
 use crate::attention::heads;
 use crate::config::TransformerConfig;

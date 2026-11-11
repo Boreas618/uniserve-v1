@@ -28,7 +28,7 @@
 //! instruction per scatter on every launch to detect a table a refusal upstream already makes
 //! unrepresentable.
 //!
-//! The program is a kernel program: one thread per (row, element) of the source, the row taken from
+//! The program is a kernel package: one thread per (row, element) of the source, the row taken from
 //! the second axis and the element block from the third, so a row's elements are never split across
 //! two blocks that could race on the same destination row. Parameters, in order: `source`,
 //! `destination`, `indices`, `count` (u32), `columns` (u32), `block` (u32), the PDL flag.
@@ -44,7 +44,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Strides, Operand};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -108,7 +108,7 @@ pub struct Args {
 pub struct Rows;
 
 impl Op for Rows {
-    const NAME: &'static str = proto::program::operator::ROWS;
+    const NAME: &'static str = proto::module::operator::ROWS;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -122,7 +122,10 @@ impl Op for Rows {
         if args.indices.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 row indices, found {}", abi::name(args.indices.dtype)),
+                format!(
+                    "expected i32 row indices, found {}",
+                    abi::name(args.indices.dtype)
+                ),
             ));
         }
         args.source
@@ -206,9 +209,8 @@ impl Op for Rows {
             // A copy: the element arrives unchanged.
             Mode::Replace => Tolerance::exact(),
             // One addition in the output's dtype: its own rounding, twice (the sum and the store).
-            Mode::Add => {
-                Tolerance::exact().with_atol(2.0 * tolerance::unit_roundoff(descriptor.dtype) as f32)
-            }
+            Mode::Add => Tolerance::exact()
+                .with_atol(2.0 * tolerance::unit_roundoff(descriptor.dtype) as f32),
         }
     }
 }

@@ -118,7 +118,7 @@ fn check_strides(name: &'static str, strides: &[i64; RANK], extents: &[u64; RANK
 pub struct CopyBlock;
 
 impl Op for CopyBlock {
-    const NAME: &'static str = proto::program::operator::COPY_BLOCK;
+    const NAME: &'static str = proto::module::operator::COPY_BLOCK;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args<'a>;
@@ -129,7 +129,9 @@ impl Op for CopyBlock {
                 Self::NAME,
                 format!(
                     "a copy of {} into {} converts nothing: both sides move {} elements",
-                    abi::name(descriptor.source), abi::name(descriptor.out), abi::name(descriptor.source)
+                    abi::name(descriptor.source),
+                    abi::name(descriptor.out),
+                    abi::name(descriptor.source)
                 ),
             ));
         }

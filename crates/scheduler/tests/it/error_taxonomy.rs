@@ -1,17 +1,17 @@
 //! §4.4's error taxonomy, driven through the production step.
 //!
-//! Each case is a real policy program in WebAssembly text, and the case states
+//! Each case is a real policy package in WebAssembly text, and the case states
 //! where the mechanism refuses it, which is the one thing the taxonomy divides
 //! the six into:
 //!
 //! - **the precopy trial** refuses five of them. §4.4 has a precopy ask every
 //!   decision on the mechanism's current state, so a trap, spent fuel, limits
-//!   over the build config's ceilings and a decision the validators refuse are found before the program can serve: the command
-//!   responds with the reason, the serving program is untouched, and no revert
+//!   over the build config's ceilings and a decision the validators refuse are found before the package can serve: the command
+//!   responds with the reason, the serving package is untouched, and no revert
 //!   happens because nothing was replaced;
 //! - **the live step** decides the sixth, and it is not a policy failure. A
-//!   starved request is a condition of serving, not of a program's responses, so
-//!   the program is switched in, admits a request and never advances it, and
+//!   starved request is a condition of serving, not of a package's responses, so
+//!   the package is switched in, admits a request and never advances it, and
 //!   the mechanism acts on what could otherwise have been served: a request
 //!   starved while another request could still be served is that request's
 //!   failure, ended by name while the epoch serves on; a request starved with
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use ipc::SamplingParams;
 use scheduler::{
-    CommandSender, GenerationRequest, PolicyBytes, PolicyProgram, PolicySource, SchedulerConfig,
+    CommandSender, GenerationRequest, PolicyBytes, PolicyPackage, PolicySource, SchedulerConfig,
 };
 use scheduling::guest::Nanos;
 use scheduling::guest::PhaseId;
@@ -60,7 +60,7 @@ enum Dispatch {
     Decides,
     /// Responds to the same output once and an empty one afterwards.
     ///
-    /// A real policy names only waiting requests, so a program that admits a
+    /// A real policy names only waiting requests, so a package that admits a
     /// request and keeps naming it on later dispatches states an admission of a
     /// running request, which §4.4 refuses — and the refusal, not the
     /// starvation, is then what the case reports.
@@ -77,7 +77,7 @@ enum Dispatch {
     Burns,
 }
 
-/// A toy policy program: the reply for every decision is stated, and the two
+/// A toy policy package: the reply for every decision is stated, and the two
 /// calls that can fail fail the way the case needs.
 struct Toy {
     limits: Limits,
@@ -210,14 +210,14 @@ fn stepped_past(epoch: &Epoch, from: u64) {
     });
 }
 
-/// A scheduler thread serving one program, with the one it replaced kept for a
+/// A scheduler thread serving one package, with the one it replaced kept for a
 /// revert.
 struct Epoch {
     handle: CommandSender,
 }
 
 impl Epoch {
-    /// A scheduler serving `good`, committed: the program that serves on when
+    /// A scheduler serving `good`, committed: the package that serves on when
     /// a candidate is refused or a live failure reverts one.
     fn serving(good: Toy) -> Self {
         let pool = Arc::new(testkit::FakeBatches::new(vec![support::fake::text_pool(
@@ -243,46 +243,46 @@ impl Epoch {
         };
         epoch
             .install("fcfs", 1, good)
-            .expect("the good program serves");
+            .expect("the good package serves");
         epoch.handle.commit_policy();
         epoch
     }
 
     /// Starts a scheduler serving `good`, committed, and then puts `failing` in
-    /// so that a live failure has a program to serve on under.
+    /// so that a live failure has a package to serve on under.
     fn with_previous(good: Toy, failing: Toy) -> Self {
         let epoch = Self::serving(good);
         epoch
             .install("fcfs", 2, failing)
-            .expect("the failing program is instantiated before it serves");
+            .expect("the failing package is instantiated before it serves");
         epoch
     }
 
-    /// Offers `failing` as the epoch's next program and responds to the trial's
+    /// Offers `failing` as the epoch's next package and responds to the trial's
     /// reason for refusing it.
     ///
     /// §4.4's first failures are decided here rather than live: the trial asks
     /// every decision the state names on the mechanism's current state, and a
-    /// program whose responses run past their fuel, declare limits above the
+    /// package whose responses run past their fuel, declare limits above the
     /// build config's ceilings, or name something that does not exist never
     /// becomes the serving one.
     ///
     /// `observe` is not one of them: at a boundary there are no events to
-    /// observe, so a program that traps there passes its trial and fails the
+    /// observe, so a package that traps there passes its trial and fails the
     /// first real step - see `a_trap_in_observe_fails_the_policy`.
     fn refuse(&self, failing: Toy) -> String {
-        let program = PolicyProgram {
+        let package = PolicyPackage {
             backend: "fcfs".to_owned(),
             // A revision past any a case installed, so the trial is of a new
-            // program rather than a name already serving.
+            // package rather than a name already serving.
             revision: 3,
             arguments: Default::default(),
             stated: Default::default(),
         };
         let source: Arc<dyn PolicySource + Send + Sync> =
             Arc::new(PolicyBytes::new(failing.wasm()));
-        match response(self.handle.precopy_policy(program, source)) {
-            Ok(()) => panic!("the trial refuses this program, and it did not"),
+        match response(self.handle.precopy_policy(package, source)) {
+            Ok(()) => panic!("the trial refuses this package, and it did not"),
             Err(reason) => reason,
         }
     }
@@ -296,7 +296,7 @@ impl Epoch {
             .step
     }
 
-    /// Asserts a program that was never served left no live failure behind.
+    /// Asserts a package that was never served left no live failure behind.
     fn no_failure(&self) {
         assert!(
             self.handle
@@ -310,26 +310,26 @@ impl Epoch {
     }
 
     fn install(&self, backend: &str, revision: u32, toy: Toy) -> Result<(), String> {
-        let program = PolicyProgram {
+        let package = PolicyPackage {
             backend: backend.to_owned(),
             revision,
             arguments: Default::default(),
             stated: Default::default(),
         };
         let source: Arc<dyn PolicySource + Send + Sync> = Arc::new(PolicyBytes::new(toy.wasm()));
-        response(self.handle.precopy_policy(program, source))?;
+        response(self.handle.precopy_policy(package, source))?;
         response(self.handle.switchover_policy())
     }
 
-    /// The revision of the program that serves: after a refused candidate or
-    /// a failure, the program that serves on is the one already serving.
+    /// The revision of the package that serves: after a refused candidate or
+    /// a failure, the package that serves on is the one already serving.
     fn serving_revision(&self) -> Option<u32> {
         self.handle
-            .policy_programs()
+            .policy_packages()
             .recv_timeout(RESPONSE)
-            .expect("the scheduler responds with its slot's programs")
+            .expect("the scheduler responds with its slot's packages")
             .running
-            .map(|program| program.revision)
+            .map(|package| package.revision)
     }
 
     /// Waits for the failure report the mechanism records for a failed policy.
@@ -363,9 +363,9 @@ fn eventually<T>(mut poll: impl FnMut() -> Option<T>) -> T {
 #[test]
 fn a_trap_in_observe_fails_the_policy() {
     // `observe` is the one decision a precopy cannot ask: at a boundary there
-    // are no events to observe, so a program that traps in it passes its trial
+    // are no events to observe, so a package that traps in it passes its trial
     // and fails the first real step that hands it one. That is the live
-    // failure, and the program before it serves on.
+    // failure, and the package before it serves on.
     let epoch = Epoch::with_previous(
         Toy::idle(),
         Toy {
@@ -383,8 +383,8 @@ fn a_trap_in_observe_fails_the_policy() {
         reason.contains("trap") && reason.contains("observ"),
         "the reason names the failed call: {reason}"
     );
-    // The program before the trapping one responds to the next decision: its
-    // layout is the one given over, and the failed program's is not.
+    // The package before the trapping one responds to the next decision: its
+    // layout is the one given over, and the failed package's is not.
     assert_eq!(epoch.serving_revision(), Some(1));
     assert!(
         epoch
@@ -397,7 +397,7 @@ fn a_trap_in_observe_fails_the_policy() {
         "a policy fails once, not on every step"
     );
     // A failed policy ends no request: the one that arrived is the previous
-    // program's to serve now.
+    // package's to serve now.
     assert!(
         !events.try_recv().is_ok_and(|event| event.is_terminal()),
         "the request was not ended by the policy's failure"
@@ -444,7 +444,7 @@ fn limits_over_the_build_ceiling_fail_the_policy() {
 
 #[test]
 fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
-    // The serving program admits the request and gives it no work, so the
+    // The serving package admits the request and gives it no work, so the
     // state the trial judges holds it as a running request and the refused output's
     // work is judged against that view.
     let mut admitting = Toy::idle();
@@ -456,11 +456,11 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     // would be a refused admission, which is a different failure from the one
     // this case states.
     admitting.dispatch = Dispatch::DecidesOnce;
-    // A program may admit only a waiting request (§4.4), and the trial of the
-    // first program runs before this request exists. So the epoch serves an
-    // idle program first, the request arrives, and the admitting program is
+    // A package may admit only a waiting request (§4.4), and the trial of the
+    // first package runs before this request exists. So the epoch serves an
+    // idle package first, the request arrives, and the admitting package is
     // installed over it: the epoch this case is about is one whose serving
-    // program has admitted the request and given it no work.
+    // package has admitted the request and given it no work.
     let epoch = Epoch::serving(Toy::idle());
     // The submission's receiver is kept: a request whose events nobody reads
     // is withdrawn, and the trial would be asked to admit a request the
@@ -471,11 +471,11 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
         .expect("the request is submitted");
     // A trial runs on the mechanism's state at the boundary it is prepared at,
     // so the arrival must have been applied before the trial that admits it:
-    // one step of the idle program leaves the request queued.
+    // one step of the idle package leaves the request queued.
     stepped_past(&epoch, epoch.step());
     epoch
         .install("fcfs", 2, admitting)
-        .expect("the good program serves");
+        .expect("the good package serves");
     stepped_past(&epoch, epoch.step());
     let reason = epoch
         .refuse(Toy {
@@ -487,7 +487,7 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
         reason.contains("phase") || reason.contains("not one of this epoch"),
         "the reason names the refused decision: {reason}"
     );
-    // Nothing of the refused output ran, and nothing of it serves: the program
+    // Nothing of the refused output ran, and nothing of it serves: the package
     // that responds to the next decision is the one that was already serving.
     assert_eq!(epoch.serving_revision(), Some(2));
     epoch.no_failure();
@@ -537,8 +537,8 @@ fn a_starved_request_with_nothing_else_running_ends_the_epoch() {
     //
     // Nothing else is running, so nothing could have been served: the epoch ends by that name - the
     // failure string says "no batch formed for 1 running request(s)" and states the running set -
-    // and the request ends with the epoch. It is not a policy failure: the program that responds to every
-    // decision correctly did nothing wrong, so no report is recorded and the previous program is not
+    // and the request ends with the epoch. It is not a policy failure: the package that responds to every
+    // decision correctly did nothing wrong, so no report is recorded and the previous package is not
     // put back in.
     let epoch = Epoch::serving(Toy::idle());
     let mut events = epoch
@@ -548,7 +548,7 @@ fn a_starved_request_with_nothing_else_running_ends_the_epoch() {
     stepped_past(&epoch, epoch.step());
     epoch
         .install("fcfs", 2, starving(vec![RequestId(1)], Nanos(1_000_000)))
-        .expect("the starving program is instantiated before it serves");
+        .expect("the starving package is instantiated before it serves");
     let terminal = eventually(|| events.try_recv().ok().filter(|event| event.is_terminal()));
     assert!(
         terminal.is_terminal(),
@@ -562,7 +562,7 @@ fn a_starved_request_fails_alone_while_the_epoch_serves() {
     // Two requests, one of them admitted and given no work: the starved one fails by name and the
     // epoch does not, because the other request was still waiting and could have been served. One
     // request's thirty seconds is not evidence that every request must be lost. (That the queued
-    // one is then served is the policy's decision, which this program does not make; what is
+    // one is then served is the policy's decision, which this package does not make; what is
     // asserted here is that the epoch is still there to make it.)
     let epoch = Epoch::serving(Toy::idle());
     let mut starved = epoch
@@ -578,10 +578,10 @@ fn a_starved_request_fails_alone_while_the_epoch_serves() {
     // mechanism's starvation rule watches running requests, so request 1 is the one that starves.
     epoch
         .install("fcfs", 2, starving(vec![RequestId(1)], Nanos(1_000_000)))
-        .expect("the starving program is instantiated before it serves");
+        .expect("the starving package is instantiated before it serves");
     let terminal = eventually(|| starved.try_recv().ok().filter(|event| event.is_terminal()));
     assert!(terminal.is_terminal(), "the starved request was not ended");
-    // The epoch did not blame the program, and the other request is still the epoch's.
+    // The epoch did not blame the package, and the other request is still the epoch's.
     epoch.no_failure();
     assert!(
         !queued.try_recv().is_ok_and(|event| event.is_terminal()),

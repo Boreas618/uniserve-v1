@@ -5,7 +5,7 @@
 //!
 //! - a batch to serve, which the thread stages and replays through the runner that serves its
 //!   phase, then performs the jobs the runner returned (4.5);
-//! - a program-layer step: `precopy` (prepare the next generation), `switchover` (at a batch
+//! - a generation step: `precopy` (prepare the next generation), `switchover` (at a batch
 //!   boundary), `purge` (after the old generation's last batch), each becoming the jobs the
 //!   runners returned (7.3);
 //! - a storage owner's recorded issue work (copies, fills, fences and waits) for its own

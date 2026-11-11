@@ -1,6 +1,6 @@
 //! Stand-in main processes behind the daemon's command channel.
 //!
-//! The program layer's tests need a daemon that commands something: an
+//! The generation layer's tests need a daemon that commands something: an
 //! engine's own process needs a device and a checkpoint, so what answers here
 //! is the protocol alone — each command is answered the way §5.1 says a main
 //! process answers it, and what the daemon sent is recorded for the test to
@@ -27,30 +27,30 @@ pub(crate) enum Seen {
 pub(crate) enum Answer {
     /// It serves, and numbers this generation for the precopy it answers.
     Serves(u64),
-    /// It cannot prepare the programs, with this reason.
+    /// It cannot prepare the modules, with this reason.
     Refuses(String),
     /// It reports this instead of answering the precopy.
     Reports(fn() -> process::Report),
 }
 
-/// What a stand-in main process was handed by a `Precopy`: the programs it
+/// What a stand-in main process was handed by a `Precopy`: the modules it
 /// would have loaded, as the epoch names them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PrecopyPayload {
     /// The operators the command carried.
     pub(crate) kernels: usize,
-    /// The revision each operator's program stated, by operator: a joining
+    /// The revision each operator's package stated, by operator: a joining
     /// process must receive the numbers the epoch installed, never the zero a
-    /// filled program carries before a Program Server selects one.
+    /// filled package carries before a Build Server selects one.
     pub(crate) revisions: Vec<(String, u32)>,
-    /// The scheduling program's backend.
+    /// The scheduling policy package's backend.
     pub(crate) policy: String,
 }
 
 /// What each stand-in engine was sent, by engine number, in arrival order.
 pub(crate) type SeenLog = Arc<Mutex<Vec<(u64, Seen)>>>;
 
-/// The programs each `Precopy` carried, by engine number, in arrival order.
+/// The modules each `Precopy` carried, by engine number, in arrival order.
 pub(crate) type PrecopyLog = Arc<Mutex<Vec<(u64, PrecopyPayload)>>>;
 
 /// The service's end of the daemon's channel, with stand-in main processes
@@ -61,8 +61,8 @@ pub(crate) fn main_processes(answers: Vec<(u64, Answer)>) -> (ProcessCommands, S
     (commands, seen)
 }
 
-/// As [`main_processes`], and the programs each `Precopy` carried: a joining
-/// main process must be handed the epoch's own programs, not none.
+/// As [`main_processes`], and the modules each `Precopy` carried: a joining
+/// main process must be handed the epoch's own modules, not none.
 pub(crate) fn main_processes_recording(
     answers: Vec<(u64, Answer)>,
 ) -> (ProcessCommands, SeenLog, PrecopyLog) {
@@ -94,7 +94,7 @@ pub(crate) fn main_processes_recording(
                                 .map(|kernel| {
                                     (
                                         kernel.op.clone(),
-                                        kernel.program.as_ref().map_or(0, |p| p.revision),
+                                        kernel.package.as_ref().map_or(0, |p| p.revision),
                                     )
                                 })
                                 .collect(),

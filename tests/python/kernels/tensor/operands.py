@@ -7,7 +7,7 @@ for a device, where the same cases run on device tensors. This module holds
 what every such check needs:
 
 - the launch of a descriptor key: the key is read against the package's
-  manifest and given to its compile script as the Program Server does for
+  manifest and given to its compile script as the Build Server does for
   a build, and the kernel runs with the compile-time values that script
   states, so a check launches the module a key names;
 - the strided inputs a check traverses: contiguous, sliced, stepped, permuted
@@ -54,12 +54,11 @@ KERNELS = (
     pathlib.Path(__file__).resolve().parents[4] / "crates" / "ops" / "kernels"
 )
 
-#: The packages' compile driver is the Program Server's Python package.
-sys.path.insert(
-    0, str(KERNELS.parents[1] / "program-server" / "python" / "src")
-)
+#: The packages' compile driver is the Build Server's Python package.
+sys.path.insert(0, str(KERNELS.parents[1] / "build-server" / "python" / "src"))
 
-from uniserve_program_server import triton as driver  # noqa: E402
+from uniserve_build_server import package  # noqa: E402
+from uniserve_build_server import triton as driver  # noqa: E402
 
 #: The architecture a check asks a compile script about. It has no
 #: programmatic dependent launch, so a key's ``pdl`` compiles to nothing and a
@@ -127,7 +126,7 @@ def described(op: str, key: str) -> dict:
     """What ``op``'s package states for the module of descriptor ``key``.
 
     The key is read against the package's manifest and given to its
-    ``spec``, which is how the Program Server asks for a build: a key the
+    ``spec``, which is how the Build Server asks for a build: a key the
     manifest does not declare, or a field the compile script misreads, fails
     here rather than passing as a launch of something else.
     """
@@ -138,7 +137,8 @@ def described(op: str, key: str) -> dict:
     )
     build = importlib.util.module_from_spec(found)
     found.loader.exec_module(build)
-    return driver.described(build.spec, root, key, ARCHITECTURE)
+    fields = package.read_fields(root, key)
+    return driver.described(build.spec, root, key, ARCHITECTURE, fields)
 
 
 def launch(op: str, key: str, programs: tuple, *words) -> None:

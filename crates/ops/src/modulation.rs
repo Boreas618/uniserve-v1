@@ -31,7 +31,7 @@ use crate::abi;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -128,7 +128,7 @@ fn scaled_output(output: DType) -> bool {
 }
 
 impl Op for ModulatedRmsNorm {
-    const NAME: &'static str = proto::program::operator::MODULATED_RMS_NORM;
+    const NAME: &'static str = proto::module::operator::MODULATED_RMS_NORM;
 
     type Descriptor = ModulatedRmsNormDescriptor;
     type Args<'a> = Args;
@@ -138,7 +138,10 @@ impl Op for ModulatedRmsNorm {
         if !descriptor.dtype.is_float() {
             return Err(Error::argument(
                 Self::NAME,
-                format!("{} is not a floating activation type", abi::name(descriptor.dtype)),
+                format!(
+                    "{} is not a floating activation type",
+                    abi::name(descriptor.dtype)
+                ),
             ));
         }
         if descriptor.width == 0 || descriptor.width > MAX_WIDTH {
@@ -176,7 +179,8 @@ impl Op for ModulatedRmsNorm {
                 Self::NAME,
                 format!(
                     "expected {} row indices, found {}",
-                    abi::name(descriptor.indices), abi::name(args.row_indices.dtype)
+                    abi::name(descriptor.indices),
+                    abi::name(args.row_indices.dtype)
                 ),
             ));
         }
@@ -396,7 +400,7 @@ pub struct GatedResidualArgs {
 pub struct GatedResidual;
 
 impl Op for GatedResidual {
-    const NAME: &'static str = proto::program::operator::GATED_RESIDUAL;
+    const NAME: &'static str = proto::module::operator::GATED_RESIDUAL;
 
     type Descriptor = GatedResidualDescriptor;
     type Args<'a> = GatedResidualArgs;

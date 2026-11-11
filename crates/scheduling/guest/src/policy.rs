@@ -8,14 +8,14 @@ use crate::limits::{Limits, Parameters};
 use crate::view::{CallView, RankView, ReplicaView, RequestView, Snapshot};
 
 /// The message the mechanism hands a policy module at instantiation: the
-/// program's arguments (design §5.1) and the state of everything already
+/// package's arguments (design §5.1) and the state of everything already
 /// running.
 ///
 /// The arguments construct the policy ([`From<Parameters>`]); the state is what
 /// [`Policy::init`] receives, exactly as design §4.4 writes that method.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Instantiation {
-    /// The program's arguments, from the deployment configuration.
+    /// The package's arguments, from the deployment configuration.
     #[serde(default)]
     pub parameters: Parameters,
     /// Every object that exists at instantiation.
@@ -27,7 +27,7 @@ pub struct Instantiation {
 ///
 /// The mechanism calls these methods; a policy holds its own state and returns
 /// decisions. It is implemented inside a policy module and executed by the
-/// mechanism as a WASM program, but the trait is the interface either side is
+/// mechanism as a WASM module, but the trait is the interface either side is
 /// written against. The methods are infallible as the design gives them: a
 /// policy never reports a bad decision here — the mechanism validates every
 /// decision and a trap (including an exhausted execution budget) is the
@@ -37,9 +37,9 @@ pub trait Policy {
     /// put in mid-flight knows everything that already exists (design §4.4:
     /// `fn init(&mut self, state: &Snapshot)`).
     ///
-    /// The program's arguments reach the policy before this call: a module is
+    /// The package's arguments reach the policy before this call: a module is
     /// constructed from its [`Parameters`] (`From<Parameters>`), then
-    /// initialized with the state. The arguments are part of the program
+    /// initialized with the state. The arguments are part of the package
     /// (§5.1), so they are not a second state argument here.
     fn init(&mut self, state: &Snapshot);
 

@@ -16,7 +16,7 @@
 //! ([`GatedDeltaNet::state_fields`]). The block's intermediates are reserved from the forward's
 //! arena under a mark released before it returns.
 
-use ops::{Shape, Strides, Operand};
+use ops::{Operand, Shape, Strides};
 use uniserve_tensor::DType;
 
 use crate::capability::{StateView, TokenBatch};

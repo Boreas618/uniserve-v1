@@ -1,18 +1,18 @@
-//! The kernel installs of a precopy: the Program Server's selection of the generation's programs
+//! The kernel installs of a precopy: the Build Server's selection of the generation's packages
 //! for every key the devices launch, then one install per device admitted on the module-load lane
 //! with every selected slot and exactly its keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use build_server::{Descriptors, PackageRequest, PrepareRequest, Selector, Target};
 use ipc::UpdateFailure;
-use program_server::{Descriptors, PrepareRequest, ProgramRequest, Selector, Target};
-use proto::program::Programs;
+use proto::module::Packages;
 use worker::host::HostTask;
 
 use super::MainProcess;
-use crate::programs::modules::{Install, ModuleWork, Select};
-use crate::programs::select::Routes;
+use crate::modules::load::{Install, ModuleWork, Select};
+use crate::modules::select::Routes;
 
 impl MainProcess {
     /// Every descriptor key this node's generation launches, by operator: the union of the local
@@ -41,22 +41,22 @@ impl MainProcess {
         keys
     }
 
-    /// Admits the Program Server's selection of the generation's programs on the module-load lane:
+    /// Admits the Build Server's selection of the generation's packages on the module-load lane:
     /// every operator's keys, with the backends the deployment names for it.
     pub(super) fn admit_selection(
         &mut self,
-        named: &Programs,
+        named: &Packages,
         keys: BTreeMap<String, BTreeSet<String>>,
     ) -> std::result::Result<Arc<HostTask<ModuleWork>>, UpdateFailure> {
         for operator in keys.keys() {
-            if proto::program::operator::named(operator).is_none() {
+            if proto::module::operator::named(operator).is_none() {
                 return Err(UpdateFailure::Precopy {
                     reason: format!("operator {operator} has no implementation in this build"),
                 });
             }
         }
         let select = Select {
-            programs: Arc::clone(&self.programs),
+            packages: Arc::clone(&self.packages),
             targets: self.targets.clone(),
             named: named.clone(),
             keys,
@@ -64,24 +64,24 @@ impl MainProcess {
         self.modules
             .admit(ModuleWork::Select(select))
             .map_err(|error| UpdateFailure::Precopy {
-                reason: format!("admitting the selection of the generation's programs: {error}"),
+                reason: format!("admitting the selection of the generation's packages: {error}"),
             })
     }
 
     /// The module-load tasks one generation needs, one per device: each is one `prepare` of every
-    /// slot in `programs`, its package asked for exactly the keys `routes` selected for it.
+    /// slot in `packages`, its package asked for exactly the keys `routes` selected for it.
     pub(super) fn admit_installs(
         &mut self,
-        programs: &Programs,
+        packages: &Packages,
         routes: &Routes,
     ) -> std::result::Result<Vec<Arc<HostTask<ModuleWork>>>, UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
-        let mut entries = Vec::with_capacity(programs.len());
-        let mut descriptors = Vec::with_capacity(programs.len());
-        for (slot, program) in programs {
-            entries.push(ProgramRequest {
+        let mut entries = Vec::with_capacity(packages.len());
+        let mut descriptors = Vec::with_capacity(packages.len());
+        for (slot, package) in packages {
+            entries.push(PackageRequest {
                 slot: slot.clone(),
-                selector: Selector::Fixed(program.clone()),
+                selector: Selector::Fixed(package.clone()),
             });
             descriptors.push(Descriptors {
                 slot: slot.clone(),
@@ -103,11 +103,11 @@ impl MainProcess {
                 return Err(invalid(format!("device {} has no build target", ordinal.0)));
             }
             let install = Install {
-                programs: Arc::clone(&self.programs),
+                packages: Arc::clone(&self.packages),
                 device,
                 request: PrepareRequest {
                     targets: vec![target.clone()],
-                    programs: entries.clone(),
+                    packages: entries.clone(),
                     descriptors: descriptors.clone(),
                 },
                 target,

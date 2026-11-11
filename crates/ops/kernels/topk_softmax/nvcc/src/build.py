@@ -6,7 +6,7 @@ butterfly width of the renormalization (the top-k width rounded up to a power of
 two). One warp routes one token, so the module declares four warps and no
 dynamic shared memory.
 
-The Program Server runs this script with the package, descriptor, target and
+The Build Server runs this script with the package, descriptor, target and
 output directory in `UNISERVE_PACKAGE`, `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`
 and `UNISERVE_OUT`; a direct run passes the same four as flags.
 """
@@ -56,88 +56,28 @@ def arguments():
 
 
 def fields_of(package, descriptor):
-    """Parse a descriptor key against the package manifest's dimensions.
+    """The descriptor's fields, as the Build Server read them from its key.
 
-    A key is `name_value` joined by `_` in any order; the longest matching name
-    wins, so a value may itself contain an underscore.
+    The server hands a build ``{dimension: value}`` in ``UNISERVE_FIELDS``
+    (``--fields`` on a direct run); this kernel is specialized on every
+    dimension its manifest declares, so a key that leaves one out is refused.
     """
+    import json
     import tomllib
 
+    stated = os.environ.get("UNISERVE_FIELDS")
+    if not stated:
+        raise SystemExit(
+            f"{descriptor}: missing fields: the Build Server states them in "
+            "UNISERVE_FIELDS"
+        )
+    fields = json.loads(stated)
     manifest = tomllib.loads((package / "package.toml").read_text())
     dimensions = manifest["kernel"]["descriptors"]["dimensions"]
-    names = sorted(dimensions, key=len, reverse=True)
-    fields = {}
-    remaining = descriptor
-    while remaining:
-        name = next((one for one in names if remaining.startswith(one + "_")), None)
-        if name is None:
-            raise SystemExit(f"{descriptor}: no dimension starts {remaining!r}")
-        rest = remaining[len(name) + 1 :]
-        value = declared_value(dimensions[name], rest)
-        if value is None:
-            raise SystemExit(
-                f"{descriptor}: {name} admits no value at {rest!r}"
-            )
-        fields[name] = value
-        remaining = rest[len(value) :].removeprefix("_")
     missing = sorted(set(dimensions) - set(fields))
     if missing:
         raise SystemExit(f"{descriptor}: the descriptor names no {missing}")
     return fields
-
-
-def declared_value(declared, rest):
-    """The value a declared dimension reads at the start of ``rest``, or None.
-
-    An enumeration reads the longest of its values that ``rest`` starts with
-    whole. A constraint table (``{ multiple = 16 }``, ``{ bits = 32 }``,
-    ``{ separator = "x" }``) reads the text up to the next ``_``, which no
-    integer, extent tuple or float bit pattern holds, and admits it when it
-    meets the constraint, as the Program Server's manifest does.
-    """
-    if isinstance(declared, list):
-        return next(
-            (
-                one
-                for one in sorted(declared, key=len, reverse=True)
-                if rest == one or rest.startswith(one + "_")
-            ),
-            None,
-        )
-    value = rest.split("_", 1)[0]
-    return value if admits(declared, value) else None
-
-
-def admits(constraint, value):
-    """Whether ``value``, as a key spells it, meets a constraint table."""
-    if "bits" in constraint:
-        # A float enters a key as its bit pattern: `0x`, then lowercase
-        # hexadecimal without leading zeros.
-        digits = value.removeprefix("0x")
-        return (
-            value.startswith("0x")
-            and 0 < len(digits) <= constraint["bits"] // 4
-            and all(digit in "0123456789abcdef" for digit in digits)
-            and (digits == "0" or not digits.startswith("0"))
-        )
-    separator = constraint.get("separator")
-    for part in value.split(separator) if separator else [value]:
-        # An integer enters a key in canonical decimal: `064` names nothing.
-        if not part or any(digit not in "0123456789" for digit in part):
-            return False
-        if part != "0" and part.startswith("0"):
-            return False
-        number = int(part)
-        if number < constraint.get("min", 1):
-            return False
-        if number > constraint.get("max", number):
-            return False
-        if number % constraint.get("multiple", 1) != 0:
-            return False
-        power = number > 0 and number & (number - 1) == 0
-        if constraint.get("power_of_two") and not power:
-            return False
-    return True
 
 
 def capability(target):
@@ -162,7 +102,7 @@ def main():
         raise SystemExit(f"scale {fields['scale']!r} has no storage kind")
 
     out.mkdir(parents=True, exist_ok=True)
-    # The nvcc the Program Server checked against this package's declared version.
+    # The nvcc the Build Server checked against this package's declared version.
     compiler = os.environ["UNISERVE_NVCC"]
     command = [
         compiler,

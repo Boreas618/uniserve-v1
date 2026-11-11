@@ -1,6 +1,6 @@
 //! Which graph nodes a capture belongs to.
 //!
-//! A captured graph is replayed as a whole, but a kernel program may be replaced one operator at a
+//! A captured graph is replayed as a whole, but a kernel package may be replaced one operator at a
 //! time: the worker hands a graph node new parameters for the operator whose
 //! program changed. The capture records node handles in launch order, so it needs the same order
 //! annotated with the operator each launch belongs to. That annotation travels through this module:

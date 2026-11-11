@@ -9,10 +9,10 @@
 //! Every move is exact: the same bits arrive on the other side. The extents and strides are launch
 //! values, so one compiled program serves every geometry a request can have.
 
+use ops::Operand;
 use ops::copy_block::{self, CopyBlock, RANK};
 use ops::patch::{self, Patch};
 use ops::unpatchify::{self, Unpatchify};
-use ops::Operand;
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
@@ -48,7 +48,10 @@ impl Copy {
         if ops::abi::bytes(dtype).is_none() {
             return Err(Error::shape(
                 "Copy",
-                format!("{dtype} elements are sub-byte; a block copy moves whole elements", dtype = ops::abi::name(dtype)),
+                format!(
+                    "{dtype} elements are sub-byte; a block copy moves whole elements",
+                    dtype = ops::abi::name(dtype)
+                ),
             ));
         }
         Ok(Self { dtype, access })
@@ -227,12 +230,7 @@ impl Patchify {
     ///
     /// A raster that is not whole patches, too few tokens or tokens of another width, an arena that
     /// cannot hold the raster, or the operator's refusal.
-    pub fn inverse(
-        &self,
-        f: &Forward,
-        tokens: Operand,
-        raster: ops::Shape,
-    ) -> Result<Operand> {
+    pub fn inverse(&self, f: &Forward, tokens: Operand, raster: ops::Shape) -> Result<Operand> {
         let [frames, height, width] = self.grid(raster)?;
         let count = u64::from(frames) * u64::from(height) * u64::from(width);
         if tokens.shape.rank() != 2

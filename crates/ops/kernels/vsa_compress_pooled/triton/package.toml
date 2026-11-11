@@ -1,4 +1,4 @@
-# The vsa_compress_pooled operator's Triton backend: design 5.2's program package.
+# The vsa_compress_pooled operator's Triton backend: design 5.2's package.
 #
 # The compression VSA's gate adds to every query row: one softmax over the key tiles, weighted into
 # the pooled per-head means `vsa_prepare_tiles` writes, narrowed once into the attention's row type.
@@ -12,6 +12,7 @@
 
 op = "vsa_compress_pooled"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

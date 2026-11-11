@@ -1,4 +1,4 @@
-# The patch operator's Triton backend: design 5.2's program package.
+# The patch operator's Triton backend: design 5.2's package.
 #
 # One cubin per descriptor: the diffusion transformer's latent packed into its rows. The move is
 # a permutation of elements — a `1×2×2` patch's four values per channel, gathered into one row —
@@ -10,6 +10,7 @@
 
 op = "patch"
 backend = "triton"
+interface_version = 1
 
 [toolchain]
 kind = "triton"

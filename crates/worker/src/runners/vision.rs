@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use nn::capability::{PatchFormat, Vision};
 use ops::Operand;
-use uniserve_tensor::DType;
 use platform::DeviceId;
+use uniserve_tensor::DType;
 
 use crate::host::{HostAction, Lane, Outcome};
 use crate::memory::encoders::EncoderHostPool;

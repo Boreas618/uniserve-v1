@@ -89,7 +89,7 @@ pub struct Args {
 pub struct Posterior;
 
 impl Op for Posterior {
-    const NAME: &'static str = proto::program::operator::POSTERIOR;
+    const NAME: &'static str = proto::module::operator::POSTERIOR;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -127,7 +127,11 @@ impl Op for Posterior {
             if view.dtype != DType::F32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected {} {name}, found {}", abi::name(DType::F32), abi::name(view.dtype)),
+                    format!(
+                        "expected {} {name}, found {}",
+                        abi::name(DType::F32),
+                        abi::name(view.dtype)
+                    ),
                 ));
             }
             if view.shape.dim(1) != channels {

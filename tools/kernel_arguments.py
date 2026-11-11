@@ -9,13 +9,13 @@ A Triton operator's arguments are written down three times, by three different h
 3. the operator's Rust ``fn launch`` in ``crates/ops/src/*.rs``, which packs one ``Arguments`` chain
    in launch order, and whose constexprs come from the descriptor key.
 
-Nothing in the tree compares them. The Program Server says whether a package declares a descriptor
+Nothing in the tree compares them. The Build Server says whether a package declares a descriptor
 key and whether it builds, and the recorded walk says whether the model launches it - and a kernel
 that reads its stage from its draw's slot satisfies all three. This script reports the three orders
 side by side and names where they disagree.
 
 **The package is asked, not parsed.** Each ``build.py`` is imported and its ``spec(fields,
-parameters, target)`` called once per declared descriptor shape, which is what the Program Server
+parameters, target)`` called once per declared descriptor shape, which is what the Build Server
 does: nine packages build their signature incrementally in code, so a source-level parse reads them
 as having none, and a signature assembled in a loop is exactly the case where a hand-check is most
 likely to be wrong.
@@ -45,11 +45,11 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 KERNELS = ROOT / "crates/ops/kernels"
 OPS = ROOT / "crates/ops/src"
 
-# A package's `build.py` imports its compile driver from the Program Server's Python package
-# (`uniserve_program_server.triton`), so that package is importable from this tree whichever
+# A package's `build.py` imports its compile driver from the Build Server's Python package
+# (`uniserve_build_server.triton`), so that package is importable from this tree whichever
 # interpreter runs the tool.
-sys.path.insert(0, str(ROOT / "crates/program-server/python/src"))
-from uniserve_program_server import package as program_package  # noqa: E402
+sys.path.insert(0, str(ROOT / "crates/build-server/python/src"))
+from uniserve_build_server import package as driver_package  # noqa: E402
 
 #: The `Arguments` methods that pack one launch word. `flag` is a word like any other: Triton's
 #: `pdl` is a kernel parameter the entry reads, not a launch attribute.
@@ -148,7 +148,7 @@ def sample(dimension: list | dict) -> list[str]:
 
     An enumeration is sampled whole. A constraint table (`{ multiple = 16 }`, `{ bits = 32 }`) admits
     a range of widths the kernel handles alike, so its least admitted value stands for all of them,
-    as `Dimension::example` in `crates/program-server/src/manifest.rs` picks it.
+    as `Dimension::example` in `crates/build-server/src/manifest.rs` picks it.
     """
     if isinstance(dimension, list):
         return dimension
@@ -846,7 +846,7 @@ def sweep(
             continue
         try:
             # The key is read as the package's build reads it, by the shared driver's parser.
-            fields = program_package.fields(package, descriptor)
+            fields = driver_package.read_fields(package, descriptor)
         except SystemExit:
             gaps.append(
                 f"{op}/{backend} {descriptor}: no declared shape parses this key"

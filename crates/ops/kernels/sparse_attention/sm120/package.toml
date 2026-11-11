@@ -1,4 +1,4 @@
-# The sparse_attention operator's SM120 backend: design 5.2's program package.
+# The sparse_attention operator's SM120 backend: design 5.2's package.
 #
 # One native module per descriptor: Video Sparse Attention on SM120/SM121, through
 # FlashInfer's CuTe DSL block-sparse kernel (`BlockSparseAttnForwardSm120Blk64`). The vendor
@@ -12,6 +12,7 @@
 
 op = "sparse_attention"
 backend = "sm120"
+interface_version = 1
 
 [toolchain]
 kind = "cute_dsl"

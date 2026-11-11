@@ -25,7 +25,7 @@ from tests.python.e2e.http_helpers import (
     require_uniserve_binary,
     server_process,
     t2va_request,
-    worker_executable,
+    engine_selection,
 )
 from uniserve_eval.transport.video import inspect_video_bytes
 
@@ -64,8 +64,7 @@ def test_base_text_to_video_at_every_768p_size(tmp_path: Path) -> None:
         model,
         "--worker-groups",
         str(deployment),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--served-model-name",
         "MiniMax-H3",
         "--port",
@@ -176,8 +175,7 @@ def test_a_fasth3_adapter_over_the_base_release_serves_its_student(
         adapter,
         "--worker-groups",
         str(deployment),
-        "--worker-executable",
-        str(worker_executable()),
+        *engine_selection(),
         "--served-model-name",
         "FastH3",
         "--port",

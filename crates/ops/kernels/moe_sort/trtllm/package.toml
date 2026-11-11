@@ -1,4 +1,4 @@
-# The moe_sort operator's trtllm-gen backend: design 5.2's program package.
+# The moe_sort operator's trtllm-gen backend: design 5.2's package.
 #
 # One native module per descriptor: the routing pipeline that groups the
 # routers' `tokens x top` route ids into tiles of permuted rows per local
@@ -15,6 +15,7 @@
 
 op = "moe_sort"
 backend = "trtllm"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

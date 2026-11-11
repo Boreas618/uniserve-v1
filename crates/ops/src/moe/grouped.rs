@@ -38,7 +38,7 @@ use crate::descriptor::Key;
 use crate::fp4::ScaleLayout;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -248,7 +248,7 @@ impl NativeCall for GatherCall {
 pub struct GatherGemm;
 
 impl Op for GatherGemm {
-    const NAME: &'static str = proto::program::operator::GATHER_GEMM;
+    const NAME: &'static str = proto::module::operator::GATHER_GEMM;
 
     type Descriptor = GatherGemmDescriptor;
     type Args<'a> = GatherGemmArgs;
@@ -294,7 +294,10 @@ impl Op for GatherGemm {
             if view.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected i32 sort metadata, found {}", abi::name(view.dtype)),
+                    format!(
+                        "expected i32 sort metadata, found {}",
+                        abi::name(view.dtype)
+                    ),
                 ));
             }
             super::require_i32_vector(Self::NAME, view)?;
@@ -395,7 +398,7 @@ impl Op for GatherGemm {
 pub struct RouteGemm;
 
 impl Op for RouteGemm {
-    const NAME: &'static str = proto::program::operator::ROUTE_GEMM;
+    const NAME: &'static str = proto::module::operator::ROUTE_GEMM;
 
     type Descriptor = RouteGemmDescriptor;
     type Args<'a> = RouteGemmArgs;
@@ -421,7 +424,10 @@ impl Op for RouteGemm {
         if args.ids.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 route ids, found {}", abi::name(args.ids.dtype)),
+                format!(
+                    "expected i32 route ids, found {}",
+                    abi::name(args.ids.dtype)
+                ),
             ));
         }
         for view in [
@@ -433,7 +439,10 @@ impl Op for RouteGemm {
             if view.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected i32 sort metadata, found {}", abi::name(view.dtype)),
+                    format!(
+                        "expected i32 sort metadata, found {}",
+                        abi::name(view.dtype)
+                    ),
                 ));
             }
             super::require_i32_vector(Self::NAME, view)?;
@@ -730,7 +739,10 @@ fn check_workspace(operator: &'static str, workspace: Operand) -> Result<()> {
     if workspace.dtype != DType::U8 {
         return Err(Error::argument(
             operator,
-            format!("expected u8 workspace bytes, found {}", abi::name(workspace.dtype)),
+            format!(
+                "expected u8 workspace bytes, found {}",
+                abi::name(workspace.dtype)
+            ),
         ));
     }
     if workspace.numel() == 0 {
@@ -928,7 +940,7 @@ impl NativeCall for RouteNvfp4Call {
 pub struct GatherGemmNvfp4;
 
 impl Op for GatherGemmNvfp4 {
-    const NAME: &'static str = proto::program::operator::GATHER_GEMM_NVFP4;
+    const NAME: &'static str = proto::module::operator::GATHER_GEMM_NVFP4;
 
     type Descriptor = GatherGemmNvfp4Descriptor;
     type Args<'a> = GatherGemmNvfp4Args;
@@ -1023,7 +1035,8 @@ impl Op for GatherGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected {} block scales, found {}",
-                    abi::name(descriptor.scale), abi::name(args.scales.dtype)
+                    abi::name(descriptor.scale),
+                    abi::name(args.scales.dtype)
                 ),
             ));
         }
@@ -1396,7 +1409,7 @@ pub struct RouteGemmNvfp4Args {
 pub struct RouteGemmNvfp4;
 
 impl Op for RouteGemmNvfp4 {
-    const NAME: &'static str = proto::program::operator::ROUTE_GEMM_NVFP4;
+    const NAME: &'static str = proto::module::operator::ROUTE_GEMM_NVFP4;
 
     type Descriptor = RouteGemmNvfp4Descriptor;
     type Args<'a> = RouteGemmNvfp4Args;
@@ -1487,7 +1500,8 @@ impl Op for RouteGemmNvfp4 {
                 Self::NAME,
                 format!(
                     "expected {} block scales, found {}",
-                    abi::name(descriptor.scale), abi::name(args.scales.dtype)
+                    abi::name(descriptor.scale),
+                    abi::name(args.scales.dtype)
                 ),
             ));
         }

@@ -3,8 +3,8 @@
 ``spec`` states what this package's kernel needs for one descriptor: the
 kernel function, its argument signature in the order the operator launches
 them, the compile-time values the descriptor dimensions give, and the
-compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The element type and the number of axes are compiled in; the shape, the
 strides and the element's bits are words. The bits travel in the unsigned
@@ -13,7 +13,7 @@ integer as wide as the element, whose width the kernel is told.
 
 import fill as kernels
 import strided
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The width in bits of each unsigned word an element's bits travel in.
 WIDTHS = {"u8": 8, "u16": 16, "u32": 32, "u64": 64}

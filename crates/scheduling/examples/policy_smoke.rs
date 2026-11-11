@@ -14,7 +14,7 @@
 //!
 //! `<module.wasm>` is a `scheduling-policy-*` crate built for
 //! `wasm32-unknown-unknown`. With `--precompile` the bytes are first
-//! precompiled the way the Program Server does it (§5.3), and the artifact is
+//! precompiled the way the Build Server does it (§5.3), and the artifact is
 //! what loads, which is the path a deployment takes.
 //!
 //! Each decision is reported with the calls it took and the fuel it burned, and
@@ -88,7 +88,7 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
         engine.module(&bytes)?
     };
 
-    // The program's arguments construct the policy; the state is its `init`.
+    // The package's arguments construct the policy; the state is its `init`.
     let parameters = Parameters::default();
     let ceilings = Limits::default();
     let mut policy = module.instantiate(&snapshot()?, &parameters, &ceilings)?;

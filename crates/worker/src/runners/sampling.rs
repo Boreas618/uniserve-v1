@@ -105,9 +105,9 @@ use ops::sampler::{
     OrderDescriptor, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor, TopLogprobsArgs,
     TopLogprobsDescriptor,
 };
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
+use proto::module::sampler::PARAMETER_COLUMNS;
 use uniserve_tensor::DType;
-use proto::program::sampler::PARAMETER_COLUMNS;
 
 use nn::Forward;
 use nn::layers::launch;
@@ -131,7 +131,7 @@ pub struct SamplerState {
     /// `[slots, vocabulary]` i32: how many times each slot has already seen each token.
     pub counts: Operand,
     /// `[rows, PARAMETER_COLUMNS]` f32: temperature, top-k width, top-p, min-p, repetition,
-    /// frequency and presence in [`proto::program::sampler::PARAMETER_COLUMNS`] order.
+    /// frequency and presence in [`proto::module::sampler::PARAMETER_COLUMNS`] order.
     ///
     /// That order is the operators' and the worker writes it. A column's meaning is its position
     /// alone, so a writer using another order would turn a top-k width into a nucleus threshold
@@ -849,7 +849,8 @@ impl Sampler {
                 "Sampler",
                 format!(
                     "expected {} tokens, found {}",
-                    ops::abi::name(self.tokens), ops::abi::name(samples.tokens.dtype)
+                    ops::abi::name(self.tokens),
+                    ops::abi::name(samples.tokens.dtype)
                 ),
             ));
         }
@@ -867,7 +868,11 @@ impl Sampler {
                 if view.dtype != dtype {
                     return Err(refused(
                         "Sampler",
-                        format!("expected {dtype} {name}, found {}", ops::abi::name(view.dtype), dtype = ops::abi::name(dtype)),
+                        format!(
+                            "expected {dtype} {name}, found {}",
+                            ops::abi::name(view.dtype),
+                            dtype = ops::abi::name(dtype)
+                        ),
                     ));
                 }
             }
@@ -889,7 +894,10 @@ impl Sampler {
         if state.parameters.dtype != DType::F32 {
             return Err(refused(
                 "Sampler",
-                format!("expected f32 parameters, found {}", ops::abi::name(state.parameters.dtype)),
+                format!(
+                    "expected f32 parameters, found {}",
+                    ops::abi::name(state.parameters.dtype)
+                ),
             ));
         }
         state
@@ -955,7 +963,10 @@ impl Sampler {
             if extra.dtype != DType::I32 {
                 return Err(refused(
                     "Sampler",
-                    format!("expected i32 extra tokens, found {}", ops::abi::name(extra.dtype)),
+                    format!(
+                        "expected i32 extra tokens, found {}",
+                        ops::abi::name(extra.dtype)
+                    ),
                 ));
             }
         }
@@ -1033,10 +1044,10 @@ fn merge_tile(vocabulary: u32, candidates: u32) -> Result<u32> {
 /// launch that reads it is still recorded in the bucket's graph - which is what makes the graph a
 /// warmup captures the graph a serving batch replays.
 pub(crate) fn inert_commit(rows: usize) -> Vec<i64> {
-    let mut table = vec![0_i64; proto::program::commit::COMMIT_FIELDS * rows];
+    let mut table = vec![0_i64; proto::module::commit::COMMIT_FIELDS * rows];
     for row in 0..rows {
-        table[proto::program::commit::column::SLOT * rows + row] = -1;
-        table[proto::program::commit::column::TASK * rows + row] = -1;
+        table[proto::module::commit::column::SLOT * rows + row] = -1;
+        table[proto::module::commit::column::TASK * rows + row] = -1;
     }
     table
 }
@@ -1068,7 +1079,7 @@ pub(crate) fn commit_descriptor(
 
 /// Every `slot_commit` descriptor a runner of `buckets` can launch, one per distinct block.
 ///
-/// The commit is a runner-owned operator: no model calls it, so the epoch's program set does not
+/// The commit is a runner-owned operator: no model calls it, so the epoch's module set does not
 /// contain it unless the runner asks. Its descriptor carries the vocabulary and the launch block
 /// (the smallest power of two covering the bucket's rows) while the table's capacity is the largest
 /// bucket's rows for every bucket, so the keys a deployment needs are one per power of two its
@@ -1099,7 +1110,7 @@ pub fn commit_descriptors(
 /// The device table is `[COMMIT_FIELDS, capacity]` i32: the staged rows fill its first `rows`
 /// columns, and the rest keep whatever the previous batch left there behind `dim(1) >= count`.
 pub(crate) fn commit_table(commit: &[i64], rows: usize, capacity: usize) -> Result<Vec<i32>> {
-    let fields = proto::program::commit::COMMIT_FIELDS;
+    let fields = proto::module::commit::COMMIT_FIELDS;
     if commit.len() != fields * rows {
         return Err(Error::Invariant(format!(
             "the commit table holds {} values, {fields} fields of {rows} rows",
@@ -1113,8 +1124,8 @@ pub(crate) fn commit_table(commit: &[i64], rows: usize, capacity: usize) -> Resu
     // operator's sentinels; this makes the tail inert as well, so the invariant survives whatever
     // `count` a future launch passes (`ops::commit`'s two sentinels).
     for row in rows.min(capacity)..capacity {
-        table[proto::program::commit::column::SLOT * capacity + row] = -1;
-        table[proto::program::commit::column::TASK * capacity + row] = -1;
+        table[proto::module::commit::column::SLOT * capacity + row] = -1;
+        table[proto::module::commit::column::TASK * capacity + row] = -1;
     }
     for field in 0..fields {
         for row in 0..rows.min(capacity) {
@@ -1206,7 +1217,7 @@ impl CommitColumns {
             table: Column::new(
                 device,
                 DType::I32,
-                u64::from(proto::program::commit::COMMIT_FIELDS as u32) * capacity,
+                u64::from(proto::module::commit::COMMIT_FIELDS as u32) * capacity,
             )?,
             valid: Column::new(device, DType::I32, capacity)?,
             active: Column::new(device, DType::I32, capacity)?,
@@ -1396,7 +1407,7 @@ impl CommitColumns {
         Operand::with_strides(
             self.table.device.ptr,
             DType::I32,
-            ops::Shape::new(&[proto::program::commit::COMMIT_FIELDS as u64, self.capacity]),
+            ops::Shape::new(&[proto::module::commit::COMMIT_FIELDS as u64, self.capacity]),
             ops::Strides::new(&[self.capacity, 1]),
         )
     }

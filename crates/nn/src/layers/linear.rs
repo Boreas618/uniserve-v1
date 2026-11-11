@@ -30,7 +30,7 @@ use ops::fp4::{
 };
 use ops::fp8::{Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor};
 use ops::gemm::{self, Descriptor, Epilogue, Gemm, WeightOrder};
-use ops::{Shape, Operand};
+use ops::{Operand, Shape};
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
@@ -107,7 +107,7 @@ struct Packed {
     alpha: Weight,
 }
 
-/// The tile an `fp8_gemm` program covers: one program set serves every projection.
+/// The tile an `fp8_gemm` program covers: one module set serves every projection.
 const FP8_TILE: (u32, u32, u32) = (64, 128, 128);
 
 /// The representation a projection's weight is held in.
@@ -617,7 +617,10 @@ impl Linear {
         if !matches!(input.dtype, DType::BF16 | DType::F16) {
             return Err(Error::shape(
                 "Linear",
-                format!("{} activations; NVFP4 encodes BF16 or FP16", ops::abi::name(input.dtype)),
+                format!(
+                    "{} activations; NVFP4 encodes BF16 or FP16",
+                    ops::abi::name(input.dtype)
+                ),
             ));
         }
         let counted = u32::try_from(rows)
@@ -933,11 +936,7 @@ impl QkvLinear {
     /// # Errors
     ///
     /// As [`Linear::forward`].
-    pub fn forward(
-        &self,
-        f: &Forward,
-        input: Operand,
-    ) -> Result<(Operand, Operand, Operand)> {
+    pub fn forward(&self, f: &Forward, input: Operand) -> Result<(Operand, Operand, Operand)> {
         Ok((
             self.query.forward(f, input)?,
             self.key.forward(f, input)?,

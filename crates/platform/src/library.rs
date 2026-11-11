@@ -2,7 +2,7 @@
 //! fatbin or PTX images, and the kernels resolved from them.
 //!
 //! A [`Library`] is what the design calls a module (4.2): a compiled kernel
-//! program for one descriptor, loaded on its device. Its kernels are
+//! package for one descriptor, loaded on its device. Its kernels are
 //! resolved with `cuLibraryGetKernel` and `cuKernelGetFunction`. The library
 //! unloads with `cuLibraryUnload` when its last owner drops it; an owner keeps
 //! it beside every [`Function`] it launches, and a captured graph that calls

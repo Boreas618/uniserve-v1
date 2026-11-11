@@ -78,17 +78,17 @@ fn serving() -> FakeBatches {
         .with_extent(Extent::OnePast)
 }
 
-/// The `fcfs` program, instantiated for the capacity this pool was built for:
+/// The `fcfs` package, instantiated for the capacity this pool was built for:
 /// a policy declares its own limits and the mechanism refuses a declaration
 /// above the ceilings the ranks were started for.
-fn policy_program(pool: &FakeBatches) -> scheduler::PolicyProgram {
+fn policy_package(pool: &FakeBatches) -> scheduler::PolicyPackage {
     let rank = pool
         .inventory()
         .first()
         .and_then(|pool| pool.ranks.first())
         .expect("the pool states its ranks");
     let ceilings = scheduler::ceilings_of(BatchCapacity::of(rank));
-    scheduler::PolicyProgram {
+    scheduler::PolicyPackage {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: scheduler::Parameters {
@@ -109,7 +109,7 @@ fn policy_program(pool: &FakeBatches) -> scheduler::PolicyProgram {
 fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    response(handle.precopy_policy(policy_program(pool), source)).expect("the policy is precopied");
+    response(handle.precopy_policy(policy_package(pool), source)).expect("the policy is precopied");
     response(handle.stage(Stage::Switchover)).expect("the policy serves");
 }
 

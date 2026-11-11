@@ -3,8 +3,8 @@
 ``spec`` states what this package's kernel needs for one descriptor: the
 kernel function, its argument signature in the order the operator launches
 them, the compile-time values the descriptor dimensions give, and the
-compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The element type and the number of axes are compiled in. The shape and both
 sides' strides are words, so one module serves every copy that traverses
@@ -14,7 +14,7 @@ the two sides, a source written into a block of a larger tensor.
 
 import copy_strided as kernels
 import strided
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 
 def spec(fields, parameters, target):

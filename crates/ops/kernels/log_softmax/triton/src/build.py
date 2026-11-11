@@ -6,7 +6,7 @@ from the grid.
 """
 
 import log_softmax as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The largest column tile a program holds in registers in one step.
 LANES = 4096

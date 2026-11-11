@@ -13,8 +13,8 @@ use ops::recurrent::{
     GatedDeltaRule as GatedDeltaRuleOp, GatedDeltaRuleArgs, GatedDeltaRuleDescriptor, RowColumns,
     Trail,
 };
-use ops::{Shape, Operand};
-use proto::program::PhaseKind;
+use ops::{Operand, Shape};
+use proto::module::PhaseKind;
 
 use crate::capability::{StateView, TokenBatch};
 use crate::error::{Error, Result};

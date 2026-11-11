@@ -342,6 +342,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-server"
+version = "2.0.0"
+dependencies = [
+ "clap",
+ "libc",
+ "ops",
+ "prost",
+ "prost-build",
+ "proto",
+ "protox",
+ "serde",
+ "serde_json",
+ "service",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "uniserve-tensor",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -922,6 +944,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "build-server",
  "bytes",
  "clap",
  "frontend",
@@ -931,7 +954,6 @@ dependencies = [
  "libc",
  "platform",
  "processing",
- "program-server",
  "prometheus-client",
  "prost",
  "proto",
@@ -1198,16 +1220,22 @@ name = "engine"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "build-server",
+ "clap",
  "crossbeam-channel",
  "ipc",
+ "libc",
+ "mimalloc",
+ "minimax-h3",
  "nn",
  "ops",
  "platform",
  "processing",
- "program-server",
  "proto",
+ "qwen3",
  "scheduler",
  "serde_json",
+ "service",
  "storage",
  "tempfile",
  "tokio",
@@ -2779,11 +2807,11 @@ dependencies = [
 name = "nn"
 version = "2.0.0"
 dependencies = [
+ "build-server",
  "memmap2",
  "ops",
  "platform",
  "processing",
- "program-server",
  "proto",
  "safetensors",
  "serde",
@@ -3225,28 +3253,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "program-server"
-version = "2.0.0"
-dependencies = [
- "clap",
- "libc",
- "ops",
- "prost",
- "prost-build",
- "proto",
- "protox",
- "serde",
- "serde_json",
- "service",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "uniserve-tensor",
 ]
 
 [[package]]
@@ -3908,11 +3914,11 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "build-server",
  "crossbeam-channel",
  "ipc",
  "libc",
  "png",
- "program-server",
  "proto",
  "rustix",
  "scheduling",
@@ -4968,17 +4974,13 @@ name = "uniserve"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "build-server",
  "clap",
  "daemon",
- "engine",
  "libc",
  "mimalloc",
- "minimax-h3",
- "nn",
  "platform",
  "processing",
- "program-server",
- "qwen3",
  "rustix",
  "serde",
  "serde_json",
@@ -5984,6 +5986,7 @@ name = "worker"
 version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
+ "build-server",
  "bytemuck",
  "crossbeam-channel",
  "indexmap 2.14.0",
@@ -5995,7 +5998,6 @@ dependencies = [
  "nvtx",
  "ops",
  "platform",
- "program-server",
  "proto",
  "rusqlite",
  "rustix",

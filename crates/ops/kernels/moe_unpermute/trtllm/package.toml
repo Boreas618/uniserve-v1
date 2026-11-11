@@ -1,4 +1,4 @@
-# The moe_unpermute operator's trtllm-gen backend: design 5.2's program package.
+# The moe_unpermute operator's trtllm-gen backend: design 5.2's package.
 #
 # One native module per descriptor: trtllm-gen's combine kernel compiled out of
 # the FlashInfer distribution this package depends on, with this package's C entry
@@ -8,6 +8,7 @@
 
 op = "moe_unpermute"
 backend = "trtllm"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

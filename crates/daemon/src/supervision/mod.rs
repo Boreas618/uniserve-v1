@@ -26,6 +26,7 @@ mod supervisor;
 
 pub(crate) use service::HandedService;
 pub use supervisor::LIFELINE_ENV;
+pub(crate) use supervisor::engine_executable;
 
 use std::net::IpAddr;
 use std::os::fd::OwnedFd;
@@ -74,16 +75,16 @@ pub struct DaemonOptions {
     /// Reads which of this host's devices are idle, for the deployment's
     /// planning of where its processes run.
     pub devices: DeviceProbe,
-    /// This node's Program Server, which the main processes the node starts resolve their
-    /// modules from (`program_config`).
-    pub program_server: program_server::command::Settings,
+    /// This node's Build Server, which the main processes the node starts resolve their
+    /// modules from (`build_config`).
+    pub build_server: build_server::command::Settings,
 }
 
 /// Reads the ordinals of this host's idle devices from the driver.
 ///
 /// The daemon plans placements and supervises processes but runs no device
 /// code itself, so the executable that links the platform supplies the probe,
-/// as it supplies the Program Server's host targets. An `Err` states why the
+/// as it supplies the Build Server's host targets. An `Err` states why the
 /// devices could not be read; the daemon answers the asking engine with it.
 pub type DeviceProbe = fn() -> Result<Vec<u32>, String>;
 
@@ -601,7 +602,7 @@ fn local(
     Ok(Local {
         supervisor: Supervisor::new(options.host.clone())
             .context("creating the daemon's lifeline")?
-            .with_program_server(options.program_server.clone()),
+            .with_build_server(options.build_server.clone()),
         claims: ClaimHolder::new(options.executable.clone(), remote_pages, address),
         address,
         devices: options.devices,
@@ -694,7 +695,7 @@ fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
         }
     };
     connection.send(&Hello {
-        major: proto::PROTOCOL_MAJOR,
+        major: proto::ENGINE_INTERFACE_VERSION,
         build: proto::BUILD.to_owned(),
         peer: Some(hello::Peer::Join(Join {
             node_rank: options.node_rank,
@@ -770,14 +771,14 @@ mod tests {
             executable: PathBuf::from("uniserve"),
             join_timeout: Duration::from_secs(5),
             devices: || Ok(Vec::new()),
-            program_server: program_server::command::Settings::default(),
+            build_server: build_server::command::Settings::default(),
         })
         .unwrap();
         let address = daemon.address().unwrap().to_owned();
         let mut engine = Connection::connect(&address).unwrap();
         engine
             .send(&Hello {
-                major: proto::PROTOCOL_MAJOR,
+                major: proto::ENGINE_INTERFACE_VERSION,
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Engine(Engine {
                     deployment: "model".to_owned(),

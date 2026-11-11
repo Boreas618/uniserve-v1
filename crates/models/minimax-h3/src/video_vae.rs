@@ -258,7 +258,7 @@ use nn::layers::{
     Spectrum, Varlen,
 };
 use nn::weights::{Weight, WeightLoader};
-use nn::{DType, DecodedMedia, Decoder, Shape, Operand};
+use nn::{DType, DecodedMedia, Decoder, Operand, Shape};
 use ops::gemm::WeightOrder;
 
 /// The element type of the decoder's projections and of the rows they read and write, and the type
@@ -1080,7 +1080,8 @@ pub(crate) mod tests {
             if index > 0 {
                 header.push(',');
             }
-            let bytes = shape.iter().product::<u64>() * ops::abi::bytes(*dtype).expect("a whole-byte type");
+            let bytes =
+                shape.iter().product::<u64>() * ops::abi::bytes(*dtype).expect("a whole-byte type");
             let extents = shape
                 .iter()
                 .map(u64::to_string)
@@ -1090,7 +1091,10 @@ pub(crate) mod tests {
                 DType::BF16 => "BF16",
                 DType::F16 => "F16",
                 DType::F32 => "F32",
-                other => panic!("the fixture writes float tensors, not {other}", other = ops::abi::name(*other)),
+                other => panic!(
+                    "the fixture writes float tensors, not {other}",
+                    other = ops::abi::name(*other)
+                ),
             };
             header.push_str(&format!(
                 r#""{name}":{{"dtype":"{format}","shape":[{extents}],"data_offsets":[{offset},{}]}}"#,

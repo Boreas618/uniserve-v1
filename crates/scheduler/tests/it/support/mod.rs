@@ -75,7 +75,7 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
 
 use ipc::{CallKind, ForwardMode, MainProcessInfo, MediaCall};
 use scheduler::{GenerationFeatures, GenerationLimits};
-use scheduler::{Parameters, PolicyProgram, SchedulerConfig};
+use scheduler::{Parameters, PolicyPackage, SchedulerConfig};
 use testkit::EndOfText;
 
 /// A rank of the scheduler tests' text deployment: every call kind, a buffer
@@ -165,10 +165,10 @@ pub(crate) fn generation_limits(calls: &[CallKind]) -> GenerationLimits {
 
 /// The policy module every integration test's epoch serves with.
 ///
-/// A deployed epoch takes its policy from the Program Server; a test epoch has
+/// A deployed epoch takes its policy from the Build Server; a test epoch has
 /// none, and a scheduler with no policy decides nothing — no output, no
 /// admission, no batch — so an epoch that submits a request must be given one.
-/// The module is the `fcfs` program this tree builds for
+/// The module is the `fcfs` package this tree builds for
 /// `wasm32-unknown-unknown`, the one that reproduces the rules the tests were
 /// written against: `testkit::packaged_module` builds it on first use, and a
 /// module named by `SCHED_POLICY_WASM` is read instead.
@@ -183,9 +183,9 @@ pub(crate) fn policy_module() -> Vec<u8> {
 /// parameters the deployment states: an epoch that speculates states its
 /// speedup and what a refilled token costs there, because the mechanism's own
 /// measurement is not a view a policy reads.
-pub(crate) fn fcfs(capacity: scheduler::BatchCapacity, stated: Parameters) -> PolicyProgram {
+pub(crate) fn fcfs(capacity: scheduler::BatchCapacity, stated: Parameters) -> PolicyPackage {
     let ceilings = scheduler::ceilings_of(capacity);
-    PolicyProgram {
+    PolicyPackage {
         backend: "fcfs".to_owned(),
         revision: 1,
         arguments: Parameters {

@@ -2,15 +2,15 @@
 
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
-dimensions give, and the compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+dimensions give, and the compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The tile (columns and channels per program), the padding mode and the element type are baked in;
 every stride and every extent is an int32 launch word, as the eager launch casts them.
 """
 
 import frame_pad as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The floating dtypes a video frame may have, as Triton spells them in an argument signature.
 DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}

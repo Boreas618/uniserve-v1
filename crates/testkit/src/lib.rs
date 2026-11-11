@@ -11,7 +11,7 @@
 //! - [`pools`]: the inventories a fake states, and the limits and arguments a handle over one is
 //!   built with.
 //! - [`text`]: where a fake's text ends, and the control tokens a scheduler over it names.
-//! - [`policy`]: the `fcfs` module this tree builds, and the program a test epoch installs it
+//! - [`policy`]: the `fcfs` module this tree builds, and the package a test epoch installs it
 //!   under.
 
 pub mod batches;
@@ -26,7 +26,7 @@ pub use batches::{
     draw_token,
 };
 pub use media::Media;
-pub use policy::{packaged_module, packaged_policy, packaged_program};
+pub use policy::{packaged_module, packaged_policy, packaged_revision};
 pub use pools::{args, limits, pool, rank};
 pub use service::{EpochPolicy, serve_requests};
 pub use text::{EOS, EndOfText, special_tokens};

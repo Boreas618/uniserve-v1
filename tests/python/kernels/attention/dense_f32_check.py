@@ -12,8 +12,8 @@ f32_check.py <module_dir> --mask dense  --sequences one python f32_check.py
 <module_dir> --mask causal --sequences one --len 1500
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory holding
-``module.so``. Run it on a GPU host with the Program Server's own environment
-(``crates/program-server/python/.venv/bin/python``), which has torch.
+``module.so``. Run it on a GPU host with the Build Server's own environment
+(``crates/build-server/python/.venv/bin/python``), which has torch.
 
 Both compiled forms are checked separately because they are different programs
 of one operator. ``--mask`` must name the mask the module was built for (a

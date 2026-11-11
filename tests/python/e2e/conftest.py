@@ -1,4 +1,4 @@
-"""GPU leases and the Program Server of the end-to-end tests.
+"""GPU leases and the Build Server of the end-to-end tests.
 
 The GPU recipe runs the end-to-end cases in parallel (``pytest -n`` with
 ``--dist loadgroup``). Each case serves on the GPUs it leases for its
@@ -40,9 +40,9 @@ from typing import IO
 
 import pytest
 
-from tests.python.e2e.http_helpers import programs_from
-from tests.python.e2e.program_server import (
-    program_server as running_program_server,
+from tests.python.e2e.http_helpers import modules_from
+from tests.python.e2e.build_server import (
+    build_server as running_build_server,
 )
 
 #: How long a case waits between attempts to lease its GPUs, in seconds.
@@ -177,15 +177,15 @@ def case_gpus(request: pytest.FixtureRequest) -> Iterator[None]:
 
 
 @pytest.fixture(scope="module", autouse=True)
-def program_server(
+def build_server(
     request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
 ) -> Iterator[Path | None]:
-    """The module's Program Server, which every deployment it starts names.
+    """The module's Build Server, which every deployment it starts names.
 
-    A deployment's epoch is resolved at this host's Program Server, and the
+    A deployment's epoch is resolved at this host's Build Server, and the
     one a daemon starts by itself holds no package, so the module starts one
     with every package of the tree installed, and `start_server` gives each
-    deployment that names no other ``program_config.socket`` this one. A
+    deployment that names no other ``build_config.socket`` this one. A
     module that installs packages of its own overrides this fixture, and a
     module that leases no GPU starts none.
     """
@@ -194,7 +194,7 @@ def program_server(
         yield None
         return
     with (
-        running_program_server(tmp_path_factory) as socket,
-        programs_from(socket),
+        running_build_server(tmp_path_factory) as socket,
+        modules_from(socket),
     ):
         yield socket

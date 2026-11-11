@@ -682,15 +682,15 @@ impl SchedulerHandle {
         self.commands.describe_requests()
     }
 
-    /// §7.3 step 2: prepares `program`'s policy on this scheduler's state,
+    /// §7.3 step 2: prepares `package`'s policy on this scheduler's state,
     /// without putting it in; the response arrives when the blocking thread that
     /// loaded it is done.
     pub fn precopy_policy(
         &self,
-        program: crate::PolicyProgram,
+        package: crate::PolicyPackage,
         source: std::sync::Arc<dyn crate::PolicySource + Send + Sync>,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.precopy_policy(program, source)
+        self.commands.precopy_policy(package, source)
     }
 
     /// §7.3 step 3: the prepared policy responds from this scheduler's next

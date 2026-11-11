@@ -1,4 +1,4 @@
-# The gather_gemm_nvfp4 operator's trtllm-gen backend: design 5.2's program package.
+# The gather_gemm_nvfp4 operator's trtllm-gen backend: design 5.2's package.
 #
 # One native module per descriptor: the trtllm-gen batched-GEMM launch code that
 # FLASHINFER_MOE calls for a routed, block-scaled product (`PermuteGemm1::Runner`),
@@ -14,6 +14,7 @@
 
 op = "gather_gemm_nvfp4"
 backend = "trtllm"
+interface_version = 1
 
 [toolchain]
 kind = "nvcc"

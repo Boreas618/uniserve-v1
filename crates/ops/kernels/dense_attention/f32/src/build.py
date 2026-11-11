@@ -20,7 +20,7 @@ A descriptor this backend does not implement — an element type other than FP32
 or heads that do not divide — is refused here by name rather than compiled into
 a module that would refuse every launch.
 
-The Program Server runs this script with its own Python environment, its
+The Build Server runs this script with its own Python environment, its
 working directory the package root, and `UNISERVE_OP`, `UNISERVE_BACKEND`,
 `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE`, `UNISERVE_OUT`
 and `MAX_JOBS` in the environment.
@@ -197,7 +197,7 @@ def main():
             )
 
     out.mkdir(parents=True, exist_ok=True)
-    # The nvcc the Program Server checked against this package's declared version.
+    # The nvcc the Build Server checked against this package's declared version.
     compiler = os.environ["UNISERVE_NVCC"]
     command = [
         compiler,

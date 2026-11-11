@@ -62,10 +62,10 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Operand};
-use uniserve_tensor::DType;
+use crate::tensor::{Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
+use uniserve_tensor::DType;
 
 /// The largest value magnitude the attention bound's absolute term is written for.
 ///
@@ -334,7 +334,7 @@ impl NativeCall for DenseCall {
 pub struct DenseAttention;
 
 impl Op for DenseAttention {
-    const NAME: &'static str = proto::program::operator::DENSE_ATTENTION;
+    const NAME: &'static str = proto::module::operator::DENSE_ATTENTION;
 
     type Descriptor = DenseDescriptor;
     type Args<'a> = DenseArgs;

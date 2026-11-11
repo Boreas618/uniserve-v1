@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """The two mutations `combine_check.py` exists to catch: build each one, require a red.
 
-    UNISERVE_NVCC=<nvcc> $UNISERVE_PROGRAM_SERVER_PYTHON mutations.py [--build-only] [--keep]
+    UNISERVE_NVCC=<nvcc> $UNISERVE_BUILD_SERVER_PYTHON mutations.py [--build-only] [--keep]
 
-`UNISERVE_NVCC` names the nvcc the mutants are compiled with, as the Program Server names it to a
-build, and the interpreter is the Program Server's own, which carries FlashInfer.
+`UNISERVE_NVCC` names the nvcc the mutants are compiled with, as the Build Server names it to a
+build, and the interpreter is the Build Server's own, which carries FlashInfer.
 
 `combine_check.py` says the combine it measures is correct. That green is evidence only if a
 *plausible-wrong* combine reads red through the same script, so this builds two of them and runs

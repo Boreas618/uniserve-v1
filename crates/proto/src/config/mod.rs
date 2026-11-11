@@ -12,7 +12,7 @@ pub mod worker_group;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -501,8 +501,12 @@ impl Default for FlashInferConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerConfig {
-    /// The `uniserve` executable the deployment's main processes run as.
-    pub executable: PathBuf,
+    /// The engine package the deployment's main processes run as: the name of an implementation
+    /// of the engine interface installed at the Build Server.
+    pub engine: String,
+    /// The revision of the engine package to run; the latest installed one, fixed when the
+    /// configuration is applied, when unset.
+    pub engine_revision: Option<u32>,
     /// Time a batch may run without rank progress before the worker group is
     /// replaced; a rank reports a stalled job after half of it.
     #[serde(with = "values::duration")]
@@ -538,7 +542,8 @@ pub struct WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            executable: default_executable(),
+            engine: DEFAULT_ENGINE.to_owned(),
+            engine_revision: None,
             watchdog_timeout: Duration::from_secs(300),
             mesh: None,
             standby: false,
@@ -547,32 +552,9 @@ impl Default for WorkerConfig {
     }
 }
 
-/// The `uniserve` executable of the virtual environment this process runs
-/// in, which runs the main processes.
-///
-/// A daemon built outside one, such as a development build, takes the active
-/// environment's; without one, `uniserve` is looked up on the search path.
-pub fn default_executable() -> PathBuf {
-    const EXECUTABLE: &str = "uniserve";
-    let environment_bin = |directory: &Path| {
-        ["python", "python3"]
-            .iter()
-            .any(|name| directory.join(name).is_file())
-            .then(|| directory.join(EXECUTABLE))
-            .filter(|candidate| candidate.is_file())
-    };
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(candidate) = executable.parent().and_then(environment_bin)
-    {
-        return candidate;
-    }
-    if let Some(environment) = std::env::var_os("VIRTUAL_ENV")
-        && let Some(candidate) = environment_bin(&Path::new(&environment).join("bin"))
-    {
-        return candidate;
-    }
-    EXECUTABLE.into()
-}
+/// The engine package a deployment runs when its configuration names none: the implementation
+/// of the engine interface this tree holds (`crates/engine/package.toml`).
+pub const DEFAULT_ENGINE: &str = "uniserve";
 
 /// What the server logs about its serving (`logging_config`). A process's
 /// log levels are options of the binary that runs it.
@@ -931,7 +913,7 @@ pub struct ParallelConfig {
 ///
 /// The leader daemon resolves it once from the serving options and hands the same value to every
 /// engine process of the epoch. Any change to it is a new epoch, except a change to a value that
-/// selects a program's backend or is a program's parameter, which the program layer applies in
+/// selects a package's backend or is a package's parameter, which the generation layer applies in
 /// place; [`EngineConfig::build_hash`] tells the two apart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -955,12 +937,12 @@ pub struct EngineConfig {
     /// it samples, so it is a property of the captured graphs and a request asking for more is
     /// refused. Zero reports no candidate.
     pub max_logprobs: u32,
-    /// The attention program's backend, and the ones that fill prompt processing and one decoding
+    /// The attention package's backend, and the ones that fill prompt processing and one decoding
     /// token when they differ.
     pub attention_backend: String,
     pub prefill_attention_backend: Option<String>,
     pub decode_attention_backend: Option<String>,
-    /// The grouped expert GEMM program's backend.
+    /// The grouped expert GEMM package's backend.
     pub moe_runner_backend: Option<String>,
     pub device: DeviceConfig,
     pub scheduler: SchedulerConfig,
@@ -979,10 +961,10 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     /// The identity of the build this configuration makes: two configurations whose hashes differ
-    /// need a new epoch, and two whose hashes agree differ at most in what the program layer
+    /// need a new epoch, and two whose hashes agree differ at most in what the generation layer
     /// changes in place (§7.7).
     ///
-    /// Every value enters it except those §7.7 assigns elsewhere: the program backends (attention,
+    /// Every value enters it except those §7.7 assigns elsewhere: the package backends (attention,
     /// the grouped expert GEMM, the expert exchange); the scheduling policy's parameters (the
     /// scheduler section, the batched token budget, the speculative cost figures); the probes'
     /// switches, which change at a step boundary; and the media section, which the frontend reads.
@@ -1046,15 +1028,20 @@ pub struct EngineArgs {
     pub requests: String,
     /// The daemon's process interface, `unix:<path>` or `<host>:<port>`: the
     /// supervision frames this process claims its storage with and reports to,
-    /// and the one place a program-layer command can reach it. A different
+    /// and the one place a generation command can reach it. A different
     /// vocabulary from `requests`, not a second address of the same one.
     pub processes: String,
     /// The identity the daemon started this process under: the engine number,
     /// or the launch generation in the epoch-switch path, where that is the
     /// only allocator.
     pub engine: u64,
-    /// The Program Server's socket.
-    pub program_server: String,
+    /// The Build Server's socket.
+    pub build_server: String,
+    /// The epoch's module set, as the daemon fixed it when the epoch's configuration was applied:
+    /// the node's daemon starts the engine package it names, and the process loads the kernel and
+    /// policy packages it names at the revisions it names. `None` in a launch built from a
+    /// configuration alone, which serves nothing.
+    pub modules: Option<crate::module::ModuleSet>,
     /// The devices this rank serves, as CUDA ordinals.
     pub devices: Vec<u32>,
     /// This rank's worker group, which keys its storage claims.
@@ -1133,7 +1120,8 @@ impl EngineArgs {
             requests: String::new(),
             processes: String::new(),
             engine: 0,
-            program_server: String::new(),
+            build_server: String::new(),
+            modules: None,
             devices: Vec::new(),
             group: String::new(),
             rank: 0,

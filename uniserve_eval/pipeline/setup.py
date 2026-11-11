@@ -88,8 +88,7 @@ def prepare_deployment(
 
     Raises:
         ValueError: If a launch command or the point's workload still holds
-            an unresolved environment reference, or `server_launch` finds
-            `--worker-executable` without a path.
+            an unresolved environment reference.
     """  # noqa: E501
     server = config.servers[point.server]
     launches = []

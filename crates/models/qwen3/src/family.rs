@@ -21,39 +21,25 @@ use nn::family::{
 };
 use nn::quantization::Declaration;
 use nn::{Checkpoint, WeightLoader};
-use processing::{ChatProfile, Serving};
 
 use crate::Qwen3ForCausalLm;
 use crate::causal_lm::expert_layers;
-use crate::config::{Config, QWEN3_5_MOE, QWEN3_MOE};
+use crate::config::Config;
 use processing::qwen_vl::ProcessorConfig;
 
 /// The `Qwen3MoeForCausalLM` registration.
 pub const FAMILY: Family = Family {
-    request: processing::Family {
-        id: "qwen3",
-        model_types: &["qwen3", "qwen3_moe"],
-        classes: &[QWEN3_MOE],
-        serving: Serving::Chat(processing::qwen::QWEN3),
-    },
+    request: processing::qwen::QWEN3,
     model: Model::Text(&Qwen3),
 };
 
 /// The `Qwen3_5MoeForConditionalGeneration` registration.
 pub const HYBRID_FAMILY: Family = Family {
-    request: processing::Family {
-        id: "qwen3_5_moe",
-        model_types: &["qwen3_5_moe"],
-        classes: &[QWEN3_5_MOE],
-        serving: Serving::Chat(ChatProfile {
-            images: Some(&Qwen3),
-            ..processing::qwen::QWEN3_5_MOE
-        }),
-    },
+    request: processing::qwen::QWEN3_5_MOE,
     model: Model::Text(&Qwen3),
 };
 
-/// The family: how a checkpoint opens and how request processing binds its image processor.
+/// The family: how a checkpoint opens.
 struct Qwen3;
 
 /// A tensor every Qwen3-VL and Qwen3.5 vision tower holds: the patch embedding.
@@ -73,23 +59,6 @@ impl TextFamily for Qwen3 {
             config,
             images,
         }))
-    }
-}
-
-impl processing::ImageFamily for Qwen3 {
-    fn processor_files(&self) -> &'static [&'static str] {
-        &ProcessorConfig::FILES
-    }
-
-    fn bind(
-        &self,
-        files: &[String],
-    ) -> std::result::Result<Box<dyn processing::ImageProcessor>, String> {
-        let [image, video] = files else {
-            return Err(format!("{} processor files, two expected", files.len()));
-        };
-        let processor = ProcessorConfig::parse(image, video)?;
-        Ok(Box::new(processor))
     }
 }
 

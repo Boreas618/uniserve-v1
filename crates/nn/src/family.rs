@@ -33,7 +33,7 @@ use crate::capability::{
     CausalLm, Decoder, Denoiser, Encoder, KvView, MediaFormat, Splicer, TokenBatch, Vision,
     WarmPrompt, WarmRequest,
 };
-use crate::{Checkpoint, Forward, Result, Operand, WeightLoader};
+use crate::{Checkpoint, Forward, Operand, Result, WeightLoader};
 use uniserve_tensor::DType;
 
 /// One model family a build serves: what execution loads of its checkpoints, beside how they

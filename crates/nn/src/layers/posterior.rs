@@ -14,7 +14,7 @@
 //! moments are one buffer cut by an offset and nothing is copied or transposed.
 
 use ops::posterior::{self, Posterior as PosteriorOp};
-use ops::{Shape, Strides, Operand};
+use ops::{Operand, Shape, Strides};
 use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
@@ -35,12 +35,7 @@ impl Posterior {
     ///
     /// Rasters of another element type, rank, channel count or trailing extent, a strided raster,
     /// an arena that cannot hold the sample, or the operator's refusal.
-    pub fn sample(
-        &self,
-        f: &Forward,
-        moments: Operand,
-        noise: Operand,
-    ) -> Result<Operand> {
+    pub fn sample(&self, f: &Forward, moments: Operand, noise: Operand) -> Result<Operand> {
         const OWNER: &str = "Posterior";
         let channels = noise.shape.dims().first().copied().unwrap_or(0);
         if channels == 0 {

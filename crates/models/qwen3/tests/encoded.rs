@@ -369,7 +369,7 @@ fn recorded_forward(
     tokens: u64,
 ) -> std::collections::BTreeSet<(String, String)> {
     use nn::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
-    use proto::program::PhaseKind;
+    use proto::module::PhaseKind;
 
     let cache = model.cache();
     let arena = nn::Arena::counting();

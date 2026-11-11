@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run `vsa_add_gated_tiles` on a device and check it bit for bit against the operator's two steps.
 
-    crates/program-server/python/.venv/bin/python gated_check.py [--package DIR] [--device cuda]
+    crates/build-server/python/.venv/bin/python gated_check.py [--package DIR] [--device cuda]
 
 **This check needs a GPU**: the kernel pins its rounding with inline PTX (`mul.rn.f32`, `add.rn.f32`)
 so that the compiler cannot contract the multiply with the sum, and `tl.inline_asm_elementwise` does

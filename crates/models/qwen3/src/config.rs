@@ -191,11 +191,11 @@ pub struct Config {
 /// The model classes [`Config::parse`] reads.
 pub const CLASSES: [&str; 3] = [QWEN3_MOE, QWEN3_5_MOE, "Qwen3VLForConditionalGeneration"];
 
-/// `Qwen3MoeForCausalLM`.
-pub const QWEN3_MOE: &str = "Qwen3MoeForCausalLM";
+/// `Qwen3MoeForCausalLM`, as request processing claims it.
+pub const QWEN3_MOE: &str = processing::qwen::QWEN3_MOE_CLASS;
 
-/// `Qwen3_5MoeForConditionalGeneration`.
-pub const QWEN3_5_MOE: &str = "Qwen3_5MoeForConditionalGeneration";
+/// `Qwen3_5MoeForConditionalGeneration`, as request processing claims it.
+pub const QWEN3_5_MOE: &str = processing::qwen::QWEN3_5_MOE_CLASS;
 
 impl Config {
     /// Read and validate the checkpoint's `config.json`.

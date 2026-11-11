@@ -118,7 +118,7 @@ fn holds(input: DType, output: DType) -> bool {
 }
 
 impl Op for Cast {
-    const NAME: &'static str = proto::program::operator::CAST;
+    const NAME: &'static str = proto::module::operator::CAST;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -183,7 +183,11 @@ impl Op for Cast {
             return Tolerance::exact();
         }
         // One rounding into the output, after at most one into the type it is reached through.
-        Tolerance::rounding(1, tolerance::accumulate(descriptor.output), descriptor.output)
+        Tolerance::rounding(
+            1,
+            tolerance::accumulate(descriptor.output),
+            descriptor.output,
+        )
     }
 }
 

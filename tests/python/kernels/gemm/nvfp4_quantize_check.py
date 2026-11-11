@@ -28,8 +28,8 @@ rather than about the values a seed happened to produce.
                              [--rows 128] [--columns 2048] [--block 1024] [--seed 7]
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory holding the
-compiled module. Run it on the GPU host with the Program Server's own
-environment (``crates/program-server/python/.venv/bin/python``), which has torch
+compiled module. Run it on the GPU host with the Build Server's own
+environment (``crates/build-server/python/.venv/bin/python``), which has torch
 and the CUDA bindings. A quantize module's directory name is a descriptor key;
 the check refuses one whose key does not name a layout it can decode, which is
 the one class of mismatch that otherwise reads as a kernel defect.

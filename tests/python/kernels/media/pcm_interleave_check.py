@@ -16,8 +16,8 @@ scale, and both ends of the range and past them.
     python pcm_check.py [--samples 65536] [--block 1024] [--pdl]
 
 It runs the package's Triton source on the GPU through Triton's own launcher,
-which is the code the store's module is compiled from. Run it with the Program
-Server's environment (`crates/program-server/python/.venv/bin/python`).
+which is the code the store's module is compiled from. Run it with the Build
+Server's environment (`crates/build-server/python/.venv/bin/python`).
 """
 
 import argparse

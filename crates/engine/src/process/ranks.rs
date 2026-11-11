@@ -60,7 +60,7 @@ impl LoadedRank {
     ///
     /// `(index, count)` is this rank's place among the process's ranks and the count of its worker
     /// group's ranks this process holds, which the scheduler sees as one pool, `products`
-    /// the products the ranks share, `generation` the epoch's program generation and `blocking` the
+    /// the products the ranks share, `generation` the epoch's module generation and `blocking` the
     /// process's lanes. A serving start and a recorded start build their workers here alike, so
     /// what a recorded start reports is what a serving one launches.
     pub(super) fn spawn_workers(

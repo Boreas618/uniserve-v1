@@ -38,7 +38,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{Shape, Strides, Operand};
+use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -94,7 +94,7 @@ pub struct Args {
 pub struct PositionInterpolate;
 
 impl Op for PositionInterpolate {
-    const NAME: &'static str = proto::program::operator::POSITION_INTERPOLATE;
+    const NAME: &'static str = proto::module::operator::POSITION_INTERPOLATE;
 
     type Descriptor = Descriptor;
     type Args<'a> = Args;
@@ -125,13 +125,19 @@ impl Op for PositionInterpolate {
         if args.indices.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 tap indices, found {}", abi::name(args.indices.dtype)),
+                format!(
+                    "expected i32 tap indices, found {}",
+                    abi::name(args.indices.dtype)
+                ),
             ));
         }
         if args.weights.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected f32 tap weights, found {}", abi::name(args.weights.dtype)),
+                format!(
+                    "expected f32 tap weights, found {}",
+                    abi::name(args.weights.dtype)
+                ),
             ));
         }
         // The program walks the destination as rows of `channels` elements: a row that is not that

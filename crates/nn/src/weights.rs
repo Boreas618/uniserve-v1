@@ -15,7 +15,7 @@
 //! Retained weights are keyed by exactly four inputs: the identity of every checkpoint file whose
 //! bytes produced the weight, the element type the weight has after conversion, the layout name,
 //! and the weight's region in its logical tensor. No program name or revision enters the key: a
-//! program-layer update keeps every retained weight. A change of dtype, quantization, layout or
+//! generation update keeps every retained weight. A change of dtype, quantization, layout or
 //! checkpoint therefore changes the key, and a change of an operator's program does not.
 //!
 //! ## Publishing
@@ -38,9 +38,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ops::fp4::ScaleLayout;
 use ops::values::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use ops::{Shape, Operand};
-use uniserve_tensor::DType;
+use ops::{Operand, Shape};
 use sha2::{Digest, Sha256};
+use uniserve_tensor::DType;
 
 use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};
 use crate::error::{Error, Result};
@@ -559,7 +559,9 @@ impl fmt::Display for WeightKey {
         write!(
             formatter,
             "{files}|{}|{}|{}",
-            ops::abi::name(self.dtype), self.layout, self.region
+            ops::abi::name(self.dtype),
+            self.layout,
+            self.region
         )?;
         if let Some(provenance) = &self.provenance {
             write!(formatter, "|{provenance}")?;
@@ -865,7 +867,8 @@ fn block_scale_dtype(tensor: &str, dtype: DType) -> Result<DType> {
         other => Err(Error::weight(
             tensor,
             format!(
-                "block scales are one byte each — F8_E4M3, or U8 where the export says so — not                  {other}", other = ops::abi::name(other)
+                "block scales are one byte each — F8_E4M3, or U8 where the export says so — not                  {other}",
+                other = ops::abi::name(other)
             ),
         )),
     }
@@ -892,7 +895,10 @@ impl Weight {
         let element = ops::abi::bytes(view.dtype).ok_or_else(|| {
             Error::weight(
                 "",
-                format!("a borrowed {} view has no whole-byte element", ops::abi::name(view.dtype)),
+                format!(
+                    "a borrowed {} view has no whole-byte element",
+                    ops::abi::name(view.dtype)
+                ),
             )
         })?;
         Ok(Self {
@@ -1178,7 +1184,10 @@ impl<'a> WeightLoader<'a> {
             let element = ops::abi::bytes(key.dtype).ok_or_else(|| {
                 Error::weight(
                     &key.region.to_string(),
-                    format!("{} has no whole-byte element size", ops::abi::name(key.dtype)),
+                    format!(
+                        "{} has no whole-byte element size",
+                        ops::abi::name(key.dtype)
+                    ),
                 )
             })?;
             let length = shape.numel().checked_mul(element).ok_or_else(|| {
@@ -1384,13 +1393,19 @@ impl<'a> WeightLoader<'a> {
         let source_element = ops::abi::bytes(source_dtype).ok_or_else(|| {
             Error::weight(
                 &request.tensor,
-                format!("{source_dtype} has no whole-byte size", source_dtype = ops::abi::name(source_dtype)),
+                format!(
+                    "{source_dtype} has no whole-byte size",
+                    source_dtype = ops::abi::name(source_dtype)
+                ),
             )
         })?;
         let element = ops::abi::bytes(dtype).ok_or_else(|| {
             Error::weight(
                 &request.tensor,
-                format!("{dtype} has no whole-byte element size", dtype = ops::abi::name(dtype)),
+                format!(
+                    "{dtype} has no whole-byte element size",
+                    dtype = ops::abi::name(dtype)
+                ),
             )
         })?;
         let expected = request
@@ -1409,7 +1424,8 @@ impl<'a> WeightLoader<'a> {
                 &request.tensor,
                 format!(
                     "{converted} bytes were read, {expected} expected for {:?} of {dtype}",
-                    request.shape.dims(), dtype = ops::abi::name(dtype)
+                    request.shape.dims(),
+                    dtype = ops::abi::name(dtype)
                 ),
             ));
         }
@@ -1571,7 +1587,8 @@ impl<'a> WeightLoader<'a> {
             if !held.contains(&encoding) {
                 return Err(Error::policy(format!(
                     "a {quantization} policy encodes weights as {encoding}, and this checkpoint \
-                     holds {listed}", encoding = ops::abi::name(encoding)
+                     holds {listed}",
+                    encoding = ops::abi::name(encoding)
                 )));
             }
         }
@@ -1581,7 +1598,9 @@ impl<'a> WeightLoader<'a> {
                     return Err(Error::policy(format!(
                         "this checkpoint holds {encoded} encoded weights, which a {dtype} element \
                          type does not describe; the quantization is the loader's policy, not its \
-                         element type", encoded = ops::abi::name(encoded), dtype = ops::abi::name(dtype)
+                         element type",
+                        encoded = ops::abi::name(encoded),
+                        dtype = ops::abi::name(dtype)
                     )));
                 }
             }
@@ -1679,7 +1698,10 @@ impl<'a> WeightLoader<'a> {
         if packed.dtype() != DType::U8 {
             return Err(Error::weight(
                 &values_request.tensor,
-                format!("packed E2M1 values are U8 bytes, not {}", ops::abi::name(packed.dtype())),
+                format!(
+                    "packed E2M1 values are U8 bytes, not {}",
+                    ops::abi::name(packed.dtype())
+                ),
             ));
         }
         // A calibrated export never packs an all-zero matrix: every E2M1 code would be zero, the
@@ -2021,7 +2043,10 @@ impl<'a> WeightLoader<'a> {
                 if values.dtype != DType::U8 {
                     return Err(Error::weight(
                         &values_name,
-                        format!("packed E2M1 values are U8 bytes, not {}", ops::abi::name(values.dtype)),
+                        format!(
+                            "packed E2M1 values are U8 bytes, not {}",
+                            ops::abi::name(values.dtype)
+                        ),
                     ));
                 }
                 let (rows_here, columns_here) = match values.shape.dims() {
@@ -2060,7 +2085,9 @@ impl<'a> WeightLoader<'a> {
                             &scales_name,
                             format!(
                                 "block scales are {here} here against the stack's {agreed}: one \
-                                 stack is one scale type", here = ops::abi::name(here), agreed = ops::abi::name(agreed)
+                                 stack is one scale type",
+                                here = ops::abi::name(here),
+                                agreed = ops::abi::name(agreed)
                             ),
                         ));
                     }
@@ -2376,7 +2403,13 @@ impl<'a> WeightLoader<'a> {
         writable: bool,
     ) -> Result<Weight> {
         let element = ops::abi::bytes(dtype).ok_or_else(|| {
-            Error::weight(name, format!("{dtype} has no whole-byte element size", dtype = ops::abi::name(dtype)))
+            Error::weight(
+                name,
+                format!(
+                    "{dtype} has no whole-byte element size",
+                    dtype = ops::abi::name(dtype)
+                ),
+            )
         })?;
         let expected = shape
             .numel()
@@ -2388,7 +2421,8 @@ impl<'a> WeightLoader<'a> {
                 format!(
                     "{} bytes for {:?} of {dtype}, {expected} expected",
                     bytes.len(),
-                    shape.dims(), dtype = ops::abi::name(dtype)
+                    shape.dims(),
+                    dtype = ops::abi::name(dtype)
                 ),
             ));
         }
@@ -2439,7 +2473,8 @@ impl<'a> WeightLoader<'a> {
                         name,
                         format!(
                             "the fused parts mix {seen} and {source} elements",
-                            source = ops::abi::name(location.dtype), seen = ops::abi::name(seen)
+                            source = ops::abi::name(location.dtype),
+                            seen = ops::abi::name(seen)
                         ),
                     ));
                 }
@@ -2464,7 +2499,11 @@ impl<'a> WeightLoader<'a> {
         if !dtype.is_float() || !checkpoint.is_float() {
             return Err(Error::weight(
                 names.first().map(String::as_str).unwrap_or(""),
-                format!("converting {checkpoint} to {dtype} is not a floating-point conversion", checkpoint = ops::abi::name(checkpoint), dtype = ops::abi::name(dtype)),
+                format!(
+                    "converting {checkpoint} to {dtype} is not a floating-point conversion",
+                    checkpoint = ops::abi::name(checkpoint),
+                    dtype = ops::abi::name(dtype)
+                ),
             ));
         }
         Ok(dtype)
@@ -2689,7 +2728,10 @@ impl<'s, 'a> Scope<'s, 'a> {
         let element = ops::abi::bytes(dtype).ok_or_else(|| {
             Error::weight(
                 &self.name(leaf),
-                format!("{dtype} has no whole-byte element", dtype = ops::abi::name(dtype)),
+                format!(
+                    "{dtype} has no whole-byte element",
+                    dtype = ops::abi::name(dtype)
+                ),
             )
         })?;
         Ok(vec![0; (Shape::new(shape).numel() * element) as usize])
@@ -2814,7 +2856,10 @@ fn spans_in<'l>(
             let location = locate(tensor).ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
             let length = stored_bytes(location);
             let element = ops::abi::bytes(location.dtype).ok_or_else(|| {
-                Error::weight(tensor, format!("{} has no whole-byte size", ops::abi::name(location.dtype)))
+                Error::weight(
+                    tensor,
+                    format!("{} has no whole-byte size", ops::abi::name(location.dtype)),
+                )
             })?;
             let begin = usize::try_from(start * element).map_err(|_| {
                 Error::weight(tensor, "the region's first element is past usize::MAX")
@@ -2846,7 +2891,10 @@ fn spans_in<'l>(
         } => {
             let location = locate(tensor).ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
             let element = ops::abi::bytes(location.dtype).ok_or_else(|| {
-                Error::weight(tensor, format!("{} has no whole-byte size", ops::abi::name(location.dtype)))
+                Error::weight(
+                    tensor,
+                    format!("{} has no whole-byte size", ops::abi::name(location.dtype)),
+                )
             })?;
             if shape.rank() == 0 {
                 return Err(Error::weight(
@@ -2905,7 +2953,10 @@ fn spans_in<'l>(
             for name in parts {
                 let location = locate(name).ok_or_else(|| Error::MissingTensor(name.clone()))?;
                 let element = ops::abi::bytes(location.dtype).ok_or_else(|| {
-                    Error::weight(name, format!("{} has no whole-byte size", ops::abi::name(location.dtype)))
+                    Error::weight(
+                        name,
+                        format!("{} has no whole-byte size", ops::abi::name(location.dtype)),
+                    )
                 })?;
                 if block.row_stride < block.columns {
                     return Err(Error::weight(
@@ -2997,8 +3048,12 @@ fn block_spans<'a>(
     block: &PartBlock,
 ) -> Result<Vec<Span<'a>>> {
     let location = locate(name).ok_or_else(|| Error::MissingTensor(name.to_owned()))?;
-    let element = ops::abi::bytes(location.dtype)
-        .ok_or_else(|| Error::weight(name, format!("{} has no whole-byte size", ops::abi::name(location.dtype))))?;
+    let element = ops::abi::bytes(location.dtype).ok_or_else(|| {
+        Error::weight(
+            name,
+            format!("{} has no whole-byte size", ops::abi::name(location.dtype)),
+        )
+    })?;
     if block.row_stride < block.columns {
         return Err(Error::weight(
             name,
@@ -3076,7 +3131,11 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
     if !bytes.len().is_multiple_of(source_bytes) {
         return Err(Error::weight(
             tensor,
-            format!("{} bytes are not whole {from} elements", bytes.len(), from = ops::abi::name(from)),
+            format!(
+                "{} bytes are not whole {from} elements",
+                bytes.len(),
+                from = ops::abi::name(from)
+            ),
         ));
     }
     let count = bytes.len() / source_bytes;
@@ -3092,7 +3151,10 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
             other => {
                 return Err(Error::weight(
                     tensor,
-                    format!("converting {other} is not a floating-point conversion", other = ops::abi::name(other)),
+                    format!(
+                        "converting {other} is not a floating-point conversion",
+                        other = ops::abi::name(other)
+                    ),
                 ));
             }
         };
@@ -3109,7 +3171,10 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
             other => {
                 return Err(Error::weight(
                     tensor,
-                    format!("converting to {other} is not a floating-point conversion", other = ops::abi::name(other)),
+                    format!(
+                        "converting to {other} is not a floating-point conversion",
+                        other = ops::abi::name(other)
+                    ),
                 ));
             }
         }
@@ -3134,7 +3199,11 @@ fn conversion(from: DType, to: DType, tensor: &str) -> Result<()> {
         (same, target) if same == target => Ok(()),
         (source, target) => Err(Error::weight(
             tensor,
-            format!("converting {source} to {target} is not implemented", source = ops::abi::name(source), target = ops::abi::name(target)),
+            format!(
+                "converting {source} to {target} is not implemented",
+                source = ops::abi::name(source),
+                target = ops::abi::name(target)
+            ),
         )),
     }
 }

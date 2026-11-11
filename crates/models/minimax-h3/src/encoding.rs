@@ -16,7 +16,7 @@
 //! **The audio encoder's attention is FP32 throughout** — query, key and value projections, the
 //! scores, the softmax and the output — whatever the checkpoint's preset says: FP32 attention for
 //! `ref2va`'s audio encoder and the VSA compression branch, as a cuBLASLt SGEMM plus a softmax
-//! kernel program. The model declares it instead of leaning on `torch.autocast`, and it is the
+//! kernel package. The model declares it instead of leaning on `torch.autocast`, and it is the
 //! opposite of the video VAE decoder's rule (one element type for both parameters and residual,
 //! whatever the deployment's preset - F32 under `dtype = "auto"`, because the checkpoint stores the
 //! VAE in F32 and auto converts nothing; FP16 is a *converted* deployment's element, and every size
@@ -146,7 +146,7 @@ use nn::layers::{
     Rounding, Transpose, WeightOrder,
 };
 use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Shape, Operand};
+use nn::{DType, Operand, Shape};
 
 use nn::codec::{DacEncoder, DacSpec};
 
@@ -462,12 +462,7 @@ impl VideoEncoder {
     /// The reference's `DiagonalGaussian` and the tail of `LatentEncoder`: mean and clamped
     /// log-variance, `mean + exp(0.5 · logvar) · noise` rounded through FP16 as a step
     /// (`ops::posterior`), then the latent space's per-channel affine ([`normalize_tables`]).
-    pub fn posterior(
-        &self,
-        f: &Forward,
-        moments: Operand,
-        noise: Operand,
-    ) -> Result<Operand> {
+    pub fn posterior(&self, f: &Forward, moments: Operand, noise: Operand) -> Result<Operand> {
         let drawn = self.sampler.sample(f, moments, noise)?;
         Ok(unbatched(self.normalize.forward(f, batched(drawn))?))
     }

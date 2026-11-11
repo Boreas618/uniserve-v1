@@ -48,12 +48,12 @@ use ipc::philox::DrawAddress;
 use ipc::{DraftWork, TimingCounters};
 use nn::family::TextModel;
 use nn::{Forward, KvView, TokenBatch};
-use ops::{Shape, Operand};
-use uniserve_tensor::DType;
+use ops::{Operand, Shape};
 use platform::DeviceId;
-use proto::program::PhaseKind;
-use proto::program::commit::{COMMIT_FIELDS, column, mode};
-use proto::program::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
+use proto::module::PhaseKind;
+use proto::module::commit::{COMMIT_FIELDS, column, mode};
+use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
+use uniserve_tensor::DType;
 
 use super::{ATTENTION_WORKSPACE_BYTES, CausalLmRunner, LOGITS_DTYPE};
 use crate::runner::Runner;

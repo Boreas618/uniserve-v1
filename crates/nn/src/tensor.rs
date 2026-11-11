@@ -11,7 +11,7 @@
 
 use crate::{Error, Result};
 
-pub use ops::{DevicePtr, MAX_RANK, Shape, Strides, Operand};
+pub use ops::{DevicePtr, MAX_RANK, Operand, Shape, Strides};
 pub use uniserve_tensor::DType;
 
 /// The device storage a borrowed view is carved from.
@@ -48,7 +48,8 @@ impl Backing {
     pub fn view(self, dtype: DType, shape: Shape) -> Result<Operand> {
         let bytes = ops::abi::bytes(dtype).ok_or_else(|| {
             Error::Unsupported(format!(
-                "{dtype} elements are sub-byte and named by their storage layout, not a view", dtype = ops::abi::name(dtype)
+                "{dtype} elements are sub-byte and named by their storage layout, not a view",
+                dtype = ops::abi::name(dtype)
             ))
         })?;
         let needed = shape.numel().checked_mul(bytes).ok_or_else(|| {
@@ -62,7 +63,8 @@ impl Backing {
                 "Backing::view",
                 format!(
                     "{needed} bytes of {} {shape:?} do not fit a {}-byte region",
-                    ops::abi::name(dtype), self.bytes
+                    ops::abi::name(dtype),
+                    self.bytes
                 ),
             ));
         }

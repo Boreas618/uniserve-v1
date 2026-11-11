@@ -30,10 +30,9 @@
 # representation the shipped performance profiles serve, and a cell states only
 # what its own path was measured to need.
 #
-# No server pins --worker-executable either: the worker processes must run the
-# same build as the daemon, so a deployment launched with --executable runs the
-# new build end to end. Without the flag each worker runs the daemon's own
-# executable, which is the binary UNISERVE_EXECUTABLE names.
+# No server selects an engine package either: a deployment launched with
+# --executable runs that daemon, the binary UNISERVE_EXECUTABLE names, and its
+# main processes run the engine package the Build Server it serves from holds.
 #
 # Environment:
 # - UNISERVE_FAST_H3_MODEL names a local copy of

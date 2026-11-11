@@ -2,8 +2,8 @@
 
 ``spec`` states what this package's kernel needs for one descriptor: the kernel function, its
 argument signature in the order the operator launches them, the compile-time values the descriptor
-dimensions give, and the compilation options. The Program Server's Triton source drives
-``uniserve_program_server.triton`` with it.
+dimensions give, and the compilation options. The Build Server's Triton source drives
+``uniserve_build_server.triton`` with it.
 
 The output row width, the tile one program walks and the two flags are baked in — the packed input
 row is ``width`` elements past the value half, and the magnitude buffer's length is the program
@@ -12,7 +12,7 @@ launch words, and the kernel indexes in int64 either way.
 """
 
 import value_first_swiglu as kernels
-from uniserve_program_server import triton as driver
+from uniserve_build_server import triton as driver
 
 #: The floating dtypes the packed input, the bias and the output may have, as Triton spells them in
 #: an argument signature.
