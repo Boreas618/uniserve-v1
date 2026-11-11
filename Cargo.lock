@@ -2779,11 +2779,10 @@ dependencies = [
 name = "nn"
 version = "2.0.0"
 dependencies = [
+ "backend",
  "memmap2",
  "ops",
- "platform",
  "processing",
- "program-server",
  "proto",
  "safetensors",
  "serde",
