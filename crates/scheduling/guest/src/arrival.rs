@@ -681,7 +681,7 @@ impl<K: Order> Policy for Arrival<K> {
 mod tests {
     use super::*;
     use crate::End;
-    use crate::ids::{StageId, PhaseId};
+    use crate::ids::{PhaseId, StageId};
     use crate::policy::Instantiation;
     use crate::time::{Duration, Nanos};
     use crate::view::{EncodingView, PageView, PhaseView, RankView, ReplicaView, Snapshot};

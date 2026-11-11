@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{StageId, EncodingId, PageId, PhaseId, RequestId};
+use crate::ids::{EncodingId, PageId, PhaseId, RequestId, StageId};
 use crate::time::Nanos;
 
 /// The whole state a policy is instantiated with (`Policy::init`).
