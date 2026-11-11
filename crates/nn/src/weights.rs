@@ -3,7 +3,7 @@
 //!
 //! A loaded weight is a [`Tensor`]: over retained storage on the device a model serves from, over
 //! host memory when a model is loaded on the CPU device, and a meta tensor when it is loaded for
-//! a profile run. Modules reach the loader through a [`VarBuilder`](crate::VarBuilder), which
+//! a profile run. Modules reach the loader through a [`VarBuilder`], which
 //! names their tensors by their path in the model.
 //!
 //! ## The layout
