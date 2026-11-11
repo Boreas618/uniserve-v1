@@ -417,7 +417,7 @@ fn elements(
     if send.dtype != recv.dtype {
         return Err(misuse(
             collective,
-            format!("sends {} and receives {}", send.dtype, recv.dtype),
+            format!("sends {} and receives {}", ops::abi::name(send.dtype), ops::abi::name(recv.dtype)),
         ));
     }
 
@@ -426,7 +426,7 @@ fn elements(
     let dtype = collective_type(send.dtype).ok_or_else(|| {
         misuse(
             collective,
-            format!("{} has no NCCL element type", send.dtype),
+            format!("{} has no NCCL element type", ops::abi::name(send.dtype)),
         )
     })?;
 
@@ -494,7 +494,8 @@ fn wait_unless_captured(stream: &Stream) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use ops::{DType, DevicePtr, Operand, Shape};
+    use ops::{DevicePtr, Operand, Shape};
+    use uniserve_tensor::DType;
 
     use super::{
         all_gather, all_reduce, all_to_all, finish, settle, split, start_all_to_all,

@@ -31,7 +31,8 @@
 
 use std::sync::Arc;
 
-use ops::{DType, Operand, Tolerance, Twins};
+use ops::{Operand, Tolerance, Twins};
+use uniserve_tensor::DType;
 use platform::{DeviceId, PinnedBuffer, Stream};
 
 use crate::{Error, Result};
@@ -217,9 +218,9 @@ impl Shadow {
                     "the twin and the real buffer have different sizes: the real output holds \
                      {bytes} bytes of {} and the twin {} of {}, so the two programs are not \
                      comparable",
-                    pair.real.dtype,
+                    ops::abi::name(pair.real.dtype),
                     pair.shadow.byte_len()?,
-                    pair.shadow.dtype,
+                    ops::abi::name(pair.shadow.dtype),
                 ));
                 continue;
             }
@@ -311,8 +312,7 @@ pub fn compare_buffers(
     tolerance: Tolerance,
 ) -> Result<u64> {
     let bytes_of = |dtype: DType| -> usize {
-        dtype
-            .bytes()
+        ops::abi::bytes(dtype)
             .map(|bytes| bytes as usize)
             .unwrap_or_default()
     };

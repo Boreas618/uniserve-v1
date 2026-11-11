@@ -37,7 +37,8 @@
 //! and so possibly the kernel a product selects, which is not provably the served arithmetic.
 
 use ops::tile_stitch::{self, TileStitch};
-use ops::{DType, Shape, Strides, Operand};
+use ops::{Shape, Strides, Operand};
+use uniserve_tensor::DType;
 
 use crate::capability::Splice;
 use crate::error::{Error, Result};
@@ -327,7 +328,7 @@ pub fn gather(
                 "a clip of {frames} frames from frame {first} of a {plane}-cell raster is past a \
                  trajectory of {} {} elements in {channels} channels",
                 trajectory.numel(),
-                trajectory.dtype,
+                ops::abi::name(trajectory.dtype),
             ),
         ));
     }
@@ -509,8 +510,8 @@ impl Blend {
             ));
         }
         let round = |value: f32| -> Result<f32> {
-            let bytes = self.dtype.encode(&[value]).map_err(Error::from)?;
-            Ok(self.dtype.decode(&bytes).map_err(Error::from)?[0])
+            let bytes = ops::values::encode(self.dtype, &[value]).map_err(Error::from)?;
+            Ok(ops::values::decode(self.dtype, &bytes).map_err(Error::from)?[0])
         };
         let frame = |view: Operand, channel: u64, index: u64| {
             Operand::new(
@@ -750,9 +751,9 @@ impl TiledEncode {
                         format!(
                             "tile {index} encoded {:?} {}, {:?} {} expected",
                             encoded.shape.dims(),
-                            encoded.dtype,
+                            ops::abi::name(encoded.dtype),
                             block.dims(),
-                            self.dtype
+                            ops::abi::name(self.dtype)
                         ),
                     ));
                 }
@@ -945,8 +946,8 @@ impl TiledDecode {
                     format!(
                         "{:?} {} tokens, {expected:?} {} expected",
                         tokens.shape.dims(),
-                        tokens.dtype,
-                        out.dtype
+                        ops::abi::name(tokens.dtype),
+                        ops::abi::name(out.dtype)
                     ),
                 ));
             }

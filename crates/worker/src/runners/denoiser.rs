@@ -45,7 +45,8 @@ use std::sync::{Arc, Mutex};
 
 use ipc::TimingCounters;
 use nn::capability::{Conditioning, Denoiser, Latents, Step, VideoRequest, WarmRequest};
-use ops::{DType, Shape, Operand};
+use ops::{Shape, Operand};
+use uniserve_tensor::DType;
 use platform::DeviceId;
 use proto::video::{LatentShape, Layout};
 
@@ -119,9 +120,8 @@ fn latent_shape(latent: &LatentShape) -> Shape {
 
 /// One latent block's bytes in `dtype`.
 fn latent_bytes(latent: &LatentShape, dtype: DType) -> Result<u64> {
-    let width = dtype
-        .bytes()
-        .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size")))?;
+    let width = ops::abi::bytes(dtype)
+        .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size", dtype = ops::abi::name(dtype))))?;
     numel(latent)?
         .checked_mul(width)
         .ok_or_else(|| Error::Invalid("a latent's bytes overflow".into()))
@@ -233,7 +233,7 @@ impl DenoiseColumns {
         )?;
         let audio = match layout.audio {
             Some(audio) => latent_bytes(&audio, shape.sample)?,
-            None => shape.sample.bytes().unwrap_or(1),
+            None => ops::abi::bytes(shape.sample).unwrap_or(1),
         };
         Staged::zero(&mut self.staged.audio, rows * audio)?;
         Ok(())
@@ -673,8 +673,8 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     /// The bytes of the largest trajectory this runner holds: the video and audio latents of its
     /// largest layout, which a host latent pool's trajectory pages are sized for.
     pub fn trajectory_bytes(&self) -> Result<u64> {
-        let element = self.shape.sample.bytes().ok_or_else(|| {
-            Error::Invalid(format!("{} has no whole-byte size", self.shape.sample))
+        let element = ops::abi::bytes(self.shape.sample).ok_or_else(|| {
+            Error::Invalid(format!("{} has no whole-byte size", ops::abi::name(self.shape.sample)))
         })?;
         let mut largest = 0;
         for plan in &self.buckets {
@@ -843,8 +843,8 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         let stream = self.stream.clone();
         let layout = layout_of(bucket)?;
         let (rows, source_width, text_width) = self.conditioning_row(&layout);
-        let element = self.shape.stack.bytes().ok_or_else(|| {
-            Error::Invalid(format!("{} has no whole-byte size", self.shape.stack))
+        let element = ops::abi::bytes(self.shape.stack).ok_or_else(|| {
+            Error::Invalid(format!("{} has no whole-byte size", ops::abi::name(self.shape.stack)))
         })?;
         // One row's size per kind: the two columns are two widths, so a single number would make
         // the shorter kind's copy land inside the wrong column's row (`conditioning_width`).
@@ -927,8 +927,8 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     fn zero_rows(&mut self, bucket: Bucket) -> Result<()> {
         let layout = layout_of(bucket)?;
         let (rows, _, text_width) = self.conditioning_row(&layout);
-        let element = self.shape.stack.bytes().ok_or_else(|| {
-            Error::Invalid(format!("{} has no whole-byte size", self.shape.stack))
+        let element = ops::abi::bytes(self.shape.stack).ok_or_else(|| {
+            Error::Invalid(format!("{} has no whole-byte size", ops::abi::name(self.shape.stack)))
         })?;
         let stride = rows * text_width * element;
         let row = text_width * element;
@@ -1968,9 +1968,8 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
 /// gathered to every rank before the solver's update), so two ranks or epochs whose layouts agree
 /// lay out every page alike.
 fn trajectory_layout(layout: &Layout, dtype: DType) -> Result<StorageLayout> {
-    let element = dtype
-        .bytes()
-        .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size")))?;
+    let element = ops::abi::bytes(dtype)
+        .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size", dtype = ops::abi::name(dtype))))?;
     let field = |tensor: &str, shape: &LatentShape, offset: u64| {
         let dims = [
             u64::from(shape.channels),
@@ -1982,7 +1981,7 @@ fn trajectory_layout(layout: &Layout, dtype: DType) -> Result<StorageLayout> {
         Field {
             tensor: tensor.to_owned(),
             source: String::new(),
-            dtype: dtype.to_string(),
+            dtype: ops::abi::name(dtype).to_owned(),
             element,
             offset,
             shape: dims.to_vec(),
@@ -2021,10 +2020,8 @@ fn trajectory_layout(layout: &Layout, dtype: DType) -> Result<StorageLayout> {
 /// to back: the video latent, then the audio latent.
 fn trajectory_regions(latents: &Latents) -> Result<Vec<(u64, u64)>> {
     let region = |view: &Operand| -> Result<(u64, u64)> {
-        let bytes = view
-            .dtype
-            .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", view.dtype)))?;
+        let bytes = ops::abi::bytes(view.dtype)
+            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", ops::abi::name(view.dtype))))?;
         Ok((view.ptr.address(), view.shape.numel() * bytes))
     };
     let mut regions = vec![region(&latents.video)?];

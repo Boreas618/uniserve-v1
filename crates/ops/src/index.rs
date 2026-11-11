@@ -47,11 +47,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
 use crate::strided;
-use crate::tensor::{DType, MAX_RANK, Operand, Strides};
+use crate::tensor::{MAX_RANK, Operand, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -118,8 +121,8 @@ impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("function", self.function)
-            .field("dtype", self.dtype)
-            .field("indices", self.indices)
+            .field("dtype", abi::name(self.dtype))
+            .field("indices", abi::name(self.indices))
             .field("rank", self.rank)
             .field("block", self.block)
             .field("pdl", self.pdl)

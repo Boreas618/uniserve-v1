@@ -42,10 +42,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use nn::forward::Forward;
-use ops::{
-    Arguments, CubinMetadata, DType, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op,
-    Shape, Operand, Tolerance, Twins, descriptor,
-};
+use ops::{Arguments, CubinMetadata, DevicePtr, Generation, Kernel, KernelEntry, LaunchGrid, Op, Shape, Operand, Tolerance, Twins, descriptor};
+use uniserve_tensor::DType;
 use platform::{
     Allocator, Budget, Buffer, Device, DeviceId, PinnedBuffer, PoolKind, Stream, memcpy_async,
     memset_d32,

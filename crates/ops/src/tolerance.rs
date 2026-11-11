@@ -41,7 +41,7 @@
 //! The comparison is `|candidate − reference| ≤ atol + rtol·magnitude`, where the magnitude is
 //! `|reference|`, or the output's largest `|reference|` for a bound that [`Tolerance::cancels`].
 
-use crate::tensor::DType;
+use uniserve_tensor::DType;
 
 /// How far one implementation of an operator may be from another.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -79,7 +79,7 @@ impl Tolerance {
     pub fn rounding(reduction: u64, accumulate: DType, output: DType) -> Self {
         Self {
             atol: 0.0,
-            rtol: relative(2.0 * gamma(reduction, accumulate) + output.unit_roundoff()),
+            rtol: relative(2.0 * gamma(reduction, accumulate) + unit_roundoff(output)),
             cancels: false,
         }
     }
@@ -92,7 +92,7 @@ impl Tolerance {
             atol: 0.0,
             rtol: relative(
                 2.0 * gamma(reduction as u64, accumulate) * reduction.sqrt()
-                    + output.unit_roundoff(),
+                    + unit_roundoff(output),
             ),
             cancels: true,
         }
@@ -121,12 +121,44 @@ impl Tolerance {
     }
 }
 
+/// The unit round-off `u` of an element type: half the gap between one and the next value above
+/// it, which is the factor every rounding bound is written with (Higham, *Accuracy and Stability
+/// of Numerical Algorithms*, 2nd ed., §2.2). An integer rounds nothing.
+pub fn unit_roundoff(dtype: DType) -> f64 {
+    match dtype {
+        DType::F64 => 1.110_223_024_625_156_5e-16, // 2^-53
+        DType::F32 => 5.960_464_477_539_063e-8,    // 2^-24
+        DType::BF16 => 3.906_25e-3,                // 2^-8
+        DType::F16 => 4.882_812_5e-4,              // 2^-11
+        DType::F8E4M3 | DType::F6E2M3 => 6.25e-2,  // 2^-4
+        DType::F6E3M2 => 1.25e-1,                  // 2^-3
+        DType::F4 => 2.5e-1,                       // 2^-2
+        DType::F8E8M0 => 5e-1,                     // 2^-1: a power of two and nothing between
+        DType::U8 | DType::U32 | DType::I16 | DType::I32 | DType::I64 => 0.0,
+        // An element type the tensor library adds has no bound until it is stated here: a NaN
+        // bound holds for no pair of values, so a comparison under it fails instead of passing.
+        _ => f64::NAN,
+    }
+}
+
+/// The element type a reduction over `dtype` accumulates in.
+///
+/// Every operator here accumulates a floating reduction in FP32, so the bounds are written with
+/// `u = 2^-24` whatever the input dtype is; FP64 alone accumulates in itself, because FP32 would
+/// lose what its elements hold.
+pub const fn accumulate(dtype: DType) -> DType {
+    match dtype {
+        DType::F64 => DType::F64,
+        _ => DType::F32,
+    }
+}
+
 /// `γₙ = n·u/(1 − n·u)` for a length-`n` reduction accumulated in `accumulate`.
 ///
 /// Saturates at 1 for a reduction so long that `n·u ≥ 1`, where the expression stops being a bound;
 /// no operator here reduces over enough terms for that to happen in FP32 (`n` would be 2²⁴).
 pub fn gamma(reduction: u64, accumulate: DType) -> f64 {
-    let terms = reduction as f64 * accumulate.unit_roundoff();
+    let terms = reduction as f64 * unit_roundoff(accumulate);
     if terms >= 1.0 {
         1.0
     } else {

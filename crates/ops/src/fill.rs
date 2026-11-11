@@ -17,11 +17,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
 use crate::strided;
-use crate::tensor::{DType, Operand};
+use crate::tensor::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -53,7 +56,7 @@ impl Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("rank", self.rank)
             .field("block", self.block)
             .field("pdl", self.pdl)
@@ -93,13 +96,14 @@ impl Op for Fill {
         strided::require_elements(Self::NAME, "destination", &args.destination)?;
         strided::require_window(Self::NAME, "destination", &args.destination)?;
 
-        let width = descriptor.dtype.bits();
+        // Every element type of a fill is a whole number of bytes.
+        let width = u8::BITS * descriptor.dtype.size_in_bytes() as u32;
         if width < u64::BITS && args.bits >> width != 0 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the bits {:#x} do not fit a {} element of {width} bits",
-                    args.bits, descriptor.dtype
+                    args.bits, abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -206,7 +210,7 @@ mod tests {
         let empty = window(DType::F32, &[4, 0], &[0, 1], 0);
         assert!(refusal(&empty).contains("nothing to launch"));
 
-        let packed = window(DType::F4E2M1, &[8], &[1], 0);
+        let packed = window(DType::F4, &[8], &[1], 0);
         assert!(refusal(&packed).contains("dtype is f4e2m1"));
     }
 

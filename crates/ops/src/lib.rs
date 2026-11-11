@@ -8,9 +8,10 @@
 //! type with a name, a descriptor, and an argument struct; a kernel program — a Triton package, a
 //! CuTe DSL package, a CUDA C++ package or a native library — fills that operator, and
 //! `uniserve engine` resolves the programs the epoch record names and hands the modules to
-//! [`Kernel`]. `ops` depends on `platform` and on the program vocabulary of `proto` (operator
-//! names and phases) alone: it launches what it is given, allocates nothing
-//! that outlives a launch, owns no model and knows no layer.
+//! [`Kernel`]. `ops` depends on `platform`, on the program vocabulary of `proto` (operator
+//! names and phases) and on the tensor library for the element type of an operand, whose number
+//! and spelling in the package ABI [`abi`] states: it launches what it is given, allocates
+//! nothing that outlives a launch, owns no model and knows no layer.
 //!
 //! ## The operators
 //!
@@ -91,6 +92,7 @@
 /// tools read.
 pub const KERNELS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels");
 
+pub mod abi;
 pub mod activation;
 pub mod activation1d;
 pub mod adaptive_pool;
@@ -163,6 +165,6 @@ pub use platform::zero_bytes;
 pub use platform::{
     CollectiveType, Communicator, DeviceRange, PlatformDevicePtr, ReduceOp, Stream, collective_type,
 };
-pub use tensor::{DType, DevicePtr, MAX_RANK, Shape, Strides, Operand};
+pub use tensor::{DevicePtr, MAX_RANK, Operand, Shape, Strides};
 pub use tolerance::Tolerance;
 pub use twins::{Twin, Twins};

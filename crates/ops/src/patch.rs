@@ -28,10 +28,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -85,7 +88,7 @@ pub fn geometry(channels: u32, height: u32, width: u32) -> Result<()> {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("block", self.block)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -157,7 +160,7 @@ impl Op for Patch {
             if view.dtype != descriptor.dtype {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected {} {name}, found {}", descriptor.dtype, view.dtype),
+                    format!("expected {} {name}, found {}", abi::name(descriptor.dtype), abi::name(view.dtype)),
                 ));
             }
         }

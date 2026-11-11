@@ -12,7 +12,8 @@
 use ops::copy_block::{self, CopyBlock, RANK};
 use ops::patch::{self, Patch};
 use ops::unpatchify::{self, Unpatchify};
-use ops::{DType, Operand};
+use ops::Operand;
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -44,10 +45,10 @@ impl Copy {
     ///
     /// A sub-byte element type, which a copy cannot address element by element.
     pub fn new(dtype: DType, access: Access) -> Result<Self> {
-        if dtype.bytes().is_none() {
+        if ops::abi::bytes(dtype).is_none() {
             return Err(Error::shape(
                 "Copy",
-                format!("{dtype} elements are sub-byte; a block copy moves whole elements"),
+                format!("{dtype} elements are sub-byte; a block copy moves whole elements", dtype = ops::abi::name(dtype)),
             ));
         }
         Ok(Self { dtype, access })
@@ -284,7 +285,7 @@ mod tests {
     fn a_copy_moves_whole_elements() {
         assert!(Copy::new(DType::BF16, Access::Element).is_ok());
         assert!(Copy::new(DType::F32, Access::Vector).is_ok());
-        assert!(Copy::new(DType::F4E2M1, Access::Element).is_err());
+        assert!(Copy::new(DType::F4, Access::Element).is_err());
     }
 
     /// A patch has extents; a raster is whole patches of the layer's channels; the forward packs

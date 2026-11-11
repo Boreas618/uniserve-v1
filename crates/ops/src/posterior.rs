@@ -24,10 +24,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Operand};
+use crate::tensor::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -124,7 +127,7 @@ impl Op for Posterior {
             if view.dtype != DType::F32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected {} {name}, found {}", DType::F32, view.dtype),
+                    format!("expected {} {name}, found {}", abi::name(DType::F32), abi::name(view.dtype)),
                 ));
             }
             if view.shape.dim(1) != channels {

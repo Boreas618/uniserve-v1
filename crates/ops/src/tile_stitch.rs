@@ -25,10 +25,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand, row_writable};
+use crate::tensor::{Shape, Operand, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -56,7 +59,7 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("channels", self.channels)
             .field("patch_frames", self.patch_frames)
             .field("patch_side", self.patch_side)
@@ -123,7 +126,7 @@ impl Op for TileStitch {
             if table.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("the {name} table is {}, not i32", table.dtype),
+                    format!("the {name} table is {}, not i32", abi::name(table.dtype)),
                 ));
             }
         }

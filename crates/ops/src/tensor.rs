@@ -1,15 +1,19 @@
-//! The numerical ABI an operator's launch code is written in: element types, shapes, strides and
-//! borrowed tensor views.
+//! The kernel argument an operator's launch code is written in: a device address, an element
+//! type, and inline extents and strides.
 //!
-//! These are the types a kernel program's parameters are made of. They
-//! live in `ops` because `ops` depends on `platform` alone and both `ops` and `nn` need them; `nn`
-//! re-exports them. Everything here is plain data: no storage is owned, no allocation happens and
-//! nothing synchronizes. A view borrows device memory its owner keeps alive until the stream work
-//! that reads it completes.
+//! [`Operand`] is what a kernel program's tensor parameters are made of. Its element type is the
+//! tensor library's `DType`, whose number and spelling for a package [`crate::abi`] states; its
+//! [`Shape`] and [`Strides`] are inline arrays of at most [`MAX_RANK`] axes, so that an operand
+//! is `Copy` and an operator's argument struct can be rebound without allocating. Everything
+//! here is plain data: no storage is owned, no allocation happens and nothing synchronizes. An
+//! operand borrows device memory its owner keeps alive until the stream work that reads it
+//! completes.
 
 use std::fmt;
 
-use crate::{Error, Result, platform};
+use uniserve_tensor::DType;
+
+use crate::{Error, Result, abi, platform};
 
 /// A device address: an opaque `u64` the driver uses (`CUdeviceptr`).
 ///
@@ -80,164 +84,6 @@ impl std::fmt::Display for DevicePtr {
 /// rebound without allocating. Six covers every operator here (a 5-d convolution, a 4-d paged
 /// cache); an operator that needs more states its own geometry instead.
 pub const MAX_RANK: usize = 6;
-
-/// An element type.
-///
-/// The numbering is part of the package ABI: a package's C header carries the same values, so a
-/// kernel program reads the element type the operator launched it with. Do not renumber.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(i64)]
-pub enum DType {
-    U8 = 0,
-    I32 = 1,
-    I64 = 2,
-    F16 = 3,
-    BF16 = 4,
-    F32 = 5,
-    /// FP8 E4M3 (`.e4m3fn`), the FP8 paged-KV element type.
-    F8E4M3 = 6,
-    /// NVFP4 E2M1, two values in one byte.
-    F4E2M1 = 7,
-    /// Signed 16-bit integer: the 16-bit PCM sample element.
-    I16 = 8,
-    /// Unsigned 32-bit integer: the index element of the tensor primitives, and their `argmin` and
-    /// `argmax` result.
-    U32 = 9,
-    /// IEEE 754 double precision.
-    F64 = 10,
-}
-
-impl DType {
-    /// The ABI numbering a package header must carry.
-    pub const fn as_i64(self) -> i64 {
-        self as i64
-    }
-
-    /// The element type with ABI number `value`.
-    pub const fn from_i64(value: i64) -> Option<Self> {
-        Some(match value {
-            0 => Self::U8,
-            1 => Self::I32,
-            2 => Self::I64,
-            3 => Self::F16,
-            4 => Self::BF16,
-            5 => Self::F32,
-            6 => Self::F8E4M3,
-            7 => Self::F4E2M1,
-            8 => Self::I16,
-            9 => Self::U32,
-            10 => Self::F64,
-            _ => return None,
-        })
-    }
-
-    /// The number of bits one element occupies in memory.
-    pub const fn bits(self) -> u32 {
-        match self {
-            Self::F4E2M1 => 4,
-            Self::U8 | Self::F8E4M3 => 8,
-            Self::F16 | Self::BF16 | Self::I16 => 16,
-            Self::I32 | Self::U32 | Self::F32 => 32,
-            Self::I64 | Self::F64 => 64,
-        }
-    }
-
-    /// The number of bytes one element occupies, when an element is a whole number of bytes.
-    ///
-    /// A sub-byte element type is addressed by its encoded storage layout, which the operators that
-    /// read it (`gemm` on an NVFP4 weight, for one) name; everything that hands out bytes fails for
-    /// it rather than rounding.
-    pub const fn bytes(self) -> Option<u64> {
-        match self.bits() {
-            4 => None,
-            bits => Some((bits / 8) as u64),
-        }
-    }
-
-    /// Whether the element type holds real numbers.
-    pub const fn is_float(self) -> bool {
-        matches!(
-            self,
-            Self::F16 | Self::BF16 | Self::F32 | Self::F64 | Self::F8E4M3 | Self::F4E2M1
-        )
-    }
-
-    /// The unit round-off `u` of the element type: half the gap between one and the next value
-    /// above it, which is the factor every rounding bound is written with (Higham, *Accuracy and
-    /// Stability of Numerical Algorithms*, 2nd ed., §2.2).
-    pub const fn unit_roundoff(self) -> f64 {
-        match self {
-            Self::F64 => 1.110_223_024_625_156_5e-16, // 2^-53
-            Self::F32 => 5.960_464_477_539_063e-8,    // 2^-24
-            Self::BF16 => 3.906_25e-3,                // 2^-8
-            Self::F16 => 4.882_812_5e-4,              // 2^-11
-            Self::F8E4M3 => 6.25e-2,                  // 2^-4
-            Self::F4E2M1 => 2.5e-1,                   // 2^-2
-            Self::U8 | Self::U32 | Self::I16 | Self::I32 | Self::I64 => 0.0,
-        }
-    }
-
-    /// The element type a reduction over this one accumulates in.
-    ///
-    /// Every operator here accumulates a floating reduction in FP32, so the bounds are written
-    /// with `u = 2^-24` whatever the input dtype is; FP64 alone accumulates in itself, because
-    /// FP32 would lose what its elements hold.
-    pub const fn accumulate(self) -> Self {
-        match self {
-            Self::F64 => Self::F64,
-            _ => Self::F32,
-        }
-    }
-}
-
-impl From<proto::tensor::DType> for DType {
-    /// The kernel element type of a tensor that crossed a process boundary: the same variant under
-    /// the same ABI number.
-    fn from(dtype: proto::tensor::DType) -> Self {
-        use proto::tensor::DType as Wire;
-        match dtype {
-            Wire::U8 => Self::U8,
-            Wire::I16 => Self::I16,
-            Wire::I32 => Self::I32,
-            Wire::I64 => Self::I64,
-            Wire::F16 => Self::F16,
-            Wire::BF16 => Self::BF16,
-            Wire::F32 => Self::F32,
-        }
-    }
-}
-
-impl From<proto::request::ModelDtype> for DType {
-    /// The kernel element type of a model's parameters and activations.
-    fn from(dtype: proto::request::ModelDtype) -> Self {
-        proto::tensor::DType::from(dtype).into()
-    }
-}
-
-impl fmt::Display for DType {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::U8 => "u8",
-            Self::U32 => "u32",
-            Self::I16 => "i16",
-            Self::I32 => "i32",
-            Self::I64 => "i64",
-            Self::F16 => "f16",
-            Self::BF16 => "bf16",
-            Self::F32 => "f32",
-            Self::F64 => "f64",
-            Self::F8E4M3 => "f8e4m3",
-            Self::F4E2M1 => "f4e2m1",
-        };
-        formatter.write_str(name)
-    }
-}
-
-impl fmt::Debug for DType {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, formatter)
-    }
-}
 
 /// The extents of each axis of a view.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -568,10 +414,10 @@ impl Operand {
 
     /// The bytes the view's elements occupy, when the element type has a whole-byte size.
     pub fn byte_len(&self) -> Result<u64> {
-        let bytes = self.dtype.bytes().ok_or_else(|| {
+        let bytes = abi::bytes(self.dtype).ok_or_else(|| {
             Error::Shape(format!(
-                "{:?} elements have no whole-byte size; its storage layout names its bytes",
-                self.dtype
+                "{} elements have no whole-byte size; its storage layout names its bytes",
+                abi::name(self.dtype)
             ))
         })?;
         Ok(self.numel() * bytes)
@@ -613,7 +459,7 @@ impl Operand {
 
     /// The address `elements` elements further, when the element type has a whole-byte size.
     pub fn offset_elements(&self, elements: u64) -> DevicePtr {
-        match self.dtype.bytes() {
+        match abi::bytes(self.dtype) {
             Some(bytes) => platform::offset(self.ptr, elements * bytes),
             None => self.ptr,
         }
@@ -631,7 +477,7 @@ impl Operand {
                 operator,
                 format!(
                     "expected {} elements, found {} in the view {:?}",
-                    dtype, self.dtype, self.shape
+                    abi::name(dtype), abi::name(self.dtype), self.shape
                 ),
             ));
         }

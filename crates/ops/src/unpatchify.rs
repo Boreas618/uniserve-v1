@@ -36,10 +36,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand, row_writable};
+use crate::tensor::{Shape, Operand, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -61,7 +64,7 @@ impl fmt::Display for Descriptor {
         // Every field is a shape or a flag: no raw float enters a key, and the affine form is its own
         // variant because the launch carries two more operands.
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("affine", self.affine)
             .field("block", self.block)
             .field("pdl", self.pdl)
@@ -165,7 +168,7 @@ impl Args {
                 Unpatchify::NAME,
                 format!(
                     "expected {} tokens, found {}",
-                    descriptor.dtype, self.tokens.dtype
+                    abi::name(descriptor.dtype), abi::name(self.tokens.dtype)
                 ),
             ));
         }
@@ -198,7 +201,7 @@ impl Args {
                 if view.dtype != descriptor.dtype {
                     return Err(Error::argument(
                         Unpatchify::NAME,
-                        format!("expected {} {name}, found {}", descriptor.dtype, view.dtype),
+                        format!("expected {} {name}, found {}", abi::name(descriptor.dtype), abi::name(view.dtype)),
                     ));
                 }
             }

@@ -46,9 +46,9 @@ impl StepIndexed {
                 format!(
                     "a {} weight table of {:?} and a {} bias table of {:?} for [steps, {per_step}] \
                      and [steps, {outputs}]",
-                    weight.dtype(),
+                    ops::abi::name(weight.dtype()),
                     weights.dims(),
-                    bias.dtype(),
+                    ops::abi::name(bias.dtype()),
                     biases.dims()
                 ),
             ));

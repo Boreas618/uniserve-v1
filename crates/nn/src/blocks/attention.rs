@@ -30,7 +30,8 @@
 //! The query halves are gathered into a packed tensor for the normalization and rotation, and the
 //! gate halves are read where the projection wrote them.
 
-use ops::{DType, Shape, Operand};
+use ops::{Shape, Operand};
+use uniserve_tensor::DType;
 
 use crate::capability::{KvLayer, KvView, TokenBatch};
 use crate::error::{Error, Result};

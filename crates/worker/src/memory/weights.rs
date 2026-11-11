@@ -354,12 +354,12 @@ impl<S: WeightStorage> WeightStore<S> {
         if dtype != key.dtype {
             return Err(nn::Error::Unsupported(format!(
                 "a weight keyed as {} cannot be published as {dtype:?}",
-                key.dtype
+                ops::abi::name(key.dtype)
             )));
         }
         let expected = shape
             .numel()
-            .checked_mul(dtype.bytes().unwrap_or_default())
+            .checked_mul(ops::abi::bytes(dtype).unwrap_or_default())
             .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or_else(|| {
                 nn::Error::Unsupported(format!(

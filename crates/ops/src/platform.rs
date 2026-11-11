@@ -36,7 +36,7 @@ pub use platform::{
 
 pub use crate::tensor::DevicePtr;
 
-use crate::tensor::DType;
+use uniserve_tensor::DType;
 
 /// The device address a launch parameter carries.
 pub(crate) fn address(pointer: DevicePtr) -> u64 {
@@ -162,7 +162,8 @@ pub fn collective_type(dtype: DType) -> Option<CollectiveType> {
         // NCCL has no 16-bit integer reduction: a silent fallback would be a wrong answer, so a
         // PCM sample travels as bytes and never as a collective's element.
         DType::I16 => return None,
-        DType::F4E2M1 => return None,
+        // Neither a packed element nor one the tensor library adds is a collective's element.
+        _ => return None,
     })
 }
 

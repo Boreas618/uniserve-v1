@@ -32,6 +32,8 @@ tracing.workspace = true
 [dev-dependencies]
 # `check_packages` states the element types of the kernel library's descriptors.
 ops.workspace = true
+# The element type of a kernel operand (`DType`).
+uniserve-tensor.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

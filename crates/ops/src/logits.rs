@@ -9,11 +9,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Shape, Operand};
+use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// One compilation of `logits_gather`.
@@ -32,7 +35,7 @@ pub struct GatherDescriptor {
 impl fmt::Display for GatherDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("block", self.block)
             .field("pdl", self.pdl)
@@ -68,7 +71,7 @@ impl Op for LogitsGather {
         if args.rows.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 row indices, found {}", args.rows.dtype),
+                format!("expected i32 row indices, found {}", abi::name(args.rows.dtype)),
             ));
         }
         let count = args.rows.shape.dim(0);
@@ -141,8 +144,8 @@ pub struct UnpadDescriptor {
 impl fmt::Display for UnpadDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
-            .field("output", self.output)
+            .field("dtype", abi::name(self.dtype))
+            .field("output", abi::name(self.output))
             .field("vocabulary", self.vocabulary)
             .field("padded", self.padded)
             .field("block", self.block)
@@ -201,7 +204,7 @@ impl Op for VocabUnpad {
                 Self::NAME,
                 format!(
                     "expected {} logits gathered into {}, found {} and {}",
-                    descriptor.dtype, descriptor.output, args.gathered.dtype, args.out.dtype
+                    abi::name(descriptor.dtype), abi::name(descriptor.output), abi::name(args.gathered.dtype), abi::name(args.out.dtype)
                 ),
             ));
         }
@@ -244,7 +247,7 @@ impl Op for VocabUnpad {
         // A row's leading `vocabulary` columns are copied out of a wider row; no arithmetic, so the
         // only rounding is the store's. Widening is exact; a narrowing pair rounds once into the
         // output type and the bound is that one rounding.
-        if descriptor.output.unit_roundoff() <= descriptor.dtype.unit_roundoff() {
+        if tolerance::unit_roundoff(descriptor.output) <= tolerance::unit_roundoff(descriptor.dtype) {
             Tolerance::exact()
         } else {
             Tolerance::rounding(1, descriptor.dtype, descriptor.output)

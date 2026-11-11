@@ -11,6 +11,8 @@ publish = false
 # `nn → ops → platform`.
 [dependencies]
 ops = { path = "../ops" }
+# The element type of a kernel operand (`DType`).
+uniserve-tensor.workspace = true
 # A family states what request processing serves of it beside what execution loads.
 processing.workspace = true
 # The phase vocabulary of a program's selection key (`proto::program::PhaseKind`).

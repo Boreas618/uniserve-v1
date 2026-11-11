@@ -25,7 +25,8 @@ use std::time::Instant;
 use ipc::{PhaseId, TimingCounters};
 use nn::family::TextModel;
 use nn::{CausalLm, Forward, KvView, TokenBatch};
-use ops::{DType, Generation, Operand};
+use ops::{Generation, Operand};
+use uniserve_tensor::DType;
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
@@ -1557,7 +1558,7 @@ impl<M: TextModel> CausalLmRunner<M> {
         if blocks.is_empty() {
             return Ok(());
         }
-        let row_bytes = hidden.shape.last() * self.model.dtype().bytes().unwrap_or(0);
+        let row_bytes = hidden.shape.last() * ops::abi::bytes(self.model.dtype()).unwrap_or(0);
         for block in blocks.iter() {
             let destination = hidden.ptr.address() + u64::from(block.token) * row_bytes;
             let bytes = block.features.rows() * row_bytes;

@@ -50,7 +50,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use ops::DType;
+use uniserve_tensor::DType;
 
 use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};
 use crate::error::{Error, Result};
@@ -317,7 +317,7 @@ impl Adapter {
                 return Err(refuse(format!(
                     "the adapter edits `{target}`, which the checkpoint stores as {}; only a \
                      floating-point parameter can take a delta",
-                    base.dtype
+                    ops::abi::name(base.dtype)
                 )));
             }
             let low_rank = match (&edit.up, &edit.down) {
@@ -352,7 +352,7 @@ impl Adapter {
                 if !matches!(part.dtype, DType::BF16 | DType::F16 | DType::F32) {
                     return Err(refuse(format!(
                         "`{}` is {}, not a floating-point delta",
-                        part.tensor, part.dtype
+                        part.tensor, ops::abi::name(part.dtype)
                     )));
                 }
             }
@@ -517,7 +517,7 @@ pub(crate) fn fused(
     ranges: &[(usize, usize)],
 ) -> Result<Vec<u8>> {
     let dtype = base.dtype;
-    let element = dtype.bytes().unwrap_or(4) as usize;
+    let element = ops::abi::bytes(dtype).unwrap_or(4) as usize;
     let columns = if base.shape.rank() == 0 {
         1
     } else {
@@ -525,14 +525,14 @@ pub(crate) fn fused(
     };
     let decode = |location: &TensorLocation, from: usize, to: usize| -> Result<Vec<f32>> {
         let bytes = checkpoint.bytes(location)?;
-        let width = location.dtype.bytes().unwrap_or(4) as usize;
+        let width = ops::abi::bytes(location.dtype).unwrap_or(4) as usize;
         let range = bytes.get(from * width..to * width).ok_or_else(|| {
             Error::weight(
                 &location.tensor,
                 format!("elements {from}..{to} reach past the tensor"),
             )
         })?;
-        Ok(location.dtype.decode(range)?)
+        Ok(ops::values::decode(location.dtype, range)?)
     };
 
     // The rows each range covers, cut at row boundaries: a range of a row-major tensor is a run
@@ -543,7 +543,7 @@ pub(crate) fn fused(
         if from % element != 0 || to % element != 0 || to < from {
             return Err(Error::weight(
                 &base.tensor,
-                format!("bytes {from}..{to} are not whole {dtype} elements"),
+                format!("bytes {from}..{to} are not whole {dtype} elements", dtype = ops::abi::name(dtype)),
             ));
         }
         let mut at = (from / element) as u64;
@@ -642,5 +642,5 @@ pub(crate) fn fused(
         }
         Ok(())
     })?;
-    Ok(dtype.encode(&values)?)
+    Ok(ops::values::encode(dtype, &values)?)
 }

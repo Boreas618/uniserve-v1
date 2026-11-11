@@ -23,10 +23,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -51,7 +54,7 @@ impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The output is always i16 and the sample count is a launch value, so neither is in the key.
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("block", self.block)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -93,7 +96,7 @@ impl Op for PcmInterleave {
                 Self::NAME,
                 format!(
                     "expected f32 channels, the decoder's output, found {}",
-                    descriptor.dtype
+                    abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -102,7 +105,7 @@ impl Op for PcmInterleave {
             if view.dtype != DType::F32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected f32 {name}, found {}", view.dtype),
+                    format!("expected f32 {name}, found {}", abi::name(view.dtype)),
                 ));
             }
         }
@@ -111,7 +114,7 @@ impl Op for PcmInterleave {
         if args.out.dtype != DType::I16 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i16 output, found {}", args.out.dtype),
+                format!("expected i16 output, found {}", abi::name(args.out.dtype)),
             ));
         }
         Ok(())

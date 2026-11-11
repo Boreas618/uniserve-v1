@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use nn::capability::{PatchFormat, Vision};
-use ops::{DType, Operand};
+use ops::Operand;
+use uniserve_tensor::DType;
 use platform::DeviceId;
 
 use crate::host::{HostAction, Lane, Outcome};
@@ -65,7 +66,7 @@ impl HostAction for ImageRead {
             &mut rgb,
         )
         .map_err(|error| Error::Invalid(format!("decoding an input image: {error}")))?;
-        let element = self.format.dtype.bytes().unwrap_or(0) as usize;
+        let element = ops::abi::bytes(self.format.dtype).unwrap_or(0) as usize;
         let patches: usize = self.grid.iter().map(|extent| *extent as usize).product();
         let mut out = vec![0_u8; patches * self.format.width() as usize * element];
         super::media::pack_block(&self.format, &rgb, 1, (height, width), self.grid, &mut out)?;
@@ -251,7 +252,7 @@ impl Images {
 
     /// The bytes of one feature row.
     pub(crate) fn row_bytes(&self) -> u64 {
-        u64::from(self.hidden) * self.dtype.bytes().unwrap_or(0)
+        u64::from(self.hidden) * ops::abi::bytes(self.dtype).unwrap_or(0)
     }
 
     /// The rows of the largest image: one slot's rows.

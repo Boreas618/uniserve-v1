@@ -37,7 +37,8 @@ use ops::{Generation, Op, Route, Stream};
 use crate::error::{Error, Result};
 use crate::group::{self, Group, Transfer};
 use crate::layers::DispatchViews;
-use crate::tensor::{DType, DevicePtr, Shape, Operand};
+use crate::tensor::{DevicePtr, Shape, Operand};
+use uniserve_tensor::DType;
 
 /// The alignment every arena reservation starts at.
 ///
@@ -173,11 +174,10 @@ impl Arena {
 
     /// Reserve a contiguous row-major tensor of `shape` elements of `dtype`.
     pub fn tensor(&self, dtype: DType, shape: Shape) -> Result<Operand> {
-        let bytes = dtype
-            .bytes()
+        let bytes = ops::abi::bytes(dtype)
             .ok_or_else(|| {
                 Error::Unsupported(format!(
-                    "{dtype} elements are sub-byte; their storage layout names their bytes"
+                    "{dtype} elements are sub-byte; their storage layout names their bytes", dtype = ops::abi::name(dtype)
                 ))
             })?
             .checked_mul(shape.numel())

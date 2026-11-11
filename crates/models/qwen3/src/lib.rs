@@ -83,9 +83,9 @@ pub(crate) fn write(f: &Forward, source: Operand, destination: Operand) -> Resul
     {
         return Err(Error::Config(format!(
             "a {} {:?} answer written into a {} {:?} buffer",
-            source.dtype,
+            ops::abi::name(source.dtype),
             source.shape.dims(),
-            destination.dtype,
+            ops::abi::name(destination.dtype),
             destination.shape.dims()
         )));
     }

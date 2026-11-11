@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use ops::DType;
+use uniserve_tensor::DType;
 use platform::DeviceId;
 use program_server::Target;
 use worker::blocking::{BlockingKind, LaneLimits, Limits};
@@ -821,7 +821,7 @@ impl ModelRunner {
     /// The element type the deployment computes in, which the daemon resolved against the
     /// checkpoint before it wrote this build config.
     fn dtype(&self) -> DType {
-        self.engine_config().model.dtype.into()
+        ops::abi::from_wire(self.engine_config().model.dtype.into())
     }
 
     /// Batches this rank's schedulers keep in flight, which the capacity plan relays through (the

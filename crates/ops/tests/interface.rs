@@ -17,8 +17,9 @@ use std::fmt;
 
 use ops::descriptor::Key;
 use ops::kernel::{CubinMetadata, LaunchGrid};
-use ops::tensor::DType;
-use ops::{Error, Float, Tolerance};
+use ops::tolerance::{accumulate, unit_roundoff};
+use ops::{Error, Float, Tolerance, abi};
+use uniserve_tensor::DType;
 
 /// A descriptor of the test's own, shaped like the real ones: fields in a fixed order.
 struct TestDescriptor {
@@ -30,7 +31,7 @@ struct TestDescriptor {
 impl fmt::Display for TestDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
             .field("scale", self.scale)
             .finish(formatter)
@@ -151,20 +152,20 @@ fn tolerance_follows_the_reduction_length_and_dtypes() {
 
     // A scale reduction: 2γₙ plus one output rounding.
     let norm = Tolerance::rounding(2048, DType::F32, DType::BF16);
-    let expected = 2.0 * ops::tolerance::gamma(2048, DType::F32) + DType::BF16.unit_roundoff();
+    let expected = 2.0 * ops::tolerance::gamma(2048, DType::F32) + unit_roundoff(DType::BF16);
     assert!((f64::from(norm.rtol) - expected).abs() < 1e-9);
     assert_eq!(norm.atol, 0.0);
 
     // A sum of mixed-sign products is bounded by the same γₙ scaled by √n.
     let dot = Tolerance::dot(2048, DType::F32, DType::BF16);
     let expected_dot = 2.0 * ops::tolerance::gamma(2048, DType::F32) * (2048.0_f64).sqrt()
-        + DType::BF16.unit_roundoff();
+        + unit_roundoff(DType::BF16);
     assert!((f64::from(dot.rtol) - expected_dot).abs() < 1e-9);
     assert!(dot.rtol > norm.rtol);
 
     // An exact-length reduction is bounded by the output dtype alone.
     let single = Tolerance::rounding(0, DType::F32, DType::BF16);
-    assert!((f64::from(single.rtol) - DType::BF16.unit_roundoff()).abs() < 1e-9);
+    assert!((f64::from(single.rtol) - unit_roundoff(DType::BF16)).abs() < 1e-9);
 }
 
 #[test]
@@ -234,39 +235,43 @@ fn native_call_structures_have_the_layouts_their_headers_mirror() {
 #[test]
 fn element_types_keep_their_abi_numbering_and_round_off() {
     // A package's header carries these numbers, so they cannot move.
-    assert_eq!(DType::U8.as_i64(), 0);
-    assert_eq!(DType::I32.as_i64(), 1);
-    assert_eq!(DType::I64.as_i64(), 2);
-    assert_eq!(DType::F16.as_i64(), 3);
-    assert_eq!(DType::BF16.as_i64(), 4);
-    assert_eq!(DType::F32.as_i64(), 5);
-    assert_eq!(DType::F8E4M3.as_i64(), 6);
-    assert_eq!(DType::F4E2M1.as_i64(), 7);
+    assert_eq!(abi::code(DType::U8).unwrap(), 0);
+    assert_eq!(abi::code(DType::I32).unwrap(), 1);
+    assert_eq!(abi::code(DType::I64).unwrap(), 2);
+    assert_eq!(abi::code(DType::F16).unwrap(), 3);
+    assert_eq!(abi::code(DType::BF16).unwrap(), 4);
+    assert_eq!(abi::code(DType::F32).unwrap(), 5);
+    assert_eq!(abi::code(DType::F8E4M3).unwrap(), 6);
+    assert_eq!(abi::code(DType::F4).unwrap(), 7);
     // Appended for the audio decoders' PCM output; the seven numbers before it never move.
-    assert_eq!(DType::I16.as_i64(), 8);
+    assert_eq!(abi::code(DType::I16).unwrap(), 8);
     // Appended for the tensor primitives' indices and for double precision.
-    assert_eq!(DType::U32.as_i64(), 9);
-    assert_eq!(DType::F64.as_i64(), 10);
+    assert_eq!(abi::code(DType::U32).unwrap(), 9);
+    assert_eq!(abi::code(DType::F64).unwrap(), 10);
     for number in 0..11 {
-        assert_eq!(DType::from_i64(number).map(DType::as_i64), Some(number));
+        let dtype = abi::from_code(number).expect("the ABI states eleven element types");
+        assert_eq!(abi::code(dtype).unwrap(), number);
     }
-    assert_eq!(DType::from_i64(11), None);
-    assert_eq!(DType::I16.bytes(), Some(2));
+    assert_eq!(abi::from_code(11), None);
+    // An element type the tensor library has and no package reads has no number.
+    assert!(abi::code(DType::F8E8M0).is_err());
+    assert_eq!(abi::bytes(DType::I16), Some(2));
     assert_eq!(
-        DType::I16.unit_roundoff(),
+        unit_roundoff(DType::I16),
         0.0,
         "an integer has no rounding"
     );
     assert!(!DType::I16.is_float());
 
-    assert_eq!(DType::BF16.bytes(), Some(2));
-    assert_eq!(DType::F4E2M1.bytes(), None, "two values share one byte");
-    assert_eq!(DType::F32.unit_roundoff(), 2.0_f64.powi(-24));
-    assert_eq!(DType::BF16.unit_roundoff(), 2.0_f64.powi(-8));
-    assert_eq!(DType::F16.bytes(), Some(2));
-    assert_eq!(DType::F8E4M3.bytes(), Some(1));
-    assert_eq!(DType::F32.accumulate(), DType::F32);
-    assert_eq!(DType::BF16.to_string(), "bf16");
+    assert_eq!(abi::bytes(DType::BF16), Some(2));
+    assert_eq!(abi::bytes(DType::F4), None, "two values share one byte");
+    assert_eq!(unit_roundoff(DType::F32), 2.0_f64.powi(-24));
+    assert_eq!(unit_roundoff(DType::BF16), 2.0_f64.powi(-8));
+    assert_eq!(abi::bytes(DType::F16), Some(2));
+    assert_eq!(abi::bytes(DType::F8E4M3), Some(1));
+    assert_eq!(accumulate(DType::F32), DType::F32);
+    assert_eq!(abi::name(DType::BF16), "bf16");
+    assert_eq!(abi::name(DType::F4), "f4e2m1");
     assert!(!DType::I32.is_float());
     assert!(DType::F8E4M3.is_float());
 }
@@ -319,7 +324,8 @@ fn a_generation_reports_a_missing_kernel_with_what_was_asked_for() {
 #[test]
 fn modulation_keys_separate_every_compiled_variant() {
     use ops::modulation::{GatedResidualDescriptor, ModulatedRmsNormDescriptor};
-    use ops::{DType, Float};
+    use ops::Float;
+    use uniserve_tensor::DType;
 
     let norm = ModulatedRmsNormDescriptor {
         dtype: DType::BF16,
@@ -453,8 +459,8 @@ fn an_operator_is_found_by_the_name_its_programs_are_filed_under() {
 #[test]
 fn a_sectioned_rotation_names_its_axes_in_its_key() {
     let plain = ops::rope::FactorsDescriptor {
-        dtype: ops::DType::F32,
-        positions: ops::DType::I32,
+        dtype: uniserve_tensor::DType::F32,
+        positions: uniserve_tensor::DType::I32,
         columns: 64,
         block: 1024,
         scale: ops::Float::from(1_000_000.0_f32),

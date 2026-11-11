@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use ops::DType;
+use uniserve_tensor::DType;
 use platform::DeviceId;
 use worker::capacity::{graph_scratch_bytes, graph_storage_bytes, quota};
 use worker::device::GraphStorage;
@@ -397,7 +397,7 @@ impl ModelRunner {
 /// the largest image's encoding; `None` for a model without a vision tower.
 pub(super) fn image_features(model: &dyn nn::family::TextModel) -> Option<(u64, u32)> {
     let vision = model.vision()?;
-    let row_bytes = u64::from(model.hidden()) * model.dtype().bytes()?;
+    let row_bytes = u64::from(model.hidden()) * ops::abi::bytes(model.dtype())?;
     Some((row_bytes, vision.max_image_rows()))
 }
 

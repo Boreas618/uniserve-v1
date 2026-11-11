@@ -16,7 +16,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ops::{DType, Shape, Operand};
+use ops::{Shape, Operand};
+use uniserve_tensor::DType;
 
 use crate::plan::Bucket;
 use crate::{Error, Result};

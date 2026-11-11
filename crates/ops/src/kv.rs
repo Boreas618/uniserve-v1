@@ -24,10 +24,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -59,8 +62,8 @@ pub struct Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
-            .field("kv", self.kv)
+            .field("dtype", abi::name(self.dtype))
+            .field("kv", abi::name(self.kv))
             .field("page", self.page)
             .field("heads", self.heads)
             .field("head_dim", self.head_dim)
@@ -113,7 +116,7 @@ impl Op for KvWrite {
                 Self::NAME,
                 format!(
                     "this writes a {} cache from {} values; an FP8 cache is filled by kv_write_scaled",
-                    descriptor.kv, descriptor.dtype
+                    abi::name(descriptor.kv), abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -126,7 +129,7 @@ impl Op for KvWrite {
                 Self::NAME,
                 format!(
                     "expected {} keys and values, found {} and {}",
-                    descriptor.dtype, args.key.dtype, args.value.dtype
+                    abi::name(descriptor.dtype), abi::name(args.key.dtype), abi::name(args.value.dtype)
                 ),
             ));
         }
@@ -135,7 +138,7 @@ impl Op for KvWrite {
         if args.slots.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 slots, found {}", args.slots.dtype),
+                format!("expected i32 slots, found {}", abi::name(args.slots.dtype)),
             ));
         }
 
@@ -145,7 +148,7 @@ impl Op for KvWrite {
             if cache.dtype != descriptor.kv {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected a {} cache, found {}", descriptor.kv, cache.dtype),
+                    format!("expected a {} cache, found {}", abi::name(descriptor.kv), abi::name(cache.dtype)),
                 ));
             }
             if cache.shape.dim(1) != page
@@ -172,7 +175,7 @@ impl Op for KvWrite {
                     Self::NAME,
                     format!(
                         "expected u8 initialization flags, one byte per page, found {}",
-                        initialized.dtype
+                        abi::name(initialized.dtype)
                     ),
                 ));
             }
@@ -282,8 +285,8 @@ pub struct ScaledWriteDescriptor {
 impl fmt::Display for ScaledWriteDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("dtype", self.dtype)
-            .field("scale", self.scale)
+            .field("dtype", abi::name(self.dtype))
+            .field("scale", abi::name(self.scale))
             .field("page", self.page)
             .field("heads", self.heads)
             .field("head_dim", self.head_dim)
@@ -329,7 +332,7 @@ impl Op for KvWriteScaled {
                 Self::NAME,
                 format!(
                     "expected a bf16 or f32 source, the descriptor says {}",
-                    descriptor.dtype
+                    abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -338,7 +341,7 @@ impl Op for KvWriteScaled {
                 Self::NAME,
                 format!(
                     "expected {} source, found {}",
-                    descriptor.dtype, args.source.dtype
+                    abi::name(descriptor.dtype), abi::name(args.source.dtype)
                 ),
             ));
         }
@@ -353,7 +356,7 @@ impl Op for KvWriteScaled {
         if args.slots.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 slots, found {}", args.slots.dtype),
+                format!("expected i32 slots, found {}", abi::name(args.slots.dtype)),
             ));
         }
 
@@ -362,7 +365,7 @@ impl Op for KvWriteScaled {
         if args.cache.dtype != DType::F8E4M3 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected an e4m3 cache, found {}", args.cache.dtype),
+                format!("expected an e4m3 cache, found {}", abi::name(args.cache.dtype)),
             ));
         }
         if args.cache.shape.dim(1) != page
@@ -388,7 +391,7 @@ impl Op for KvWriteScaled {
                 Self::NAME,
                 format!(
                     "expected {} page scales, found {}",
-                    descriptor.scale, args.scales.dtype
+                    abi::name(descriptor.scale), abi::name(args.scales.dtype)
                 ),
             ));
         }
@@ -407,7 +410,7 @@ impl Op for KvWriteScaled {
                 Self::NAME,
                 format!(
                     "expected u8 initialization flags, one byte per page, found {}",
-                    args.initialized.dtype
+                    abi::name(args.initialized.dtype)
                 ),
             ));
         }

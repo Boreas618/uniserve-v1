@@ -110,4 +110,4 @@ pub mod launch {
 }
 
 /// The accumulation element type of every floating-point operator here.
-pub(crate) const ACCUMULATE: ops::DType = ops::DType::F32;
+pub(crate) const ACCUMULATE: uniserve_tensor::DType = uniserve_tensor::DType::F32;

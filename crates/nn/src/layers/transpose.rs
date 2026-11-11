@@ -9,7 +9,8 @@
 //! descriptor holds the element type and the tile side, and nothing of the request's geometry.
 
 use ops::transpose::{self, Transpose as TransposeOp};
-use ops::{DType, Operand};
+use ops::Operand;
+use uniserve_tensor::DType;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -27,10 +28,10 @@ pub struct Transpose {
 impl Transpose {
     /// The transpose of a `dtype` matrix.
     pub fn new(dtype: DType) -> Result<Self> {
-        if dtype.bytes().is_none() {
+        if ops::abi::bytes(dtype).is_none() {
             return Err(Error::shape(
                 "Transpose",
-                format!("{dtype} has no whole-byte element size to move"),
+                format!("{dtype} has no whole-byte element size to move", dtype = ops::abi::name(dtype)),
             ));
         }
         Ok(Self { dtype })
@@ -75,7 +76,7 @@ impl Transpose {
                 "Transpose",
                 format!(
                     "the source is {}, the layer was built for {}",
-                    source.dtype, self.dtype
+                    ops::abi::name(source.dtype), ops::abi::name(self.dtype)
                 ),
             ));
         }

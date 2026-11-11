@@ -40,10 +40,13 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Operand};
+use crate::tensor::{Shape, Operand};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -107,7 +110,7 @@ impl fmt::Display for Descriptor {
         // Shape only: a channel count, a stride or a tap count, so the key names no host float and no
         // length that varies with a request.
         Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("channels", self.channels)
             .field("kernel", self.kernel)
             .field("ratio", self.ratio)
@@ -209,7 +212,7 @@ impl Op for Activation1d {
             if view.dtype != descriptor.dtype {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected {} {name}, found {}", descriptor.dtype, view.dtype),
+                    format!("expected {} {name}, found {}", abi::name(descriptor.dtype), abi::name(view.dtype)),
                 ));
             }
         }
@@ -221,7 +224,7 @@ impl Op for Activation1d {
             if view.dtype != DType::F32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected f32 {name}, found {}", view.dtype),
+                    format!("expected f32 {name}, found {}", abi::name(view.dtype)),
                 ));
             }
         }

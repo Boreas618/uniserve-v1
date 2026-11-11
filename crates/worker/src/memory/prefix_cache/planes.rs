@@ -1151,7 +1151,7 @@ impl CachePlanes {
             .map(|storage| {
                 ops::Operand::new(
                     ops::DevicePtr::new(storage.address()),
-                    ops::DType::U8,
+                    uniserve_tensor::DType::U8,
                     ops::Shape::new(&[cells, self.plan.plane_bytes]),
                 )
             })
@@ -1454,7 +1454,7 @@ impl CachePlanes {
     /// A plane whose storage element no kernel operand describes is an error
     /// naming that plane, never a widening: a kernel must not read storage as
     /// a type it does not hold.
-    pub fn dtype(&self, group: usize) -> Result<ops::DType> {
+    pub fn dtype(&self, group: usize) -> Result<uniserve_tensor::DType> {
         let plan = self
             .plan
             .groups

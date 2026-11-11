@@ -44,11 +44,14 @@
 
 use std::fmt;
 
+use uniserve_tensor::DType;
+
+use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::{self, Stream};
-use crate::tensor::{DType, Shape, Operand};
-use crate::tolerance::Tolerance;
+use crate::tensor::{Shape, Operand};
+use crate::tolerance::{self, Tolerance};
 use crate::{DevicePtr, Error, Op, Result, Twins};
 
 /// The elements one program draws.
@@ -107,7 +110,7 @@ pub struct NoiseDescriptor {
 impl fmt::Display for NoiseDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = Key::new()
-            .field("dtype", self.dtype)
+            .field("dtype", abi::name(self.dtype))
             .field("block", self.block)
             .field("kind", self.kind);
         // The per-row form is the default, so its key is the one it always had: `source` appears
@@ -159,7 +162,7 @@ impl Op for PhiloxNoise {
                 Self::NAME,
                 format!(
                     "{} is not a floating noise type: the draw is computed in FP32",
-                    descriptor.dtype
+                    abi::name(descriptor.dtype)
                 ),
             ));
         }
@@ -175,7 +178,7 @@ impl Op for PhiloxNoise {
                 Self::NAME,
                 format!(
                     "expected {} noise, found {}",
-                    descriptor.dtype, args.out.dtype
+                    abi::name(descriptor.dtype), abi::name(args.out.dtype)
                 ),
             ));
         }
@@ -224,7 +227,7 @@ impl Op for PhiloxNoise {
             // Philox is integer arithmetic, so the uniforms agree bit for bit; the normal then costs
             // the logarithm, the square root, the angle and its cosine or sine before the store
             // rounds into the output type.
-            NoiseKind::Normal => Tolerance::new(0.0, 4.0 * descriptor.dtype.unit_roundoff() as f32),
+            NoiseKind::Normal => Tolerance::new(0.0, 4.0 * tolerance::unit_roundoff(descriptor.dtype) as f32),
             // A 24-bit value scaled by 2^-24 is exact in FP32 and rounds once into a narrower output.
             NoiseKind::Uniform => Tolerance::exact(),
         }

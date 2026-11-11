@@ -36,7 +36,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::Mmap;
-use ops::{DType, Shape};
+use ops::Shape;
+use uniserve_tensor::DType;
 use safetensors::Dtype as FormatDtype;
 use safetensors::SafeTensors;
 
@@ -516,7 +517,7 @@ impl Checkpoint {
                     several.len(),
                     several
                         .iter()
-                        .map(|(dtype, example)| format!("{dtype} (such as `{example}`)"))
+                        .map(|(dtype, example)| format!("{dtype} (such as `{example}`)", dtype = ops::abi::name(*dtype)))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -987,7 +988,7 @@ fn element_type(path: &Path, tensor: &str, dtype: FormatDtype) -> Result<DType> 
         FormatDtype::BF16 => Ok(DType::BF16),
         FormatDtype::F32 => Ok(DType::F32),
         FormatDtype::F8_E4M3 => Ok(DType::F8E4M3),
-        FormatDtype::F4 => Ok(DType::F4E2M1),
+        FormatDtype::F4 => Ok(DType::F4),
         FormatDtype::BOOL => refuses("BOOL"),
         FormatDtype::I8 => refuses("I8"),
         FormatDtype::U16 => refuses("U16"),

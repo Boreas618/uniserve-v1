@@ -35,7 +35,8 @@ use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput, ImageShape,
     PatchFormat, TokenBatch, WarmPrompt,
 };
-use ops::{DType, Operand};
+use ops::Operand;
+use uniserve_tensor::DType;
 use platform::DeviceId;
 use proto::program::PhaseKind;
 
@@ -307,8 +308,8 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         let Some(pool) = self.host_pool.as_ref() else {
             return Ok(());
         };
-        let element = self.shape.dtype.bytes().ok_or_else(|| {
-            Error::Invalid(format!("{} has no whole-byte size", self.shape.dtype))
+        let element = ops::abi::bytes(self.shape.dtype).ok_or_else(|| {
+            Error::Invalid(format!("{} has no whole-byte size", ops::abi::name(self.shape.dtype)))
         })?;
         let width = u64::from(self.shape.hidden.max(1));
         let row_bytes = width * element;

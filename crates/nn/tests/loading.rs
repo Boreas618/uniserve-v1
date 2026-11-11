@@ -32,7 +32,8 @@ fn dtype_name(dtype: DType) -> &'static str {
         DType::F32 => "F32",
         DType::F64 => "F64",
         DType::F8E4M3 => "F8_E4M3",
-        DType::F4E2M1 => "F4_E2M1",
+        DType::F4 => "F4_E2M1",
+        other => panic!("the fixtures write no {other:?} tensor"),
     }
 }
 
@@ -52,12 +53,13 @@ fn shard_typed(
     let mut header = String::from("{");
     let mut payload: Vec<u8> = Vec::new();
     for (tensor, dtype, shape, bytes) in tensors {
-        let expected: u64 = shape.iter().product::<u64>() * dtype.bytes().unwrap();
+        let expected: u64 = shape.iter().product::<u64>() * ops::abi::bytes(*dtype).unwrap();
         assert_eq!(
             expected,
             bytes.len() as u64,
             "the fixture's `{tensor}` says {shape:?} of {dtype}, which is {expected} bytes, not {}",
-            bytes.len()
+            bytes.len(),
+            dtype = ops::abi::name(*dtype)
         );
         let start = payload.len() as u64;
         payload.extend_from_slice(bytes);
@@ -1099,7 +1101,7 @@ fn a_header_naming_fp8_and_fp4_opens_with_those_types() {
 
     let checkpoint = Checkpoint::open(root).unwrap();
     let packed = checkpoint.read("packed").unwrap();
-    assert_eq!(packed.dtype, DType::F4E2M1);
+    assert_eq!(packed.dtype, DType::F4);
     assert_eq!(packed.shape.dims(), &[2, 8]);
     assert_eq!(packed.bytes, payload[0..8]);
     let scales = checkpoint.read("scales").unwrap();
@@ -2037,7 +2039,7 @@ fn stage(root: &Path, name: &str, tensors: &[(&str, DType, u64)]) {
     let typed: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
         .iter()
         .map(|(tensor, dtype, elements)| {
-            let bytes = vec![0u8; (*elements * dtype.bytes().unwrap()) as usize];
+            let bytes = vec![0u8; (*elements * ops::abi::bytes(*dtype).unwrap()) as usize];
             (*tensor, *dtype, vec![*elements], bytes)
         })
         .collect();
