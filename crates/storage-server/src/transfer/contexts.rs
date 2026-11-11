@@ -1,5 +1,5 @@
 //! Each GPU's CUDA context, held only while the Transfer Server has work on
-//! the GPU, and booked in the GPU's storage ledgers only while held.
+//! the GPU, and reserved in the GPU's quotas only while held.
 //!
 //! A primary context takes device storage whether or not anything runs in it
 //! (hundreds of MiB on a GB200), and the Transfer Server runs on every host
@@ -7,18 +7,18 @@
 //! one, as an update's preparation does:
 //!
 //! - A [`Hold`] is a claim on one GPU, counted per GPU, and taking or
-//!   dropping one waits for no CUDA call and no ledger. Every piece of a
+//!   dropping one waits for no CUDA call and no quota. Every piece of a
 //!   task holds the GPUs it reads, writes or runs on; a GPU lane holds its
 //!   GPU while its thread runs; an exposure to another host holds the GPU of
 //!   each device allocation it exposes, until that host ends it.
 //!   An explicit transfer session also holds its operation's GPUs between
 //!   tasks, until its client closes the session or disconnects. Opening a
-//!   session alone neither starts nor books a CUDA context.
+//!   session alone neither starts nor reserves a CUDA context.
 //! - The first use of a GPU under its holds starts a [`Session`]
-//!   ([`Slot::retain`]): the context is booked in every storage ledger of the
+//!   ([`Slot::retain`]): the context is reserved in every quota of the
 //!   GPU, at the bytes the Transfer Server measured it at when it started,
-//!   and then the GPU's primary context is retained. A ledger that has no
-//!   room for it refuses the booking, and the use fails, so a ledger never
+//!   and then the GPU's primary context is retained. A quota that has no
+//!   room for it refuses the reservation, and the use fails, so a quota never
 //!   passes its quota for the context. Everything the Transfer Server
 //!   creates in the context lives in the session or under one of its holds:
 //!   device mappings of the server's allocations, host allocations
@@ -28,12 +28,12 @@
 //!   the registrations, then the mappings, then the context are released,
 //!   the process waits for the driver calls it deferred (`platform::reclaim`),
 //!   so that the driver destroyed the context and NVML lists the process on
-//!   the GPU no more, and then the booking ends. The next hold that uses the
+//!   the GPU no more, and then the reservation ends. The next hold that uses the
 //!   GPU starts a new session.
 //!
 //! The main thread, which holds the connection to the server, places the
-//! bookings ([`Bookings`]); a session starts on the thread that first uses
-//! the GPU, never on the main thread, which waits for no booking.
+//! reservations ([`Reservations`]); a session starts on the thread that first uses
+//! the GPU, never on the main thread, which waits for no reservation.
 //!
 //! An allocation the server takes back leaves every session once no piece
 //! copies it ([`Contexts::forget`]), so that a GPU busy for long does not
@@ -51,39 +51,39 @@ use super::storage::{HostMap, Mapped};
 /// A value made once, or why it could not be made.
 type Made<T> = OnceLock<Result<T, String>>;
 
-/// One GPU as its context is booked: its device, UUID and total storage, and
+/// One GPU as its context is reserved: its device, UUID and total storage, and
 /// the bytes its context takes, as the Transfer Server measured them when
 /// it started.
-pub(super) struct Booked {
+pub(super) struct Reserved {
     pub(super) device: DeviceId,
     pub(super) uuid: [u8; 16],
     pub(super) total: u64,
     pub(super) context: u64,
 }
 
-/// A change of a GPU's booking the main thread places in the server's
-/// ledgers ([`Request::Book`](::storage::protocol::Request::Book) of
+/// A change of a GPU's reservation the main thread places in the server's
+/// quotas ([`Request::Quota`](::storage::protocol::Request::Quota) of
 /// [`Item::TransferContext`](::storage::protocol::Item::TransferContext)).
-pub(super) struct Booking {
+pub(super) struct Reservation {
     pub(super) gpu: [u8; 16],
     pub(super) total: u64,
-    /// The context's bytes; 0 ends the booking.
+    /// The context's bytes; 0 ends the reservation.
     pub(super) bytes: u64,
     /// Where the server's answer goes: a refusal's message, or nothing when
-    /// it booked. `None` for an ending, which is never refused.
+    /// it reserved. `None` for an ending, which is never refused.
     pub(super) answer: Option<mpsc::SyncSender<Result<(), String>>>,
 }
 
-/// The way to the main thread for bookings: their queue and its wake pipe.
-pub(super) struct Bookings {
-    pub(super) sender: mpsc::Sender<Booking>,
+/// The way to the main thread for reservations: their queue and its wake pipe.
+pub(super) struct Reservations {
+    pub(super) sender: mpsc::Sender<Reservation>,
     pub(super) wake: Arc<OwnedFd>,
 }
 
-impl Bookings {
-    fn send(&self, booking: Booking) -> Result<(), String> {
+impl Reservations {
+    fn send(&self, reservation: Reservation) -> Result<(), String> {
         self.sender
-            .send(booking)
+            .send(reservation)
             .map_err(|_| "the Transfer Server stops".to_owned())?;
         let _ = rustix::io::write(&*self.wake, b"x");
         Ok(())
@@ -96,17 +96,17 @@ pub(super) struct Contexts {
 }
 
 impl Contexts {
-    /// A slot for each of `gpus`, with no context held, booking through
-    /// `bookings`.
-    pub(super) fn new(gpus: Vec<Booked>, bookings: Bookings) -> Self {
-        let bookings = Arc::new(bookings);
+    /// A slot for each of `gpus`, with no context held, reservation through
+    /// `reservations`.
+    pub(super) fn new(gpus: Vec<Reserved>, reservations: Reservations) -> Self {
+        let reservations = Arc::new(reservations);
         Self {
             slots: gpus
                 .into_iter()
                 .map(|gpu| {
                     Arc::new(Slot {
                         gpu,
-                        bookings: Arc::clone(&bookings),
+                        reservations: Arc::clone(&reservations),
                         state: Mutex::new(State {
                             holders: 0,
                             session: None,
@@ -147,8 +147,8 @@ impl Contexts {
 
 /// One GPU's holds and, while one of them used the GPU, its session.
 pub(super) struct Slot {
-    gpu: Booked,
-    bookings: Arc<Bookings>,
+    gpu: Reserved,
+    reservations: Arc<Reservations>,
     state: Mutex<State>,
     /// Signalled when a session started or closed.
     changed: Condvar,
@@ -158,7 +158,7 @@ struct State {
     holders: usize,
     session: Option<Arc<Session>>,
     /// Whether a session is starting or closing, outside the lock: its
-    /// booking waits for the server, and its release for the driver.
+    /// reservation waits for the server, and its release for the driver.
     changing: bool,
 }
 
@@ -201,12 +201,12 @@ impl Slot {
     }
 
     /// The moment the Transfer Server starts to hold the GPU's context: it
-    /// books the context's bytes in every storage ledger of the GPU, and once
-    /// the server booked them, retains the context. Its storage counts in the
-    /// ledgers from here until [`Slot::release`].
+    /// reserves the context's bytes in every quota of the GPU, and once
+    /// the server reserved them, retains the context. Its storage counts in the
+    /// quotas from here until [`Slot::release`].
     fn retain(&self) -> Result<Arc<Session>, String> {
         let (answer, answered) = mpsc::sync_channel(1);
-        self.bookings.send(Booking {
+        self.reservations.send(Reservation {
             gpu: self.gpu.uuid,
             total: self.gpu.total,
             bytes: self.gpu.context,
@@ -217,7 +217,7 @@ impl Slot {
             .map_err(|_| "the Transfer Server stops".to_owned())?
             .map_err(|refusal| {
                 format!(
-                    "the storage ledgers of {} have no room for the Transfer Server's CUDA \
+                    "the quotas of {} have no room for the Transfer Server's CUDA \
                      context: {refusal}",
                     self.name()
                 )
@@ -253,7 +253,7 @@ impl Slot {
     /// The moment the Transfer Server stops holding the GPU's context: the
     /// session's registrations, mappings and context are released, the
     /// driver calls they deferred have run, so the context's device storage
-    /// is free, and then its booking ends.
+    /// is free, and then its reservation ends.
     fn release(&self, session: &Session) {
         let started = Instant::now();
         session.close();
@@ -268,9 +268,9 @@ impl Slot {
         );
     }
 
-    /// End the context's booking; the main thread places it without waiting.
+    /// End the context's reservation; the main thread places it without waiting.
     fn unbook(&self) {
-        let _ = self.bookings.send(Booking {
+        let _ = self.reservations.send(Reservation {
             gpu: self.gpu.uuid,
             total: self.gpu.total,
             bytes: 0,
@@ -313,9 +313,9 @@ impl Drop for Claim {
 }
 
 impl Hold {
-    /// The GPU's session, started (its context booked and retained) when the
+    /// The GPU's session, started (its context reserved and retained) when the
     /// GPU has none. The caller uses it only while it holds this hold, and
-    /// never on the main thread, which places the booking.
+    /// never on the main thread, which places the reservation.
     pub(super) fn session(&self) -> Result<Arc<Session>, String> {
         self.0.slot.session()
     }

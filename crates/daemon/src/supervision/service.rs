@@ -30,9 +30,10 @@ use std::time::Duration;
 
 use prost::Message as _;
 use proto::process::{
-    self, Answered, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface,
-    LedgerReport, Node, NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled,
-    Upstream, Welcome, downstream, event, from_member, hello, reply, request, to_member, upstream,
+    self, Answered, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface, Node,
+    NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled, Upstream,
+    UsageReport, Welcome, downstream, event, from_member, hello, reply, request, to_member,
+    upstream,
 };
 use proto::{Connection, Handed, Listener};
 
@@ -194,8 +195,8 @@ impl Local {
                     Err(error) => reply.error = format!("{error:#}"),
                 }
             }
-            Some(request::Kind::Ledger(query)) => match self.claims.ledger(&query.deployment) {
-                Ok(ledgers) => reply.kind = Some(reply::Kind::Ledger(LedgerReport { ledgers })),
+            Some(request::Kind::Usage(query)) => match self.claims.usage(&query.deployment) {
+                Ok(usage) => reply.kind = Some(reply::Kind::Usage(UsageReport { usage })),
                 Err(error) => reply.error = format!("{error:#}"),
             },
             Some(request::Kind::ThrottleTransfers(throttle)) => {
@@ -881,7 +882,7 @@ pub(crate) fn run_leader(
         }
         // Clients of the process socket: the daemon's own, and the ones a main
         // process's workers open. They ask (a device inventory, a storage
-        // ledger, a launch) and are answered; they are never commanded, and a
+        // quota, a launch) and are answered; they are never commanded, and a
         // client that goes takes with it the launches it asked for and nothing
         // else: the deployment's owner stays, whose processes the epoch layer
         // named.
@@ -1176,7 +1177,7 @@ fn route(
         Some(request::Kind::Spawn(spawn)) => Some(spawn.host.as_str()),
         Some(request::Kind::Reserve(reserve)) => Some(reserve.host.as_str()),
         Some(request::Kind::Claim(claim)) => Some(claim.host.as_str()),
-        Some(request::Kind::Ledger(query)) => Some(query.host.as_str()),
+        Some(request::Kind::Usage(query)) => Some(query.host.as_str()),
         Some(request::Kind::KeepWeights(keep)) => Some(keep.host.as_str()),
         Some(request::Kind::ThrottleTransfers(throttle)) => Some(throttle.host.as_str()),
         Some(request::Kind::Devices(query)) => Some(query.host.as_str()),

@@ -50,10 +50,10 @@ impl ModelRunner {
         // beside it - the successor recaptures on the same stream, so its plans map beside the
         // serving generation's and its buckets stay addressable through a revert.
         //
-        // A reservation is virtual address space, not a booking (`capacity::graph_storage_bytes`'s
-        // own contract): the bytes are booked when a graph maps, so reserving the second pool costs
+        // A reservation is virtual address space, not a reservation (`capacity::graph_storage_bytes`'s
+        // own contract): the bytes are reserved when a graph maps, so reserving the second pool costs
         // a device nothing until an update needs it, and the refusal for a preparation with no room
-        // comes from the ledger's book at capture time - the update's failure, not the rank's.
+        // comes from the quota's reserve at capture time - the update's failure, not the rank's.
         let bytes = graph_storage_bytes(i64::try_from(total)?, true, false);
         if bytes == 0 {
             bail!("device {} reports no memory to capture graphs in", device.0);
@@ -68,7 +68,7 @@ impl ModelRunner {
                 device.0
             )
         })?;
-        // Every pool on this device is booked against `budget`, so `budget` is what the device has
+        // Every pool on this device is reserved against `budget`, so `budget` is what the device has
         // left to give: the epoch's weights are device-resident retained storage, mapped before
         // this call, and an allowance drawn from the total would let the graph, scratch and
         // resident pools map past the device by exactly the model's size. The deployment's
@@ -77,14 +77,14 @@ impl ModelRunner {
         // already holding the weights gets only what remains.
         let budget = quota(total, self.engine_config().mem_fraction_static).min(storage.free);
         // What a rank must be able to map to serve at all, which is every pool the allocator
-        // books at its first capture: the graph range in full and the scratch. The graph range is
+        // reserves at its first capture: the graph range in full and the scratch. The graph range is
         // mapped whole and not a pool at a time - `arena::Pools::new` divides the range among the
         // streams and `Pools::pool` allocates a stream's share in one buffer - so a rank that
         // holds room for one of the two pools and not both is refused here
         // rather than at its first capture, after the model load. The resident pool is a
         // reservation of addresses and not of storage: its bytes are the KV cache the capacity
         // plan fitted into the same free bytes below, and they map through the Storage Server's
-        // ledger, so charging them here as well would refuse a deployment whose cache fills the
+        // quota, so charging them here as well would refuse a deployment whose cache fills the
         // device's free bytes - which is what the fit is meant to do.
         let needs = bytes + scratch;
         if budget < needs {
@@ -129,7 +129,7 @@ impl ModelRunner {
     ///
     /// Called after the epoch's model is loaded and before any thread that borrows the owners: the
     /// plan measures a device the weights are already mapped on, so what it computes is what is
-    /// left, not what was there before the load. Every owner is booked against the device's one
+    /// left, not what was there before the load. Every owner is reserved against the device's one
     /// allowance as it maps, which is what makes the first `mapped <= budget` reading after warmup
     /// count every byte the plan charged. The device's pool set is opened here, first, because the
     /// owners carve their storage from it and the runner is built from them.
@@ -288,14 +288,14 @@ impl ModelRunner {
         let planned = worker::capacity::plan_rank(self.engine_config(), &request, report, group)?;
         // The keys and values the plan fitted are the process's resident pool: a unit is a cache
         // unit, and the plan charged them all against the same device allowance the pools are
-        // booked against. A plan that fitted no cache (a rank that serves none) states zero.
+        // reserved against. A plan that fitted no cache (a rank that serves none) states zero.
         let resident = match (&planned.cache, planned.info.prefix_cache.as_ref()) {
             // The recurrent state's banks are carved from the same pool, beside the block tables.
             (Some(cache), Some(info)) => {
                 u64::from(info.num_units) * cache.unit_bytes + request.carved_bytes
             }
             // A media rank keeps no cache, and its resident pool holds the tables its model
-            // declares per layout. The reservation is addresses and not storage: a table books the
+            // declares per layout. The reservation is addresses and not storage: a table reserves the
             // allowance as it maps, so the range is what the device has left to give.
             _ if matches!(loaded, Loaded::Video(_)) => {
                 platform::Device::new(device)

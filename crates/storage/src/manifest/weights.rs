@@ -206,7 +206,7 @@ pub fn sources<E>(
     else {
         return Ok(None);
     };
-    let retains = |tensor: &crate::protocol::ListedTensor| {
+    let retains = |tensor: &crate::protocol::TensorListing| {
         tensor.access == Access::ReadOnly
             && tensor.retainers.iter().any(|retainer| {
                 retainer.scope.deployment == deployment

@@ -30,11 +30,12 @@
 
 mod child;
 pub mod command;
+mod error;
 mod kv_storage;
-mod ledger;
 pub mod mooncake;
 mod moves;
 mod pages;
+mod quota;
 mod restart;
 mod serve;
 mod shoot;
@@ -53,13 +54,14 @@ use rustix::event::{PollFd, PollFlags, poll};
 
 use crate::mooncake::BATCH_PAGES;
 use ::storage::protocol::{
-    Access, Allocation, Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostStorage,
-    Item, Key, ListedDeployment, ListedTensor, Listing, Location, Mode, PageLevel, Reply, Request,
-    Retainer, Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorRecord, VERSION,
-    Welcome,
+    Access, Allocation, Claim, ClientMessage, DeploymentListing, ErrorKind, Event, Hello,
+    HostStorage, Item, Key, Listing, Location, Mode, PageLevel, Quota, Request, Response, Retainer,
+    Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorListing, TensorRecord, Tensors,
+    Usage, VERSION, Welcome,
 };
 use ::storage::transport::Connection;
 pub use child::Launch;
+pub use error::Error;
 use kv_storage::{KvStorage, Task};
 pub use pages::{DEFAULT_POOL_BYTES, STAGING_POOL_BYTES};
 pub use restart::{PREDECESSOR_DESCRIPTOR, Pending as RestartPending, relaunch_arguments};
@@ -179,7 +181,7 @@ impl Deployment {
 
 /// What handling a request came to.
 enum Outcome {
-    Reply(Reply, Vec<Attachment>),
+    Response(Response, Vec<Attachment>),
     /// The request waits for these processes to be shot down.
     Wait(Vec<Holder>),
     /// The request is answered when the connector finishes this task.
@@ -220,9 +222,9 @@ pub struct Server {
     /// Host storage a new page pool leaves available to the host's other
     /// processes.
     host_reserve: u64,
-    /// The GPUs' storage ledgers: what the processes book and the quotas
-    /// the epochs state ([`ledger`]).
-    ledgers: ledger::Ledgers,
+    /// The GPUs' quotas: what the processes reserve and the quotas
+    /// the epochs state ([`quota`]).
+    quotas: quota::Quotas,
     kv_storage: KvStorage,
     transfers: transfers::Transfers,
     /// The epochs' weights moving between GPUs and host storage.
@@ -263,7 +265,7 @@ impl Server {
             shootdowns: ShootDowns::default(),
             pages: pages::Pools::new(page_pool_bytes),
             host_reserve,
-            ledgers: ledger::Ledgers::default(),
+            quotas: quota::Quotas::default(),
             kv_storage: KvStorage::new(connector),
             transfers: transfers::Transfers::new(transfer),
             moves: moves::Moves::default(),
@@ -589,7 +591,7 @@ impl Server {
             let outcome = self.handle(id, &request, descriptors);
             let handled = started.elapsed();
             match outcome {
-                Ok(Outcome::Reply(reply, storages)) => {
+                Ok(Outcome::Response(reply, storages)) => {
                     self.answer(id, request_id, reply, &storages);
                     self.send_events();
                     // The server is single-threaded: a request that holds
@@ -640,14 +642,14 @@ impl Server {
                     return;
                 }
                 Err((kind, message)) => {
-                    self.answer(id, request_id, Reply::Error { kind, message }, &[]);
+                    self.answer(id, request_id, Response::Error { kind, message }, &[]);
                 }
             }
         }
     }
 
     /// Send a reply with the descriptors of `storages`, in order.
-    fn answer(&mut self, id: ClientId, request: u64, reply: Reply, attachments: &[Attachment]) {
+    fn answer(&mut self, id: ClientId, request: u64, reply: Response, attachments: &[Attachment]) {
         let descriptors: Vec<BorrowedFd<'_>> = attachments
             .iter()
             .filter_map(|attachment| match attachment {
@@ -661,7 +663,10 @@ impl Server {
         let Some(client) = self.clients.get_mut(&id) else {
             return;
         };
-        let message = ServerMessage::Reply { id: request, reply };
+        let message = ServerMessage::Response {
+            id: request,
+            response: reply,
+        };
         if let Err(error) = client.connection.send(&message, &descriptors) {
             tracing::warn!(pid = client.pid, %error, "a reply to a storage client failed");
         }
@@ -681,10 +686,13 @@ impl Server {
             .clone()
             .ok_or_else(|| invalid("a request precedes the client's hello"))?;
         match (request, role) {
-            (Request::List, _) => Ok(Outcome::Reply(Reply::Listing(self.listing()), Vec::new())),
+            (Request::List, _) => Ok(Outcome::Response(
+                Response::Listing(self.listing()),
+                Vec::new(),
+            )),
             (Request::Read { deployment, key }, Role::Peer) => self
                 .read_bytes(deployment, key)
-                .map(|bytes| Outcome::Reply(Reply::Read { bytes }, Vec::new())),
+                .map(|bytes| Outcome::Response(Response::Read { bytes }, Vec::new())),
             (
                 Request::Read { deployment, key },
                 Role::Head {
@@ -692,15 +700,15 @@ impl Server {
                 },
             ) if deployment == &owner => self
                 .read_bytes(deployment, key)
-                .map(|bytes| Outcome::Reply(Reply::Read { bytes }, Vec::new())),
+                .map(|bytes| Outcome::Response(Response::Read { bytes }, Vec::new())),
             (Request::Read { deployment, key }, Role::Worker { scope, .. })
                 if deployment == &scope.deployment =>
             {
                 self.read_bytes(deployment, key)
-                    .map(|bytes| Outcome::Reply(Reply::Read { bytes }, Vec::new()))
+                    .map(|bytes| Outcome::Response(Response::Read { bytes }, Vec::new()))
             }
-            (Request::Endpoint, _) => Ok(Outcome::Reply(
-                Reply::Endpoint {
+            (Request::Endpoint, _) => Ok(Outcome::Response(
+                Response::Endpoint {
                     tcp: self.tcp.as_ref().map(|(_, address)| address.clone()),
                 },
                 Vec::new(),
@@ -709,7 +717,7 @@ impl Server {
                 "a deployment is claimed at its host's server, not from another host",
             )),
             (
-                Request::PagePool { .. }
+                Request::Pool { .. }
                 | Request::Lookup { .. }
                 | Request::Reserve { .. }
                 | Request::Commit { .. }
@@ -727,9 +735,9 @@ impl Server {
                 outcome
             }
             (
-                Request::Transfer { .. }
-                | Request::OpenTransfer { .. }
-                | Request::CloseTransfer { .. }
+                Request::Submit { .. }
+                | Request::OpenSession { .. }
+                | Request::CloseSession { .. }
                 | Request::Cancel { .. }
                 | Request::Throttle { .. },
                 role,
@@ -760,23 +768,26 @@ impl Server {
                 let pools = self
                     .pages
                     .peer_pin(id, deployment, layouts, keys, &visibility);
-                Ok(Outcome::Reply(Reply::PeerPinned { pools }, Vec::new()))
+                Ok(Outcome::Response(
+                    Response::PeerPinned { pools },
+                    Vec::new(),
+                ))
             }
             (Request::PeerUnpin { pool, keys }, Role::Peer) => {
                 pool_of(&mut self.pages, *pool)?.peer_unpin(id, keys);
                 self.pages.settle();
-                Ok(Outcome::Reply(Reply::PeerUnpinned, Vec::new()))
+                Ok(Outcome::Response(Response::PeerUnpinned, Vec::new()))
             }
             (Request::Finished { task, results }, Role::Connector) => {
                 self.finished(*task, results);
                 // A download that failed freed the slots it had reserved.
                 self.pages.settle();
-                Ok(Outcome::Reply(Reply::Finished, Vec::new()))
+                Ok(Outcome::Response(Response::Finished, Vec::new()))
             }
             (Request::Retire { deployment }, Role::Operator) => self.retire(deployment),
             (Request::Restart { executable }, Role::Operator) => self
                 .begin_restart(executable.as_deref())
-                .map(|pid| Outcome::Reply(Reply::Restarting { pid }, Vec::new()))
+                .map(|pid| Outcome::Response(Response::Restarting { pid }, Vec::new()))
                 .map_err(resource),
             (
                 Request::Claim {
@@ -786,7 +797,7 @@ impl Server {
                 },
                 Role::Head { deployment, .. },
             ) => self.claim(id, &deployment, scopes, *epoch, retire),
-            (Request::PublishEpochs { epochs }, Role::Head { deployment, .. }) => {
+            (Request::Publish { epochs }, Role::Head { deployment, .. }) => {
                 self.publish_epochs(id, &deployment, epochs)
             }
             (Request::KeepWeights { epochs, cache_keys }, Role::Head { deployment, .. }) => {
@@ -808,50 +819,60 @@ impl Server {
             ) => {
                 let descriptor = descriptors.into_iter().next();
                 self.allocated(*request, *bytes, failure.as_deref(), descriptor);
-                Ok(Outcome::Reply(Reply::Noted, Vec::new()))
+                Ok(Outcome::Response(Response::Noted, Vec::new()))
             }
-            (Request::Ledger { gpus }, role) => {
+            (Request::Usage { gpus }, role) => {
                 let deployment = match &role {
                     Role::Head { deployment, .. } => Some(deployment.clone()),
                     Role::Worker { scope, .. } => Some(scope.deployment.clone()),
                     Role::Transfer | Role::Peer | Role::Operator | Role::Connector => None,
                 };
-                let ledgers = self.ledgers_of(gpus, deployment.as_deref());
-                let transfers = deployment
+                let quotas = self.quotas_of(gpus, deployment.as_deref());
+                let tasks = deployment
                     .as_deref()
                     .map(|deployment| self.transfers.totals(deployment))
                     .unwrap_or_default();
-                Ok(Outcome::Reply(
-                    Reply::Ledger {
-                        ledgers,
+                Ok(Outcome::Response(
+                    Response::Usage(Usage {
+                        quotas,
                         host: self.host_storage().map_err(resource)?,
-                        transfers,
-                    },
+                        tasks,
+                    }),
                     Vec::new(),
                 ))
             }
             (
-                Request::Book {
+                Request::Quota {
                     gpu,
                     total,
-                    quota,
-                    items,
+                    limit,
+                    reservations,
                 },
                 Role::Worker { scope, epoch, .. },
-            ) => self.book(
+            ) => self.reserve(
                 id,
-                ledger::Booker::Worker { scope, epoch },
+                quota::Reserver::Worker { scope, epoch },
                 *gpu,
                 *total,
-                *quota,
-                items,
+                *limit,
+                reservations,
             ),
             (
-                Request::Book {
-                    gpu, total, items, ..
+                Request::Quota {
+                    gpu,
+                    total,
+                    reservations,
+                    ..
                 },
                 Role::Transfer,
-            ) => self.book(id, ledger::Booker::Transfer, *gpu, *total, None, items),
+            ) => self.reserve(
+                id,
+                quota::Reserver::Transfer,
+                *gpu,
+                *total,
+                None,
+                reservations,
+            ),
             (
                 request,
                 Role::Worker {
@@ -1054,9 +1075,9 @@ impl Server {
         for id in released {
             self.remove_tensor(&id);
         }
-        // A retired epoch's quota ends with its storage: the ledger then
-        // books what its successor alone holds, under the successor's.
-        self.ledgers.retire(deployment, &retired);
+        // A retired epoch's quota ends with its storage: the quota then
+        // reserves what its successor alone holds, under the successor's.
+        self.quotas.retire(deployment, &retired);
         tracing::info!(
             deployment,
             epoch,
@@ -1069,7 +1090,7 @@ impl Server {
         for other in self.idle_deployments(deployment) {
             self.release_deployment(&other);
         }
-        Ok(Outcome::Reply(Reply::Claimed { claim }, Vec::new()))
+        Ok(Outcome::Response(Response::Claimed { claim }, Vec::new()))
     }
 
     /// Publish a committed set atomically before any reader can observe it.
@@ -1098,7 +1119,7 @@ impl Server {
                 self.upload(pool, pages);
             }
         }
-        Ok(Outcome::Reply(Reply::EpochsPublished, Vec::new()))
+        Ok(Outcome::Response(Response::Published, Vec::new()))
     }
 
     /// The deployments other than `except` that hold a claim, a tensor or a
@@ -1145,7 +1166,7 @@ impl Server {
         }
         let pools = self.pages.release(deployment);
         self.pools_released(&pools);
-        self.ledgers.release(deployment);
+        self.quotas.release(deployment);
         tracing::info!(
             deployment,
             released = count,
@@ -1223,11 +1244,11 @@ impl Server {
         })
     }
 
-    /// The retained device storages as the ledgers see them: each storage's
+    /// The retained device storages as the quotas see them: each storage's
     /// record, the access of its tensors and the scopes of the epochs that
     /// retain any of them.
-    fn held(&self) -> Vec<ledger::Held<'_>> {
-        let mut held: HashMap<StorageId, ledger::Held<'_>> = HashMap::new();
+    fn retained(&self) -> Vec<quota::Retained<'_>> {
+        let mut retained: HashMap<StorageId, quota::Retained<'_>> = HashMap::new();
         for tensor in self.tensors.values() {
             let Some(storage) = self.storages.get(&tensor.storage) else {
                 continue;
@@ -1235,77 +1256,74 @@ impl Server {
             if !matches!(storage.record.location, Location::Device { .. }) {
                 continue;
             }
-            held.entry(tensor.storage)
-                .or_insert_with(|| ledger::Held {
-                    record: &storage.record,
-                    access: tensor.access,
-                    retainers: BTreeSet::new(),
-                })
-                .retainers
+            retained
+                .entry(tensor.storage)
+                .or_insert_with(|| (&storage.record, tensor.access, BTreeSet::new()))
+                .2
                 .extend(&tensor.retainers);
         }
-        held.into_values().collect()
+        retained.into_values().collect()
     }
 
-    /// The ledgers of `gpus` (every GPU when empty) of `deployment` (every
+    /// The quotas of `gpus` (every GPU when empty) of `deployment` (every
     /// deployment when `None`).
-    fn ledgers_of(&self, gpus: &[[u8; 16]], deployment: Option<&str>) -> Vec<GpuLedger> {
-        let mut ledgers = self.ledgers.ledgers(
-            self.held(),
+    fn quotas_of(&self, gpus: &[[u8; 16]], deployment: Option<&str>) -> Vec<Quota> {
+        let mut quotas = self.quotas.quotas(
+            self.retained(),
             &self.transfer_contexts(),
             &|gpu| gpus.is_empty() || gpus.contains(gpu),
             &|name| deployment.is_none_or(|deployment| deployment == name),
         );
-        for ledger in &mut ledgers {
-            ledger.host_link_bytes_per_second = self.host_link(ledger.gpu);
+        for quota in &mut quotas {
+            quota.host_link_bytes_per_second = self.host_link(quota.gpu);
         }
-        ledgers
+        quotas
     }
 
-    /// `book`: see [`Request::Book`]. A worker books in its deployment's
-    /// ledger, the Transfer Server in every ledger of the GPU.
-    fn book(
+    /// `reserve`: see [`Request::Quota`]. A worker reserves in its deployment's
+    /// quota, the Transfer Server in every quota of the GPU.
+    fn reserve(
         &mut self,
         id: ClientId,
-        booker: ledger::Booker,
+        reserver: quota::Reserver,
         gpu: [u8; 16],
         total: u64,
         quota: Option<u64>,
         items: &[(Item, u64)],
     ) -> Result<Outcome, (ErrorKind, String)> {
-        let deployment = match &booker {
-            ledger::Booker::Worker { scope, .. } => {
+        let deployment = match &reserver {
+            quota::Reserver::Worker { scope, .. } => {
                 let worker =
                     |item: &Item| matches!(item, Item::GraphPool | Item::Process | Item::Staging);
                 if let Some(&(item, _)) = items.iter().find(|(item, _)| !worker(item)) {
-                    return Err(invalid(&format!("a worker books no {}", item.name())));
+                    return Err(invalid(&format!("a worker reserves no {}", item.name())));
                 }
                 Some(scope.deployment.clone())
             }
-            ledger::Booker::Transfer => {
+            quota::Reserver::Transfer => {
                 let transfer = |item: &Item| matches!(item, Item::Staging | Item::TransferContext);
                 if let Some(&(item, _)) = items.iter().find(|(item, _)| !transfer(item)) {
                     return Err(invalid(&format!(
-                        "the Transfer Server books no {}",
+                        "the Transfer Server reserves no {}",
                         item.name()
                     )));
                 }
                 None
             }
         };
-        let before = self.ledgers_of(&[gpu], deployment.as_deref());
-        let previous = self.ledgers.book(id, booker, gpu, total, quota, items);
-        let after = self.ledgers_of(&[gpu], deployment.as_deref());
-        if let Some(refusal) = ledger::overrun(&before, &after) {
-            self.ledgers = previous;
+        let before = self.quotas_of(&[gpu], deployment.as_deref());
+        let previous = self.quotas.reserve(id, reserver, gpu, total, quota, items);
+        let after = self.quotas_of(&[gpu], deployment.as_deref());
+        if let Some(refusal) = quota::overrun(&before, &after) {
+            self.quotas = previous;
             return Err((ErrorKind::Quota, refusal));
         }
-        Ok(Outcome::Reply(
-            Reply::Ledger {
-                ledgers: after,
+        Ok(Outcome::Response(
+            Response::Usage(Usage {
+                quotas: after,
                 host: self.host_storage().map_err(resource)?,
-                transfers: Vec::new(),
-            },
+                tasks: Vec::new(),
+            }),
             Vec::new(),
         ))
     }
@@ -1351,8 +1369,8 @@ impl Server {
             released = count,
             "epochs retain their weights and rollback cache"
         );
-        Ok(Outcome::Reply(
-            Reply::Retained { released: count },
+        Ok(Outcome::Response(
+            Response::Retained { released: count },
             Vec::new(),
         ))
     }
@@ -1372,8 +1390,8 @@ impl Server {
             ));
         }
         let count = self.release_deployment(deployment);
-        Ok(Outcome::Reply(
-            Reply::Retired { released: count },
+        Ok(Outcome::Response(
+            Response::Retired { released: count },
             Vec::new(),
         ))
     }
@@ -1468,8 +1486,8 @@ impl Server {
                 "a worker's retention released its scope's tensors"
             );
         }
-        Ok(Outcome::Reply(
-            Reply::Retained { released: count },
+        Ok(Outcome::Response(
+            Response::Retained { released: count },
             Vec::new(),
         ))
     }
@@ -1609,12 +1627,12 @@ impl Server {
             .iter()
             .map(|storage| self.storages[storage].record)
             .collect();
-        Ok(Outcome::Reply(
-            Reply::Got {
+        Ok(Outcome::Response(
+            Response::Tensors(Tensors {
                 tensors,
                 storages: records,
                 missing,
-            },
+            }),
             storages.into_iter().map(Attachment::Storage).collect(),
         ))
     }
@@ -1763,10 +1781,10 @@ impl Server {
         // A storage no tensor names is not retained, unless a move fills it.
         self.storages
             .retain(|_, entry| entry.tensors > 0 || entry.moving);
-        Ok(Outcome::Reply(Reply::Put, Vec::new()))
+        Ok(Outcome::Response(Response::Put, Vec::new()))
     }
 
-    /// Refuses a put whose new device storages would take a ledger of the
+    /// Refuses a put whose new device storages would take a quota of the
     /// holder's deployment past its quota. A storage is new when a tensor
     /// the put creates lies in it; a read-only tensor already retained adds
     /// the caller's scope to its storage and no storage.
@@ -1794,20 +1812,20 @@ impl Server {
         }
         for (gpu, bytes) in added {
             let deployment = holder.scope.deployment.as_str();
-            for ledger in self.ledgers_of(&[gpu], Some(deployment)) {
-                let (Some(quota), used) = (ledger.quota, ledger.used()) else {
+            for quota in self.quotas_of(&[gpu], Some(deployment)) {
+                let (Some(limit), usage) = (quota.limit, quota.usage()) else {
                     continue;
                 };
-                if used + bytes > quota {
+                if usage + bytes > limit {
                     return Err((
                         ErrorKind::Quota,
                         format!(
-                            "{bytes} bytes of new device storage of {} would take the storage \
-                             ledger of GPU {} to {} bytes, past its quota of {quota} bytes:\n{}",
+                            "{bytes} bytes of new device storage of {} would take the usage \
+                             of GPU {} to {} bytes, past its quota of {limit} bytes:\n{}",
                             holder.scope,
                             ::storage::protocol::gpu_name(&gpu),
-                            used + bytes,
-                            ledger.describe()
+                            usage + bytes,
+                            quota.describe()
                         ),
                     ));
                 }
@@ -1877,7 +1895,7 @@ impl Server {
                 tensor.writer = Some(holder.clone());
             }
         }
-        Ok(Outcome::Reply(Reply::Promoted, Vec::new()))
+        Ok(Outcome::Response(Response::Promoted, Vec::new()))
     }
 
     /// `release`: see [`Request::Release`].
@@ -1894,7 +1912,7 @@ impl Server {
                 }
             }
         }
-        Ok(Outcome::Reply(Reply::Released, Vec::new()))
+        Ok(Outcome::Response(Response::Released, Vec::new()))
     }
 
     /// `rekey`: see [`Request::Rekey`].
@@ -1948,7 +1966,7 @@ impl Server {
                 self.insert_tensor(new, tensor);
             }
         }
-        Ok(Outcome::Reply(Reply::Rekeyed, Vec::new()))
+        Ok(Outcome::Response(Response::Rekeyed, Vec::new()))
     }
 
     /// Index a tensor under `id`.
@@ -2038,9 +2056,9 @@ impl Server {
         let Some(client) = self.clients.remove(&id) else {
             return;
         };
-        // What the process booked ends with it: the storage it booked is its
+        // What the process reserved ends with it: the storage it reserved is its
         // own, which the driver frees as the process ends.
-        self.ledgers.disconnect(id);
+        self.quotas.disconnect(id);
         match &client.role {
             Some(Role::Head { .. }) => {
                 // The head's tasks are cancelled below, but each may still
@@ -2184,7 +2202,7 @@ impl Server {
                     }
                 }
             }
-            tensors.push(ListedTensor {
+            tensors.push(TensorListing {
                 key: *key,
                 name: tensor.name.clone(),
                 scopes: tensor
@@ -2227,7 +2245,7 @@ impl Server {
             deployments: self
                 .deployments
                 .iter()
-                .map(|(deployment, entry)| ListedDeployment {
+                .map(|(deployment, entry)| DeploymentListing {
                     deployment: deployment.clone(),
                     head_connected: entry
                         .head
@@ -2237,7 +2255,7 @@ impl Server {
             page_pools: self.pages.listing(),
             connector: self.kv_storage.client.is_some(),
             transfer: self.listed_transfer(),
-            ledgers: self.ledgers_of(&[], None),
+            quotas: self.quotas_of(&[], None),
         }
     }
 
@@ -2433,7 +2451,7 @@ impl Server {
                         }
                     })
                     .collect();
-                self.answer(client, request, Reply::Lookup { levels }, &[]);
+                self.answer(client, request, Response::Lookup { levels }, &[]);
                 if let Some(entry) = self.clients.get_mut(&client) {
                     entry.held = false;
                 }
@@ -2500,9 +2518,9 @@ impl Server {
         request: &Request,
         role: &Role,
     ) -> Result<Outcome, (ErrorKind, String)> {
-        let reply = |reply| Ok(Outcome::Reply(reply, Vec::new()));
+        let reply = |reply| Ok(Outcome::Response(reply, Vec::new()));
         if let (
-            Request::PagePool {
+            Request::Pool {
                 shape,
                 numa_node,
                 bytes,
@@ -2551,12 +2569,8 @@ impl Server {
             }
             let slots = self.pages.get(pool).map_or(0, pages::Pool::slots);
             self.offer_pools();
-            return Ok(Outcome::Reply(
-                Reply::PagePool {
-                    pool,
-                    slots,
-                    page_bytes: shape.page_bytes,
-                },
+            return Ok(Outcome::Response(
+                Response::Pool { pool, slots },
                 vec![Attachment::Pool(pool)],
             ));
         }
@@ -2603,7 +2617,7 @@ impl Server {
                             }
                         })
                         .collect();
-                    return reply(Reply::Lookup { levels });
+                    return reply(Response::Lookup { levels });
                 }
                 // The connector looks up the pages the pool does not hold;
                 // the request waits for it.
@@ -2628,7 +2642,7 @@ impl Server {
                     .pages
                     .reserve(*pool, writer.as_ref(), id, keys, *window, &visibility)
                     .ok_or_else(|| invalid(&format!("page pool {pool} does not exist")))?;
-                reply(Reply::Reserved { slots })
+                reply(Response::Reserved { slots })
             }
             Request::Commit { pool, keys } => {
                 let entry = pool_of(&mut self.pages, *pool)?;
@@ -2641,21 +2655,21 @@ impl Server {
                         .is_some_and(|published| visibility.shared(published))
                 });
                 self.upload(*pool, committed);
-                reply(Reply::Committed)
+                reply(Response::Committed)
             }
             Request::Abort { pool, keys } => {
                 pool_of(&mut self.pages, *pool)?.abort(keys);
-                reply(Reply::Aborted)
+                reply(Response::Aborted)
             }
             Request::Pin { pool, reader, keys } => {
                 of_deployment(reader)?;
                 let slots = pool_of(&mut self.pages, *pool)?.pin(reader, id, keys, &visibility);
-                reply(Reply::Pinned { slots })
+                reply(Response::Pinned { slots })
             }
             Request::Unpin { pool, reader, keys } => {
                 of_deployment(reader)?;
                 pool_of(&mut self.pages, *pool)?.unpin(reader, keys);
-                reply(Reply::Unpinned)
+                reply(Response::Unpinned)
             }
             Request::HostCache {
                 tokens,
@@ -2708,11 +2722,11 @@ impl Server {
                     held,
                     "sized the host KV cache of an epoch"
                 );
-                reply(Reply::HostCache { tokens: held })
+                reply(Response::HostCache { tokens: held })
             }
             Request::Prefetch { pool, keys, tag } => {
                 self.prefetch(id, *pool, keys, *tag, &visibility)?;
-                reply(Reply::Prefetching)
+                reply(Response::Prefetching)
             }
             _ => Err(invalid(&format!(
                 "{} is not a page request of a head",
@@ -2833,7 +2847,7 @@ fn resource(error: io::Error) -> (ErrorKind, String) {
 fn request_name(request: &Request) -> &'static str {
     match request {
         Request::Claim { .. } => "claim",
-        Request::PublishEpochs { .. } => "publish_epochs",
+        Request::Publish { .. } => "publish_epochs",
         Request::Retain { .. } => "retain",
         Request::KeepWeights { .. } => "keep_weights",
         Request::Get { .. } => "get",
@@ -2846,7 +2860,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Read { .. } => "read",
         Request::Retire { .. } => "retire",
         Request::Restart { .. } => "restart",
-        Request::PagePool { .. } => "page_pool",
+        Request::Pool { .. } => "page_pool",
         Request::Lookup { .. } => "lookup",
         Request::Reserve { .. } => "reserve",
         Request::Commit { .. } => "commit",
@@ -2859,11 +2873,11 @@ fn request_name(request: &Request) -> &'static str {
         Request::Prefetch { .. } => "prefetch",
         Request::HostCache { .. } => "host_cache",
         Request::Finished { .. } => "finished",
-        Request::Book { .. } => "book",
-        Request::Ledger { .. } => "ledger",
-        Request::Transfer { .. } => "transfer",
-        Request::OpenTransfer { .. } => "open_transfer",
-        Request::CloseTransfer { .. } => "close_transfer",
+        Request::Quota { .. } => "reserve",
+        Request::Usage { .. } => "quota",
+        Request::Submit { .. } => "transfer",
+        Request::OpenSession { .. } => "open_transfer",
+        Request::CloseSession { .. } => "close_transfer",
         Request::Cancel { .. } => "cancel",
         Request::Throttle { .. } => "throttle",
         Request::Measured { .. } => "measured",

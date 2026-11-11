@@ -21,7 +21,7 @@ use scheduler::GenerationRequest;
 use scheduler::{
     CacheChange, CommandSender, Event, EventRx, FinishReason, SchedulerConfig, WeightsInFlight,
 };
-use storage::{GpuLedger, Item, LedgerEntry, Scope, Segment};
+use storage::{Item, Quota, Reservation, Scope, Segment};
 use testkit::FakeBatches;
 
 use crate::support::fake;
@@ -102,20 +102,20 @@ impl SimWorkers {
     /// The deployment's usage of the worker's GPU: each held segment of the
     /// serving epoch, its process, and the other epoch's and the Transfer
     /// Server's reservations.
-    fn usage(&self) -> GpuLedger {
+    fn usage(&self) -> Quota {
         let scope = Scope {
             deployment: "model".into(),
             group: "model".into(),
             rank: 0,
         };
-        let entry = |item, scope: Option<&Scope>, epochs: Vec<u64>, segment, bytes| LedgerEntry {
+        let entry = |item, scope: Option<&Scope>, epochs: Vec<u64>, segment, bytes| Reservation {
             item,
             scope: scope.cloned(),
             epochs,
             segment,
             bytes,
         };
-        let mut entries: Vec<LedgerEntry> = (0..self.held)
+        let mut entries: Vec<Reservation> = (0..self.held)
             .map(|ordinal| {
                 entry(
                     Item::CacheSegment,
@@ -165,12 +165,12 @@ impl SimWorkers {
             self.weights_bytes,
         ));
         entries.retain(|entry| entry.bytes > 0);
-        GpuLedger {
+        Quota {
             gpu: [7; 16],
             deployment: "model".into(),
             total: 1 << 40,
-            quota: Some(self.quota),
-            entries,
+            limit: Some(self.quota),
+            reservations: entries,
             host_link_bytes_per_second: self.host_link,
             transfer_context: self.transfer_context,
         }
@@ -237,13 +237,13 @@ fn operate(
     };
     let mut results = vec![result.to_string()];
     if workers.experts && matches!(operation, EpochOperation::CacheStorage(_)) {
-        let usage = workers.expert_process.map(|process| GpuLedger {
+        let usage = workers.expert_process.map(|process| Quota {
             gpu: [8; 16],
             deployment: "model".into(),
             total: 2_000,
-            quota: Some(1_000),
+            limit: Some(1_000),
             host_link_bytes_per_second: None,
-            entries: vec![LedgerEntry {
+            reservations: vec![Reservation {
                 item: Item::Process,
                 scope: Some(Scope {
                     deployment: "model".into(),

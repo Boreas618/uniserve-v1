@@ -367,7 +367,7 @@ impl MainProcess {
         let status = answer_commit(&mut self.update, generation);
         if matches!(status, GenerationStatus::Committed { .. }) {
             // Probation ended in a commit, so the generation before the update can never serve
-            // again. Its graphs and kernels live until the purge, which is the worker's book to
+            // again. Its graphs and kernels live until the purge, which is the worker's reserve to
             // keep - and the packages it was built from go with the record of it, since no revert
             // can serve it.
             self.update.retired.clear();

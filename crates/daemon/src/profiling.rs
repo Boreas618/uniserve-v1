@@ -105,9 +105,9 @@ pub struct Session {
     pub overhead: Option<Overhead>,
     pub guard: Vec<GuardAction>,
     /// The device storage the session holds on each selected worker's GPU
-    /// (`SessionRequest::device_storage`), which the workers book in the
-    /// GPUs' storage ledgers: the KV cache gave back tail segments for it
-    /// where a ledger lacked room, and grows back once the session ends.
+    /// (`SessionRequest::device_storage`), which the workers reserve in the
+    /// GPUs' quotas: the KV cache gave back tail segments for it
+    /// where a quota lacked room, and grows back once the session ends.
     pub device_storage: u64,
 }
 
@@ -227,7 +227,7 @@ impl Replica {
         })
         .map_err(|error| UpdateError::Failed(error.into()))?;
         // The device storage the collectors hold on each selected worker's
-        // GPU must fit its storage ledger: where it lacks room, the KV cache
+        // GPU must fit its quota: where it lacks room, the KV cache
         // gives back tail segments first, as an epoch change's preparation
         // does, the requests holding them running on.
         let device_storage = request.device_storage();
@@ -241,7 +241,7 @@ impl Replica {
             })?;
         }
         // A worker that cannot start the session, or whose GPU's storage
-        // ledger cannot fit the device storage its collectors would hold,
+        // quota cannot fit the device storage its collectors would hold,
         // leaves the session to the workers that started it, which end it.
         let results = match self.hook("uniserve.profile_start", &payload).await {
             Ok(results) => results,
@@ -331,7 +331,7 @@ impl Replica {
     /// End session `id` on the workers that started it after another
     /// worker refused or failed to: the session never ran, and each worker
     /// that started it closes its file and releases its collectors and
-    /// their booked storage. The KV cache grows back into the room it made
+    /// their reserved storage. The KV cache grows back into the room it made
     /// for the session's `device_storage`.
     async fn abandon_profile(&self, id: u64, device_storage: u64, client: &EngineClient) {
         let payload = serde_json::json!({ "session": id, "reason": "not started" }).to_string();

@@ -308,7 +308,7 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
     let claim = model_head
         .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
         .unwrap();
-    model_head.publish_epochs(vec![0]).unwrap();
+    model_head.publish(vec![0]).unwrap();
     let mut first = worker(&server.socket, scope("text", 0), 1, claim);
     let storage = memfd(b"abcdefgh");
     first
@@ -562,7 +562,7 @@ fn retry<T>(mut attempt: impl FnMut() -> Result<T, Error>) -> T {
 
 #[test]
 fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
-    use ::storage::protocol::{PageLevel, PageShape, PageSlot, Reply, Request};
+    use ::storage::protocol::{PageLevel, PageShape, PageSlot, Request, Response};
 
     let server = Running::start();
     let claim = head(&server.socket)
@@ -579,7 +579,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
     };
     let answer = worker
         .call(
-            &Request::PagePool {
+            &Request::Pool {
                 shape,
                 numa_node: None,
                 bytes: None,
@@ -587,7 +587,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
             &[],
         )
         .unwrap();
-    let Reply::PagePool { pool, slots, .. } = answer.reply else {
+    let Response::Pool { pool, slots, .. } = answer.reply else {
         panic!("a page pool request answered {:?}", answer.reply);
     };
     assert_eq!((slots, answer.descriptors.len()), (4, 1));
@@ -602,7 +602,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
     )
     .unwrap();
     let mut ask = |request: Request| remote.call(&request, &[]).unwrap().reply;
-    let Reply::Reserved { slots } = ask(Request::Reserve {
+    let Response::Reserved { slots } = ask(Request::Reserve {
         pool,
         writer: Some(scope("text", 0)),
         keys: vec![key(1), key(2)],
@@ -623,7 +623,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
             pool,
             keys: vec![key(1), key(2)],
         }),
-        Reply::Lookup {
+        Response::Lookup {
             levels: vec![PageLevel::Host, PageLevel::Absent]
         }
     );
@@ -634,7 +634,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
             epoch: 0,
             retire: Vec::new(),
         }),
-        Reply::Error {
+        Response::Error {
             kind: ErrorKind::Invalid,
             ..
         }
@@ -675,12 +675,12 @@ pub(crate) fn next_event(client: &mut Client) -> (::storage::protocol::Event, Ve
 
 #[test]
 fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() {
-    use ::storage::protocol::{Event, PageLevel, PageShape, PageSlot, Reply, Request};
+    use ::storage::protocol::{Event, PageLevel, PageShape, PageSlot, Request, Response};
 
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_epochs(vec![0]).unwrap();
+    head.publish(vec![0]).unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     let shape = PageShape {
         layout: key(3),
@@ -688,9 +688,9 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         kv_head_count: 2,
         page_bytes: 16,
     };
-    let Reply::PagePool { pool, .. } = worker
+    let Response::Pool { pool, .. } = worker
         .call(
-            &Request::PagePool {
+            &Request::Pool {
                 shape,
                 numa_node: None,
                 bytes: None,
@@ -722,7 +722,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
     ));
 
     // A committed page is uploaded from its slot.
-    let Reply::Reserved { slots } = head
+    let Response::Reserved { slots } = head
         .call(
             &Request::Reserve {
                 pool,
@@ -766,7 +766,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
     };
     assert_eq!(
         connector.call(&finished, &[]).unwrap().reply,
-        Reply::Finished
+        Response::Finished
     );
 
     // A lookup asks the connector for the pages the pool does not hold.
@@ -794,7 +794,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         .unwrap();
     assert_eq!(
         head.wait(lookup).unwrap().reply,
-        Reply::Lookup {
+        Response::Lookup {
             levels: vec![PageLevel::Host, PageLevel::Storage, PageLevel::Absent]
         }
     );
@@ -806,7 +806,10 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         keys: vec![key(1), key(2), key(3)],
         tag: 7,
     };
-    assert_eq!(head.call(&prefetch, &[]).unwrap().reply, Reply::Prefetching);
+    assert_eq!(
+        head.call(&prefetch, &[]).unwrap().reply,
+        Response::Prefetching
+    );
     let (Event::Download { task, pages, .. }, _) = next_event(&mut connector) else {
         panic!("the prefetch did not reach the connector");
     };
@@ -845,7 +848,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
     drop(connector);
     assert_eq!(
         head.wait(lookup).unwrap().reply,
-        Reply::Lookup {
+        Response::Lookup {
             levels: vec![PageLevel::Host, PageLevel::Host, PageLevel::Absent]
         }
     );
@@ -875,7 +878,7 @@ fn scope_of(deployment: &str) -> Scope {
 /// The page pool `worker` maps for pages of 16 bytes, asking for `bytes`:
 /// its id and slots.
 fn page_pool(worker: &mut Client, bytes: Option<u64>) -> Result<(u64, u64), Error> {
-    use ::storage::protocol::{PageShape, Reply, Request};
+    use ::storage::protocol::{PageShape, Request, Response};
 
     let shape = PageShape {
         layout: key(3),
@@ -884,7 +887,7 @@ fn page_pool(worker: &mut Client, bytes: Option<u64>) -> Result<(u64, u64), Erro
         page_bytes: 16,
     };
     let answer = worker.call(
-        &Request::PagePool {
+        &Request::Pool {
             shape,
             numa_node: None,
             bytes,
@@ -892,14 +895,14 @@ fn page_pool(worker: &mut Client, bytes: Option<u64>) -> Result<(u64, u64), Erro
         &[],
     )?;
     match answer.reply {
-        Reply::PagePool { pool, slots, .. } => Ok((pool, slots)),
+        Response::Pool { pool, slots, .. } => Ok((pool, slots)),
         reply => panic!("a page pool request answered {reply:?}"),
     }
 }
 
 #[test]
 fn page_pools_belong_to_their_deployment_and_leave_with_it() {
-    use ::storage::protocol::{Reply, Request};
+    use ::storage::protocol::{Request, Response};
 
     let server = Running::start();
     // The head stays connected, so another deployment's claim keeps this
@@ -936,7 +939,7 @@ fn page_pools_belong_to_their_deployment_and_leave_with_it() {
         .unwrap();
     assert!(matches!(
         lookup.reply,
-        Reply::Error {
+        Response::Error {
             kind: ErrorKind::Invalid,
             ..
         }
@@ -1043,7 +1046,7 @@ fn a_page_pool_the_hosts_storage_cannot_hold_is_refused() {
     };
     let refused = worker
         .call(
-            &Request::PagePool {
+            &Request::Pool {
                 shape,
                 numa_node: None,
                 bytes: Some(1 << 50),
@@ -1053,7 +1056,7 @@ fn a_page_pool_the_hosts_storage_cannot_hold_is_refused() {
         .unwrap();
     assert!(matches!(
         refused.reply,
-        ::storage::protocol::Reply::Error {
+        ::storage::protocol::Response::Error {
             kind: ErrorKind::Resource,
             ..
         }
@@ -1098,7 +1101,7 @@ fn epochs_retain_their_own_storage_and_a_claim_retires_one() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let first_claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_epochs(vec![1]).unwrap();
+    head.publish(vec![1]).unwrap();
 
     // Epoch 1's worker publishes shared weights, its exclusive planes and a
     // buffer of its own.
@@ -1197,7 +1200,7 @@ pub(crate) fn engine_head(socket: &Path, epoch: u64) -> Client {
 
 /// A page pool of four 16-byte pages that `worker` maps.
 pub(crate) fn trial_pool(worker: &mut Client) -> u64 {
-    use ::storage::protocol::{PageShape, Reply, Request};
+    use ::storage::protocol::{PageShape, Request, Response};
 
     let shape = PageShape {
         layout: key(3),
@@ -1207,7 +1210,7 @@ pub(crate) fn trial_pool(worker: &mut Client) -> u64 {
     };
     let answer = worker
         .call(
-            &Request::PagePool {
+            &Request::Pool {
                 shape,
                 numa_node: None,
                 bytes: None,
@@ -1215,7 +1218,7 @@ pub(crate) fn trial_pool(worker: &mut Client) -> u64 {
             &[],
         )
         .unwrap();
-    let Reply::PagePool { pool, .. } = answer.reply else {
+    let Response::Pool { pool, .. } = answer.reply else {
         panic!("the page pool was refused: {:?}", answer.reply);
     };
     pool
@@ -1223,9 +1226,9 @@ pub(crate) fn trial_pool(worker: &mut Client) -> u64 {
 
 /// `head` writes and commits the pages of `keys` in `pool`.
 pub(crate) fn publish(head: &mut Client, pool: u64, keys: &[Key]) {
-    use ::storage::protocol::{PageSlot, Reply, Request};
+    use ::storage::protocol::{PageSlot, Request, Response};
 
-    let Reply::Reserved { slots } = head
+    let Response::Reserved { slots } = head
         .call(
             &Request::Reserve {
                 pool,
@@ -1259,9 +1262,9 @@ pub(crate) fn publish(head: &mut Client, pool: u64, keys: &[Key]) {
 /// The levels `head` finds the pages of `keys` at in `pool`, without a
 /// connector.
 fn levels(head: &mut Client, pool: u64, keys: &[Key]) -> Vec<::storage::protocol::PageLevel> {
-    use ::storage::protocol::{Reply, Request};
+    use ::storage::protocol::{Request, Response};
 
-    let Reply::Lookup { levels } = head
+    let Response::Lookup { levels } = head
         .call(
             &Request::Lookup {
                 pool,
@@ -1287,7 +1290,7 @@ fn a_epoch_on_trial_publishes_its_pages_to_itself_until_its_commit() {
     let server = Running::start();
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_epochs(vec![1]).unwrap();
+    daemon.publish(vec![1]).unwrap();
     let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let pool = trial_pool(&mut worker);
     let mut connector = Client::connect(&server.socket, Role::Connector).unwrap();
@@ -1336,12 +1339,12 @@ fn a_epoch_on_trial_publishes_its_pages_to_itself_until_its_commit() {
     finish(&mut connector, task, vec![false]);
     assert_eq!(
         serving.wait(lookup).unwrap().reply,
-        ::storage::protocol::Reply::Lookup {
+        ::storage::protocol::Response::Lookup {
             levels: vec![PageLevel::Host, PageLevel::Absent]
         }
     );
     // Nor does it pin it.
-    let ::storage::protocol::Reply::Pinned { slots } = serving
+    let ::storage::protocol::Response::Pinned { slots } = serving
         .call(
             &Request::Pin {
                 pool,
@@ -1359,7 +1362,7 @@ fn a_epoch_on_trial_publishes_its_pages_to_itself_until_its_commit() {
 
     // The commit publishes epoch 2 before retiring epoch 1, and
     // the KV storage takes them.
-    daemon.publish_epochs(vec![2]).unwrap();
+    daemon.publish(vec![2]).unwrap();
     daemon.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
     let (Event::Upload { task, pages, .. }, _) = next_event(&mut connector) else {
         panic!("the committed epoch's pages were not uploaded");
@@ -1387,7 +1390,7 @@ fn independent_replicas_publish_successors_as_a_group() {
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(9, vec![scope("text", 0)], Vec::new()).unwrap();
     daemon.claim(3, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_epochs(vec![9, 3]).unwrap();
+    daemon.publish(vec![9, 3]).unwrap();
     let mut worker = epoch_worker(&server.socket, scope("text", 0), 9, claim);
     let pool = trial_pool(&mut worker);
     let mut first = engine_head(&server.socket, 9);
@@ -1409,10 +1412,7 @@ fn independent_replicas_publish_successors_as_a_group() {
     let mut peer = engine_head(&server.socket, 8);
     publish(&mut candidate, pool, &[key(3)]);
     publish(&mut peer, pool, &[key(4)]);
-    assert_eq!(
-        server_error(candidate.publish_epochs(vec![4])),
-        ErrorKind::Invalid
-    );
+    assert_eq!(server_error(candidate.publish(vec![4])), ErrorKind::Invalid);
     assert_eq!(
         levels(&mut first, pool, &[key(3), key(4)]),
         vec![Absent, Absent]
@@ -1424,14 +1424,14 @@ fn independent_replicas_publish_successors_as_a_group() {
 
     // A rejected set publishes none of its otherwise valid members.
     assert_eq!(
-        server_error(daemon.publish_epochs(vec![4, 99])),
+        server_error(daemon.publish(vec![4, 99])),
         ErrorKind::Invalid
     );
     assert_eq!(
         levels(&mut first, pool, &[key(3), key(4)]),
         vec![Absent, Absent]
     );
-    daemon.publish_epochs(vec![4, 8]).unwrap();
+    daemon.publish(vec![4, 8]).unwrap();
     assert_eq!(
         levels(&mut first, pool, &[key(3), key(4)]),
         vec![Host, Host]
@@ -1454,7 +1454,7 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
     let server = Running::start();
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_epochs(vec![1]).unwrap();
+    daemon.publish(vec![1]).unwrap();
     let mut serving_worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let pool = trial_pool(&mut serving_worker);
     daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
@@ -1503,7 +1503,7 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
     assert_eq!(contents(got.storages.remove(0).1), b"good");
 
     // Epoch 2 reserves a page it commits only after the rollback.
-    let ::storage::protocol::Reply::Reserved { .. } = trial
+    let ::storage::protocol::Response::Reserved { .. } = trial
         .call(
             &::storage::protocol::Request::Reserve {
                 pool,
@@ -1560,7 +1560,7 @@ fn a_epoch_reads_what_it_published_that_only_a_epoch_on_trial_retains() {
     let server = Running::start();
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_epochs(vec![1]).unwrap();
+    daemon.publish(vec![1]).unwrap();
     let mut serving = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let planes = memfd(&[1; 4]);
     serving
@@ -1587,12 +1587,12 @@ fn a_epoch_reads_what_it_published_that_only_a_epoch_on_trial_retains() {
 /// takes on all of them holds fewer.
 #[test]
 fn a_host_sizes_the_host_kv_cache_of_a_epoch_in_tokens() {
-    use ::storage::protocol::{Reply, Request};
+    use ::storage::protocol::{Request, Response};
 
     let server = Running::start();
     let mut daemon = head(&server.socket);
     daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_epochs(vec![1]).unwrap();
+    daemon.publish(vec![1]).unwrap();
     let mut engine = engine_head(&server.socket, 1);
     let mut ask = |tokens: u64, host_bytes: Option<u64>| {
         let answer = engine
@@ -1605,7 +1605,7 @@ fn a_host_sizes_the_host_kv_cache_of_a_epoch_in_tokens() {
                 &[],
             )
             .unwrap();
-        let Reply::HostCache { tokens } = answer.reply else {
+        let Response::HostCache { tokens } = answer.reply else {
             panic!("the host KV cache was not sized: {:?}", answer.reply);
         };
         tokens
@@ -1666,13 +1666,13 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
 /// through it into the KV storage.
 #[test]
 fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
-    use ::storage::protocol::{PageShape, Reply, Request};
+    use ::storage::protocol::{PageShape, Request, Response};
     use storage_server::STAGING_POOL_BYTES;
 
     let server = Running::reserving(u64::MAX);
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_epochs(vec![1]).unwrap();
+    daemon.publish(vec![1]).unwrap();
     let mut engine = engine_head(&server.socket, 1);
     let mut ask = |tokens: u64, host_bytes: Option<u64>| {
         let answer = engine
@@ -1685,7 +1685,7 @@ fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
                 &[],
             )
             .unwrap();
-        let Reply::HostCache { tokens } = answer.reply else {
+        let Response::HostCache { tokens } = answer.reply else {
             panic!("the host KV cache was not sized: {:?}", answer.reply);
         };
         tokens
@@ -1700,14 +1700,14 @@ fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
             kv_head_count: 2,
             page_bytes: 16,
         };
-        let request = Request::PagePool {
+        let request = Request::Pool {
             shape,
             numa_node: None,
             bytes: Some(bytes),
         };
         match worker.call(&request, &[]).unwrap().reply {
-            Reply::PagePool { slots, .. } => Some(slots),
-            Reply::Error { .. } => None,
+            Response::Pool { slots, .. } => Some(slots),
+            Response::Error { .. } => None,
             reply => panic!("a page pool request answered {reply:?}"),
         }
     };
@@ -1855,7 +1855,7 @@ fn one_key_keeps_a_copy_at_each_location() {
     assert_eq!(listed, vec![(key(2), near)]);
 }
 
-/// The GPU the ledger tests book on, which no process touches: the server
+/// The GPU the quota tests reserve on, which no process touches: the server
 /// never interprets a storage, so a memfd stands for device storage.
 pub(crate) const GPU: [u8; 16] = [0x5a; 16];
 
@@ -1874,50 +1874,50 @@ fn segment(epoch: u64, ordinal: u32) -> Option<::storage::Segment> {
     Some(::storage::Segment { epoch, ordinal })
 }
 
-/// The deployment's ledger of [`GPU`] as `client` reads it.
-pub(crate) fn ledger(client: &mut Client) -> ::storage::GpuLedger {
-    let ledgers = client.ledger(vec![GPU]).unwrap().ledgers;
-    assert_eq!(ledgers.len(), 1, "{ledgers:?}");
-    ledgers.into_iter().next().unwrap()
+/// The deployment's quota of [`GPU`] as `client` reads it.
+pub(crate) fn quota_of(client: &mut Client) -> ::storage::Quota {
+    let quotas = client.usage(vec![GPU]).unwrap().quotas;
+    assert_eq!(quotas.len(), 1, "{quotas:?}");
+    quotas.into_iter().next().unwrap()
 }
 
-/// The bytes of `ledger`'s entries of `item` held by exactly `epochs`.
-pub(crate) fn booked(ledger: &::storage::GpuLedger, item: Item, epochs: &[u64]) -> u64 {
-    ledger.bytes(|entry| entry.item == item && entry.epochs == epochs)
+/// The bytes of `quota`'s reservations of `item` held by exactly `epochs`.
+pub(crate) fn reserved(quota: &::storage::Quota, item: Item, epochs: &[u64]) -> u64 {
+    quota.bytes(|reservation| reservation.item == item && reservation.epochs == epochs)
 }
 
-/// Waits until `client` reads `used` bytes booked in the ledger: a
+/// Waits until `client` reads a usage of `usage` bytes: a
 /// connection's end reaches the server a moment after the client drops it.
-fn await_used(client: &mut Client, used: u64) {
-    let mut booked = 0;
+fn await_usage(client: &mut Client, usage: u64) {
+    let mut reserved = 0;
     for _ in 0..200 {
-        booked = ledger(client).used();
-        if booked == used {
+        reserved = quota_of(client).usage();
+        if reserved == usage {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("the ledger books {booked} bytes, not {used}");
+    panic!("the usage is {reserved} bytes, not {usage}");
 }
 
 /// Two epochs of a deployment share a GPU within one quota: each storage is
-/// booked once, however many epochs map it, an epoch's booked items end with
-/// its processes, nothing takes the ledger past its quota, and a commit
+/// reserved once, however many epochs map it, an epoch's reserved items end with
+/// its processes, nothing takes a GPU past its quota, and a commit
 /// hands the predecessor's segments the successor maps to the successor on
-/// the ledger, as a transfer rather than a release and an allocation.
+/// the quota, as a transfer rather than a release and an allocation.
 #[test]
 fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_epochs(vec![1]).unwrap();
+    head.publish(vec![1]).unwrap();
 
-    // Epoch 1 states its quota of 700 bytes of the GPU's 1000 and books its
+    // Epoch 1 states its quota of 700 bytes of the GPU's 1000 and reserves its
     // process and graph pool, then publishes its weights, a KV cache
     // segment and its buffer.
     let mut first = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     first
-        .book(
+        .reserve(
             GPU,
             1000,
             Some(700),
@@ -1939,22 +1939,22 @@ fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
             ],
         )
         .unwrap();
-    let book = ledger(&mut head);
+    let quota = quota_of(&mut head);
     assert_eq!(
-        (book.quota, book.total, book.used()),
+        (quota.limit, quota.total, quota.usage()),
         (Some(700), 1000, 470)
     );
-    assert_eq!(booked(&book, Item::CacheSegment, &[1]), 50);
-    assert_eq!(booked(&book, Item::Exclusive, &[1]), 20);
+    assert_eq!(reserved(&quota, Item::CacheSegment, &[1]), 50);
+    assert_eq!(reserved(&quota, Item::Exclusive, &[1]), 20);
 
-    // Epoch 2 maps the weights and the segment: each is booked once, held
-    // by both epochs, beside the process and graph pool epoch 2 books.
+    // Epoch 2 maps the weights and the segment: each is reserved once, held
+    // by both epochs, beside the process and graph pool epoch 2 reserves.
     head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
     let mut second = epoch_worker(&server.socket, scope("text", 0), 2, claim);
     second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
-    let book = second
-        .book(
+    let quota = second
+        .reserve(
             GPU,
             1000,
             Some(700),
@@ -1962,12 +1962,12 @@ fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
         )
         .unwrap()
         .remove(0);
-    assert_eq!(book.used(), 670);
-    assert_eq!(booked(&book, Item::Weights, &[1, 2]), 200);
-    assert_eq!(booked(&book, Item::CacheSegment, &[1, 2]), 50);
+    assert_eq!(quota.usage(), 670);
+    assert_eq!(reserved(&quota, Item::Weights, &[1, 2]), 200);
+    assert_eq!(reserved(&quota, Item::CacheSegment, &[1, 2]), 50);
 
-    // The successor's own segment takes the ledger to its quota; one byte
-    // more is refused, naming every entry of the ledger.
+    // The successor's own segment takes the quota to its quota; one byte
+    // more is refused, naming every entry of the quota.
     let own = memfd(&[4; 4]);
     second
         .put(
@@ -1997,13 +1997,13 @@ fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
         }
         other => panic!("expected a refusal past the quota, got {other:?}"),
     }
-    assert_eq!(ledger(&mut head).used(), 700);
+    assert_eq!(quota_of(&mut head).usage(), 700);
 
     // The commit: epoch 1's processes end in order, withdrawing what they
-    // booked, and the claim retires epoch 1, which releases its buffer. The
+    // reserved, and the claim retires epoch 1, which releases its buffer. The
     // segment epoch 2 maps is epoch 2's alone, its bytes unchanged.
     first
-        .book(
+        .reserve(
             GPU,
             1000,
             Some(700),
@@ -2011,31 +2011,31 @@ fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
         )
         .unwrap();
     drop(first);
-    await_used(&mut head, 500);
+    await_usage(&mut head, 500);
     head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
-    let book = ledger(&mut head);
-    assert_eq!(book.used(), 480);
-    assert_eq!(booked(&book, Item::CacheSegment, &[2]), 80);
-    assert_eq!(booked(&book, Item::Weights, &[2]), 200);
-    assert_eq!(booked(&book, Item::Exclusive, &[1]), 0);
-    assert_eq!(book.quota, Some(700));
+    let quota = quota_of(&mut head);
+    assert_eq!(quota.usage(), 480);
+    assert_eq!(reserved(&quota, Item::CacheSegment, &[2]), 80);
+    assert_eq!(reserved(&quota, Item::Weights, &[2]), 200);
+    assert_eq!(reserved(&quota, Item::Exclusive, &[1]), 0);
+    assert_eq!(quota.limit, Some(700));
 }
 
 /// A previous epoch kept as its weights keeps nothing else once its
-/// processes exited: what they booked ends with them, and the head ends its
+/// processes exited: what they reserved ends with them, and the head ends its
 /// retention of every exclusive storage, so its buffer is released and the
 /// segment its successor maps is the successor's alone, while the weights
-/// both map stay booked once for both. The successor's room on the ledger
+/// both map stay reserved once for both. The successor's room on the quota
 /// grows by all of it.
 #[test]
 fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_epochs(vec![1]).unwrap();
+    head.publish(vec![1]).unwrap();
     let mut first = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     first
-        .book(GPU, 1000, Some(700), vec![(Item::Process, 100)])
+        .reserve(GPU, 1000, Some(700), vec![(Item::Process, 100)])
         .unwrap();
     let storages = [memfd(&[1; 4]), memfd(&[2; 4]), memfd(&[3; 4])];
     first
@@ -2056,21 +2056,21 @@ fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
     let mut second = epoch_worker(&server.socket, scope("text", 0), 2, claim);
     second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
-    assert_eq!(ledger(&mut head).used(), 370);
+    assert_eq!(quota_of(&mut head).usage(), 370);
 
     // The previous epoch's processes exit; the head keeps its weights.
-    // The kept epoch's processes end in order, withdrawing what they booked.
+    // The kept epoch's processes end in order, withdrawing what they reserved.
     first
-        .book(GPU, 1000, Some(700), vec![(Item::Process, 0)])
+        .reserve(GPU, 1000, Some(700), vec![(Item::Process, 0)])
         .unwrap();
     drop(first);
-    await_used(&mut head, 270);
+    await_usage(&mut head, 270);
     assert_eq!(head.keep_weights(vec![1], Vec::new()).unwrap(), 1);
-    let book = ledger(&mut head);
-    assert_eq!(book.used(), 250);
-    assert_eq!(booked(&book, Item::Weights, &[1, 2]), 200);
-    assert_eq!(booked(&book, Item::CacheSegment, &[2]), 50);
-    assert_eq!(booked(&book, Item::Exclusive, &[1]), 0);
+    let quota = quota_of(&mut head);
+    assert_eq!(quota.usage(), 250);
+    assert_eq!(reserved(&quota, Item::Weights, &[1, 2]), 200);
+    assert_eq!(reserved(&quota, Item::CacheSegment, &[2]), 50);
+    assert_eq!(reserved(&quota, Item::Exclusive, &[1]), 0);
     // A worker is no head.
     let refused = second
         .call(
@@ -2084,7 +2084,7 @@ fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
     assert!(
         matches!(
             refused.reply,
-            ::storage::protocol::Reply::Error {
+            ::storage::protocol::Response::Error {
                 kind: ErrorKind::Invalid,
                 ..
             }
@@ -2104,7 +2104,7 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_epochs(vec![1]).unwrap();
+    head.publish(vec![1]).unwrap();
     let mut first = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let storages = [memfd(&[1; 4]), memfd(&[2; 4])];
     first
@@ -2124,7 +2124,7 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
         server_error(head.move_weights(1, true)),
         ErrorKind::Unavailable
     );
-    assert_eq!(booked(&ledger(&mut head), Item::Weights, &[1]), 200);
+    assert_eq!(reserved(&quota_of(&mut head), Item::Weights, &[1]), 200);
     // Epoch 2 retains nothing; epoch 1 has nothing in host storage.
     assert_eq!(head.move_weights(2, true).unwrap(), (0, 0));
     assert_eq!(head.move_weights(1, false).unwrap(), (0, 0));
@@ -2135,7 +2135,7 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
     assert!(
         matches!(
             refused.reply,
-            ::storage::protocol::Reply::Error {
+            ::storage::protocol::Response::Error {
                 kind: ErrorKind::Invalid,
                 ..
             }
@@ -2146,29 +2146,29 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
 }
 
 /// The processes of one scope and epoch serve in turn: a standby or a
-/// relaunch that books beside the rank it replaces counts once, as the
-/// larger booking.
+/// relaunch that reserves beside the rank it replaces counts once, as the
+/// larger reservation.
 #[test]
 fn the_processes_of_one_scope_count_as_their_largest_booking() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_epochs(vec![1]).unwrap();
+    head.publish(vec![1]).unwrap();
     let mut rank = epoch_worker(&server.socket, scope("text", 0), 1, claim);
-    rank.book(GPU, 1000, Some(700), vec![(Item::Process, 300)])
+    rank.reserve(GPU, 1000, Some(700), vec![(Item::Process, 300)])
         .unwrap();
     let mut standby = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     standby
-        .book(GPU, 1000, Some(700), vec![(Item::Process, 350)])
+        .reserve(GPU, 1000, Some(700), vec![(Item::Process, 350)])
         .unwrap();
-    assert_eq!(ledger(&mut head).used(), 350);
+    assert_eq!(quota_of(&mut head).usage(), 350);
     drop(standby);
-    await_used(&mut head, 300);
+    await_usage(&mut head, 300);
 }
 
-/// A lost rank's booking stays reserved for the process that replaces it:
-/// another scope cannot book into it, and the relaunch takes each item over
-/// as it books it.
+/// A lost rank's reservation stays reserved for the process that replaces it:
+/// another scope cannot reserve into it, and the relaunch takes each item over
+/// as it reserves it.
 #[test]
 fn a_lost_rank_s_booking_stays_reserved_for_its_relaunch() {
     let server = Running::start();
@@ -2176,9 +2176,9 @@ fn a_lost_rank_s_booking_stays_reserved_for_its_relaunch() {
     let claim = head
         .claim(1, vec![scope("text", 0), scope("text", 1)], Vec::new())
         .unwrap();
-    head.publish_epochs(vec![1]).unwrap();
+    head.publish(vec![1]).unwrap();
     let mut rank = epoch_worker(&server.socket, scope("text", 0), 1, claim);
-    rank.book(
+    rank.reserve(
         GPU,
         1000,
         Some(700),
@@ -2190,25 +2190,25 @@ fn a_lost_rank_s_booking_stays_reserved_for_its_relaunch() {
     // The lost rank's 500 bytes leave 200 of the quota to another scope.
     let mut other = epoch_worker(&server.socket, scope("text", 1), 1, claim);
     assert_eq!(
-        server_error(other.book(GPU, 1000, Some(700), vec![(Item::Process, 300)])),
+        server_error(other.reserve(GPU, 1000, Some(700), vec![(Item::Process, 300)])),
         ErrorKind::Quota
     );
-    assert_eq!(ledger(&mut head).used(), 500);
+    assert_eq!(quota_of(&mut head).usage(), 500);
 
-    // The relaunch books a smaller process and takes that item over; the
-    // graph pool it has not booked yet stays reserved.
+    // The relaunch reserves a smaller process and takes that item over; the
+    // graph pool it has not reserved yet stays reserved.
     let mut relaunch = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     relaunch
-        .book(GPU, 1000, Some(700), vec![(Item::Process, 250)])
+        .reserve(GPU, 1000, Some(700), vec![(Item::Process, 250)])
         .unwrap();
-    assert_eq!(ledger(&mut head).used(), 450);
+    assert_eq!(quota_of(&mut head).usage(), 450);
     relaunch
-        .book(GPU, 1000, Some(700), vec![(Item::GraphPool, 150)])
+        .reserve(GPU, 1000, Some(700), vec![(Item::GraphPool, 150)])
         .unwrap();
-    assert_eq!(ledger(&mut head).used(), 400);
+    assert_eq!(quota_of(&mut head).usage(), 400);
 }
 
-/// A rank that withdraws its bookings before its connection ends, as a
+/// A rank that withdraws its reservations before its connection ends, as a
 /// worker that ends in order does, leaves nothing reserved, and a lost
 /// rank's reservation ends with its epoch's retirement.
 #[test]
@@ -2218,35 +2218,32 @@ fn reservations_end_with_a_withdrawal_or_the_epoch_s_retirement() {
     let claim = head
         .claim(1, vec![scope("text", 0), scope("text", 1)], Vec::new())
         .unwrap();
-    head.publish_epochs(vec![1]).unwrap();
+    head.publish(vec![1]).unwrap();
     let mut closed = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     closed
-        .book(GPU, 1000, Some(700), vec![(Item::Process, 300)])
+        .reserve(GPU, 1000, Some(700), vec![(Item::Process, 300)])
         .unwrap();
     closed
-        .book(GPU, 1000, Some(700), vec![(Item::Process, 0)])
+        .reserve(GPU, 1000, Some(700), vec![(Item::Process, 0)])
         .unwrap();
     drop(closed);
-    await_used(&mut head, 0);
+    await_usage(&mut head, 0);
 
     let mut lost = epoch_worker(&server.socket, scope("text", 1), 1, claim);
-    lost.book(GPU, 1000, Some(700), vec![(Item::Process, 300)])
+    lost.reserve(GPU, 1000, Some(700), vec![(Item::Process, 300)])
         .unwrap();
     drop(lost);
-    assert_eq!(ledger(&mut head).used(), 300);
+    assert_eq!(quota_of(&mut head).usage(), 300);
     head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_epochs(vec![2]).unwrap();
+    head.publish(vec![2]).unwrap();
     head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
-    // Nothing is booked on the GPU any more: it has no ledger, or an empty
+    // Nothing is reserved on the GPU any more: it has no quota, or an empty
     // one.
-    let ledgers = head.ledger(vec![GPU]).unwrap().ledgers;
-    assert_eq!(
-        ledgers.iter().map(::storage::GpuLedger::used).sum::<u64>(),
-        0
-    );
+    let quotas = head.usage(vec![GPU]).unwrap().quotas;
+    assert_eq!(quotas.iter().map(::storage::Quota::usage).sum::<u64>(), 0);
 }
 
-/// A worker books only its own items, and a booking that leaves a ledger
+/// A worker reserves only its own items, and a reservation that leaves a quota
 /// past its quota (as a smaller fraction an epoch states since may) shrinks
 /// it but never grows it.
 #[test]
@@ -2254,25 +2251,25 @@ fn a_ledger_past_its_quota_shrinks_but_never_grows() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_epochs(vec![1]).unwrap();
+    head.publish(vec![1]).unwrap();
     let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     worker
-        .book(GPU, 1000, Some(700), vec![(Item::Process, 600)])
+        .reserve(GPU, 1000, Some(700), vec![(Item::Process, 600)])
         .unwrap();
     for item in [Item::TransferContext, Item::Weights, Item::CacheSegment] {
         assert_eq!(
-            server_error(worker.book(GPU, 1000, None, vec![(item, 1)])),
+            server_error(worker.reserve(GPU, 1000, None, vec![(item, 1)])),
             ErrorKind::Invalid
         );
     }
 
     worker
-        .book(GPU, 1000, Some(500), vec![(Item::Process, 550)])
+        .reserve(GPU, 1000, Some(500), vec![(Item::Process, 550)])
         .unwrap();
     assert_eq!(
-        server_error(worker.book(GPU, 1000, None, vec![(Item::Process, 560)])),
+        server_error(worker.reserve(GPU, 1000, None, vec![(Item::Process, 560)])),
         ErrorKind::Quota
     );
-    let book = ledger(&mut worker);
-    assert_eq!((book.quota, book.used()), (Some(500), 550));
+    let quota = quota_of(&mut worker);
+    assert_eq!((quota.limit, quota.usage()), (Some(500), 550));
 }

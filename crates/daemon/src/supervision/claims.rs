@@ -153,12 +153,14 @@ impl ClaimHolder {
             .call(&storage::protocol::Request::Endpoint, &[])?
             .reply
         {
-            storage::protocol::Reply::Endpoint { tcp: Some(bound) } if self.remote_pages => bound
-                .rsplit_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok())
-                .zip(self.address)
-                .map(|(port, address)| std::net::SocketAddr::new(address, port).to_string())
-                .unwrap_or_default(),
+            storage::protocol::Response::Endpoint { tcp: Some(bound) } if self.remote_pages => {
+                bound
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    .zip(self.address)
+                    .map(|(port, address)| std::net::SocketAddr::new(address, port).to_string())
+                    .unwrap_or_default()
+            }
             _ => String::new(),
         };
         let claimed = Claimed {
@@ -190,7 +192,7 @@ impl ClaimHolder {
             .get_mut(deployment)
             .with_context(|| format!("this node holds no claim of deployment {deployment}"))?
             .client
-            .publish_epochs(epochs.to_vec())?;
+            .publish(epochs.to_vec())?;
         Ok(())
     }
 
@@ -310,10 +312,10 @@ impl ClaimHolder {
         Ok(())
     }
 
-    /// The storage ledgers this node's Storage Server keeps for
+    /// The quotas this node's Storage Server keeps for
     /// `deployment`, one per GPU of the node it uses, what the host admits
     /// of new host storage, and what the deployment's transfer tasks copied
-    /// on the host by priority, as JSON (`{"ledgers": [...],
+    /// on the host by priority, as JSON (`{"quotas": [...],
     /// "host_storage": {...}, "transfers": [...]}`), read over the claim
     /// this daemon holds.
     ///
@@ -321,7 +323,7 @@ impl ClaimHolder {
     ///
     /// Fails when this daemon holds no claim of the deployment, or the
     /// server cannot be reached.
-    pub(crate) fn ledger(&mut self, deployment: &str) -> anyhow::Result<String> {
+    pub(crate) fn usage(&mut self, deployment: &str) -> anyhow::Result<String> {
         use anyhow::Context as _;
 
         let held = self
@@ -330,12 +332,12 @@ impl ClaimHolder {
             .with_context(|| format!("this node holds no claim of deployment {deployment}"))?;
         let read = held
             .client
-            .ledger(Vec::new())
-            .with_context(|| format!("reading the storage ledgers of deployment {deployment}"))?;
+            .usage(Vec::new())
+            .with_context(|| format!("reading the quotas of deployment {deployment}"))?;
         Ok(serde_json::json!({
-            "ledgers": read.ledgers,
+            "quotas": read.quotas,
             "host_storage": read.host,
-            "transfers": read.transfers,
+            "tasks": read.tasks,
         })
         .to_string())
     }
@@ -401,7 +403,7 @@ impl ClaimHolder {
         let mut claims = Vec::with_capacity(self.held.len());
         let mut descriptors = Vec::with_capacity(self.held.len());
         for (deployment, held) in self.held.drain() {
-            let (descriptor, next) = held.client.hand_over()?;
+            let (descriptor, next) = held.client.handoff()?;
             descriptors.push(descriptor);
             claims.push(HandedClaim {
                 deployment,

@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use ::storage::protocol::Access;
-use ::storage::{Claim, Client, GpuLedger, Item, Key, Location, Mode, Role, Scope, StorageRecord};
+use ::storage::{Claim, Client, Item, Key, Location, Mode, Quota, Role, Scope, StorageRecord};
 use ipc::StorageLaunch;
 use platform::{DeviceId, Protection};
 
@@ -484,7 +484,7 @@ impl Retained {
         let record = StorageRecord {
             location: Location::Device { gpu },
             bytes,
-            // The ledgers book the segment's storages together, as the cache's.
+            // The quotas reserve the segment's storages together, as the cache's.
             segment: Some(::storage::Segment {
                 epoch: part.segment.epoch,
                 ordinal: part.segment.ordinal,
@@ -743,16 +743,16 @@ impl Retained {
         }
         let task = state
             .client
-            .transfer(spans, ::storage::protocol::Priority::Promotion, 0)
+            .copy(spans, ::storage::protocol::Priority::Promotion, 0)
             .map_err(|error| storage_error("copying the predecessor's cache flags", error))?;
         // The copy is a few cells per unit: the worker waits for it at the boundary it runs at.
         loop {
             match state
                 .client
-                .poll_transfer(task)
+                .poll_task(task)
                 .map_err(|error| storage_error("copying the predecessor's cache flags", error))?
             {
-                Some((_, ::storage::protocol::TransferEnd::Complete)) => break,
+                Some((_, ::storage::protocol::TaskStatus::Complete)) => break,
                 Some((_, end)) => {
                     return Err(Error::Interface(format!(
                         "copying the predecessor's cache flags ended as {end:?}"
@@ -876,7 +876,7 @@ impl Retained {
         Ok(())
     }
 
-    /// The worker's scope, which its epoch's ledger entries name.
+    /// The worker's scope, which its epoch's quota entries name.
     pub fn scope(&self) -> &Scope {
         &self.scope
     }
@@ -897,7 +897,7 @@ impl Retained {
     /// already stays.
     pub fn state_quota(&self, device: DeviceId, fraction: f64) -> Result<()> {
         let total = device.memory_info()?.total;
-        self.book(
+        self.reserve(
             device,
             total,
             crate::capacity::quota(total, fraction),
@@ -906,71 +906,70 @@ impl Retained {
         .map(drop)
     }
 
-    /// The deployment's ledger of the GPU of `device`, and what the host
+    /// The deployment's quota of the GPU of `device`, and what the host
     /// admits of new host storage.
-    pub fn ledger(&self, device: DeviceId) -> Result<(GpuLedger, ::storage::HostStorage)> {
+    pub fn usage(&self, device: DeviceId) -> Result<(Quota, ::storage::HostStorage)> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
         let read = state
             .client
-            .ledger(vec![gpu])
-            .map_err(|error| storage_error("reading the storage ledger", error))?;
+            .usage(vec![gpu])
+            .map_err(|error| storage_error("reading the quota", error))?;
         Ok((
-            Self::of_deployment(&self.scope, gpu, read.ledgers),
+            Self::of_deployment(&self.scope, gpu, read.quotas),
             read.host,
         ))
     }
 
-    /// Books `items` of the worker on the GPU of `device` of `total` bytes,
-    /// stating the epoch's quota there (see `Request::Book`), and returns
-    /// the deployment's ledger of the GPU after it. Fails with the server's
-    /// refusal, which names every entry of the ledger, when the booking
+    /// Reserves `items` of the worker on the GPU of `device` of `total` bytes,
+    /// stating the epoch's quota there (see `Request::Quota`), and returns
+    /// the deployment's quota of the GPU after it. Fails with the server's
+    /// refusal, which names every entry of the quota, when the reservation
     /// would take it past its quota.
-    pub(crate) fn book(
+    pub(crate) fn reserve(
         &self,
         device: DeviceId,
         total: u64,
         quota: u64,
         items: Vec<(Item, u64)>,
-    ) -> Result<GpuLedger> {
+    ) -> Result<Quota> {
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
-        let ledgers =
-            state
-                .client
-                .book(gpu, total, Some(quota), items)
-                .map_err(|error| match error {
-                    ::storage::Error::Server {
-                        kind: ::storage::protocol::ErrorKind::Quota,
-                        message,
-                    } => Error::Unsupported(format!(
-                        "the device storage the worker holds on {device} does not fit its quota: \
+        let quotas = state
+            .client
+            .reserve(gpu, total, Some(quota), items)
+            .map_err(|error| match error {
+                ::storage::Error::Server {
+                    kind: ::storage::protocol::ErrorKind::Quota,
+                    message,
+                } => Error::Unsupported(format!(
+                    "the device storage the worker holds on {device} does not fit its quota: \
                      {message}"
-                    )),
-                    error => storage_error("booking device storage", error),
-                })?;
-        Ok(Self::of_deployment(&self.scope, gpu, ledgers))
+                )),
+                error => storage_error("reservation device storage", error),
+            })?;
+        Ok(Self::of_deployment(&self.scope, gpu, quotas))
     }
 
-    /// The ledger of `scope`'s deployment among `ledgers` of `gpu`; an
+    /// The quota of `scope`'s deployment among `quotas` of `gpu`; an
     /// empty one when the server keeps none yet.
-    fn of_deployment(scope: &Scope, gpu: [u8; 16], ledgers: Vec<GpuLedger>) -> GpuLedger {
-        ledgers
+    fn of_deployment(scope: &Scope, gpu: [u8; 16], quotas: Vec<Quota>) -> Quota {
+        quotas
             .into_iter()
-            .find(|ledger| ledger.deployment == scope.deployment)
-            .unwrap_or(GpuLedger {
+            .find(|quota| quota.deployment == scope.deployment)
+            .unwrap_or(Quota {
                 gpu,
                 deployment: scope.deployment.clone(),
                 total: 0,
-                quota: None,
-                entries: Vec::new(),
+                limit: None,
+                reservations: Vec::new(),
                 host_link_bytes_per_second: None,
                 transfer_context: 0,
             })
     }
 
     /// Whether the worker's scope retains `tensor` in the worker's epoch.
-    fn retains(&self, tensor: &::storage::protocol::ListedTensor) -> bool {
+    fn retains(&self, tensor: &::storage::protocol::TensorListing) -> bool {
         tensor
             .retainers
             .iter()

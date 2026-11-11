@@ -147,9 +147,9 @@ fn keep_event(
 /// and it is asked for through the process connection, where the driver applies it.
 const EPOCH_LIFECYCLE: &str = "this command is the epoch layer's, applied through the process connection rather than the \
      request connection";
-/// What the engine answers a command over the deployment's storage ledgers or transfer budgets:
+/// What the engine answers a command over the deployment's quotas or transfer budgets:
 /// each node's daemon reads them over the claim it holds, not through an epoch's main process.
-pub(super) const LEDGERS: &str = "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
+pub(super) const QUOTAS: &str = "the quotas and transfer budgets are read by each node's daemon over its claim, not \
      by an epoch's main process";
 /// The name of an engine command, for a log line about one this epoch does not serve.
 pub(super) fn engine_command_name(
@@ -489,13 +489,13 @@ impl MainProcess {
                     },
                 ))
             }
-            // The storage ledgers and the transfer budgets are each node's daemon's, read over
+            // The quotas and the transfer budgets are each node's daemon's, read over
             // its claim; an epoch's main process holds no claim of the deployment's.
             Some(proto::request::wire::engine_command::Kind::DescribeStorage(describe)) => Some(
                 proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
                     id: describe.id,
                     results: Vec::new(),
-                    error: LEDGERS.to_owned(),
+                    error: QUOTAS.to_owned(),
                 }),
             ),
             // What the prefix cache holds is answered here, from what this process announced.

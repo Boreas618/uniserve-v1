@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::MainProcess;
-use super::requests::{LEDGERS, fence_switch};
+use super::requests::{QUOTAS, fence_switch};
 
 /// A storage command (a cache resize, a sleep or wake, a hook) still working: what answers it, and
 /// who waits.
@@ -252,7 +252,7 @@ impl MainProcess {
         // The storage of a previous epoch is each node's daemon's to keep or release over its
         // claim; this process holds no claim of the deployment's.
         if !resize.keep_weights.is_empty() {
-            self.refuse(front, resize.id, LEDGERS.to_owned());
+            self.refuse(front, resize.id, QUOTAS.to_owned());
             return;
         }
         let change = match scheduler::CacheChange::from_wire(resize) {

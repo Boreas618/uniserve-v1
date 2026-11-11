@@ -149,14 +149,14 @@ impl<'r> Context<'r> {
                     .iter()
                     .any(|chunk| matches!(chunk.binding, Binding::Remote { .. }))
                 {
-                    return Err(Error::Invalid(
+                    return Err(Error::Manifest(
                         "remote storage is a source; submit the request on the target host".into(),
                     ));
                 }
             }
         }
         if request.gpus.len() < request.target.ranks.len() {
-            return Err(Error::Invalid(format!(
+            return Err(Error::Manifest(format!(
                 "{} target ranks cannot take {} GPUs",
                 request.target.ranks.len(),
                 request.gpus.len()
@@ -214,7 +214,7 @@ impl<'r> Context<'r> {
                 element: field.element,
                 logical: &canonical.logical,
             }),
-            (Form::Canonical, _) => Err(Error::Invalid(format!(
+            (Form::Canonical, _) => Err(Error::Manifest(format!(
                 "field {} has no canonical form",
                 field.tensor
             ))),
@@ -228,7 +228,7 @@ impl<'r> Context<'r> {
         if bandwidth > 0.0 {
             Ok(bandwidth)
         } else {
-            Err(Error::Invalid(format!(
+            Err(Error::Manifest(format!(
                 "no bandwidth is measured from {:?} to {:?}",
                 pair.0, pair.1
             )))
@@ -409,7 +409,7 @@ pub(super) fn plan(request: &Request) -> Result<Manifest> {
     let candidates = match fixed {
         Some(assignment) => vec![assignment],
         None if request.target.ranks.iter().any(|rank| rank.gpu.is_some()) => {
-            return Err(Error::Invalid(
+            return Err(Error::Manifest(
                 "target ranks name GPUs for some ranks only, or GPUs outside the request's".into(),
             ));
         }
@@ -439,7 +439,7 @@ pub(super) fn plan(request: &Request) -> Result<Manifest> {
             best = Some((busiest, manifest));
         }
     }
-    let (_, mut manifest) = best.ok_or_else(|| Error::Invalid("no GPU assignment".into()))?;
+    let (_, mut manifest) = best.ok_or_else(|| Error::Manifest("no GPU assignment".into()))?;
     manifest.request = request.digest()?;
     manifest.digest = manifest.compute_digest()?;
     Ok(manifest)
@@ -674,7 +674,7 @@ impl<'c, 'r> Draft<'c, 'r> {
                     && named == group
                 {
                     let canonical = canonical.as_ref().ok_or_else(|| {
-                        Error::Invalid(format!(
+                        Error::Manifest(format!(
                             "field {} of group {group} has no canonical form",
                             field.tensor
                         ))
@@ -693,7 +693,7 @@ impl<'c, 'r> Draft<'c, 'r> {
             }
         }
         let encoding = encoding.ok_or_else(|| {
-            Error::Invalid(format!("rank {rank} holds no field of group {group}"))
+            Error::Manifest(format!("rank {rank} holds no field of group {group}"))
         })?;
         let index = self.stagings.len() as u32;
         self.stagings.push(Staging {
@@ -735,7 +735,7 @@ impl<'c, 'r> Draft<'c, 'r> {
                 let staging = self.staging(side, at.rank, group)?;
                 Ok(Space::Staging { staging })
             }
-            (Form::Canonical, _) => Err(Error::Invalid(format!(
+            (Form::Canonical, _) => Err(Error::Manifest(format!(
                 "field {} has no canonical form",
                 field.tensor
             ))),
@@ -931,7 +931,7 @@ impl<'c, 'r> Draft<'c, 'r> {
         // there: need each field's canonical region.
         let staging = self.staging(Side::Target, rank, group)?;
         let Some(conversion) = self.decodes.get(&staging) else {
-            return Err(Error::Invalid(format!("group {group} has no conversion")));
+            return Err(Error::Manifest(format!("group {group} has no conversion")));
         };
         let fields = conversion.fields.clone();
         for (storage, tensor) in fields {
@@ -1172,7 +1172,7 @@ impl<'c, 'r> Draft<'c, 'r> {
             .get(index)
             .filter(|chunk| chunk.offset <= offset)
             .ok_or_else(|| {
-                Error::Invalid(format!(
+                Error::Manifest(format!(
                     "byte {offset} of storage {} is in no chunk",
                     field.storage
                 ))
@@ -1271,7 +1271,7 @@ fn region_runs(logical: &[Span], from: &View<'_>, into: &View<'_>) -> Result<Vec
     let mut source_local = Vec::with_capacity(logical.len());
     let mut target_local = Vec::with_capacity(logical.len());
     for (dim, span) in logical.iter().enumerate() {
-        let missing = || Error::Invalid(format!("a block is not held along dimension {dim}"));
+        let missing = || Error::Manifest(format!("a block is not held along dimension {dim}"));
         let (source_start, source_step) = from.locate(dim, span).ok_or_else(missing)?;
         let (target_start, target_step) = into.locate(dim, span).ok_or_else(missing)?;
         source_local.push(source_start);
@@ -1283,7 +1283,7 @@ fn region_runs(logical: &[Span], from: &View<'_>, into: &View<'_>) -> Result<Vec
         ));
     }
     if from.element != into.element {
-        return Err(Error::Invalid(
+        return Err(Error::Manifest(
             "a block's source and target elements differ in size".into(),
         ));
     }

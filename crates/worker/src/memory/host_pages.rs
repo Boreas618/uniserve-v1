@@ -2,7 +2,7 @@
 //!
 //! The server keeps page pools of host storage: a memfd of equal slots per
 //! page layout and NUMA node, shared by every process of the host that asks
-//! for the same layout (`storage::protocol::Request::PagePool`). The host
+//! for the same layout (`storage::protocol::Request::Pool`). The host
 //! KV cache maps one per cache group, a denoising rank one for its latent
 //! trajectories, and an encoder rank its host's encoder pool; each maps it
 //! here, writable and registered for device copies, and addresses its slots
@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use ::storage::protocol::{PageShape, Reply, Request};
+use ::storage::protocol::{PageShape, Request, Response};
 use platform::{DeviceAttribute, DeviceId};
 
 use crate::memory::allocation::{Backing, ElementType, Storage, StorageView};
@@ -68,7 +68,7 @@ impl HostPages {
     ) -> Result<Self> {
         let answer = retained.call(what, |client| {
             client.call(
-                &Request::PagePool {
+                &Request::Pool {
                     shape,
                     numa_node,
                     bytes,
@@ -76,12 +76,7 @@ impl HostPages {
                 &[],
             )
         })?;
-        let Reply::PagePool {
-            pool,
-            slots,
-            page_bytes,
-        } = answer.reply
-        else {
+        let Response::Pool { pool, slots } = answer.reply else {
             return Err(Error::Interface(format!(
                 "the storage server answered {what} with {:?}",
                 answer.reply
@@ -90,6 +85,7 @@ impl HostPages {
         let descriptor = answer.descriptors.into_iter().next().ok_or_else(|| {
             Error::Interface(format!("{what}: the pool arrived without its storage"))
         })?;
+        let page_bytes = shape.page_bytes;
         let storage = Storage::map_host(descriptor, (slots * page_bytes) as usize, device, true)?;
         tracing::info!(
             pool,
@@ -103,10 +99,7 @@ impl HostPages {
             pool,
             storage,
             slots,
-            shape: PageShape {
-                page_bytes,
-                ..shape
-            },
+            shape,
         })
     }
 

@@ -29,8 +29,8 @@ use ::storage::transport::{Connection, Socket};
 use serde::{Deserialize, Serialize};
 
 use crate::kv_storage::KvStorage;
-use crate::ledger::Ledgers;
 use crate::pages::{HandedPools, Pools};
+use crate::quota::Quotas;
 use crate::transfers::Transfers;
 use crate::{ClientId, Deployment, Holder, Launch, Server, StorageEntry, TensorEntry};
 use ::storage::protocol::Retainer;
@@ -95,15 +95,15 @@ struct HandedServer {
     pages: HandedPools,
     host_reserve: u64,
     relaunch: Vec<String>,
-    /// The GPUs' totals, the epochs' quotas and the bookings of the
+    /// The GPUs' totals, the epochs' quotas and the reservations of the
     /// clients the handoff carries; empty from a predecessor that kept no
-    /// ledgers, whose clients book again when they next book.
+    /// quotas, whose clients reserve again when they next reserve.
     #[serde(default)]
-    ledgers: Ledgers,
+    quotas: Quotas,
     /// What each deployment's transfer tasks copied, by priority; empty
     /// from a predecessor that counted none.
     #[serde(default)]
-    transfer_totals: Vec<(String, Vec<::storage::protocol::TransferTotal>)>,
+    transfer_totals: Vec<(String, Vec<::storage::protocol::TaskTotal>)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -375,7 +375,7 @@ impl Server {
             pages,
             host_reserve: self.host_reserve,
             relaunch: std::mem::take(&mut self.relaunch),
-            ledgers: std::mem::take(&mut self.ledgers),
+            quotas: std::mem::take(&mut self.quotas),
             transfer_totals: self.transfers.handed_totals(),
         };
 
@@ -655,7 +655,7 @@ impl Server {
             shootdowns,
             pages,
             host_reserve: handed.host_reserve,
-            ledgers: handed.ledgers,
+            quotas: handed.quotas,
             kv_storage: KvStorage::new(connector),
             transfers: {
                 let mut transfers = Transfers::new(transfer);
@@ -753,7 +753,7 @@ mod tests {
         )
         .unwrap();
         let claim = head.claim(0, vec![scope.clone()], Vec::new()).unwrap();
-        head.publish_epochs(vec![0]).unwrap();
+        head.publish(vec![0]).unwrap();
         let mut worker = Client::connect(
             &path,
             Role::Worker {
@@ -789,10 +789,10 @@ mod tests {
                 )],
             )
             .unwrap();
-        // The worker books its process storage on a GPU under a quota.
+        // The worker reserves its process storage on a GPU under a quota.
         let gpu = [9; 16];
         worker
-            .book(gpu, 1000, Some(700), vec![(Item::Process, 300)])
+            .reserve(gpu, 1000, Some(700), vec![(Item::Process, 300)])
             .unwrap();
 
         // Committed replicas share their outputs; a candidate's output is
@@ -833,7 +833,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        head.publish_epochs(vec![2]).unwrap();
+        head.publish(vec![2]).unwrap();
 
         // Stop the server between two rounds and hand it to a successor on
         // another thread; a sleeping process stands for the successor's.
@@ -875,7 +875,7 @@ mod tests {
             .get(vec![Key([2; 32]), Key([3; 32])], Mode::Read, Vec::new())
             .unwrap();
         assert_eq!(got.missing, vec![Key([3; 32])]);
-        head.publish_epochs(vec![3]).unwrap();
+        head.publish(vec![3]).unwrap();
         assert!(
             worker
                 .get(vec![Key([3; 32])], Mode::Read, Vec::new())
@@ -883,12 +883,12 @@ mod tests {
                 .missing
                 .is_empty()
         );
-        // The ledger goes on too: its quota and the worker's booking, which
-        // the successor holds against a booking past the quota.
-        let ledgers = worker.ledger(vec![gpu]).unwrap().ledgers;
-        assert_eq!(ledgers.len(), 1);
-        assert_eq!((ledgers[0].quota, ledgers[0].used()), (Some(700), 300));
-        let refused = worker.book(gpu, 1000, None, vec![(Item::Staging, 401)]);
+        // The quota goes on too: its quota and the worker's reservation, which
+        // the successor holds against a reservation past the quota.
+        let quotas = worker.usage(vec![gpu]).unwrap().quotas;
+        assert_eq!(quotas.len(), 1);
+        assert_eq!((quotas[0].limit, quotas[0].usage()), (Some(700), 300));
+        let refused = worker.reserve(gpu, 1000, None, vec![(Item::Staging, 401)]);
         assert!(
             matches!(
                 refused,

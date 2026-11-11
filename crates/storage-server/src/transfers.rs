@@ -8,17 +8,17 @@
 //! ([`Request::Measured`](::storage::protocol::Request::Measured)), and runs
 //! the tasks heads and workers submit:
 //!
-//! 1. A client's [`Request::Transfer`] names its spans by [`Region`]. The
+//! 1. A client's [`Request::Submit`] names its spans by [`Region`]. The
 //!    server checks that every region is storage of the client's deployment
 //!    and every span lies within its region and writes no read-only tensor,
 //!    resolves each region to an [`Allocation`] and a byte offset, and
-//!    forwards the task as [`Event::Transfer`]. The first task that copies
+//!    forwards the task as [`Event::Task`]. The first task that copies
 //!    an allocation gives the Transfer Server its descriptor
 //!    ([`Event::Allocation`]); a released allocation is taken back
 //!    ([`Event::AllocationReleased`]) and unmapped once no task copies it.
 //! 2. The Transfer Server reports each task's progress and end
 //!    ([`Request::Copied`]), which the server relays to the submitter
-//!    ([`Event::TransferProgress`], [`Event::Transferred`]).
+//!    ([`Event::TaskProgress`], [`Event::TaskEnded`]).
 //! 3. A cancellation, by task or by update, and a submitter whose connection
 //!    closes cancel tasks ([`Event::Cancel`]); each still ends with its
 //!    report, since bytes may be in flight until then.
@@ -37,7 +37,7 @@
 //! NIXL agent ([`Event::Register`]); the peer's request waits until the
 //! Transfer Server reports the ranges and its agent's metadata
 //! ([`Request::Registered`](::storage::protocol::Request::Registered)), which
-//! answer it ([`Reply::Exposed`]). The exposure lives until the peer ends it
+//! answer it ([`Response::Exposed`]). The exposure lives until the peer ends it
 //! ([`Request::Unexpose`](::storage::protocol::Request::Unexpose)) or its
 //! connection closes; the Transfer Server then lets its registrations go
 //! ([`Event::Deregister`]), and the GPU contexts they held with them.
@@ -54,8 +54,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ::storage::protocol::{
     Access, Allocation, ContextBytes, ErrorKind, Event, FabricExport, FabricHandle, Link,
-    LinkBandwidth, LinkEnd, ListedTask, ListedTransfer, Location, Move, Priority, Region,
-    Registered, Reply, Role, Span, Throttle, TransferEnd, TransferTotal,
+    LinkBandwidth, LinkEnd, Location, Move, Priority, Region, Registration, Response, Role, Span,
+    TaskListing, TaskStatus, TaskTotal, Throttle, TransferListing,
 };
 
 use crate::child::{Launch, Supervised};
@@ -141,7 +141,7 @@ impl Transfers {
 
     /// What `deployment`'s tasks copied, by priority, highest first; the
     /// priorities it submitted no task of are left out.
-    pub(super) fn totals(&self, deployment: &str) -> Vec<TransferTotal> {
+    pub(super) fn totals(&self, deployment: &str) -> Vec<TaskTotal> {
         let Some(totals) = self.totals.get(deployment) else {
             return Vec::new();
         };
@@ -149,7 +149,7 @@ impl Transfers {
             .iter()
             .zip(totals)
             .filter(|(_, total)| total.bytes > 0)
-            .map(|(&priority, total)| TransferTotal {
+            .map(|(&priority, total)| TaskTotal {
                 priority,
                 bytes: total.bytes,
                 copied: total.copied,
@@ -158,7 +158,7 @@ impl Transfers {
     }
 
     /// Every deployment's totals, as a hot restart hands them over.
-    pub(super) fn handed_totals(&self) -> Vec<(String, Vec<TransferTotal>)> {
+    pub(super) fn handed_totals(&self) -> Vec<(String, Vec<TaskTotal>)> {
         self.totals
             .keys()
             .map(|deployment| (deployment.clone(), self.totals(deployment)))
@@ -166,7 +166,7 @@ impl Transfers {
     }
 
     /// Takes over the totals a predecessor handed over.
-    pub(super) fn resume_totals(&mut self, handed: Vec<(String, Vec<TransferTotal>)>) {
+    pub(super) fn resume_totals(&mut self, handed: Vec<(String, Vec<TaskTotal>)>) {
         for (deployment, totals) in handed {
             let entry = self.totals.entry(deployment).or_default();
             for total in totals {
@@ -283,15 +283,15 @@ impl Server {
             .ok_or_else(|| invalid("a transfer request comes from a head or a worker"))?
             .to_owned();
         match request {
-            Request::Transfer {
+            Request::Submit {
                 spans,
                 priority,
                 update,
             } => {
                 let task = self.submit(id, &deployment, spans, *priority, *update)?;
-                Ok(Outcome::Reply(Reply::Transferring { task }, Vec::new()))
+                Ok(Outcome::Response(Response::Submitted { task }, Vec::new()))
             }
-            Request::OpenTransfer { gpus } => {
+            Request::OpenSession { gpus } => {
                 let transfer = self
                     .transfers
                     .client
@@ -310,23 +310,23 @@ impl Server {
                 self.transfers.sessions.insert(session, id);
                 self.events.push((
                     transfer,
-                    Event::TransferSession {
+                    Event::Session {
                         session,
                         gpus: gpus.clone(),
                     },
                     Vec::new(),
                 ));
-                Ok(Outcome::Reply(
-                    Reply::TransferOpened { session },
+                Ok(Outcome::Response(
+                    Response::SessionOpened { session },
                     Vec::new(),
                 ))
             }
-            Request::CloseTransfer { session } => {
+            Request::CloseSession { session } => {
                 if self.transfers.sessions.get(session) != Some(&id) {
                     return Err(invalid("the connection owns no such transfer session"));
                 }
                 self.close_transfer(*session);
-                Ok(Outcome::Reply(Reply::TransferClosed, Vec::new()))
+                Ok(Outcome::Response(Response::SessionClosed, Vec::new()))
             }
             Request::Cancel { tasks, update } => {
                 let selected: BTreeSet<u64> = tasks.iter().copied().collect();
@@ -334,8 +334,8 @@ impl Server {
                     task.deployment == deployment
                         && (selected.contains(&task_id) || Some(task.update) == *update)
                 });
-                Ok(Outcome::Reply(
-                    Reply::Cancelled { tasks: cancelled },
+                Ok(Outcome::Response(
+                    Response::Cancelled { tasks: cancelled },
                     Vec::new(),
                 ))
             }
@@ -344,7 +344,7 @@ impl Server {
                     return Err(invalid("a head throttles links"));
                 }
                 self.throttle(&deployment, links, *throttle)?;
-                Ok(Outcome::Reply(Reply::Throttled, Vec::new()))
+                Ok(Outcome::Response(Response::Throttled, Vec::new()))
             }
             _ => Err(invalid("not a transfer request")),
         }
@@ -380,11 +380,15 @@ impl Server {
                         None => known.push(*context),
                     }
                 }
-                Ok(Outcome::Reply(Reply::Noted, Vec::new()))
+                Ok(Outcome::Response(Response::Noted, Vec::new()))
             }
-            Request::Copied { task, bytes, end } => {
-                self.copied(*task, *bytes, end.clone());
-                Ok(Outcome::Reply(Reply::Noted, Vec::new()))
+            Request::Copied {
+                task,
+                bytes,
+                status,
+            } => {
+                self.copied(*task, *bytes, status.clone());
+                Ok(Outcome::Response(Response::Noted, Vec::new()))
             }
             Request::Registered {
                 request,
@@ -393,7 +397,7 @@ impl Server {
                 failure,
             } => {
                 self.registered(*request, metadata, ranges, failure.as_deref());
-                Ok(Outcome::Reply(Reply::Noted, Vec::new()))
+                Ok(Outcome::Response(Response::Noted, Vec::new()))
             }
             _ => Err(invalid("not a request of the Transfer Server")),
         }
@@ -507,7 +511,7 @@ impl Server {
         &mut self,
         number: u64,
         metadata: &[u8],
-        ranges: &[Registered],
+        ranges: &[Registration],
         failure: Option<&str>,
     ) {
         tracing::debug!(
@@ -533,7 +537,7 @@ impl Server {
                     .iter()
                     .map(|&(index, base)| {
                         let range = ranges.get(index).filter(|range| base <= range.bytes)?;
-                        Some(Registered {
+                        Some(Registration {
                             end: range.end.clone(),
                             key: range.key,
                             address: range.address + base,
@@ -545,7 +549,7 @@ impl Server {
                 match regions {
                     Some(regions) => {
                         self.transfers.live.insert(number, exposure.client);
-                        Reply::Exposed {
+                        Response::Exposed {
                             exposure: number,
                             metadata: metadata.to_vec(),
                             regions,
@@ -571,7 +575,7 @@ impl Server {
             self.transfers.live.remove(&exposure);
             self.deregister(exposure);
         }
-        Outcome::Reply(Reply::Unexposed, Vec::new())
+        Outcome::Response(Response::Unexposed, Vec::new())
     }
 
     /// Have the Transfer Server let the registrations of exposure `number`
@@ -587,7 +591,7 @@ impl Server {
     }
 
     /// Answer a peer's exposure with `reply` and serve its connection on.
-    fn release_exposure(&mut self, exposure: Exposure, reply: Reply) {
+    fn release_exposure(&mut self, exposure: Exposure, reply: Response) {
         self.answer(exposure.client, exposure.request, reply, &[]);
         if let Some(client) = self.clients.get_mut(&exposure.client) {
             client.held = false;
@@ -718,7 +722,7 @@ impl Server {
         );
         self.events.push((
             transfer_server,
-            Event::Transfer {
+            Event::Task {
                 task,
                 priority,
                 moves,
@@ -789,7 +793,7 @@ impl Server {
         );
         self.events.push((
             transfer_server,
-            Event::Transfer {
+            Event::Task {
                 task,
                 priority: Priority::Background,
                 moves,
@@ -992,7 +996,7 @@ impl Server {
     }
 
     /// The Transfer Server reported task `task`.
-    fn copied(&mut self, task: u64, bytes: u64, end: Option<TransferEnd>) {
+    fn copied(&mut self, task: u64, bytes: u64, end: Option<TaskStatus>) {
         let Some(entry) = self.transfers.tasks.get_mut(&task) else {
             return;
         };
@@ -1011,13 +1015,17 @@ impl Server {
             }
         }
         match (owner, end) {
-            (Owner::Client(client), Some(end)) => {
-                self.events
-                    .push((client, Event::Transferred { task, bytes, end }, Vec::new()));
+            (Owner::Client(client), Some(status)) => {
+                let ended = Event::TaskEnded {
+                    task,
+                    bytes,
+                    status,
+                };
+                self.events.push((client, ended, Vec::new()));
             }
             (Owner::Client(client), None) => {
                 self.events
-                    .push((client, Event::TransferProgress { task, bytes }, Vec::new()));
+                    .push((client, Event::TaskProgress { task, bytes }, Vec::new()));
             }
             (Owner::Move { number, index }, Some(end)) => self.moved(number, index, &end),
             (Owner::Move { .. }, None) => {}
@@ -1038,7 +1046,7 @@ impl Server {
         if let Some(transfer) = self.transfers.client {
             self.events.push((
                 transfer,
-                Event::TransferSession {
+                Event::Session {
                     session,
                     gpus: Vec::new(),
                 },
@@ -1094,7 +1102,7 @@ impl Server {
         self.transfers.links.clear();
         self.transfers.contexts.clear();
         self.transfers.sessions.clear();
-        let failed = TransferEnd::Failed {
+        let failed = TaskStatus::Failed {
             message: "the Transfer Server ended".into(),
         };
         for (task, entry) in std::mem::take(&mut self.transfers.tasks) {
@@ -1102,10 +1110,10 @@ impl Server {
                 Owner::Client(client) => {
                     self.events.push((
                         client,
-                        Event::Transferred {
+                        Event::TaskEnded {
                             task,
                             bytes: entry.copied,
-                            end: failed.clone(),
+                            status: failed.clone(),
                         },
                         Vec::new(),
                     ));
@@ -1145,7 +1153,7 @@ impl Server {
     }
 
     /// The device storage the connected Transfer Server's CUDA context takes
-    /// on each GPU while it holds one, as it measured it; it books the
+    /// on each GPU while it holds one, as it measured it; it reserves the
     /// context itself while it holds it.
     pub(super) fn transfer_contexts(&self) -> Vec<([u8; 16], u64)> {
         self.transfers
@@ -1170,9 +1178,9 @@ impl Server {
     }
 
     /// The Transfer Server in a listing, while it is connected.
-    pub(super) fn listed_transfer(&self) -> Option<ListedTransfer> {
+    pub(super) fn listed_transfer(&self) -> Option<TransferListing> {
         let client = self.clients.get(&self.transfers.client?)?;
-        Some(ListedTransfer {
+        Some(TransferListing {
             pid: client.pid,
             links: self.transfers.links.clone(),
             contexts: self.transfers.contexts.clone(),
@@ -1180,7 +1188,7 @@ impl Server {
                 .transfers
                 .tasks
                 .iter()
-                .map(|(&task, entry)| ListedTask {
+                .map(|(&task, entry)| TaskListing {
                     task,
                     deployment: entry.deployment.clone(),
                     update: entry.update,
@@ -1250,8 +1258,8 @@ fn remote(
     })
 }
 
-fn error_reply((kind, message): (ErrorKind, String)) -> Reply {
-    Reply::Error { kind, message }
+fn error_reply((kind, message): (ErrorKind, String)) -> Response {
+    Response::Error { kind, message }
 }
 
 pub(super) fn unavailable() -> (ErrorKind, String) {

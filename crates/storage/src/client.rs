@@ -15,31 +15,18 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::protocol::{
-    Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostStorage, Item, Key, Link,
-    Listing, Location, Mode, PeerPool, Priority, Region, Registered, Reply, Request, Role, Scope,
-    ServerMessage, Span, StorageRecord, TensorRecord, Throttle, TransferTotal, VERSION, Welcome,
+    Claim, ClientMessage, Event, Hello, HostStorage, Item, Key, Link, Listing, Location, Mode,
+    PeerPool, Priority, Quota, Region, Registration, Request, Response, Role, Scope, ServerMessage,
+    Span, StorageRecord, TaskTotal, TensorRecord, Tensors, Throttle, Usage, VERSION, Welcome,
 };
 use crate::transport::Connection;
 
-/// Why a request failed.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("storage server connection: {0}")]
-    Io(#[from] io::Error),
-    #[error("the storage server refused the connection: {0}")]
-    Refused(String),
-    #[error("the storage server answered {kind:?}: {message}")]
-    Server { kind: ErrorKind, message: String },
-    #[error("the storage server answered out of protocol: {0}")]
-    Protocol(String),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
+use crate::error::{Error, Result};
 
 /// A reply and the descriptors that came with it.
 #[derive(Debug)]
 pub struct Answer {
-    pub reply: Reply,
+    pub reply: Response,
     pub descriptors: Vec<OwnedFd>,
 }
 
@@ -141,7 +128,7 @@ impl Client {
     /// # Errors
     ///
     /// Fails when answers, events or frames are buffered.
-    pub fn hand_over(self) -> Result<(OwnedFd, u64)> {
+    pub fn handoff(self) -> Result<(OwnedFd, u64)> {
         if !self.answers.is_empty() || !self.events.is_empty() {
             return Err(Error::Protocol(
                 "a connection with answers or events not taken cannot be handed over".into(),
@@ -155,7 +142,7 @@ impl Client {
     }
 
     /// Goes on with a Unix connection another process handed over
-    /// ([`Client::hand_over`]).
+    /// ([`Client::handoff`]).
     pub fn resume(descriptor: OwnedFd, next: u64) -> Self {
         Self {
             connection: Connection::new(UnixStream::from(descriptor)),
@@ -209,20 +196,17 @@ impl Client {
     /// Consume one task's completion without waiting, discarding its progress
     /// notifications. Other tasks' events stay queued for their owners.
     /// Returns `None` while the transfer is pending or after it was consumed.
-    pub fn poll_transfer(
-        &mut self,
-        task: u64,
-    ) -> Result<Option<(u64, crate::protocol::TransferEnd)>> {
+    pub fn poll_task(&mut self, task: u64) -> Result<Option<(u64, crate::protocol::TaskStatus)>> {
         self.pump()?;
         let mut completion = None;
         self.events.retain(|(event, _)| match event {
-            Event::TransferProgress { task: found, .. } if *found == task => false,
-            Event::Transferred {
+            Event::TaskProgress { task: found, .. } if *found == task => false,
+            Event::TaskEnded {
                 task: found,
                 bytes,
-                end,
+                status,
             } if *found == task => {
-                completion = Some((*bytes, end.clone()));
+                completion = Some((*bytes, status.clone()));
                 false
             }
             _ => true,
@@ -263,8 +247,14 @@ impl Client {
 
     fn deliver(&mut self, message: ServerMessage, descriptors: Vec<OwnedFd>) -> Result<()> {
         match message {
-            ServerMessage::Reply { id, reply } => {
-                self.answers.insert(id, Answer { reply, descriptors });
+            ServerMessage::Response { id, response } => {
+                self.answers.insert(
+                    id,
+                    Answer {
+                        reply: response,
+                        descriptors,
+                    },
+                );
             }
             ServerMessage::Event(event) => self.events.push_back((event, descriptors)),
             ServerMessage::Welcome(_) => {
@@ -277,7 +267,7 @@ impl Client {
     /// The answer, unless the server answered with an error.
     fn expect(answer: Answer) -> Result<Answer> {
         match answer.reply {
-            Reply::Error { kind, message } => Err(Error::Server { kind, message }),
+            Response::Error { kind, message } => Err(Error::Server { kind, message }),
             _ => Ok(answer),
         }
     }
@@ -291,15 +281,15 @@ impl Client {
             retire,
         };
         match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Claimed { claim } => Ok(claim),
+            Response::Claimed { claim } => Ok(claim),
             other => Err(unexpected("claim", &other)),
         }
     }
 
     /// Make the claimed, committed epochs' tensors and pages shared together.
-    pub fn publish_epochs(&mut self, epochs: Vec<u64>) -> Result<()> {
-        match Self::expect(self.call(&Request::PublishEpochs { epochs }, &[])?)?.reply {
-            Reply::EpochsPublished => Ok(()),
+    pub fn publish(&mut self, epochs: Vec<u64>) -> Result<()> {
+        match Self::expect(self.call(&Request::Publish { epochs }, &[])?)?.reply {
+            Response::Published => Ok(()),
             other => Err(unexpected("publishing epochs", &other)),
         }
     }
@@ -309,7 +299,7 @@ impl Client {
     /// were released.
     pub fn retain(&mut self, keys: Vec<Key>, at: Vec<Location>) -> Result<u64> {
         match Self::expect(self.call(&Request::Retain { keys, at }, &[])?)?.reply {
-            Reply::Retained { released } => Ok(released),
+            Response::Retained { released } => Ok(released),
             other => Err(unexpected("retain", &other)),
         }
     }
@@ -330,11 +320,11 @@ impl Client {
 
     fn got(answer: Answer) -> Result<Got> {
         match answer.reply {
-            Reply::Got {
+            Response::Tensors(Tensors {
                 tensors,
                 storages,
                 missing,
-            } => {
+            }) => {
                 if storages.len() != answer.descriptors.len() {
                     return Err(Error::Protocol(format!(
                         "{} storages arrived with {} descriptors",
@@ -367,7 +357,7 @@ impl Client {
             storages: records,
         };
         match Self::expect(self.call(&request, &descriptors)?)?.reply {
-            Reply::Put => Ok(()),
+            Response::Put => Ok(()),
             other => Err(unexpected("put", &other)),
         }
     }
@@ -375,7 +365,7 @@ impl Client {
     /// See [`Request::Promote`].
     pub fn promote(&mut self, keys: Vec<Key>) -> Result<()> {
         match Self::expect(self.call(&Request::Promote { keys }, &[])?)?.reply {
-            Reply::Promoted => Ok(()),
+            Response::Promoted => Ok(()),
             other => Err(unexpected("promote", &other)),
         }
     }
@@ -383,7 +373,7 @@ impl Client {
     /// See [`Request::Release`].
     pub fn release(&mut self, keys: Vec<Key>) -> Result<()> {
         match Self::expect(self.call(&Request::Release { keys }, &[])?)?.reply {
-            Reply::Released => Ok(()),
+            Response::Released => Ok(()),
             other => Err(unexpected("release", &other)),
         }
     }
@@ -392,7 +382,7 @@ impl Client {
     /// (every copy when empty).
     pub fn rekey(&mut self, moves: Vec<(Key, Key)>, at: Vec<Location>) -> Result<()> {
         match Self::expect(self.call(&Request::Rekey { moves, at }, &[])?)?.reply {
-            Reply::Rekeyed => Ok(()),
+            Response::Rekeyed => Ok(()),
             other => Err(unexpected("rekey", &other)),
         }
     }
@@ -400,7 +390,7 @@ impl Client {
     /// See [`Request::Restart`]. Returns the successor's process id.
     pub fn restart(&mut self, executable: Option<String>) -> Result<u32> {
         match Self::expect(self.call(&Request::Restart { executable }, &[])?)?.reply {
-            Reply::Restarting { pid } => Ok(pid),
+            Response::Restarting { pid } => Ok(pid),
             other => Err(unexpected("restart", &other)),
         }
     }
@@ -408,38 +398,38 @@ impl Client {
     /// See [`Request::Retire`]. Returns how many tensors were released.
     pub fn retire(&mut self, deployment: String) -> Result<u64> {
         match Self::expect(self.call(&Request::Retire { deployment }, &[])?)?.reply {
-            Reply::Retired { released } => Ok(released),
+            Response::Retired { released } => Ok(released),
             other => Err(unexpected("retire", &other)),
         }
     }
 
-    /// See [`Request::Transfer`]. Returns the task, whose progress and end
+    /// See [`Request::Submit`]. Returns the task, whose progress and end
     /// arrive as events.
-    pub fn transfer(&mut self, spans: Vec<Span>, priority: Priority, update: u64) -> Result<u64> {
-        let request = Request::Transfer {
+    pub fn copy(&mut self, spans: Vec<Span>, priority: Priority, update: u64) -> Result<u64> {
+        let request = Request::Submit {
             spans,
             priority,
             update,
         };
         match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Transferring { task } => Ok(task),
+            Response::Submitted { task } => Ok(task),
             other => Err(unexpected("transfer", &other)),
         }
     }
 
-    /// Hold transfer contexts between tasks until `close_transfer` or
+    /// Hold transfer contexts between tasks until `close_session` or
     /// connection closure. Each operation owns its separate session.
-    pub fn open_transfer(&mut self, gpus: Vec<[u8; 16]>) -> Result<u64> {
-        match Self::expect(self.call(&Request::OpenTransfer { gpus }, &[])?)?.reply {
-            Reply::TransferOpened { session } => Ok(session),
+    pub fn open_session(&mut self, gpus: Vec<[u8; 16]>) -> Result<u64> {
+        match Self::expect(self.call(&Request::OpenSession { gpus }, &[])?)?.reply {
+            Response::SessionOpened { session } => Ok(session),
             other => Err(unexpected("open transfer", &other)),
         }
     }
 
     /// Release a session; existing tasks retain their own physical holds.
-    pub fn close_transfer(&mut self, session: u64) -> Result<()> {
-        match Self::expect(self.call(&Request::CloseTransfer { session }, &[])?)?.reply {
-            Reply::TransferClosed => Ok(()),
+    pub fn close_session(&mut self, session: u64) -> Result<()> {
+        match Self::expect(self.call(&Request::CloseSession { session }, &[])?)?.reply {
+            Response::SessionClosed => Ok(()),
             other => Err(unexpected("close transfer", &other)),
         }
     }
@@ -447,7 +437,7 @@ impl Client {
     /// See [`Request::Cancel`]. Returns how many tasks were cancelled.
     pub fn cancel(&mut self, tasks: Vec<u64>, update: Option<u64>) -> Result<u64> {
         match Self::expect(self.call(&Request::Cancel { tasks, update }, &[])?)?.reply {
-            Reply::Cancelled { tasks } => Ok(tasks),
+            Response::Cancelled { tasks } => Ok(tasks),
             other => Err(unexpected("cancel", &other)),
         }
     }
@@ -455,7 +445,7 @@ impl Client {
     /// See [`Request::Throttle`].
     pub fn throttle(&mut self, links: Vec<Link>, throttle: Throttle) -> Result<()> {
         match Self::expect(self.call(&Request::Throttle { links, throttle }, &[])?)?.reply {
-            Reply::Throttled => Ok(()),
+            Response::Throttled => Ok(()),
             other => Err(unexpected("throttle", &other)),
         }
     }
@@ -467,13 +457,13 @@ impl Client {
         &mut self,
         deployment: String,
         regions: Vec<Region>,
-    ) -> Result<(u64, Vec<u8>, Vec<Registered>)> {
+    ) -> Result<(u64, Vec<u8>, Vec<Registration>)> {
         let request = Request::Expose {
             deployment,
             regions,
         };
         match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Exposed {
+            Response::Exposed {
                 exposure,
                 metadata,
                 regions,
@@ -485,7 +475,7 @@ impl Client {
     /// See [`Request::Unexpose`].
     pub fn unexpose(&mut self, exposure: u64) -> Result<()> {
         match Self::expect(self.call(&Request::Unexpose { exposure }, &[])?)?.reply {
-            Reply::Unexposed => Ok(()),
+            Response::Unexposed => Ok(()),
             other => Err(unexpected("unexpose", &other)),
         }
     }
@@ -506,7 +496,7 @@ impl Client {
             keys,
         };
         match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::PeerPinned { pools } => Ok(pools),
+            Response::PeerPinned { pools } => Ok(pools),
             other => Err(unexpected("peer pin", &other)),
         }
     }
@@ -515,7 +505,7 @@ impl Client {
     /// of `keys` in `pool`.
     pub fn peer_unpin(&mut self, pool: u64, keys: Vec<Key>) -> Result<()> {
         match Self::expect(self.call(&Request::PeerUnpin { pool, keys }, &[])?)?.reply {
-            Reply::PeerUnpinned => Ok(()),
+            Response::PeerUnpinned => Ok(()),
             other => Err(unexpected("peer unpin", &other)),
         }
     }
@@ -523,7 +513,7 @@ impl Client {
     /// See [`Request::List`].
     pub fn list(&mut self) -> Result<Listing> {
         match Self::expect(self.call(&Request::List, &[])?)?.reply {
-            Reply::Listing(listing) => Ok(listing),
+            Response::Listing(listing) => Ok(listing),
             other => Err(unexpected("list", &other)),
         }
     }
@@ -532,7 +522,7 @@ impl Client {
     /// tensor `key`.
     pub fn read(&mut self, deployment: String, key: Key) -> Result<Vec<u8>> {
         match Self::expect(self.call(&Request::Read { deployment, key }, &[])?)?.reply {
-            Reply::Read { bytes } => Ok(bytes),
+            Response::Read { bytes } => Ok(bytes),
             other => Err(unexpected("read", &other)),
         }
     }
@@ -547,7 +537,7 @@ impl Client {
             Request::Restore { epoch }
         };
         match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Moved { storages, bytes } => Ok((storages, bytes)),
+            Response::Moved { storages, bytes } => Ok((storages, bytes)),
             other => Err(unexpected("move_weights", &other)),
         }
     }
@@ -555,64 +545,56 @@ impl Client {
     /// See [`Request::KeepWeights`]. Returns how many tensors were released.
     pub fn keep_weights(&mut self, epochs: Vec<u64>, cache_keys: Vec<Key>) -> Result<u64> {
         match Self::expect(self.call(&Request::KeepWeights { epochs, cache_keys }, &[])?)?.reply {
-            Reply::Retained { released } => Ok(released),
+            Response::Retained { released } => Ok(released),
             other => Err(unexpected("keep_weights", &other)),
         }
     }
 
-    /// See [`Request::Book`]. Returns the ledgers of `gpu` the caller books
+    /// See [`Request::Quota`]. Returns the quotas of `gpu` the caller reserves
     /// in; a refusal is [`ErrorKind::Quota`], whose message names every
-    /// entry of the ledger it would overrun.
-    pub fn book(
+    /// entry of the quota it would overrun.
+    pub fn reserve(
         &mut self,
         gpu: [u8; 16],
         total: u64,
-        quota: Option<u64>,
-        items: Vec<(Item, u64)>,
-    ) -> Result<Vec<GpuLedger>> {
-        let request = Request::Book {
+        limit: Option<u64>,
+        reservations: Vec<(Item, u64)>,
+    ) -> Result<Vec<Quota>> {
+        let request = Request::Quota {
             gpu,
             total,
-            quota,
-            items,
+            limit,
+            reservations,
         };
         match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Ledger { ledgers, .. } => Ok(ledgers),
-            other => Err(unexpected("book", &other)),
+            Response::Usage(usage) => Ok(usage.quotas),
+            other => Err(unexpected("reserve", &other)),
         }
     }
 
-    /// See [`Request::Ledger`]: the ledgers of `gpus` (every GPU when empty),
+    /// See [`Request::Usage`]: the quotas of `gpus` (every GPU when empty),
     /// what the host admits of new host storage, and what the transfer
     /// tasks of the client's deployment copied.
-    pub fn ledger(&mut self, gpus: Vec<[u8; 16]>) -> Result<Ledgers> {
-        match Self::expect(self.call(&Request::Ledger { gpus }, &[])?)?.reply {
-            Reply::Ledger {
-                ledgers,
-                host,
-                transfers,
-            } => Ok(Ledgers {
-                ledgers,
-                host,
-                transfers,
-            }),
-            other => Err(unexpected("ledger", &other)),
+    pub fn usage(&mut self, gpus: Vec<[u8; 16]>) -> Result<Usage> {
+        match Self::expect(self.call(&Request::Usage { gpus }, &[])?)?.reply {
+            Response::Usage(usage) => Ok(usage),
+            other => Err(unexpected("quota", &other)),
         }
     }
 }
 
-/// What a [`Request::Ledger`] answers ([`Client::ledger`]).
+/// What a [`Request::Usage`] answers ([`Client::quota`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ledgers {
-    /// The ledgers of the GPUs asked for.
-    pub ledgers: Vec<GpuLedger>,
+pub struct Quotas {
+    /// The quotas of the GPUs asked for.
+    pub quotas: Vec<Quota>,
     /// What the host admits of new host storage.
     pub host: HostStorage,
     /// What the transfer tasks of the client's deployment copied on the
     /// host, by priority.
-    pub transfers: Vec<TransferTotal>,
+    pub transfers: Vec<TaskTotal>,
 }
 
-fn unexpected(request: &str, reply: &Reply) -> Error {
+fn unexpected(request: &str, reply: &Response) -> Error {
     Error::Protocol(format!("{request} was answered with {reply:?}"))
 }

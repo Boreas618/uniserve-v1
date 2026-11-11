@@ -162,7 +162,7 @@ pub struct LatentSource {
 
 /// A host latent pool, as a rank of any epoch on its host maps it again:
 /// its identity at the Storage Server and the shape and NUMA node a page
-/// pool request finds it by (`storage::protocol::Request::PagePool`).
+/// pool request finds it by (`storage::protocol::Request::Pool`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentPoolRef {
     pub pool: u64,

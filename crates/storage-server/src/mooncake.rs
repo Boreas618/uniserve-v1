@@ -33,28 +33,17 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use mooncake_store::{MooncakeStore, StoreError};
+use mooncake_store::MooncakeStore;
 use rustix::event::{PollFd, PollFlags, poll};
 
 use ::storage::client::Client;
 use ::storage::connector::Settings;
-use ::storage::protocol::{Event, Key, PageShape, Reply, Request, Role};
+use ::storage::protocol::{Event, Key, PageShape, Request, Response, Role};
 
 /// The most pages one Mooncake call carries.
 pub const BATCH_PAGES: usize = 128;
 
-/// Why the connector stopped.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("mooncake: {0}")]
-    Mooncake(#[from] StoreError),
-    #[error(transparent)]
-    Storage(#[from] ::storage::client::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error("{0}")]
-    Settings(String),
-}
+use crate::Error;
 
 /// The bytes Mooncake's client keeps for transfers that do not come from a
 /// registered buffer. Every page moves between a registered pool and
@@ -174,9 +163,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
             Ok(()) => {}
             // The server closes the connection when it stops, which ends
             // the connector.
-            Err(::storage::client::Error::Io(error))
-                if error.kind() == io::ErrorKind::UnexpectedEof =>
-            {
+            Err(::storage::Error::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
                 tracing::info!("the storage server closed the connection");
                 return Ok(());
             }
@@ -216,17 +203,17 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
                 }
                 // The events of heads, workers and the Transfer Server.
                 Event::Prefetched { .. }
-                | Event::TransferProgress { .. }
-                | Event::Transferred { .. }
+                | Event::TaskProgress { .. }
+                | Event::TaskEnded { .. }
                 | Event::Allocation { .. }
                 | Event::AllocationReleased { .. }
-                | Event::Transfer { .. }
+                | Event::Task { .. }
                 | Event::Cancel { .. }
                 | Event::Throttle { .. }
                 | Event::Register { .. }
                 | Event::Deregister { .. }
                 | Event::Allocate { .. }
-                | Event::TransferSession { .. } => {}
+                | Event::Session { .. } => {}
             }
         }
         let finished = std::mem::take(&mut *lock(&shared.finished));
@@ -237,7 +224,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
         // longer holds, which changes nothing here.
         reports.retain(|id| match client.take(*id) {
             Some(answer) => {
-                if let Reply::Error { message, .. } = answer.reply {
+                if let Response::Error { message, .. } = answer.reply {
                     tracing::warn!(message, "the storage server refused a task's results");
                 }
                 false

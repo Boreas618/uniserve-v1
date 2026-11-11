@@ -190,7 +190,7 @@ impl Field {
 
     fn validate(&self) -> Result<()> {
         if self.strides.len() != self.shape.len() || self.element == 0 {
-            return Err(Error::Invalid(format!(
+            return Err(Error::Manifest(format!(
                 "field {} declares its shape and strides inconsistently",
                 self.tensor
             )));
@@ -203,7 +203,7 @@ impl Field {
             Encoding::Encoded { canonical, .. } => match canonical {
                 Some(canonical) => {
                     if canonical.strides.len() != canonical.shape.len() {
-                        return Err(Error::Invalid(format!(
+                        return Err(Error::Manifest(format!(
                             "the canonical form of field {} declares its shape and strides \
                              inconsistently",
                             self.tensor
@@ -229,7 +229,7 @@ fn validate_part(tensor: &str, shape: &[u64], logical: &Logical) -> Result<()> {
     let rank = shape.len();
     if logical.shape.len() != rank || logical.units.len() != rank || logical.segments.len() != rank
     {
-        return Err(Error::Invalid(format!(
+        return Err(Error::Manifest(format!(
             "field {tensor} declares its shape and logical part inconsistently"
         )));
     }
@@ -241,7 +241,7 @@ fn validate_part(tensor: &str, shape: &[u64], logical: &Logical) -> Result<()> {
                 .last()
                 .is_none_or(|last| last < logical.shape[dim]);
             if !fits_local || !fits_logical || segment.span.step == 0 {
-                return Err(Error::Invalid(format!(
+                return Err(Error::Manifest(format!(
                     "field {tensor} holds a segment outside its shapes along dimension {dim}"
                 )));
             }
@@ -604,7 +604,7 @@ impl StorageLayout {
         for field in &self.fields {
             field.validate()?;
             if field.bytes().end > self.bytes {
-                return Err(Error::Invalid(format!(
+                return Err(Error::Manifest(format!(
                     "field {} ends past its storage's {} bytes",
                     field.tensor, self.bytes
                 )));
@@ -668,7 +668,7 @@ impl StorageLayout {
             };
             let field = &self.fields[index];
             let source = fingerprint(&field.tensor).ok_or_else(|| {
-                Error::Invalid(format!(
+                Error::Manifest(format!(
                     "field {} has no tensor loading fingerprint",
                     field.tensor
                 ))

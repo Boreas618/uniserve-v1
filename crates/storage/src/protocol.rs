@@ -3,98 +3,114 @@
 //! A connection opens with the client's [`Hello`], which states the protocol
 //! version and the client's [`Role`], and the server's [`Welcome`]. Every
 //! later client message is a [`Request`] with an identity of the client's
-//! choosing; the server answers requests in order on their connection, each
-//! with one [`Reply`] that repeats the identity, and sends asynchronous
-//! completions as [`Event`]s on the same connection.
+//! choosing; the server responds to requests in order on their connection,
+//! each with one [`Response`] that repeats the identity, and sends
+//! asynchronous completions as [`Event`]s on the same connection. A request
+//! the server refuses is responded with [`Response::Error`], the protocol's
+//! one error: an [`ErrorKind`] and a message.
 //!
-//! The protocol is versioned ([`VERSION`]) and a Storage Server serves
-//! clients of its own version only: it refuses a client of any other version
-//! at `Hello`, and a server of another version has to be stopped before a
-//! component of this build starts its own. The encoding is MessagePack with
-//! named fields.
-//!
-//! Storage belongs to epochs: an epoch is the set of processes that executes
-//! one configuration of a deployment (an engine and its workers, relaunched
-//! or not), and a deployment runs at most two at once while it updates. Each
-//! tensor is retained by the `(scope, epoch)` pairs that use it: a worker's
-//! requests retain and release under its own epoch alone, so an epoch that
-//! starts beside another neither takes nor releases the other's storage,
-//! and an epoch's storage outlives its processes until the head retires the
-//! epoch.
+//! The protocol is versioned ([`VERSION`]), and its version is part of the
+//! engine interface's (`proto::ENGINE_INTERFACE_VERSION`): a Storage Server
+//! serves clients of its own version only and refuses any other at `Hello`.
+//! The encoding is MessagePack with named fields.
 //!
 //! The server stores bytes with DLPack metadata and never interprets them:
-//! clients compute every [`Key`] and define what the bytes mean.
+//! clients compute every [`Key`] and define what the bytes mean. The
+//! protocol holds seven objects, and each request acts on one of them.
 //!
-//! The server keeps one storage ledger per GPU for each deployment that uses
-//! it ([`GpuLedger`]), so that the two epochs of a deployment and the host's
-//! Transfer Server stay within one quota on a GPU they share, rather than
-//! each sizing itself against what its own process holds. The quota is
-//! `⌊total × fraction⌋` of the whole GPU for the fraction the deployment's
-//! workers configure (`mem_fraction_static`). The ledger books what the
-//! server derives from the storages it retains (the weights, each KV cache
-//! segment, the other exclusive storages), each storage once whatever
-//! number of epochs map it, and what the processes book themselves
-//! ([`Request::Book`]): a worker's graph pool, process storage and staging,
-//! and the Transfer Server's staging and its CUDA context while it holds
-//! one on the GPU. The server refuses a booking or a new device storage
-//! that would take a ledger past its quota.
+//! **Claim.** A daemon's hold on a deployment's storage on its host
+//! ([`Claim`], [`Request::Claim`]). The claiming connection is the
+//! deployment's head; the claim lasts while it is connected, and its token
+//! is what the deployment's workers state in their [`Role`]. Storage belongs
+//! to epochs: an epoch is the set of processes that executes one
+//! configuration of a deployment, and a deployment runs at most two at once
+//! while it updates. A claim names the scopes its epoch places on the host
+//! and the epochs it retires; what an epoch publishes stays private to it
+//! until the head publishes the epoch ([`Request::Publish`]), and pages
+//! committed under a published epoch outlive its retirement. The head also
+//! keeps a previous epoch as its weights alone ([`Request::KeepWeights`]) and
+//! moves them to host storage and back ([`Request::Offload`],
+//! [`Request::Restore`]).
 //!
-//! Besides tensors, the server keeps host page pools (L2): one memfd of
+//! **Scope.** Who may map or adopt storage ([`Scope`]): one rank of one
+//! worker group of one deployment. Each tensor is retained by the
+//! `(scope, epoch)` pairs that use it ([`Retainer`]): a worker's requests
+//! retain and release under its own epoch alone, so an epoch that starts
+//! beside another neither takes nor releases the other's storage.
+//!
+//! **Tensor.** Read-only retained storage with a key
+//! ([`TensorRecord`] with [`Access::ReadOnly`] over a [`StorageRecord`]):
+//! weights, shared by every process that maps them. Published with
+//! [`Request::Put`], mapped with [`Request::Get`] ([`Mode::Read`]), kept with
+//! [`Request::Retain`].
+//!
+//! **Storage.** Exclusive storage with one writer
+//! ([`TensorRecord`] with [`Access::Exclusive`]): cache segments, buffer
+//! pools, latent buffers. Its creator writes it; a successor of the same
+//! scope adopts it ([`Request::Get`] with [`Mode::Write`], once the previous
+//! writer is out) or maps it in standby and is promoted
+//! ([`Mode::Standby`], [`Request::Promote`]); a writer gives it up with
+//! [`Request::Release`].
+//!
+//! **Pool.** Host pages addressed by key ([`Request::Pool`]): one memfd of
 //! equal slots per deployment, NUMA node and [`PageShape`], shared by the
-//! deployment's workers whose pages have that shape, of the size the
-//! worker asks for. A deployment's pools are released with its tensors.
-//! The server refuses a pool the host's available storage cannot hold.
-//! The server indexes committed pages by key
-//! and tracks each slot's state; workers copy pages in and out of the slots
-//! on their own streams, at the head's direction. Behind the pools, the
+//! deployment's workers whose pages have that shape. A head looks pages up,
+//! reserves slots, commits or aborts them, and pins and unpins what a rank
+//! reads ([`Request::Lookup`], [`Request::Reserve`], [`Request::Commit`],
+//! [`Request::Abort`], [`Request::Pin`], [`Request::Unpin`]); workers copy
+//! pages in and out of the slots on their own streams. Behind the pools, the
 //! server's Mooncake connector ([`Role::Connector`]) keeps committed pages
-//! in the KV storage (L3) and reads them back for prefetches.
+//! in the remote store and reads them back ([`Request::Prefetch`]). Another
+//! host's scheduler pins the published pages it reads as a [`Role::Peer`]
+//! ([`Request::PeerPin`], [`Request::PeerUnpin`]).
 //!
-//! The server copies no byte itself. Its Transfer Server ([`Role::Transfer`])
-//! copies between the storage the server holds for heads and workers: a
-//! client submits a task of [`Span`]s with a [`Priority`]
-//! ([`Request::Transfer`]), the server resolves each [`Region`] to one of its
-//! allocations and forwards the task, and relays the Transfer Server's
-//! progress and the task's end to the client as events
-//! ([`Event::TransferProgress`], [`Event::Transferred`]). The submitter
+//! **Quota.** A GPU's limit for the deployment and the reservations against
+//! it ([`Quota`]): the limit is `⌊total × fraction⌋` of the whole GPU for the
+//! fraction the deployment's workers configure (`mem_fraction_static`). The
+//! server reserves what it derives from the device storage it retains (the
+//! weights, each KV cache segment, the other exclusive storages), each
+//! allocation once whatever number of epochs map it; the processes reserve
+//! what they hold themselves ([`Request::Quota`]): a worker's graph pool,
+//! process storage and staging, and the Transfer Server's staging and its
+//! CUDA context while it holds one on the GPU. The server refuses a
+//! reservation or a new device storage that would take a GPU's usage past
+//! its limit, so the two epochs of a deployment and the host's Transfer
+//! Server stay within one quota on a GPU they share ([`Request::Usage`]).
+//!
+//! **Task.** A copy of [`Span`]s between [`Region`]s, run by the Transfer
+//! Server ([`Role::Transfer`]); the server copies no byte itself. A client
+//! submits a task with a [`Priority`] ([`Request::Submit`]), the server
+//! resolves each region to one of its allocations and forwards the task, and
+//! relays the Transfer Server's progress and the task's end to the client as
+//! events ([`Event::TaskProgress`], [`Event::TaskEnded`]). The submitter
 //! keeps a task's sources unchanged and its destinations unread until the
 //! task ends; the Transfer Server reports the end only after it saw every
-//! copy complete on the host.
+//! copy complete on the host. Tasks take their turns by priority on each
+//! [`Link`], within the link's byte budget, which a head halves and restores
+//! ([`Request::Throttle`]).
 //!
 //! A span's source may lie on another host ([`Region::Remote`]): the
 //! destination host's Transfer Server READs it through NIXL. It asks the
 //! source host's server, over that server's TCP endpoint as a
 //! [`Role::Peer`], to expose the regions ([`Request::Expose`]); that server
 //! has its own Transfer Server register their allocations with its NIXL
-//! agent ([`Event::Register`], [`Request::Registered`]) and answers with the
-//! agent's metadata and each region's address ([`Reply::Exposed`]). The
+//! agent ([`Event::Register`], [`Request::Registered`]) and responds with the
+//! agent's metadata and each region's address ([`Response::Exposed`]). The
 //! exposure lasts until the reading Transfer Server ends it, once its task
 //! ended ([`Request::Unexpose`]), or its connection closes: the source's
 //! Transfer Server then lets the registrations go ([`Event::Deregister`]),
-//! and with them the GPU contexts they held.
-//!
-//! Another host's scheduler finds pages it lacks in this host's pools the
-//! same way, as a [`Role::Peer`]: it pins the committed pages of a
-//! deployment's published epochs by key ([`Request::PeerPin`]), has its own
-//! host's Transfer Server READ the pinned slots as a [`Region::Remote`]
-//! page pool, and unpins them ([`Request::PeerUnpin`]); its pins end with
-//! its connection too. A peer connection states no credential: the TCP
-//! endpoint is unauthenticated, and a host relies on the isolation of the
-//! network it listens on to keep other processes from reading or pinning
-//! the pages and host tensors it serves.
+//! and with them the GPU contexts they held. A peer connection states no
+//! credential: the TCP endpoint is unauthenticated, and a host relies on the
+//! isolation of the network it listens on to keep other processes from
+//! reading or pinning the pages and host tensors it serves.
 
 use serde::{Deserialize, Serialize};
 
 /// The protocol version a Storage Server and its clients speak; a server
-/// refuses a client of any other. Committed pages stay reusable by content key
-/// until ordinary eviction; only an epoch's uncommitted publications are
-/// discarded when it retires. A [`Reply::Ledger`] answering a
-/// [`Request::Ledger`] carries what the deployment's transfer tasks copied
-/// ([`TransferTotal`]). A peer pins pages by key ([`Request::PeerPin`]), a
-/// head reserves slots that its transfer tasks write ([`Request::Reserve`]
-/// without a writer), and a task may take its turn at
-/// [`Priority::Request`].
-pub const VERSION: u32 = 20;
+/// refuses a client of any other. The engine interface carries it
+/// (`proto::ENGINE_INTERFACE_VERSION`), so an engine built for another
+/// storage protocol is refused at its hello to the daemon as well.
+pub const VERSION: u32 = 21;
 
 /// The most bytes a [`Request::Read`] answers with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -176,9 +192,9 @@ pub enum Role {
     /// The Mooncake connector the server runs.
     Connector,
     /// The Transfer Server the server runs, which copies bytes between the
-    /// storage the server holds. Every ledger of a GPU it uses books its CUDA
+    /// storage the server holds. Every quota of a GPU it uses reserves its CUDA
     /// context there, as it measured it ([`Request::Measured`]), and any
-    /// staging it books ([`Request::Book`]).
+    /// staging it reserves ([`Request::Quota`]).
     Transfer,
     /// A process of another host, connected to the server's TCP endpoint:
     /// that host's Transfer Server, which READs storage of this host through
@@ -232,8 +248,8 @@ pub struct StorageRecord {
     /// The allocation's size, a multiple of the device's allocation
     /// granularity for device storage.
     pub bytes: u64,
-    /// The KV cache segment the storage is part of, which its GPU's ledger
-    /// books as that segment ([`Item::CacheSegment`]); `None` for any other
+    /// The KV cache segment the storage is part of, which its GPU's quota
+    /// reserves as that segment ([`Item::CacheSegment`]); `None` for any other
     /// storage.
     pub segment: Option<Segment>,
     /// The fabric handle the device allocation's creator exported, when it
@@ -279,14 +295,14 @@ impl<'de> Deserialize<'de> for FabricHandle {
 
 /// One segment of a KV cache's value planes: the epoch that created its
 /// storage and its ordinal there. A segment is one storage per layer and
-/// plane, which a ledger books together.
+/// plane, which a quota reserves together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Segment {
     pub epoch: u64,
     pub ordinal: u32,
 }
 
-/// What one entry of a GPU's storage ledger is.
+/// What one entry of a GPU's quota is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Item {
@@ -299,20 +315,20 @@ pub enum Item {
     /// latent banks.
     Exclusive,
     /// A worker's CUDA graph storage pool: the storage its captured graphs
-    /// address. Booked by the worker.
+    /// address. Reserved by the worker.
     GraphPool,
     /// What a worker process holds on the device beside the storages the
     /// server retains and its graph pool: its CUDA context, communicator
     /// buffers, PyTorch's allocations, Rust's arenas and tables, the
     /// product storage it has yet to make resident, and the device storage
-    /// a profiling session's collectors hold while it runs. Booked by the
+    /// a profiling session's collectors hold while it runs. Reserved by the
     /// worker.
     Process,
-    /// Device storage a process holds to stage transfers. Booked by the
+    /// Device storage a process holds to stage transfers. Reserved by the
     /// process.
     Staging,
     /// The device storage of the Transfer Server's CUDA context, at the
-    /// bytes it measured when it started ([`Request::Measured`]). Booked by
+    /// bytes it measured when it started ([`Request::Measured`]). Reserved by
     /// the Transfer Server before it retains the context on the GPU, which
     /// it holds only while it has work there, and ended when it released
     /// it.
@@ -320,9 +336,9 @@ pub enum Item {
 }
 
 impl Item {
-    /// Whether a process books the item itself ([`Request::Book`]), rather
+    /// Whether a process reserves the item itself ([`Request::Quota`]), rather
     /// than the server deriving it from the storages it retains.
-    pub fn booked(self) -> bool {
+    pub fn of_process(self) -> bool {
         matches!(
             self,
             Self::GraphPool | Self::Process | Self::Staging | Self::TransferContext
@@ -343,22 +359,22 @@ impl Item {
     }
 }
 
-/// One deployment's storage ledger of one GPU: everything the deployment's
+/// One deployment's quota of one GPU: everything the deployment's
 /// epochs hold on it, and the Transfer Server's items there, beside which
 /// every deployment that uses the GPU holds its storage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GpuLedger {
+pub struct Quota {
     /// The GPU's UUID.
     pub gpu: [u8; 16],
-    /// The deployment; empty for a GPU only the Transfer Server books.
+    /// The deployment; empty for a GPU only the Transfer Server reserves.
     pub deployment: String,
     /// The GPU's total storage, as the processes that use it state it; 0
     /// until one does.
     pub total: u64,
     /// `⌊total × fraction⌋` for the smallest fraction an epoch of the
     /// deployment states for the GPU; `None` until one states one.
-    pub quota: Option<u64>,
-    pub entries: Vec<LedgerEntry>,
+    pub limit: Option<u64>,
+    pub reservations: Vec<Reservation>,
     /// The bandwidth of copies from host storage to the GPU, in bytes per
     /// second, as the host's Transfer Server measured it when it started;
     /// `None` while none did. What returns from host storage to the GPU
@@ -366,22 +382,22 @@ pub struct GpuLedger {
     pub host_link_bytes_per_second: Option<u64>,
     /// The device storage the Transfer Server's CUDA context takes on the
     /// GPU while it holds one, as it measured it when it started; 0 when no
-    /// Transfer Server measured the GPU. The ledger books it as an entry
+    /// Transfer Server measured the GPU. The quota reserves it as an entry
     /// ([`Item::TransferContext`]) only while the Transfer Server holds the
     /// context, from its first work on the GPU to its last, so a plan that
-    /// leaves room for transfers counts it whether or not it is booked.
+    /// leaves room for transfers counts it whether or not it is reserved.
     pub transfer_context: u64,
 }
 
-/// One entry of a [`GpuLedger`].
+/// One entry of a [`Quota`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LedgerEntry {
+pub struct Reservation {
     pub item: Item,
     /// The worker scope that holds it; `None` for the Transfer Server's
     /// items and for storages several scopes hold.
     pub scope: Option<Scope>,
     /// The epochs that hold it: one for an epoch's own, two for the storages
-    /// a successor epoch maps of its predecessor, which are booked once;
+    /// a successor epoch maps of its predecessor, which are reserved once;
     /// none for the Transfer Server's items.
     pub epochs: Vec<u64>,
     /// The segment of an [`Item::CacheSegment`].
@@ -389,26 +405,26 @@ pub struct LedgerEntry {
     pub bytes: u64,
 }
 
-impl GpuLedger {
-    /// The bytes every entry books.
-    pub fn used(&self) -> u64 {
+impl Quota {
+    /// The bytes every reservation takes.
+    pub fn usage(&self) -> u64 {
         self.bytes(|_| true)
     }
 
     /// The bytes of the entries `select` picks.
-    pub fn bytes(&self, select: impl Fn(&LedgerEntry) -> bool) -> u64 {
-        self.entries
+    pub fn bytes(&self, select: impl Fn(&Reservation) -> bool) -> u64 {
+        self.reservations
             .iter()
-            .filter(|entry| select(entry))
-            .map(|entry| entry.bytes)
+            .filter(|reservation| select(reservation))
+            .map(|reservation| reservation.bytes)
             .sum()
     }
 
     /// Every entry, one per line, for a refusal or a log.
     pub fn describe(&self) -> String {
-        let quota = self.quota.map_or_else(
-            || "no quota".to_owned(),
-            |quota| format!("a quota of {quota}"),
+        let limit = self.limit.map_or_else(
+            || "no limit".to_owned(),
+            |limit| format!("a limit of {limit}"),
         );
         let holder = if self.deployment.is_empty() {
             "the Transfer Server"
@@ -416,18 +432,18 @@ impl GpuLedger {
             self.deployment.as_str()
         };
         let mut lines = vec![format!(
-            "GPU {} of {holder}: {} bytes booked of {quota}",
+            "GPU {} of {holder}: {} bytes reserved of {limit}",
             gpu_name(&self.gpu),
-            self.used(),
+            self.usage(),
         )];
-        for entry in &self.entries {
-            lines.push(format!("  {}", entry.describe()));
+        for reservation in &self.reservations {
+            lines.push(format!("  {}", reservation.describe()));
         }
         lines.join("\n")
     }
 }
 
-impl LedgerEntry {
+impl Reservation {
     /// The entry on one line: its item, holder and bytes.
     pub fn describe(&self) -> String {
         let epochs: Vec<String> = self.epochs.iter().map(u64::to_string).collect();
@@ -756,7 +772,7 @@ pub enum Throttle {
 /// How a transfer task ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TransferEnd {
+pub enum TaskStatus {
     /// Every span was copied.
     Complete,
     /// The task was cancelled; its destinations hold any part of the spans.
@@ -821,7 +837,7 @@ pub struct LinkBandwidth {
 /// peer's READ names it: NIXL finds the registration in the agent's
 /// metadata by the range's key, address and length.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Registered {
+pub struct Registration {
     /// Host storage, or the GPU with this UUID, of the registering host.
     pub end: LinkEnd,
     /// The key the agent registered the range under, which no other
@@ -882,7 +898,7 @@ pub enum Request {
     /// Publish all listed committed epochs together. Claimed epochs remain
     /// private until this request, including during preparation and trial.
     /// Every listed epoch must be claimed by the head's deployment.
-    PublishEpochs { epochs: Vec<u64> },
+    Publish { epochs: Vec<u64> },
     /// Release every tensor the caller's scope retains in the caller's epoch
     /// that `keys` does not list; the copies of listed keys at the locations
     /// `at` lists are retained (every copy when `at` is empty).
@@ -904,14 +920,14 @@ pub enum Request {
     /// each storage's size, admitted under the host rule as one (refused,
     /// moving nothing, when the host cannot hold it all), has its Transfer
     /// Server copy each storage there, and then the tensors' copies lie in
-    /// host storage and the device storages are released: each GPU's ledger
+    /// host storage and the device storages are released: each GPU's quota
     /// leaves their storage to the other epoch. Answered with `Moved` once
     /// every copy ended; refused while no Transfer Server runs.
     Offload { epoch: u64 },
     /// From a head: epoch `epoch`'s weights that `Offload` moved to host
     /// storage return to the GPUs they came from, before its processes start
     /// again: its Transfer Server creates device storage of each storage's
-    /// size on its GPU, admitted against the GPU's ledger (refused, moving
+    /// size on its GPU, admitted against the GPU's quota (refused, moving
     /// nothing, past the quota), and copies each storage there; then the
     /// tensors' copies lie on those GPUs again and the host copies are
     /// released. Answered with `Moved` once every copy ended.
@@ -962,7 +978,7 @@ pub enum Request {
     /// copy of `key` in host storage that a scope of `deployment` retains
     /// read-only, a one-dimensional tensor of `uint8` elements (such as a
     /// weight manifest) of at most [`READ_BYTES`] bytes. Answered with
-    /// [`Reply::Read`]; refused when the deployment retains no such tensor,
+    /// [`Response::Read`]; refused when the deployment retains no such tensor,
     /// or a longer one.
     Read { deployment: String, key: Key },
     /// Release every tensor and page pool of `deployment` and forget its
@@ -983,7 +999,7 @@ pub enum Request {
     /// default when `None`), refused when the host's available storage,
     /// less the server's reserve and what its pools have yet to allocate,
     /// cannot hold it.
-    PagePool {
+    Pool {
         shape: PageShape,
         numa_node: Option<u32>,
         bytes: Option<u64>,
@@ -994,7 +1010,7 @@ pub enum Request {
     Lookup { pool: u64, keys: Vec<Key> },
     /// A slot for each key the pool holds no page of, to be written by the
     /// worker of `writer`, or, with no writer, by the head's own transfer
-    /// tasks ([`Request::Transfer`] into the pool), as the pages a head
+    /// tasks ([`Request::Submit`] into the pool), as the pages a head
     /// reads from another host's pool. With `window`, the keys are the
     /// pages of one sliding window, which the pool evicts whole. When the
     /// head's connection closes first, its reservations end once no worker
@@ -1033,7 +1049,7 @@ pub enum Request {
     /// epoch on trial or a rolled-back epoch published is not. A pinned
     /// page stays readable and is not evicted until the peer unpins it
     /// ([`Request::PeerUnpin`]) or its connection closes. Answered with
-    /// [`Reply::PeerPinned`]. The request carries no credential (see
+    /// [`Response::PeerPinned`]. The request carries no credential (see
     /// [`Role::Peer`]).
     PeerPin {
         deployment: String,
@@ -1060,7 +1076,7 @@ pub enum Request {
     /// available storage (bounded by the server's storage cgroup limit, and
     /// counting the deployment's page pools no epoch maps, which the server
     /// releases for a new pool) less what the page pools have yet to
-    /// allocate and the server's reserve. Answered with [`Reply::HostCache`].
+    /// allocate and the server's reserve. Answered with [`Response::HostCache`].
     HostCache {
         tokens: u64,
         token_bytes: Vec<u64>,
@@ -1070,41 +1086,42 @@ pub enum Request {
     /// [`Event::Upload`] or [`Event::Download`]: one result per page of the
     /// task.
     Finished { task: u64, results: Vec<bool> },
-    /// Book the caller's own items on GPU `gpu` (of total storage `total`):
-    /// each item of `items` takes its bytes, 0 ending it; an item left out
-    /// keeps its booking. A worker books [`Item::GraphPool`],
-    /// [`Item::Process`] and [`Item::Staging`] in its deployment's ledger
-    /// under its scope and epoch, and states `quota`, `⌊total × fraction⌋`
+    /// Reserve the caller's own items on GPU `gpu` (of total storage `total`):
+    /// each item of `reservations` takes its bytes, 0 releasing it; an item
+    /// left out keeps its reservation. A worker reserves [`Item::GraphPool`],
+    /// [`Item::Process`] and [`Item::Staging`] against its deployment's quota
+    /// under its scope and epoch, and states `limit`, `⌊total × fraction⌋`
     /// for its configured fraction. The processes of one scope and epoch (a
     /// rank, and the relaunch or standby that replaces it) serve in turn, so
-    /// the larger of their bookings of an item counts. The Transfer Server
-    /// books [`Item::Staging`] and [`Item::TransferContext`] in every ledger
-    /// of the GPU, stating no quota: its context before it retains it, which
-    /// a ledger without room refuses. A booking ends with the connection of
-    /// the process that made it, as that process's storage ends with it. Refused, booking nothing, when it
-    /// would take a ledger past its quota; answered with the ledgers of the
-    /// GPU the caller books in.
-    Book {
+    /// the larger of their reservations of an item counts. The Transfer
+    /// Server reserves [`Item::Staging`] and [`Item::TransferContext`] against
+    /// every quota of the GPU, stating no limit: its context before it
+    /// retains it, which a quota without room refuses. A process that ends in
+    /// order releases its reservations first; a worker's process that is lost
+    /// leaves them reserved for its relaunch. Refused, reserving nothing,
+    /// when it would take a GPU's usage past its limit; responded with the
+    /// quotas of the GPU the caller reserves against ([`Response::Usage`]).
+    Quota {
         gpu: [u8; 16],
         total: u64,
-        quota: Option<u64>,
-        items: Vec<(Item, u64)>,
+        limit: Option<u64>,
+        reservations: Vec<(Item, u64)>,
     },
-    /// The ledgers of `gpus` (of every GPU when empty) and what the host
+    /// The quotas of `gpus` (of every GPU when empty) and what the host
     /// admits of new host storage: of the caller's deployment for a worker
     /// and a head, of every deployment for the Transfer Server and an
     /// operator.
-    Ledger { gpus: Vec<[u8; 16]> },
+    Usage { gpus: Vec<[u8; 16]> },
     /// From a head or a worker: copy `spans` as one task of `update`, which
     /// takes its turn at `priority` on every link it uses. Answered with the
-    /// task's number at once; [`Event::TransferProgress`] follows as it
-    /// copies and [`Event::Transferred`] when it ends. Refused, copying
+    /// task's number at once; [`Event::TaskProgress`] follows as it
+    /// copies and [`Event::TaskEnded`] when it ends. Refused, copying
     /// nothing, when no Transfer Server runs, when a region is not storage
     /// of the caller's deployment, or when a span reaches past its region
     /// or writes a read-only tensor; a region of another host is checked
     /// by that host once the task runs ([`Region::Remote`]). A task ends
     /// with its submitter's connection, cancelled.
-    Transfer {
+    Submit {
         spans: Vec<Span>,
         priority: Priority,
         /// The update (epoch change) the task serves, a number its
@@ -1115,13 +1132,13 @@ pub enum Request {
     /// Hold the transfer contexts of these local GPUs across successive
     /// tasks. Contexts remain lazy and quota-accounted. The session ends
     /// explicitly or when its owning connection closes.
-    OpenTransfer { gpus: Vec<[u8; 16]> },
+    OpenSession { gpus: Vec<[u8; 16]> },
     /// End a session of this connection. Submitted tasks keep their own
     /// holds until physical completion; this releases only the session.
-    CloseTransfer { session: u64 },
+    CloseSession { session: u64 },
     /// From a head or a worker: cancel `tasks` and, with `update`, every
     /// task of that update, of the caller's deployment. Answered at once;
-    /// each task's [`Event::Transferred`] follows once the Transfer Server
+    /// each task's [`Event::TaskEnded`] follows once the Transfer Server
     /// copies none of its bytes any more.
     Cancel {
         tasks: Vec<u64>,
@@ -1150,12 +1167,12 @@ pub enum Request {
     Copied {
         task: u64,
         bytes: u64,
-        end: Option<TransferEnd>,
+        status: Option<TaskStatus>,
     },
     /// From another host's Transfer Server ([`Role::Peer`]): have this
     /// host's Transfer Server register `regions`, retained tensors or page
     /// pools of `deployment` on this host, with its NIXL agent, for that
-    /// Transfer Server's READs. Answered with [`Reply::Exposed`] once they
+    /// Transfer Server's READs. Answered with [`Response::Exposed`] once they
     /// are registered; refused when a region is not storage of the
     /// deployment, when no Transfer Server is connected, or when it cannot
     /// register them. The regions stay registered for the exposure until
@@ -1181,7 +1198,7 @@ pub enum Request {
     Registered {
         request: u64,
         metadata: Vec<u8>,
-        ranges: Vec<Registered>,
+        ranges: Vec<Registration>,
         failure: Option<String>,
     },
     /// From the Transfer Server: the device storage of the server's
@@ -1214,7 +1231,7 @@ pub enum ErrorKind {
     /// No Transfer Server is connected: it has not started yet, or it
     /// ended and the server starts it again.
     Unavailable,
-    /// A booking or a new device storage would take a GPU's ledger past
+    /// A reservation or a new device storage would take a GPU's quota past
     /// its quota.
     Quota,
 }
@@ -1222,21 +1239,17 @@ pub enum ErrorKind {
 /// The server's answer to one request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Reply {
-    EpochsPublished,
+pub enum Response {
+    Published,
     Claimed {
         claim: Claim,
     },
     Retained {
         released: u64,
     },
-    /// The tensors found, over `storages`, whose descriptors travel with the
-    /// reply in order, and the keys not found.
-    Got {
-        tensors: Vec<TensorRecord>,
-        storages: Vec<StorageRecord>,
-        missing: Vec<Key>,
-    },
+    /// What a [`Request::Get`] or a [`Request::AllocateHost`] found; the
+    /// storages' descriptors travel with the response, in order.
+    Tensors(Tensors),
     Put,
     Promoted,
     Released,
@@ -1254,12 +1267,11 @@ pub enum Reply {
     Restarting {
         pid: u32,
     },
-    /// The page pool, whose memfd travels with the reply: `slots` slots of
-    /// `page_bytes` bytes, slot `i` at byte `i * page_bytes`.
-    PagePool {
+    /// The page pool, whose memfd travels with the response: `slots` slots
+    /// of the shape's `page_bytes`, slot `i` at byte `i * page_bytes`.
+    Pool {
         pool: u64,
         slots: u64,
-        page_bytes: u64,
     },
     /// One level per key of the lookup.
     Lookup {
@@ -1291,22 +1303,16 @@ pub enum Reply {
         tokens: u64,
     },
     Finished,
-    /// The ledgers a `Book` or a `Ledger` names, and what the host admits
-    /// of new host storage; for a `Ledger`, also what the transfer tasks of
-    /// the asking deployment copied, by priority (none for a `Book`).
-    Ledger {
-        ledgers: Vec<GpuLedger>,
-        host: HostStorage,
-        transfers: Vec<TransferTotal>,
-    },
-    /// The task a [`Request::Transfer`] submitted.
-    Transferring {
+    /// What a [`Request::Quota`] or a [`Request::Usage`] names.
+    Usage(Usage),
+    /// The task a [`Request::Submit`] submitted.
+    Submitted {
         task: u64,
     },
-    TransferOpened {
+    SessionOpened {
         session: u64,
     },
-    TransferClosed,
+    SessionClosed,
     /// How many tasks a [`Request::Cancel`] cancelled.
     Cancelled {
         tasks: u64,
@@ -1328,7 +1334,7 @@ pub enum Reply {
     Exposed {
         exposure: u64,
         metadata: Vec<u8>,
-        regions: Vec<Registered>,
+        regions: Vec<Registration>,
     },
     /// A [`Request::Unexpose`] was taken.
     Unexposed,
@@ -1336,6 +1342,25 @@ pub enum Reply {
         kind: ErrorKind,
         message: String,
     },
+}
+
+/// The tensors a [`Request::Get`] found, over `storages`, which they name by
+/// index, and the keys it did not find.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tensors {
+    pub tensors: Vec<TensorRecord>,
+    pub storages: Vec<StorageRecord>,
+    pub missing: Vec<Key>,
+}
+
+/// The quotas a [`Request::Quota`] or a [`Request::Usage`] names, what the
+/// host admits of new host storage, and, for a [`Request::Usage`], what the
+/// tasks of the asking deployment copied, by priority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub quotas: Vec<Quota>,
+    pub host: HostStorage,
+    pub tasks: Vec<TaskTotal>,
 }
 
 /// The pages a [`Request::PeerPin`] pinned in one pool: the pool, the shape
@@ -1352,27 +1377,27 @@ pub struct PeerPool {
 /// What a server holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Listing {
-    pub tensors: Vec<ListedTensor>,
+    pub tensors: Vec<TensorListing>,
     /// Bytes of device storages per GPU (by UUID) and per scope that holds a
     /// tensor in them; a storage shared by scopes counts for each.
     pub device_bytes: Vec<ScopeBytes>,
     /// Bytes of host storages, per scope.
     pub host_bytes: Vec<ScopeBytes>,
     /// The deployments claimed, and whether their head is connected.
-    pub deployments: Vec<ListedDeployment>,
+    pub deployments: Vec<DeploymentListing>,
     /// The page pools.
-    pub page_pools: Vec<ListedPool>,
+    pub page_pools: Vec<PoolListing>,
     /// Whether the Mooncake connector is connected.
     pub connector: bool,
     /// The Transfer Server, while it is connected.
-    pub transfer: Option<ListedTransfer>,
-    /// Every deployment's ledger of every GPU the server books.
-    pub ledgers: Vec<GpuLedger>,
+    pub transfer: Option<TransferListing>,
+    /// Every deployment's quota of every GPU the server reserves.
+    pub quotas: Vec<Quota>,
 }
 
 /// The Transfer Server in a [`Listing`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListedTransfer {
+pub struct TransferListing {
     /// Its process id.
     pub pid: i32,
     /// The links it measured when it started; empty until it reported them.
@@ -1380,12 +1405,12 @@ pub struct ListedTransfer {
     /// The device storage its CUDA context takes on each GPU it uses.
     pub contexts: Vec<ContextBytes>,
     /// The tasks it runs.
-    pub tasks: Vec<ListedTask>,
+    pub tasks: Vec<TaskListing>,
 }
 
 /// One transfer task in a [`Listing`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListedTask {
+pub struct TaskListing {
     pub task: u64,
     pub deployment: String,
     pub update: u64,
@@ -1403,7 +1428,7 @@ pub struct ListedTask {
 /// over): the tasks the deployment's heads and workers submitted and the
 /// weight moves the server made for it, ended or running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransferTotal {
+pub struct TaskTotal {
     pub priority: Priority,
     /// The bytes of every span of the tasks submitted.
     pub bytes: u64,
@@ -1415,7 +1440,7 @@ pub struct TransferTotal {
 
 /// One page pool in a [`Listing`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListedPool {
+pub struct PoolListing {
     pub pool: u64,
     /// The deployment the pool belongs to.
     pub deployment: String,
@@ -1434,7 +1459,7 @@ pub struct ListedPool {
 
 /// One retained tensor in a [`Listing`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListedTensor {
+pub struct TensorListing {
     pub key: Key,
     pub name: String,
     pub scopes: Vec<Scope>,
@@ -1471,7 +1496,7 @@ pub struct Retainer {
 
 /// One claimed deployment in a [`Listing`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListedDeployment {
+pub struct DeploymentListing {
     pub deployment: String,
     pub head_connected: bool,
 }
@@ -1484,14 +1509,14 @@ pub struct ListedDeployment {
 pub enum Event {
     /// To a transfer's submitter: task `task` copied `bytes` of its spans
     /// so far.
-    TransferProgress { task: u64, bytes: u64 },
+    TaskProgress { task: u64, bytes: u64 },
     /// To a transfer's submitter: task `task` ended as `end`, having copied
     /// `bytes`. From then on the Transfer Server reads none of its sources
     /// and writes none of its destinations.
-    Transferred {
+    TaskEnded {
         task: u64,
         bytes: u64,
-        end: TransferEnd,
+        status: TaskStatus,
     },
     /// To the Transfer Server: an allocation of `bytes` in `storage`, whose
     /// descriptor travels with the event (a CUDA VMM allocation's POSIX
@@ -1509,14 +1534,14 @@ pub enum Event {
     AllocationReleased { allocation: Allocation },
     /// To the Transfer Server: copy `moves` as task `task` at `priority`,
     /// and report with [`Request::Copied`].
-    Transfer {
+    Task {
         task: u64,
         priority: Priority,
         moves: Vec<Move>,
     },
     /// Retain local GPU contexts between tasks of an operation. A session
     /// with no GPUs ends its holds; task holds remain independent.
-    TransferSession { session: u64, gpus: Vec<[u8; 16]> },
+    Session { session: u64, gpus: Vec<[u8; 16]> },
     /// To the Transfer Server: cancel task `task`.
     Cancel { task: u64 },
     /// To the Transfer Server: change the budgets of `links` and of every
@@ -1594,6 +1619,6 @@ pub enum ClientMessage {
 #[serde(rename_all = "snake_case")]
 pub enum ServerMessage {
     Welcome(Welcome),
-    Reply { id: u64, reply: Reply },
+    Response { id: u64, response: Response },
     Event(Event),
 }

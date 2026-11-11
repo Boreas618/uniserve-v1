@@ -40,7 +40,7 @@
 //! A [`Planner`] caches each pair's executable manifest. Participating
 //! workers consume that concrete plan. [`BoundManifest::spans`]
 //! turns the copies into the spans of a transfer between the chunks the
-//! Storage Server retains ([`crate::protocol::Request::Transfer`]), which
+//! Storage Server retains ([`crate::protocol::Request::Submit`]), which
 //! its Transfer Server executes. The source epoch of weights is what the
 //! manifests an epoch retains name ([`weights::sources`]).
 
@@ -62,15 +62,7 @@ pub use tasks::{BoundManifest, Spans};
 use crate::Key;
 use crate::protocol::{LinkBandwidth, LinkEnd, Location};
 
-/// Why a manifest cannot be computed or applied.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// A layout or request contradicts itself.
-    #[error("invalid copy manifest input: {0}")]
-    Invalid(String),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
+pub use crate::error::{Error, Result};
 
 use crate::key::Digest;
 
@@ -105,7 +97,7 @@ impl Binding {
         match self {
             Self::Rank => gpu
                 .map(|gpu| LinkEnd::Device { gpu })
-                .ok_or_else(|| Error::Invalid("rank storage names no GPU".into())),
+                .ok_or_else(|| Error::Manifest("rank storage names no GPU".into())),
             Self::Local {
                 at: Location::Host { .. },
             } => Ok(LinkEnd::Host),
@@ -179,7 +171,7 @@ impl Storage {
     ) -> Result<Self> {
         layout.validate()?;
         if page_bytes == 0 {
-            return Err(Error::Invalid("pages of no bytes hold no storage".into()));
+            return Err(Error::Manifest("pages of no bytes hold no storage".into()));
         }
         let pages = layout.bytes.div_ceil(page_bytes);
         let chunks = (0..pages)
@@ -341,7 +333,7 @@ impl Request {
     /// The digest of everything the manifest is computed from.
     pub fn digest(&self) -> Result<[u8; 32]> {
         let encoded = rmp_serde::to_vec(self)
-            .map_err(|error| Error::Invalid(format!("encoding a manifest request: {error}")))?;
+            .map_err(|error| Error::Manifest(format!("encoding a manifest request: {error}")))?;
         let mut digest = Digest::new(b"uniserve-manifest-request");
         digest.bytes(&encoded);
         Ok(digest.finish())
@@ -501,7 +493,7 @@ impl Manifest {
             &self.missing,
         );
         let encoded = rmp_serde::to_vec(&directed)
-            .map_err(|error| Error::Invalid(format!("encoding a manifest: {error}")))?;
+            .map_err(|error| Error::Manifest(format!("encoding a manifest: {error}")))?;
         let mut digest = Digest::new(b"uniserve-manifest");
         digest.bytes(&encoded);
         Ok(digest.finish())

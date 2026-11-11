@@ -61,7 +61,7 @@ pub(crate) fn copies(
     content: [u8; 32],
     gpu: Gpu,
 ) -> Result<Vec<PageCopy>> {
-    let invalid = |error: manifest::Error| Error::Invalid(format!("a latent restore: {error}"));
+    let invalid = |error: ::storage::Error| Error::Invalid(format!("a latent restore: {error}"));
     let fingerprint = |_: &str| Some(content);
     let paged = |stored: &Stored| {
         manifest::Storage::paged(stored.layout.clone(), stored.page_bytes, &fingerprint)

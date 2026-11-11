@@ -37,7 +37,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 
 use ::storage::protocol::{
-    Key, ListedPool, PageAnchor, PageShape, PageSlot, PageWindow, PeerPool, Scope,
+    Key, PageAnchor, PageShape, PageSlot, PageWindow, PeerPool, PoolListing, Scope,
 };
 use serde::{Deserialize, Serialize};
 
@@ -724,8 +724,8 @@ impl Pools {
         self.settle();
     }
 
-    pub(super) fn listing(&self) -> Vec<ListedPool> {
-        let mut pools: Vec<ListedPool> = self
+    pub(super) fn listing(&self) -> Vec<PoolListing> {
+        let mut pools: Vec<PoolListing> = self
             .pools
             .iter()
             .map(|(&pool, entry)| entry.listed(pool))
@@ -1423,7 +1423,7 @@ impl Pool {
         }
     }
 
-    fn listed(&self, pool: u64) -> ListedPool {
+    fn listed(&self, pool: u64) -> PoolListing {
         let (mut ready, mut reserved, mut pinned, mut uploading) = (0, 0, 0, 0);
         for slot in &self.slots {
             match slot {
@@ -1441,7 +1441,7 @@ impl Pool {
                 }
             }
         }
-        ListedPool {
+        PoolListing {
             pool,
             deployment: self.deployment.clone(),
             shape: self.shape,

@@ -49,7 +49,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// - `CUDA_MODULE_LOADING=EAGER`: lazy module loading synchronizes the context when a kernel is first
 ///   used, which can deadlock against a collective another stream is waiting in for a peer.
 /// - `NCCL_RUNTIME_CONNECT=0`: deferred peer handshakes would allocate connection buffers after the
-///   process booked its device storage.
+///   process reserved its device storage.
 const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
     ("CUDA_MODULE_LOADING", "EAGER"),
     ("NCCL_RUNTIME_CONNECT", "0"),
@@ -543,8 +543,8 @@ impl EngineControl {
         Ok((control, welcome.nodes))
     }
 
-    /// The storage ledgers every node's Storage Server keeps for the deployment, one JSON report
-    /// per node: `{"host": ..., "ledgers": [...], "host_storage": {...}, "transfers": [...]}`.
+    /// The quotas every node's Storage Server keeps for the deployment, one JSON report
+    /// per node: `{"host": ..., "quotas": [...], "host_storage": {...}, "transfers": [...]}`.
     /// Each node's daemon reads them over its claim, so no main process is asked.
     pub(crate) fn storage_reports(&self) -> anyhow::Result<Vec<String>> {
         let (mut connection, nodes) = self.connect()?;
@@ -554,7 +554,7 @@ impl EngineControl {
             connection.send(&process::Upstream {
                 kind: Some(upstream::Kind::Request(process::Request {
                     id: index as u64 + 1,
-                    kind: Some(request::Kind::Ledger(process::LedgerQuery {
+                    kind: Some(request::Kind::Usage(process::UsageQuery {
                         host: host.clone(),
                         deployment: self.deployment.clone(),
                     })),
@@ -562,19 +562,19 @@ impl EngineControl {
             })?;
             let answer: process::Downstream = connection
                 .recv(DAEMON_TIMEOUT)?
-                .context("the daemon did not report its storage ledgers")?;
+                .context("the daemon did not report its quotas")?;
             let Some(downstream::Kind::Reply(answer)) = answer.kind else {
-                anyhow::bail!("the daemon did not answer its ledger query");
+                anyhow::bail!("the daemon did not answer its quota query");
             };
             anyhow::ensure!(
                 answer.error.is_empty(),
-                "the storage ledgers of {host}: {}",
+                "the quotas of {host}: {}",
                 answer.error
             );
-            let Some(reply::Kind::Ledger(report)) = answer.kind else {
-                anyhow::bail!("the daemon returned no storage ledger");
+            let Some(reply::Kind::Usage(report)) = answer.kind else {
+                anyhow::bail!("the daemon returned no quota");
             };
-            let mut report: serde_json::Value = serde_json::from_str(&report.ledgers)?;
+            let mut report: serde_json::Value = serde_json::from_str(&report.usage)?;
             report["host"] = serde_json::Value::String(host);
             reports.push(report.to_string());
         }

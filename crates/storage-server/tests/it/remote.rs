@@ -22,7 +22,7 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use ::storage::protocol::{PageShape, PageSlot, Priority, Region, Reply, Request, TransferEnd};
+use ::storage::protocol::{PageShape, PageSlot, Priority, Region, Request, Response, TaskStatus};
 use ::storage::{Access, Client, Key, Role, TensorRecord};
 
 use crate::server::{
@@ -53,7 +53,7 @@ fn rdma_host() -> Running {
 fn endpoint(socket: &Path) -> String {
     let mut operator = Client::connect(socket, Role::Operator).unwrap();
     match operator.call(&Request::Endpoint, &[]).unwrap().reply {
-        Reply::Endpoint { tcp: Some(tcp) } => tcp,
+        Response::Endpoint { tcp: Some(tcp) } => tcp,
         other => panic!("the server names no endpoint: {other:?}"),
     }
 }
@@ -119,7 +119,7 @@ fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
     ];
     for (source_host, reason) in cases {
         let task = worker
-            .transfer(
+            .copy(
                 vec![span(
                     remote_region(&source_host, tensor_region(1)),
                     0,
@@ -132,7 +132,7 @@ fn a_read_from_another_host_fails_when_that_host_cannot_expose_its_source() {
             )
             .unwrap();
         match end_of(&mut worker, task) {
-            (0, TransferEnd::Failed { message }) => assert!(
+            (0, TaskStatus::Failed { message }) => assert!(
                 message.contains(&source_host) && message.contains(reason),
                 "the failure names neither {source_host} nor {reason:?}: {message}"
             ),
@@ -222,7 +222,7 @@ fn page_pool(worker: &mut Client, page_bytes: u64, slots: u64) -> (u64, std::fs:
     };
     let answer = worker
         .call(
-            &Request::PagePool {
+            &Request::Pool {
                 shape,
                 numa_node: None,
                 bytes: Some(slots * page_bytes),
@@ -230,7 +230,7 @@ fn page_pool(worker: &mut Client, page_bytes: u64, slots: u64) -> (u64, std::fs:
             &[],
         )
         .unwrap();
-    let Reply::PagePool { pool, .. } = answer.reply else {
+    let Response::Pool { pool, .. } = answer.reply else {
         panic!("the page pool was refused: {:?}", answer.reply);
     };
     let storage = answer
@@ -249,7 +249,7 @@ fn reserve(
     writer: Option<::storage::Scope>,
     keys: &[Key],
 ) -> Vec<u64> {
-    let Reply::Reserved { slots } = head
+    let Response::Reserved { slots } = head
         .call(
             &Request::Reserve {
                 pool,
@@ -290,7 +290,7 @@ fn a_peer_reads_published_pages_into_its_own_pool() {
     let claim = source_daemon
         .claim(1, vec![scope("text", 0)], Vec::new())
         .unwrap();
-    source_daemon.publish_epochs(vec![1]).unwrap();
+    source_daemon.publish(vec![1]).unwrap();
     let mut source_worker = epoch_worker(&source_host.socket, scope("text", 0), 1, claim);
     let (source_pool, source_storage) = page_pool(&mut source_worker, PAGE, 8);
     let mut source_head = engine_head(&source_host.socket, 1);
@@ -326,7 +326,7 @@ fn a_peer_reads_published_pages_into_its_own_pool() {
     let claim = destination_daemon
         .claim(1, vec![scope("text", 0)], Vec::new())
         .unwrap();
-    destination_daemon.publish_epochs(vec![1]).unwrap();
+    destination_daemon.publish(vec![1]).unwrap();
     let mut destination_worker = epoch_worker(&destination_host.socket, scope("text", 0), 1, claim);
     let (destination_pool, destination_storage) = page_pool(&mut destination_worker, PAGE, 8);
     let mut destination_head = engine_head(&destination_host.socket, 1);
@@ -351,12 +351,10 @@ fn a_peer_reads_published_pages_into_its_own_pool() {
             )
         })
         .collect();
-    let task = destination_head
-        .transfer(spans, Priority::Request, 0)
-        .unwrap();
+    let task = destination_head.copy(spans, Priority::Request, 0).unwrap();
     assert_eq!(
         end_of(&mut destination_head, task),
-        (3 * PAGE, TransferEnd::Complete)
+        (3 * PAGE, TaskStatus::Complete)
     );
     destination_head
         .call(
@@ -381,7 +379,7 @@ mod device {
     use std::time::{Duration, Instant};
 
     use ::storage::protocol::{
-        FabricExport, FabricHandle, Link, LinkEnd, Priority, Span, TransferEnd,
+        FabricExport, FabricHandle, Link, LinkEnd, Priority, Span, TaskStatus,
     };
     use ::storage::{Access, Client};
     use platform::{DeviceAllocation, DeviceId, HandleType, ShareableHandle};
@@ -454,7 +452,7 @@ mod device {
         let read = |worker: &mut ::storage::Client, device_at: usize, host_at: usize| {
             let started = Instant::now();
             let task = worker
-                .transfer(
+                .copy(
                     vec![
                         span(
                             remote_region(&source, tensor_region(1)),
@@ -477,7 +475,7 @@ mod device {
                 .unwrap();
             assert_eq!(
                 end_of(worker, task),
-                (2 * BYTES as u64, TransferEnd::Complete)
+                (2 * BYTES as u64, TaskStatus::Complete)
             );
             let elapsed = started.elapsed();
 
@@ -593,7 +591,7 @@ mod device {
         let source = endpoint(&source_host.socket);
         let read_into = |worker: &mut ::storage::Client, offset: usize| {
             let task = worker
-                .transfer(
+                .copy(
                     vec![span(
                         remote_region(&source, tensor_region(1)),
                         0,
@@ -607,7 +605,7 @@ mod device {
                 .unwrap();
             end_of(worker, task)
         };
-        let complete = (granularity as u64, TransferEnd::Complete);
+        let complete = (granularity as u64, TaskStatus::Complete);
         assert_eq!(read_into(&mut destination_worker, 0), complete);
 
         // The source host's Transfer Server ends; its server starts another,
@@ -732,7 +730,7 @@ mod device {
 
         let read_into = |worker: &mut Client, source: u8, offset: usize, length: usize| {
             let task = worker
-                .transfer(
+                .copy(
                     vec![span(
                         remote_region(&endpoint, tensor_region(source)),
                         0,
@@ -761,12 +759,12 @@ mod device {
 
         assert_eq!(
             read_into(&mut destination_worker, 1, 0, read_bytes),
-            (read_bytes as u64, TransferEnd::Complete)
+            (read_bytes as u64, TaskStatus::Complete)
         );
         assert_eq!(remote_links(&mut destination_head), 0);
         assert_eq!(
             read_into(&mut destination_worker, 3, bytes, bytes),
-            (bytes as u64, TransferEnd::Complete)
+            (bytes as u64, TaskStatus::Complete)
         );
         assert!(remote_links(&mut destination_head) > 0);
 
@@ -870,11 +868,11 @@ mod device {
             })
             .collect();
         let task = destination_worker
-            .transfer(spans, Priority::Background, 1)
+            .copy(spans, Priority::Background, 1)
             .unwrap();
         assert_eq!(
             end_of(&mut destination_worker, task),
-            ((cases.len() * ROWS * ROW) as u64, TransferEnd::Complete)
+            ((cases.len() * ROWS * ROW) as u64, TaskStatus::Complete)
         );
 
         let mut expected = vec![0; granularity];

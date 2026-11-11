@@ -218,8 +218,8 @@ pub fn list(socket: &Path) -> ::storage::Result<()> {
             );
         }
     }
-    for ledger in &listing.ledgers {
-        println!("{}", ledger.describe());
+    for quota in &listing.quotas {
+        println!("{}", quota.describe());
     }
     Ok(())
 }

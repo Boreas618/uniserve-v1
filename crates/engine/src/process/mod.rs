@@ -233,7 +233,7 @@ pub(crate) struct MainProcess {
     /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
     workers: Vec<Arc<Worker>>,
     memory: Vec<Memory>,
-    /// The rank's Storage Server client, kept for the two calls that reach its ledger and no
+    /// The rank's Storage Server client, kept for the two calls that reach its quota and no
     /// other: a park gives the cache's segments back, and a wake maps them again. Every caller takes
     /// `&mut` of its own `&Retained` (`impl ExclusiveStorage for &Retained`), so the device thread can
     /// hold one beside the control thread without a lock.

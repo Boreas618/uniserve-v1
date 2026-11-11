@@ -122,7 +122,7 @@ pub struct CacheTable {
 }
 
 /// A host page pool a rank maps at its host's Storage Server
-/// (`storage::protocol::Request::PagePool`), as it reports it: the pool the
+/// (`storage::protocol::Request::Pool`), as it reports it: the pool the
 /// engine pins, reserves, commits and looks pages up in, and where it
 /// reaches it. What the pages hold is the report's that carries it: a cache
 /// group's pages (`PrefixCacheInfo::page_pools`), keyed by the group's page

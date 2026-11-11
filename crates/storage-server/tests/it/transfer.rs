@@ -16,8 +16,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ::storage::protocol::{
-    ErrorKind, Event, Link, LinkEnd, PageShape, Priority, Region, Reply, Request, Span, Throttle,
-    TransferEnd, TransferTotal,
+    ErrorKind, Event, Link, LinkEnd, PageShape, Priority, Region, Request, Response, Span,
+    TaskStatus, TaskTotal, Throttle,
 };
 use ::storage::{Access, Client, Role};
 use storage_server::Launch;
@@ -128,15 +128,15 @@ pub(crate) fn transfer_event(client: &mut Client) -> Event {
 }
 
 /// The end of task `task`, skipping its progress.
-pub(crate) fn end_of(client: &mut Client, task: u64) -> (u64, TransferEnd) {
+pub(crate) fn end_of(client: &mut Client, task: u64) -> (u64, TaskStatus) {
     loop {
         match transfer_event(client) {
-            Event::Transferred {
+            Event::TaskEnded {
                 task: ended,
                 bytes,
-                end,
+                status: end,
             } if ended == task => return (bytes, end),
-            Event::TransferProgress { .. } | Event::Transferred { .. } => {}
+            Event::TaskProgress { .. } | Event::TaskEnded { .. } => {}
             other => panic!("unexpected event {other:?}"),
         }
     }
@@ -236,9 +236,9 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
         kv_head_count: 1,
         page_bytes: 16,
     };
-    let Reply::PagePool { pool, .. } = worker
+    let Response::Pool { pool, .. } = worker
         .call(
-            &Request::PagePool {
+            &Request::Pool {
                 shape,
                 numa_node: None,
                 bytes: None,
@@ -255,7 +255,7 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
     // starts at byte 16 of its storage. The pool's slot 2 then goes back
     // into the destination's last bytes.
     let task = worker
-        .transfer(
+        .copy(
             vec![
                 span(tensor_region(1), 8, tensor_region(2), 0, 24),
                 span(tensor_region(1), 0, Region::Pool { pool }, 32, 16),
@@ -264,15 +264,15 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
             1,
         )
         .unwrap();
-    assert_eq!(end_of(&mut worker, task), (40, TransferEnd::Complete));
+    assert_eq!(end_of(&mut worker, task), (40, TaskStatus::Complete));
     let pool_task = worker
-        .transfer(
+        .copy(
             vec![span(Region::Pool { pool }, 32, tensor_region(2), 32, 16)],
             Priority::Background,
             1,
         )
         .unwrap();
-    assert_eq!(end_of(&mut worker, pool_task), (16, TransferEnd::Complete));
+    assert_eq!(end_of(&mut worker, pool_task), (16, TaskStatus::Complete));
 
     let copied = read(&destination, 0, 64);
     assert_eq!(&copied[..16], &[0; 16]);
@@ -299,18 +299,18 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
     assert!(transfer.contexts.is_empty());
     assert!(transfer.tasks.is_empty());
 
-    // The deployment's ledger read counts what its ended tasks copied, by
+    // The deployment's quota read counts what its ended tasks copied, by
     // priority, highest first.
-    let transfers = head.ledger(Vec::new()).unwrap().transfers;
+    let transfers = head.usage(Vec::new()).unwrap().tasks;
     assert_eq!(
         transfers,
         vec![
-            TransferTotal {
+            TaskTotal {
                 priority: Priority::Warming,
                 bytes: 40,
                 copied: 40,
             },
-            TransferTotal {
+            TaskTotal {
                 priority: Priority::Background,
                 bytes: 16,
                 copied: 16,
@@ -341,7 +341,7 @@ fn concurrent_transfers_can_be_collected_in_reverse_order() {
         .into_iter()
         .map(|offset| {
             worker
-                .transfer(
+                .copy(
                     vec![span(tensor_region(1), offset, tensor_region(2), offset, 32)],
                     Priority::Warming,
                     1,
@@ -353,13 +353,13 @@ fn concurrent_transfers_can_be_collected_in_reverse_order() {
     let deadline = Instant::now() + Duration::from_secs(60);
     for task in tasks.into_iter().rev() {
         let completed = loop {
-            if let Some(completed) = worker.poll_transfer(task).unwrap() {
+            if let Some(completed) = worker.poll_task(task).unwrap() {
                 break completed;
             }
             assert!(Instant::now() < deadline, "a transfer did not complete");
             std::thread::sleep(Duration::from_millis(1));
         };
-        assert_eq!(completed, (32, TransferEnd::Complete));
+        assert_eq!(completed, (32, TaskStatus::Complete));
     }
     assert_eq!(read(&destination, 0, 64), source_bytes);
 }
@@ -387,7 +387,7 @@ fn a_span_of_rows_copies_each_row_at_its_pitches() {
     // 8 bytes apart in the destination from byte 0: a column of a matrix
     // of 16-byte rows gathered into a matrix of 8-byte rows.
     let task = worker
-        .transfer(
+        .copy(
             vec![rows_span(
                 (tensor_region(1), 2, 16),
                 (tensor_region(2), 0, 8),
@@ -398,7 +398,7 @@ fn a_span_of_rows_copies_each_row_at_its_pitches() {
             1,
         )
         .unwrap();
-    assert_eq!(end_of(&mut worker, task), (16, TransferEnd::Complete));
+    assert_eq!(end_of(&mut worker, task), (16, TaskStatus::Complete));
     let copied = read(&destination, 0, 64);
     for row in 0..4 {
         let target = row * 8;
@@ -485,11 +485,11 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
         )],
     ];
     for spans in refused {
-        let result = worker.transfer(spans, Priority::Background, 1);
+        let result = worker.copy(spans, Priority::Background, 1);
         assert_eq!(server_error(result), ErrorKind::Invalid);
     }
     // Another deployment's head names none of this deployment's storage.
-    let result = other_head.transfer(
+    let result = other_head.copy(
         vec![span(tensor_region(1), 0, tensor_region(2), 0, 8)],
         Priority::Background,
         1,
@@ -515,7 +515,7 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
             &[(host(32), source.as_fd())],
         )
         .unwrap();
-    let result = worker.transfer(
+    let result = worker.copy(
         vec![span(tensor_region(1), 0, tensor_region(1), 0, 8)],
         Priority::Background,
         1,
@@ -579,14 +579,14 @@ fn a_promotion_transfer_overtakes_background_transfers_on_its_link() {
     } = slow(&server, 256 << 20);
 
     let background = worker
-        .transfer(
+        .copy(
             vec![span(tensor_region(1), 0, tensor_region(2), 0, bytes - 4096)],
             Priority::Background,
             1,
         )
         .unwrap();
     let promotion = worker
-        .transfer(
+        .copy(
             vec![span(
                 tensor_region(1),
                 0,
@@ -601,8 +601,11 @@ fn a_promotion_transfer_overtakes_background_transfers_on_its_link() {
 
     let mut ended = Vec::new();
     while ended.len() < 2 {
-        if let Event::Transferred { task, end, .. } = transfer_event(&mut worker) {
-            assert_eq!(end, TransferEnd::Complete);
+        if let Event::TaskEnded {
+            task, status: end, ..
+        } = transfer_event(&mut worker)
+        {
+            assert_eq!(end, TaskStatus::Complete);
             ended.push(task);
         }
     }
@@ -638,7 +641,7 @@ fn a_throttle_without_links_takes_the_deployments_tasks_links() {
         .unwrap();
     let copy = |worker: &mut Client, update: u64| {
         worker
-            .transfer(
+            .copy(
                 vec![span(tensor_region(1), 0, tensor_region(2), 0, bytes)],
                 Priority::Background,
                 update,
@@ -653,13 +656,13 @@ fn a_throttle_without_links_takes_the_deployments_tasks_links() {
     let started = Instant::now();
     while started.elapsed() < Duration::from_millis(200) {
         worker.pump().unwrap();
-        if let Some((Event::Transferred { end, .. }, _)) = worker.next_event() {
+        if let Some((Event::TaskEnded { status: end, .. }, _)) = worker.next_event() {
             panic!("a task over a halved link ended within 200 ms: {end:?}");
         }
         std::thread::sleep(Duration::from_millis(1));
     }
     head.throttle(Vec::new(), Throttle::Restore).unwrap();
-    assert_eq!(end_of(&mut worker, task), (bytes, TransferEnd::Complete));
+    assert_eq!(end_of(&mut worker, task), (bytes, TaskStatus::Complete));
     assert_eq!(
         read(&destination, 0, bytes as usize),
         read(&source, 0, bytes as usize)
@@ -669,7 +672,7 @@ fn a_throttle_without_links_takes_the_deployments_tasks_links() {
     std::thread::sleep(Duration::from_secs(9));
     let started = Instant::now();
     let task = copy(&mut worker, 2);
-    assert_eq!(end_of(&mut worker, task), (bytes, TransferEnd::Complete));
+    assert_eq!(end_of(&mut worker, task), (bytes, TaskStatus::Complete));
     assert!(
         started.elapsed() < Duration::from_millis(200),
         "a task over a restored link took {:?}",
@@ -689,7 +692,7 @@ fn a_cancelled_transfer_ends_cancelled_and_stops_copying() {
     } = slow(&server, 256 << 20);
 
     let task = worker
-        .transfer(
+        .copy(
             vec![span(tensor_region(1), 0, tensor_region(2), 0, bytes)],
             Priority::Warming,
             7,
@@ -697,7 +700,7 @@ fn a_cancelled_transfer_ends_cancelled_and_stops_copying() {
         .unwrap();
     // The task reports its progress while it copies.
     match transfer_event(&mut worker) {
-        Event::TransferProgress {
+        Event::TaskProgress {
             task: running,
             bytes: copied,
         } => assert!(running == task && copied < bytes),
@@ -706,7 +709,7 @@ fn a_cancelled_transfer_ends_cancelled_and_stops_copying() {
     // The head cancels the update's tasks, the worker's among them.
     assert_eq!(head.cancel(vec![], Some(7)).unwrap(), 1);
     let (copied, end) = end_of(&mut worker, task);
-    assert_eq!(end, TransferEnd::Cancelled);
+    assert_eq!(end, TaskStatus::Cancelled);
     assert!(copied < bytes);
 
     // Once it ended, no byte past what it reported is written.
@@ -733,7 +736,7 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
         ..
     } = slow(&server, 256 << 20);
     let task = worker
-        .transfer(
+        .copy(
             vec![span(tensor_region(1), 0, tensor_region(2), 0, bytes)],
             Priority::Background,
             1,
@@ -741,7 +744,7 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
         .unwrap();
     assert!(matches!(
         transfer_event(&mut worker),
-        Event::TransferProgress { .. }
+        Event::TaskProgress { .. }
     ));
 
     // The forks of the Transfer Server's restart hold no test's
@@ -754,7 +757,7 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
     assert_eq!(unsafe { libc::kill(crashed, libc::SIGKILL) }, 0);
     let (_, end) = end_of(&mut worker, task);
     assert!(
-        matches!(&end, TransferEnd::Failed { message } if message.contains("Transfer Server")),
+        matches!(&end, TaskStatus::Failed { message } if message.contains("Transfer Server")),
         "{end:?}"
     );
     // The submitter learns it at once, before the server starts another
@@ -766,13 +769,13 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
     let restarted = transfer_pid(&server.socket, Some(crashed));
     assert_ne!(restarted, crashed);
     let task = worker
-        .transfer(
+        .copy(
             vec![span(tensor_region(1), 0, tensor_region(2), 0, bytes)],
             Priority::Background,
             2,
         )
         .unwrap();
-    assert_eq!(end_of(&mut worker, task), (bytes, TransferEnd::Complete));
+    assert_eq!(end_of(&mut worker, task), (bytes, TaskStatus::Complete));
     assert_eq!(
         read(&destination, 0, bytes as usize),
         read(&source, 0, bytes as usize)
@@ -780,11 +783,11 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
 }
 
 /// An offload of an epoch's weights that the host cannot hold is refused
-/// whole under the host rule: nothing moves, and the GPU's ledger still
-/// books the weights.
+/// whole under the host rule: nothing moves, and the GPU's quota still
+/// reserves the weights.
 #[test]
 fn an_offload_the_host_cannot_hold_is_refused_and_moves_nothing() {
-    use crate::server::{booked, device, epoch_worker, ledger};
+    use crate::server::{device, epoch_worker, quota_of, reserved};
 
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);
@@ -808,7 +811,7 @@ fn an_offload_the_host_cannot_hold_is_refused_and_moves_nothing() {
         other => panic!("expected a refusal under the host rule, got {other:?}"),
     }
     assert_eq!(
-        booked(&ledger(&mut head), ::storage::Item::Weights, &[1]),
+        reserved(&quota_of(&mut head), ::storage::Item::Weights, &[1]),
         bytes
     );
 }
@@ -822,7 +825,7 @@ pub(crate) mod device {
 
     use ::storage::Access;
     use ::storage::protocol::{
-        Event, Link, LinkEnd, Location, Priority, Region, StorageRecord, Throttle, TransferEnd,
+        Event, Link, LinkEnd, Location, Priority, Region, StorageRecord, TaskStatus, Throttle,
     };
     use platform::{
         CopyBatch, DeviceAllocation, DeviceId, HandleType, Nvml, PinnedBuffer, ShareableHandle,
@@ -981,8 +984,8 @@ pub(crate) mod device {
                 .spans()
                 .collect::<::storage::manifest::Result<Vec<_>>>()
                 .unwrap();
-            let task = worker.transfer(spans, Priority::Background, 1).unwrap();
-            assert_eq!(end_of(&mut worker, task), (256, TransferEnd::Complete));
+            let task = worker.copy(spans, Priority::Background, 1).unwrap();
+            assert_eq!(end_of(&mut worker, task), (256, TaskStatus::Complete));
             assert_eq!(read(&staging, 512, 256), contents[64..320]);
         }
         let received = device_bytes(&destination);
@@ -1014,13 +1017,13 @@ pub(crate) mod device {
             .expect("the Transfer Server measured its context on the GPU")
     }
 
-    /// The Transfer Server's context as the deployment's ledger of `gpu`
-    /// books it, if it does.
+    /// The Transfer Server's context as the deployment's quota of `gpu`
+    /// reserves it, if it does.
     fn booked_context(client: &mut ::storage::Client, gpu: [u8; 16]) -> Option<u64> {
-        let ledgers = client.ledger(vec![gpu]).unwrap().ledgers;
-        ledgers
+        let quotas = client.usage(vec![gpu]).unwrap().quotas;
+        quotas
             .iter()
-            .flat_map(|ledger| &ledger.entries)
+            .flat_map(|quota| &quota.reservations)
             .find(|entry| entry.item == ::storage::Item::TransferContext)
             .map(|entry| entry.bytes)
     }
@@ -1033,14 +1036,14 @@ pub(crate) mod device {
     }
 
     /// Wait, at most ten seconds, until the Transfer Server `pid` holds no
-    /// context on `device`, and the ledger `client` reads books none.
+    /// context on `device`, and the quota `client` reads reserves none.
     fn await_release(nvml: &Nvml, client: &mut ::storage::Client, device: DeviceId, pid: i32) {
         let gpu = device.uuid().unwrap().0;
         let deadline = Instant::now() + Duration::from_secs(10);
         while holds_context(nvml, device, pid) || booked_context(client, gpu).is_some() {
             assert!(
                 Instant::now() < deadline,
-                "the Transfer Server still holds or books its context on {device}"
+                "the Transfer Server still holds or reserves its context on {device}"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1048,9 +1051,9 @@ pub(crate) mod device {
 
     /// The Transfer Server holds a GPU's CUDA context only while a task
     /// needs the GPU: none once it started; while a task copies into the
-    /// GPU, the context, booked in the deployment's ledger of the GPU at the
+    /// GPU, the context, reserved in the deployment's quota of the GPU at the
     /// bytes it measured; once the task ended, neither the context (NVML
-    /// lists the process on the GPU no more) nor its booking. A following
+    /// lists the process on the GPU no more) nor its reservation. A following
     /// task on the GPU retains it again. Explicit sessions keep it between
     /// tasks until their last owner closes or disconnects.
     #[test]
@@ -1085,15 +1088,15 @@ pub(crate) mod device {
             )
             .unwrap();
         assert_eq!(booked_context(&mut head, gpu), None);
-        // The ledger states the bandwidth from host storage to the GPU the
+        // The quota states the bandwidth from host storage to the GPU the
         // Transfer Server measured.
-        let ledgers = head.ledger(vec![gpu]).unwrap().ledgers;
-        assert!(!ledgers.is_empty());
+        let quotas = head.usage(vec![gpu]).unwrap().quotas;
+        assert!(!quotas.is_empty());
         assert!(
-            ledgers.iter().all(|ledger| ledger
+            quotas.iter().all(|quota| quota
                 .host_link_bytes_per_second
                 .is_some_and(|bandwidth| bandwidth > 0)),
-            "{ledgers:?}"
+            "{quotas:?}"
         );
 
         // The host link into the GPU at its floor, so that the task lasts
@@ -1106,7 +1109,7 @@ pub(crate) mod device {
             head.throttle(vec![link.clone()], Throttle::Halve).unwrap();
         }
         let task = worker
-            .transfer(
+            .copy(
                 vec![span(tensor_region(1), 0, tensor_region(2), 0, bytes as u64)],
                 Priority::Background,
                 1,
@@ -1114,8 +1117,8 @@ pub(crate) mod device {
             .unwrap();
         loop {
             match super::transfer_event(&mut worker) {
-                Event::TransferProgress { task: running, .. } if running == task => break,
-                Event::Transferred { end, .. } => panic!("the task ended at once: {end:?}"),
+                Event::TaskProgress { task: running, .. } if running == task => break,
+                Event::TaskEnded { status: end, .. } => panic!("the task ended at once: {end:?}"),
                 _ => {}
             }
         }
@@ -1123,51 +1126,51 @@ pub(crate) mod device {
         assert!(holds_context(&nvml, first, pid));
         assert_eq!(
             end_of(&mut worker, task),
-            (bytes as u64, TransferEnd::Complete)
+            (bytes as u64, TaskStatus::Complete)
         );
         await_release(&nvml, &mut head, first, pid);
         assert_eq!(device_bytes(&destination), source_bytes);
 
         // Two independent operations share the context, without creating
-        // or booking it until a task actually uses the GPU.
-        let session = worker.open_transfer(vec![gpu]).unwrap();
-        let other_session = head.open_transfer(vec![gpu]).unwrap();
+        // or reservation it until a task actually uses the GPU.
+        let session = worker.open_session(vec![gpu]).unwrap();
+        let other_session = head.open_session(vec![gpu]).unwrap();
         assert_eq!(booked_context(&mut head, gpu), None);
         let tail: u64 = 2 << 20;
         let task = worker
-            .transfer(
+            .copy(
                 vec![span(tensor_region(1), 0, tensor_region(2), 0, tail)],
                 Priority::Background,
                 2,
             )
             .unwrap();
-        assert_eq!(end_of(&mut worker, task), (tail, TransferEnd::Complete));
+        assert_eq!(end_of(&mut worker, task), (tail, TaskStatus::Complete));
         assert_eq!(booked_context(&mut head, gpu), Some(context));
         assert!(holds_context(&nvml, first, pid));
-        worker.close_transfer(session).unwrap();
+        worker.close_session(session).unwrap();
         assert_eq!(booked_context(&mut head, gpu), Some(context));
-        head.close_transfer(other_session).unwrap();
+        head.close_session(other_session).unwrap();
         await_release(&nvml, &mut head, first, pid);
 
         // Connection closure also retires its session, after task holds.
-        worker.open_transfer(vec![gpu]).unwrap();
+        worker.open_session(vec![gpu]).unwrap();
         let task = worker
-            .transfer(
+            .copy(
                 vec![span(tensor_region(1), 0, tensor_region(2), 0, tail)],
                 Priority::Warming,
                 3,
             )
             .unwrap();
-        assert_eq!(end_of(&mut worker, task), (tail, TransferEnd::Complete));
+        assert_eq!(end_of(&mut worker, task), (tail, TaskStatus::Complete));
         assert_eq!(booked_context(&mut head, gpu), Some(context));
         drop(worker);
         await_release(&nvml, &mut head, first, pid);
     }
 
-    /// A GPU whose storage ledger has no room for the Transfer Server's
+    /// A GPU whose quota has no room for the Transfer Server's
     /// context refuses the context: a task that needs the GPU fails, naming
-    /// the ledger, and the context is neither booked nor retained, so the
-    /// ledger stays within its quota.
+    /// the quota, and the context is neither reserved nor retained, so the
+    /// quota stays within its quota.
     #[test]
     #[ignore = "requires a CUDA device"]
     fn a_ledger_without_room_for_the_context_fails_the_task_that_needs_the_gpu() {
@@ -1200,7 +1203,7 @@ pub(crate) mod device {
         let quota = granularity as u64 + 4096 + context / 2;
         let total = 1 << 40;
         worker
-            .book(
+            .reserve(
                 gpu,
                 total,
                 Some(quota),
@@ -1209,39 +1212,39 @@ pub(crate) mod device {
             .unwrap();
 
         let task = worker
-            .transfer(
+            .copy(
                 vec![span(tensor_region(1), 0, tensor_region(2), 0, 4096)],
                 Priority::Background,
                 1,
             )
             .unwrap();
         match end_of(&mut worker, task) {
-            (0, TransferEnd::Failed { message }) => assert!(
-                message.contains("ledger") && message.contains("quota"),
+            (0, TaskStatus::Failed { message }) => assert!(
+                message.contains("quota") && message.contains("limit"),
                 "{message}"
             ),
             other => panic!("a task without room for the context ended {other:?}"),
         }
-        let ledgers = head.ledger(vec![gpu]).unwrap().ledgers;
-        let ledger = &ledgers[0];
+        let quotas = head.usage(vec![gpu]).unwrap().quotas;
+        let stated = &quotas[0];
         assert!(
-            ledger
-                .entries
+            stated
+                .reservations
                 .iter()
-                .all(|entry| entry.item != ::storage::Item::TransferContext)
+                .all(|reservation| reservation.item != ::storage::Item::TransferContext)
         );
-        assert!(ledger.used() <= quota);
+        assert!(stated.usage() <= quota);
         assert!(!holds_context(&nvml, first, pid));
         assert_eq!(device_bytes(&destination), vec![0; granularity]);
     }
 
-    /// The weights booked on `gpu` in `head`'s ledger of it: each entry's
+    /// The weights reserved on `gpu` in `head`'s quota of it: each entry's
     /// epochs and bytes, sorted.
     fn weights_on(head: &mut ::storage::Client, gpu: [u8; 16]) -> Vec<(Vec<u64>, u64)> {
-        let ledgers = head.ledger(vec![gpu]).unwrap().ledgers;
-        let mut weights: Vec<(Vec<u64>, u64)> = ledgers
+        let quotas = head.usage(vec![gpu]).unwrap().quotas;
+        let mut weights: Vec<(Vec<u64>, u64)> = quotas
             .iter()
-            .flat_map(|ledger| &ledger.entries)
+            .flat_map(|quota| &quota.reservations)
             .filter(|entry| entry.item == ::storage::Item::Weights)
             .map(|entry| (entry.epochs.clone(), entry.bytes))
             .collect();
@@ -1251,9 +1254,9 @@ pub(crate) mod device {
 
     /// The weights an epoch alone retains move to host storage and back
     /// through the Transfer Server, bytes intact: the offload leaves them in
-    /// host storage and the GPU's ledger without them, while the weights its
+    /// host storage and the GPU's quota without them, while the weights its
     /// successor maps stay on the GPU; the restore returns them to the GPU
-    /// they left and to its ledger.
+    /// they left and to its quota.
     #[test]
     #[ignore = "requires a CUDA device"]
     fn a_epochs_own_weights_move_to_host_storage_and_back() {
@@ -1267,7 +1270,7 @@ pub(crate) mod device {
 
         let mut head = head(&server.socket);
         let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-        head.publish_epochs(vec![1]).unwrap();
+        head.publish(vec![1]).unwrap();
         let mut previous = epoch_worker(&server.socket, scope("text", 0), 1, claim);
         let (own, own_fd) = device_storage(first, &own_bytes);
         let (shared, shared_fd) = device_storage(first, &shared_bytes);
@@ -1310,13 +1313,13 @@ pub(crate) mod device {
         let mut own_weights = |successor: &mut ::storage::Client| {
             update += 1;
             let task = successor
-                .transfer(
+                .copy(
                     vec![span(tensor_region(1), 0, tensor_region(3), 0, size)],
                     Priority::Background,
                     update,
                 )
                 .unwrap();
-            assert_eq!(end_of(successor, task), (size, TransferEnd::Complete));
+            assert_eq!(end_of(successor, task), (size, TaskStatus::Complete));
             read(&copy, 0, granularity)
         };
         let location = |head: &mut ::storage::Client| {
@@ -1410,8 +1413,8 @@ pub(crate) mod device {
             peer
         });
         let bytes: u64 = spans.iter().map(|span| span.bytes).sum();
-        let task = worker.transfer(spans, Priority::Promotion, 1).unwrap();
-        assert_eq!(end_of(&mut worker, task), (bytes, TransferEnd::Complete));
+        let task = worker.copy(spans, Priority::Promotion, 1).unwrap();
+        assert_eq!(end_of(&mut worker, task), (bytes, TaskStatus::Complete));
 
         let copied = device_bytes(&local);
         assert_eq!(&copied[..half], &host_source_bytes[..]);
@@ -1506,7 +1509,7 @@ pub(crate) mod device {
         };
         let half = granularity as u64 / 2;
         let task = worker
-            .transfer(
+            .copy(
                 vec![
                     span(region.clone(), half, tensor_region(2), 0, half),
                     span(region, 0, tensor_region(2), half, half),
@@ -1517,7 +1520,7 @@ pub(crate) mod device {
             .unwrap();
         assert_eq!(
             end_of(&mut worker, task),
-            (granularity as u64, TransferEnd::Complete)
+            (granularity as u64, TaskStatus::Complete)
         );
         let copied = device_bytes(&destination);
         assert_eq!(&copied[..granularity / 2], &source_bytes[granularity / 2..]);

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use storage::protocol::{Event, PageLevel, PageShape, PageSlot, Reply, Request};
+use storage::protocol::{Event, PageLevel, PageShape, PageSlot, Request, Response};
 use storage::{Client, Key, Role, Scope};
 
 const PAGE_BYTES: u64 = 4096;
@@ -99,7 +99,7 @@ fn claim_pool(socket: &Path, shape: PageShape) -> (Client, Client, u64, Mapping)
     )
     .unwrap();
     let claim = head.claim(0, vec![scope()], Vec::new()).unwrap();
-    head.publish_epochs(vec![0]).unwrap();
+    head.publish(vec![0]).unwrap();
     let mut worker = Client::connect(
         socket,
         Role::Worker {
@@ -112,7 +112,7 @@ fn claim_pool(socket: &Path, shape: PageShape) -> (Client, Client, u64, Mapping)
     .unwrap();
     let answer = worker
         .call(
-            &Request::PagePool {
+            &Request::Pool {
                 shape,
                 numa_node: None,
                 bytes: None,
@@ -120,7 +120,7 @@ fn claim_pool(socket: &Path, shape: PageShape) -> (Client, Client, u64, Mapping)
             &[],
         )
         .unwrap();
-    let Reply::PagePool { pool, slots, .. } = answer.reply else {
+    let Response::Pool { pool, slots, .. } = answer.reply else {
         panic!("the page pool was refused: {:?}", answer.reply);
     };
     let storage = answer.descriptors.into_iter().next().unwrap();
@@ -169,7 +169,7 @@ impl Drop for Mapping {
     }
 }
 
-fn reply(client: &mut Client, request: Request) -> Reply {
+fn reply(client: &mut Client, request: Request) -> Response {
     client.call(&request, &[]).unwrap().reply
 }
 
@@ -201,7 +201,7 @@ fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
     // The first server commits the page; its connector uploads it.
     let first = Serving::start(&master, 256 << 20);
     let (mut head, _worker, pool, mut mapping) = claim_pool(&first.socket, shape);
-    let Reply::Reserved { slots } = reply(
+    let Response::Reserved { slots } = reply(
         &mut head,
         Request::Reserve {
             pool,
@@ -244,7 +244,7 @@ fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
                 keys: vec![key, missing],
             },
         ),
-        Reply::Lookup {
+        Response::Lookup {
             levels: vec![PageLevel::Storage, PageLevel::Absent]
         }
     );
@@ -257,7 +257,7 @@ fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
                 tag: 1,
             },
         ),
-        Reply::Prefetching
+        Response::Prefetching
     );
     let deadline = Instant::now() + Duration::from_secs(30);
     let results = loop {
@@ -269,7 +269,7 @@ fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(results, vec![true, false]);
-    let Reply::Pinned { slots } = reply(
+    let Response::Pinned { slots } = reply(
         &mut head,
         Request::Pin {
             pool,

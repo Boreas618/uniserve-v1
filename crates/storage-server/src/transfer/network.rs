@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::storage::Client;
-use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registered};
+use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registration};
 use platform::DeviceId;
 
 use super::contexts::Hold;
@@ -361,7 +361,7 @@ impl Network {
         endpoint: &str,
         deployment: &str,
         regions: Vec<Region>,
-    ) -> Result<(String, u64, Vec<Registered>), String> {
+    ) -> Result<(String, u64, Vec<Registration>), String> {
         let host = self.host(endpoint);
         let mut host = host.lock().unwrap_or_else(PoisonError::into_inner);
         tracing::debug!(
@@ -409,7 +409,7 @@ impl Host {
         endpoint: &str,
         deployment: &str,
         regions: Vec<Region>,
-    ) -> ::storage::Result<(u64, Vec<u8>, Vec<Registered>)> {
+    ) -> ::storage::Result<(u64, Vec<u8>, Vec<Registration>)> {
         let mut retry = self.client.is_some();
         loop {
             let client = match &mut self.client {
@@ -483,7 +483,7 @@ fn over_fabric(
 pub(super) fn register(
     network: &Network,
     allocations: &[Exposed],
-) -> Result<(Vec<u8>, Vec<Registered>), String> {
+) -> Result<(Vec<u8>, Vec<Registration>), String> {
     let agent = network.agent()?;
     let ranges = allocations
         .iter()
@@ -492,7 +492,7 @@ pub(super) fn register(
                 Some(hold) => hold.session()?.nixl_region(agent, mapped)?,
                 None => mapped.nixl_host_region(agent)?,
             };
-            Ok(Registered {
+            Ok(Registration {
                 end: mapped.end.clone(),
                 key: region.key,
                 address: region.address,
@@ -509,7 +509,7 @@ pub(super) fn register(
 }
 
 /// A range another host's agent registered, as this agent's READs name it.
-fn source_region(range: &Registered) -> Result<nixl::Region, String> {
+fn source_region(range: &Registration) -> Result<nixl::Region, String> {
     let segment = match range.end {
         LinkEnd::Host => nixl::Segment::Host,
         LinkEnd::Device { .. } => nixl::Segment::Device,

@@ -14,10 +14,10 @@
 //! storage to itself) and the device storage its context takes on each GPU
 //! ([`devices`]), then releases its contexts, connects as
 //! [`Role::Transfer`] and reports both ([`Request::Measured`]). It holds a
-//! GPU's context again only while it has work on the GPU, booked in the
-//! GPU's storage ledgers at the measured bytes meanwhile ([`contexts`]). It
+//! GPU's context again only while it has work on the GPU, reserved in the
+//! GPU's quotas at the measured bytes meanwhile ([`contexts`]). It
 //! then runs the server's tasks
-//! ([`Event::Transfer`]): every move goes to the lane of its link and of
+//! ([`Event::Task`]): every move goes to the lane of its link and of
 //! what runs its copies ([`lanes`]), by path:
 //!
 //! | Source → destination | Runs on |
@@ -45,7 +45,7 @@
 //! task READing from another host ends its exposures there once it ended.
 //! What waits on another host, on a GPU's context or on a registration runs
 //! on a helper or lane thread, so the main thread keeps taking the server's
-//! events and the lanes' reports meanwhile, and places the bookings the
+//! events and the lanes' reports meanwhile, and places the reservations the
 //! other threads wait for.
 //!
 //! It also creates device storage the server holds from then on: an epoch's
@@ -75,13 +75,13 @@ use std::time::Duration;
 
 use ::storage::client::Client;
 use ::storage::protocol::{
-    Allocation, ContextBytes, Event, Item, Link, LinkEnd, Move, Priority, Registered, Reply,
-    Request, Role, TransferEnd,
+    Allocation, ContextBytes, Event, Item, Link, LinkEnd, Move, Priority, Registration, Request,
+    Response, Role, TaskStatus,
 };
 use platform::DeviceId;
 use rustix::event::{PollFd, PollFlags, poll};
 
-use contexts::{Booked, Booking, Bookings, Contexts, Hold};
+use contexts::{Contexts, Hold, Reservation, Reservations, Reserved};
 use devices::Gpus;
 use lanes::{End, LaneKey, Lanes, Piece, Runner};
 use network::{Exposed, Inbound, Lease, Network, Sources};
@@ -101,16 +101,7 @@ pub struct Options {
     pub nixl_library: Option<PathBuf>,
 }
 
-/// Why the Transfer Server stopped.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Cuda(#[from] platform::Error),
-    #[error(transparent)]
-    Storage(#[from] ::storage::client::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-}
+use crate::Error;
 
 /// Measure this host's links, connect to the Storage Server on `socket`
 /// and run its tasks until it closes the connection.
@@ -126,7 +117,7 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
         .iter()
         .map(|measured| (measured.link.clone(), measured.bytes_per_second as f64))
         .collect();
-    let booked = booked(&gpus, &context_bytes)?;
+    let reserved = reserved(&gpus, &context_bytes)?;
 
     let mut client = Client::connect(socket, Role::Transfer)?;
     let (wake_reader, wake_writer) = rustix::pipe::pipe_with(
@@ -134,10 +125,10 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
     )
     .map_err(io::Error::from)?;
     let wake = Arc::new(wake_writer.try_clone()?);
-    let (booking_sender, bookings) = mpsc::channel();
+    let (booking_sender, reservations) = mpsc::channel();
     let contexts = Arc::new(Contexts::new(
-        booked,
-        Bookings {
+        reserved,
+        Reservations {
             sender: booking_sender,
             wake: Arc::clone(&wake),
         },
@@ -172,7 +163,7 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
         ),
         network,
         finished,
-        bookings,
+        reservations,
         answers: HashMap::new(),
         exposing: HashMap::new(),
         exposures: HashMap::new(),
@@ -204,9 +195,7 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
             Ok(()) => {}
             // The server closes the connection when it stops, which ends
             // the Transfer Server.
-            Err(::storage::client::Error::Io(error))
-                if error.kind() == io::ErrorKind::UnexpectedEof =>
-            {
+            Err(::storage::Error::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
                 tracing::info!("the storage server closed the connection");
                 return Ok(());
             }
@@ -220,8 +209,8 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
                 server.send_with(&mut client, &report, descriptor.as_ref())?;
             }
         }
-        while let Ok(booking) = server.bookings.try_recv() {
-            server.book(&mut client, booking)?;
+        while let Ok(reservation) = server.reservations.try_recv() {
+            server.reserve(&mut client, reservation)?;
         }
         // A lane reports a link it measured before the chunk that measured
         // it completes, so the links taken after the reports include every
@@ -236,19 +225,24 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
             };
             server.send(&mut client, &measured)?;
         }
-        for (task, bytes, end) in reports {
-            if end.is_some() {
+        for (task, bytes, status) in reports {
+            if status.is_some() {
                 server.ended(task);
             }
-            server.send(&mut client, &Request::Copied { task, bytes, end })?;
+            let copied = Request::Copied {
+                task,
+                bytes,
+                status,
+            };
+            server.send(&mut client, &copied)?;
         }
         server.collect(&mut client);
     }
 }
 
-/// Each GPU as its context is booked: the context's bytes as measured, and
+/// Each GPU as its context is reserved: the context's bytes as measured, and
 /// the GPU's total storage as NVML reports it.
-fn booked(gpus: &Gpus, measured: &[ContextBytes]) -> Result<Vec<Booked>, Error> {
+fn reserved(gpus: &Gpus, measured: &[ContextBytes]) -> Result<Vec<Reserved>, Error> {
     let identities: Vec<(DeviceId, [u8; 16])> = gpus.identities().collect();
     if identities.is_empty() {
         return Ok(Vec::new());
@@ -257,7 +251,7 @@ fn booked(gpus: &Gpus, measured: &[ContextBytes]) -> Result<Vec<Booked>, Error> 
     identities
         .into_iter()
         .map(|(device, uuid)| {
-            Ok(Booked {
+            Ok(Reserved {
                 device,
                 uuid,
                 total: nvml.memory_info(device)?.total,
@@ -287,7 +281,7 @@ enum Done {
     Registered {
         request: u64,
         holds: Vec<Hold>,
-        registered: Result<(Vec<u8>, Vec<Registered>), String>,
+        registered: Result<(Vec<u8>, Vec<Registration>), String>,
     },
     /// The device storage of the server's allocation `request`: its POSIX
     /// descriptor and its size, rounded up to the GPU's granularity; or
@@ -344,10 +338,10 @@ struct Served {
     helpers: Helpers,
     /// What the helpers finished.
     finished: mpsc::Receiver<Done>,
-    /// The bookings of GPU contexts the main thread places in the server's
-    /// ledgers.
-    bookings: mpsc::Receiver<Booking>,
-    /// Bookings placed whose answer a thread waits for, by request.
+    /// The reservations of GPU contexts the main thread places in the server's
+    /// quotas.
+    reservations: mpsc::Receiver<Reservation>,
+    /// Reservations placed whose answer a thread waits for, by request.
     answers: HashMap<u64, mpsc::SyncSender<Result<(), String>>>,
     /// The tasks whose sources other hosts are exposing, and whether the
     /// server cancelled each meanwhile.
@@ -381,17 +375,17 @@ impl Served {
         Ok(())
     }
 
-    /// Place `booking` in the server's ledgers: a GPU's context, booked at
+    /// Place `reservation` in the server's quotas: a GPU's context, reserved at
     /// its bytes before a thread retains it, or ended once it was released.
-    fn book(&mut self, client: &mut Client, booking: Booking) -> Result<(), Error> {
-        let request = Request::Book {
-            gpu: booking.gpu,
-            total: booking.total,
-            quota: None,
-            items: vec![(Item::TransferContext, booking.bytes)],
+    fn reserve(&mut self, client: &mut Client, reservation: Reservation) -> Result<(), Error> {
+        let request = Request::Quota {
+            gpu: reservation.gpu,
+            total: reservation.total,
+            limit: None,
+            reservations: vec![(Item::TransferContext, reservation.bytes)],
         };
         let id = client.submit(&request, &[])?;
-        match booking.answer {
+        match reservation.answer {
             Some(answer) => {
                 self.answers.insert(id, answer);
             }
@@ -400,14 +394,14 @@ impl Served {
         Ok(())
     }
 
-    /// Take the server's answers: a booking's answer goes to the thread that
+    /// Take the server's answers: a reservation's answer goes to the thread that
     /// waits for it; an error to a report names a task the server no longer
     /// holds, which changes nothing here.
     fn collect(&mut self, client: &mut Client) {
         self.answers.retain(|id, answer| match client.take(*id) {
             Some(answered) => {
                 let outcome = match answered.reply {
-                    Reply::Error { message, .. } => Err(message),
+                    Response::Error { message, .. } => Err(message),
                     _ => Ok(()),
                 };
                 let _ = answer.send(outcome);
@@ -417,7 +411,7 @@ impl Served {
         });
         self.replies.retain(|id| match client.take(*id) {
             Some(answer) => {
-                if let Reply::Error { message, .. } = answer.reply {
+                if let Response::Error { message, .. } = answer.reply {
                     tracing::warn!(message, "the storage server refused a report");
                 }
                 false
@@ -455,12 +449,12 @@ impl Served {
                 // READ of it fails from then on.
                 self.allocations.remove(&allocation);
             }
-            Event::Transfer {
+            Event::Task {
                 task,
                 priority,
                 moves,
             } => self.transfer(task, priority, &moves),
-            Event::TransferSession { session, gpus } => {
+            Event::Session { session, gpus } => {
                 if gpus.is_empty() {
                     if let Some(holds) = self.sessions.remove(&session) {
                         self.helpers.spawn(move || {
@@ -526,8 +520,8 @@ impl Served {
                     });
                 }
             }
-            Event::TransferProgress { .. }
-            | Event::Transferred { .. }
+            Event::TaskProgress { .. }
+            | Event::TaskEnded { .. }
             | Event::Prefetched { .. }
             | Event::Pool { .. }
             | Event::PoolReleased { .. }
@@ -581,7 +575,7 @@ impl Served {
                     .map(|piece| pieces.push(piece)),
             };
             if let Err(message) = taken {
-                self.lanes.end(task, TransferEnd::Failed { message });
+                self.lanes.end(task, TaskStatus::Failed { message });
                 return;
             }
         }
@@ -667,7 +661,7 @@ impl Served {
             .and_then(|(device, readers)| Ok((self.contexts.hold(device)?, device, readers)));
         self.helpers.spawn(move || {
             // The allocation is made in the GPU's session, whose context the
-            // ledgers book while it is held; the session closes once the
+            // quotas reserve while it is held; the session closes once the
             // last hold ends, after the allocation's handle was released.
             let allocated = held.and_then(|(hold, device, readers)| {
                 hold.session()?;
@@ -689,7 +683,7 @@ impl Served {
                 let cancelled = self.exposing.remove(&task).unwrap_or(false);
                 match pieces {
                     Ok(sources) if cancelled => {
-                        self.lanes.end(task, TransferEnd::Cancelled);
+                        self.lanes.end(task, TaskStatus::Cancelled);
                         self.leases.insert(task, sources.leases);
                         self.ended(task);
                     }
@@ -697,10 +691,10 @@ impl Served {
                         self.leases.insert(task, sources.leases);
                         self.lanes.submit(task, priority, sources.pieces);
                     }
-                    Err(_) if cancelled => self.lanes.end(task, TransferEnd::Cancelled),
+                    Err(_) if cancelled => self.lanes.end(task, TaskStatus::Cancelled),
                     Err(message) => {
                         tracing::warn!(task, message, "a task's sources on other hosts failed");
-                        self.lanes.end(task, TransferEnd::Failed { message });
+                        self.lanes.end(task, TaskStatus::Failed { message });
                     }
                 }
                 None

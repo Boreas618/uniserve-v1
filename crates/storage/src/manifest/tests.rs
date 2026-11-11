@@ -1278,13 +1278,13 @@ fn encoded_fields_move_in_canonical_form() {
 
 /// A tensor a listing lists: `key` at `location`, retained by `epoch` of
 /// deployment `model`.
-fn listed(key: Key, name: &str, location: Location, epoch: u64) -> crate::protocol::ListedTensor {
+fn listed(key: Key, name: &str, location: Location, epoch: u64) -> crate::protocol::TensorListing {
     let scope = crate::Scope {
         deployment: "model".into(),
         group: "model".into(),
         rank: 0,
     };
-    crate::protocol::ListedTensor {
+    crate::protocol::TensorListing {
         key,
         name: name.into(),
         scopes: vec![scope.clone()],
@@ -1368,7 +1368,7 @@ fn a_epochs_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
     }
     let mut listing = crate::protocol::Listing {
         tensors,
-        transfer: Some(crate::protocol::ListedTransfer {
+        transfer: Some(crate::protocol::TransferListing {
             pid: 1,
             links: links(2),
             contexts: Vec::new(),
@@ -1451,7 +1451,7 @@ fn unchanged_fields_of_a_packed_weight_storage_remain_transfer_sources() {
     );
     let listing = crate::protocol::Listing {
         tensors,
-        transfer: Some(crate::protocol::ListedTransfer {
+        transfer: Some(crate::protocol::TransferListing {
             pid: 1,
             links: links(2),
             contexts: Vec::new(),

@@ -117,8 +117,8 @@ use std::time::{Duration, Instant};
 use ipc::{PageCopy, PoolConversion, PrefixCacheInfo};
 use ipc::{RequestId, UnitId};
 use storage::protocol::{
-    Event, PageAnchor, PageLevel, PageShape, PageSlot, PageWindow, PeerPool, Reply, Request,
-    TransferEnd,
+    Event, PageAnchor, PageLevel, PageShape, PageSlot, PageWindow, PeerPool, Request, Response,
+    TaskStatus,
 };
 use storage::{Key, Scope};
 
@@ -762,7 +762,7 @@ impl KvOffloadManager {
             host_bytes,
         };
         match self.servers.call(client, &request)? {
-            Reply::HostCache { tokens } => Ok(tokens),
+            Response::HostCache { tokens } => Ok(tokens),
             other => {
                 anyhow::bail!("the Storage Server responded to a host KV cache size with {other:?}")
             }
@@ -1685,8 +1685,8 @@ impl KvOffloadManager {
 
     /// Peer read `number`'s task ended as `end`: settle its slots and pins,
     /// and count it for the admission that waits for it.
-    fn read_ended(&mut self, number: u64, end: &TransferEnd) {
-        let complete = matches!(end, TransferEnd::Complete);
+    fn read_ended(&mut self, number: u64, end: &TaskStatus) {
+        let complete = matches!(end, TaskStatus::Complete);
         let Some(read) = self.reads.remove(&number) else {
             return;
         };
@@ -2269,7 +2269,10 @@ impl KvOffloadManager {
         let mut admissions = false;
         let (events, responses) = self.servers.take();
         for (client, event) in events {
-            if let Event::Transferred { task, end, .. } = event {
+            if let Event::TaskEnded {
+                task, status: end, ..
+            } = event
+            {
                 if let Some(read) = self.tasks.get(&(client, task)).copied() {
                     self.read_ended(read, &end);
                     admissions = true;
@@ -2309,7 +2312,7 @@ impl KvOffloadManager {
                     reply,
                 ) => {
                     let slots = match reply {
-                        Reply::Pinned { slots } => slots,
+                        Response::Pinned { slots } => slots,
                         other => {
                             tracing::warn!(?other, "a host KV cache pin failed");
                             Vec::new()
@@ -2329,7 +2332,7 @@ impl KvOffloadManager {
                     reply,
                 ) => {
                     let levels = match reply {
-                        Reply::Lookup { levels } => levels,
+                        Response::Lookup { levels } => levels,
                         other => {
                             tracing::warn!(?other, "a host KV cache lookup failed");
                             Vec::new()
@@ -2350,7 +2353,7 @@ impl KvOffloadManager {
                     reply,
                 ) => {
                     let slots = match reply {
-                        Reply::Pinned { slots } => slots,
+                        Response::Pinned { slots } => slots,
                         other => {
                             tracing::warn!(?other, "a host KV cache pin failed");
                             Vec::new()
@@ -2372,7 +2375,7 @@ impl KvOffloadManager {
                 }
                 (Asked::Reserve { offload, rank }, reply) => {
                     let slots = match reply {
-                        Reply::Reserved { slots } => slots,
+                        Response::Reserved { slots } => slots,
                         other => {
                             tracing::warn!(?other, "a host KV cache reservation failed");
                             Vec::new()
@@ -2389,7 +2392,7 @@ impl KvOffloadManager {
                     reply,
                 ) => {
                     let pools = match reply {
-                        Reply::PeerPinned { pools } => pools,
+                        Response::PeerPinned { pools } => pools,
                         other => {
                             tracing::warn!(?other, "a peer's host KV cache pin failed");
                             Vec::new()
@@ -2415,7 +2418,7 @@ impl KvOffloadManager {
                     reply,
                 ) => {
                     let slots = match reply {
-                        Reply::Reserved { slots } => slots,
+                        Response::Reserved { slots } => slots,
                         other => {
                             tracing::warn!(
                                 ?other,
@@ -2428,7 +2431,7 @@ impl KvOffloadManager {
                     admissions = true;
                 }
                 (Asked::PeerRead { read }, reply) => match reply {
-                    Reply::Transferring { task } => {
+                    Response::Submitted { task } => {
                         if let Some(entry) = self.reads.get_mut(&read) {
                             entry.task = Some(task);
                             let client = entry.read.client;
@@ -2440,7 +2443,7 @@ impl KvOffloadManager {
                     }
                     other => {
                         tracing::warn!(?other, "a peer read of host KV cache pages was refused");
-                        let refused = TransferEnd::Failed {
+                        let refused = TaskStatus::Failed {
                             message: format!("{other:?}"),
                         };
                         self.read_ended(read, &refused);
@@ -2758,12 +2761,12 @@ mod tests {
                     kv_head_count: 8,
                     page_bytes: 16,
                 };
-                let request = Request::PagePool {
+                let request = Request::Pool {
                     shape,
                     numa_node: None,
                     bytes: None,
                 };
-                let Reply::PagePool { pool, .. } = worker.call(&request, &[]).unwrap().reply else {
+                let Response::Pool { pool, .. } = worker.call(&request, &[]).unwrap().reply else {
                     panic!("the page pool was refused");
                 };
                 pool
@@ -2960,7 +2963,7 @@ mod tests {
     }
 
     /// The pool `pool` as the server on `socket` lists it.
-    fn listed(socket: &std::path::Path, pool: u64) -> storage::protocol::ListedPool {
+    fn listed(socket: &std::path::Path, pool: u64) -> storage::protocol::PoolListing {
         let mut operator = Client::connect(socket, Role::Operator).unwrap();
         operator
             .list()
@@ -2995,7 +2998,7 @@ mod tests {
         )
         .unwrap();
         let claim = daemon.claim(1, vec![scope.clone()], Vec::new()).unwrap();
-        daemon.publish_epochs(vec![1]).unwrap();
+        daemon.publish(vec![1]).unwrap();
         let mut peer_worker = Client::connect(
             &peer.socket,
             Role::Worker {
@@ -3012,12 +3015,12 @@ mod tests {
             kv_head_count: 8,
             page_bytes: 16,
         };
-        let request = Request::PagePool {
+        let request = Request::Pool {
             shape,
             numa_node: None,
             bytes: None,
         };
-        let Reply::PagePool {
+        let Response::Pool {
             pool: peer_pool, ..
         } = peer_worker.call(&request, &[]).unwrap().reply
         else {
@@ -3162,7 +3165,7 @@ mod tests {
         )
         .unwrap();
         let claim = daemon.claim(1, vec![scope.clone()], Vec::new()).unwrap();
-        daemon.publish_epochs(vec![1]).unwrap();
+        daemon.publish(vec![1]).unwrap();
         let mut peer_worker = Client::connect(
             &peer.socket,
             Role::Worker {
@@ -3181,12 +3184,12 @@ mod tests {
             kv_head_count: 8,
             page_bytes: 32,
         };
-        let request = Request::PagePool {
+        let request = Request::Pool {
             shape: source,
             numa_node: None,
             bytes: None,
         };
-        let Reply::PagePool {
+        let Response::Pool {
             pool: peer_pool, ..
         } = peer_worker.call(&request, &[]).unwrap().reply
         else {

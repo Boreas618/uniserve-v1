@@ -27,12 +27,14 @@
 
 pub mod client;
 pub mod connector;
+mod error;
 pub mod key;
 pub mod manifest;
 pub mod protocol;
 pub mod transport;
 
-pub use client::{Answer, Client, Error, Got, Result};
+pub use client::{Answer, Client, Got};
+pub use error::{Error, Result};
 
 /// The socket of this host's Storage Server for the calling user:
 /// `storage-server.sock` in the user's service directory
@@ -41,6 +43,6 @@ pub fn default_socket() -> std::path::PathBuf {
     service::runtime_directory().join("storage-server.sock")
 }
 pub use protocol::{
-    Access, Claim, GpuLedger, HostStorage, Item, Key, LedgerEntry, Listing, Location, Mode, Role,
+    Access, Claim, HostStorage, Item, Key, Listing, Location, Mode, Quota, Reservation, Role,
     Scope, Segment, StorageRecord, TensorRecord,
 };

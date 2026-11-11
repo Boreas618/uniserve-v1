@@ -52,7 +52,7 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use ::storage::protocol::{Link, LinkBandwidth, LinkEnd, Priority, Throttle, TransferEnd};
+use ::storage::protocol::{Link, LinkBandwidth, LinkEnd, Priority, TaskStatus, Throttle};
 use platform::{
     DeviceId, Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream, memcpy_async,
 };
@@ -204,7 +204,7 @@ struct TaskState {
     running: usize,
     copied: u64,
     /// How the task ends, once a cancellation or a failure decided it.
-    end: Option<TransferEnd>,
+    end: Option<TaskStatus>,
     reported: Instant,
     /// When the task's pieces were queued, and how many there were: the
     /// task's time on the lanes, which its end reports.
@@ -294,7 +294,7 @@ struct State {
     bandwidths: HashMap<Link, f64>,
     /// Each report: the task, the bytes it copied, and its end once it
     /// ended.
-    reports: Vec<(u64, u64, Option<TransferEnd>)>,
+    reports: Vec<(u64, u64, Option<TaskStatus>)>,
     /// Links from other hosts that lanes measured, not reported yet.
     measured: Vec<LinkBandwidth>,
 }
@@ -374,7 +374,7 @@ impl State {
             return false;
         };
         if state.pieces == 0 && state.running == 0 {
-            let end = state.end.take().unwrap_or(TransferEnd::Complete);
+            let end = state.end.take().unwrap_or(TaskStatus::Complete);
             let copied = state.copied;
             tracing::info!(
                 task,
@@ -415,7 +415,7 @@ impl State {
             }
             Some(message) => {
                 if state.end.is_none() {
-                    state.end = Some(TransferEnd::Failed { message });
+                    state.end = Some(TaskStatus::Failed { message });
                 }
                 self.purge(task)
             }
@@ -586,7 +586,7 @@ impl Lanes {
 
     /// End task `task` at once as `end`, before it copied anything: it
     /// cannot run, or it was cancelled before its pieces were queued.
-    pub(super) fn end(&mut self, task: u64, end: TransferEnd) {
+    pub(super) fn end(&mut self, task: u64, end: TaskStatus) {
         self.shared.lock().reports.push((task, 0, Some(end)));
         self.shared.wake_main();
     }
@@ -599,7 +599,7 @@ impl Lanes {
             return;
         };
         if entry.end.is_none() {
-            entry.end = Some(TransferEnd::Cancelled);
+            entry.end = Some(TaskStatus::Cancelled);
         }
         let purged = state.purge(task);
         let reported = state.report(task, Instant::now());
@@ -640,7 +640,7 @@ impl Lanes {
     }
 
     /// The reports made since the last call.
-    pub(super) fn reports(&mut self) -> Vec<(u64, u64, Option<TransferEnd>)> {
+    pub(super) fn reports(&mut self) -> Vec<(u64, u64, Option<TaskStatus>)> {
         std::mem::take(&mut self.shared.lock().reports)
     }
 

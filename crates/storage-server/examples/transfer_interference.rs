@@ -33,16 +33,16 @@
 //! phases; setup and a verification copy on every link run before then.
 //!
 //! Before it allocates anything it checks, from the server's listing, that
-//! every GPU A ledger with a quota leaves room for the Transfer Server's
-//! CUDA context, which the Transfer Server books in every ledger of a GPU
-//! before it retains the context: a ledger without that room fails every
+//! every GPU A quota with a quota leaves room for the Transfer Server's
+//! CUDA context, which the Transfer Server reserves in every quota of a GPU
+//! before it retains the context: a quota without that room fails every
 //! copy into GPU A. The verification copy then proves the room exists.
 //!
 //! It writes one JSON object per line to standard output, each with `t`
 //! (wall-clock Unix seconds) and `event`:
 //!
 //! - `setup`: the GPUs' UUIDs, the links' measured bandwidths and the
-//!   Transfer Server's context bytes, and every GPU A ledger.
+//!   Transfer Server's context bytes, and every GPU A quota.
 //! - `verified`: a link's verification copy completed.
 //! - `point_start`, then one `second` per whole second of copying with the
 //!   bytes the point's tasks reported copied in it (from their
@@ -68,10 +68,8 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ::storage::protocol::{Event, Link, LinkEnd, Priority, Region, Span, Throttle, TransferEnd};
-use ::storage::{
-    Access, Client, GpuLedger, Key, Location, Role, Scope, StorageRecord, TensorRecord,
-};
+use ::storage::protocol::{Event, Link, LinkEnd, Priority, Region, Span, TaskStatus, Throttle};
+use ::storage::{Access, Client, Key, Location, Quota, Role, Scope, StorageRecord, TensorRecord};
 use anyhow::{Context, bail, ensure};
 use platform::{DeviceAllocation, DeviceAttribute, DeviceId};
 use rustix::event::{PollFd, PollFlags, poll};
@@ -338,27 +336,33 @@ fn measured_listing(socket: &std::path::Path) -> anyhow::Result<::storage::Listi
     }
 }
 
-/// A ledger as a JSON object: its deployment, quota, booked bytes and the
-/// room it leaves.
-fn ledger_json(ledger: &GpuLedger) -> String {
-    let used = ledger.used();
-    let quota = ledger
-        .quota
-        .map_or_else(|| "null".to_owned(), |quota| quota.to_string());
-    let room = ledger.quota.map_or_else(
+/// A quota as a JSON object: its deployment, limit, usage and the room it
+/// leaves.
+fn quota_json(quota: &Quota) -> String {
+    let usage = quota.usage();
+    let limit = quota
+        .limit
+        .map_or_else(|| "null".to_owned(), |limit| limit.to_string());
+    let room = quota.limit.map_or_else(
         || "null".to_owned(),
-        |quota| (quota as i128 - used as i128).to_string(),
+        |limit| (limit as i128 - usage as i128).to_string(),
     );
-    let entries: Vec<String> = ledger
-        .entries
+    let reservations: Vec<String> = quota
+        .reservations
         .iter()
-        .map(|entry| format!("[{},{}]", quoted(&format!("{:?}", entry.item)), entry.bytes))
+        .map(|reservation| {
+            format!(
+                "[{},{}]",
+                quoted(&format!("{:?}", reservation.item)),
+                reservation.bytes
+            )
+        })
         .collect();
     format!(
-        "{{\"deployment\":{},\"quota\":{quota},\"used\":{used},\"room\":{room},\"transfer_context\":{},\"entries\":[{}]}}",
-        quoted(&ledger.deployment),
-        ledger.transfer_context,
-        entries.join(",")
+        "{{\"deployment\":{},\"limit\":{limit},\"usage\":{usage},\"room\":{room},\"transfer_context\":{},\"reservations\":[{}]}}",
+        quoted(&quota.deployment),
+        quota.transfer_context,
+        reservations.join(",")
     )
 }
 
@@ -413,9 +417,7 @@ impl Copier {
             source_pitch: 0,
             destination_pitch: 0,
         };
-        Ok(self
-            .worker
-            .transfer(vec![span], Priority::Background, update)?)
+        Ok(self.worker.copy(vec![span], Priority::Background, update)?)
     }
 
     /// Take the transfer events received so far into `progress`. Returns
@@ -426,22 +428,26 @@ impl Copier {
         let mut completed = 0;
         while let Some((event, _)) = self.worker.next_event() {
             match event {
-                Event::TransferProgress { task, bytes } => {
+                Event::TaskProgress { task, bytes } => {
                     if let Some(seen) = progress.running.get_mut(&task) {
                         progress.bytes += bytes.saturating_sub(*seen);
                         *seen = (*seen).max(bytes);
                     }
                 }
-                Event::Transferred { task, bytes, end } => {
+                Event::TaskEnded {
+                    task,
+                    bytes,
+                    status: end,
+                } => {
                     let Some(seen) = progress.running.remove(&task) else {
                         continue;
                     };
                     progress.bytes += bytes.saturating_sub(seen);
                     match end {
-                        TransferEnd::Complete => completed += 1,
-                        TransferEnd::Cancelled if cancelling => {}
-                        TransferEnd::Cancelled => bail!("task {task} was cancelled"),
-                        TransferEnd::Failed { message } => {
+                        TaskStatus::Complete => completed += 1,
+                        TaskStatus::Cancelled if cancelling => {}
+                        TaskStatus::Cancelled => bail!("task {task} was cancelled"),
+                        TaskStatus::Failed { message } => {
                             bail!("task {task} failed: {message}")
                         }
                     }
@@ -629,7 +635,7 @@ fn run(options: &Options) -> anyhow::Result<()> {
     // `routes` lists the kinds in their declaration order.
     let route = |kind: LinkKind| &routes[kind as usize];
 
-    // What the Transfer Server measured, and whether every GPU A ledger
+    // What the Transfer Server measured, and whether every GPU A quota
     // with a quota leaves room for its context there.
     let listing = measured_listing(&options.socket)?;
     let transfer = listing
@@ -654,10 +660,10 @@ fn run(options: &Options) -> anyhow::Result<()> {
             .find(|context| context.gpu == gpu)
             .map_or(0, |context| context.bytes)
     };
-    let ledgers: Vec<&GpuLedger> = listing
-        .ledgers
+    let quotas: Vec<&Quota> = listing
+        .quotas
         .iter()
-        .filter(|ledger| ledger.gpu == gpu_a)
+        .filter(|quota| quota.gpu == gpu_a)
         .collect();
     emit(
         "setup",
@@ -677,24 +683,24 @@ fn run(options: &Options) -> anyhow::Result<()> {
                 "ledgers_a",
                 format!(
                     "[{}]",
-                    ledgers
+                    quotas
                         .iter()
-                        .map(|ledger| ledger_json(ledger))
+                        .map(|quota| quota_json(quota))
                         .collect::<Vec<_>>()
                         .join(",")
                 ),
             ),
         ],
     );
-    for ledger in &ledgers {
-        if let Some(quota) = ledger.quota {
+    for quota in &quotas {
+        if let Some(limit) = quota.limit {
             ensure!(
-                ledger.used() + context(gpu_a) <= quota,
-                "the ledger of deployment {} on GPU A books {} of its quota {}: no room for \
-                 the Transfer Server's context of {} bytes",
-                ledger.deployment,
-                ledger.used(),
-                quota,
+                quota.usage() + context(gpu_a) <= limit,
+                "the quota of deployment {} on GPU A has {} reserved of its limit {}: no room \
+                 for the Transfer Server's context of {} bytes",
+                quota.deployment,
+                quota.usage(),
+                limit,
                 context(gpu_a)
             );
         }
