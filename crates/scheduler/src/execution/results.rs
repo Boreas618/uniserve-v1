@@ -98,7 +98,7 @@ impl Scheduler {
     /// request that has not already failed frees the products the call
     /// consumed. Once no call of the request remains in flight, a terminal
     /// intent, a closed output or a muxed artifact retires the request
-    /// through `finish_media`.
+    /// through `retire`.
     pub(crate) fn process_diffusion_result(
         &mut self,
         call: Call,
@@ -353,7 +353,7 @@ impl Scheduler {
             }
         });
         if let Some(event) = terminal {
-            self.finish_media(id, event);
+            self.retire(id, event);
         }
     }
 
@@ -363,73 +363,6 @@ impl Scheduler {
         if let Some(status) = self.requests.status_mut(&id) {
             *status = RequestStatus::Finished(terminal);
         }
-    }
-
-    /// Emits terminal media output and releases all request-owned resources.
-    ///
-    /// A request whose admission was never placed in a batch frees its
-    /// allocations at once. Otherwise a `Finish` command is queued and the
-    /// allocations wait in `retiring_requests` until `acknowledge_commands`
-    /// sees that command complete.
-    pub(crate) fn finish_media(&mut self, id: RequestId, event: Terminal) {
-        if self.media_state(id).is_none() {
-            return;
-        }
-        let Some(Graph::Video(mut state)) = self.requests.remove(&id).map(|request| request.graph)
-        else {
-            return;
-        };
-        // The policy sees the request end, with how it ended, exactly as a token
-        // request's end is stated (`retire_token_request`): a media request the
-        // policy still holds resident is one it plans work for, and the
-        // mechanism refuses that work as naming a request it no longer holds.
-        let end = event.end();
-        let request = scheduling::guest::RequestId(id.0);
-        self.recorder.record(views::finished(request, end));
-        self.watchdog.finished(request);
-        self.running.retain(|candidate| *candidate != id);
-        // The pins of its stored trajectory end, and a store not yet carried
-        // to its workers is aborted; so do its encoder outputs' pins and
-        // reservations.
-        if let Some(store) = self.trajectories.as_mut() {
-            store.forget(id);
-        }
-        if let Some(store) = self.encoder_outputs.as_mut() {
-            store.forget(state.request_key);
-        }
-        let usage = Usage {
-            prompt_tokens: state.request.prompt_token_ids.len(),
-            ..Usage::default()
-        };
-        for event in event.events(usage) {
-            let _ = state.output.enqueue(event);
-        }
-        self.output.retire(id, state.output);
-
-        // No worker holds state for a request whose admission was never
-        // placed in a batch, so there is nothing to retire remotely.
-        if state.admission_state == WorkerRegistration::Unsubmitted {
-            if let Err(unknown) = state.allocations.free(&mut self.storage) {
-                self.invariant_broken(&unknown.to_string());
-            }
-            return;
-        }
-        let request_key = state.request_key;
-        self.inflight
-            .pending_commands
-            .push_back(BatchCommand::Finish {
-                request_key,
-                retained_buffers: Vec::new(),
-            });
-        self.retiring_requests.insert(
-            id,
-            RetiringRequest {
-                request_key,
-                allocations: Vec::new(),
-                media_allocations: Some(state.allocations),
-                buffers: HashMap::new(),
-            },
-        );
     }
 
     /// Removes the in-flight call a worker result names, releasing its

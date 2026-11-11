@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::completion::CallCompletion;
+use crate::request::Request;
 use ipc::{ForwardMode, MediaCall};
 
 use crate::kv_cache::manager::AttentionManager;
@@ -1000,20 +1001,15 @@ impl Scheduler {
         }
     }
 
-    /// Publishes terminal accounting and releases every resource owned by one request.
-    ///
-    /// Applies to token requests in `running`; media requests terminate
-    /// through `finish_media`. For a request that is not running, this only
-    /// clears a pending finish. Allocations of a request registered with its
-    /// workers move to `retiring_requests` until the queued `Finish` command
-    /// is acknowledged; an unregistered request's allocations are freed here.
+    /// Finishes a running request for `reason`, with the stop condition it
+    /// matched; see [`Self::retire`].
     pub(super) fn finish_with(
         &mut self,
         id: RequestId,
         reason: FinishReason,
         stop_reason: Option<crate::StopReason>,
     ) {
-        self.retire_token_request(
+        self.retire(
             id,
             Terminal::Finished {
                 reason,
@@ -1022,24 +1018,43 @@ impl Scheduler {
         );
     }
 
-    /// Ends a token request as migratable for `cause`, releasing what it
-    /// owns as `finish_with` does; its terminal event is `Migratable`,
-    /// naming no stored trajectory.
-    pub(super) fn migrate_request(&mut self, id: RequestId, cause: MigrationCause) {
-        self.retire_token_request(id, Terminal::migrate(cause));
-    }
-
-    /// Publishes `terminal` and releases every resource owned by one token
-    /// request; see `finish_with`.
-    fn retire_token_request(&mut self, id: RequestId, terminal: Terminal) {
-        // A call of this request still queued behind a full worker queue can
-        // never be served nor state its layout once the request's allocation
-        // goes, so it leaves the queue with the request.
-        self.retire_queued_calls(id);
-        // The policy sees the request end, with how it ended.
-        let end = terminal.end();
+    /// Retires the running request `id` with `terminal`, whatever its graph:
+    /// tells the policy how it ended, takes it out of the request table and
+    /// the running list, releases what it holds and publishes its terminal
+    /// events.
+    ///
+    /// For a request that is not running, this only clears a pending finish.
+    /// What a request registered with its workers holds moves to
+    /// `retiring_requests` until the queued `Finish` command is acknowledged;
+    /// an unregistered request's storage is freed here.
+    ///
+    /// A full event channel transfers the journal to the retired-output
+    /// queue, which drains the terminal event under normal backpressure or
+    /// hands it to the receiver when the step loop stops. A closed receiver
+    /// drops the terminal event with the journal. A terminal event published
+    /// by `finish_after_inflight` may still be journaled, and it is the only
+    /// one the request publishes.
+    pub(super) fn retire(&mut self, id: RequestId, terminal: Terminal) {
+        let terminal_published = self
+            .inflight
+            .pending_finishes
+            .remove(&id)
+            .is_some_and(|finish| finish.terminal_published);
+        if !self.requests.get(&id).is_some_and(Request::admitted) {
+            return;
+        }
+        if self.requests.tokens(&id).is_some() {
+            // A call of this request still waiting for a slot of its devices
+            // can never be served nor state its layout once the request's
+            // allocation goes, so it leaves the queue with the request.
+            self.retire_queued_calls(id);
+        }
+        // The policy sees the request end, with how it ended: a request it
+        // still holds is one it gives work, which the mechanism would refuse
+        // as naming a request it no longer holds.
         let request = scheduling::guest::RequestId(id.0);
-        self.recorder.record(views::finished(request, end));
+        self.recorder
+            .record(views::finished(request, terminal.end()));
         self.watchdog.finished(request);
         if terminal.migration().is_some()
             && self.config.canvas.is_none()
@@ -1050,18 +1065,8 @@ impl Scheduler {
         {
             self.advance_request_cache(id, true);
         }
-        let reason = match &terminal {
-            Terminal::Finished { reason, .. } => Some(reason.clone()),
-            _ => None,
-        };
-        let terminal_published = self
-            .inflight
-            .pending_finishes
-            .remove(&id)
-            .is_some_and(|finish| finish.terminal_published);
-
         // Report accepted request progress before error teardown removes it.
-        if reason == Some(FinishReason::Error)
+        if matches!(&terminal, Terminal::Finished { reason, .. } if *reason == FinishReason::Error)
             && let Some(state) = self.requests.tokens(&id)
         {
             tracing::error!(
@@ -1075,112 +1080,150 @@ impl Scheduler {
             );
         }
 
-        // Registered requests retain their allocations until every worker pool
-        // acknowledges the ordered close command.
-        let mut awaits_close = false;
-        let mut allocations = None;
-        if let Some(mut st) = self
-            .requests
-            .tokens(&id)
-            .is_some()
-            .then(|| self.requests.remove(&id))
-            .flatten()
-            .and_then(|request| match request.graph {
-                Graph::Tokens(state) => Some(state),
-                Graph::Video(_) => None,
-            })
+        let Some(request) = self.requests.remove(&id) else {
+            return;
+        };
+        // The request leaves the running list before its terminal output is
+        // exposed, so the next step observes the released capacity.
+        self.running.retain(|running| *running != id);
+        let (mut events, usage) = match request.graph {
+            Graph::Tokens(state) => self.release_tokens(id, *state, &terminal),
+            Graph::Video(state) => self.release_video(id, *state),
+        };
+        let accepted = terminal_published
+            || terminal
+                .events(usage)
+                .into_iter()
+                .all(|event| events.enqueue(event));
+        if accepted {
+            self.output.retire(id, events);
+        }
+    }
+
+    /// Releases what the retired token request `st` held and returns its
+    /// event journal with the usage its terminal event reports.
+    fn release_tokens(
+        &mut self,
+        id: RequestId,
+        mut st: TokenState,
+        terminal: &Terminal,
+    ) -> (EventJournal, Usage) {
+        if st.allocations.is_some() {
+            // The slot this request held is free from here on.
+            self.rows_held = self.rows_held.saturating_sub(1);
+        }
+        if matches!(terminal, Terminal::Finished { .. })
+            && let Some(resume) = st.req.cache.resume
+            && let Some(cache) = &self.storage.cache
         {
-            if st.allocations.is_some() {
-                // The pool row this request held is free from here on.
-                self.rows_held = self.rows_held.saturating_sub(1);
-            }
-            if matches!(terminal, Terminal::Finished { .. })
-                && let Some(resume) = st.req.cache.resume
-                && let Some(cache) = &self.storage.cache
-            {
-                cache.pool().forget_resume(resume);
-            }
-            let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
-            if st.worker_registered {
-                let retained_buffers = self.storage.retained_buffers(request_key);
-                let command = BatchCommand::Finish {
+            cache.pool().forget_resume(resume);
+        }
+        let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
+        // A registered request retains its allocations until every worker
+        // pool acknowledges the ordered close command; an unregistered one
+        // has no outstanding worker reference, so its allocations return at
+        // once.
+        if st.worker_registered {
+            let retained_buffers = self.storage.retained_buffers(request_key);
+            self.inflight
+                .pending_commands
+                .push_back(BatchCommand::Finish {
                     request_key,
                     retained_buffers,
-                };
-                self.inflight.pending_commands.push_back(command);
-                let mut allocations: Vec<RequestAllocations> = Vec::new();
-                let mut buffers = HashMap::new();
-                match st.allocations.take() {
-                    Some(mut allocation) => {
-                        buffers = std::mem::take(&mut allocation.buffers);
-                        allocations.push(allocation);
-                    }
-                    None => self.invariant_broken("a registered request holds its allocations"),
+                });
+            let mut allocations: Vec<RequestAllocations> = Vec::new();
+            let mut buffers = HashMap::new();
+            match st.allocations.take() {
+                Some(mut allocation) => {
+                    buffers = std::mem::take(&mut allocation.buffers);
+                    allocations.push(allocation);
                 }
-                self.retiring_requests.insert(
-                    id,
-                    RetiringRequest {
-                        request_key,
-                        allocations,
-                        media_allocations: None,
-                        buffers,
-                    },
-                );
-                awaits_close = true;
-            } else {
-                allocations = st.allocations.take();
+                None => self.invariant_broken("a registered request holds its allocations"),
             }
-
-            // Remove admission reservations before exposing terminal output so
-            // the next scheduler step observes the released capacity.
-            self.running.retain(|request| *request != id);
-            self.storage.reserved_encoder_entries = self
-                .storage
-                .reserved_encoder_entries
-                .saturating_sub(st.req.num_encoder_cache_entries());
-
-            // Its encodings' lookups in the host encoder pools end, those of
-            // its calls in flight once they complete.
-            if let Some(store) = self.encoder_outputs.as_mut() {
-                store.forget(RequestKey::new(self.engine_id, id, st.request_epoch));
-            }
-
-            // Releasing the request's encoder pins may make cache products
-            // physically reclaimable by their owning worker.
-            let mut free_encoder_products = std::mem::take(&mut st.transient_encoder_products);
-            for pin in &st.encoder_cache_pins {
-                if let Some(product) = self.storage.encoder_cache.release(pin.key, &pin.product) {
-                    free_encoder_products.push(product);
-                }
-            }
-            self.free_buffers(
-                free_encoder_products
-                    .into_iter()
-                    .map(|product| product.buffer_id()),
+            self.retiring_requests.insert(
+                id,
+                RetiringRequest {
+                    request_key,
+                    allocations,
+                    media_allocations: None,
+                    buffers,
+                },
             );
-
-            // A full event channel transfers ownership to the retired-output
-            // queue, which drains the terminal event under normal backpressure
-            // or hands it to the receiver when the control loop stops. A
-            // closed receiver drops the terminal event with the journal. A
-            // terminal event published by `finish_after_inflight` may still
-            // be journaled, and it is the only one the request publishes.
-            let usage = usage(&st);
-            let accepted = terminal_published
-                || terminal
-                    .events(usage)
-                    .into_iter()
-                    .all(|event| st.output.events.enqueue(event));
-            if accepted {
-                self.output.retire(id, st.output.events);
-            }
-        }
-
-        // Unregistered requests have no outstanding worker reference, so their
-        // allocations can return to the scheduler immediately.
-        if !awaits_close && let Some(allocations) = allocations {
+        } else if let Some(allocations) = st.allocations.take() {
             allocations.free(&mut self.storage);
         }
+
+        self.storage.reserved_encoder_entries = self
+            .storage
+            .reserved_encoder_entries
+            .saturating_sub(st.req.num_encoder_cache_entries());
+
+        // Its encodings' lookups in the host encoder pools end, those of
+        // its calls in flight once they complete.
+        if let Some(store) = self.encoder_outputs.as_mut() {
+            store.forget(request_key);
+        }
+
+        // Releasing the request's encoder pins may make cache products
+        // physically reclaimable by their owning worker.
+        let mut free_encoder_products = std::mem::take(&mut st.transient_encoder_products);
+        for pin in &st.encoder_cache_pins {
+            if let Some(product) = self.storage.encoder_cache.release(pin.key, &pin.product) {
+                free_encoder_products.push(product);
+            }
+        }
+        self.free_buffers(
+            free_encoder_products
+                .into_iter()
+                .map(|product| product.buffer_id()),
+        );
+
+        let usage = usage(&st);
+        (st.output.events, usage)
+    }
+
+    /// Releases what the retired video request `state` held and returns its
+    /// event journal with the usage its terminal event reports.
+    fn release_video(&mut self, id: RequestId, state: VideoState) -> (EventJournal, Usage) {
+        // The pins of its stored trajectory end, and a store not yet carried
+        // to its workers is aborted; so do its encoder outputs' pins and
+        // reservations.
+        if let Some(store) = self.trajectories.as_mut() {
+            store.forget(id);
+        }
+        if let Some(store) = self.encoder_outputs.as_mut() {
+            store.forget(state.request_key);
+        }
+        let usage = Usage {
+            prompt_tokens: state.request.prompt_token_ids.len(),
+            ..Usage::default()
+        };
+
+        // No worker holds state for a request whose admission was never
+        // placed in a batch, so there is nothing to retire remotely.
+        if state.admission_state == WorkerRegistration::Unsubmitted {
+            if let Err(unknown) = state.allocations.free(&mut self.storage) {
+                self.invariant_broken(&unknown.to_string());
+            }
+            return (state.output, usage);
+        }
+        let request_key = state.request_key;
+        self.inflight
+            .pending_commands
+            .push_back(BatchCommand::Finish {
+                request_key,
+                retained_buffers: Vec::new(),
+            });
+        self.retiring_requests.insert(
+            id,
+            RetiringRequest {
+                request_key,
+                allocations: Vec::new(),
+                media_allocations: Some(state.allocations),
+                buffers: HashMap::new(),
+            },
+        );
+        (state.output, usage)
     }
 }
 

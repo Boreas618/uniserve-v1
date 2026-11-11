@@ -215,7 +215,7 @@ impl Scheduler {
                 if steps > 0 {
                     tracing::info!(request = id.0, steps, "stored a preempted video trajectory");
                 }
-                self.finish_media(
+                self.retire(
                     id,
                     Terminal::Migrated {
                         cause,

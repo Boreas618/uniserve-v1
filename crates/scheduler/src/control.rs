@@ -102,11 +102,7 @@ impl Scheduler {
             }
         }
         for id in self.running.clone() {
-            if self.requests.video(&id).is_some() {
-                self.finish_media(id, Terminal::finish(FinishReason::Aborted));
-            } else {
-                self.finish(id, FinishReason::Aborted);
-            }
+            self.retire(id, Terminal::finish(FinishReason::Aborted));
         }
 
         // Every running request has now retired its journal, so the retained
@@ -814,7 +810,7 @@ impl Scheduler {
             Graph::Video(_) => {
                 request.status.finish(Terminal::finish(reason.clone()));
                 if !self.inflight.has_pending_calls(id) {
-                    self.finish_media(id, Terminal::finish(reason));
+                    self.retire(id, Terminal::finish(reason));
                 }
             }
             Graph::Tokens(state) => {

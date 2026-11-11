@@ -157,11 +157,11 @@ impl Scheduler {
                     Some(cause) => Terminal::migrate(cause),
                     None => Terminal::Failed(msg.to_string()),
                 };
-                self.finish_media(id, terminal);
+                self.retire(id, terminal);
             } else if let Some(cause) = migrating {
-                self.migrate_request(id, cause);
+                self.retire(id, Terminal::migrate(cause));
             } else if self.migrates_on_loss(id) {
-                self.migrate_request(id, MigrationCause::Loss);
+                self.retire(id, Terminal::migrate(MigrationCause::Loss));
             } else if self.requests.tokens(&id).is_some() {
                 self.emit(
                     id,
@@ -221,7 +221,7 @@ impl Scheduler {
                 Some(None) => MigrationCause::Loss,
                 _ => continue,
             };
-            self.finish_media(id, Terminal::migrate(cause));
+            self.retire(id, Terminal::migrate(cause));
         }
 
         let running: Vec<(RequestId, MigrationCause)> = self
@@ -234,7 +234,7 @@ impl Scheduler {
             })
             .collect();
         for (id, cause) in running {
-            self.migrate_request(id, cause);
+            self.retire(id, Terminal::migrate(cause));
         }
     }
 
@@ -493,7 +493,7 @@ impl Scheduler {
                         None if migrating => Terminal::migrate(MigrationCause::Loss),
                         None => Terminal::Failed(loss.message.clone()),
                     };
-                    self.finish_media(id, terminal);
+                    self.retire(id, terminal);
                 }
             } else if self.requests.tokens(&id).is_some() && !migrating {
                 self.finish_after_inflight(id, FinishReason::Error, None);
@@ -537,12 +537,12 @@ impl Scheduler {
         }
         let media = self.media_ids();
         for id in media {
-            self.finish_media(id, Terminal::Failed(message.to_string()));
+            self.retire(id, Terminal::Failed(message.to_string()));
         }
         let ids = self.running.clone();
         for id in ids {
             if self.migrates_on_loss(id) {
-                self.migrate_request(id, MigrationCause::Loss);
+                self.retire(id, Terminal::migrate(MigrationCause::Loss));
                 continue;
             }
             self.emit(

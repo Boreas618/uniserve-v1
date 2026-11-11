@@ -880,14 +880,14 @@ impl Scheduler {
                     Terminal::Migrated { cause, .. } => {
                         self.retire_preempted(id, cause);
                     }
-                    terminal => self.finish_media(id, terminal),
+                    terminal => self.retire(id, terminal),
                 }
                 continue;
             }
             let reason = match terminal {
                 Terminal::Finished { reason, .. } => reason,
                 Terminal::Migrated { cause, .. } => {
-                    self.migrate_request(id, cause);
+                    self.retire(id, Terminal::migrate(cause));
                     continue;
                 }
                 Terminal::Failed(_) | Terminal::Rejected(_) => FinishReason::Error,

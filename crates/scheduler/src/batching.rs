@@ -240,15 +240,7 @@ impl Scheduler {
                 break;
             }
             let refill = views::phase_kind(phase) == Some(PhaseKind::Refill);
-            // A media request lives in the media flow's own state, which the
-            // token rule cannot read: `can_schedule_next` finds no token state
-            // for it and would refuse every media call of the epoch.
-            let ready = if self.requests.video(&id).is_some() {
-                self.media_can_schedule_next(id)
-            } else {
-                self.can_schedule_next(id)
-            };
-            if !ready {
+            if !self.can_schedule_next(id) {
                 continue;
             }
             // A request whose end is decided schedules nothing, and one that is
@@ -286,7 +278,7 @@ impl Scheduler {
                 // A request offers nothing further while the call carrying its
                 // worker admission is in flight.
                 if state.admission_state == WorkerRegistration::InFlight
-                    || !self.ready_calls(state).contains(&media_call)
+                    || !self.video_ready_calls(state).contains(&media_call)
                 {
                     continue;
                 }
@@ -1135,7 +1127,7 @@ impl Scheduler {
     /// cache holds still reports its encoder here. Otherwise the request's
     /// phase decides. Returns `None` when the request is not running or has
     /// no call to issue.
-    pub(super) fn peek_next_call_variant(&self, id: RequestId) -> Option<CallKind> {
+    pub(super) fn token_next_call(&self, id: RequestId) -> Option<CallKind> {
         let st = self.requests.tokens(&id)?;
         if let Some(variant) = self.pending_successor_code(id) {
             return Some(variant);

@@ -238,9 +238,27 @@ impl Scheduler {
         rounds
     }
 
-    /// Lists every call of one request that can be scheduled now.
+    /// The calls of request `id`'s graph that are ready now, in the graph's
+    /// order: the first is its next phase, which the policy reads.
     ///
-    /// A request is a graph of calls with data dependencies, so a tick offers
+    /// A token request's loop has at most one (`token_next_call`); a video
+    /// request's chain offers every call whose inputs are done
+    /// (`video_ready_calls`). Empty when the request is not running or has
+    /// nothing ready.
+    pub(crate) fn ready_calls(&self, id: RequestId) -> Vec<CallKind> {
+        match self.media_state(id) {
+            Some(state) => self
+                .video_ready_calls(state)
+                .into_iter()
+                .map(CallKind::Media)
+                .collect(),
+            None => self.token_next_call(id).into_iter().collect(),
+        }
+    }
+
+    /// Lists every call of one video request that can be scheduled now.
+    ///
+    /// A request is a graph of calls with data dependencies, so a step offers
     /// all of them and the media occupancy decides which ones fit. At most one
     /// call of each kind is ready at once: the cursors this returns against
     /// advance as calls are scheduled, so a unit group only becomes ready
@@ -248,40 +266,13 @@ impl Scheduler {
     ///
     /// A conditioned request first reads its media on a CPU worker. The calls
     /// reading those host products wait until the read has completed, so a
-    /// model worker's queue never holds a call blocked on a host task. Then
-    /// the vision encoding precedes the text encoding that splices its
-    /// features in, on the same component; the text encoding waits until
-    /// those features are produced, because a distributed worker starts its
-    /// batches in submission order and one waiting for an input would hold
-    /// back every later one. Meanwhile the latent encoding covers the visual
-    /// condition units in rounds and then the audio tracks, each call on the
-    /// latent encoder's ranks that the prompt's encoding does not take and
-    /// that hold none of the request's calls (`latent_round`). Latent
-    /// preparation follows once every one of them is scheduled.
-    ///
-    /// Latent preparation, the denoising steps and the two decoders become
+    /// product a call names always exists. The encoders, the latent
+    /// preparation, the denoising steps and the decoders become
     /// ready once their predecessor is scheduled; they name their inputs by
     /// product reference and do not wait here for the producer to complete.
     /// Video and audio encoding wait until the call producing their input has
     /// completed, and muxing waits for completed encode rounds.
-    /// The media calls a request can run right now, in the graph's order: the
-    /// first is its next phase.
-    ///
-    /// `views.rs` reads this as a media request's `RequestView.phase` (§4.4: a
-    /// schedule addresses phases, and a video request's phases are the calls of
-    /// its graph). Empty when the request is not a resident media request or
-    /// has nothing ready.
-    pub(crate) fn media_ready_calls(&self, id: RequestId) -> Vec<CallKind> {
-        let Some(state) = self.media_state(id) else {
-            return Vec::new();
-        };
-        self.ready_calls(state)
-            .into_iter()
-            .map(CallKind::Media)
-            .collect()
-    }
-
-    pub(crate) fn ready_calls(&self, state: &VideoState) -> Vec<MediaCall> {
+    pub(crate) fn video_ready_calls(&self, state: &VideoState) -> Vec<MediaCall> {
         let sampling = state.request.sampling;
         let graph = &state.graph;
         // A product is produced once its producing call has left the

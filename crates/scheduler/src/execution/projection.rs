@@ -462,27 +462,30 @@ impl Scheduler {
             .is_some_and(|owner| self.dispatch.prefill_groups.contains(owner))
     }
 
-    /// Whether a media request may take its next call.
+    /// Returns whether request `id` may take its next call.
     ///
-    /// A media request has no token output window to fill and no decoder
-    /// boundaries: its own state (`VideoState`) names the calls it has
-    /// ready, and the media flow checks that, its admission in flight and the
-    /// component and host task pools it occupies when it plans one. Its output
-    /// journal is unbounded — one event per call — so there is no window to
-    /// wait for either; only a finish in flight holds it.
-    pub(crate) fn media_can_schedule_next(&self, id: RequestId) -> bool {
-        !self.inflight.pending_finishes.contains_key(&id)
-    }
-
-    /// Returns whether the next call can be scheduled.
+    /// No request does while a finish of it is in flight. A video request
+    /// has no token output window to fill and no decoder boundaries: its
+    /// graph names the calls it has ready, and assembly checks its admission
+    /// in flight and the stage and host thread pools it occupies when it
+    /// builds one; its output is one event per call, so there is no window to
+    /// wait for either. A token request also waits for room in its output
+    /// window, for the frontend decoder's decisions, for a worker that
+    /// serves its next call, and for its calls in flight unless a successor
+    /// may be queued behind them.
     pub(crate) fn can_schedule_next(&self, id: RequestId) -> bool {
-        !self.inflight.pending_finishes.contains_key(&id)
-            && self.output_window_ready(id)
+        if self.inflight.pending_finishes.contains_key(&id) {
+            return false;
+        }
+        if self.requests.video(&id).is_some() {
+            return true;
+        }
+        self.output_window_ready(id)
             && self.requests.tokens(&id).is_some_and(|state| {
                 !state.speculative_chain_invalidated
                     && state.output.decoder_boundaries.len()
                         < self.info.max_unresolved_calls.max(1) as usize
-                    && self.peek_next_call_variant(id).is_none_or(|kind| {
+                    && self.token_next_call(id).is_none_or(|kind| {
                         self.dispatch
                             .worker_target(
                                 &self.worker,
@@ -548,7 +551,7 @@ impl Scheduler {
             .map(|pending| output_bound(pending.call.kind))
             .sum::<usize>();
         let next = self
-            .peek_next_call_variant(id)
+            .token_next_call(id)
             .map_or(DEFAULT_OUTPUT_EVENTS, output_bound);
         available
             .saturating_sub(reserved)

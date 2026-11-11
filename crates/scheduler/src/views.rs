@@ -467,7 +467,7 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
 ///
 /// A refill chunk is a prefill call named by the request's draft state.
 fn next_phase(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> Option<PhaseId> {
-    let kind = scheduler.peek_next_call_variant(id)?;
+    let kind = scheduler.token_next_call(id)?;
     let phase = match kind {
         // A refill chunk is the policy's decision alone (`Plan::refill`), and
         // the mechanism builds its call: the request's phase is the serving
@@ -532,7 +532,7 @@ fn prefill_end(state: &TokenState) -> u32 {
 }
 
 fn next_tokens(scheduler: &Scheduler, state: &TokenState, id: RequestId) -> u32 {
-    match scheduler.peek_next_call_variant(id) {
+    match scheduler.token_next_call(id) {
         // A prompt chunk or a refill is charged the chunk the policy sizes; a
         // structural write (a block's commit) writes one position of its own
         // and states it, because nothing is left to size.
@@ -718,7 +718,7 @@ fn view(scheduler: &Scheduler, request: &crate::request::Request, facts: &Record
 /// one ready.
 fn media_phase(scheduler: &Scheduler, id: RequestId) -> Option<PhaseId> {
     scheduler
-        .media_ready_calls(id)
+        .ready_calls(id)
         .first()
         .map(|kind| call_phase_id(*kind))
 }
@@ -1174,7 +1174,7 @@ pub(crate) fn dispatch(scheduler: &Scheduler) -> Option<(CallView, Vec<ReplicaVi
         let Some(state) = scheduler.requests.tokens(id) else {
             continue;
         };
-        let Some(kind) = scheduler.peek_next_call_variant(*id) else {
+        let Some(kind) = scheduler.token_next_call(*id) else {
             continue;
         };
         let key = RequestKey::new(scheduler.engine_id, *id, state.request_epoch);
