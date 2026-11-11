@@ -70,6 +70,7 @@
 //! | [`copy_strided::CopyStrided`] | `copy_strided` | [`copy_strided`] |
 //! | [`fill::Fill`] | `fill` | [`fill`] |
 //! | [`reduce::Reduce`] | `reduce` | [`reduce`] |
+//! | [`index::Index`] | `index` | [`index`] |
 //!
 //! ## Descriptor keys
 //!
@@ -117,6 +118,7 @@ pub mod frame;
 pub mod gelu;
 pub mod gemm;
 pub mod generation;
+pub mod index;
 pub mod install;
 pub mod kernel;
 pub mod kv;
