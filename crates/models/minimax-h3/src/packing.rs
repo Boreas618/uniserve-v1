@@ -116,6 +116,20 @@ fn audio_steps(condition: &ConditionShape) -> usize {
     condition.audio_samples.div_ceil(AUDIO_HOP) as usize
 }
 
+/// The latent a condition's pixels encode to, with `channels` latent channels: its latent
+/// frames by the frame rule at its own raster, and `None` without pixels. It is the shape of
+/// the condition's anchoring noise.
+pub fn condition_latent(condition: &ConditionShape, channels: u32) -> Option<LatentShape> {
+    let [frames, rows, columns] = token_grid(condition);
+
+    (frames > 0).then_some(LatentShape {
+        channels,
+        frames: frames as u32,
+        height: rows as u32 * PATCH_SIDE,
+        width: columns as u32 * PATCH_SIDE,
+    })
+}
+
 /// The `(audio, visual)` rows `condition` takes in the document: one row per channel per latent
 /// step, channel-major, then one row per patch of every latent frame.
 pub fn condition_rows(condition: &ConditionShape) -> (usize, usize) {

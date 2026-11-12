@@ -21,11 +21,12 @@
 
 pub mod audio_vae;
 pub mod config;
+pub mod denoiser;
 pub mod modulation;
 pub mod packing;
 pub mod refiner;
-pub mod transformer;
 pub mod splice;
+pub mod transformer;
 pub mod video_vae;
 
 pub use config::{
