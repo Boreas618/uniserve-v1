@@ -87,7 +87,9 @@ pub trait BackendStorage: Debug + Send + Sync + 'static {
 
     fn unary(&self, op: UnaryOp, layout: &Layout) -> Result<Box<dyn BackendStorage>>;
 
-    /// Element-wise `op` of two operands of the same shape and dtype.
+    /// Element-wise `op` of two operands of the same shape and dtype. [`BinaryOp`] states the
+    /// arithmetic of an integer dtype and the operations that exist on integer dtypes alone,
+    /// which a backend refuses for any other.
     fn binary(
         &self,
         op: BinaryOp,

@@ -19,7 +19,7 @@ fn main() -> Result<()> {
 ## What the crate provides
 
 - `Tensor`: a reference-counted view (`Layout`: shape, strides, start offset) over a reference-counted `Storage`. Views (`narrow`, `reshape`, `transpose`, `permute`, `squeeze`, `unsqueeze`, `broadcast_as`, `chunk`, `t`, indexing with `i(...)`) share the storage of the tensor they come from.
-- Tensor operations built from backend primitives: element-wise arithmetic and comparisons with broadcasting, `where_cond`, reductions, `to_dtype`, `contiguous`, `cat`, `stack`, `pad_with_zeros`, `gather`, `scatter`, `scatter_add`, `index_select`, `index_add`, `slice_set`, `matmul`, `conv1d`, `conv2d`, their transposed forms, pooling and upsampling.
+- Tensor operations built from backend primitives: element-wise arithmetic and comparisons with broadcasting, the integer operations `remainder`, `bitwise_and`, `bitwise_or`, `bitwise_xor`, `bitwise_left_shift` and `bitwise_right_shift`, `where_cond`, reductions, `to_dtype`, `contiguous`, `cat`, `stack`, `pad_with_zeros`, `gather`, `scatter`, `scatter_add`, `index_select`, `index_add`, `slice_set`, `matmul`, `conv1d`, `conv2d`, their transposed forms, pooling and upsampling.
 - `DType`: `U8`, `U32`, `I16`, `I32`, `I64`, `BF16`, `F16`, `F32`, `F64`, `F8E4M3`, and the packed types `F6E2M3`, `F6E3M2`, `F4`, `F8E8M0`, whose tensors keep their bytes as loaded and support no arithmetic.
 - `Shape`, `Dim`, `D`, `Layout`, `NdArray` and `WithDType` for building tensors from host values and reading them back (`to_vec0` to `to_vec3`, `to_scalar`).
 - `Module`: a `forward` over one tensor.
@@ -28,6 +28,11 @@ fn main() -> Result<()> {
 - `Display` for tensors and the crate's `Error`.
 
 Index tensors of `index_select`, `gather`, `scatter`, `scatter_add` and `index_add` may be `U8`, `U32` or `I64`.
+
+Arithmetic follows PyTorch where the two have the same expression:
+
+- An integer tensor computes in its element type: `+`, `-` and `*` wrap, `/` truncates toward zero (`torch.div(.., rounding_mode="trunc")`), and `remainder` is `torch.remainder`, whose result is zero or has the sign of the divisor. A zero integer divisor is an error on the CPU backend.
+- A scalar operand of an integer tensor (`&x + 1.0`, `7.0 / &x`) is an integer of the element type and the operation is the one of two tensors, so it is exact for every value. No operation changes the element type: a scalar with a fractional part is an error, where PyTorch would return a float tensor, and so is one outside the element type's range, which PyTorch refuses as well; a caller that wants the float result converts the tensor with `to_dtype` first.
 
 ## Devices and the backend interface
 

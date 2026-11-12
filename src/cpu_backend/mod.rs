@@ -1564,6 +1564,32 @@ impl Map2 for MatMul {
     }
 }
 
+/// One of the operations that exist on the integer element types alone
+/// ([`BinaryOp::integral`]): `$f` of each pair of elements of two integer storages of one
+/// element type, and an error for any other element type.
+macro_rules! integer_binary {
+    ($lhs:ident, $rhs:ident, $lhs_l:ident, $rhs_l:ident, $op:ident, $f:expr) => {
+        match ($lhs, $rhs) {
+            (Self::U8(lhs), Self::U8(rhs)) => {
+                Ok(Self::U8(binary_map($lhs_l, $rhs_l, lhs, rhs, $f)))
+            }
+            (Self::U32(lhs), Self::U32(rhs)) => {
+                Ok(Self::U32(binary_map($lhs_l, $rhs_l, lhs, rhs, $f)))
+            }
+            (Self::I16(lhs), Self::I16(rhs)) => {
+                Ok(Self::I16(binary_map($lhs_l, $rhs_l, lhs, rhs, $f)))
+            }
+            (Self::I32(lhs), Self::I32(rhs)) => {
+                Ok(Self::I32(binary_map($lhs_l, $rhs_l, lhs, rhs, $f)))
+            }
+            (Self::I64(lhs), Self::I64(rhs)) => {
+                Ok(Self::I64(binary_map($lhs_l, $rhs_l, lhs, rhs, $f)))
+            }
+            _ => Err(Error::UnsupportedDTypeForOp($lhs.dtype(), $op.name()).bt()),
+        }
+    };
+}
+
 fn elu<T: num_traits::Float>(v: T, alpha: T) -> T {
     if v.is_sign_positive() {
         v
@@ -2392,6 +2418,14 @@ impl CpuStorage {
     }
 
     pub fn binary(&self, op: BinaryOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
+        // An integer quotient and its remainder have no value for a zero divisor.
+        if matches!(op, BinaryOp::Div | BinaryOp::Remainder) && rhs.views_integer_zero(rhs_l) {
+            crate::bail!(
+                "integer division by zero in {}: the right operand holds a zero",
+                op.name()
+            )
+        }
+
         match op {
             BinaryOp::Add => self.binary_impl::<op::Add>(rhs, lhs_l, rhs_l),
             BinaryOp::Mul => self.binary_impl::<op::Mul>(rhs, lhs_l, rhs_l),
@@ -2399,6 +2433,45 @@ impl CpuStorage {
             BinaryOp::Div => self.binary_impl::<op::Div>(rhs, lhs_l, rhs_l),
             BinaryOp::Maximum => self.binary_impl::<op::Maximum>(rhs, lhs_l, rhs_l),
             BinaryOp::Minimum => self.binary_impl::<op::Minimum>(rhs, lhs_l, rhs_l),
+            BinaryOp::Remainder => {
+                integer_binary!(self, rhs, lhs_l, rhs_l, op, op::remainder)
+            }
+            BinaryOp::BitwiseAnd => {
+                integer_binary!(self, rhs, lhs_l, rhs_l, op, |x, y| x & y)
+            }
+            BinaryOp::BitwiseOr => {
+                integer_binary!(self, rhs, lhs_l, rhs_l, op, |x, y| x | y)
+            }
+            BinaryOp::BitwiseXor => {
+                integer_binary!(self, rhs, lhs_l, rhs_l, op, |x, y| x ^ y)
+            }
+            BinaryOp::BitwiseLeftShift => {
+                integer_binary!(self, rhs, lhs_l, rhs_l, op, |x, y| x
+                    .wrapping_shl(op::shift_count(y)))
+            }
+            BinaryOp::BitwiseRightShift => {
+                integer_binary!(self, rhs, lhs_l, rhs_l, op, |x, y| x
+                    .wrapping_shr(op::shift_count(y)))
+            }
+        }
+    }
+
+    /// Whether the storage holds integers and `layout` views a zero among them.
+    fn views_integer_zero(&self, layout: &Layout) -> bool {
+        fn views_zero<T: WithDType>(values: &[T], layout: &Layout) -> bool {
+            match layout.contiguous_offsets() {
+                Some((start, end)) => values[start..end].iter().any(T::is_zero),
+                None => layout.strided_index().any(|index| values[index].is_zero()),
+            }
+        }
+
+        match self {
+            Self::U8(values) => views_zero(values, layout),
+            Self::U32(values) => views_zero(values, layout),
+            Self::I16(values) => views_zero(values, layout),
+            Self::I32(values) => views_zero(values, layout),
+            Self::I64(values) => views_zero(values, layout),
+            _ => false,
         }
     }
 

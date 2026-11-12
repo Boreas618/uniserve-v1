@@ -407,6 +407,42 @@ impl Tensor {
         Ok(from_storage(storage, shape))
     }
 
+    /// The scalar `value` as the right operand of `op` on `self`, which holds integers: a tensor
+    /// of the element type, the device and the shape of `self` whose every element is `value`.
+    ///
+    /// Arithmetic between an integer tensor and a scalar is the integer arithmetic of two
+    /// tensors, so the scalar has to be a value of the element type. A scalar with a fractional
+    /// part, one that is not finite and one outside the element type's range are errors: the
+    /// result of such an expression is no integer tensor, and a caller that means it converts
+    /// the tensor with [`Tensor::to_dtype`] first.
+    fn integer_scalar(&self, value: f64, op: &'static str) -> Result<Tensor> {
+        let dtype = self.dtype();
+        let (low, high) = match dtype {
+            DType::U8 => (0., u8::MAX as f64),
+            DType::U32 => (0., u32::MAX as f64),
+            DType::I16 => (i16::MIN as f64, i16::MAX as f64),
+            DType::I32 => (i32::MIN as f64, i32::MAX as f64),
+            DType::I64 => (i64::MIN as f64, i64::MAX as f64),
+            _ => bail!("{op}: {dtype:?} is no integer element type"),
+        };
+        // `i64::MAX as f64` rounds up to 2^63, the first value past I64.
+        let within = value >= low && value <= high && value < i64::MAX as f64;
+
+        if value.fract() != 0. || !within {
+            bail!(
+                "{op}: the scalar {value} is no {dtype:?} value; arithmetic between an integer \
+                 tensor and a scalar takes an integer of the element type, and a tensor \
+                 converted with to_dtype takes any scalar"
+            )
+        }
+
+        // Every bound above is within I64, so the integral value converts exactly both times.
+        Tensor::new(value as i64, &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(self.device())?
+            .broadcast_as(self.shape())
+    }
+
     pub(crate) fn same_shape_binary_op(&self, rhs: &Self, op: &'static str) -> Result<&Shape> {
         let lhs = self.shape();
         let rhs = rhs.shape();
@@ -437,12 +473,29 @@ impl Tensor {
     binary_op!(div, Div);
     binary_op_scalar!(maximum, Maximum);
     binary_op_scalar!(minimum, Minimum);
+
+    // The operations of the integer element types, named as PyTorch names them
+    // ([`BinaryOp`] states each one). The right operand is a tensor of the same shape or a
+    // scalar, which is converted to the element type of `self`.
+    binary_op_scalar!(remainder, Remainder);
+    binary_op_scalar!(bitwise_and, BitwiseAnd);
+    binary_op_scalar!(bitwise_or, BitwiseOr);
+    binary_op_scalar!(bitwise_xor, BitwiseXor);
+    binary_op_scalar!(bitwise_left_shift, BitwiseLeftShift);
+    binary_op_scalar!(bitwise_right_shift, BitwiseRightShift);
+
     broadcast_binary_op!(broadcast_add, add);
     broadcast_binary_op!(broadcast_mul, mul);
     broadcast_binary_op!(broadcast_sub, sub);
     broadcast_binary_op!(broadcast_div, div);
     broadcast_binary_op!(broadcast_maximum, maximum);
     broadcast_binary_op!(broadcast_minimum, minimum);
+    broadcast_binary_op!(broadcast_remainder, remainder);
+    broadcast_binary_op!(broadcast_bitwise_and, bitwise_and);
+    broadcast_binary_op!(broadcast_bitwise_or, bitwise_or);
+    broadcast_binary_op!(broadcast_bitwise_xor, bitwise_xor);
+    broadcast_binary_op!(broadcast_bitwise_left_shift, bitwise_left_shift);
+    broadcast_binary_op!(broadcast_bitwise_right_shift, bitwise_right_shift);
     broadcast_binary_op!(broadcast_eq, eq);
     broadcast_binary_op!(broadcast_ne, ne);
     broadcast_binary_op!(broadcast_lt, lt);
@@ -2750,7 +2803,7 @@ macro_rules! bin_trait {
             type Output = Result<Tensor>;
 
             fn $fn1(self, rhs: f64) -> Self::Output {
-                self.affine($mul(rhs), $add(rhs))
+                std::ops::$trait::$fn1(&self, rhs)
             }
         }
 
@@ -2758,11 +2811,26 @@ macro_rules! bin_trait {
             type Output = Result<Tensor>;
 
             fn $fn1(self, rhs: f64) -> Self::Output {
+                // An integer tensor computes in its element type: the operation of two tensors.
+                if self.dtype().is_int() {
+                    let rhs = self.integer_scalar(rhs, stringify!($fn1))?;
+                    return Tensor::$fn1(self, &rhs);
+                }
                 self.affine($mul(rhs), $add(rhs))
             }
         }
     };
 }
+
+// A tensor and a scalar.
+//
+// On a float tensor the scalar is converted to the element type and the operation is one affine
+// map. On an integer tensor the operation is the integer one of two tensors, the scalar being a
+// value of the element type (`Tensor::integer_scalar`): `+`, `-` and `*` wrap, which is what
+// PyTorch computes for `x + 1`, `x - 1` and `x * 2`, and `/` truncates toward zero, which is
+// PyTorch's `torch.div(x, 2, rounding_mode="trunc")`. PyTorch's own `x / 2` is a float tensor,
+// as is its result for a scalar with a fractional part; no operation here changes the element
+// type, so a scalar that is no value of the element type is an error.
 
 bin_trait!(Add, add, |_| 1., |v| v);
 bin_trait!(Sub, sub, |_| 1., |v: f64| -v);
@@ -2805,7 +2873,7 @@ impl std::ops::Sub<Tensor> for f64 {
     type Output = Result<Tensor>;
 
     fn sub(self, rhs: Tensor) -> Self::Output {
-        rhs.affine(-1., self)
+        self - &rhs
     }
 }
 
@@ -2813,6 +2881,9 @@ impl std::ops::Sub<&Tensor> for f64 {
     type Output = Result<Tensor>;
 
     fn sub(self, rhs: &Tensor) -> Self::Output {
+        if rhs.dtype().is_int() {
+            return Tensor::sub(&rhs.integer_scalar(self, "sub")?, rhs);
+        }
         rhs.affine(-1., self)
     }
 }
@@ -2820,9 +2891,8 @@ impl std::ops::Sub<&Tensor> for f64 {
 impl std::ops::Div<Tensor> for f64 {
     type Output = Result<Tensor>;
 
-    #[allow(clippy::suspicious_arithmetic_impl)]
     fn div(self, rhs: Tensor) -> Self::Output {
-        rhs.recip()? * self
+        self / &rhs
     }
 }
 
@@ -2831,6 +2901,9 @@ impl std::ops::Div<&Tensor> for f64 {
 
     #[allow(clippy::suspicious_arithmetic_impl)]
     fn div(self, rhs: &Tensor) -> Self::Output {
+        if rhs.dtype().is_int() {
+            return Tensor::div(&rhs.integer_scalar(self, "div")?, rhs);
+        }
         rhs.recip()? * self
     }
 }

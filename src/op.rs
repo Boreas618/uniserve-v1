@@ -36,7 +36,22 @@ impl ReduceOp {
     }
 }
 
-// These ops return the same type as their input type.
+/// The element-wise operations of two operands of one shape and one element type. The result
+/// has that element type.
+///
+/// On an integer element type the arithmetic is the element type's own: `Add`, `Sub` and `Mul`
+/// wrap, and `Div` truncates toward zero. The operations from `Remainder` on exist on the
+/// integer element types alone ([`BinaryOp::integral`]) and are named as PyTorch names them:
+///
+/// - `Remainder` is `torch.remainder`: the remainder of the floored quotient, which is zero or
+///   has the sign of the divisor;
+/// - `BitwiseAnd`, `BitwiseOr` and `BitwiseXor` combine the bits of the two elements;
+/// - `BitwiseLeftShift` and `BitwiseRightShift` shift the left element by the right one. A
+///   right shift of a signed element repeats its sign bit. A count that is negative or not
+///   below the element's width in bits leaves its element unspecified.
+///
+/// A zero divisor of `Div` or `Remainder` on an integer element type is an error on the CPU
+/// backend and leaves its element unspecified on a device backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
@@ -45,6 +60,12 @@ pub enum BinaryOp {
     Div,
     Maximum,
     Minimum,
+    Remainder,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseLeftShift,
+    BitwiseRightShift,
 }
 
 impl BinaryOp {
@@ -56,6 +77,25 @@ impl BinaryOp {
             Self::Div => Div::NAME,
             Self::Maximum => Maximum::NAME,
             Self::Minimum => Minimum::NAME,
+            Self::Remainder => "remainder",
+            Self::BitwiseAnd => "bitwise_and",
+            Self::BitwiseOr => "bitwise_or",
+            Self::BitwiseXor => "bitwise_xor",
+            Self::BitwiseLeftShift => "bitwise_left_shift",
+            Self::BitwiseRightShift => "bitwise_right_shift",
+        }
+    }
+
+    /// Whether the operation exists on the integer element types alone.
+    pub fn integral(&self) -> bool {
+        match self {
+            Self::Add | Self::Mul | Self::Sub | Self::Div | Self::Maximum | Self::Minimum => false,
+            Self::Remainder
+            | Self::BitwiseAnd
+            | Self::BitwiseOr
+            | Self::BitwiseXor
+            | Self::BitwiseLeftShift
+            | Self::BitwiseRightShift => true,
         }
     }
 }
@@ -307,10 +347,18 @@ pub struct Round;
 pub struct Sign;
 
 // `$name` is an ident; stringify! derives the NAME string.
+// `$e` is the operation on a float element and `$int`, over the operands `$a` and `$b`, the one
+// on an integer element, whose arithmetic wraps.
 // The optional `$vec_op` and `$scalar_op` name methods of `crate::cpu::kernels::VecOps` that
 // override the float slice loops with SIMD implementations.
 macro_rules! bin_op {
-    ($op:ident, $name:ident, $e:expr $(, $vec_op:ident, $scalar_op:ident)?) => {
+    (
+        $op:ident,
+        $name:ident,
+        $e:expr,
+        |$a:ident, $b:ident| $int:expr
+        $(, $vec_op:ident, $scalar_op:ident)?
+    ) => {
         impl BinaryOpT for $op {
             const NAME: &'static str = stringify!($name);
             #[inline(always)]
@@ -322,15 +370,15 @@ macro_rules! bin_op {
             #[inline(always)]
             fn f64(v1: f64, v2: f64) -> f64 { $e(v1, v2) }
             #[inline(always)]
-            fn u8(v1: u8, v2: u8) -> u8 { $e(v1, v2) }
+            fn u8($a: u8, $b: u8) -> u8 { $int }
             #[inline(always)]
-            fn u32(v1: u32, v2: u32) -> u32 { $e(v1, v2) }
+            fn u32($a: u32, $b: u32) -> u32 { $int }
             #[inline(always)]
-            fn i16(v1: i16, v2: i16) -> i16 { $e(v1, v2) }
+            fn i16($a: i16, $b: i16) -> i16 { $int }
             #[inline(always)]
-            fn i32(v1: i32, v2: i32) -> i32 { $e(v1, v2) }
+            fn i32($a: i32, $b: i32) -> i32 { $int }
             #[inline(always)]
-            fn i64(v1: i64, v2: i64) -> i64 { $e(v1, v2) }
+            fn i64($a: i64, $b: i64) -> i64 { $int }
             #[inline(always)]
             fn f8e4m3(v1: f8e4m3, v2: f8e4m3) -> f8e4m3 { $e(v1, v2) }
             $(
@@ -371,12 +419,68 @@ macro_rules! bin_op {
     };
 }
 
-bin_op!(Add, add, |v1, v2| v1 + v2, vec_add, scalar_add);
-bin_op!(Sub, sub, |v1, v2| v1 - v2);
-bin_op!(Mul, mul, |v1, v2| v1 * v2, vec_mul, scalar_mul);
-bin_op!(Div, div, |v1, v2| v1 / v2);
-bin_op!(Minimum, minimum, |v1, v2| if v1 > v2 { v2 } else { v1 });
-bin_op!(Maximum, maximum, |v1, v2| if v1 < v2 { v2 } else { v1 });
+bin_op!(
+    Add,
+    add,
+    |v1, v2| v1 + v2,
+    |v1, v2| v1.wrapping_add(v2),
+    vec_add,
+    scalar_add
+);
+bin_op!(Sub, sub, |v1, v2| v1 - v2, |v1, v2| v1.wrapping_sub(v2));
+bin_op!(
+    Mul,
+    mul,
+    |v1, v2| v1 * v2,
+    |v1, v2| v1.wrapping_mul(v2),
+    vec_mul,
+    scalar_mul
+);
+// The integer quotient truncates toward zero; the CPU backend refuses a zero divisor before it
+// divides.
+bin_op!(Div, div, |v1, v2| v1 / v2, |v1, v2| v1.wrapping_div(v2));
+bin_op!(
+    Minimum,
+    minimum,
+    |v1, v2| if v1 > v2 { v2 } else { v1 },
+    |v1, v2| if v1 > v2 { v2 } else { v1 }
+);
+bin_op!(
+    Maximum,
+    maximum,
+    |v1, v2| if v1 < v2 { v2 } else { v1 },
+    |v1, v2| if v1 < v2 { v2 } else { v1 }
+);
+
+/// `torch.remainder` on one pair of integer elements: the remainder of the floored quotient,
+/// which is zero or has the sign of `divisor`.
+///
+/// `divisor` is not zero.
+#[inline(always)]
+pub(crate) fn remainder<T: num_traits::PrimInt + num_traits::CheckedRem>(
+    dividend: T,
+    divisor: T,
+) -> T {
+    // The one remainder that overflows is the smallest value by minus one, which is zero.
+    let truncated = dividend.checked_rem(&divisor).unwrap_or_else(T::zero);
+
+    // The truncated quotient leaves a remainder of the dividend's sign; the floored one is a
+    // divisor further where the two signs differ. The sum has operands of opposite signs.
+    if !truncated.is_zero() && (truncated < T::zero()) != (divisor < T::zero()) {
+        truncated + divisor
+    } else {
+        truncated
+    }
+}
+
+/// The number of bits a shift moves an element by, from the element that states it.
+///
+/// A count outside the element's width leaves the result unspecified: the wrapping shifts that
+/// take this value reduce it modulo the width.
+#[inline(always)]
+pub(crate) fn shift_count<T: num_traits::PrimInt>(count: T) -> u32 {
+    count.to_u32().unwrap_or(0)
+}
 
 #[allow(clippy::redundant_closure_call)]
 macro_rules! unary_op {
