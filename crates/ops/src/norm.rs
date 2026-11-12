@@ -44,6 +44,10 @@ pub struct RmsNormDescriptor {
     pub pdl: bool,
     /// Whether the weight is stored zero-centred: the row is scaled by `1 + weight`.
     pub centred: bool,
+    /// Rows of the gain: row `i` of the input is scaled by gain row `i mod groups`. One for a
+    /// gain every row shares; the streams of a hyper-connected residual each have their own
+    /// (`refs/vllm/vllm/models/qwen4_exp/nvidia/ops/hc.py:12-51`).
+    pub groups: u32,
 }
 
 impl fmt::Display for RmsNormDescriptor {
@@ -54,7 +58,14 @@ impl fmt::Display for RmsNormDescriptor {
             .field("tile", self.tile)
             .field("pdl", self.pdl);
         // Named only for a zero-centred weight, so every other key stays as it was.
-        centred(key, self.centred).finish(formatter)
+        let key = centred(key, self.centred);
+
+        // Named only for a gain of several rows.
+        if self.groups > 1 {
+            key.field("groups", self.groups).finish(formatter)
+        } else {
+            key.finish(formatter)
+        }
     }
 }
 
@@ -72,7 +83,7 @@ fn centred(key: Key, centred: bool) -> Key {
 pub struct RmsNormArgs {
     /// `[rows, columns]`.
     pub x: Operand,
-    /// `[columns]`, the per-channel scale.
+    /// `[groups · columns]`, the per-channel scale of each gain row, contiguous.
     pub weight: Operand,
     /// `[rows, columns]`.
     pub out: Operand,
@@ -104,8 +115,18 @@ impl Op for RmsNorm {
                 ),
             ));
         }
+        let groups = u64::from(descriptor.groups);
+        if groups == 0 || !args.x.rows().is_multiple_of(groups) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{} rows under a gain of {groups} rows: the rows are whole groups",
+                    args.x.rows()
+                ),
+            ));
+        }
         args.weight
-            .require_shape(Self::NAME, Shape::new(&[columns]))?;
+            .require_shape(Self::NAME, Shape::new(&[groups * columns]))?;
         Ok(())
     }
 
@@ -115,6 +136,7 @@ impl Op for RmsNorm {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
+        // The gain's row count is compiled in: a program reads gain row `row mod groups`.
         let mut arguments = Arguments::new();
         arguments
             .view(args.x)
@@ -264,15 +286,25 @@ pub struct GatedRmsNormDescriptor {
     pub columns: u32,
     /// The tile one program loads at a time; at least `columns` rounds up to the next power of two.
     pub tile: u32,
+    /// Whether the gate passes through a sigmoid in place of the SiLU (`output_gate_type:
+    /// "sigmoid"`,
+    /// `refs/vllm/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:817-831`).
+    pub sigmoid: bool,
 }
 
 impl fmt::Display for GatedRmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("dtype", abi::name(self.dtype))
             .field("columns", self.columns)
-            .field("tile", self.tile)
-            .finish(formatter)
+            .field("tile", self.tile);
+
+        // The SiLU gate keeps the key its modules are filed under.
+        if self.sigmoid {
+            key.variant("gate", "sigmoid").finish(formatter)
+        } else {
+            key.finish(formatter)
+        }
     }
 }
 
@@ -281,12 +313,12 @@ impl fmt::Display for GatedRmsNormDescriptor {
 pub struct GatedRmsNormArgs {
     /// `[rows, columns]`, contiguous: the rows normalized.
     pub x: Operand,
-    /// `[rows, columns]`, contiguous: the gate each normalized element is multiplied by through a
-    /// SiLU.
+    /// `[rows, columns]`, contiguous: the gate each normalized element is multiplied by through
+    /// the descriptor's activation.
     pub gate: Operand,
     /// `[columns]`, the per-channel scale.
     pub weight: Operand,
-    /// `[rows, columns]`, contiguous: receives `x · rsqrt(mean(x²) + eps) · weight · silu(gate)`.
+    /// `[rows, columns]`, contiguous: receives `x · rsqrt(mean(x²) + eps) · weight · act(gate)`.
     pub out: Operand,
     /// The variance floor.
     pub eps: f32,
@@ -603,5 +635,49 @@ impl Op for Softmax {
         // where the grid is absolute and far coarser than `gamma`. A vocabulary-wide row of real
         // logits does not reach that spread.
         Tolerance::rounding(u64::from(descriptor.columns), DType::F32, descriptor.dtype)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A gain every row shares and a SiLU gate keep the keys their modules are filed under; a
+    /// gain of several rows and a sigmoid gate name themselves.
+    #[test]
+    fn a_grouped_gain_and_a_sigmoid_gate_name_themselves() {
+        let norm = RmsNormDescriptor {
+            dtype: DType::BF16,
+            columns: 2560,
+            tile: 4096,
+            pdl: false,
+            centred: true,
+            groups: 1,
+        };
+        assert_eq!(
+            norm.to_string(),
+            "dtype_bf16_columns_2560_tile_4096_pdl_false_centred_true"
+        );
+        let grouped = RmsNormDescriptor { groups: 4, ..norm };
+        assert_eq!(
+            grouped.to_string(),
+            "dtype_bf16_columns_2560_tile_4096_pdl_false_centred_true_groups_4"
+        );
+
+        let gated = GatedRmsNormDescriptor {
+            dtype: DType::BF16,
+            columns: 128,
+            tile: 128,
+            sigmoid: false,
+        };
+        assert_eq!(gated.to_string(), "dtype_bf16_columns_128_tile_128");
+        let sigmoid = GatedRmsNormDescriptor {
+            sigmoid: true,
+            ..gated
+        };
+        assert_eq!(
+            sigmoid.to_string(),
+            "dtype_bf16_columns_128_tile_128_gate_sigmoid"
+        );
     }
 }

@@ -25,6 +25,16 @@
 //! ([`Scheme::Nvfp4Weights`], ModelOpt's `W4A16_NVFP4`). The per-module statement wins over the
 //! file's `config_groups`, which summarize it.
 //!
+//! ## Block-scaled FP8
+//!
+//! An export may store a weight as E4M3 values with one scale per block of rows and columns in
+//! a `weight_scale_inv` tensor beside it ([`Scheme::Fp8Blocks`]; ModelOpt's `FP8_BLOCK_SCALES`
+//! and the `quant_method: "fp8"` exports with a `weight_block_size`). The shard states it
+//! whatever the declaration says, and every module reads such a weight as the dense matrix its
+//! values and scales state, decoded once at load: no operator of this build multiplies
+//! block-scaled FP8 weights, so a module whose weights are too many to hold dense refuses the
+//! checkpoint itself.
+//!
 //! ## The method follows the module
 //!
 //! There is no table of roles: a module asks for its weight through its
@@ -47,7 +57,7 @@ use crate::error::{Error, Result};
 
 mod nvfp4;
 
-pub use nvfp4::{Nvfp4Names, Nvfp4Stack, Nvfp4Weight, ValueLayout};
+pub use nvfp4::{Nvfp4Names, Nvfp4Share, Nvfp4Stack, Nvfp4Weight, ValueLayout};
 
 /// The declaration's own file, when the export writes one beside `config.json`.
 const DECLARATION_FILE: &str = "hf_quant_config.json";
@@ -66,6 +76,11 @@ pub enum Scheme {
     /// ModelOpt per-tensor FP8: `weight` in `F8_E4M3`, one `weight_scale` and the static
     /// `input_scale` the activations are encoded by.
     Fp8,
+    /// Block-scaled FP8: `weight` `[rows, columns]` in `F8_E4M3` and `weight_scale_inv`
+    /// `[rows / r, columns / c]`, the scale each `r × c` block of the weight is multiplied by.
+    /// Read by every module as the dense matrix `e4m3(weight) · weight_scale_inv`, decoded once
+    /// at load.
+    Fp8Blocks,
 }
 
 /// The scheme a checkpoint's key/value cache scales follow.
@@ -92,6 +107,9 @@ pub struct Declaration {
     /// A mixed-precision export's scheme per module, longest name first; `None` when one scheme
     /// covers every packed weight.
     layers: Option<Vec<(String, Scheme)>>,
+    /// The weights whose shards store a `weight_scale_inv` beside them, once [`Self::resolve`]
+    /// has read the shards: block-scaled FP8, whatever the declaration states.
+    blocks: Option<BTreeSet<String>>,
 }
 
 impl Declaration {
@@ -103,6 +121,7 @@ impl Declaration {
             kv_cache: KvCacheScheme::Unquantized,
             packed: None,
             layers: None,
+            blocks: None,
         }
     }
 
@@ -169,17 +188,27 @@ impl Declaration {
     /// This declaration with every weight's packing taken from what `checkpoint`'s shards hold: a
     /// weight is packed when the shard stores a `weight_scale` beside it.
     pub fn resolve(&self, checkpoint: &Checkpoint) -> Self {
+        let beside = |suffix: &'static str| -> BTreeSet<String> {
+            checkpoint
+                .names()
+                .filter_map(|name| name.strip_suffix(suffix))
+                .filter(|weight| weight.ends_with("weight"))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        // A block-scaled weight is stated by its shard alone.
+        let blocks = beside("_scale_inv");
+        let blocks = (!blocks.is_empty()).then_some(blocks);
         if self.scheme == Scheme::Dense && self.layers.is_none() {
-            return self.clone();
+            return Self {
+                blocks,
+                ..self.clone()
+            };
         }
-        let packed = checkpoint
-            .names()
-            .filter_map(|name| name.strip_suffix("_scale"))
-            .filter(|weight| weight.ends_with("weight"))
-            .map(str::to_owned)
-            .collect();
         Self {
-            packed: Some(packed),
+            packed: Some(beside("_scale")),
+            blocks,
             ..self.clone()
         }
     }
@@ -189,6 +218,13 @@ impl Declaration {
     /// What the shards hold once [`Self::resolve`] has read them; the declaration's intent (packed
     /// unless an excluded module owns it) before.
     pub fn scheme(&self, weight: &str) -> Scheme {
+        if self
+            .blocks
+            .as_ref()
+            .is_some_and(|blocks| blocks.contains(weight))
+        {
+            return Scheme::Fp8Blocks;
+        }
         if let Some(layers) = &self.layers {
             // A mixed export: a weight its shard stores packed takes its module's scheme.
             let packed = self
@@ -253,7 +289,7 @@ pub(crate) fn e4m3(byte: u8) -> f32 {
 }
 
 /// `value` as BF16 bits, rounded to nearest even.
-fn bf16_bits(value: f32) -> u16 {
+pub(crate) fn bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     if value.is_nan() {
         return ((bits >> 16) as u16) | 0x0040;
@@ -312,12 +348,14 @@ fn layer_scheme(owner: &str, module: &str, layer: &Fields<'_>) -> Result<Scheme>
         "FP8" => Scheme::Fp8,
         "NVFP4" => Scheme::Nvfp4,
         "W4A16_NVFP4" => Scheme::Nvfp4Weights,
+        // ModelOpt's two spellings of weight-only FP8 with per-block scales.
+        "FP8_BLOCK_SCALES" | "FP8_PB_WO" => Scheme::Fp8Blocks,
         other => {
             return Err(refuse(
                 owner,
                 format!(
                     "states `{other}` for {module}, and the per-module algorithms served are FP8, \
-                     NVFP4 and W4A16_NVFP4"
+                     NVFP4, W4A16_NVFP4 and FP8_BLOCK_SCALES (FP8_PB_WO)"
                 ),
             ));
         }
@@ -514,6 +552,7 @@ fn declaration(
         kv_cache,
         packed: None,
         layers,
+        blocks: None,
     })
 }
 

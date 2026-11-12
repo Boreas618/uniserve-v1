@@ -84,8 +84,8 @@ pub use adapter::{Adapter, Fusion};
 pub use capability::{
     CausalLm, Clip, ConditionPiece, ConditionShape, Conditioning, Decoder, Denoiser, Drafter,
     Encoder, EncoderLayout, ExpertExchange, KvCache, KvPlanes, MediaFormat, MediaInput, NO_SLOT,
-    PatchFormat, PixelNorm, RecurrentState, Splice, Splicer, Step, TokenBatch, VideoRequest,
-    Vision,
+    PatchFormat, PixelNorm, RecurrentState, Splice, Splicer, Step, TokenBatch, VerifySlots,
+    VideoRequest, Vision,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
 pub use collective::Split;

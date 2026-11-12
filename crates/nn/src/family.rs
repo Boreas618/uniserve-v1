@@ -285,6 +285,10 @@ pub struct TextPlacement {
     /// Whether the deployment speculates with the checkpoint's own drafter, so its layers load
     /// beside the model's ([`TextModel::drafter`]); a deployment that does not leaves them unread.
     pub drafter: bool,
+    /// The tokens a step of the deployment drafts beyond the one it commits, zero for a
+    /// deployment that does not speculate: a model whose state fields hold a window per request
+    /// ([`crate::capability::VerifySlots`]) sizes them by it.
+    pub draft_tokens: u32,
 }
 
 /// A loaded causal language model, as execution sizes and serves it.
@@ -304,6 +308,21 @@ pub trait TextModel: CausalLm + Send + Sync {
     /// The recurrent state its layers keep per request slot, as this rank holds it; `None` for a
     /// model whose every layer attends over the key/value cache.
     fn state(&self) -> Option<StateShape>;
+
+    /// The recurrent state of a model whose layers do not all keep the same fields: one entry
+    /// per run of layers that do, in the order [`crate::capability::RecurrentState::live`]
+    /// holds their buffers (every layer of the first entry, then of the second). The one entry
+    /// of [`Self::state`] for every other model.
+    fn state_layers(&self) -> Vec<StateShape> {
+        self.state().into_iter().collect()
+    }
+
+    /// The width of the rows [`CausalLm::forward`] returns, which [`CausalLm::compute_logits`]
+    /// and the drafter read: [`Self::hidden`], or the residual streams' joint width for a model
+    /// that carries several and reads them out at its head.
+    fn stream_width(&self) -> u32 {
+        self.hidden()
+    }
 
     /// Its routed experts, when it has any.
     fn experts(&self) -> Option<ExpertShape>;
@@ -370,6 +389,19 @@ pub struct CacheShape {
     pub kv_heads: u32,
     /// Width of one head.
     pub head_dim: u32,
+    /// The index keys each layer stores beside its keys and values
+    /// ([`crate::capability::KvPlanes::index_keys`]), for a model whose attention reads the
+    /// tokens an indexer selects; `None` otherwise.
+    pub index_keys: Option<IndexKeys>,
+}
+
+/// The index-key plane of an attention layer: one key per `ratio` consecutive tokens of a page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexKeys {
+    /// Elements of one index key.
+    pub width: u32,
+    /// Tokens one key stands for; it divides the page size.
+    pub ratio: u32,
 }
 
 /// The routed experts of a causal language model, as an expert exchange carries them.

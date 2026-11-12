@@ -58,6 +58,7 @@ fn state(
         live: buffers(slots),
         checkpoint: buffers(slots),
         trail: trail.map(buffers),
+        verify: None,
     }
 }
 
@@ -85,6 +86,8 @@ fn batch(phase: PhaseKind, page_size: u32, on_meta: bool) -> TokenBatch {
         draft_lens: None,
         rope_positions: None,
         live_tokens: None,
+        token_ids: None,
+        ngram_context: None,
     }
 }
 
@@ -145,6 +148,9 @@ fn causal_conv1d_continues_each_row_from_its_slots_last_inputs() {
     let out = functional::causal_conv1d(
         &tensor(&x, (7, channels), DType::F32),
         &tensor(&weight, (channels, width), DType::F32),
+        1,
+        true,
+        &batch(PhaseKind::Decode, 64, false),
         &state,
         0,
         0,
@@ -186,12 +192,13 @@ fn causal_conv1d_continues_each_row_from_its_slots_last_inputs() {
     // A state of another extent, and a field the state does not hold.
     let narrow = tensor(&weight[..channels * 3], (channels, 3), DType::F32);
     let input = tensor(&x, (7, channels), DType::F32);
-    let refused = functional::causal_conv1d(&input, &narrow, &state, 0, 0);
+    let decode = batch(PhaseKind::Decode, 64, false);
+    let refused = functional::causal_conv1d(&input, &narrow, 1, true, &decode, &state, 0, 0);
     assert!(refused.unwrap_err().to_string().contains("live buffer"));
 
     let weight = tensor(&weight, (channels, width), DType::F32);
-    assert!(functional::causal_conv1d(&input, &weight, &state, 0, 1).is_err());
-    assert!(functional::causal_conv1d(&input, &weight, &state, 1, 0).is_err());
+    assert!(functional::causal_conv1d(&input, &weight, 1, true, &decode, &state, 0, 1).is_err());
+    assert!(functional::causal_conv1d(&input, &weight, 1, true, &decode, &state, 1, 0).is_err());
 }
 
 // ---- The gated delta rule ---------------------------------------------------------------------
@@ -319,6 +326,7 @@ impl Inputs {
             &gate(&self.b),
             &tensor(a_log, VALUE_HEADS, DType::F32),
             &tensor(dt_bias, VALUE_HEADS, DType::F32),
+            functional::StateAxes::KeyValue,
             batch,
             state,
             0,
@@ -490,6 +498,7 @@ fn meta_state(config: &GatedDeltaNetConfig, tokens: usize, trail: bool) -> Recur
         live: buffers(4),
         checkpoint: buffers(4),
         trail: trail.then(|| buffers(tokens)),
+        verify: None,
     }
 }
 
@@ -503,6 +512,9 @@ fn config(value_dim: u32) -> GatedDeltaNetConfig {
         value_dim,
         conv_width: 4,
         eps: 1e-6,
+        sigmoid_gate: false,
+        axes: functional::StateAxes::KeyValue,
+        draft_tokens: 0,
         split: Split::WHOLE,
     }
 }
@@ -519,6 +531,9 @@ fn the_recurrent_functions_state_their_kernels() {
         functional::causal_conv1d(
             &meta((tokens, channels), DType::BF16),
             &meta((channels, 4), DType::BF16),
+            1,
+            true,
+            &batch(PhaseKind::Decode, 64, true),
             &state,
             0,
             0,
@@ -551,6 +566,7 @@ fn the_recurrent_functions_state_their_kernels() {
                 &meta((tokens, 4), DType::BF16),
                 &meta(4, DType::BF16),
                 &meta(4, DType::BF16),
+                functional::StateAxes::KeyValue,
                 &batch,
                 state,
                 0,
@@ -573,6 +589,123 @@ fn the_recurrent_functions_state_their_kernels() {
         launches,
         [("gated_delta_rule", format!("{base}_form_chunked_chunk_64"))]
     );
+}
+
+/// A state that lends request slots: the convolution's window holds a row per draft and the
+/// rule a slot per row of a step, and each key names what the plain operator's does not.
+#[test]
+fn request_slots_name_their_window_and_their_slots() {
+    let drafted = GatedDeltaNetConfig {
+        axes: functional::StateAxes::ValueKey,
+        draft_tokens: 3,
+        ..config(4)
+    };
+    let channels = drafted.conv_channels() as usize;
+    let tokens = 8;
+    assert_eq!(drafted.state_fields(DType::BF16)[0].dims, [6, channels]);
+
+    let state = RecurrentState {
+        query_offsets: meta(3, DType::U32),
+        seq_lens: meta(2, DType::U32),
+        slots: meta(2, DType::U32),
+        checkpoints: meta(2, DType::U32),
+        verify: Some(nn::VerifySlots {
+            state_indices: meta((2, 4), DType::U32),
+            num_accepted: meta(2, DType::U32),
+        }),
+        ..meta_state(&drafted, tokens, false)
+    };
+
+    // A decode-phase batch leaves the window for a step that chooses; a prefill does not.
+    let convolution = |phase, dilation, activation| {
+        let window = if dilation == 1 {
+            state.clone()
+        } else {
+            // A dilation of three reads nine inputs back: a window of twelve rows.
+            RecurrentState {
+                live: vec![vec![meta((4, 12, channels), DType::BF16)]],
+                checkpoint: vec![vec![meta((4, 12, channels), DType::BF16)]],
+                ..state.clone()
+            }
+        };
+        let (mixed, launches) = recorded(|| {
+            functional::causal_conv1d(
+                &meta((tokens, channels), DType::BF16),
+                &meta((channels, 4), DType::BF16),
+                dilation,
+                activation,
+                &batch(phase, 64, true),
+                &window,
+                0,
+                0,
+            )
+        });
+        mixed.unwrap();
+        launches[0].1.clone()
+    };
+    let base = "dtype_bf16_channels_32_width_4_block_32";
+    assert_eq!(
+        convolution(PhaseKind::Decode, 1, true),
+        format!("{base}_dilation_1_activation_silu_window_6_stepwise_true")
+    );
+    assert_eq!(
+        convolution(PhaseKind::Prefill, 1, true),
+        format!("{base}_dilation_1_activation_silu_window_6_stepwise_false")
+    );
+    assert_eq!(
+        convolution(PhaseKind::Decode, 3, false),
+        format!("{base}_dilation_3_activation_none_window_12_stepwise_true")
+    );
+
+    let row = meta((tokens, channels), DType::BF16)
+        .reshape((tokens, channels / 4, 4))
+        .unwrap();
+    let heads = |first, heads| row.narrow(1, first, heads).unwrap();
+    let (out, launches) = recorded(|| {
+        functional::gated_delta_rule(
+            &heads(0, 2),
+            &heads(2, 2),
+            &heads(4, 4),
+            &meta((tokens, 4), DType::BF16),
+            &meta((tokens, 4), DType::BF16),
+            &meta(4, DType::BF16),
+            &meta(4, DType::BF16),
+            functional::StateAxes::ValueKey,
+            &batch(PhaseKind::Decode, 64, true),
+            &state,
+            0,
+            1,
+        )
+    });
+    out.unwrap();
+    assert_eq!(
+        launches,
+        [(
+            "gated_delta_rule",
+            "dtype_bf16_key_heads_2_value_heads_4_key_dim_4_value_dim_4_block_4_form_recurrent_\
+             chunk_1_axes_value_key_slots_4"
+                .to_owned()
+        )]
+    );
+
+    // A trail and request slots are two ways to keep a step's states: not both.
+    let both = RecurrentState {
+        trail: meta_state(&drafted, tokens, true).trail,
+        ..state.clone()
+    };
+    let (refused, _) = recorded(|| {
+        functional::causal_conv1d(
+            &meta((tokens, channels), DType::BF16),
+            &meta((channels, 4), DType::BF16),
+            1,
+            true,
+            &batch(PhaseKind::Decode, 64, true),
+            &both,
+            0,
+            0,
+        )
+    });
+    assert!(refused.is_err());
 }
 
 // ---- The module -------------------------------------------------------------------------------
@@ -682,6 +815,9 @@ fn a_gated_delta_net_mixes_its_rows_through_the_slots_state() {
         let convolved = functional::causal_conv1d(
             &project(&hidden, "mixer.in_proj_qkv.weight", (channels, 16)),
             &weight(&weights, "mixer.conv1d.weight", (channels, 4)),
+            1,
+            true,
+            &decode,
             &reference,
             0,
             0,
@@ -702,6 +838,7 @@ fn a_gated_delta_net_mixes_its_rows_through_the_slots_state() {
             &project(&hidden, "mixer.in_proj_b.weight", (4, 16)),
             &weight(&weights, "mixer.A_log", 4),
             &weight(&weights, "mixer.dt_bias", 4),
+            functional::StateAxes::KeyValue,
             &decode,
             &reference,
             0,
@@ -715,6 +852,7 @@ fn a_gated_delta_net_mixes_its_rows_through_the_slots_state() {
                 .unwrap(),
             &weight(&weights, "mixer.norm.weight", value_dim as usize),
             1e-6,
+            false,
         )
         .unwrap();
         let expected = project(
@@ -805,19 +943,27 @@ fn a_gated_delta_net_states_its_fields_and_its_kernels() {
     let (refused, _) = recorded(|| network.forward(&hidden, &prefill, &short, 0));
     assert!(refused.unwrap_err().to_string().contains("two expected"));
 
-    // A gated delta network is served on one rank, and its value heads group over its key
-    // heads.
-    let split = GatedDeltaNetConfig {
-        split: Split { size: 2, rank: 0 },
+    // A rank of a tensor-parallel group holds a share of the key heads and of the value heads
+    // they serve, so the split divides the key heads.
+    let halves = GatedDeltaNetConfig {
+        split: Split { size: 2, rank: 1 },
         ..config
     };
-    let refused = GatedDeltaNet::load(&split, loader.root().pp("mixer"));
+    assert_eq!(halves.conv_channels(), config.conv_channels() / 2);
+    assert_eq!(halves.state_fields(DType::BF16)[1].dims[0], 2);
+    assert!(GatedDeltaNet::load(&halves, loader.root().pp("mixer")).is_ok());
+
+    let thirds = GatedDeltaNetConfig {
+        split: Split { size: 3, rank: 0 },
+        ..config
+    };
+    let refused = GatedDeltaNet::load(&thirds, loader.root().pp("mixer"));
     assert!(
         refused
             .err()
             .unwrap()
             .to_string()
-            .contains("one tensor rank")
+            .contains("does not hold a share")
     );
 
     let ungrouped = GatedDeltaNetConfig {

@@ -339,6 +339,11 @@ impl Config {
             value_dim: values.count("linear_value_head_dim")?,
             conv_width: values.count("linear_conv_kernel_dim")?,
             eps: text.rms_norm_eps,
+            // Qwen3.5 gates the output norm with the SiLU and keeps one slot per request,
+            // whose state rows are the keys'.
+            sigmoid_gate: false,
+            axes: nn::functional::StateAxes::KeyValue,
+            draft_tokens: 0,
             split: Split::WHOLE,
         };
         if !linear.value_heads.is_multiple_of(linear.key_heads) {
@@ -648,7 +653,7 @@ impl VisionConfig {
     /// A field of the wrong type, a block activation other than `gelu_pytorch_tanh`,
     /// DeepStack blocks out of order or outside the tower, heads that do not split the width
     /// into two even rotary halves, or a position table that is not a square grid.
-    fn read(root: &Fields<'_>) -> Result<Self> {
+    pub fn read(root: &Fields<'_>) -> Result<Self> {
         let values = root.object("vision_config")?;
         let owner = values.owner().to_owned();
 
@@ -712,7 +717,7 @@ impl VisionConfig {
 
 /// The processor rules of `checkpoint` and its images' pixel normalization, or `None` when it
 /// states no processor files.
-fn processor(checkpoint: &nn::Checkpoint) -> Result<Option<(ProcessorConfig, PixelNorm)>> {
+pub fn processor(checkpoint: &nn::Checkpoint) -> Result<Option<(ProcessorConfig, PixelNorm)>> {
     let [image_file, video_file] = ProcessorConfig::FILES;
     let (Some(image), Some(video)) = (
         checkpoint.sidecar(image_file)?,
@@ -776,7 +781,7 @@ fn routed_experts(fields: &Fields<'_>) -> Result<(u32, u32)> {
 /// from the text configuration itself. `partial_rotary_factor` is the factor of a
 /// configuration that states none, or `None` when it must state one. Every other recipe is
 /// [`RotaryConfig::from_hf`]'s.
-fn rope(
+pub fn rope(
     values: &Fields<'_>,
     head_dim: u32,
     max_position_embeddings: u32,
@@ -862,7 +867,7 @@ fn sectioned(theta: f32, dim: u32, sections: &[u32]) -> Result<RotaryConfig> {
 
 /// Which layers of a hybrid stack of `layers` layers are linear, from `layer_types` or
 /// `full_attention_interval`, which must agree when both are stated.
-fn linear_layers(values: &Fields<'_>, layers: u32) -> Result<Vec<bool>> {
+pub fn linear_layers(values: &Fields<'_>, layers: u32) -> Result<Vec<bool>> {
     let derived = values
         .optional_count("full_attention_interval")?
         .map(|interval| {

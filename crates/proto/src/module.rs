@@ -227,6 +227,8 @@ pub mod operator {
     pub const DENSE_ATTENTION: &str = "dense_attention";
     pub const PAGED_ATTENTION: &str = "paged_attention";
     pub const SPARSE_ATTENTION: &str = "sparse_attention";
+    pub const INDEXED_ATTENTION: &str = "indexed_attention";
+    pub const INDEX_SCORES: &str = "index_scores";
     pub const MOE_UNPERMUTE: &str = "moe_unpermute";
     pub const EXPERT_EXCHANGE: &str = "expert_exchange";
     pub const GATHER_GEMM: &str = "gather_gemm";
@@ -327,6 +329,8 @@ pub mod operator {
         DENSE_ATTENTION,
         PAGED_ATTENTION,
         SPARSE_ATTENTION,
+        INDEXED_ATTENTION,
+        INDEX_SCORES,
         MOE_UNPERMUTE,
         EXPERT_EXCHANGE,
         GATHER_GEMM,

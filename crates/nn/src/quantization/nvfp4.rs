@@ -197,6 +197,109 @@ impl ValueLayout {
     }
 }
 
+/// One tensor-parallel rank's share of every matrix of a packed stack, in elements of the
+/// checkpoint's matrices: `count` rows or columns from `first`, published as `padded` of them,
+/// the ones past the share zero.
+///
+/// A rank of a tensor-parallel group holds a share of each expert's intermediate width (vLLM's
+/// split of the family's experts, `refs/vllm/vllm/models/qwen4_exp/nvidia/low_latency_gemm.py:27-65`):
+/// rows of the gate and up projections, columns of the down projection. The grouped products
+/// read whole row tiles, so a share that is not whole tiles is padded with rows and columns of
+/// zero codes and zero block scales, which contribute nothing: a gated row of zeros is zero
+/// and a down column of zeros multiplies it. The bounds are whole bytes and whole block
+/// scales: multiples of sixteen elements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nvfp4Share {
+    /// Rows `first .. first + count` of every matrix.
+    Rows {
+        /// The first row of the share.
+        first: u64,
+        /// Rows of the share.
+        count: u64,
+        /// Rows published: the share, then rows of zeros.
+        padded: u64,
+    },
+    /// Columns `first .. first + count` of every row.
+    Columns {
+        /// The first element of the share in a row.
+        first: u64,
+        /// Elements of the share in a row.
+        count: u64,
+        /// Elements published of a row: the share, then zeros.
+        padded: u64,
+    },
+}
+
+impl Nvfp4Share {
+    /// The `(rows, columns)` a matrix of `rows` by `columns` elements is published as.
+    const fn extents(self, rows: u64, columns: u64) -> (u64, u64) {
+        match self {
+            Self::Rows { padded, .. } => (padded, columns),
+            Self::Columns { padded, .. } => (rows, padded),
+        }
+    }
+
+    /// Whether the share lies in a matrix of `rows` by `columns` elements on whole bytes and
+    /// block scales.
+    const fn fits(self, rows: u64, columns: u64) -> bool {
+        let (first, count, padded, extent, unit) = match self {
+            Self::Rows {
+                first,
+                count,
+                padded,
+            } => (first, count, padded, rows, 1),
+            Self::Columns {
+                first,
+                count,
+                padded,
+            } => (first, count, padded, columns, 16),
+        };
+
+        count > 0
+            && first + count <= extent
+            && padded >= count
+            && first % unit == 0
+            && count % unit == 0
+            && padded % unit == 0
+    }
+
+    /// The share of `bytes`, a matrix of `rows` rows stored `unit` elements a byte, as it is
+    /// published: the rows or the bytes of each row the share names, then zeros.
+    fn cut(self, bytes: &[u8], rows: u64, unit: u64) -> Vec<u8> {
+        let row_bytes = bytes.len() / rows.max(1) as usize;
+
+        match self {
+            Self::Rows {
+                first,
+                count,
+                padded,
+            } => {
+                let held = &bytes[first as usize * row_bytes..(first + count) as usize * row_bytes];
+                let mut out = held.to_vec();
+                out.resize(padded as usize * row_bytes, 0);
+                out
+            }
+            Self::Columns {
+                first,
+                count,
+                padded,
+            } => {
+                let (first, count, padded) = (
+                    (first / unit) as usize,
+                    (count / unit) as usize,
+                    (padded / unit) as usize,
+                );
+                let mut out = Vec::with_capacity(rows as usize * padded);
+                for row in bytes.chunks(row_bytes) {
+                    out.extend_from_slice(&row[first..first + count]);
+                    out.resize(out.len() + padded - count, 0);
+                }
+                out
+            }
+        }
+    }
+}
+
 /// One expert's linear block scales in the 128x4 layout the products read.
 ///
 /// The launcher's own `computeSFIndex` (TensorRT-LLM's `fp8Op.h`) written out: rows padded to
@@ -712,6 +815,44 @@ impl WeightLoader<'_> {
         layout: (ValueLayout, ScaleLayout),
         input_scale: bool,
     ) -> Result<(Nvfp4Stack, Vec<f32>)> {
+        self.nvfp4_stack_share(
+            name,
+            prefix,
+            projections,
+            slots,
+            vocabulary,
+            names,
+            layout,
+            input_scale,
+            None,
+        )
+    }
+
+    /// [`Self::nvfp4_stack`] of one tensor-parallel rank's `share` of every matrix
+    /// ([`Nvfp4Share`]), or of the whole matrices without one. The tensor scales and the
+    /// activation scales are the whole matrices': every rank multiplies by the same numbers.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::nvfp4_stack`], and a share that does not lie in the matrices on whole bytes
+    /// and block scales.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is one independent fact of the stack, stated by the module that \
+                  owns it"
+    )]
+    pub fn nvfp4_stack_share(
+        &self,
+        name: &str,
+        prefix: &str,
+        projections: &[&str],
+        slots: &[u32],
+        vocabulary: u32,
+        names: Nvfp4Names,
+        layout: (ValueLayout, ScaleLayout),
+        input_scale: bool,
+        share: Option<Nvfp4Share>,
+    ) -> Result<(Nvfp4Stack, Vec<f32>)> {
         let (values_layout, layout) = layout;
         let experts = u32::try_from(slots.len())
             .map_err(|_| Error::weight(name, "more slots than a stack holds".to_owned()))?;
@@ -836,19 +977,39 @@ impl WeightLoader<'_> {
             }
         }
 
-        let rows = rows.unwrap_or(0) * per;
-        let columns = columns.unwrap_or(0);
-        let shard_scales = ScaleLayout::Linear.shape(rows, columns);
+        // One projection's matrix as the checkpoint stores it, and as this rank publishes it.
+        let (stored_rows, stored_columns) = (rows.unwrap_or(0), columns.unwrap_or(0));
+        let shard_scales = ScaleLayout::Linear.shape(stored_rows * per, stored_columns);
         if shard_scales.numel() != entry * per {
             return Err(Error::weight(
                 name,
                 format!(
-                    "a linear entry for {rows} rows of {columns} elements is {} block scales, \
-                     and {per} concatenated entries hold {entry} each",
+                    "a linear entry for {stored_rows} rows of {stored_columns} elements is {} \
+                     block scales, and {per} concatenated entries hold {entry} each",
                     shard_scales.numel() / per.max(1)
                 ),
             ));
         }
+        if let Some(share) = share
+            && !share.fits(stored_rows, stored_columns)
+        {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "{share:?} is no share of matrices of {stored_rows} rows of {stored_columns} \
+                     elements on whole bytes and block scales"
+                ),
+            ));
+        }
+        let (rows, columns) = match share {
+            Some(share) => share.extents(stored_rows, stored_columns),
+            None => (stored_rows, stored_columns),
+        };
+        let rows = rows * per;
+
+        // A share is another weight than the whole stack: its name states it.
+        let shared = share.map_or_else(String::new, |share| format!("@{share:?}"));
+        let name = &format!("{name}{shared}");
 
         // The values' row arrangement: a plain shard needs nothing, a shuffled one is permuted
         // here once, at load. A product whose A operand is read with `useShuffledMatrix` cannot
@@ -907,7 +1068,12 @@ impl WeightLoader<'_> {
             |loader| {
                 let mut bytes = Vec::with_capacity(numel(&values_shape) as usize);
                 for values_name in &values_names {
-                    bytes.extend_from_slice(&loader.checkpoint().read(values_name)?);
+                    let stored = loader.checkpoint().read(values_name)?;
+                    match share {
+                        // Two codes a byte along a row.
+                        Some(share) => bytes.extend(share.cut(&stored, stored_rows, 2)),
+                        None => bytes.extend_from_slice(&stored),
+                    }
                 }
 
                 Ok(Cow::Owned(values_layout.arrange(
@@ -935,7 +1101,12 @@ impl WeightLoader<'_> {
                 let blocks = ScaleLayout::Linear.columns(columns);
                 let mut scales_bytes = Vec::with_capacity((count * rows * blocks) as usize);
                 for scales_name in &scales_names {
-                    scales_bytes.extend_from_slice(&loader.checkpoint().read(scales_name)?);
+                    let stored = loader.checkpoint().read(scales_name)?;
+                    match share {
+                        // One block scale per sixteen elements of a row.
+                        Some(share) => scales_bytes.extend(share.cut(&stored, stored_rows, 16)),
+                        None => scales_bytes.extend_from_slice(&stored),
+                    }
                 }
 
                 // One expert's linear table becomes the published arrangement: rows permuted
@@ -1039,7 +1210,66 @@ impl WeightLoader<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ValueLayout, swizzled_scales};
+    use super::{Nvfp4Share, ValueLayout, swizzled_scales};
+
+    /// A rank's share of a packed matrix is its rows, or its bytes of every row, and zeros to
+    /// the padded extent: two codes a byte, one block scale per sixteen elements.
+    #[test]
+    fn a_share_is_a_ranks_rows_or_columns_padded_with_zeros() {
+        // Four rows of sixty-four elements: thirty-two bytes of codes, four block scales.
+        let codes: Vec<u8> = (0..4 * 32).map(|byte| byte as u8 + 1).collect();
+        let scales: Vec<u8> = (0..4 * 4).map(|byte| byte as u8 + 1).collect();
+
+        let rows = Nvfp4Share::Rows {
+            first: 1,
+            count: 2,
+            padded: 4,
+        };
+        assert!(rows.fits(4, 64) && rows.extents(4, 64) == (4, 64));
+        let cut = rows.cut(&codes, 4, 2);
+        assert_eq!(cut[..64], codes[32..96]);
+        assert!(cut[64..].iter().all(|byte| *byte == 0) && cut.len() == 4 * 32);
+
+        let columns = Nvfp4Share::Columns {
+            first: 16,
+            count: 32,
+            padded: 48,
+        };
+        assert!(columns.fits(4, 64) && columns.extents(4, 64) == (4, 48));
+        let cut = columns.cut(&codes, 4, 2);
+        assert_eq!(cut.len(), 4 * 24);
+        assert_eq!(cut[..16], codes[8..24]);
+        assert!(cut[16..24].iter().all(|byte| *byte == 0));
+        assert_eq!(cut[24..40], codes[32 + 8..32 + 24]);
+        let cut = columns.cut(&scales, 4, 16);
+        assert_eq!(cut, [2, 3, 0, 6, 7, 0, 10, 11, 0, 14, 15, 0]);
+
+        // A share is whole bytes and whole block scales of a row, inside the matrix.
+        for refused in [
+            Nvfp4Share::Columns {
+                first: 8,
+                count: 32,
+                padded: 32,
+            },
+            Nvfp4Share::Columns {
+                first: 48,
+                count: 32,
+                padded: 32,
+            },
+            Nvfp4Share::Rows {
+                first: 3,
+                count: 2,
+                padded: 2,
+            },
+            Nvfp4Share::Rows {
+                first: 0,
+                count: 2,
+                padded: 1,
+            },
+        ] {
+            assert!(!refused.fits(4, 64), "{refused:?}");
+        }
+    }
 
     /// The block-scale arrangement is the launcher's `computeSFIndex`: a permutation of the
     /// checkpoint's row-major table into the 128x4 layout, padded with zeros.

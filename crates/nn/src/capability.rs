@@ -81,6 +81,17 @@ pub struct TokenBatch {
     /// token row needs to know which rows are real, and it cannot derive that from any shape.
     /// The value is on the device because it changes per replay of one captured graph.
     pub live_tokens: Option<Tensor>,
+    /// `[tokens]` U32: the token id of each packed token, as the request's prompt states it (a
+    /// vision row holds its placeholder's id), for a model whose layers read token ids beside
+    /// the embeddings: an n-gram hash embedding hashes each token with the two before it.
+    /// `None` for every other model.
+    pub token_ids: Option<Tensor>,
+    /// `[rows, 2]` U32: the two token ids before each row's first token, oldest first, with
+    /// the vocabulary's end-of-text id where the request has no earlier token. Present exactly
+    /// when `token_ids` is: a row's first tokens hash with ids the batch does not hold, which
+    /// execution reads from the request's token ids as it reads positions. It is an input,
+    /// not state: nothing is kept, checkpointed or committed for it.
+    pub ngram_context: Option<Tensor>,
 }
 
 impl TokenBatch {
@@ -216,6 +227,26 @@ impl TokenBatch {
                 ),
             ));
         }
+
+        match (&self.token_ids, &self.ngram_context) {
+            (None, None) => {}
+            (Some(ids), Some(context))
+                if ids.dims() == [tokens]
+                    && ids.dtype() == DType::U32
+                    && context.dims() == [rows, 2]
+                    && context.dtype() == DType::U32 => {}
+            (ids, context) => {
+                return Err(Error::shape(
+                    OWNER,
+                    format!(
+                        "token_ids is {:?} and ngram_context {:?}: [{tokens}] u32 and \
+                         [{rows}, 2] u32 expected, both or neither",
+                        ids.as_ref().map(Tensor::dims),
+                        context.as_ref().map(Tensor::dims)
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -246,6 +277,12 @@ pub struct KvPlanes {
     pub key_scale: Option<Tensor>,
     /// `[pages, 1, 1, 1]` F32: each page's value scale, present exactly when `value` is FP8.
     pub value_scale: Option<Tensor>,
+    /// `[pages, page_size / ratio, width]` index keys, for a layer whose attention reads the
+    /// tokens an indexer selects ([`crate::family::CacheShape::index_keys`]): row `g` of a page
+    /// is the compressed key of the page's group `g` of `ratio` consecutive tokens, written when
+    /// the group completes. It lies on the key/value page table, so a page reused from the
+    /// prefix cache brings its groups' keys. `None` for a layer that attends every key.
+    pub index_keys: Option<Tensor>,
 }
 
 /// The paged cache of one attention group, as execution lends it for one forward: how rows
@@ -315,7 +352,9 @@ pub struct RecurrentState {
     pub checkpoints: Tensor,
     /// The live buffers: one entry per recurrent layer, in the model's order of them, each the
     /// layer's fields in the order of its [`crate::family::StateShape`], `[slots, …]` in the
-    /// field's element type and extents.
+    /// field's element type and extents. A model whose layers keep different fields states
+    /// them as runs of layers ([`crate::family::TextModel::state_layers`]), and the entries
+    /// follow the runs in order.
     pub live: Vec<Vec<Tensor>>,
     /// The checkpoint buffers, in the same order and extents.
     pub checkpoint: Vec<Vec<Tensor>>,
@@ -324,6 +363,38 @@ pub struct RecurrentState {
     /// verification keeps one, because only after the forward does it learn after which of a
     /// row's tokens the slot's state stands; `None` for every other batch.
     pub trail: Option<Vec<Vec<Tensor>>>,
+    /// The slots of a deployment whose verifications copy no state ([`VerifySlots`]); `None`
+    /// for a deployment that keeps one slot per request, with or without a trail.
+    pub verify: Option<VerifySlots>,
+}
+
+/// The slots a request's rows read and write when acceptance copies no state (vLLM's
+/// `state_indices` and `num_accepted`, `refs/vllm/vllm/v1/attention/backends/gdn_attn.py:463-486`).
+///
+/// A request of a deployment that drafts `n` tokens owns `Q = n + 1` slots of a matrix-valued
+/// field and one slot, its first, of every window field, whose windows are `n` rows longer than
+/// the layer's history. A decode-phase row (a decode or a verification, at most `Q` tokens)
+/// starts from the state `num_accepted` says stands and leaves the state after each of its
+/// tokens where the next step can choose it:
+///
+/// - a matrix-valued field is read from slot `state_indices[r, num_accepted[r] − 1]` and the
+///   state after the row's token `t` is written to slot `state_indices[r, t]`, the source read
+///   before any slot is written;
+/// - a window field is read from row `num_accepted[r] − 1` of the window of slot
+///   `state_indices[r, 0]`, and left holding the inputs after the first one read, so the
+///   history before the row's token `t + 1` begins at window row `t`.
+///
+/// A row of any other phase reads the same way and leaves the state after its last token in
+/// slot `state_indices[r, 0]` and at window row zero, so the step after it states
+/// `num_accepted = 1`. What a commit writes is `num_accepted` alone.
+#[derive(Clone)]
+pub struct VerifySlots {
+    /// `[rows, Q]` U32: each state row's slots; column zero is the row's entry of
+    /// [`RecurrentState::slots`]. A padding row's entries are [`NO_SLOT`].
+    pub state_indices: Tensor,
+    /// `[rows]` U32, in `1..=Q`: how many tokens of the row's previous step stand; one for a
+    /// row whose previous step was not of the decode phase.
+    pub num_accepted: Tensor,
 }
 
 /// The rows of one expert-parallel exchange, as execution lends them to a model whose routed
@@ -1145,7 +1216,10 @@ pub trait CausalLm {
     fn embed_input_ids(&self, ids: &Tensor) -> Result<Tensor>;
 
     /// Runs the decoder stack over `hidden`, the batch's embeddings, and returns the final
-    /// normalized hidden state, `[tokens, hidden]`.
+    /// normalized hidden state, `[tokens, hidden]`; a model that carries several residual
+    /// streams returns them side by side, `[tokens, stream_width]`
+    /// ([`crate::family::TextModel::stream_width`]), and reads them out in
+    /// [`Self::compute_logits`].
     ///
     /// `cache` holds the model's attention groups, in the order its attention layers index
     /// them, whose pages the batch's slot mapping writes in place. `state` is the recurrent
@@ -1165,7 +1239,7 @@ pub trait CausalLm {
         hidden: &Tensor,
     ) -> Result<Tensor>;
 
-    /// The logits of `hidden`, the `[rows, hidden]` rows named by
+    /// The logits of `hidden`, the rows of [`Self::forward`]'s result named by
     /// [`TokenBatch::logits_rows`], which execution gathered: `[rows, vocabulary]` FP32.
     ///
     /// # Errors
@@ -1223,6 +1297,43 @@ pub trait Drafter: Send + Sync {
         embedded: &Tensor,
         hidden: &Tensor,
     ) -> Result<Tensor>;
+
+    /// The state its layers keep per request slot beside the draft cache, in the order
+    /// [`Self::forward_stateful`] is lent their buffers; empty for a drafter that keeps none.
+    fn state(&self) -> Vec<crate::family::StateShape> {
+        Vec::new()
+    }
+
+    /// [`Self::forward`] for a drafter whose layers keep a state ([`Self::state`]): `state`
+    /// holds the buffers of its layers, advanced in place. `hidden` and the result are rows of
+    /// the model's [`crate::family::TextModel::stream_width`]. A drafter that keeps none
+    /// ignores `state`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward`], and a stateful drafter run without its state.
+    fn forward_stateful(
+        &self,
+        batch: &TokenBatch,
+        cache: &KvCache,
+        state: Option<&RecurrentState>,
+        embedded: &Tensor,
+        hidden: &Tensor,
+    ) -> Result<Tensor> {
+        let _ = state;
+        self.forward(batch, cache, embedded, hidden)
+    }
+
+    /// The rows [`CausalLm::compute_logits`] reads of `hidden`, rows of the drafter's output:
+    /// the output itself, or what the drafter's own read of it computes when the model's head
+    /// projects another width than the drafter returns.
+    ///
+    /// # Errors
+    ///
+    /// Rows a module refuses.
+    fn logits_rows(&self, hidden: &Tensor) -> Result<Tensor> {
+        Ok(hidden.clone())
+    }
 }
 
 /// The vision tower of a causal language model: images to rows of the model's hidden width,
@@ -1304,6 +1415,8 @@ mod tests {
             draft_lens: None,
             rope_positions: None,
             live_tokens: None,
+            token_ids: None,
+            ngram_context: None,
         }
     }
 
@@ -1393,6 +1506,7 @@ mod tests {
                 value_initialized: plane(),
                 key_scale: None,
                 value_scale: None,
+                index_keys: None,
             }],
             workspace: plane(),
         };

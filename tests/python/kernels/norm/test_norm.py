@@ -56,6 +56,22 @@ def test_a_zero_centred_row_norm_matches_its_reference_on_the_interpreter(op):
     interpreted(FAMILY / "row_norm_check.py", "--op", op, "--centred", "true")
 
 
+def test_a_grouped_row_norm_matches_its_reference_on_the_interpreter():
+    interpreted(
+        FAMILY / "row_norm_check.py",
+        "--op",
+        "rms_norm",
+        "--centred",
+        "true",
+        "--groups",
+        "4",
+    )
+
+
+def test_a_sigmoid_gated_norm_matches_its_reference_on_the_interpreter():
+    interpreted(FAMILY / "gated_rms_norm_check.py", "--gate", "sigmoid")
+
+
 @pytest.mark.parametrize("check", INTERPRETED)
 def test_a_norm_matches_its_reference_on_the_interpreter(check):
     interpreted(FAMILY / check)

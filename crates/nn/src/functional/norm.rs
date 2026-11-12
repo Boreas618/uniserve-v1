@@ -52,14 +52,19 @@ pub(super) fn gain(weight: &Tensor, centred: bool) -> Result<Tensor> {
 /// `x · rsqrt(mean(x²) + eps) · gain`, where the gain is the weight, or one plus it when the
 /// checkpoint stores it zero-centred (`centred`).
 ///
+/// `weight` is one vector of the row width, or `groups` of them one after another: row `i` of
+/// `x` is then scaled by gain row `i mod groups`, so the rows are whole groups (the streams of
+/// a hyper-connected residual, each normalized with its own gain).
+///
 /// The result has `x`'s shape and `output` elements: `x`'s own type, or a narrower activation
 /// type that the rows reading the result are computed in, in which case the normalization
 /// narrows as it writes (`weighted_rms_norm`) and rounds once.
 ///
 /// # Errors
 ///
-/// When `weight` is not one vector of `x`'s row width, a zero-centred gain is asked with a
-/// narrowing output (no kernel reads both), or the operator refuses its arguments.
+/// When `weight` is not whole vectors of `x`'s row width whose count divides the rows, a
+/// zero-centred or grouped gain is asked with a narrowing output (no kernel reads both), or the
+/// operator refuses its arguments.
 pub fn rms_norm(
     x: &Tensor,
     weight: &Tensor,
@@ -70,19 +75,40 @@ pub fn rms_norm(
     const OWNER: &str = "rms_norm";
 
     let width = columns(OWNER, x)?;
-    vector(OWNER, "weight", weight, width)?;
-    if centred && output != x.dtype() {
+    let row_count = x.elem_count() / width as usize;
+    let groups = match weight.dims() {
+        &[gain] if gain > 0 && gain.is_multiple_of(width as usize) => gain / width as usize,
+        _ => 0,
+    };
+    if groups == 0 || !row_count.is_multiple_of(groups) {
         return Err(Error::shape(
             OWNER,
-            "a zero-centred gain narrows no output type".to_owned(),
+            format!(
+                "the weight is {:?}, and {row_count} rows of {width} elements take whole \
+                 vectors of {width} whose count divides the rows",
+                weight.dims()
+            ),
+        ));
+    }
+    if (centred || groups > 1) && output != x.dtype() {
+        return Err(Error::shape(
+            OWNER,
+            "a zero-centred or grouped gain narrows no output type".to_owned(),
         ));
     }
 
     if on_cpu(x) {
         let normalized = rms_scaled(&x.to_dtype(DType::F32)?, eps)?;
-        return Ok(normalized
-            .broadcast_mul(&gain(weight, centred)?)?
-            .to_dtype(output)?);
+        let gain = gain(weight, centred)?;
+        if groups == 1 {
+            return Ok(normalized.broadcast_mul(&gain)?.to_dtype(output)?);
+        }
+
+        // Row `i` reads gain row `i mod groups`.
+        let scaled = normalized
+            .reshape((row_count / groups, groups, width as usize))?
+            .broadcast_mul(&gain.reshape((groups, width as usize))?)?;
+        return Ok(scaled.reshape(x.shape())?.to_dtype(output)?);
     }
 
     let rows = as_rows(OWNER, x)?;
@@ -97,6 +123,7 @@ pub fn rms_norm(
                 tile,
                 pdl: PDL,
                 centred,
+                groups: groups as u32,
             },
             RmsNormArgs {
                 x: backend::operand(&rows)?,
@@ -182,8 +209,9 @@ pub fn add_rms_norm(
     Ok((like_rows(out, x)?, like_rows(sum, x)?))
 }
 
-/// RMS normalization gated by the SiLU of a second input:
-/// `x · rsqrt(mean(x²) + eps) · weight · silu(gate)`, the output norm of a gated delta network.
+/// RMS normalization gated by an activation of a second input:
+/// `x · rsqrt(mean(x²) + eps) · weight · act(gate)`, the output norm of a gated delta network.
+/// The activation is the SiLU, or the sigmoid when `sigmoid`.
 ///
 /// The row is normalized before it is gated, in FP32, and rounds once into `x`'s element type.
 ///
@@ -191,7 +219,13 @@ pub fn add_rms_norm(
 ///
 /// When `gate` is not `x`'s shape and element type, `weight` is not one vector of the row
 /// width, or the operator refuses its arguments.
-pub fn gated_rms_norm(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+pub fn gated_rms_norm(
+    x: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+    sigmoid: bool,
+) -> Result<Tensor> {
     const OWNER: &str = "gated_rms_norm";
 
     let width = columns(OWNER, x)?;
@@ -201,7 +235,13 @@ pub fn gated_rms_norm(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32) -> R
     if on_cpu(x) {
         let normalized =
             rms_scaled(&x.to_dtype(DType::F32)?, eps)?.broadcast_mul(&gain(weight, false)?)?;
-        let gated = (normalized * gate.to_dtype(DType::F32)?.silu()?)?;
+        let gate = gate.to_dtype(DType::F32)?;
+        let gated = (normalized
+            * if sigmoid {
+                gate.sigmoid()?
+            } else {
+                gate.silu()?
+            })?;
 
         return Ok(gated.to_dtype(x.dtype())?);
     }
@@ -215,6 +255,7 @@ pub fn gated_rms_norm(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f32) -> R
             dtype: x.dtype(),
             columns: width,
             tile: row_tile(width),
+            sigmoid,
         },
         GatedRmsNormArgs {
             x: backend::operand(&rows)?,

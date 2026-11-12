@@ -106,6 +106,7 @@ impl Mtp {
                 layers: 1,
                 kv_heads: text.local_heads(splits.0)?.1,
                 head_dim: text.head_dim,
+                index_keys: None,
             },
             path: vb.path().to_owned(),
         })

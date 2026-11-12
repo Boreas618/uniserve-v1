@@ -38,6 +38,19 @@
 //! slot. Only the recurrent walk of the delta rule keeps one; the chunked form solves a chunk at
 //! once and holds no state between its tokens.
 //!
+//! ## Request slots
+//!
+//! A deployment whose verifications copy no state gives each request `Q` slots and a window of
+//! `Q − 1` more rows than a layer's history ([`RequestSlots`]; vLLM's `state_indices` and
+//! `num_accepted`). A row then reads the state its previous step left for the tokens that stand:
+//! the convolution from window row `num_accepted[r] − 1` of its first slot, the delta rule from slot
+//! `state_indices[r, num_accepted[r] − 1]`. What it leaves depends on the form: one that keeps
+//! every token ([`CausalConv1dDescriptor::stepwise`], [`Form::Recurrent`]) leaves the window
+//! holding the inputs after the first one read and the state after token `t` in slot
+//! `state_indices[r, t]`, every source read before any slot is written; any other leaves the
+//! state after the row's last token at window row zero and in the row's first slot. Such a batch
+//! keeps no trail.
+//!
 //! ## The two forms of the delta rule
 //!
 //! [`Form::Recurrent`] walks a row's tokens one at a time, which is the decode step's shape.
@@ -104,6 +117,40 @@ impl RowColumns {
 pub struct Trail {
     /// `[rows, dims…]`, contiguous, with a row for every token of the batch.
     pub bank: Operand,
+}
+
+/// The slots of a batch whose requests own several (the module's Request slots).
+#[derive(Clone, Copy)]
+pub struct RequestSlots {
+    /// `[rows, Q]` u32, contiguous: each row's slots, the first its entry of
+    /// [`RowColumns::slots`].
+    pub state_indices: Operand,
+    /// `[rows]` u32, in `1..=Q`: the tokens of each row's previous step that stand.
+    pub num_accepted: Operand,
+}
+
+impl RequestSlots {
+    /// The slots a request owns, `Q`, checked against a batch of `rows` rows.
+    fn check(&self, operator: &'static str, rows: u64) -> Result<u64> {
+        self.state_indices.require_rank(operator, 2)?;
+        let owned = self.state_indices.shape.dim(1);
+
+        self.state_indices
+            .require_shape(operator, Shape::new(&[rows, owned]))
+            .and_then(|()| self.state_indices.require_row(operator, DType::U32, owned))
+            .map_err(|error| Error::argument(operator, format!("state_indices: {error}")))?;
+        if self.state_indices.strides != Strides::row_major(self.state_indices.shape) {
+            return Err(Error::argument(
+                operator,
+                "state_indices is not contiguous".to_owned(),
+            ));
+        }
+        self.num_accepted
+            .require_shape(operator, Shape::new(&[rows]))
+            .and_then(|()| self.num_accepted.require_row(operator, DType::U32, rows))
+            .map_err(|error| Error::argument(operator, format!("num_accepted: {error}")))?;
+        Ok(owned)
+    }
 }
 
 /// The trail operand of a launch and the flag the kernel tests: the bank, or the state bank itself
@@ -176,15 +223,49 @@ pub struct CausalConv1dDescriptor {
     pub width: u32,
     /// Channels one program covers.
     pub block: u32,
+    /// Inputs between consecutive taps: tap `j` reads the input `(K − 1 − j) · dilation` tokens
+    /// back, so the history is `(K − 1) · dilation` inputs.
+    pub dilation: u32,
+    /// Whether the sum passes through its SiLU before it rounds; without it the FP32 sum rounds
+    /// once into the output type.
+    pub activation: bool,
+    /// Rows of a slot's window: the history, and one more per token a request's step may draft
+    /// ([`RequestSlots`]).
+    pub window: u32,
+    /// Whether the window is left for a step that chooses how many of the row's tokens stand
+    /// (the module's Request slots), which a decode-phase batch of such a deployment asks.
+    pub stepwise: bool,
+}
+
+impl CausalConv1dDescriptor {
+    /// Inputs before a token its taps read: `(width − 1) · dilation`.
+    pub const fn history(&self) -> u32 {
+        self.width.saturating_sub(1) * self.dilation
+    }
+
+    /// Whether the descriptor is the plain convolution of a slot's last inputs: undilated, with
+    /// its SiLU, over a window that is the history.
+    const fn is_plain(&self) -> bool {
+        self.dilation == 1 && self.activation && self.window == self.history() && !self.stepwise
+    }
 }
 
 impl fmt::Display for CausalConv1dDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("dtype", abi::name(self.dtype))
             .field("channels", self.channels)
             .field("width", self.width)
-            .field("block", self.block)
+            .field("block", self.block);
+
+        // The plain convolution keeps the key its modules are filed under.
+        if self.is_plain() {
+            return key.finish(formatter);
+        }
+        key.field("dilation", self.dilation)
+            .variant("activation", if self.activation { "silu" } else { "none" })
+            .field("window", self.window)
+            .field("stepwise", self.stepwise)
             .finish(formatter)
     }
 }
@@ -200,14 +281,18 @@ pub struct CausalConv1dArgs {
     pub out: Operand,
     /// The batch's rows.
     pub rows: RowColumns,
-    /// `[slots, width − 1, channels]`, contiguous: each slot's last inputs, oldest first; read for a
+    /// `[slots, window, channels]`, contiguous: each slot's last inputs, oldest first; read for a
     /// row that continues and overwritten with the row's last inputs.
     pub state: Operand,
-    /// `[slots, width − 1, channels]`, contiguous: receives a row's inputs before its checkpoint.
+    /// `[slots, window, channels]`, contiguous: receives a row's inputs before its checkpoint,
+    /// from window row zero.
     pub checkpoint: Operand,
     /// `[tokens, width − 1, channels]`: receives, for each token, the inputs up to and including
     /// it, when the batch keeps a trail.
     pub trail: Option<Trail>,
+    /// The requests' slots, when a request owns several: the window row a row's history begins
+    /// at follows from `num_accepted`.
+    pub slots: Option<RequestSlots>,
 }
 
 /// The depthwise causal convolution of a linear-attention layer, with its SiLU, over a batch of
@@ -225,18 +310,52 @@ impl Op for CausalConv1d {
     type Args<'a> = CausalConv1dArgs;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        if descriptor.width < 2 || descriptor.channels == 0 || descriptor.block == 0 {
+        if descriptor.width < 2
+            || descriptor.channels == 0
+            || descriptor.block == 0
+            || descriptor.dilation == 0
+        {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "a convolution of {} taps over {} channels in blocks of {} keeps no state",
-                    descriptor.width, descriptor.channels, descriptor.block
+                    "a convolution of {} taps {} inputs apart over {} channels in blocks of {} \
+                     keeps no state",
+                    descriptor.width, descriptor.dilation, descriptor.channels, descriptor.block
                 ),
             ));
         }
         let channels = u64::from(descriptor.channels);
         let width = u64::from(descriptor.width);
-        args.rows.check(Self::NAME)?;
+        let rows = args.rows.check(Self::NAME)?;
+
+        // A window holds the history and a row per token a request's step may draft, which the
+        // slots a request owns state.
+        let history = u64::from(descriptor.history());
+        let window = u64::from(descriptor.window);
+        let owned = match &args.slots {
+            Some(slots) => slots.check(Self::NAME, rows)?,
+            None => 1,
+        };
+        if window != history + owned - 1 || (descriptor.stepwise && args.slots.is_none()) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a window of {window} rows for a history of {history} inputs and requests of \
+                     {owned} slots{}",
+                    if descriptor.stepwise {
+                        ", left for a step that chooses"
+                    } else {
+                        ""
+                    }
+                ),
+            ));
+        }
+        if args.trail.is_some() && args.slots.is_some() {
+            return Err(Error::argument(
+                Self::NAME,
+                "a batch whose requests own several slots keeps no trail".to_owned(),
+            ));
+        }
         args.x.require_rank(Self::NAME, 2)?;
         args.x.require_row(Self::NAME, descriptor.dtype, channels)?;
         let tokens = args.x.shape.dim(0);
@@ -254,7 +373,7 @@ impl Op for CausalConv1d {
             .require_shape(Self::NAME, Shape::new(&[channels, width]))?;
         args.weight
             .require_row(Self::NAME, descriptor.dtype, width)?;
-        let dims = [width - 1, channels];
+        let dims = [window, channels];
         let slots = check_bank(Self::NAME, "state", &args.state, descriptor.dtype, &dims)?;
         let kept = check_bank(
             Self::NAME,
@@ -308,6 +427,12 @@ impl Op for CausalConv1d {
             .view(trail)
             .i32(args.x.strides.get(0) as i32)
             .i32(trailing);
+
+        // A program compiled for requests of several slots reads their two columns after the
+        // plain convolution's parameters; the dilation, the window and the form are compiled in.
+        if let Some(slots) = args.slots {
+            arguments.view(slots.state_indices).view(slots.num_accepted);
+        }
         kernel.launch(
             LaunchGrid::new([
                 u64::from(descriptor.channels).div_ceil(u64::from(descriptor.block)),
@@ -366,6 +491,17 @@ impl fmt::Display for Form {
     }
 }
 
+/// The order of the two matrix axes of a stored state.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum StateAxes {
+    /// `[value_heads, key_dim, value_dim]`: a key's row holds what it recalls.
+    KeyValue,
+    /// `[value_heads, value_dim, key_dim]`: a value's row holds its weights over the keys, the
+    /// order vLLM stores
+    /// (`refs/vllm/vllm/model_executor/layers/mamba/mamba_utils.py:296-300`).
+    ValueKey,
+}
+
 /// One compilation of `gated_delta_rule`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GatedDeltaRuleDescriptor {
@@ -385,11 +521,28 @@ pub struct GatedDeltaRuleDescriptor {
     pub form: Form,
     /// Tokens of one chunk of [`Form::Chunked`]; one for [`Form::Recurrent`].
     pub chunk: u32,
+    /// The order of a stored state's matrix axes.
+    pub axes: StateAxes,
+    /// Slots a request owns ([`RequestSlots`]), or zero when it owns one and a verification
+    /// keeps a trail.
+    pub request_slots: u32,
+}
+
+impl GatedDeltaRuleDescriptor {
+    /// The extents of one slot's state.
+    const fn state_dims(&self) -> [u64; 3] {
+        let (key, value) = (self.key_dim as u64, self.value_dim as u64);
+
+        match self.axes {
+            StateAxes::KeyValue => [self.value_heads as u64, key, value],
+            StateAxes::ValueKey => [self.value_heads as u64, value, key],
+        }
+    }
 }
 
 impl fmt::Display for GatedDeltaRuleDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let mut key = Key::new()
             .field("dtype", abi::name(self.dtype))
             .field("key_heads", self.key_heads)
             .field("value_heads", self.value_heads)
@@ -397,8 +550,16 @@ impl fmt::Display for GatedDeltaRuleDescriptor {
             .field("value_dim", self.value_dim)
             .field("block", self.block)
             .field("form", self.form)
-            .field("chunk", self.chunk)
-            .finish(formatter)
+            .field("chunk", self.chunk);
+
+        // A state of key rows in one slot per request keeps the key its modules are filed under.
+        if self.axes == StateAxes::ValueKey {
+            key = key.variant("axes", "value_key");
+        }
+        if self.request_slots > 0 {
+            key = key.field("slots", self.request_slots);
+        }
+        key.finish(formatter)
     }
 }
 
@@ -432,6 +593,9 @@ pub struct GatedDeltaRuleArgs {
     pub trail: Option<Trail>,
     /// `[tokens, value_heads, value_dim]`, contiguous: receives `q̂ᵀS` after each token.
     pub out: Operand,
+    /// The requests' slots, when a request owns several
+    /// ([`GatedDeltaRuleDescriptor::request_slots`]).
+    pub slots: Option<RequestSlots>,
 }
 
 /// The gated delta rule over a batch of rows that continue from their slots' states; see the module
@@ -477,7 +641,25 @@ impl Op for GatedDeltaRule {
                 ));
             }
         }
-        args.rows.check(Self::NAME)?;
+        let rows = args.rows.check(Self::NAME)?;
+        let owned = match &args.slots {
+            Some(slots) => slots.check(Self::NAME, rows)?,
+            None => 0,
+        };
+        if owned != u64::from(d.request_slots) || (owned > 0 && args.trail.is_some()) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "requests of {owned} slots{} against a program for {}",
+                    if args.trail.is_some() {
+                        " and a trail"
+                    } else {
+                        ""
+                    },
+                    d.request_slots
+                ),
+            ));
+        }
         let key_heads = u64::from(d.key_heads);
         let value_heads = u64::from(d.value_heads);
         let key_dim = u64::from(d.key_dim);
@@ -533,7 +715,7 @@ impl Op for GatedDeltaRule {
                 "the output is not contiguous".to_owned(),
             ));
         }
-        let dims = [value_heads, key_dim, value_dim];
+        let dims = d.state_dims();
         let slots = check_bank(Self::NAME, "state", &args.state, DType::F32, &dims)?;
         let kept = check_bank(
             Self::NAME,
@@ -599,6 +781,11 @@ impl Op for GatedDeltaRule {
             .i32(args.a.strides.get(0) as i32)
             .f32(scale)
             .i32(trailing);
+
+        // A program compiled for requests of several slots reads their two columns last.
+        if let Some(slots) = args.slots {
+            arguments.view(slots.state_indices).view(slots.num_accepted);
+        }
         kernel.launch(
             LaunchGrid::new([
                 u64::from(descriptor.value_dim / descriptor.block),
@@ -634,5 +821,97 @@ impl Op for GatedDeltaRule {
             rtol: 2.0 * dot.rtol,
             ..dot
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn convolution() -> CausalConv1dDescriptor {
+        CausalConv1dDescriptor {
+            dtype: DType::BF16,
+            channels: 8192,
+            width: 4,
+            block: 256,
+            dilation: 1,
+            activation: true,
+            window: 3,
+            stepwise: false,
+        }
+    }
+
+    fn rule() -> GatedDeltaRuleDescriptor {
+        GatedDeltaRuleDescriptor {
+            dtype: DType::BF16,
+            key_heads: 16,
+            value_heads: 32,
+            key_dim: 128,
+            value_dim: 128,
+            block: 64,
+            form: Form::Recurrent,
+            chunk: 1,
+            axes: StateAxes::KeyValue,
+            request_slots: 0,
+        }
+    }
+
+    /// The plain convolution and the rule over one slot of key rows keep the keys their
+    /// modules are filed under; a dilation, a sum without its activation, a window with rows
+    /// for drafts, another axis order and request slots each name themselves.
+    #[test]
+    fn a_key_names_what_differs_from_the_plain_operator() {
+        assert_eq!(
+            convolution().to_string(),
+            "dtype_bf16_channels_8192_width_4_block_256"
+        );
+        let dilated = CausalConv1dDescriptor {
+            channels: 10_240,
+            dilation: 3,
+            activation: false,
+            window: 12,
+            stepwise: true,
+            ..convolution()
+        };
+        assert_eq!(dilated.history(), 9);
+        assert_eq!(
+            dilated.to_string(),
+            "dtype_bf16_channels_10240_width_4_block_256_dilation_3_activation_none_window_12_\
+             stepwise_true"
+        );
+        // A window that holds drafts is another program whatever else is plain.
+        let windowed = CausalConv1dDescriptor {
+            window: 6,
+            ..convolution()
+        };
+        assert!(windowed.to_string().ends_with("_window_6_stepwise_false"));
+
+        let base = "dtype_bf16_key_heads_16_value_heads_32_key_dim_128_value_dim_128_block_64\
+                    _form_recurrent_chunk_1";
+        assert_eq!(rule().to_string(), base);
+        let slotted = GatedDeltaRuleDescriptor {
+            axes: StateAxes::ValueKey,
+            request_slots: 4,
+            ..rule()
+        };
+        assert_eq!(
+            slotted.to_string(),
+            format!("{base}_axes_value_key_slots_4")
+        );
+    }
+
+    /// A state's extents follow its axis order.
+    #[test]
+    fn a_state_of_value_rows_swaps_the_matrix_axes() {
+        let narrow = GatedDeltaRuleDescriptor {
+            key_dim: 64,
+            ..rule()
+        };
+        assert_eq!(narrow.state_dims(), [32, 64, 128]);
+        let swapped = GatedDeltaRuleDescriptor {
+            axes: StateAxes::ValueKey,
+            ..narrow
+        };
+        assert_eq!(swapped.state_dims(), [32, 128, 64]);
     }
 }

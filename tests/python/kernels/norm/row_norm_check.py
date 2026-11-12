@@ -5,6 +5,7 @@
     python row_norm_check.py --op add_rms_norm --interpreter         # the same on the CPU
     python row_norm_check.py --op rms_norm --columns 5120 --tile 8192
     python row_norm_check.py --op add_rms_norm --centred true    # a zero-centred weight, 1 + w
+    python row_norm_check.py --op rms_norm --centred true --groups 4 --rows 8   # a gain per stream
 
 One script covers both operators because they are one row reduction with one difference —
 `add_rms_norm` sums `x + residual` first, writes that sum back out as the new residual, and
@@ -130,7 +131,9 @@ def check(operator, case):
     if case["offset_row"]:
         x[-1, :] += 1000.0
     x = x.to(dtype)
-    weight = torch.randn(columns, generator=generator).to(dtype)
+    # A gain of `groups` rows: row `i` reads gain row `i mod groups`. Only `rms_norm` has one.
+    groups = case["groups"] if operator == "rms_norm" else 1
+    weight = torch.randn(groups * columns, generator=generator).to(dtype)
     eps = case["eps"]
 
     if operator == "rms_norm":
@@ -147,14 +150,18 @@ def check(operator, case):
             BLOCK=tile,
             PDL=case["pdl"],
             CENTRED=case["centred"],
+            GROUPS=groups,
         )
         exact_x = x.cpu().double()
         expected_out = exact_x * torch.rsqrt(
             (exact_x * exact_x).sum(dim=-1, keepdim=True) / columns + eps
         )
-        expected_out = expected_out * (
-            weight.cpu().double() + float(case["centred"])
+        gain = (
+            weight.cpu()
+            .double()
+            .view(groups, columns)[torch.arange(rows) % groups]
         )
+        expected_out = expected_out * (gain + float(case["centred"]))
         if case["truncate"]:
             expected_out = truncate(expected_out, dtype)
         relative = bound(columns, case["dtype"], OPERATORS[operator])
@@ -288,6 +295,7 @@ def check_hand(operator, tile):
         BLOCK=tile,
         PDL=False,
         CENTRED=False,
+        GROUPS=1,
     )
     expected = torch.tensor(HAND["expect"], dtype=torch.float64)
     difference = (out.double() - expected).abs()
@@ -308,12 +316,16 @@ def cases(flags):
         "eps": flags.eps,
         "pdl": flags.pdl == "true",
         "centred": flags.centred == "true",
+        "groups": flags.groups,
     }
     return [
         {
             **common,
             "label": "the fixture's shape, one row per program",
-            "rows": flags.rows,
+            # The rows are whole groups of the gain.
+            "rows": flags.rows * flags.groups
+            if flags.groups > 1
+            else flags.rows,
             "columns": flags.columns,
             "tile": flags.tile,
             "flat_row": True,
@@ -324,7 +336,7 @@ def cases(flags):
         {
             **common,
             "label": "a row far shorter than the tile, almost every lane masked",
-            "rows": 3,
+            "rows": 3 * flags.groups,
             "columns": 100,
             "tile": flags.tile,
             "flat_row": False,
@@ -335,7 +347,7 @@ def cases(flags):
         {
             **common,
             "label": "a width that is a whole number of tiles",
-            "rows": 2,
+            "rows": 2 * flags.groups,
             "columns": 512,
             "tile": 512,
             "flat_row": False,
@@ -360,6 +372,12 @@ def main() -> int:
         choices=["true", "false"],
         default="false",
         help="read a zero-centred weight, scaling by 1 + w",
+    )
+    parser.add_argument(
+        "--groups",
+        type=int,
+        default=1,
+        help="rows of the gain of rms_norm: row i reads gain row i mod groups",
     )
     parser.add_argument("--expect-key", default=None)
     parser.add_argument(

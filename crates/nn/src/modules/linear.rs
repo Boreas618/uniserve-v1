@@ -159,9 +159,9 @@ impl Linear {
         let name = vb.name("weight");
 
         match vb.scheme("weight") {
-            // A weight-only NVFP4 matrix is read as the dense matrix it states
-            // (`VarBuilder::load`).
-            Scheme::Dense | Scheme::Nvfp4Weights => {
+            // A weight-only NVFP4 matrix and a block-scaled FP8 matrix are read as the dense
+            // matrix they state (`VarBuilder::load`).
+            Scheme::Dense | Scheme::Nvfp4Weights | Scheme::Fp8Blocks => {
                 let weight = vb.load(
                     &name,
                     &weight_source(&name, inputs, local_out, local_in, parallel),
