@@ -20,6 +20,7 @@
 //! thread's, installed by execution (`AGENTS.md`, Model Library Boundary).
 
 pub mod config;
+pub mod packing;
 
 pub use config::{
     AudioVaeConfig, Config, DenoiserConfig, ScheduleConfig, TransformerConfig, VideoVaeConfig,
