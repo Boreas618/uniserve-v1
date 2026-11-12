@@ -32,8 +32,8 @@
 //! | [`parallel`] | [`HostGroup`](parallel::host::HostGroup), the host collectives of a rank group over a TCP full mesh |
 //! | [`stream`] | [`EventPool`](stream::EventPool), the event leases storage owners defer their releases behind |
 //! | [`thread_pool`] | [`ThreadPool`](thread_pool::ThreadPool), a bounded pool of threads for one kind of blocking host work |
-//! | [`memory`] | The rank's storage at the host's Storage Server: [`Storage`](memory::allocation::Storage), the [`StorageClient`](memory::client::StorageClient) and the exclusive storages it takes, host page pools, and the [`WeightStore`](memory::weights::WeightStore) that `nn::WeightLoader` publishes to |
 //! | [`sampler`] | [`Sampler`](sampler::Sampler), the token selection that ends a causal forward, the commit of its tokens into the slots' state, and the host encodings of the columns it reads |
+//! | [`memory`] | The rank's storage at the host's Storage Server: [`Storage`](memory::allocation::Storage), the [`StorageClient`](memory::client::StorageClient) and the exclusive storages it takes, host page pools, and the [`WeightStore`](memory::weights::WeightStore) that `nn::WeightLoader` publishes to; the division of a GPU's quota when a rank starts ([`memory::division`]) and the [`GraphPool`](memory::graph_pool::GraphPool) that maps the runners' regions |
 //!
 //! ## Rules every module keeps
 //!
