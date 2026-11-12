@@ -784,7 +784,7 @@ impl Phase {
 /// [Quota...], "host_storage": HostStorage}` (`EngineControl::storage_reports`).
 ///
 /// A standby keeps graph pools of the serving process's size beside it. A device is crowded when
-/// what its quota leaves unbooked is less than the graph pools the deployment reserves on it: a
+/// what its quota leaves unreserved is less than the graph pools the deployment reserves on it: a
 /// resident standby's would not fit. Suspended pools move to host storage, so they fit when the
 /// host's Storage Server admits every graph pool its devices reserve. A report that does not parse
 /// states nothing about its host, which then keeps no standby.

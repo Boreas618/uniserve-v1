@@ -2145,7 +2145,7 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
 /// relaunch that reserves beside the rank it replaces counts once, as the
 /// larger reservation.
 #[test]
-fn the_processes_of_one_scope_count_as_their_largest_booking() {
+fn the_processes_of_one_scope_count_as_their_largest_reservation() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
@@ -2166,7 +2166,7 @@ fn the_processes_of_one_scope_count_as_their_largest_booking() {
 /// another scope cannot reserve into it, and the relaunch takes each item over
 /// as it reserves it.
 #[test]
-fn a_lost_rank_s_booking_stays_reserved_for_its_relaunch() {
+fn a_lost_rank_s_reservation_is_kept_for_its_relaunch() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head
@@ -2268,4 +2268,145 @@ fn a_usage_past_its_quota_shrinks_but_never_grows() {
     );
     let quota = quota_of(&mut worker);
     assert_eq!((quota.limit, quota.usage()), (Some(500), 550));
+}
+
+/// A standby of a scope maps the scope's exclusive storage without writing
+/// it, and adopts it by promotion once its writer gave it up; a worker of
+/// another scope cannot take it from the promoted writer.
+#[test]
+fn a_standby_of_the_scope_adopts_its_storage_by_promotion() {
+    let server = Running::start();
+    let claim = head(&server.socket)
+        .claim(0, vec![scope("flow", 0), scope("flow", 1)], Vec::new())
+        .unwrap();
+
+    let mut writer = worker(&server.socket, scope("flow", 0), 1, claim);
+    let storage = memfd(&[7; 4]);
+    writer
+        .put(
+            vec![tensor(key(9), "planes", 0, 0, Access::Exclusive)],
+            &[(host(4), storage.as_fd())],
+        )
+        .unwrap();
+
+    // The standby maps the very storage, and a key it does not hold in
+    // standby is not promoted.
+    let mut standby = worker(&server.socket, scope("flow", 0), 2, claim);
+    let (mapped, descriptors) = standby
+        .get(vec![key(9)], Mode::Standby, Vec::new())
+        .unwrap();
+    assert_eq!(mapped.tensors.len(), 1);
+    assert_eq!(
+        contents(descriptors.into_iter().next().unwrap()),
+        vec![7; 4]
+    );
+    assert_eq!(
+        server_error(standby.promote(vec![key(8)])),
+        ErrorKind::Invalid
+    );
+
+    writer.release(vec![key(9)]).unwrap();
+    standby.promote(vec![key(9)]).unwrap();
+
+    // The storage has one writer: another scope's worker is refused it.
+    let mut other = worker(&server.socket, scope("flow", 1), 1, claim);
+    assert_eq!(
+        server_error(other.get(vec![key(9)], Mode::Write, Vec::new())),
+        ErrorKind::Held
+    );
+}
+
+/// A pool's slots through a head's requests: a reserved slot is committed
+/// or aborted, an aborted slot is free again, a committed page is found and
+/// evicted for a later reservation unless it is pinned, and an unpinned
+/// page is evictable again.
+#[test]
+fn a_reservation_is_committed_or_aborted_and_a_pin_keeps_its_page() {
+    use ::storage::protocol::{PageLevel, PageSlot, Request, Response};
+
+    let server = Running::start();
+    let mut head = head(&server.socket);
+    let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
+    let mut rank = worker(&server.socket, scope("text", 0), 1, claim);
+    let pool = trial_pool(&mut rank);
+
+    let reserve = |head: &mut Client, keys: Vec<Key>| {
+        let request = Request::Reserve {
+            pool,
+            writer: Some(scope("text", 0)),
+            keys,
+            window: None,
+        };
+        match head.call(&request, &[]).unwrap().0 {
+            Response::Reserved { slots } => slots,
+            other => panic!("a reservation responded {other:?}"),
+        }
+    };
+    let reserved = |slots: &[PageSlot]| {
+        slots
+            .iter()
+            .filter(|slot| matches!(slot, PageSlot::Reserved { .. }))
+            .count()
+    };
+
+    // The pool's four slots are reserved; a fifth page finds none.
+    let first: Vec<Key> = (1..=4).map(key).collect();
+    assert_eq!(reserved(&reserve(&mut head, first.clone())), 4);
+    assert_eq!(reserve(&mut head, vec![key(5)]), vec![PageSlot::Full]);
+
+    // Two pages are written and committed, two are not and are aborted.
+    let commit = Request::Commit {
+        pool,
+        keys: vec![key(1), key(2)],
+    };
+    assert_eq!(head.call(&commit, &[]).unwrap().0, Response::Committed);
+    let abort = Request::Abort {
+        pool,
+        keys: vec![key(3), key(4)],
+    };
+    assert_eq!(head.call(&abort, &[]).unwrap().0, Response::Aborted);
+    assert_eq!(
+        levels(&mut head, pool, &first),
+        vec![
+            PageLevel::Host,
+            PageLevel::Host,
+            PageLevel::Absent,
+            PageLevel::Absent
+        ]
+    );
+    assert_eq!(reserve(&mut head, vec![key(1)]), vec![PageSlot::Present]);
+
+    // A pinned page keeps its slot: four further pages take the two free
+    // slots and the unpinned page's, and one finds none.
+    let pin = Request::Pin {
+        pool,
+        reader: scope("text", 0),
+        keys: vec![key(1), key(3)],
+    };
+    let Response::Pinned { slots } = head.call(&pin, &[]).unwrap().0 else {
+        panic!("a pin was refused");
+    };
+    assert!(matches!(slots[..], [Some(_), None]), "{slots:?}");
+
+    let second: Vec<Key> = (5..=8).map(key).collect();
+    let slots = reserve(&mut head, second.clone());
+    assert_eq!(reserved(&slots), 3, "{slots:?}");
+    assert_eq!(
+        levels(&mut head, pool, &[key(1), key(2)]),
+        vec![PageLevel::Host, PageLevel::Absent]
+    );
+
+    // Once unpinned and nothing is reserved, every slot is evictable.
+    let abort = Request::Abort { pool, keys: second };
+    assert_eq!(head.call(&abort, &[]).unwrap().0, Response::Aborted);
+    let unpin = Request::Unpin {
+        pool,
+        reader: scope("text", 0),
+        keys: vec![key(1)],
+    };
+    assert_eq!(head.call(&unpin, &[]).unwrap().0, Response::Unpinned);
+
+    let third: Vec<Key> = (9..=12).map(key).collect();
+    assert_eq!(reserved(&reserve(&mut head, third)), 4);
+    assert_eq!(levels(&mut head, pool, &[key(1)]), vec![PageLevel::Absent]);
 }

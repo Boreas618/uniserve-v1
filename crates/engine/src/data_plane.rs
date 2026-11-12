@@ -346,7 +346,7 @@ impl DataPlane {
             match started {
                 Ok(answer) => answers.push(answer.to_string()),
                 Err(error) => {
-                    self.unbook_profiling(index);
+                    self.release_profiling(index);
                     return Err(error);
                 }
             }
@@ -357,13 +357,13 @@ impl DataPlane {
     /// The session's storage is no longer held on `index`'s device. A failure leaves the larger
     /// reservation in the quota, which only overstates the rank's storage, so it is logged rather than
     /// failing the session's end.
-    fn unbook_profiling(&self, index: usize) {
+    fn release_profiling(&self, index: usize) {
         let failure = match self.book_profiling(index, 0) {
             Ok(None) => return,
             Ok(Some(refusal)) => refusal,
             Err(error) => error.to_string(),
         };
-        tracing::warn!("unbooking the ended profiling session's device storage failed: {failure}");
+        tracing::warn!("releasing the ended profiling session's device storage failed: {failure}");
     }
 
     /// Ends the profiling session `payload` names on every rank: each writes what remains and closes
@@ -390,7 +390,7 @@ impl DataPlane {
                 reason: reason.clone(),
                 rank: number,
             })?;
-            self.unbook_profiling(index);
+            self.release_profiling(index);
             answers.push(answer.to_string());
         }
         Ok(answers)
