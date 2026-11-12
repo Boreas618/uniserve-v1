@@ -37,9 +37,11 @@
 mod activation;
 mod conv;
 mod embedding;
+mod frame;
 mod linear;
 mod logits;
 mod norm;
+mod residual_norm;
 
 use uniserve_tensor::{DType, Device, Shape, Tensor};
 
@@ -50,10 +52,14 @@ pub use activation::{
 };
 pub use conv::{Padding, causal_pad, conv_transpose1d, conv1d, conv3d};
 pub use embedding::{embedding, vocabulary_shard};
+pub use frame::frame_norm_pad;
 pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
 pub use linear::{ENCODE_CHUNK, WeightOrder, encode_block, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
+pub use residual_norm::{
+    modulated_rms_norm, modulated_rms_norm_, scaled_residual_layer_norm, scaled_residual_rms_norm_,
+};
 
 /// Whether the descriptors this crate builds are the programmatic-dependent-launch variants.
 pub(crate) const PDL: bool = false;

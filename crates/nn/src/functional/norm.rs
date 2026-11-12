@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 
 /// `rows`, FP32 `[rows, columns]`, scaled by the reciprocal root of each row's mean square plus
 /// `eps`.
-fn rms_scaled(rows: &Tensor, eps: f32) -> Result<Tensor> {
+pub(super) fn rms_scaled(rows: &Tensor, eps: f32) -> Result<Tensor> {
     let mean_square = rows.sqr()?.mean_keepdim(D::Minus1)?;
     let scale = (mean_square + f64::from(eps))?.sqrt()?.recip()?;
 

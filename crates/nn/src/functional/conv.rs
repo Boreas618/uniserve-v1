@@ -327,7 +327,7 @@ fn convolve(
 }
 
 /// `tensor` stored packed row-major: itself when it is, and a copy otherwise.
-fn packed(tensor: &Tensor) -> Result<Tensor> {
+pub(super) fn packed(tensor: &Tensor) -> Result<Tensor> {
     let operand = backend::operand(tensor)?;
 
     if operand.strides == ops::Strides::row_major(operand.shape) {
