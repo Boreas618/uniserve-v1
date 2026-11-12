@@ -42,8 +42,10 @@
 //! The forward's activation peak does not bound that sum: the context's allocator gives a
 //! freed block out again, so the outputs one operator writes over a forward of many layers
 //! add up to more than the forward ever holds at once. The bound is a profile run's figure
-//! like the peak, since the meta context sees every launch and its outputs, and this module
-//! takes it per runner as an input.
+//! like the peak: `Graphs::shadow_peak` states twice the bytes the largest forward of a runner
+//! allocates in total, which no operator's outputs exceed, and this module takes it per runner
+//! as an input. An operator that writes execution-owned memory in place is shadowed over the
+//! scratch memory its runner redirects it to, which that memory's owner adds to the figure.
 //!
 //! ## After the division
 //!
