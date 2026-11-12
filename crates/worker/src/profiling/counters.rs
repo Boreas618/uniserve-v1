@@ -1,12 +1,12 @@
-//! The always-on counters CUPTI gives a serving process: the watch of the driver calls that make its
-//! threads wait for the device and the record of its streams' device time, reported as
-//! `ForwardStats::blocking_calls` and `ForwardStats::stream_us`.
+//! The always-on counters CUPTI gives a serving process: the watch of the driver calls that make
+//! its threads wait for the device and the record of its streams' device time, reported as
+//! `ForwardStats::blocking_calls` and `ForwardStats::stream_us` ([`super::forward_stats`]).
 //!
-//! The process subscribes to CUPTI as it starts ([`subscribe`]), before it loads a module or captures
-//! a graph, so that collectors observe their CUDA resources' lifetimes. The counters start once the
-//! process's ranks serve ([`Counters::start`]) and stay on: they share the subscription with the
-//! session collectors. A profiler that holds CUPTI's one subscription (Nsight Systems) leaves the
-//! process without them.
+//! The process subscribes to CUPTI as it starts ([`subscribe`]), before it loads a module or
+//! captures a graph, so that collectors observe their CUDA resources' lifetimes. The counters
+//! start once the process's ranks serve ([`Counters::start`]) and stay on: they share the
+//! subscription with the session collectors. A profiler that holds CUPTI's one subscription
+//! (Nsight Systems) leaves the process without them.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -144,7 +144,7 @@ impl Counters {
 /// `{thread}/{call}`, since the last take. They travel with the next batch result.
 static BLOCKING: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
-/// Count `calls` (by call name) that `thread` made.
+/// Counts `calls` (by call name) that `thread` made.
 pub fn add_blocking(thread: &str, calls: &[(&'static str, u64)]) {
     if calls.is_empty() {
         return;

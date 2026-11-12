@@ -17,7 +17,9 @@
 //!
 //! The shape and both sides' strides are launch words ([`crate::strided`]), so a descriptor names
 //! the element type, the axes the call traverses and the block. No element is converted: the
-//! destination receives the source's bits.
+//! destination receives the source's bits. That holds for every element a primitive moves
+//! ([`crate::strided::MOVED`]): an FP8 (`f8e4m3`) tensor is copied, cloned, made contiguous and
+//! concatenated as the bytes its elements are.
 //!
 //! The two operands do not overlap. A caller that moves elements within one tensor reads a
 //! source its destination has not reached.
@@ -90,7 +92,7 @@ impl Op for CopyStrided {
     type Args<'a> = Args;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::ELEMENTS)?;
+        strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::MOVED)?;
         strided::require_block(Self::NAME, descriptor.block)?;
 
         strided::require_dtype(Self::NAME, "source", &args.source, descriptor.dtype)?;
@@ -287,5 +289,33 @@ mod tests {
             destination: contiguous(0x2000, &[0, 8]),
         };
         assert!(refusal(&empty).contains("nothing to launch"));
+    }
+
+    #[test]
+    fn an_fp8_tensor_moves_as_its_bytes_and_a_packed_one_does_not() {
+        let of = |dtype: DType, strides: &[u64]| Args {
+            source: Operand::with_strides(
+                DevicePtr::new(0x1000),
+                dtype,
+                Shape::new(&[5, 2, 3]),
+                Strides::new(strides),
+            ),
+            destination: Operand::new(DevicePtr::new(0x2000), dtype, Shape::new(&[5, 2, 3])),
+        };
+
+        // A permuted FP8 view made contiguous.
+        let narrow = of(DType::F8E4M3, &[1, 15, 5]);
+        let descriptor = Descriptor::of(&narrow, BLOCK, false);
+        assert_eq!(
+            descriptor.to_string(),
+            "dtype_f8e4m3_rank_2_block_1024_pdl_false"
+        );
+        CopyStrided::check(&descriptor, &narrow).unwrap();
+        assert_eq!(CopyStrided::tolerance(&descriptor), Tolerance::exact());
+
+        // Two NVFP4 elements share a byte: no stride addresses one.
+        let packed = of(DType::F4, &[6, 3, 1]);
+        let message = refusal(&packed);
+        assert!(message.contains("dtype is f4e2m1"), "{message}");
     }
 }

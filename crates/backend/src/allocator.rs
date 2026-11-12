@@ -51,6 +51,10 @@ struct Blocks {
     reached: u64,
     /// The furthest `top` reached under any reset.
     peak: u64,
+    /// The bytes of every block handed out since the reset, freed or not.
+    allocated: u64,
+    /// The largest `allocated` reached under any reset.
+    allocated_peak: u64,
     /// `(bytes, offset)` of every free block, so the first entry at or above a size is the
     /// smallest block that holds it at the lowest address.
     by_size: BTreeSet<(u64, u64)>,
@@ -93,6 +97,7 @@ impl Allocator {
                 // so what surrounded it is in use.
                 blocks.insert(offset + needed, size - needed);
             }
+            blocks.count(needed);
             return Ok((self.base + offset, blocks.resets));
         }
 
@@ -108,6 +113,7 @@ impl Allocator {
         blocks.top = end;
         blocks.reached = blocks.reached.max(end);
         blocks.peak = blocks.peak.max(end);
+        blocks.count(needed);
         Ok((self.base + offset, blocks.resets))
     }
 
@@ -145,6 +151,7 @@ impl Allocator {
         blocks.top = end;
         blocks.reached = end;
         blocks.peak = blocks.peak.max(end);
+        blocks.count(needed);
         Ok((self.base + offset, blocks.resets))
     }
 
@@ -189,6 +196,7 @@ impl Allocator {
         blocks.resets += 1;
         blocks.top = 0;
         blocks.reached = 0;
+        blocks.allocated = 0;
         blocks.by_size.clear();
         blocks.by_offset.clear();
     }
@@ -196,6 +204,13 @@ impl Allocator {
     /// The furthest byte of the region any forward reached.
     pub fn peak(&self) -> u64 {
         self.lock().peak
+    }
+
+    /// The most bytes any forward was handed in total between two resets, every block counted
+    /// whether or not it was freed and given out again: the bytes of everything a forward
+    /// writes, where [`Allocator::peak`] is what it holds at once.
+    pub fn allocated_peak(&self) -> u64 {
+        self.lock().allocated_peak
     }
 
     /// The bytes of the region below which blocks are in use or free: zero when every tensor
@@ -214,6 +229,12 @@ impl Allocator {
 }
 
 impl Blocks {
+    /// Counts a block of `bytes` handed out.
+    fn count(&mut self, bytes: u64) {
+        self.allocated += bytes;
+        self.allocated_peak = self.allocated_peak.max(self.allocated);
+    }
+
     fn insert(&mut self, offset: u64, bytes: u64) {
         self.by_size.insert((bytes, offset));
         self.by_offset.insert(offset, bytes);
@@ -248,6 +269,23 @@ mod tests {
         allocator.free(b, 300, reset);
         let (e, _) = allocator.allocate(100).unwrap();
         vec![a, b, c, d, e]
+    }
+
+    #[test]
+    fn the_bytes_a_forward_is_handed_count_reused_blocks_and_restart_at_a_reset() {
+        let allocator = Allocator::counting();
+        forward(&allocator);
+
+        // 1000, 300, 512, 4096 and 100 bytes, each rounded up to 256: reused blocks count
+        // again, so the total is above what the forward held at once.
+        let handed = 1024 + 512 + 512 + 4096 + 256;
+        assert_eq!(allocator.allocated_peak(), handed);
+        assert!(allocator.peak() < handed);
+
+        // A smaller forward after a reset leaves the largest total standing.
+        allocator.reset();
+        allocator.allocate(100).unwrap();
+        assert_eq!(allocator.allocated_peak(), handed);
     }
 
     #[test]

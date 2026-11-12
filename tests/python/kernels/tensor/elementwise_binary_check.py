@@ -15,6 +15,11 @@ What is covered:
   against a broadcast one;
 - **integer arithmetic** in the element type itself: sums and products that wrap, and quotients of
   either sign, which truncate toward zero where a floor would differ;
+- **the functions of the integer element types alone** on every one of them: `remainder` over
+  dividends and divisors of both signs, where it takes the divisor's sign and the smallest value by
+  minus one is zero; the three `bitwise_` combinations over every pair of the type's extreme bit
+  patterns; and the two shifts by every count below the element's width, a right shift repeating
+  the sign bit of a signed element. A floating element type has no module for them;
 - **the comparisons and the extrema on a NaN, on equal values and on signed zeros**: a comparison
   writes `u8`, and `maximum`/`minimum` return the left operand unless the right is strictly beyond;
 - **every layout** of `operands.views` as the left operand, against a right operand that is
@@ -33,6 +38,14 @@ ARITHMETIC = ("add", "sub", "mul", "div")
 EXTREMA = ("maximum", "minimum")
 COMPARISONS = ("eq", "ne", "lt", "le", "gt", "ge")
 FUNCTIONS = ARITHMETIC + EXTREMA + COMPARISONS
+
+#: The functions that exist on the integer element types alone (`BinaryFunction::integral`).
+BITWISE = ("bitwise_and", "bitwise_or", "bitwise_xor")
+SHIFTS = ("bitwise_left_shift", "bitwise_right_shift")
+INTEGRAL = ("remainder",) + BITWISE + SHIFTS
+
+#: The width in bits of each integer element type.
+WIDTH = {"u8": 8, "u32": 32, "i16": 16, "i32": 32, "i64": 64}
 
 
 def expected_of(function, left, right):
@@ -58,6 +71,14 @@ def expected_of(function, left, right):
             "le": lambda: left <= right,
             "gt": lambda: left > right,
             "ge": lambda: left >= right,
+            # numpy's remainder is the floored quotient's, as `torch.remainder` is, and its
+            # right shift repeats a signed element's sign bit.
+            "remainder": lambda: np.remainder(left, right),
+            "bitwise_and": lambda: left & right,
+            "bitwise_or": lambda: left | right,
+            "bitwise_xor": lambda: left ^ right,
+            "bitwise_left_shift": lambda: np.left_shift(left, right),
+            "bitwise_right_shift": lambda: np.right_shift(left, right),
         }[function]()
 
 
@@ -112,10 +133,35 @@ def nonzero(tensor):
 
 
 def operand_pair(function, dtype, left, right):
-    """The two operands of a case: an integer quotient never divides by zero."""
-    if function == "div" and dtype in operands.INTEGERS:
+    """The two operands of a case, the right one held to what the function defines.
+
+    An integer quotient and a remainder never divide by zero, and a shift count is below the
+    element's width.
+    """
+    if function in ("div", "remainder") and dtype in operands.INTEGERS:
         right = nonzero(right)
+    if function in SHIFTS:
+        right = operands.tensor(
+            operands.real(right) % WIDTH[dtype], dtype
+        ).view(right.shape)
     return left, right
+
+
+def integers(dtype, numbers):
+    """`numbers` as a tensor of the integer element type `dtype`, wrapped into its range."""
+    element = np.dtype(str(operands.ELEMENTS[dtype]).removeprefix("torch."))
+    wrapped = np.array(numbers, dtype=object) % (1 << WIDTH[dtype])
+    return operands.tensor(wrapped.astype(np.uint64).astype(element), dtype)
+
+
+def refused(function, dtype):
+    """Whether the package has no module of `function` for `dtype`."""
+    key = f"function_{function}_dtype_{dtype}_rank_1_block_{operands.BLOCK}_pdl_false"
+    try:
+        operands.described("elementwise_binary", key)
+    except SystemExit as stated:
+        return "integer element types alone" in str(stated)
+    return False
 
 
 def main():
@@ -204,6 +250,86 @@ def main():
         for function in ARITHMETIC:
             checked += check(function, dtype, "the type's edges", left, right)
 
+    # The functions of the integer element types alone, on every one of them: contiguous
+    # operands, and a permuted left operand against one row repeated over its leading axes.
+    for dtype in operands.INTEGERS:
+        for seed, function in enumerate(INTEGRAL):
+            left = operands.values(dtype, (5, 7), seed + 200)
+            right = operands.values(dtype, (5, 7), seed + 250)
+            checked += check(
+                function,
+                dtype,
+                "contiguous",
+                *operand_pair(function, dtype, left, right),
+            )
+
+            left = operands.values(dtype, (3, 4, 5), seed + 300).permute(
+                2, 0, 1
+            )
+            right = operands.values(dtype, (1, 1, 4), seed + 350)
+            left, right = operand_pair(function, dtype, left, right)
+            checked += check(
+                function,
+                dtype,
+                "permuted against a row",
+                left,
+                right.expand(5, 3, 4),
+            )
+
+    for dtype in operands.INTEGERS:
+        width = WIDTH[dtype]
+        signed = dtype in ("i16", "i32", "i64")
+        low = -(1 << (width - 1)) if signed else 0
+        high = (1 << (width - 1)) - 1 if signed else (1 << width) - 1
+
+        # A remainder takes the divisor's sign: both signs on both sides, an exact multiple, a
+        # zero dividend, and the type's two ends. The smallest value by minus one is zero.
+        if signed:
+            dividends = [7, -7, 7, -7, 6, -6, 0, low, low, high, high, low + 1]
+            divisors = [3, 3, -3, -3, 3, -3, 5, -1, 7, -1, low, high]
+        else:
+            dividends = [7, 6, 0, high, high, 10, high - 1]
+            divisors = [3, 3, 5, 7, high, high, high]
+        checked += check(
+            "remainder",
+            dtype,
+            "both signs and the type's ends",
+            integers(dtype, dividends),
+            integers(dtype, divisors),
+        )
+
+        # Every pair of the type's extreme bit patterns: each one down a column against each
+        # one along a row.
+        patterns = [0, 1, -1, low, high, 0x5555555555555555, 0xAAAAAAAAAAAAAAAA]
+        count = len(patterns)
+        column = integers(dtype, patterns).view(count, 1).expand(count, count)
+        row = integers(dtype, patterns).view(1, count).expand(count, count)
+        for function in BITWISE:
+            checked += check(
+                function, dtype, "extreme bit patterns", column, row
+            )
+
+        # Each pattern shifted by every count the element's width admits.
+        column = integers(dtype, patterns).view(count, 1).expand(count, width)
+        row = (
+            integers(dtype, list(range(width)))
+            .view(1, width)
+            .expand(count, width)
+        )
+        for function in SHIFTS:
+            checked += check(
+                function, dtype, "every count below the width", column, row
+            )
+
+    # A floating element type has no module for an integer function.
+    for dtype in operands.FLOATS:
+        for function in INTEGRAL:
+            if not refused(function, dtype):
+                raise SystemExit(
+                    f"{function} on {dtype}: the package states a module for a function of "
+                    f"the integer element types alone"
+                )
+
     # Every layout as the left operand, against the three broadcasts of a right operand.
     layouts = 0
     for dtype, function in (
@@ -230,9 +356,10 @@ def main():
 
     print(
         f"ok: {checked} elements over {len(FUNCTIONS)} functions on "
-        f"{len(operands.FLOATS + operands.INTEGERS)} element types and {layouts} strided and "
-        f"broadcast launches of rank 1 to 6 on {operands.where()}, arithmetic within rounding(1) "
-        f"and the rest exact"
+        f"{len(operands.FLOATS + operands.INTEGERS)} element types, {len(INTEGRAL)} integer "
+        f"functions on {len(operands.INTEGERS)} and {layouts} strided and broadcast launches of "
+        f"rank 1 to 6 on {operands.where()}, float arithmetic within rounding(1) and the rest "
+        f"exact"
     )
     return 0
 

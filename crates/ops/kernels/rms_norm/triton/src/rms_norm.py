@@ -33,6 +33,7 @@ def _rms_norm_kernel(
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
     CENTRED: tl.constexpr,  # noqa: N803
+    GROUPS: tl.constexpr,  # noqa: N803
 ):
     """Normalize one row per program.
 
@@ -41,7 +42,8 @@ def _rms_norm_kernel(
     and ``pdl`` the launch's copy of the descriptor's flag. Every program loads
     its whole row before storing, so the output may alias the input.
     ``CENTRED`` reads a zero-centred weight: the row is scaled by ``1 + w``,
-    the one added in FP32.
+    the one added in FP32. ``GROUPS`` is the weight's row count: row ``i``
+    reads weight row ``i mod GROUPS``.
     """
     _pdl_prologue(PDL)
 
@@ -50,7 +52,7 @@ def _rms_norm_kernel(
     mask = offsets < columns
     row_base = row * columns
     x = tl.load(x_ptr + row_base + offsets, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(w_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + (row % GROUPS) * columns + offsets, mask=mask, other=0.0).to(tl.float32)
     if CENTRED:
         w = w + 1.0
 

@@ -56,6 +56,10 @@ def scatter(fields, pdl):
     """The compilation of a scatter: one program per block of columns."""
     block = int(fields["block"])
     pointer = strided.pointer(fields["dtype"])
+    # Only an addition computes, and so only it names a computing type: a
+    # `scatter_set` of an element that only moves stores the bits it loaded.
+    adds = fields["function"] == "scatter_add"
+    compute = strided.compute(fields["dtype"]) if adds else "int"
     return {
         "kernel": kernels._scatter_kernel,
         "signature": {
@@ -80,8 +84,8 @@ def scatter(fields, pdl):
             "PDL": "constexpr",
         },
         "constexprs": {
-            "ADDS": fields["function"] == "scatter_add",
-            "COMPUTE": strided.compute(fields["dtype"]),
+            "ADDS": adds,
+            "COMPUTE": compute,
             "ABSENT": ABSENT[fields["indices"]],
             "RANK": int(fields["rank"]),
             "BLOCK": block,

@@ -10,9 +10,9 @@
 //! key     [key_rows, heads, head_dim]            rows are whole blocks
 //! value   [key_rows, heads, head_dim]
 //! out     [query_rows, heads, head_dim]
-//! indices [heads, query_tiles, selected] i32     global key-block ids
-//! counts  [heads, query_tiles] i32               how many of each row are read
-//! valid   [key_blocks] i32                       valid rows of each block, 0..=tile
+//! indices [heads, query_tiles, selected] u32     global key-block ids
+//! counts  [heads, query_tiles] u32               how many of each row are read
+//! valid   [key_blocks] u32                       valid rows of each block, 0..=tile
 //! lse     [heads, query_rows] f32                when the descriptor asks for it
 //! ```
 //!
@@ -125,11 +125,11 @@ pub struct SparseArgs {
     pub key: Operand,
     /// `[key_rows, heads, head_dim]` values.
     pub value: Operand,
-    /// `[heads, query_tiles, selected]` i32: the key blocks each query tile reads first.
+    /// `[heads, query_tiles, selected]` u32: the key blocks each query tile reads first.
     pub indices: Operand,
-    /// `[heads, query_tiles]` i32: how many of each row's indices are read.
+    /// `[heads, query_tiles]` u32: how many of each row's indices are read.
     pub counts: Operand,
-    /// `[key_blocks]` i32: valid rows of each key block.
+    /// `[key_blocks]` u32: valid rows of each key block.
     pub valid: Operand,
     /// `[heads, query_rows]` f32: the softmax normalizer, when the descriptor asks for it.
     pub lse: Option<Operand>,
@@ -157,11 +157,11 @@ pub struct SparseCall {
     pub out: *mut c_void,
     /// `[heads, query_rows]` f32 normalizer, or null when the descriptor has none.
     pub lse: *mut c_void,
-    /// `[heads, query_tiles, selected]` i32 key-block ids.
+    /// `[heads, query_tiles, selected]` u32 key-block ids.
     pub indices: *const c_void,
-    /// `[heads, query_tiles]` i32 read counts.
+    /// `[heads, query_tiles]` u32 read counts.
     pub counts: *const c_void,
-    /// `[key_blocks]` i32 valid rows of each block.
+    /// `[key_blocks]` u32 valid rows of each block.
     pub valid: *const c_void,
     /// Heads of the call.
     pub heads: i64,
@@ -378,10 +378,10 @@ impl Op for SparseAttention {
                 "the output must not alias the query, key or value",
             ));
         }
-        // The staged metadata tables: one int32 per entry, contiguous, read on the device.
+        // The selection's tables: one 32-bit unsigned entry each, contiguous, read on the device.
         let query_tiles = query_rows / block;
         args.indices.require_rank(operator, 3)?;
-        if args.indices.dtype != DType::I32
+        if args.indices.dtype != DType::U32
             || args.indices.shape.dim(0) != heads
             || args.indices.shape.dim(1) != query_tiles
             || args.indices.shape.dim(2) == 0
@@ -389,7 +389,7 @@ impl Op for SparseAttention {
             return Err(Error::argument(
                 operator,
                 format!(
-                    "expected i32 indices [{heads}, {query_tiles}, selected] with selected > 0, \
+                    "expected u32 indices [{heads}, {query_tiles}, selected] with selected > 0, \
                      found {} {:?}",
                     abi::name(args.indices.dtype),
                     args.indices.shape.dims()
@@ -398,22 +398,22 @@ impl Op for SparseAttention {
         }
         args.counts
             .require_shape(operator, Shape::new(&[heads, query_tiles]))?;
-        if args.counts.dtype != DType::I32 {
+        if args.counts.dtype != DType::U32 {
             return Err(Error::argument(
                 operator,
                 format!(
-                    "expected i32 counts, found {}",
+                    "expected u32 counts, found {}",
                     abi::name(args.counts.dtype)
                 ),
             ));
         }
         args.valid
             .require_shape(operator, Shape::new(&[key_rows / block]))?;
-        if args.valid.dtype != DType::I32 {
+        if args.valid.dtype != DType::U32 {
             return Err(Error::argument(
                 operator,
                 format!(
-                    "expected i32 valid sizes, found {}",
+                    "expected u32 valid sizes, found {}",
                     abi::name(args.valid.dtype)
                 ),
             ));

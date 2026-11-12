@@ -14,8 +14,8 @@
 //! | Qwen3.6 | `qwen3_5_moe` | [`ToolCallFormat::Xml`] |
 //! | Qwen3.8 Flash Next | `qwen4_exp` | [`ToolCallFormat::Xml`] |
 //!
-//! [`QWEN4_EXP`] states the formats of a family no model crate loads yet, so its image side is
-//! absent until one does.
+//! Qwen3.6 and Qwen3.8 Flash Next hold the Qwen3-VL vision tower and take images, sized by the
+//! Qwen-VL processor rules their checkpoints state.
 
 use crate::family::Family;
 use crate::image::{ImageFamily, ImageProcessor};
@@ -53,8 +53,8 @@ pub const QWEN3_5_MOE: Family = Family {
     }),
 };
 
-/// Qwen3.8 Flash Next (`Qwen4ExpForConditionalGeneration`): `<think>` reasoning and function and
-/// parameter tags for tool calls.
+/// Qwen3.8 Flash Next (`Qwen4ExpForConditionalGeneration`): a chat family that takes images,
+/// with `<think>` reasoning and function and parameter tags for tool calls.
 pub const QWEN4_EXP: Family = Family {
     id: "qwen4_exp",
     model_types: &["qwen4_exp"],
@@ -62,7 +62,7 @@ pub const QWEN4_EXP: Family = Family {
     serving: Serving::Chat(ChatProfile {
         reasoning: Some(ReasoningFormat::Think),
         tool_calls: Some(ToolCallFormat::Xml),
-        images: None,
+        images: Some(&Images),
     }),
 };
 
@@ -125,5 +125,6 @@ mod tests {
 
         assert!(profile(QWEN3).images.is_none());
         assert!(profile(QWEN3_5_MOE).images.is_some());
+        assert!(profile(QWEN4_EXP).images.is_some());
     }
 }

@@ -198,7 +198,9 @@ impl ExecutionBatch {
     /// carries its frees to `frees_group`, the group that encodes images,
     /// which releases them and responds to no call. A batch that completes
     /// reports no command as failed, which the scheduler reads as its
-    /// commands having been applied.
+    /// commands having been applied. The spans of the products the calls
+    /// read and write travel with it (`Batch::buffers`), so its runners
+    /// find each product where the scheduler placed it.
     pub(crate) fn device_batch(
         &self,
         generation: u64,
@@ -227,6 +229,7 @@ impl ExecutionBatch {
                 latent_restores: Vec::new(),
                 host_outputs: Vec::new(),
                 images: Vec::new(),
+                buffers: Vec::new(),
                 frees: self.frees(),
                 media: None,
             };
@@ -313,7 +316,21 @@ impl ExecutionBatch {
         device.generation = generation;
         // The products whose last reader completed reach the rank that holds them.
         device.frees = self.frees();
+        device.buffers = self.buffers();
         Ok((device, calls))
+    }
+
+    /// The spans of every product the batch's calls read or write, once per backing rank and
+    /// product, in call order: the projection of the calls' [`RequestDispatch::buffers`] that the
+    /// batch's runners find the products they name in (`Batch::buffers`).
+    fn buffers(&self) -> Vec<(u32, BufferAllocation)> {
+        let mut placed = std::collections::HashSet::new();
+        self.requests
+            .iter()
+            .flat_map(|(_, dispatch)| &dispatch.buffers)
+            .filter(|span| placed.insert((span.rank, span.allocation.buffer)))
+            .map(|span| (span.rank, span.allocation))
+            .collect()
     }
 
     /// Iterates over request admissions carried by batch commands.

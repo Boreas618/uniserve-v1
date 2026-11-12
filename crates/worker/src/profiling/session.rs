@@ -1,25 +1,31 @@
 //! A profiling session on one rank: its window over the rank's steps, its collectors and its file.
 //!
 //! The leader daemon starts a session on every rank of the epoch that executes with the operation
-//! `uniserve.profile_start`, which reaches each rank's device thread as a queue item, so it takes
-//! effect between two batches ([`Session::start`]). A rank the session does not select answers so and
-//! records nothing. A selected rank prepares the collectors ([`super::collectors`]) and creates its
-//! file ([`super::artifact`]); its device thread arms the collectors before the forward of the first
-//! step its window takes and disarms them after the last, so that what the collectors record begins
-//! and ends at step boundaries:
+//! `uniserve.profile_start`, which reaches each rank's executor as a [`Change`] in its queue, so
+//! it takes effect between two batches ([`Session::change`]). A rank the session does not select
+//! responds so and records nothing. A selected rank prepares the collectors
+//! ([`super::collectors`]) and creates its file ([`super::artifact`]); its executor arms the
+//! collectors before the forward of the first step its window takes and disarms them after the
+//! last, so that what the collectors record begins and ends at step boundaries:
 //!
 //! - A step is one batch's forward; its stage is its call kind.
-//! - The window skips `start_step` steps of the selected stages, then takes `steps` of them, or every
-//!   one until the session ends. Steps of the other stages are not recorded: the collectors are
-//!   disarmed before such a step and armed again before the next selected one.
-//! - Every step during the session is listed in the file (`steps`), with whether the window took it.
+//! - The window skips `start_step` steps of the selected stages, then takes `steps` of them, or
+//!   every one until the session ends. Steps of the other stages are not recorded: the collectors
+//!   are disarmed before such a step and armed again before the next selected one.
+//! - Every step during the session is listed in the file (`steps`), with whether the window took
+//!   it.
 //!
-//! A sampler thread drains the armed samplers every [`DRAIN_PERIOD`]. The rank reports its progress
-//! with every batch result (`ForwardStats::profile`): the steps its window took, the bytes of its
-//! file, and that its window ended. The daemon ends the session with `uniserve.profile_stop`
-//! ([`Session::stop`]) when every window ended, its time passed, the operator ends it, its epoch
-//! changes, or the quality-of-service guard ends it; the guard first releases collectors one by one
-//! (`uniserve.profile_release`, [`Session::release`]).
+//! A window is made of whole steps, so an executor whose rank holds a session runs its steps one
+//! at a time: it tells the session each step's begin and end ([`Session::begin`],
+//! [`Session::end`]) and, when either returns `true`, waits for the rank's streams and then
+//! changes the collectors ([`Session::apply`]).
+//!
+//! A sampler thread drains the armed samplers every [`DRAIN_PERIOD`]. The rank reports its
+//! progress with every batch result (`ForwardStats::profile`, [`Session::progress`]): the steps
+//! its window took, the bytes of its file, and that its window ended. The daemon ends the session
+//! with `uniserve.profile_stop` when every window ended, its time passed, the operator ends it,
+//! its epoch changes, or the quality-of-service guard ends it; the guard first releases collectors
+//! one by one (`uniserve.profile_release`).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -28,12 +34,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crossbeam_channel::Sender;
 use platform::DeviceId;
 use proto::profile::{Collector, SessionRequest, SessionStart};
 
-use super::artifact::{ClockRow, Message, Rows, StepRow, Writer};
+use super::artifact::{ClockRow, Message, Writer, send};
 use super::collectors::{self, Collectors};
-use super::fences::{self, Fences, realtime};
+use super::markers::{Markers, monotonic, realtime};
 use crate::{Error, Result, lock};
 
 /// How often the sampler thread drains the armed samplers.
@@ -47,7 +54,7 @@ enum Action {
     CycleRanges,
 }
 
-/// A change of a rank's session, as a device thread performs it.
+/// A change of a rank's session, as the daemon's operation reaches the rank's executor.
 #[derive(Clone)]
 pub enum Change {
     /// Start a session on the rank.
@@ -67,8 +74,8 @@ pub enum Change {
     },
 }
 
-/// The device storage a session of `request` holds on the device of rank `rank` while it runs, for a
-/// session that selects the rank; 0 otherwise.
+/// The device storage a session of `request` holds on the device of rank `rank` while it runs, for
+/// a session that selects the rank; 0 otherwise.
 pub fn device_storage(request: &SessionRequest, rank: u32) -> u64 {
     if request.workers.is_empty() || request.workers.contains(&rank) {
         request.device_storage()
@@ -78,12 +85,13 @@ pub fn device_storage(request: &SessionRequest, rank: u32) -> u64 {
 }
 
 /// A session on a rank the session selected.
-pub(crate) struct Session {
+pub struct Session {
     id: u64,
     device: DeviceId,
     request: SessionRequest,
     writer: Option<Writer>,
-    rows: Rows,
+    /// The file's writer, for the session's own rows.
+    rows: Sender<Message>,
     collectors: Arc<Mutex<Collectors>>,
     /// The collectors running ([`collectors::bit`]), read at every step instead of the collectors'
     /// lock, which the sampler thread holds while it drains the samplers.
@@ -106,22 +114,81 @@ pub(crate) struct Session {
     sampler: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
 }
 
-/// What a session's start or stop answers the daemon, as JSON.
-pub(crate) type Answer = serde_json::Value;
-
 impl Session {
-    /// Start the session `start` on rank `rank`, whose CUDA device is `device`: `None` with the
-    /// answer when the session does not select the rank.
+    /// Performs `change` on `slot`, the session of the rank whose CUDA device is `device`, and
+    /// returns the rank's response to the daemon's operation, as JSON: a start fills the slot when
+    /// the session selects the rank, a stop of the session in the slot empties it, and a release
+    /// turns one of its collectors off.
+    ///
+    /// The executor calls this between two batches, with nothing of the rank in flight: a start
+    /// prepares collectors on the device and a stop releases them.
     ///
     /// # Errors
     ///
-    /// Fails when the rank cannot create its file; collectors that cannot run are reported in the
-    /// answer, and the session runs the others.
-    pub(crate) fn start(
+    /// Fails when a session already records the rank, the request is invalid, or the rank cannot
+    /// create its file. A stop or a release that names another session than the slot's changes
+    /// nothing and says so in its response.
+    pub fn change(
+        slot: &mut Option<Self>,
+        change: Change,
+        device: DeviceId,
+    ) -> Result<serde_json::Value> {
+        match change {
+            Change::Start { start, rank } => {
+                if let Some(session) = slot {
+                    return Err(Error::Invalid(format!(
+                        "profiling session {} records the rank",
+                        session.id
+                    )));
+                }
+                let (session, response) = Self::start(*start, rank, device)?;
+                *slot = session;
+                Ok(response)
+            }
+            Change::Stop {
+                session,
+                reason,
+                rank,
+            } => match slot.take_if(|running| running.id == session) {
+                Some(running) => {
+                    let mut response = running.stop(&reason);
+                    response["rank"] = serde_json::json!(rank);
+                    Ok(response)
+                }
+                None => Ok(serde_json::json!({
+                    "rank": rank,
+                    "session": session,
+                    "selected": false,
+                })),
+            },
+            Change::Release {
+                session,
+                collector,
+                reason,
+                rank,
+            } => {
+                let mut response = match slot {
+                    Some(running) if running.id == session => running.release(collector, &reason),
+                    _ => serde_json::json!({ "released": false }),
+                };
+                response["rank"] = serde_json::json!(rank);
+                Ok(response)
+            }
+        }
+    }
+
+    /// Starts the session `start` on rank `rank`, whose CUDA device is `device`, and returns it
+    /// with the rank's response: no session when it does not select the rank.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the request is invalid or the rank cannot create its file; collectors that
+    /// cannot run are reported in the response, and the session runs the others.
+    fn start(
         start: SessionStart,
         rank: u32,
         device: DeviceId,
-    ) -> Result<(Option<Self>, Answer)> {
+    ) -> Result<(Option<Self>, serde_json::Value)> {
         let SessionStart {
             session,
             epoch,
@@ -131,6 +198,7 @@ impl Session {
         if !request.workers.is_empty() && !request.workers.contains(&rank) {
             return Ok((None, serde_json::json!({ "rank": rank, "selected": false })));
         }
+
         std::fs::create_dir_all(&request.output_dir).map_err(|error| {
             Error::transport_source(format!("creating {}", request.output_dir.display()), error)
         })?;
@@ -143,33 +211,22 @@ impl Session {
         )?;
         let rows = writer.rows();
         clocks(&rows, device, "start");
-        if let Some(fences) = Fences::installed() {
-            rows.send(Message::FenceProbes(
-                fences
-                    .instances()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, instance)| {
-                        (
-                            index as u32,
-                            instance.path.clone(),
-                            instance.component.clone(),
-                        )
-                    })
-                    .collect(),
-            ));
+        if let Some(markers) = Markers::installed() {
+            send(&rows, Message::Instances(markers.instances()));
         }
+
         let (collectors, states) = Collectors::prepare(&request, Some(device), rows.clone());
         let running = collectors.running();
         let collectors = Arc::new(Mutex::new(collectors));
         let sampler = sampler(Arc::clone(&collectors))?;
-        let answer = serde_json::json!({
+        let response = serde_json::json!({
             "rank": rank,
             "selected": true,
             "path": path,
             "collectors": states,
         });
         tracing::info!(session, path = %path.display(), "a profiling session started");
+
         Ok((
             Some(Self {
                 id: session,
@@ -189,22 +246,19 @@ impl Session {
                 reported: (0, 0, false),
                 sampler: Some(sampler),
             }),
-            answer,
+            response,
         ))
     }
 
-    pub(crate) fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// Account the start of step `step` (a batch's forward) of `stage`: the window takes it or not,
-    /// and the collectors are to be armed or disarmed before its forward accordingly. Answers
-    /// whether [`Self::apply`] has work, which must run with nothing of the rank in flight.
-    pub(crate) fn begin(&mut self, step: u64, stage: &str) -> bool {
-        let staged =
+    /// Accounts the start of step `step` (a batch's id) of `stage` (its call kind), before the
+    /// step's first launch: the window takes it or not, and the collectors are to be armed or
+    /// disarmed before its forward accordingly. Returns whether [`Self::apply`] has work, which
+    /// must run with nothing of the rank in flight.
+    pub fn begin(&mut self, step: u64, stage: &str) -> bool {
+        let selected =
             self.request.stages.is_empty() || self.request.stages.iter().any(|s| s == stage);
         let mut taken = false;
-        if self.ended.is_none() && staged {
+        if self.ended.is_none() && selected {
             if self.skipped < self.request.start_step {
                 self.skipped += 1;
             } else if self.request.steps.is_none_or(|steps| self.taken < steps) {
@@ -212,6 +266,7 @@ impl Session {
                 self.taken += 1;
             }
         }
+
         let collecting = self.running.load(Ordering::Acquire) != 0;
         if collecting && taken != self.intended {
             self.pending
@@ -223,22 +278,27 @@ impl Session {
         !self.pending.is_empty()
     }
 
-    /// Account the end of step `step`'s forward: a step the window took counts, and the window's
-    /// last disarms the collectors. Answers whether [`Self::apply`] has work.
-    pub(crate) fn end(&mut self, step: u64) -> bool {
+    /// Accounts the end of step `step`'s forward, once the device completed it: a step the window
+    /// took counts, and the window's last disarms the collectors. Returns whether [`Self::apply`]
+    /// has work.
+    pub fn end(&mut self, step: u64) -> bool {
         let Some((stage, taken, begin)) = self.open.remove(&step) else {
             return false;
         };
-        self.rows.send(Message::Step(StepRow {
-            step,
-            stage,
-            selected: taken,
-            begin,
-            end: platform::cupti::timestamp().ok(),
-        }));
+        send(
+            &self.rows,
+            Message::Step {
+                step,
+                stage,
+                selected: taken,
+                begin,
+                end: platform::cupti::timestamp().ok(),
+            },
+        );
         if !taken {
             return !self.pending.is_empty();
         }
+
         self.recorded += 1;
         if self
             .request
@@ -260,9 +320,10 @@ impl Session {
         !self.pending.is_empty()
     }
 
-    /// Perform the changes of the collectors that are due, on the rank's device thread between two
-    /// forwards.
-    pub(crate) fn apply(&mut self) {
+    /// Performs the changes of the collectors that are due, on the rank's executor between two
+    /// forwards: the caller waited for the rank's streams, so a collector starts or stops with
+    /// nothing of the rank in flight and records whole steps.
+    pub fn apply(&mut self) {
         let mut collectors = lock(&self.collectors);
         while let Some(action) = self.pending.pop_front() {
             match action {
@@ -273,9 +334,10 @@ impl Session {
         }
     }
 
-    /// What the rank reports since its last report: the steps its window took, the bytes its file
-    /// grew by, and that its window ended (once).
-    pub(crate) fn progress(&mut self) -> BTreeMap<String, u64> {
+    /// What the rank reports since its last report (`ForwardStats::profile`): the steps its window
+    /// took (`{session}/steps`), the bytes its file grew by (`{session}/bytes`), and that its
+    /// window ended (`{session}/ended`, once).
+    pub fn progress(&mut self) -> BTreeMap<String, u64> {
         let bytes = self.writer.as_ref().map_or(0, Writer::bytes);
         let mut progress = BTreeMap::new();
         let (steps, reported_bytes, ended) = self.reported;
@@ -289,6 +351,7 @@ impl Session {
         if ending && !ended {
             progress.insert(format!("{}/ended", self.id), 1);
         }
+
         self.reported = (
             self.recorded.max(steps),
             bytes.max(reported_bytes),
@@ -297,33 +360,38 @@ impl Session {
         progress
     }
 
-    /// Release `collector`, which the quality-of-service guard turned off for `reason`; answers
+    /// Releases `collector`, which the quality-of-service guard turned off for `reason`; responds
     /// whether the rank ran it.
-    pub(crate) fn release(&mut self, collector: Collector, reason: &str) -> Answer {
+    fn release(&mut self, collector: Collector, reason: &str) -> serde_json::Value {
         let released = lock(&self.collectors).release(collector, "released", reason);
         serde_json::json!({ "released": released })
     }
 
-    /// End the session for `reason`: disarm and release the collectors, write what remains and close
-    /// the file. Runs while the rank runs no batch.
-    pub(crate) fn stop(mut self, reason: &str) -> Answer {
+    /// Ends the session for `reason`: disarms and releases the collectors, writes what remains
+    /// and closes the file. Runs while the rank runs no batch. Responds with the steps recorded
+    /// and what the file holds.
+    fn stop(mut self, reason: &str) -> serde_json::Value {
         if let Some((stop, thread)) = self.sampler.take() {
             drop(stop);
             let _ = thread.join();
         }
         lock(&self.collectors).release_all(reason);
         clocks(&self.rows, self.device, "end");
-        self.rows.send(Message::Metadata(vec![
-            ("ended".to_owned(), realtime().to_string()),
-            ("end_reason".to_owned(), reason.to_owned()),
-            ("steps_recorded".to_owned(), self.recorded.to_string()),
-            (
-                "window_ended".to_owned(),
-                self.ended.clone().unwrap_or_default(),
-            ),
-        ]));
-        // The writer finishes once every sender of rows is gone: the collectors' (the sampler thread
-        // ended) and the session's.
+        send(
+            &self.rows,
+            Message::Metadata(vec![
+                ("ended".to_owned(), realtime().to_string()),
+                ("end_reason".to_owned(), reason.to_owned()),
+                ("steps_recorded".to_owned(), self.recorded.to_string()),
+                (
+                    "window_ended".to_owned(),
+                    self.ended.clone().unwrap_or_default(),
+                ),
+            ]),
+        );
+
+        // The writer finishes once every sender of rows is gone: the collectors' (the sampler
+        // thread ended) and the session's.
         let Self {
             id,
             writer,
@@ -334,17 +402,18 @@ impl Session {
         } = self;
         drop(collectors);
         drop(rows);
-        let summary = match writer.map(Writer::finish) {
-            Some(Ok(summary)) => serde_json::to_value(summary).unwrap_or_default(),
+        let file = match writer.map(Writer::finish) {
+            Some(Ok(finished)) => finished,
             Some(Err(error)) => serde_json::json!({ "error": error.to_string() }),
             None => serde_json::Value::Null,
         };
         tracing::info!(session = id, reason, "a profiling session ended");
+
         serde_json::json!({
             "session": id,
             "steps": recorded,
             "reason": reason,
-            "file": summary,
+            "file": file,
         })
     }
 }
@@ -389,31 +458,28 @@ fn metadata(
     entries
 }
 
-/// Sample the host's clocks, and calibrate `device`'s fence clock, into the file's `clocks`.
-fn clocks(rows: &Rows, device: DeviceId, source: &'static str) {
+/// Samples the host's clocks, and calibrates `device`'s range marker clock, into the file's
+/// `clocks`.
+fn clocks(rows: &Sender<Message>, device: DeviceId, source: &'static str) {
     let before = realtime();
     let cupti = platform::cupti::timestamp().ok();
-    let monotonic = fences::monotonic();
+    let monotonic = monotonic();
     let after = realtime();
-    rows.send(Message::Clock(ClockRow {
-        source,
-        device: None,
-        gpu: None,
-        realtime: before / 2 + after / 2,
-        cupti,
-        monotonic: Some(monotonic),
-        uncertainty: (after - before) / 2,
-    }));
-    if let Some(alignment) = Fences::installed().and_then(|fences| fences.calibrate(device)) {
-        rows.send(Message::Clock(ClockRow {
-            source: "globaltimer",
-            device: Some(alignment.device),
-            gpu: Some(alignment.gpu),
-            realtime: alignment.realtime,
-            cupti: Some(alignment.cupti),
-            monotonic: None,
-            uncertainty: alignment.uncertainty,
-        }));
+    send(
+        rows,
+        Message::Clock(ClockRow {
+            source,
+            device: None,
+            gpu: None,
+            realtime: before / 2 + after / 2,
+            cupti,
+            monotonic: Some(monotonic),
+            uncertainty: (after - before) / 2,
+        }),
+    );
+
+    if let Some(sample) = Markers::installed().and_then(|markers| markers.calibrate(device)) {
+        send(rows, Message::Clock(sample));
     }
 }
 
@@ -429,4 +495,83 @@ fn sampler(collectors: Arc<Mutex<Collectors>>) -> Result<(mpsc::Sender<()>, Join
         })
         .map_err(|error| Error::transport_source("starting the profile sampler", error))?;
     Ok((stop, thread))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request for the range timeline over every stage, of the ranks `workers`.
+    fn request(workers: &[u32]) -> SessionRequest {
+        serde_json::from_value(serde_json::json!({
+            "collectors": ["fence_timeline"],
+            "workers": workers,
+            "output_dir": "/nonexistent/profiles",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_rank_the_session_does_not_select_records_nothing() {
+        let mut slot = None;
+        let start = SessionStart {
+            session: 7,
+            epoch: 2,
+            request: request(&[0]),
+        };
+        assert_eq!(device_storage(&start.request, 1), 0);
+
+        let response = Session::change(
+            &mut slot,
+            Change::Start {
+                start: Box::new(start),
+                rank: 1,
+            },
+            DeviceId(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response,
+            serde_json::json!({ "rank": 1, "selected": false })
+        );
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn a_stop_or_release_of_a_session_the_rank_does_not_hold_changes_nothing() {
+        let mut slot = None;
+
+        let stopped = Session::change(
+            &mut slot,
+            Change::Stop {
+                session: 7,
+                reason: "operator".to_owned(),
+                rank: 3,
+            },
+            DeviceId(3),
+        )
+        .unwrap();
+        assert_eq!(
+            stopped,
+            serde_json::json!({ "rank": 3, "session": 7, "selected": false })
+        );
+
+        let released = Session::change(
+            &mut slot,
+            Change::Release {
+                session: 7,
+                collector: Collector::FenceTimeline,
+                reason: "slowdown".to_owned(),
+                rank: 3,
+            },
+            DeviceId(3),
+        )
+        .unwrap();
+        assert_eq!(
+            released,
+            serde_json::json!({ "released": false, "rank": 3 })
+        );
+        assert!(slot.is_none());
+    }
 }

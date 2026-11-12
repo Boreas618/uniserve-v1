@@ -3,9 +3,11 @@
 
     python gated_rms_norm_check.py                    # rows of 128 under a tile of 128, on a GPU
     python gated_rms_norm_check.py --interpreter      # the same on Triton's interpreter
+    python gated_rms_norm_check.py --gate sigmoid     # the sigmoid gate
 
-The operator is a gated delta network's output norm: `x · rsqrt(mean(x²) + eps) · w · silu(z)`,
-normalized before it is gated (FLA's `RMSNormGated`, `norm_before_gate=True`). The cases are what
+The operator is a gated delta network's output norm: `x · rsqrt(mean(x²) + eps) · w · act(z)`,
+normalized before it is gated (FLA's `RMSNormGated`, `norm_before_gate=True`), with the SiLU
+or, under `--gate sigmoid`, the sigmoid (`output_gate_type: "sigmoid"`). The cases are what
 a masked row reduction and a gate can get wrong: the head width the model serves, a row far below
 its tile, a row of zeros (whose output is exactly zero), and gates spanning the SiLU's saturation.
 
@@ -35,6 +37,7 @@ def parse():
         "--interpreter", action="store_true", help="run on Triton's interpreter"
     )
     parser.add_argument("--dtype", choices=["bf16", "f32"], default="bf16")
+    parser.add_argument("--gate", choices=["silu", "sigmoid"], default="silu")
     return parser.parse_args()
 
 
@@ -81,6 +84,7 @@ def check(label, rows, columns, tile, device, seed):
         columns,
         eps,
         BLOCK=tile,
+        SIGMOID=FLAGS.gate == "sigmoid",
         num_warps=4,
     )
     exact = x.double()
@@ -88,13 +92,16 @@ def check(label, rows, columns, tile, device, seed):
         (exact * exact).mean(-1, keepdim=True) + eps
     )
     z = gate.double()
-    expected = normalized * weight.double() * z * torch.sigmoid(z)
+    opened = (
+        torch.sigmoid(z) if FLAGS.gate == "sigmoid" else z * torch.sigmoid(z)
+    )
+    expected = normalized * weight.double() * opened
     error = (out.cpu().double() - expected).abs()
     relative = bound(columns, FLAGS.dtype)
     outside = int((~(error <= relative * expected.abs())).sum())
     print(
         f"{'exact' if outside == 0 else 'FAIL'}: {label}, {rows} x {columns} of tile {tile}, "
-        f"{FLAGS.dtype} — max abs {float(error.max()):.3e}, bound {relative:.3e} relative, "
+        f"{FLAGS.dtype}, {FLAGS.gate} gate — max abs {float(error.max()):.3e}, bound {relative:.3e} relative, "
         f"{outside} outside"
     )
     return outside

@@ -353,6 +353,23 @@ impl Scheduler {
                 bytes,
             });
         }
+        // The products the call reads lie where their producers wrote them: in the request's own
+        // spans, or in the encoder cache's retention when the request pinned a cached product.
+        for buffer in call.buffer_inputs().map(TensorRef::buffer_id) {
+            let Some(span) = allocations
+                .buffers
+                .get(&buffer)
+                .or_else(|| self.storage.encoder_buffers.get(&buffer))
+            else {
+                self.invariant_broken("a token call's input product holds a span");
+                return None;
+            };
+            call_buffers.push(BufferAllocation {
+                buffer,
+                offset: span.offset,
+                bytes: span.bytes,
+            });
+        }
 
         // Worker selection records the request's residency on that worker. A
         // request that has not run this stage yet is placed where the

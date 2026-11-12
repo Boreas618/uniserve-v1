@@ -10,16 +10,19 @@ use serde_json::Value;
 
 use crate::{Error, Result};
 
-/// The decoder layers whose hidden state H3 conditions on.
-///
-/// The text encoder checkpoint is a 64-layer Qwen3-VL; H3 reads the state after layer 50. The
-/// checkpoint's configuration does not state how many layers a consumer keeps.
+/// The decoder layers of the text encoder H3 conditions on: the hidden state after this many
+/// layers is the prompt's features, with no final norm.
 pub const RETAINED_LAYERS: u32 = 50;
 
-/// Read `text_encoder/config.json` and check that H3's truncation fits it: the checkpoint holds
-/// the retained layers, and every DeepStack feature has a retained layer to follow.
+/// The text encoder's configuration, from `text_encoder/config.json`.
+///
+/// # Errors
+///
+/// A checkpoint shallower than the retained layers, without a vision tower, or with more
+/// DeepStack features than retained layers.
 pub(super) fn text_encoder(metadata: &Value) -> Result<qwen3::Config> {
     let config = qwen3::Config::parse(&Fields::of("text_encoder/config.json", metadata)?)?;
+
     if RETAINED_LAYERS > config.text.num_hidden_layers {
         return Err(Error::config(format!(
             "H3 keeps {RETAINED_LAYERS} of the text encoder's {} layers",
@@ -29,6 +32,7 @@ pub(super) fn text_encoder(metadata: &Value) -> Result<qwen3::Config> {
     let vision = config.vision.as_ref().ok_or_else(|| {
         Error::config("H3's text encoder is a Qwen3-VL model with a vision tower".to_owned())
     })?;
+
     let features = vision.deepstack_visual_indexes.len();
     if features > RETAINED_LAYERS as usize {
         return Err(Error::config(format!(
@@ -44,13 +48,13 @@ mod tests {
 
     #[test]
     fn the_released_text_encoder_holds_the_retained_layers() {
-        let config =
-            text_encoder(&crate::config::tests_support::text_encoder()).expect("the released one");
+        let released = crate::config::tests_support::text_encoder();
+        let config = text_encoder(&released).unwrap();
         assert!(config.text.num_hidden_layers >= RETAINED_LAYERS);
 
-        let mut shallow = crate::config::tests_support::text_encoder();
+        let mut shallow = released;
         shallow["text_config"]["num_hidden_layers"] = serde_json::json!(RETAINED_LAYERS - 1);
-        let error = text_encoder(&shallow).expect_err("too few layers");
+        let error = text_encoder(&shallow).unwrap_err();
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("keeps")),
             "{error}"

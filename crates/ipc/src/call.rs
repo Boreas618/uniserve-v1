@@ -737,7 +737,7 @@ impl MediaCall {
             Self::TextEncoding | Self::LatentEncoding => &[Self::LatentPreparation],
             Self::LatentPreparation => &[Self::Denoising],
             Self::Denoising => &[Self::Denoising, Self::VideoDecoding, Self::AudioDecoding],
-            Self::VideoDecoding => &[Self::VideoEncoding],
+            Self::VideoDecoding => &[Self::VideoDecoding, Self::VideoEncoding],
             Self::VideoEncoding => &[Self::Muxing],
             Self::AudioDecoding => &[Self::AudioEncoding],
             Self::AudioEncoding | Self::Muxing => &[],

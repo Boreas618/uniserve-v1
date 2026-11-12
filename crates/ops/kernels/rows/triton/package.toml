@@ -33,6 +33,6 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_mode_replace_columns_5120_block_1024_pdl_false`, and the slice's own widths.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], mode = ["replace", "add"], columns = { min = 1 }, block = { power_of_two = true }, pdl = ["false", "true"] }
+dimensions = { dtype = ["bf16", "f16", "f32", "i32"], mode = ["replace", "add", "place"], columns = { min = 1 }, block = { power_of_two = true }, pdl = ["false", "true"] }
 
 [parameters]

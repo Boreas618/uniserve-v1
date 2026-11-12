@@ -14,6 +14,9 @@
 //! stores those bits without converting anything. A scalar of the host therefore becomes an
 //! element once, on the host, by the host's own conversion, and every implementation of the
 //! operator writes the same bytes.
+//!
+//! The destination holds any element a primitive moves ([`crate::strided::MOVED`]): an FP8
+//! (`f8e4m3`) element is its one byte, so the bits of a zero are the zero byte.
 
 use std::fmt;
 
@@ -84,7 +87,7 @@ impl Op for Fill {
     type Args<'a> = Args;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::ELEMENTS)?;
+        strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::MOVED)?;
         strided::require_block(Self::NAME, descriptor.block)?;
 
         strided::require_dtype(
@@ -231,5 +234,25 @@ mod tests {
 
         let byte = window(DType::U8, &[8], &[1], 0x100);
         assert!(refusal(&byte).contains("do not fit a u8 element"));
+    }
+
+    #[test]
+    fn an_fp8_element_is_stored_as_its_byte() {
+        // One in E4M3: a zero sign, the exponent's bias and no mantissa.
+        let ones = window(DType::F8E4M3, &[4, 8], &[8, 1], 0x38);
+        let descriptor = Descriptor::of(&ones, BLOCK, false);
+        assert_eq!(
+            descriptor.to_string(),
+            "dtype_f8e4m3_rank_1_block_1024_pdl_false"
+        );
+        Fill::check(&descriptor, &ones).unwrap();
+        assert_eq!(Fill::tolerance(&descriptor), Tolerance::exact());
+
+        // A block of a larger FP8 tensor is a window like any other.
+        let block = window(DType::F8E4M3, &[4, 8], &[32, 1], 0);
+        Fill::check(&Descriptor::of(&block, BLOCK, false), &block).unwrap();
+
+        let wide = window(DType::F8E4M3, &[8], &[1], 0x100);
+        assert!(refusal(&wide).contains("do not fit a f8e4m3 element"));
     }
 }

@@ -2682,15 +2682,15 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 name = "minimax-h3"
 version = "2.0.0"
 dependencies = [
+ "backend",
  "nn",
- "ops",
  "processing",
- "proto",
  "qwen3",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "uniserve-tensor",
 ]
 
 [[package]]
@@ -2807,10 +2807,9 @@ dependencies = [
 name = "nn"
 version = "2.0.0"
 dependencies = [
- "build-server",
+ "backend",
  "memmap2",
  "ops",
- "platform",
  "processing",
  "proto",
  "safetensors",
@@ -3516,14 +3515,25 @@ dependencies = [
 name = "qwen3"
 version = "2.0.0"
 dependencies = [
+ "backend",
  "nn",
- "ops",
  "processing",
- "proto",
- "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
+ "uniserve-tensor",
+]
+
+[[package]]
+name = "qwen4-exp"
+version = "2.0.0"
+dependencies = [
+ "backend",
+ "nn",
+ "processing",
+ "qwen3",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uniserve-tensor",
 ]
 
 [[package]]
@@ -5986,6 +5996,7 @@ dependencies = [
 name = "worker"
 version = "2.0.0"
 dependencies = [
+ "backend",
  "base64 0.22.1",
  "build-server",
  "bytemuck",
@@ -6005,6 +6016,7 @@ dependencies = [
  "serde",
  "serde_json",
  "storage",
+ "storage-server",
  "tempfile",
  "thiserror 2.0.18",
  "time",

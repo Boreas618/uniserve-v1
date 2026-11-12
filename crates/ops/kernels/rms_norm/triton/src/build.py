@@ -40,9 +40,16 @@ def spec(fields, parameters, target):
             "BLOCK": "constexpr",
             "PDL": "constexpr",
             "CENTRED": "constexpr",
+            "GROUPS": "constexpr",
         },
-        # A key names `centred` only for a zero-centred weight.
-        "constexprs": {"BLOCK": tile, "PDL": pdl, "CENTRED": fields.get("centred", "false") == "true"},
+        # A key names `centred` only for a zero-centred weight and `groups` only for a weight of
+        # several rows.
+        "constexprs": {
+            "BLOCK": tile,
+            "PDL": pdl,
+            "CENTRED": fields.get("centred", "false") == "true",
+            "GROUPS": int(fields.get("groups", "1")),
+        },
         "options": {"num_warps": warps_of(tile), "launch_pdl": pdl},
     }
 

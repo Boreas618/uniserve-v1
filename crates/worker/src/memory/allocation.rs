@@ -1,323 +1,74 @@
-//! Rust-owned allocations and their typed views.
+//! One allocation the worker owns or maps.
 //!
-//! Runtime storage (cache planes, graph inputs and outputs, workspaces, staging)
-//! is allocated here. A [`Storage`] owns one allocation; a [`StorageView`]
-//! is a typed, strided window into it that retains the allocation, the way a
-//! torch tensor views a torch storage. Dropping the last reference
-//! releases the storage through `cuda`'s reclaimer, which never
-//! waits for device work: owners must retire all device accesses to an
-//! allocation before dropping it.
+//! A [`Storage`] is one allocation: device storage this process created, page-locked or pageable
+//! host storage, or a mapping of storage the host's Storage Server retains (a weight's
+//! allocation, a cache plane, a page pool). Dropping the last reference releases the allocation
+//! or the mapping without waiting for device work, so an owner retires every device access to a
+//! storage before it drops it.
 //!
-//! Exportable device allocations (`cuMemCreate` with a shareable handle) and
-//! mappings of storage the host's Storage Server retains are recorded in a
-//! process-wide registry by address, with how long they live, so a
-//! transport can export any view of them in place
-//! ([`Storage::exportable_containing`]).
-
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, Weak};
+//! A forward reads and writes a storage through a tensor: [`Storage::external`] gives the tensor
+//! over a window of a device allocation, which execution lends for the duration of a call
+//! (`backend::external`). The tensor does not keep the allocation alive; its owner does.
 
 use std::os::fd::OwnedFd;
+use std::sync::{Arc, Mutex};
 
-use crate::{Error, Result, lock};
 use platform::{
     DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
     SegmentedMapping,
 };
+use uniserve_tensor::{DType, Shape, Tensor};
 
-/// The element type of storage.
-///
-/// The set is the one checkpoints and kernels use: the floating-point types a
-/// `dtype` or `quantization` can name, the integer types a kernel reads for
-/// What a storage plane holds.
-///
-/// Wider than the kernel ABI on purpose: storage carries initialized flags
-/// (`Bool`), block-table indices (`I32`/`I64`), scale planes (`F32`) and
-/// checkpoint element types that no kernel operand describes. Every
-/// kernel-facing dtype in an `ops`/`nn` call is [`uniserve_tensor::DType`], and
-/// [`ElementType::to_ops`] is the only bridge between the two, so a `Bool`
-/// flag or an `F64` scale plane can never silently become `U8` or `F32` in a
-/// kernel argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ElementType {
-    Bool,
-    U8,
-    I8,
-    I16,
-    I32,
-    I64,
-    U32,
-    F16,
-    BF16,
-    F32,
-    F64,
-    F8E4M3,
-    F8E5M2,
-}
+use crate::{Error, Result, lock};
 
-impl ElementType {
-    /// Storage width of one element in bytes.
-    pub fn bytes(self) -> usize {
-        match self {
-            Self::Bool | Self::U8 | Self::I8 | Self::F8E4M3 | Self::F8E5M2 => 1,
-            Self::I16 | Self::F16 | Self::BF16 => 2,
-            Self::I32 | Self::U32 | Self::F32 => 4,
-            Self::I64 | Self::F64 => 8,
-        }
-    }
-
-    /// The name a configuration, a checkpoint index or a descriptor key
-    /// spells this type with.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Bool => "bool",
-            Self::U8 => "uint8",
-            Self::I8 => "int8",
-            Self::I16 => "int16",
-            Self::I32 => "int32",
-            Self::I64 => "int64",
-            Self::U32 => "uint32",
-            Self::F16 => "float16",
-            Self::BF16 => "bfloat16",
-            Self::F32 => "float32",
-            Self::F64 => "float64",
-            Self::F8E4M3 => "float8_e4m3fn",
-            Self::F8E5M2 => "float8_e5m2",
-        }
-    }
-
-    /// The type a name spells, or `None` for a name this crate does not serve.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name.trim_start_matches("torch.") {
-            "bool" => Self::Bool,
-            "uint8" => Self::U8,
-            "int8" => Self::I8,
-            "int16" => Self::I16,
-            "int32" => Self::I32,
-            "int64" => Self::I64,
-            "uint32" => Self::U32,
-            "float16" => Self::F16,
-            "bfloat16" => Self::BF16,
-            "float32" => Self::F32,
-            "float64" => Self::F64,
-            "float8_e4m3fn" => Self::F8E4M3,
-            "float8_e5m2" => Self::F8E5M2,
-            _ => return None,
-        })
-    }
-
-    /// The type a name spells, failing for any other.
-    pub fn parse(name: &str) -> Result<Self> {
-        Self::from_name(name)
-            .ok_or_else(|| crate::Error::Invalid(format!("unknown element type {name:?}")))
-    }
-}
-
-/// The storage element type of a request message's dtype.
-impl From<proto::tensor::DType> for ElementType {
-    fn from(dtype: proto::tensor::DType) -> Self {
-        match dtype {
-            proto::tensor::DType::U8 => Self::U8,
-            proto::tensor::DType::I16 => Self::I16,
-            proto::tensor::DType::I32 => Self::I32,
-            proto::tensor::DType::I64 => Self::I64,
-            proto::tensor::DType::F16 => Self::F16,
-            proto::tensor::DType::BF16 => Self::BF16,
-            proto::tensor::DType::F32 => Self::F32,
-        }
-    }
-}
-
-impl ElementType {
-    /// The kernel operand type of this storage element, when one describes it.
-    ///
-    /// `None` for the storage-only elements: an initialized flag, a signed
-    /// 8-bit integer, or the second FP8 spelling a checkpoint uses. A view
-    /// handed to a kernel must go through this, so a storage type no kernel
-    /// reads never becomes a silently wrong operand.
-    pub fn to_ops(self) -> Option<uniserve_tensor::DType> {
-        match self {
-            Self::U8 => Some(uniserve_tensor::DType::U8),
-            Self::I32 => Some(uniserve_tensor::DType::I32),
-            Self::I64 => Some(uniserve_tensor::DType::I64),
-            Self::F16 => Some(uniserve_tensor::DType::F16),
-            Self::BF16 => Some(uniserve_tensor::DType::BF16),
-            Self::F32 => Some(uniserve_tensor::DType::F32),
-            Self::F8E4M3 => Some(uniserve_tensor::DType::F8E4M3),
-            Self::I16 => Some(uniserve_tensor::DType::I16),
-            Self::U32 => Some(uniserve_tensor::DType::U32),
-            Self::F64 => Some(uniserve_tensor::DType::F64),
-            Self::Bool | Self::I8 | Self::F8E5M2 => None,
-        }
-    }
-
-    /// The storage element a kernel operand type is stored as, when a storage
-    /// plane can hold it.
-    ///
-    /// `None` for a packed element such as [`uniserve_tensor::DType::F4`]: a packed 4-bit operand exists only as
-    /// a kernel operand. Screen storage counts bytes as elements times a whole
-    /// element size, so a plane of packed nibbles would silently halve every
-    /// byte count it feeds; such a plane is declared as its container bytes
-    /// with the packed dtype named in the descriptor instead.
-    pub fn from_kernel(dtype: uniserve_tensor::DType) -> Option<Self> {
-        Some(match dtype {
-            uniserve_tensor::DType::U8 => Self::U8,
-            uniserve_tensor::DType::I32 => Self::I32,
-            uniserve_tensor::DType::I64 => Self::I64,
-            uniserve_tensor::DType::F16 => Self::F16,
-            uniserve_tensor::DType::BF16 => Self::BF16,
-            uniserve_tensor::DType::F32 => Self::F32,
-            uniserve_tensor::DType::F8E4M3 => Self::F8E4M3,
-            uniserve_tensor::DType::I16 => Self::I16,
-            uniserve_tensor::DType::U32 => Self::U32,
-            uniserve_tensor::DType::F64 => Self::F64,
-            // A packed element, and one the tensor library adds, is no element of a plane.
-            _ => return None,
-        })
-    }
-}
-
-/// The message dtype of a storage element type, for the element types messages
-/// carry.
-impl TryFrom<ElementType> for proto::tensor::DType {
-    type Error = crate::Error;
-
-    fn try_from(dtype: ElementType) -> Result<Self> {
-        Ok(match dtype {
-            ElementType::U8 => Self::U8,
-            ElementType::I16 => Self::I16,
-            ElementType::I32 => Self::I32,
-            ElementType::I64 => Self::I64,
-            ElementType::F16 => Self::F16,
-            ElementType::BF16 => Self::BF16,
-            ElementType::F32 => Self::F32,
-            other => {
-                return Err(crate::Error::Unsupported(format!(
-                    "{} has no message dtype",
-                    other.name()
-                )));
-            }
-        })
-    }
-}
-
-/// Storage a view can borrow: a device buffer, a host allocation or a segment
-/// of either. Implementors keep the bytes valid and unmoved for as long as the
-/// value is alive.
-///
-/// Where a storage lives: the host, page-locked host storage, or a device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MemoryKind {
-    Host,
-    /// Page-locked host storage, readable by CUDA copies.
-    PinnedHost,
-    Cuda(DeviceId),
-}
-
-impl MemoryKind {
-    /// The locator spelling of transfer peers (`cuda:<ordinal>`, or `cpu` for
-    /// host storage of either kind), which consumers read back with
-    /// [`Self::from_locator`].
-    pub fn locator_name(self) -> String {
-        match self {
-            Self::Cuda(device) => format!("cuda:{}", device.0),
-            Self::Host | Self::PinnedHost => "cpu".to_owned(),
-        }
-    }
-
-    /// The storage kind a transfer locator names; `cpu` is plain host storage.
-    pub fn from_locator(locator: &str) -> Result<Self> {
-        if locator == "cpu" {
-            return Ok(Self::Host);
-        }
-        match locator.strip_prefix("cuda:") {
-            Some(ordinal) => ordinal
-                .parse::<i32>()
-                .map(|ordinal| Self::Cuda(DeviceId(ordinal)))
-                .map_err(|_| {
-                    crate::Error::Invalid(format!("transfer locator {locator:?} names no device"))
-                }),
-            None => Err(crate::Error::Invalid(format!(
-                "transfer locator {locator:?} names no storage kind"
-            ))),
-        }
-    }
-}
-
-pub trait Backing: Send + Sync + 'static {
-    fn device(&self) -> MemoryKind;
-    /// Base address: a device pointer for CUDA storage, a host pointer
-    /// otherwise.
-    fn address(&self) -> u64;
-    /// Length of the allocation in bytes.
-    fn bytes(&self) -> usize;
-    /// The most bytes one copy may address in this storage: the length of a
-    /// segment of storage mapped in segments that are unmapped apart, where
-    /// the driver refuses a copy whose range holds an unmapped segment.
-    fn copy_span(&self) -> u64 {
-        u64::MAX
-    }
-}
-
-pub fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
-    let mut strides = vec![1; shape.len()];
-    for axis in (0..shape.len().saturating_sub(1)).rev() {
-        strides[axis] = strides[axis + 1] * shape[axis + 1];
-    }
-    strides
-}
-
-/// One allocation owned by the worker: device storage, page-locked or
-/// pageable host storage, or a mapping of storage another process exported.
+/// One allocation owned by the worker: device storage, page-locked or pageable host storage, or
+/// a mapping of storage another process created.
 pub struct Storage {
     kind: Kind,
 }
 
+/// What a [`Storage`] holds.
 enum Kind {
+    /// Device storage this process created and holds.
     Device(DeviceAllocation),
+    /// Page-locked host storage, a source and destination of device copies.
     Pinned(PinnedBuffer),
-    /// Pageable host storage for computations on the host. Boxed so its address
-    /// is stable.
+    /// Pageable host storage of a rank that computes on the host. Boxed so its address is
+    /// stable.
     Host(Box<[u8]>),
-    /// Another process's (or peer device's) exported allocation mapped into
-    /// this process; for storage the Storage Server retains, with the
-    /// descriptor that maps it, which this process exports it by.
-    Mapped {
-        mapping: Mutex<PeerMapping>,
-        descriptor: Mutex<Option<OwnedFd>>,
+    /// A device allocation the Storage Server retains, mapped into this process through its
+    /// descriptor. Behind a lock because an in-place weight update replaces the physical
+    /// allocation under the mapping's address ([`Storage::rebind`]).
+    Mapped(Mutex<PeerMapping>),
+    /// Host storage the Storage Server keeps: a memfd mapped into this process and registered
+    /// for device copies.
+    HostMapped(HostMapping),
+    /// Device storage in segments mapped back to back in one reserved address range, each a
+    /// physical allocation of its own that the Storage Server retains by its descriptor,
+    /// released and mapped again at its place: a KV cache plane that gives part of its storage
+    /// back while every address stays valid.
+    Segmented {
+        device: DeviceId,
+        /// The first byte of the reserved range.
+        address: u64,
+        /// The length of the reserved range, mapped or not.
+        bytes: usize,
+        mapping: Mutex<SegmentedMapping>,
     },
-    /// Host storage the Storage Server retains: a memfd mapped into this
-    /// process and registered for device copies.
-    Retained(HostMapping),
-    /// Device storage in segments mapped back to back in one reserved range,
-    /// each a physical allocation of its own that the Storage Server retains
-    /// by its descriptor, released and mapped again at its place: a KV cache
-    /// plane that gives part of its storage back while every address stays
-    /// valid.
-    Segmented(Segments),
 }
 
-/// A segmented storage's mapping.
-struct Segments {
-    device: DeviceId,
-    address: u64,
-    bytes: usize,
-    mapping: Mutex<SegmentedMapping>,
-}
-
-/// A shared mapping of a host memfd, registered with CUDA so device copies
-/// read it directly. Read-only once published: mapped `PROT_READ` and
-/// registered `CU_MEMHOSTREGISTER_READ_ONLY`.
+/// A shared mapping of a host memfd, registered with CUDA so device copies read and write it
+/// directly.
 struct HostMapping {
     address: usize,
     bytes: usize,
-    device: DeviceId,
-    registration: Mutex<Option<HostRegistration>>,
+    /// The registration of the mapped range, ended before the range is unmapped.
+    registration: Option<HostRegistration>,
 }
 
 impl HostMapping {
-    /// Map `bytes` of `descriptor` from its start, writable or not, and
-    /// register the mapping in `device`'s context.
+    /// Maps `bytes` of `descriptor` from its start, writable or read-only, and registers the
+    /// mapping in `device`'s context.
     fn map(descriptor: &OwnedFd, bytes: usize, device: DeviceId, writable: bool) -> Result<Self> {
         use std::os::fd::AsRawFd;
 
@@ -326,8 +77,9 @@ impl HostMapping {
         } else {
             libc::PROT_READ
         };
-        // SAFETY: a new shared mapping of a descriptor this call borrows; the
-        // mapping keeps the storage alive after the descriptor closes.
+
+        // SAFETY: a new shared mapping of a descriptor this call borrows; the mapping keeps the
+        // storage alive after the descriptor closes.
         let address = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -340,101 +92,81 @@ impl HostMapping {
         };
         if address == libc::MAP_FAILED {
             return Err(Error::transport_source(
-                "mapping retained host storage",
+                "mapping host storage of the storage server",
                 std::io::Error::last_os_error(),
             ));
         }
+
+        // The mapping exists from here on, so a refused registration unmaps it on the way out.
         let mut mapping = Self {
             address: address as usize,
             bytes,
-            device,
-            registration: Mutex::new(None),
+            registration: None,
         };
-        mapping.register(writable)?;
-        Ok(mapping)
-    }
+        let pointer = mapping.address as *mut u8;
 
-    fn register(&mut self, writable: bool) -> Result<()> {
-        let pointer = self.address as *mut u8;
-        // SAFETY: the range is this mapping, which outlives the registration
-        // (`Drop` unregisters before unmapping).
+        // SAFETY: the range is this mapping, which outlives the registration: `Drop` ends the
+        // registration before it unmaps the range.
         let registration = unsafe {
             if writable {
-                HostRegistration::new(self.device, pointer, self.bytes)
+                HostRegistration::new(device, pointer, bytes)
             } else {
-                HostRegistration::read_only(self.device, pointer, self.bytes)
+                HostRegistration::read_only(device, pointer, bytes)
             }
         }?;
-        *lock(&self.registration) = Some(registration);
-        Ok(())
+        mapping.registration = Some(registration);
+
+        Ok(mapping)
     }
 }
 
 impl Drop for HostMapping {
     fn drop(&mut self) {
-        drop(lock(&self.registration).take());
-        // SAFETY: the last owner of this live mapping, unregistered above.
+        drop(self.registration.take());
+
+        // SAFETY: the last owner of this live mapping, whose registration ended above.
         unsafe { libc::munmap(self.address as *mut _, self.bytes) };
     }
 }
 
-/// Exportable allocations by base address. Entries
-/// are weak: the registry never extends an allocation's lifetime, and a
-/// dropped allocation removes its own entry.
-static EXPORTABLE: Mutex<BTreeMap<u64, Weak<Storage>>> = Mutex::new(BTreeMap::new());
-
 impl Storage {
-    /// Device storage on `device`. Contents are uninitialized.
-    pub fn device(device: DeviceId, bytes: usize) -> Result<Arc<Self>> {
+    /// Linear device storage on `device`. Contents are uninitialized.
+    pub fn linear(device: DeviceId, bytes: usize) -> Result<Arc<Self>> {
         let allocation = DeviceAllocation::linear(device, bytes)?;
+
         Ok(Arc::new(Self {
             kind: Kind::Device(allocation),
         }))
     }
 
-    /// Device storage that can be exported in place to other processes, with
-    /// read-write access for `device` and every device in `access`, kept by
-    /// the rank until it closes. The length is rounded up to the allocation
+    /// Device storage that other processes and devices can map in place, with read-write access
+    /// for `device` and every device in `access`. The length is rounded up to the allocation
     /// granularity. Contents are uninitialized.
-    pub(crate) fn exportable(
-        device: DeviceId,
-        bytes: usize,
-        access: &[DeviceId],
-    ) -> Result<Arc<Self>> {
-        Self::register_exportable(device, bytes, access)
-    }
-
-    fn register_exportable(
-        device: DeviceId,
-        bytes: usize,
-        access: &[DeviceId],
-    ) -> Result<Arc<Self>> {
+    pub fn exportable(device: DeviceId, bytes: usize, access: &[DeviceId]) -> Result<Arc<Self>> {
         let allocation = DeviceAllocation::exportable(device, bytes, access)?;
-        let address = allocation.address();
-        let storage = Arc::new(Self {
+
+        Ok(Arc::new(Self {
             kind: Kind::Device(allocation),
-        });
-        lock(&EXPORTABLE).insert(address, Arc::downgrade(&storage));
-        Ok(storage)
+        }))
     }
 
-    /// Device storage whose owner keeps fabric exports live while a Storage
-    /// Server can retain the same allocation through its POSIX descriptor.
-    pub(crate) fn retained_device(device: DeviceId, bytes: usize) -> Result<Arc<Self>> {
+    /// Device storage this process creates and holds, of the kind a Storage Server can retain
+    /// through a POSIX descriptor: a table a model writes after its load, which lives as long as
+    /// this process. The length is rounded up to the allocation granularity. Contents are
+    /// uninitialized.
+    pub fn retainable(device: DeviceId, bytes: usize) -> Result<Arc<Self>> {
         let allocation = DeviceAllocation::retainable(device, bytes, &[])?;
-        let address = allocation.address();
-        let storage = Arc::new(Self {
+
+        Ok(Arc::new(Self {
             kind: Kind::Device(allocation),
-        });
-        lock(&EXPORTABLE).insert(address, Arc::downgrade(&storage));
-        Ok(storage)
+        }))
     }
 
-    /// Every other visible device that can address `device`'s storage: the
-    /// devices an exportable allocation grants access to, so in-process
-    /// readers on those devices can copy from it.
-    pub(crate) fn peers(device: DeviceId) -> Result<Vec<DeviceId>> {
+    /// Every other visible device that can address `device`'s storage: the devices an exportable
+    /// allocation grants access to, so readers on those devices in this process copy from it.
+    pub fn peers(device: DeviceId) -> Result<Vec<DeviceId>> {
         let mut peers = Vec::new();
+
         for peer in (0..DeviceId::count()?).map(DeviceId) {
             if peer != device && peer.can_access_peer(device)? {
                 peers.push(peer);
@@ -443,10 +175,11 @@ impl Storage {
         Ok(peers)
     }
 
-    /// Page-locked host storage usable as a CUDA copy source or destination
-    /// for `device`. Contents are uninitialized.
+    /// Page-locked host storage usable as a source or destination of `device`'s copies. Contents
+    /// are uninitialized.
     pub fn pinned(device: DeviceId, bytes: usize) -> Result<Arc<Self>> {
         let buffer = PinnedBuffer::new(device, bytes)?;
+
         Ok(Arc::new(Self {
             kind: Kind::Pinned(buffer),
         }))
@@ -459,13 +192,12 @@ impl Storage {
         })
     }
 
-    /// Device storage of segments of `lengths` bytes back to back, each a
-    /// multiple of the allocation granularity, none mapped yet
-    /// ([`Storage::create_segment`], [`Storage::import_segment`]), addressed
-    /// by `device` and every device in `access` once mapped. Other
-    /// processes cannot map it as one allocation, so it is not exportable in
-    /// place: an export of it is a copy.
-    pub(crate) fn segmented(
+    /// Device storage of segments of `lengths` bytes back to back, each a multiple of the
+    /// allocation granularity, none mapped yet ([`Storage::create_segment`],
+    /// [`Storage::import_segment`]), addressed by `device` and every device in `access` once
+    /// mapped. Another process maps each segment by its own descriptor, never the storage as one
+    /// allocation.
+    pub fn segmented(
         device: DeviceId,
         lengths: &[usize],
         access: &[DeviceId],
@@ -473,94 +205,83 @@ impl Storage {
         let mapping = SegmentedMapping::reserve(device, lengths, access)?;
         let address = mapping.address();
         let bytes = mapping.len();
+
         Ok(Arc::new(Self {
-            kind: Kind::Segmented(Segments {
+            kind: Kind::Segmented {
                 device,
                 address,
                 bytes,
                 mapping: Mutex::new(mapping),
-            }),
+            },
         }))
     }
 
-    fn segments(&self) -> Result<&Segments> {
+    /// The mapping of a segmented storage.
+    fn segments(&self) -> Result<&Mutex<SegmentedMapping>> {
         match &self.kind {
-            Kind::Segmented(segments) => Ok(segments),
+            Kind::Segmented { mapping, .. } => Ok(mapping),
             _ => Err(Error::Invariant("the storage is not segmented".into())),
         }
     }
 
-    /// Creates the storage of segment `index` and returns its descriptor for
-    /// the Storage Server to retain. Contents are uninitialized.
-    pub(crate) fn create_segment(&self, index: usize) -> Result<OwnedFd> {
-        Ok(lock(&self.segments()?.mapping).create(index)?)
+    /// Creates the storage of segment `index` and returns its descriptor for the Storage Server
+    /// to retain. Contents are uninitialized.
+    pub fn create_segment(&self, index: usize) -> Result<OwnedFd> {
+        Ok(lock(self.segments()?).create(index)?)
     }
 
-    /// Maps segment `index` from the descriptor of storage another process
-    /// created and the Storage Server retains.
-    pub(crate) fn import_segment(&self, index: usize, descriptor: &OwnedFd) -> Result<()> {
-        Ok(lock(&self.segments()?.mapping).import(index, descriptor)?)
+    /// Maps segment `index` from the descriptor of storage another process created and the
+    /// Storage Server retains.
+    pub fn import_segment(&self, index: usize, descriptor: &OwnedFd) -> Result<()> {
+        Ok(lock(self.segments()?).import(index, descriptor)?)
     }
 
-    /// Maps segment `index` read-only from the descriptor of storage another
-    /// epoch writes: a fault of this process cannot change its bytes.
-    pub(crate) fn import_segment_read_only(
-        &self,
-        index: usize,
-        descriptor: &OwnedFd,
-    ) -> Result<()> {
-        Ok(lock(&self.segments()?.mapping).import_protected(
-            index,
-            descriptor,
-            Protection::ReadOnly,
-        )?)
+    /// Maps segment `index` read-only from the descriptor of storage another epoch writes: a
+    /// fault of this process cannot change its bytes.
+    pub fn import_segment_read_only(&self, index: usize, descriptor: &OwnedFd) -> Result<()> {
+        Ok(lock(self.segments()?).import_protected(index, descriptor, Protection::ReadOnly)?)
     }
 
-    /// Unmaps segment `index` at once, as its storage is given back: no
-    /// device work may access it any more.
-    pub(crate) fn release_segment(&self, index: usize) -> Result<()> {
-        Ok(lock(&self.segments()?.mapping).release(index)?)
+    /// Unmaps segment `index` at once, as its storage is given back. The caller has retired
+    /// every device access to it.
+    pub fn release_segment(&self, index: usize) -> Result<()> {
+        Ok(lock(self.segments()?).release(index)?)
     }
 
-    /// Map a **device** allocation the Storage Server retains, `bytes` long,
-    /// through its `descriptor`, with `protection` for `device` and every
-    /// device in `access`. The mapping is registered as resident exportable
-    /// storage, which this process exports in place by its descriptor.
+    /// Whether segment `index` is mapped: one that is not was given back, or was never created.
+    pub fn segment_mapped(&self, index: usize) -> Result<bool> {
+        Ok(lock(self.segments()?).is_mapped(index))
+    }
+
+    /// Maps a **device** allocation the Storage Server retains, `bytes` long, through its
+    /// `descriptor`, with `protection` for `device` and every device in `access`.
     ///
-    /// The descriptor must be one `cuMemExportToShareableHandle` produced from
-    /// a `cuMemCreate` allocation, which is what a device location's is: this
-    /// is the VMM import, and it cannot take a host record. A `Location::Host`
-    /// record's storage is a memfd, and it is mapped and registered instead by
-    /// [`Storage::map_host`]. The record's location is the rule, not this
-    /// function.
-    pub(crate) fn import(
-        descriptor: OwnedFd,
+    /// The descriptor is one `cuMemExportToShareableHandle` produced from a `cuMemCreate`
+    /// allocation, which is what the record of a device location carries. The storage of a host
+    /// location is a memfd, which [`Storage::map_host`] maps and registers; the record's
+    /// location decides between the two.
+    pub fn map_device(
+        descriptor: &OwnedFd,
         bytes: usize,
         device: DeviceId,
         access: &[DeviceId],
         protection: Protection,
     ) -> Result<Arc<Self>> {
-        let mapping = PeerMapping::import_retained(device, &descriptor, bytes, access, protection)?;
-        let address = mapping.address();
-        let storage = Arc::new(Self {
-            kind: Kind::Mapped {
-                mapping: Mutex::new(mapping),
-                descriptor: Mutex::new(Some(descriptor)),
-            },
-        });
-        lock(&EXPORTABLE).insert(address, Arc::downgrade(&storage));
-        Ok(storage)
+        let mapping = PeerMapping::import_retained(device, descriptor, bytes, access, protection)?;
+
+        Ok(Arc::new(Self {
+            kind: Kind::Mapped(Mutex::new(mapping)),
+        }))
     }
 
-    /// New device storage for the Storage Server to retain, of at least
-    /// `bytes`, mapped read-write for `device` and every device in `access`,
-    /// and the descriptor that publishes it. Contents are uninitialized.
+    /// New device storage for the Storage Server to retain, of at least `bytes`, mapped
+    /// read-write for `device` and every device in `access`, and the descriptor that publishes
+    /// it. Contents are uninitialized.
     ///
-    /// The creating allocation is released at once and the storage is used
-    /// through a mapping of its descriptor, as a later worker maps it, so
-    /// that retained storage is uniformly held through descriptors, which
-    /// NVML attributes to no process.
-    pub(crate) fn retainable(
+    /// The creating allocation is released at once and the storage is used through a mapping of
+    /// its descriptor, as a later worker maps it, so that retained storage is uniformly held
+    /// through descriptors, which NVML attributes to no process.
+    pub fn retained(
         device: DeviceId,
         bytes: usize,
         access: &[DeviceId],
@@ -569,65 +290,61 @@ impl Storage {
         let descriptor = created.export_descriptor()?.ok_or_else(|| {
             Error::Invariant("a retainable allocation exports a descriptor".into())
         })?;
-        let mapped = descriptor
-            .try_clone()
-            .map_err(|error| Error::transport_source("duplicating a descriptor", error))?;
-        let storage = Self::import(mapped, created.len(), device, access, Protection::ReadWrite)?;
+
+        let storage = Self::map_device(
+            &descriptor,
+            created.len(),
+            device,
+            access,
+            Protection::ReadWrite,
+        )?;
         drop(created);
+
         Ok((storage, descriptor))
     }
 
-    /// Map host storage the Storage Server keeps, `bytes` long, through its
-    /// `descriptor`, writable or read-only, registered in `device`'s
-    /// context: a page pool, which the rank's copies write and read.
-    pub(crate) fn map_host(
+    /// Maps host storage the Storage Server keeps, `bytes` long, through its `descriptor`,
+    /// writable or read-only, registered in `device`'s context: a page pool, which the rank's
+    /// copies write and read.
+    pub fn map_host(
         descriptor: OwnedFd,
         bytes: usize,
         device: DeviceId,
         writable: bool,
     ) -> Result<Arc<Self>> {
         let mapping = HostMapping::map(&descriptor, bytes, device, writable)?;
+
         Ok(Arc::new(Self {
-            kind: Kind::Retained(mapping),
+            kind: Kind::HostMapped(mapping),
         }))
     }
 
-    /// Puts the physical allocation `source` maps at this storage's address: a retained weight
-    /// takes another retained allocation's bytes while every pointer to it, a captured graph's
-    /// among them, stays what it was (§7.6). `source` keeps its own mapping until its owner drops
-    /// it, and this storage exports what it maps now.
+    /// Puts the physical allocation `source` maps at this storage's address, read-only: a
+    /// retained weight takes another retained allocation's bytes while every pointer to it, a
+    /// captured graph's and a weight tensor's among them, stays what it is. `source` keeps its
+    /// own mapping until its owner drops it.
     ///
-    /// No device work may read this storage during the call. A failure after the driver unmapped
-    /// the old allocation leaves the address unusable, and the caller retires the rank.
-    pub fn rebind_retained(&self, source: &Self) -> Result<()> {
-        let (
-            Kind::Mapped {
-                mapping: target,
-                descriptor: target_descriptor,
-            },
-            Kind::Mapped {
-                mapping: source,
-                descriptor: source_descriptor,
-            },
-        ) = (&self.kind, &source.kind)
-        else {
+    /// The caller has retired every device read of this storage. A failure after the driver
+    /// unmapped the allocation this storage held leaves the address unusable, and the caller
+    /// retires the rank.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] unless both storages are mappings of retained device allocations, and
+    /// two different ones; the driver's refusal.
+    pub fn rebind(&self, source: &Self) -> Result<()> {
+        let (Kind::Mapped(target), Kind::Mapped(replacement)) = (&self.kind, &source.kind) else {
             return Err(Error::State(
                 "only a retained device mapping takes another retained allocation",
             ));
         };
-        let replacement = lock(source_descriptor)
-            .as_ref()
-            .map(|descriptor| {
-                descriptor
-                    .try_clone()
-                    .map_err(|error| Error::transport_source("duplicating a descriptor", error))
-            })
-            .transpose()?
-            .ok_or(Error::State(
-                "only a retained device mapping takes another retained allocation",
-            ))?;
-        lock(target).remap_from(&lock(source), Protection::ReadOnly)?;
-        *lock(target_descriptor) = Some(replacement);
+        if std::ptr::eq(self, source) {
+            return Err(Error::State(
+                "a retained mapping does not replace its own allocation",
+            ));
+        }
+
+        lock(target).remap_from(&lock(replacement), Protection::ReadOnly)?;
         Ok(())
     }
 
@@ -635,89 +352,72 @@ impl Storage {
     ///
     /// # Safety
     ///
-    /// No device or other host access may write the returned range while the
-    /// slice is alive.
+    /// No device or other host access may write the returned range while the slice is alive.
     pub unsafe fn host_bytes(&self) -> Option<&[u8]> {
         match &self.kind {
-            Kind::Device(_) | Kind::Mapped { .. } | Kind::Segmented(_) => None,
+            Kind::Device(_) | Kind::Mapped(_) | Kind::Segmented { .. } => None,
+
             Kind::Pinned(buffer) => {
-                // SAFETY: the buffer spans `len()` bytes and is owned by `self`, which
-                // the slice borrows; the caller excludes concurrent writers.
+                // SAFETY: the buffer spans `len()` bytes and is owned by `self`, which the
+                // slice borrows; the caller excludes concurrent writers.
                 Some(unsafe { std::slice::from_raw_parts(buffer.as_ptr(), buffer.len()) })
             }
+
             Kind::Host(bytes) => Some(bytes),
-            // SAFETY: the mapping spans `bytes` and is owned by `self`; the
-            // caller excludes concurrent writers.
-            Kind::Retained(mapping) => Some(unsafe {
-                std::slice::from_raw_parts(mapping.address as *const u8, mapping.bytes)
-            }),
-        }
-    }
-}
 
-impl Drop for Storage {
-    fn drop(&mut self) {
-        let registered = match &self.kind {
-            Kind::Device(allocation) if allocation.handle_type().is_some() => {
-                Some(allocation.address())
-            }
-            Kind::Mapped {
-                mapping,
-                descriptor,
-            } if lock(descriptor).is_some() => Some(lock(mapping).address()),
-            _ => None,
-        };
-        if let Some(address) = registered {
-            let mut registry = lock(&EXPORTABLE);
-            // A new allocation may already reuse the address; remove only a
-            // dead entry.
-            if registry
-                .get(&address)
-                .is_some_and(|entry| entry.strong_count() == 0)
-            {
-                registry.remove(&address);
+            Kind::HostMapped(mapping) => {
+                let first = mapping.address as *const u8;
+
+                // SAFETY: the mapping spans `bytes` and is owned by `self`, which the slice
+                // borrows; the caller excludes concurrent writers.
+                Some(unsafe { std::slice::from_raw_parts(first, mapping.bytes) })
             }
         }
     }
-}
 
-impl Backing for Storage {
-    fn device(&self) -> MemoryKind {
+    /// The device the allocation is on; `None` for host storage, page-locked or not.
+    pub fn device(&self) -> Option<DeviceId> {
         match &self.kind {
-            Kind::Device(allocation) => MemoryKind::Cuda(allocation.device()),
-            Kind::Mapped { mapping, .. } => MemoryKind::Cuda(lock(mapping).device()),
-            Kind::Segmented(segments) => MemoryKind::Cuda(segments.device),
-            Kind::Pinned(_) | Kind::Retained(_) => MemoryKind::PinnedHost,
-            Kind::Host(_) => MemoryKind::Host,
+            Kind::Device(allocation) => Some(allocation.device()),
+            Kind::Mapped(mapping) => Some(lock(mapping).device()),
+            Kind::Segmented { device, .. } => Some(*device),
+            Kind::Pinned(_) | Kind::HostMapped(_) | Kind::Host(_) => None,
         }
     }
 
-    fn address(&self) -> u64 {
+    /// The address of the first byte: a device pointer for device storage, a host pointer
+    /// otherwise.
+    pub fn address(&self) -> u64 {
         match &self.kind {
             Kind::Device(allocation) => allocation.address(),
-            Kind::Mapped { mapping, .. } => lock(mapping).address(),
-            Kind::Segmented(segments) => segments.address,
+            Kind::Mapped(mapping) => lock(mapping).address(),
+            Kind::Segmented { address, .. } => *address,
             Kind::Pinned(buffer) => buffer.address(),
             Kind::Host(bytes) => bytes.as_ptr() as u64,
-            Kind::Retained(mapping) => mapping.address as u64,
+            Kind::HostMapped(mapping) => mapping.address as u64,
         }
     }
 
-    fn bytes(&self) -> usize {
+    /// The length of the allocation in bytes.
+    pub fn bytes(&self) -> usize {
         match &self.kind {
             Kind::Device(allocation) => allocation.len(),
-            Kind::Mapped { mapping, .. } => lock(mapping).len(),
-            Kind::Segmented(segments) => segments.bytes,
+            Kind::Mapped(mapping) => lock(mapping).len(),
+            Kind::Segmented { bytes, .. } => *bytes,
             Kind::Pinned(buffer) => buffer.len(),
             Kind::Host(bytes) => bytes.len(),
-            Kind::Retained(mapping) => mapping.bytes,
+            Kind::HostMapped(mapping) => mapping.bytes,
         }
     }
 
-    fn copy_span(&self) -> u64 {
+    /// The most bytes one copy may address in this storage: the length of the shortest segment
+    /// of a segmented storage, whose segments are unmapped apart and where the driver refuses a
+    /// copy whose range holds an unmapped segment; no bound for any other storage.
+    pub fn copy_span(&self) -> u64 {
         match &self.kind {
-            Kind::Segmented(segments) => {
-                let mapping = lock(&segments.mapping);
+            Kind::Segmented { mapping, .. } => {
+                let mapping = lock(mapping);
+
                 (0..mapping.segments())
                     .map(|index| mapping.segment_len(index) as u64)
                     .min()
@@ -726,131 +426,66 @@ impl Backing for Storage {
             _ => u64::MAX,
         }
     }
-}
 
-/// A typed, strided window into an allocation.
-///
-/// `offset` is in bytes; `shape` and `strides` are in elements. Construction
-/// checks that the window lies inside its allocation.
-///
-/// Narrowing an axis to its whole extent returns the view itself.
-#[derive(Clone)]
-pub struct StorageView {
-    storage: Arc<dyn Backing>,
-    offset: usize,
-    dtype: ElementType,
-    shape: Vec<i64>,
-    strides: Vec<i64>,
-}
-
-impl StorageView {
-    /// A contiguous view of `shape` starting `offset` bytes into `storage`.
-    pub fn contiguous(
-        storage: Arc<dyn Backing>,
+    /// The tensor of `shape` elements of `dtype` whose first element lies `offset` bytes into
+    /// this allocation: memory execution owns and lends to a forward (`backend::external`). A
+    /// strided window is a view of the tensor this returns.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invariant`] when the elements reach past the allocation; [`Error::Unsupported`]
+    /// for host storage, which no kernel addresses, and for an element narrower than a byte,
+    /// whose plane is stated as the bytes that hold it.
+    ///
+    /// # Safety
+    ///
+    /// The caller keeps this storage alive, its window mapped, and the window's bytes unwritten
+    /// by anything but the kernels launched on the tensor, until every tensor over the window
+    /// is dropped and the stream work issued on them, including the replays of a graph captured
+    /// over them, has completed.
+    pub unsafe fn external(
+        &self,
         offset: usize,
-        dtype: ElementType,
-        shape: &[i64],
-    ) -> Result<Self> {
-        Self::strided(storage, offset, dtype, shape, &contiguous_strides(shape))
-    }
+        shape: impl Into<Shape>,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let shape = shape.into();
+        let element = ops::abi::bytes(dtype).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{} has no whole-byte element: its plane is stated as the bytes that hold it",
+                ops::abi::name(dtype)
+            ))
+        })?;
 
-    pub(crate) fn strided(
-        storage: Arc<dyn Backing>,
-        offset: usize,
-        dtype: ElementType,
-        shape: &[i64],
-        strides: &[i64],
-    ) -> Result<Self> {
-        if shape.len() != strides.len() {
-            return Err(Error::Invariant(
-                "a view needs one stride per dimension".to_owned(),
-            ));
-        }
-        let view = Self {
-            storage,
-            offset,
-            dtype,
-            shape: shape.to_vec(),
-            strides: strides.to_vec(),
-        };
-        view.byte_len()?;
-        Ok(view)
-    }
-
-    /// The allocation this view retains.
-    pub fn storage(&self) -> &Arc<dyn Backing> {
-        &self.storage
-    }
-
-    pub(crate) fn device(&self) -> MemoryKind {
-        self.storage.device()
-    }
-
-    pub fn dtype(&self) -> ElementType {
-        self.dtype
-    }
-
-    pub fn shape(&self) -> &[i64] {
-        &self.shape
-    }
-
-    pub(crate) fn strides(&self) -> &[i64] {
-        &self.strides
-    }
-
-    /// Address of the first element.
-    pub fn address(&self) -> u64 {
-        self.storage.address() + self.offset as u64
-    }
-
-    /// Elements addressed by the view.
-    pub fn numel(&self) -> u64 {
-        self.shape.iter().map(|&extent| extent as u64).product()
-    }
-
-    /// Bytes from the first to one past the last element.
-    pub fn byte_len(&self) -> Result<usize> {
-        if self.shape.contains(&0) {
-            return Ok(0);
-        }
-        if self
-            .shape
-            .iter()
-            .chain(&self.strides)
-            .any(|&value| value < 0)
-        {
-            return Err(Error::Invariant(
-                "views require non-negative extents and strides".to_owned(),
-            ));
-        }
-        let last: i64 = self
-            .shape
-            .iter()
-            .zip(&self.strides)
-            .map(|(&extent, &stride)| (extent - 1) * stride)
-            .sum();
-        let bytes = (last as usize + 1) * self.dtype.bytes();
-        if self.offset + bytes > self.storage.bytes() {
+        let end = (shape.elem_count() as u64)
+            .checked_mul(element)
+            .and_then(|bytes| bytes.checked_add(offset as u64));
+        if end.is_none_or(|end| end > self.bytes() as u64) {
             return Err(Error::Invariant(format!(
-                "a view of {bytes} bytes at offset {} exceeds its {}-byte allocation",
-                self.offset,
-                self.storage.bytes()
+                "{:?} elements of {} at byte {offset} reach past an allocation of {} bytes",
+                shape.dims(),
+                ops::abi::name(dtype),
+                self.bytes()
             )));
         }
-        Ok(bytes)
-    }
-}
 
-impl std::fmt::Debug for StorageView {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("StorageView")
-            .field("device", &self.device())
-            .field("offset", &self.offset)
-            .field("dtype", &self.dtype)
-            .field("shape", &self.shape)
-            .field("strides", &self.strides)
-            .finish()
+        let Some(device) = self.device() else {
+            return Err(Error::Unsupported(
+                "host storage is no tensor of a device: a kernel addresses device storage".into(),
+            ));
+        };
+
+        // SAFETY: the window lies inside this allocation, as checked above, and the caller
+        // keeps it valid and unwritten for as long as the tensor's work may read it.
+        let tensor = unsafe {
+            backend::external(
+                self.address() + offset as u64,
+                shape,
+                dtype,
+                &backend::cuda(device.0 as usize),
+            )
+        }?;
+        Ok(tensor)
     }
 }
 
@@ -858,91 +493,22 @@ impl std::fmt::Debug for StorageView {
 mod tests {
     use super::*;
 
+    /// A window is checked against its allocation before anything else, so a tensor never
+    /// addresses bytes its storage does not hold; host storage, which holds the window, is then
+    /// refused as no device's.
     #[test]
-    fn views_stay_inside_their_allocation() -> Result<()> {
-        let storage: Arc<dyn Backing> = Storage::host(64);
-        assert!(
-            StorageView::contiguous(Arc::clone(&storage), 0, ElementType::F32, &[4, 4]).is_ok()
-        );
-        assert!(
-            StorageView::contiguous(Arc::clone(&storage), 4, ElementType::F32, &[4, 4]).is_err()
-        );
+    fn a_window_stays_inside_its_allocation() {
+        let storage = Storage::host(64);
 
-        Ok(())
-    }
+        // SAFETY: neither call returns a tensor.
+        let (inside, outside) = unsafe {
+            (
+                storage.external(0, (4, 4), DType::F32),
+                storage.external(4, (4, 4), DType::F32),
+            )
+        };
 
-    #[test]
-    fn dtype_names_round_trip() -> Result<()> {
-        for dtype in [
-            ElementType::Bool,
-            ElementType::U8,
-            ElementType::BF16,
-            ElementType::F8E4M3,
-            ElementType::F64,
-        ] {
-            assert_eq!(ElementType::parse(dtype.name())?, dtype);
-        }
-        assert!(ElementType::parse("complex64").is_err());
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod element_type_tests {
-    use super::ElementType;
-
-    /// The ten element types the kernel ABI describes, and the three storage
-    /// carries that no kernel operand names.
-    const KERNEL: [ElementType; 10] = [
-        ElementType::U8,
-        ElementType::U32,
-        ElementType::I32,
-        ElementType::I64,
-        ElementType::I16,
-        ElementType::F16,
-        ElementType::BF16,
-        ElementType::F32,
-        ElementType::F64,
-        ElementType::F8E4M3,
-    ];
-    const STORAGE_ONLY: [ElementType; 3] =
-        [ElementType::Bool, ElementType::I8, ElementType::F8E5M2];
-
-    #[test]
-    fn only_the_kernel_element_types_reach_a_kernel_operand() {
-        for element in KERNEL {
-            assert!(
-                element.to_ops().is_some(),
-                "{element:?} is a kernel element type"
-            );
-        }
-        for element in STORAGE_ONLY {
-            assert!(
-                element.to_ops().is_none(),
-                "{element:?} has no kernel operand type and must not become one"
-            );
-        }
-    }
-
-    #[test]
-    fn every_storable_kernel_element_type_round_trips_and_packed_fp4_has_no_plane() {
-        let storable = [
-            uniserve_tensor::DType::U8,
-            uniserve_tensor::DType::U32,
-            uniserve_tensor::DType::I32,
-            uniserve_tensor::DType::I64,
-            uniserve_tensor::DType::F16,
-            uniserve_tensor::DType::BF16,
-            uniserve_tensor::DType::F32,
-            uniserve_tensor::DType::F64,
-            uniserve_tensor::DType::F8E4M3,
-        ];
-        for dtype in storable {
-            let element = ElementType::from_kernel(dtype)
-                .unwrap_or_else(|| panic!("{dtype:?} is a storage element too"));
-            assert_eq!(element.to_ops(), Some(dtype), "{dtype:?} must round-trip");
-        }
-        // A packed 4-bit operand is a kernel operand only: no plane of it exists.
-        assert_eq!(ElementType::from_kernel(uniserve_tensor::DType::F4), None);
+        assert!(matches!(inside, Err(Error::Unsupported(_))));
+        assert!(matches!(outside, Err(Error::Invariant(_))));
     }
 }

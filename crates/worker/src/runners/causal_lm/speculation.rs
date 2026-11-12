@@ -1,1722 +1,1326 @@
-//! Speculative decoding with the model's own drafter: the eager step a speculating deployment
-//! serves every token batch with.
+//! Speculative decoding with the model's own drafter: the verification buckets, the drafter's
+//! bucket, and the memory that joins them.
 //!
-//! A deployment that speculates (`speculative_config.num_draft_tokens` above zero) keeps the draft
-//! cache in its pool and serves each batch in one eager step of four stages, separated by the two
-//! host readbacks the step needs:
+//! A runner whose config states drafts ([`CausalLmConfig::drafts`](super::CausalLmConfig))
+//! serves every step in two captured graphs, issued back to back on its stream:
 //!
 //! ```text
-//! target    the model over the batch: a prompt batch as it is; a verification's tokens each as a
-//!           one-token attention row (a decode step's shape at its position) while one state row
-//!           per call walks them in order and keeps the recurrent state after every token (the
-//!           trail)
-//! sample    every sampled position through the sampling module: a verification samples each of
-//!           its tokens, with the drafts before it counted in the row's penalties
-//!                                         ── readback: the sampled tokens ──
-//! accept    per verification, the longest prefix of drafts its own samples agree with, then the
-//!           sample after it; settle each slot's recurrent state on the trail's entry of its last
-//!           accepted token; commit the accepted tokens into the slots' state (`slot_commit`)
-//! draft     the drafter's entries over the positions whose next token is now known, then the
-//!           drafts each call proposes, chained step by step on the device
-//!                                         ── readback: the proposals, the slots' positions ──
+//! target    a prompt batch from its prefill bucket, or a verification batch from a
+//!           verification bucket: each token of a verification is one attention row (the decode
+//!           step at its position) and one sampling row, while one state row per verification
+//!           advances the recurrent state through its tokens and keeps the state after each
+//!           (the trail). The graph samples every token, accepts on the device the drafts its
+//!           own samples agree with, settles the recurrent state on the trail's entry of the
+//!           last accepted token, and commits (`slot_commit`: the verification's row, then a
+//!           count row per accepted draft).
+//! drafter   the drafter's bucket of the same rows and tokens: its entries over the positions
+//!           whose next token the target left, then the drafts each row proposes, each chained
+//!           step embedding the proposal of the step before it.
 //! ```
 //!
-//! ## Why the acceptance keeps the target distribution
+//! Nothing is read back between the two. What the drafter's graph and the completion read of
+//! the target's is kept in memory this module owns ([`Kept`]), because a forward's own tensors
+//! are the allocator's and the next forward takes them again: the target's hidden rows, its
+//! chosen tokens with their scores, and each verification's agreed length. Both forwards
+//! depend on their bucket alone for their launches, shapes and copies: draft counts, accepted
+//! lengths, entries, the draft cache's pages and the chained positions are input columns
+//! ([`fill_verification`], [`fill_drafter`]) or are computed on the device from them.
 //!
-//! The drafter proposes deterministically (the argmax of its logits), so the draft distribution
-//! `q` is a point mass at the draft `d`. The rejection rule (Leviathan et al. 2023; vLLM's and
-//! SGLang's rejection samplers) accepts `d` with probability `min(1, p(d)/q(d)) = p(d)` and on
-//! rejection draws from `norm(max(0, p - q))`, which is `p` with `d` removed. Drawing `x ~ p` and
-//! accepting exactly when `x = d` has the same law: `P(x = d) = p(d)`, and given `x ≠ d`, `x` is
-//! distributed as `p` without `d`. Each position draws with the uniform its request's seed and the
-//! position address (`ipc::philox`), the draw a decode at that position makes, so a speculated run
-//! of a seeded request reproduces itself, and a greedy request's verification takes the argmax a
-//! decode would: its accepted tokens are the tokens it generates without speculation, up to the
-//! decode kernels rounding a verification's rows in another order than one decode row.
+//! ## Acceptance keeps the target distribution
 //!
-//! ## What is the model's and what is the runner's
+//! The drafter proposes deterministically (the argmax of its logits), so the draft
+//! distribution `q` is a point mass at the draft `d`. The rejection rule (Leviathan et al.
+//! 2023; vLLM's and SGLang's rejection samplers) accepts `d` with probability
+//! `min(1, p(d) / q(d)) = p(d)` and on rejection draws from `norm(max(0, p - q))`, which is `p`
+//! with `d` removed. Drawing `x ~ p` and accepting exactly when `x = d` has the same law:
+//! `P(x = d) = p(d)`, and given `x ≠ d`, `x` is distributed as `p` without `d`. Each position
+//! draws with the uniform of its request's stream at the position's address (`ipc::philox`),
+//! the draw a decode at that position makes, so a speculated run of a seeded request
+//! reproduces itself, and a greedy request's verification takes the argmax a decode would.
 //!
-//! The model computes its forward and its drafter's ([`nn::family::Drafter`]); which positions an
-//! entry covers, the draft cache's pages, the acceptance, the commit and the state's settling are
-//! this runner's, as `AGENTS.md`'s Model Library Boundary assigns them.
+//! ## On the device
+//!
+//! ```text
+//! agrees  [T]      = chosen == Drafts            a row's last token names no draft
+//! run     [R, D+1] = agrees gathered by Windows  offset j of row r, zero from its last token on
+//! agreed  [R]      = argmin(run)                 the first offset that disagrees
+//! last    [R]      = Firsts + agreed             the token whose sample ends the accepted prefix
+//! ```
+//!
+//! A verification commits `agreed + 1` tokens: its agreed drafts and the sample after them.
+//! The drafter's entry at offset `j` of a verification is written when `j <= agreed`, reads
+//! the token chosen at that offset, and the row's first proposal reads the entry at `agreed`.
+//!
+//! ## The draft cache
+//!
+//! The drafter's keys and values lie in the pool's draft group, which has no pooled page
+//! table: a row's table is stated per step, from the pages the scheduler installed for its
+//! request slot ([`DraftPool`], [`DraftPages`]).
+//!
+//! ## What is refused
+//!
+//! A runner that speculates joins no expert union, serves no paired forward of a verification
+//! (its token rows share one request's pages, and the scratch set gives each row its own), and
+//! refuses a draft cache refill of a model that keeps a recurrent state, which would need a
+//! scratch state per refill row.
 
-use std::ops::Range;
-use std::time::Instant;
+use std::sync::Arc;
 
-use ipc::execution::{BatchOutput, CallOutput, RowKind, RowState};
-use ipc::philox::DrawAddress;
-use ipc::{DraftWork, TimingCounters};
-use nn::family::TextModel;
-use nn::{Forward, KvView, TokenBatch};
-use ops::{Operand, Shape};
-use platform::DeviceId;
-use proto::module::PhaseKind;
-use proto::module::commit::{COMMIT_FIELDS, column, mode};
-use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
-use uniserve_tensor::DType;
-
-use super::{ATTENTION_WORKSPACE_BYTES, CausalLmRunner, LOGITS_DTYPE};
-use crate::runner::Runner;
-use crate::runners::columns::{Column, encode_f32, encode_i32};
-use crate::runners::recording::{Footprint, Walk};
-use crate::runners::sampling::{
-    SamplerState, Samples, Scores, TopLogprobs, commit_block, commit_descriptor, scored,
+use ipc::execution::{
+    Batch, BatchColumns, BatchRow, BatchRows, CallOutput, LogitAdjustments, RowKind,
 };
-use crate::runners::state::StateRows;
+use ipc::philox::DrawAddress;
+use ipc::{CallStatus, DraftWork};
+use nn::{KvCache, NO_SLOT, PhaseKind, RecurrentState, TokenBatch, functional};
+use platform::Stream;
+use proto::module::commit::{COMMIT_FIELDS, column, mode};
+use proto::module::sampler::PARAMETER_COLUMNS;
+use uniserve_tensor::{DType, Shape, Tensor};
+
+use super::columns::{self, Column, Layout, slot_row};
+use super::{CausalLmRunner, StateBuffers};
+use crate::buckets::Bucket;
+use crate::memory::allocation::Storage;
+use crate::memory::cache::CacheLayout;
+use crate::sampler::{self, Sampler};
 use crate::{Error, Result};
 
-/// Sampling parameter columns of one row.
-const COLUMNS: usize = PARAMETER_COLUMNS as usize;
+/// The alignment of a kept tensor in its memory.
+const ALIGNMENT: u64 = backend::allocator::ALIGNMENT;
 
-/// The draft cache's geometry in the pool, read from the cache plan when the runner binds.
-#[derive(Clone, Copy, Debug)]
-struct DraftPool {
+/// The kept tensors, in the order they lie in their memory. The first twelve are the entries
+/// of a sampling forward's outputs in their order (`output`).
+pub(crate) const KEPT: usize = 14;
+pub(crate) const CHOSEN: usize = 0;
+pub(crate) const LOGPROBS: usize = 1;
+pub(crate) const RANKS: usize = 2;
+pub(crate) const LOGICAL: usize = 3;
+pub(crate) const SAMPLING: usize = 4;
+pub(crate) const TOP_VALUES: usize = 5;
+pub(crate) const TOP_IDS: usize = 6;
+pub(crate) const VALID: usize = 7;
+pub(crate) const PROMPT_LOGPROBS: usize = 8;
+pub(crate) const PROMPT_RANKS: usize = 9;
+pub(crate) const PROMPT_VALUES: usize = 10;
+pub(crate) const PROMPT_IDS: usize = 11;
+pub(crate) const AGREED: usize = 12;
+pub(crate) const HIDDEN: usize = 13;
+
+/// The sampling parameters of a row that states none: a greedy row.
+const NO_PARAMETERS: [f32; PARAMETER_COLUMNS as usize] = [0.0; PARAMETER_COLUMNS as usize];
+
+/// How the draft cache lies in the unit pool: the cache layout's statement of its draft group,
+/// read once ([`DraftPool::of`]).
+///
+/// A drafter has fewer layers than a unit has columns, so each of its layers lies over `span`
+/// columns of a unit: a draft page of the scheduler holds `span` runs of `page` tokens, and
+/// the drafter's attention reads run `c` of the draft page in unit `u` as page
+/// `c · units + u`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DraftPool {
     /// The draft group's index among the cache groups.
-    group: u32,
-    /// K/V pages of `page` tokens one draft page holds (`CachePlan::draft_span`).
-    span: u32,
-    /// Tokens of one K/V page, which the drafter's attention reads a draft page in.
-    page: u32,
-    /// Units of the pool: a draft layer's page `c · units + u` is run `c` of the draft page in unit
-    /// `u`.
-    units: u32,
+    pub group: u32,
+    /// The runs of `page` tokens one draft page holds.
+    pub span: u32,
+    /// Tokens of one page as the drafter's attention reads it.
+    pub page: u32,
+    /// Units of the pool.
+    pub units: u32,
 }
 
 impl DraftPool {
-    /// The attention page of position `position` in a draft table of `first` page and `units`, and
-    /// whether the table holds a unit there.
-    fn page(&self, first: u32, units: &[u32], position: u32) -> (i32, bool) {
+    /// The draft pool of a cache of `layout` over `units` units.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a layout that keeps no draft group: the model's drafter states
+    /// no cache.
+    pub fn of(layout: &CacheLayout, units: u32) -> Result<Self> {
+        let stated = layout.draft_group().zip(layout.draft_span());
+        let Some((group, span)) = stated.filter(|(_, span)| *span > 0) else {
+            return Err(Error::Invalid(
+                "the deployment speculates and its cache keeps no draft group".into(),
+            ));
+        };
+
+        Ok(Self {
+            group: group as u32,
+            span,
+            page: layout.groups[group].block_size / span,
+            units,
+        })
+    }
+
+    /// The pages a row of the drafter's page table holds for sequences of at most
+    /// `max_kv_len` keys.
+    pub const fn width(&self, max_kv_len: u32) -> u32 {
+        max_kv_len.div_ceil(if self.page == 0 { 1 } else { self.page })
+    }
+
+    /// The drafter's page of `position` in a table whose first draft page is `first` and
+    /// whose pages lie in `units`, and whether the table holds a unit there.
+    fn page_of(&self, first: u32, units: &[u32], position: u32) -> (u32, bool) {
         let tokens = self.page * self.span;
         let draft_page = position / tokens;
         let run = (position % tokens) / self.page;
+
         let unit = draft_page
             .checked_sub(first)
             .and_then(|held| units.get(held as usize).copied())
             .unwrap_or(0);
-        ((run * self.units + unit) as i32, unit != 0)
+        (run * self.units + unit, unit != 0)
     }
 
-    /// The cache slot the drafter writes position `position` of a table at, `-1` where the table
-    /// holds no unit: the entry is then not written, and the draft cache does not count it.
-    fn slot(&self, first: u32, units: &[u32], position: u32) -> i32 {
-        match self.page(first, units, position) {
-            (page, true) => page * self.page as i32 + (position % self.page) as i32,
-            _ => -1,
+    /// The cache slot the drafter writes `position` at, [`NO_SLOT`] where the table holds no
+    /// unit: the entry is then not written.
+    pub(crate) fn slot(&self, first: u32, units: &[u32], position: u32) -> u32 {
+        match self.page_of(first, units, position) {
+            (page, true) => page * self.page + position % self.page,
+            _ => NO_SLOT,
         }
     }
 
-    /// One row of the drafter's block table: the attention page of every page of `width`.
-    fn row(&self, first: u32, units: &[u32], width: u32, out: &mut Vec<i32>) {
-        for page in 0..width {
-            out.push(self.page(first, units, page * self.page).0);
-        }
+    /// One row of the drafter's page table: the page of each of its `width` pages, the
+    /// padding unit's where the table holds none.
+    pub(crate) fn row(&self, first: u32, units: &[u32], width: u32, out: &mut Vec<u32>) {
+        out.extend((0..width).map(|page| self.page_of(first, units, page * self.page).0));
     }
 }
 
-/// One call of a step, as the step evaluates it.
-#[derive(Clone, Debug, Default)]
-struct CallPlan {
-    /// The call's request slot.
-    slot: i32,
-    /// What the call computes.
-    kind: Option<RowKind>,
-    /// The call's rows among the staged batch's.
-    rows: Range<usize>,
-    /// The call's tokens among the batch's.
-    tokens: Range<usize>,
-    /// The position of its first token.
-    start: u32,
-    /// The drafts a verification verifies: its tokens after its first.
-    drafts: Vec<i32>,
-    /// Its rows of the sampling step.
-    samples: Range<usize>,
-    /// What it does for its request's draft cache.
-    draft: DraftWork,
+/// What states the pages a request slot holds in the draft group, as the scheduler last
+/// installed them: its first draft page and the units of the pages from there on; `None` for a
+/// slot that holds none ([`CausalLmRunner::set_draft_pages`]). A table the batch being served
+/// carries is read from the batch itself.
+pub type DraftPages = Box<dyn FnMut(u32) -> Option<(u32, Vec<u32>)> + Send>;
+
+/// What a target forward leaves for the drafter's forward and for the completion, in memory
+/// the runner owns: one tensor per entry of the sampling outputs, each verification's agreed
+/// length, and the hidden rows (module documentation).
+pub(crate) struct Kept {
+    /// Each kept tensor, in the order of the entry constants.
+    tensors: [Tensor; KEPT],
+    /// The tensors' memory; `None` for a runner whose graphs hold no device.
+    _storage: Option<Arc<Storage>>,
 }
 
-/// One row of the sampling step.
-#[derive(Clone, Debug)]
-struct SampleRow {
-    /// The token of the batch whose hidden state it projects.
-    hidden: i32,
-    slot: i32,
-    parameters: [f32; COLUMNS],
-    draw: DrawAddress,
-    /// The tokens before it its penalties count beyond the slot's history: a verification's drafts
-    /// ahead of the position, `-1` elsewhere; `drafts` of them.
-    extras: Vec<i32>,
-    /// Its logit adjustments, its staged row's: the bias flag and the ban mask's index. Every row of
-    /// a verification samples under its call's bans, which the scheduler keeps uniform over the
-    /// drafts it verifies.
-    adjustment: [i32; 2],
-}
-
-/// One step's plan, read from the staged batch.
-#[derive(Debug, Default)]
-struct Plan {
-    /// Whether the batch verifies: its tokens attend as one-token rows of the decode phase.
-    verify: bool,
-    calls: Vec<CallPlan>,
-    samples: Vec<SampleRow>,
-    /// The batch's tokens.
+/// The shape and the element type of each kept tensor, for sampling rows `rows`, `tokens`
+/// tokens, `candidates` reported candidates and hidden rows of `hidden` elements of `dtype`.
+fn kept_shapes(
+    rows: usize,
     tokens: usize,
-}
-
-/// What a call accepted: its committed tokens and their scores (`sampling::scored`).
-#[derive(Clone, Debug, Default)]
-struct Accepted {
-    tokens: Vec<u32>,
-    logprobs: Vec<Vec<ipc::TokenLogprob>>,
-}
-
-/// One launch sequence's scores of its sampled tokens, in columns the host reads back: each
-/// token's log-probability and rank, and its row's most likely tokens.
-struct ScoreColumns {
-    logprobs: Column,
-    ranks: Column,
-    /// `[tokens, candidates]` f32 and i32, for a sampler that reports candidates.
-    values: Option<Column>,
-    ids: Option<Column>,
     candidates: u32,
+    hidden: u32,
+    dtype: DType,
+) -> [(Shape, DType); KEPT] {
+    // A runner that reports no candidate keeps one unread column.
+    let width = candidates.max(1) as usize;
+
+    [
+        (rows.into(), DType::U32),
+        (rows.into(), DType::F32),
+        (rows.into(), DType::I32),
+        (rows.into(), DType::I32),
+        (rows.into(), DType::I32),
+        ((rows, width).into(), DType::F32),
+        ((rows, width).into(), DType::U32),
+        (rows.into(), DType::I32),
+        (tokens.into(), DType::F32),
+        (tokens.into(), DType::I32),
+        ((tokens, width).into(), DType::F32),
+        ((tokens, width).into(), DType::U32),
+        (rows.into(), DType::U32),
+        ((tokens, hidden as usize).into(), dtype),
+    ]
 }
 
-impl ScoreColumns {
-    fn new(device: DeviceId, tokens: u64, candidates: u32) -> Result<Self> {
-        let wide = tokens * u64::from(candidates);
+/// Each kept tensor's offset in its memory, and the memory's bytes.
+fn kept_offsets(shapes: &[(Shape, DType); KEPT]) -> Result<([u64; KEPT], u64)> {
+    let mut offsets = [0; KEPT];
+    let mut bytes = 0_u64;
+
+    for (offset, (shape, dtype)) in offsets.iter_mut().zip(shapes) {
+        *offset = bytes;
+
+        let element = ops::abi::bytes(*dtype).ok_or_else(|| {
+            Error::Invalid(format!(
+                "hidden rows of {} have no whole-byte layout to keep",
+                ops::abi::name(*dtype)
+            ))
+        })?;
+        bytes += (shape.elem_count() as u64 * element).next_multiple_of(ALIGNMENT);
+    }
+    Ok((offsets, bytes))
+}
+
+impl Kept {
+    /// The bytes of device memory the kept tensors take.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for hidden rows of an element type with no whole-byte layout.
+    pub(crate) fn bytes(
+        rows: usize,
+        tokens: usize,
+        candidates: u32,
+        hidden: u32,
+        dtype: DType,
+    ) -> Result<u64> {
+        Ok(kept_offsets(&kept_shapes(rows, tokens, candidates, hidden, dtype))?.1)
+    }
+
+    /// The zeroed kept tensors. `stream` is the stream the runner's graphs replay on, and
+    /// `None` for graphs that hold no device: the tensors are then meta tensors.
+    ///
+    /// # Errors
+    ///
+    /// As [`Kept::bytes`]; the driver's refusal of the allocation or of the fill.
+    pub(crate) fn new(
+        stream: Option<&Stream>,
+        rows: usize,
+        tokens: usize,
+        candidates: u32,
+        hidden: u32,
+        dtype: DType,
+    ) -> Result<Self> {
+        let shapes = kept_shapes(rows, tokens, candidates, hidden, dtype);
+        let (offsets, bytes) = kept_offsets(&shapes)?;
+
+        let mut tensors = Vec::with_capacity(KEPT);
+        let storage = match stream {
+            Some(stream) => {
+                let bytes = usize::try_from(bytes).map_err(|_| {
+                    Error::Invalid("the kept outputs are larger than memory".into())
+                })?;
+                let storage = Storage::linear(stream.device(), bytes)?;
+
+                // The drafter's graph gathers from the kept tokens and agreed lengths by
+                // columns that name no row for a prompt, and its idle forward reads the
+                // hidden rows before any target wrote them: every byte starts defined.
+                //
+                // SAFETY: the range is the whole allocation, which this value keeps for as
+                // long as the tensors over it exist.
+                unsafe { platform::memset_d8(storage.address(), 0, bytes, stream) }?;
+
+                for ((shape, dtype), offset) in shapes.into_iter().zip(offsets) {
+                    // SAFETY: this value owns the storage and outlives the tensors' work:
+                    // the runner that holds it holds the graphs captured over them, and
+                    // only the kernels of those graphs write the tensors.
+                    tensors.push(unsafe { storage.external(offset as usize, shape, dtype) }?);
+                }
+                Some(storage)
+            }
+            None => {
+                let meta = backend::meta();
+                for (shape, dtype) in shapes {
+                    // SAFETY: a tensor over the meta device has no memory: its address is
+                    // never read or written.
+                    tensors.push(unsafe { backend::external(0, shape, dtype, &meta) }?);
+                }
+                None
+            }
+        };
+
         Ok(Self {
-            logprobs: Column::new(device, DType::F32, tokens.max(1))?,
-            ranks: Column::new(device, DType::I32, tokens.max(1))?,
-            values: (candidates > 0)
-                .then(|| Column::new(device, DType::F32, wide))
-                .transpose()?,
-            ids: (candidates > 0)
-                .then(|| Column::new(device, DType::I32, wide))
-                .transpose()?,
-            candidates,
+            tensors: tensors.try_into().map_err(|_| {
+                Error::Invariant("the kept outputs hold another number of tensors".into())
+            })?,
+            _storage: storage,
         })
     }
 
-    /// The scores of `rows` rows of a `vocabulary`-wide distribution, with the candidates' chunks
-    /// taken from `arena`.
-    fn views(&self, f: &Forward<'_>, rows: u64, vocabulary: u32) -> Result<Scores> {
-        let width = u64::from(self.candidates);
-        let top = match (&self.values, &self.ids) {
-            (Some(values), Some(ids)) => Some(TopLogprobs::with_chunks(
-                f,
-                values.shaped(&[rows, width]),
-                ids.shaped(&[rows, width]),
-                rows,
-                vocabulary,
-                self.candidates,
-            )?),
+    /// Kept tensor `entry`, over its whole extent.
+    pub(crate) const fn tensor(&self, entry: usize) -> &Tensor {
+        &self.tensors[entry]
+    }
+
+    /// Copies `value` to the head of kept tensor `entry` and returns that head: the tensor a
+    /// later forward and the completion read in its place.
+    ///
+    /// # Errors
+    ///
+    /// A value of more rows, another trailing extent or another element type than the kept
+    /// tensor's.
+    pub(crate) fn keep(&self, entry: usize, value: &Tensor) -> Result<Tensor> {
+        let rows = value.dims().first().copied().unwrap_or(0);
+        let head = self.tensors[entry].narrow(0, 0, rows)?;
+
+        head.slice_set(value, 0, 0)?;
+        Ok(head)
+    }
+}
+
+/// The speculation of one runner: its drafts, the draft cache it is lent, the sampler of its
+/// verifications and what its forwards keep.
+pub(crate) struct Speculation {
+    /// The drafts a verification holds at most.
+    pub(crate) drafts: u32,
+    /// How the draft cache lies in the unit pool.
+    pub(crate) pool: DraftPool,
+    /// What the target forwards keep.
+    pub(crate) kept: Kept,
+    /// The selection of a verification: the runner's sampler over the same two tables, whose
+    /// rows also count the drafts before the position they sample.
+    pub(crate) verifier: Sampler,
+    /// The draft cache as it is lent: the drafter's planes and the workspace. Its page table
+    /// is a column of each forward.
+    pub(crate) draft: Option<KvCache>,
+    /// The trail buffers of the recurrent state, for a model that keeps one.
+    pub(crate) trail: Option<StateBuffers>,
+    /// What states a slot's installed draft pages.
+    pub(crate) pages: Option<DraftPages>,
+}
+
+/// The agreed length of each verification and the token that ends its accepted prefix:
+/// `(agreed, last)`, both `[rows]` U32 (module documentation).
+///
+/// - `chosen`: `[tokens]` U32, the token sampled at each token of the batch;
+/// - `drafts`: `[tokens]` U32, the draft each sample is compared with, [`NO_SLOT`] for the
+///   last token of a row and for a token no row holds;
+/// - `windows`: `[rows, drafts + 1]` U32, the token of each row at each offset, the row's last
+///   token past its end, and [`NO_SLOT`] for a row the batch does not hold;
+/// - `firsts`: `[rows]` U32, each row's first token.
+///
+/// Every operation is one between tensors, so the same launches serve any batch of the
+/// bucket.
+///
+/// # Errors
+///
+/// Columns of another shape or element type.
+pub(crate) fn accept(
+    chosen: &Tensor,
+    drafts: &Tensor,
+    windows: &Tensor,
+    firsts: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let (rows, width) = windows.dims2()?;
+
+    // One where a token's sample is the draft after it. A row's last token names no draft,
+    // and a gather through `NO_SLOT` reads zero, so every row's run ends in a zero.
+    let agrees = chosen.eq(drafts)?;
+    let run = agrees
+        .index_select(&windows.flatten_all()?, 0)?
+        .reshape((rows, width))?;
+
+    // The first offset whose sample is not its draft: every draft before it agreed.
+    let agreed = run.argmin(1)?;
+    let last = firsts.add(&agreed)?;
+
+    Ok((agreed, last))
+}
+
+/// Whether `call` is a verification: a verification, or a decode, which a speculating runner
+/// serves as a verification of no draft.
+const fn verifying(call: &BatchRow) -> bool {
+    matches!(call.kind, RowKind::Verify | RowKind::Decode)
+}
+
+/// Whether `columns` verify: their calls are verifications ([`verifying`]).
+///
+/// # Errors
+///
+/// [`Error::Invalid`] for a batch that mixes prompt rows with verifications, a verification
+/// that is not one row, that samples nothing or that holds more than `drafts` drafts.
+pub(crate) fn verifies(columns: &BatchColumns, drafts: u32) -> Result<bool> {
+    let rows = &columns.rows;
+    let count = rows.calls.iter().filter(|call| verifying(call)).count();
+    if count == 0 {
+        return Ok(false);
+    }
+    if count != rows.calls.len() {
+        return Err(Error::Invalid(
+            "a batch mixes prompt rows with verifications".into(),
+        ));
+    }
+
+    for (index, call) in rows.calls.iter().enumerate() {
+        let row = call.rows.start as usize;
+        let span = rows.query_offsets.get(row..row + 2);
+        let tokens = span.map_or(0, |span| (span[1] - span[0]).max(0) as u32);
+
+        // Verification `index` is row `index`: the device keeps each one's agreed length by
+        // its row.
+        let sampled = rows.logits_rows.get(row).is_some_and(|logits| *logits >= 0);
+        if call.rows.len() != 1 || row != index || tokens == 0 || !sampled {
+            return Err(Error::Invalid(format!(
+                "a verification of slot {} holds {} rows of {tokens} tokens: one row carries a \
+                 committed token and its drafts, and samples each",
+                call.request,
+                call.rows.len()
+            )));
+        }
+        if tokens - 1 > drafts {
+            return Err(Error::Invalid(format!(
+                "a verification of slot {} carries {} drafts, and the deployment verifies \
+                 {drafts}",
+                call.request,
+                tokens - 1
+            )));
+        }
+    }
+    Ok(true)
+}
+
+/// The columns of a verification batch with one row per token: each token attends as the
+/// decode step at its position and samples the position after it.
+///
+/// A row of `n` tokens whose last query sees `end` keys becomes `n` rows of one token, token
+/// `j` seeing `end - (n - 1 - j)` keys, on its row's slot, with its row's parameters and
+/// adjustments, and drawing at the address of the position after it in its request's stream.
+/// The calls keep their order and own their tokens' rows; the commit table stays one row per
+/// call.
+pub(crate) fn token_rows(columns: &BatchColumns) -> BatchColumns {
+    let rows = &columns.rows;
+    let tokens = rows.tokens();
+    let width = PARAMETER_COLUMNS as usize;
+
+    let mut expanded = BatchColumns {
+        rows: BatchRows {
+            positions: rows.positions.clone(),
+            slot_mapping: rows.slot_mapping.clone(),
+            query_offsets: (0..=tokens as i32).collect(),
+            logits_rows: (0..tokens as i32).collect(),
+            ..BatchRows::default()
+        },
+        input_ids: columns.input_ids.clone(),
+        commit: columns.commit.clone(),
+        checkpoints: columns.checkpoints.clone(),
+        page_size: columns.page_size,
+        max_kv_len: columns.max_kv_len,
+        ..BatchColumns::default()
+    };
+
+    let adjustments = &columns.adjustments;
+    let mut biased = Vec::new();
+    let mut banned = Vec::new();
+
+    for call in &rows.calls {
+        let row = call.rows.start as usize;
+        let span = |index: usize| rows.query_offsets.get(index).copied().unwrap_or(0).max(0);
+        let (first, last) = (span(row), span(row + 1));
+
+        let end = rows.seq_lens.get(row).copied().unwrap_or(0);
+        let start = rows.positions.get(first as usize).copied().unwrap_or(0);
+        let key = columns.draws.get(row).map_or(0, |draw| draw.key);
+
+        for token in first..last {
+            expanded
+                .rows
+                .seq_lens
+                .push((end + 1 - (last - token)).max(0));
+            expanded
+                .slots
+                .push(columns.slots.get(row).copied().unwrap_or(-1));
+            expanded.parameters.extend(
+                columns
+                    .parameters
+                    .get(row * width..(row + 1) * width)
+                    .unwrap_or(&NO_PARAMETERS),
+            );
+            expanded.draws.push(DrawAddress {
+                key,
+                position: (start.max(0) + (token - first) + 1) as u64,
+            });
+
+            biased.push(adjustments.biased.get(row).copied().unwrap_or(false));
+            banned.push(adjustments.banned.get(row).cloned().unwrap_or_default());
+        }
+
+        expanded.rows.calls.push(BatchRow {
+            rows: first as u32..last as u32,
+            ..call.clone()
+        });
+    }
+
+    expanded.adjustments = LogitAdjustments {
+        installs: Vec::new(),
+        biased: if biased.iter().any(|flag| *flag) {
+            biased
+        } else {
+            Vec::new()
+        },
+        banned: if banned.iter().any(|tokens| !tokens.is_empty()) {
+            banned
+        } else {
+            Vec::new()
+        },
+    };
+    expanded
+}
+
+/// The columns of an idle verification of `bucket`: every row a committed token and `drafts`
+/// drafts that address no slot, page or request, in the form a batch states them.
+pub(crate) fn idle_verification(
+    bucket: &Bucket,
+    drafts: u32,
+    page_size: u32,
+    max_kv_len: u32,
+) -> BatchColumns {
+    let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
+    let width = drafts + 1;
+
+    let calls: Vec<BatchRow> = (0..bucket.rows)
+        .map(|row| BatchRow {
+            request: 0,
+            kind: RowKind::Verify,
+            cache_group: 0,
+            rows: row..row + 1,
+        })
+        .collect();
+
+    BatchColumns {
+        rows: BatchRows {
+            positions: vec![0; tokens],
+            slot_mapping: vec![-1; tokens],
+            seq_lens: vec![0; rows],
+            query_offsets: (0..=bucket.rows).map(|row| (row * width) as i32).collect(),
+            logits_rows: vec![-1; rows],
+            calls: calls.clone(),
+        },
+        input_ids: vec![0; tokens],
+        slots: vec![-1; rows],
+        parameters: vec![0.0; rows * PARAMETER_COLUMNS as usize],
+        draws: vec![DrawAddress::default(); rows],
+        commit: sampler::inert_commit(calls.len()),
+        page_size,
+        max_kv_len,
+        ..BatchColumns::default()
+    }
+}
+
+/// Writes into `block` the columns of the verification batch `columns` padded to `bucket`, a
+/// verification bucket (`columns` documents each).
+///
+/// `expanded` is [`token_rows`] of `columns`: the generic columns are its rows, one per token.
+/// The commit table holds the batch's row per call, whose task is the call's own, then one
+/// count row per draft of each call, which counts when the device accepted the draft.
+///
+/// # Errors
+///
+/// As `columns::fill`; [`Error::Invariant`] for a bucket that is no verification bucket of
+/// the layout's drafts.
+pub(crate) fn fill_verification(
+    layout: &Layout,
+    slots: u32,
+    vocabulary: u32,
+    columns: &BatchColumns,
+    expanded: &BatchColumns,
+    bucket: &Bucket,
+    block: &mut [u8],
+) -> Result<()> {
+    let drafts = layout.drafts();
+    let (bucket_rows, bucket_tokens) = (bucket.rows as usize, bucket.tokens as usize);
+    if drafts == 0 || bucket_tokens != bucket_rows * (drafts + 1) {
+        return Err(Error::Invariant(format!(
+            "bucket {bucket} is no verification of {drafts} drafts a row"
+        )));
+    }
+
+    // Each token is an attention row and a sampling row.
+    let rows_of_tokens = Bucket::prefill(bucket.tokens, bucket.tokens, bucket.variant);
+    columns::fill(
+        layout,
+        slots,
+        vocabulary,
+        expanded,
+        &rows_of_tokens,
+        None,
+        block,
+    )?;
+
+    let rows = &columns.rows;
+    let calls = rows.calls.len();
+    let tokens = rows.tokens();
+    if calls > bucket_rows {
+        return Err(Error::Invalid(format!(
+            "{calls} verifications do not fit bucket {bucket}"
+        )));
+    }
+    let span = |call: &BatchRow| {
+        let row = call.rows.start as usize;
+        let offset = |index: usize| rows.query_offsets.get(index).map_or(0, |at| *at as usize);
+
+        (offset(row), offset(row + 1).min(tokens))
+    };
+
+    // ---- The sequences: one per call, which the recurrent state advances ----
+
+    let mut state_offsets = vec![tokens as u32; bucket_rows + 1];
+    let mut state_lens = vec![0_u32; bucket_rows];
+    let mut state_slots = vec![NO_SLOT; bucket_rows];
+    let mut firsts = vec![0_u32; bucket_rows];
+
+    // ---- The drafts: what each sample is compared with and what each row counts ----
+
+    let mut compared = vec![NO_SLOT; bucket_tokens];
+    let mut extras = vec![NO_SLOT; bucket_tokens * drafts];
+    let mut windows = vec![NO_SLOT; bucket_rows * (drafts + 1)];
+    let mut draft_tokens = vec![NO_SLOT; bucket_rows * drafts];
+
+    let mut table = sampler::commit_table(&columns.commit, calls, layout.rows())?;
+    let stride = layout.rows();
+
+    for (index, call) in rows.calls.iter().enumerate() {
+        let row = call.rows.start as usize;
+        let (first, last) = span(call);
+
+        state_offsets[index] = first as u32;
+        state_lens[index] = rows
+            .seq_lens
+            .get(row)
+            .map_or(0, |length| (*length).max(0) as u32);
+        firsts[index] = first as u32;
+
+        let own = match columns.slots.get(row).copied().map(u32::try_from) {
+            Some(Ok(slot)) => Some(slot_row(slot, slots)?),
             _ => None,
         };
-        Ok(Scores {
-            logprobs: self.logprobs.extent(0..rows),
-            ranks: self.ranks.extent(0..rows),
-            top,
-        })
-    }
+        state_slots[index] = own.unwrap_or(NO_SLOT);
 
-    /// Row `index`'s sampled `token` and its scores, as the device wrote them.
-    fn scored(&self, index: usize, token: u32, vocabulary: u32) -> Vec<ipc::TokenLogprob> {
-        let width = self.candidates as usize;
-        let read = |column: &Option<Column>| {
-            column.as_ref().map_or(Vec::new(), |column| {
-                // SAFETY: the column's host side holds `[tokens, candidates]` elements of four
-                // bytes, `index` is a sampled row, and the stream has completed the launches that
-                // wrote them.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        column.host.as_ptr().cast::<u32>().add(index * width),
-                        width,
-                    )
-                    .to_vec()
-                }
-            })
-        };
-        let values: Vec<f32> = read(&self.values).into_iter().map(f32::from_bits).collect();
-        let ids: Vec<i32> = read(&self.ids).into_iter().map(|id| id as i32).collect();
-        let logprob = Speculation::read_f32(&self.logprobs, index + 1)[index];
-        let rank = Speculation::read_i32(&self.ranks, index + 1)[index].max(0) as u32;
-        scored(token, logprob, rank, &values, &ids, vocabulary)
+        // The row's drafts are its tokens after its first.
+        let ids = columns.input_ids.get(first..last).unwrap_or_default();
+        let drafted: Vec<u32> = ids.iter().skip(1).map(|id| (*id).max(0) as u32).collect();
+
+        for (ahead, token) in (first..last).enumerate() {
+            if let Some(draft) = drafted.get(ahead) {
+                compared[token] = *draft;
+            }
+            extras[token * drafts..][..ahead].copy_from_slice(&drafted[..ahead]);
+        }
+        for offset in 0..=drafts {
+            windows[index * (drafts + 1) + offset] = (first + offset.min(drafted.len())) as u32;
+        }
+        draft_tokens[index * drafts..][..drafted.len()].copy_from_slice(&drafted);
+
+        // The call's own row installs the token that ends its accepted prefix, task `index`;
+        // a row the scheduler states no task for installs nothing.
+        let commits = table[column::TASK * stride + index] >= 0;
+        if let Some(slot) = table.get_mut(column::SLOT * stride + index)
+            && let Ok(stated) = u32::try_from(*slot)
+        {
+            *slot = slot_row(stated, slots)? as i32;
+        }
+        if !commits {
+            continue;
+        }
+        table[column::TASK * stride + index] = index as i32;
+
+        // An accepted draft joins the slot's counts before the installed token.
+        let counts = table[column::PENALTIES * stride + index];
+        for ahead in 0..drafted.len() {
+            let task = bucket_rows + index * drafts + ahead;
+
+            table[column::SLOT * stride + task] = table[column::SLOT * stride + index];
+            table[column::MODE * stride + task] = mode::COUNT as i32;
+            table[column::TASK * stride + task] = task as i32;
+            table[column::PENALTIES * stride + task] = counts;
+        }
     }
+    state_offsets[calls..].fill(tokens as u32);
+
+    let steps: Vec<u32> = (0..bucket_rows * drafts)
+        .map(|cell| (cell % drafts) as u32)
+        .collect();
+
+    layout.put(block, Column::StateOffsets, &state_offsets)?;
+    layout.put(block, Column::StateLens, &state_lens)?;
+    layout.put(block, Column::StateSlots, &state_slots)?;
+    layout.put(block, Column::Firsts, &firsts)?;
+    layout.put(block, Column::Drafts, &compared)?;
+    layout.put(block, Column::Extras, &extras)?;
+    layout.put(block, Column::Windows, &windows)?;
+    layout.put(block, Column::DraftTokens, &draft_tokens)?;
+    layout.put(block, Column::DraftSteps, &steps)?;
+    layout.put(block, Column::Commit, &table)
 }
 
-/// The longest prefix of `drafts` the samples `sampled` agree with, then the sample after it: the
-/// tokens a verification of `drafts` commits, given that `sampled[j]` is the token drawn at the
-/// draft `j`'s position (`sampled` is one longer than `drafts`).
-fn accepted_prefix(drafts: &[i32], sampled: &[u32]) -> usize {
-    let agreed = drafts
+/// The last entry of drafter row `row` that a prompt batch states, as a token of the batch:
+/// its last token when the batch samples the token after it or states it (`lookahead`), the
+/// token before it otherwise, and `None` for a row with no token whose next one is known.
+fn last_entry(rows: &BatchRows, row: usize, lookahead: Option<u32>) -> Option<usize> {
+    let offset = |index: usize| {
+        rows.query_offsets
+            .get(index)
+            .map_or(0, |at| (*at).max(0) as usize)
+    };
+    let (first, last) = (offset(row), offset(row + 1).min(rows.tokens()));
+
+    let ends = rows.logits_rows.get(row).is_some_and(|logits| *logits >= 0) || lookahead.is_some();
+    let entries = (last - first.min(last)).saturating_sub(usize::from(!ends));
+
+    (entries > 0).then(|| first + entries - 1)
+}
+
+/// The draft work of the call that owns row `row` of `columns`, when the row is the call's
+/// last: the row a call's lookahead and proposals belong to.
+fn row_work(columns: &BatchColumns, row: usize) -> DraftWork {
+    columns
+        .rows
+        .calls
         .iter()
-        .zip(sampled)
-        .take_while(|(draft, token)| u32::try_from(**draft).ok() == Some(**token))
-        .count();
-    (agreed + 1).min(sampled.len())
+        .position(|call| call.rows.end as usize == row + 1)
+        .and_then(|call| columns.drafts.get(call).copied())
+        .unwrap_or_default()
 }
 
-/// The host and device columns of one eager step, sized for the largest batch the runner serves.
+/// Writes into `block` the columns of the drafter's forward behind `columns`, padded to the
+/// rows and tokens of `bucket` (`columns` documents each).
 ///
-/// They are pinned host memory the device reads in place: every stage writes its columns before it
-/// launches and the step synchronizes before the next stage writes, so no column is rewritten while
-/// a launch may read it.
-pub(crate) struct Speculation {
-    /// The most drafts one verification carries.
-    drafts: u32,
-    pool: Option<DraftPool>,
-    /// The most tokens a verification holds: every slot's `drafts + 1`, each attending as a row.
-    verify_tokens: u64,
-    /// The most tokens and rows a step's columns hold.
-    tokens: u64,
-    rows: u64,
-    /// The pages one row of the drafter's block table holds.
-    width: u32,
+/// The drafter rows of a verification batch are its calls, whose entries are bounded on the
+/// device by the length each call agreed; a prompt batch's drafter rows are its rows, each
+/// entry reading the prompt's next token, the last one the token the row sampled or its
+/// call's lookahead. `tables` is each drafter row's installed draft pages,
+/// `(first page, units)`, in row order.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] for a batch the bucket does not hold or a position that is none.
+pub(crate) fn fill_drafter(
+    layout: &Layout,
+    pool: &DraftPool,
     vocabulary: u32,
-    // The target forward's attention rows and state rows.
-    positions: Column,
-    ids: Column,
-    slot_mapping: Column,
-    seq_lens: Column,
-    query_offsets: Column,
-    logits_rows: Column,
-    state_offsets: Column,
-    state_lens: Column,
-    state_slots: Column,
-    /// `[3]` the token counts of the target, the drafter's entries and its chained steps.
-    live: Column,
-    // The sampling step.
-    indices: Column,
-    parameters: Column,
-    sample_slots: Column,
-    draws: Column,
-    extras: Column,
-    /// `[tokens, 2]` each sampling row's adjustments, and `[rows, ceil(vocabulary / 32)]` the
-    /// staged batch's ban masks they index.
-    adjustments: Column,
-    bans: Column,
-    greedy: Column,
-    greedy_scores: ScoreColumns,
-    drawn: Column,
-    drawn_scores: ScoreColumns,
-    // The commit.
-    table: Column,
-    commit_tokens: Column,
-    points: Column,
-    flags: Column,
-    continuation: Column,
-    capacity: u64,
-    // The drafter.
-    draft_positions: Column,
-    draft_ids: Column,
-    draft_slots: Column,
-    draft_lens: Column,
-    draft_offsets: Column,
-    draft_hidden: Column,
-    draft_tables: Column,
-    /// `[drafts, rows]` each chained step's positions, cache slots and lengths.
-    chained_positions: Column,
-    chained_slots: Column,
-    chained_lens: Column,
-    chained_offsets: Column,
-    chained_tables: Column,
-    /// The rows whose drafter output each call's first proposal reads.
-    last_entries: Column,
-    /// `[drafts, rows]` the proposals, one step per run.
-    proposals: Column,
-    encoded: Vec<u8>,
+    columns: &BatchColumns,
+    tables: &[(u32, Vec<u32>)],
+    bucket: &Bucket,
+    block: &mut [u8],
+) -> Result<()> {
+    let drafts = layout.drafts();
+    let rows = &columns.rows;
+    let verify = rows.calls.iter().any(verifying);
+    let (bucket_rows, bucket_tokens) = (bucket.rows as usize, bucket.tokens as usize);
+    let (sequences, tokens) = (rows.rows(), rows.tokens());
+
+    if sequences > bucket_rows || tokens > bucket_tokens || bucket_rows > layout.rows() {
+        return Err(Error::Invalid(format!(
+            "a batch of {sequences} rows and {tokens} tokens does not fit the drafter's bucket \
+             {bucket}"
+        )));
+    }
+    let position = |token: usize| -> Result<u32> {
+        let stated = rows.positions.get(token).copied().unwrap_or(0);
+
+        u32::try_from(stated).map_err(|_| {
+            Error::Invalid(format!(
+                "token {token} states the position {stated}, which the draft cache holds no \
+                 entry for"
+            ))
+        })
+    };
+    let offset = |index: usize| {
+        rows.query_offsets
+            .get(index)
+            .map_or(0, |at| (*at).max(0) as usize)
+    };
+    let empty = (0, Vec::new());
+
+    // ---- The entries: one per token whose next token the step knows ----
+
+    let mut next_ids = vec![0_u32; bucket_tokens];
+    let mut next_rows = vec![NO_SLOT; bucket_tokens];
+    let mut entry_rows = vec![NO_SLOT; bucket_tokens];
+    let mut entry_steps = vec![1_u32; bucket_tokens];
+    let mut draft_slots = vec![NO_SLOT; bucket_tokens];
+
+    let mut state_offsets = vec![tokens as u32; bucket_rows + 1];
+    let mut lens = vec![0_u32; bucket_rows];
+    let mut pages = Vec::with_capacity(bucket_rows * layout.pages());
+
+    // ---- The chained steps: one token a row at the positions after its entries ----
+
+    let stride = layout.rows();
+    let cells = 3 * drafts;
+    let mut last_entries = vec![0_u32; bucket_rows];
+    let mut proposal_rows = vec![NO_SLOT; bucket_rows];
+    let mut chain_positions = vec![0_i32; drafts * stride];
+    let mut chain_lens = vec![0_u32; drafts * stride];
+    let mut chain_slots = vec![NO_SLOT; bucket_rows * cells];
+
+    // A step that writes nothing reads its slot from a cell that holds none, whatever length
+    // the row agreed: the cells from `2 · drafts - 1` on.
+    let mut chain_index = vec![0_u32; drafts * stride];
+    for step in 0..drafts {
+        for row in 0..bucket_rows {
+            chain_index[step * stride + row] = (row * cells + 2 * drafts - 1) as u32;
+        }
+    }
+
+    for row in 0..sequences {
+        let (first, last) = (offset(row), offset(row + 1).min(tokens));
+        let (page, units) = tables.get(row).unwrap_or(&empty);
+        let work = row_work(columns, row);
+
+        state_offsets[row] = first as u32;
+        if last > first {
+            lens[row] = position(last - 1)? + 1;
+        }
+
+        // The entry of the batch's token that the row's first proposal continues from, before
+        // the length a verification agreed.
+        let base = if verify {
+            for (ahead, token) in (first..last).enumerate() {
+                next_rows[token] = token as u32;
+                entry_rows[token] = row as u32;
+                entry_steps[token] = ahead as u32;
+                draft_slots[token] = pool.slot(*page, units, position(token)?);
+            }
+            proposal_rows[row] = row as u32;
+
+            (last > first).then_some(first)
+        } else {
+            let entries =
+                last_entry(rows, row, work.lookahead).map_or(0, |entry| entry + 1 - first);
+
+            for token in first..first + entries {
+                entry_steps[token] = 0;
+                draft_slots[token] = pool.slot(*page, units, position(token)?);
+
+                // The prompt's next token, the token the row samples, or the call's lookahead.
+                if token + 1 < last {
+                    next_ids[token] = columns.input_ids[token + 1].max(0) as u32;
+                } else if rows.logits_rows.get(row).is_some_and(|logits| *logits >= 0) {
+                    next_rows[token] = row as u32;
+                } else {
+                    next_ids[token] = work.lookahead.unwrap_or(0).min(vocabulary - 1);
+                }
+            }
+            (entries > 0).then(|| first + entries - 1)
+        };
+
+        let Some(base) = base else {
+            continue;
+        };
+        last_entries[row] = base as u32;
+        let start = position(base)?;
+
+        for cell in 0..2 * drafts - 1 {
+            chain_slots[row * cells + cell] = pool.slot(*page, units, start + cell as u32 + 1);
+        }
+        let proposals = work.proposals.min(drafts as u32) as usize;
+        for step in 1..drafts {
+            chain_positions[step * stride + row] = (start + step as u32) as i32;
+            chain_lens[step * stride + row] = start + step as u32 + 1;
+
+            // A row that proposes fewer drafts writes nothing past its own.
+            if step < proposals {
+                chain_index[step * stride + row] = (row * cells + step - 1) as u32;
+            }
+        }
+    }
+    state_offsets[sequences..].fill(tokens as u32);
+
+    for row in 0..bucket_rows {
+        let (page, units) = tables.get(row).unwrap_or(&empty);
+        pool.row(*page, units, layout.pages() as u32, &mut pages);
+    }
+
+    let mut chain_offsets: Vec<u32> = (0..=sequences as u32).collect();
+    chain_offsets.resize(bucket_rows + 1, sequences as u32);
+
+    layout.put(block, Column::NextIds, &next_ids)?;
+    layout.put(block, Column::NextRows, &next_rows)?;
+    layout.put(block, Column::EntryRows, &entry_rows)?;
+    layout.put(block, Column::EntrySteps, &entry_steps)?;
+    layout.put(block, Column::DraftSlots, &draft_slots)?;
+    layout.put(block, Column::NoSlots, &vec![NO_SLOT; bucket_tokens])?;
+    layout.put(
+        block,
+        Column::TokenCap,
+        &vec![vocabulary - 1; bucket_tokens],
+    )?;
+    layout.put(block, Column::StateOffsets, &state_offsets)?;
+    layout.put(block, Column::DraftLens, &lens)?;
+    layout.put(block, Column::DraftTables, &pages)?;
+    layout.put(block, Column::LastEntries, &last_entries)?;
+    layout.put(block, Column::ProposalRows, &proposal_rows)?;
+    layout.put(block, Column::ChainPositions, &chain_positions)?;
+    layout.put(block, Column::ChainLens, &chain_lens)?;
+    layout.put(block, Column::ChainSlots, &chain_slots)?;
+    layout.put(block, Column::ChainIndex, &chain_index)?;
+    layout.put(block, Column::ChainOffsets, &chain_offsets)?;
+    layout.put(block, Column::LiveRows, &[sequences as u32])
 }
 
-impl Speculation {
-    /// The columns of a runner on `device` whose batches hold at most `tokens` tokens in `rows`
-    /// rows, over `slots` request slots, verifying at most `drafts` drafts per call, with a
-    /// `vocabulary`-wide head reporting `candidates` most likely tokens a sampled one, and
-    /// sequences of at most `max_kv_len` keys in pages of `page` tokens.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the device, the batch bounds, the slots, the draft limit and the model's widths"
-    )]
-    pub(crate) fn new(
-        device: DeviceId,
-        tokens: u64,
-        rows: u64,
-        slots: u32,
-        drafts: u32,
-        vocabulary: u32,
-        candidates: u32,
-        max_kv_len: u32,
-        page: u32,
-    ) -> Result<Self> {
-        if drafts == 0 {
-            return Err(Error::Invalid(
-                "a deployment that speculates verifies at least one draft".into(),
-            ));
+/// Gives each call of `batch` the drafts its row proposed: `proposals` are the drafter's
+/// outputs, one `[rows]` U32 tensor per chained step, read under the installed context.
+///
+/// A call receives as many as it asked for and the deployment drafts, from its last row, up
+/// to the first that is no token of the vocabulary: a drafter row with no numeric logit
+/// proposes none, and the next verification verifies those before it. A call that failed, or
+/// whose row has no entry to continue from, receives none.
+///
+/// # Errors
+///
+/// [`Error::Invariant`] for fewer proposals than the calls' rows.
+pub(crate) fn propose(
+    batch: &Batch,
+    vocabulary: u32,
+    proposals: &[Tensor],
+    calls: &mut [CallOutput],
+) -> Result<()> {
+    let columns = &batch.columns;
+
+    let mut steps = Vec::with_capacity(proposals.len());
+    for step in proposals {
+        steps.push(step.flatten_all()?.to_vec1::<u32>()?);
+    }
+
+    for (index, (call, output)) in columns.rows.calls.iter().zip(calls).enumerate() {
+        let work = columns.drafts.get(index).copied().unwrap_or_default();
+        let Some(row) = (call.rows.end as usize).checked_sub(1) else {
+            continue;
+        };
+
+        let continues = verifying(call) || last_entry(&columns.rows, row, work.lookahead).is_some();
+        if output.status != CallStatus::Ok || !continues {
+            continue;
         }
-        // A verification of every slot's `drafts + 1` tokens attends as one row per token.
-        let verify_tokens = u64::from(slots) * u64::from(drafts + 1);
-        let tokens = tokens.max(verify_tokens);
-        let rows = rows.max(u64::from(slots)).max(verify_tokens);
-        let width = max_kv_len.div_ceil(page.max(1));
-        let i32s = |count: u64| Column::new(device, DType::I32, count.max(1));
-        let f32s = |count: u64| Column::new(device, DType::F32, count.max(1));
-        let capacity = rows + tokens;
-        let chained = u64::from(drafts) * pitch(rows);
-        Ok(Self {
-            drafts,
-            pool: None,
-            verify_tokens,
-            tokens,
-            rows,
-            width,
-            vocabulary,
-            positions: i32s(tokens)?,
-            ids: i32s(tokens)?,
-            slot_mapping: i32s(tokens)?,
-            seq_lens: i32s(rows)?,
-            query_offsets: i32s(rows + 1)?,
-            logits_rows: i32s(rows)?,
-            state_offsets: i32s(rows + 1)?,
-            state_lens: i32s(rows)?,
-            state_slots: i32s(rows)?,
-            live: i32s(3 * pitch(1))?,
-            indices: i32s(tokens)?,
-            parameters: f32s(tokens * COLUMNS as u64)?,
-            sample_slots: i32s(tokens)?,
-            draws: f32s(tokens)?,
-            extras: i32s(tokens * u64::from(drafts))?,
-            adjustments: i32s(2 * tokens)?,
-            bans: i32s(rows * u64::from(ops::sampler::ban_words(vocabulary)))?,
-            greedy: i32s(tokens)?,
-            greedy_scores: ScoreColumns::new(device, tokens, candidates)?,
-            drawn: i32s(tokens)?,
-            drawn_scores: ScoreColumns::new(device, tokens, candidates)?,
-            table: i32s(COMMIT_FIELDS as u64 * capacity)?,
-            commit_tokens: i32s(capacity)?,
-            points: i32s(capacity)?,
-            flags: i32s(capacity)?,
-            continuation: Column::new(device, DType::U8, capacity)?,
-            capacity,
-            draft_positions: i32s(tokens)?,
-            draft_ids: i32s(tokens)?,
-            draft_slots: i32s(tokens)?,
-            draft_lens: i32s(rows)?,
-            draft_offsets: i32s(rows + 1)?,
-            draft_hidden: i32s(tokens)?,
-            draft_tables: i32s(rows * u64::from(width))?,
-            chained_positions: i32s(chained)?,
-            chained_slots: i32s(chained)?,
-            chained_lens: i32s(chained)?,
-            chained_offsets: i32s(rows + 1)?,
-            chained_tables: i32s(rows * u64::from(width))?,
-            last_entries: i32s(rows)?,
-            proposals: i32s(chained)?,
-            encoded: Vec::new(),
+
+        for step in steps.iter().take(work.proposals as usize) {
+            let token = *step.get(row).ok_or_else(|| {
+                Error::Invariant(format!(
+                    "the drafter proposed for {} rows and the batch holds row {row}",
+                    step.len()
+                ))
+            })?;
+            if token >= vocabulary {
+                break;
+            }
+            output.draft_token_ids.push(token);
+        }
+    }
+    Ok(())
+}
+
+impl CausalLmRunner {
+    /// The speculation of a runner whose buckets verify or draft.
+    fn speculating(&self) -> Result<&Speculation> {
+        self.speculation.as_ref().ok_or_else(|| {
+            Error::Invariant(
+                "a verification or drafter bucket of a runner that speculates nothing".into(),
+            )
         })
     }
 
-    /// The most tokens a verification batch holds: the rows its recurrent state's trail keeps.
-    pub(crate) fn trail_tokens(&self) -> u32 {
-        u32::try_from(self.verify_tokens).unwrap_or(u32::MAX)
-    }
+    /// The forward of a verification bucket (module documentation). Its outputs are kept, in
+    /// the order `output` states for a verification.
+    pub(super) fn forward_verification(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
+        let speculation = self.speculating()?;
+        let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
+        let drafts = speculation.drafts as usize;
 
-    /// Reads the draft cache's geometry from the cache plan.
-    pub(crate) fn bind(&mut self, cache: &crate::memory::prefix_cache::PrefixCache) -> Result<()> {
-        let plan = cache.plan();
-        let group = plan.draft_group().ok_or_else(|| {
-            Error::Invalid(
-                "the deployment speculates and its cache keeps no draft group: the model's drafter \
-                 states no cache"
-                    .into(),
-            )
-        })?;
-        let span = plan
-            .draft_span()
-            .ok_or_else(|| Error::Invariant("a draft group lies over no column".into()))?;
-        let page = plan.groups[group].block_size / span;
-        self.pool = Some(DraftPool {
-            group: group as u32,
-            span,
-            page,
-            units: cache.num_units(),
-        });
-        Ok(())
-    }
+        // ---- The model: each token an attention row, each verification a state row ----
 
-    fn write_i32(column: &mut Column, encoded: &mut Vec<u8>, values: &[i32]) -> Result<()> {
-        encode_i32(encoded, values);
-        column.write(encoded)
-    }
+        let slots = self.column(Column::Slots, tokens)?;
+        let cache = self.gathered_cache(&self.column(Column::TableRows, tokens)?)?;
 
-    fn write_f32(column: &mut Column, encoded: &mut Vec<u8>, values: &[f32]) -> Result<()> {
-        encode_f32(encoded, values);
-        column.write(encoded)
-    }
-
-    /// The values the device wrote into the first `count` elements of an i32 column.
-    fn read_i32(column: &Column, count: usize) -> Vec<i32> {
-        // SAFETY: the column's host side holds at least `count` i32, the stream has completed the
-        // launches that wrote them, and nothing writes the column while it is read.
-        unsafe { std::slice::from_raw_parts(column.host.as_ptr().cast::<i32>(), count).to_vec() }
-    }
-
-    /// The values the device wrote into the first `count` elements of an f32 column.
-    fn read_f32(column: &Column, count: usize) -> Vec<f32> {
-        // SAFETY: as `read_i32`'s.
-        unsafe { std::slice::from_raw_parts(column.host.as_ptr().cast::<f32>(), count).to_vec() }
-    }
-}
-
-impl Plan {
-    /// The plan of the staged batch: its calls, its tokens and its sampled positions.
-    fn of(staging: &super::Staging, drafts: u32) -> Result<Self> {
-        let rows = staging.batch_rows();
-        let calls = staging.calls().len();
-        let tokens = staging.live_tokens() as usize;
-        let row_count = rows
-            .calls
-            .get(..calls)
-            .and_then(|calls| calls.last())
-            .map_or(0, |call| call.rows.end as usize);
-        let slots = staging.slots(row_count);
-        let parameters = staging.parameters(row_count);
-        let draws = staging.draws(row_count);
-        let adjustments = staging.adjustments().rows(row_count);
-        let adjustment = |row: usize| [adjustments[2 * row], adjustments[2 * row + 1]];
-        let ids = staging.input_ids(tokens);
-        let work = staging.drafts();
-        let mut plan = Plan {
-            tokens,
-            ..Plan::default()
-        };
-        for (index, call) in rows.calls[..calls].iter().enumerate() {
-            let range = call.rows.start as usize..call.rows.end as usize;
-            let first = rows.query_offsets[range.start] as usize;
-            let last = rows.query_offsets[range.end] as usize;
-            let start = rows.positions.get(first).copied().unwrap_or(0).max(0) as u32;
-            let verify = matches!(call.kind, RowKind::Verify | RowKind::Decode);
-            plan.verify |= verify;
-            let samples = plan.samples.len();
-            let mut drafted = Vec::new();
-            if verify {
-                if range.len() != 1 {
-                    return Err(Error::Invariant(format!(
-                        "a verification of {} rows: one row carries its tokens",
-                        range.len()
-                    )));
-                }
-                drafted = ids[first + 1..last].to_vec();
-                if drafted.len() > drafts as usize {
-                    return Err(Error::Invalid(format!(
-                        "a verification carries {} drafts, the deployment verifies {drafts}",
-                        drafted.len()
-                    )));
-                }
-                // Every token samples the position after it, its penalties counting the drafts
-                // before it.
-                if rows.logits_rows[range.start] >= 0 {
-                    for token in first..last {
-                        let ahead = token - first;
-                        let mut extras = vec![-1; drafts as usize];
-                        extras[..ahead].copy_from_slice(&drafted[..ahead]);
-                        let row = range.start;
-                        plan.samples.push(SampleRow {
-                            hidden: token as i32,
-                            slot: slots[row],
-                            parameters: parameters[row * COLUMNS..(row + 1) * COLUMNS]
-                                .try_into()
-                                .map_err(|_| Error::Invariant("a parameter row".into()))?,
-                            draw: DrawAddress {
-                                key: draws[row].key,
-                                position: u64::from(start) + ahead as u64 + 1,
-                            },
-                            extras,
-                            adjustment: adjustment(row),
-                        });
-                    }
-                }
-            } else {
-                for row in range.clone() {
-                    if rows.logits_rows[row] < 0 {
-                        continue;
-                    }
-                    plan.samples.push(SampleRow {
-                        hidden: rows.query_offsets[row + 1] - 1,
-                        slot: slots[row],
-                        parameters: parameters[row * COLUMNS..(row + 1) * COLUMNS]
-                            .try_into()
-                            .map_err(|_| Error::Invariant("a parameter row".into()))?,
-                        draw: draws[row],
-                        extras: vec![-1; drafts as usize],
-                        adjustment: adjustment(row),
-                    });
-                }
-            }
-            plan.calls.push(CallPlan {
-                slot: slots[range.start],
-                kind: Some(call.kind),
-                rows: range,
-                tokens: first..last,
-                start,
-                drafts: drafted,
-                samples: samples..plan.samples.len(),
-                draft: work.get(index).copied().unwrap_or_default(),
-            });
-        }
-        if plan.verify
-            && plan
-                .calls
-                .iter()
-                .any(|call| call.kind == Some(RowKind::Prefill))
-        {
-            return Err(Error::Invariant(
-                "a batch mixes prompt rows with verifications".into(),
-            ));
-        }
-        Ok(plan)
-    }
-
-    /// A plan of the worst-case step of `bucket`'s shape, for a recorded walk: a prompt bucket's
-    /// rows each sampling and proposing, a decode bucket's rows as verifications of every draft.
-    fn recorded(bucket: crate::plan::Bucket, drafts: u32) -> Self {
-        let parameters = [0.0; COLUMNS];
-        let sample = |hidden: usize, slot: i32| SampleRow {
-            hidden: hidden as i32,
-            slot,
-            parameters,
-            draw: DrawAddress::default(),
-            extras: vec![-1; drafts as usize],
-            adjustment: [0, -1],
-        };
-        let work = DraftWork {
-            proposals: drafts,
-            lookahead: None,
-            refill: None,
-        };
-        let mut plan = Plan::default();
-        if bucket.variant.is_decode() {
-            let width = drafts as usize + 1;
-            let calls = (bucket.rows as usize / width).max(1);
-            plan.verify = true;
-            plan.tokens = calls * width;
-            for call in 0..calls {
-                let first = call * width;
-                plan.calls.push(CallPlan {
-                    slot: call as i32 + 1,
-                    kind: Some(RowKind::Verify),
-                    rows: call..call + 1,
-                    tokens: first..first + width,
-                    start: 0,
-                    drafts: vec![0; drafts as usize],
-                    samples: first..first + width,
-                    draft: work,
-                });
-                for token in first..first + width {
-                    plan.samples.push(sample(token, call as i32 + 1));
-                }
-            }
-        } else {
-            let rows = bucket.rows as usize;
-            let tokens = bucket.tokens as usize;
-            plan.tokens = tokens;
-            let mut first = 0;
-            for row in 0..rows {
-                let end = if row + 1 == rows {
-                    tokens
-                } else {
-                    (first + 1).min(tokens)
-                };
-                plan.calls.push(CallPlan {
-                    slot: row as i32 + 1,
-                    kind: Some(RowKind::Prefill),
-                    rows: row..row + 1,
-                    tokens: first..end,
-                    start: 0,
-                    drafts: Vec::new(),
-                    samples: row..row + 1,
-                    draft: work,
-                });
-                plan.samples
-                    .push(sample(end.saturating_sub(1), row as i32 + 1));
-                first = end;
-            }
-        }
-        plan
-    }
-}
-
-/// One drafter entry: the position it writes, the token after it and the target token whose hidden
-/// state it reads.
-#[derive(Clone, Copy, Debug)]
-struct Entry {
-    position: u32,
-    next: i32,
-    hidden: i32,
-}
-
-/// The drafter's work of one call: its entries, in position order, and the drafts it proposes.
-#[derive(Clone, Debug, Default)]
-struct CallEntries {
-    entries: Vec<Entry>,
-    proposals: u32,
-}
-
-impl<M: TextModel> CausalLmRunner<M> {
-    /// Serves the staged batch in one eager speculative step (the module's stages) and answers its
-    /// completion.
-    pub(super) fn speculate(
-        &mut self,
-        generation: u64,
-        batch: ipc::execution::BatchId,
-    ) -> Result<BatchOutput> {
-        // The step's forward borrows the staging regions across calls that update the runner, so
-        // the regions are held apart from it for the step: moving them moves their handles, not
-        // the memory a graph addresses.
-        let regions = std::mem::replace(
-            &mut self.lifecycle.staging,
-            crate::staging::StagingRegion::empty(),
-        );
-        let answer = self.speculate_over(generation, batch, &regions);
-        self.lifecycle.staging = regions;
-        answer
-    }
-
-    /// [`Self::speculate`] with the runner's staging regions `regions`.
-    fn speculate_over(
-        &mut self,
-        generation: u64,
-        batch: ipc::execution::BatchId,
-        regions: &crate::staging::StagingRegion,
-    ) -> Result<BatchOutput> {
-        let launched = Instant::now();
-        let kernels = self.lifecycle.generation_named(generation)?;
-        self.install_pending(batch)?;
-        let drafts = self.spec()?.drafts;
-        let plan = Plan::of(&self.staging, drafts)?;
-        // A row that resumes from a cached prefix continues from the checkpoint its prefix ends at.
-        self.copy_state(generation, ipc::execution::StateDirection::Restore)?;
-
-        let stream = self.stream.clone();
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let tensor = self.tensor.clone();
-        // The speculative step runs eagerly, so whatever its forwards upload is copied from a
-        // staging slot the stream consumes before the slot is reused.
-        let staging = regions.slot()?;
-        let mut forward = Forward::new(&stream, &kernels, &arena).with_staging(staging);
-        if let Some(group) = tensor.as_deref() {
-            forward = forward.with_group(group);
-        }
-
-        let workspace = forward.empty(DType::U8, ops::Shape::new(&[ATTENTION_WORKSPACE_BYTES]))?;
-        self.write_target(&plan)?;
-        let hidden = self.target(&forward, &plan, workspace)?;
-        // The rows' checkpoints move into the state pages behind the forward that wrote them.
-        self.copy_state(generation, ipc::execution::StateDirection::Keep)?;
-        self.write_samples(&plan)?;
-        // The slots the batch starts requests on, stream-ordered before the sampling that reads
-        // their counts and bias rows.
-        self.start_slots(&stream)?;
-        self.sample_rows(&forward, &plan, hidden)?;
-        regions.release(&stream)?;
-        stream.synchronize()?;
-
-        let accepted = self.accept(&plan)?;
-        if let Some(state) = self.state.as_ref() {
-            for (call, taken) in plan.calls.iter().zip(&accepted) {
-                // A verification that rejected a draft leaves its slot's state after the last token
-                // it accepted, which the trail holds; one that accepted every draft already ends
-                // there.
-                if plan.verify && taken.tokens.len() < call.tokens.len() && !taken.tokens.is_empty()
-                {
-                    let token = call.tokens.start + taken.tokens.len() - 1;
-                    state.settle(&forward, call.slot as u32, token as u32, &stream)?;
-                }
-            }
-        }
-        self.commit_accepted(&forward, &plan, &accepted)?;
-        let entries = self.entries(&plan, &accepted);
-        let proposals = self.draft(&forward, &plan, &entries, hidden, workspace)?;
-        let slots = self.commit.slots();
-        // SAFETY: the readback buffer holds `2 · slots` i32 and the two per-slot columns `slots`
-        // each; the stream completes the copies before they are read below.
-        unsafe {
-            platform::memcpy_async(
-                self.commit.readback_address(0),
-                self.commit.logical_ptr().address(),
-                slots * 4,
-                &stream,
-            )?;
-            platform::memcpy_async(
-                self.commit.readback_address(0) + (slots * 4) as u64,
-                self.commit.sampling_ptr().address(),
-                slots * 4,
-                &stream,
-            )?;
-        }
-        if let Some(fence) = self.offload_fence.take() {
-            stream.wait_event(&fence)?;
-        }
-        stream.synchronize()?;
-        let device_us = launched.elapsed().as_micros() as u64;
-
-        let host_start = Instant::now();
-        // SAFETY: the copies above filled both halves of the readback and the stream completed.
-        let (logical, sampling) = unsafe {
-            let base = self.commit.readback_ptr(0).cast::<i32>();
-            (
-                std::slice::from_raw_parts(base, slots),
-                std::slice::from_raw_parts(base.add(slots), slots),
-            )
-        };
-        let calls = self.staging.calls().to_vec();
-        let mut outputs = Vec::with_capacity(calls.len());
-        for (index, ((call, taken), proposed)) in
-            plan.calls.iter().zip(accepted).zip(proposals).enumerate()
-        {
-            let slot = usize::try_from(call.slot).unwrap_or(usize::MAX);
-            let state = match (logical.get(slot), sampling.get(slot)) {
-                (Some(&logical), Some(&sampling)) => RowState {
-                    step_index: sampling.max(0) as u32,
-                    cache_computed_len: logical.max(0) as u32,
-                    cache_visible_len: sampling.max(0) as u32,
-                },
-                _ => RowState::default(),
-            };
-            let mut output = CallOutput::completed(calls[index], taken.tokens, state);
-            output.token_logprobs = taken.logprobs;
-            output.draft_token_ids = proposed;
-            outputs.push(output);
-        }
-        Ok(BatchOutput {
-            calls: outputs,
-            timing: TimingCounters {
-                queued_us: 0,
-                device_us,
-                copy_us: 0,
-                host_us: host_start.elapsed().as_micros() as u64,
-            },
-            forward_stats: None,
-        })
-    }
-
-    /// The speculation's columns, which a speculating runner holds.
-    fn spec(&mut self) -> Result<&mut Speculation> {
-        self.speculation
-            .as_mut()
-            .ok_or(Error::State("the runner does not speculate"))
-    }
-
-    /// Writes the target forward's columns: the batch's attention rows (a verification's tokens one
-    /// row each) and its state rows (one per row of the staged batch).
-    fn write_target(&mut self, plan: &Plan) -> Result<()> {
-        let rows = self.staging.batch_rows().clone();
-        let ids = self.staging.input_ids(plan.tokens).to_vec();
-        let staged_rows = plan.calls.last().map_or(0, |call| call.rows.end);
-        let checkpoints = self.staging.checkpoints(staged_rows).to_vec();
-        let mut seq_lens = Vec::new();
-        let mut offsets = vec![0];
-        let mut state_offsets = vec![0];
-        let mut state_lens = Vec::new();
-        let mut state_slots = Vec::new();
-        for call in &plan.calls {
-            for row in call.rows.clone() {
-                let first = rows.query_offsets[row];
-                let last = rows.query_offsets[row + 1];
-                let end = rows.seq_lens[row];
-                if plan.verify {
-                    // One attention row per token, each the decode step at its position.
-                    for token in first..last {
-                        seq_lens.push(end - (last - token) + 1);
-                        offsets.push(token + 1);
-                    }
-                } else {
-                    seq_lens.push(end);
-                    offsets.push(last);
-                }
-                state_offsets.push(last);
-                state_lens.push(end);
-                state_slots.push(call.slot);
-            }
-        }
-        let logits = vec![-1; seq_lens.len()];
-        if let Some(state) = self.state.as_mut() {
-            state.stage(&checkpoints)?;
-            state.checkpoints.push(&self.stream)?;
-        }
-        let tokens = plan.tokens;
-        let spec = self
-            .speculation
-            .as_mut()
-            .ok_or(Error::State("speculation"))?;
-        if tokens as u64 > spec.tokens || seq_lens.len() as u64 > spec.rows {
-            return Err(Error::Invalid(format!(
-                "a speculative step of {tokens} tokens in {} rows, the runner holds {} and {}",
-                seq_lens.len(),
-                spec.tokens,
-                spec.rows
-            )));
-        }
-        let encoded = &mut spec.encoded;
-        Speculation::write_i32(&mut spec.positions, encoded, &rows.positions[..tokens])?;
-        Speculation::write_i32(&mut spec.ids, encoded, &ids)?;
-        Speculation::write_i32(
-            &mut spec.slot_mapping,
-            encoded,
-            &rows.slot_mapping[..tokens],
-        )?;
-        Speculation::write_i32(&mut spec.seq_lens, encoded, &seq_lens)?;
-        Speculation::write_i32(&mut spec.query_offsets, encoded, &offsets)?;
-        Speculation::write_i32(&mut spec.logits_rows, encoded, &logits)?;
-        Speculation::write_i32(&mut spec.state_offsets, encoded, &state_offsets)?;
-        Speculation::write_i32(&mut spec.state_lens, encoded, &state_lens)?;
-        Speculation::write_i32(&mut spec.state_slots, encoded, &state_slots)?;
-        // A prompt's image rows rotate by their multi-axis coordinates and are written with their
-        // features, as in a replay.
-        self.stage_image_rows(&rows.positions[..tokens])
-    }
-
-    /// The target forward over the written columns: the embedding and the model, into a hidden
-    /// state of the batch's tokens, which the step's later stages read.
-    fn target(
-        &mut self,
-        forward: &Forward<'_>,
-        plan: &Plan,
-        workspace: Operand,
-    ) -> Result<Operand> {
-        let tokens = plan.tokens as u64;
-        let attention_rows: usize = if plan.verify {
-            plan.tokens
-        } else {
-            plan.calls.iter().map(|call| call.rows.len()).sum()
-        };
-        let state_rows: u64 = plan.calls.iter().map(|call| call.rows.len() as u64).sum();
-        let mut slots = Vec::with_capacity(attention_rows);
-        for call in &plan.calls {
-            let count = if plan.verify {
-                call.tokens.len()
-            } else {
-                call.rows.len()
-            };
-            slots.extend(std::iter::repeat_n(call.slot, count));
-        }
-        let spec = self
-            .speculation
-            .as_mut()
-            .ok_or(Error::State("speculation"))?;
-        let live = [tokens as i32];
-        Speculation::write_i32(&mut spec.live, &mut spec.encoded, &live)?;
-        let spec = self
-            .speculation
-            .as_ref()
-            .ok_or(Error::State("speculation"))?;
-        let rows = attention_rows as u64;
         let batch = TokenBatch {
-            positions: spec.positions.extent(0..tokens),
-            slot_mapping: spec.slot_mapping.extent(0..tokens),
-            seq_lens: spec.seq_lens.extent(0..rows),
-            query_offsets: spec.query_offsets.extent(0..rows + 1),
-            logits_rows: spec.logits_rows.extent(0..rows),
-            phase: if plan.verify {
-                PhaseKind::Decode
-            } else {
-                PhaseKind::Prefill
-            },
-            page_size: self.kv.page_size(),
-            num_tokens: plan.tokens as u32,
-            max_kv_len: self.max_kv_len,
-            draft_lens: None,
-            rope_positions: self.rope_view(plan.tokens as u32),
-        };
-        let state_view = StateRows {
-            query_offsets: spec.state_offsets.extent(0..state_rows + 1),
-            seq_lens: spec.state_lens.extent(0..state_rows),
-            slots: spec.state_slots.extent(0..state_rows),
-            count: state_rows,
-        };
-        let ids = spec.ids.extent(0..tokens);
-        let live = spec.live.extent(0..1);
-        let forward = forward_with_live(forward, live);
-        let quiet = !forward.launches();
-        self.with_kv_over(
-            workspace,
-            &slots,
-            None,
-            quiet,
-            Some((state_view, plan.verify)),
-            |cache| {
-                let embedded = self
-                    .model
-                    .embed_input_ids(&forward, ids)
-                    .map_err(Error::from)?;
-                if forward.launches() {
-                    self.write_image_rows(embedded)?;
-                }
-                self.model
-                    .forward(&forward, &batch, cache, embedded)
-                    .map_err(Error::from)
-            },
-        )
-    }
-
-    /// Writes the sampling step's columns.
-    fn write_samples(&mut self, plan: &Plan) -> Result<()> {
-        let spec = self
-            .speculation
-            .as_mut()
-            .ok_or(Error::State("speculation"))?;
-        let indices: Vec<i32> = plan.samples.iter().map(|row| row.hidden).collect();
-        let slots: Vec<i32> = plan.samples.iter().map(|row| row.slot).collect();
-        let parameters: Vec<f32> = plan.samples.iter().flat_map(|row| row.parameters).collect();
-        let draws: Vec<f32> = plan.samples.iter().map(|row| row.draw.uniform()).collect();
-        let extras: Vec<i32> = plan
-            .samples
-            .iter()
-            .flat_map(|row| row.extras.iter().copied())
-            .collect();
-        let adjustments: Vec<i32> = plan.samples.iter().flat_map(|row| row.adjustment).collect();
-        let encoded = &mut spec.encoded;
-        Speculation::write_i32(&mut spec.indices, encoded, &indices)?;
-        Speculation::write_i32(&mut spec.sample_slots, encoded, &slots)?;
-        Speculation::write_f32(&mut spec.parameters, encoded, &parameters)?;
-        Speculation::write_f32(&mut spec.draws, encoded, &draws)?;
-        Speculation::write_i32(&mut spec.extras, encoded, &extras)?;
-        Speculation::write_i32(&mut spec.adjustments, encoded, &adjustments)?;
-        Speculation::write_i32(&mut spec.bans, encoded, self.staging.adjustments().bans())?;
-        Ok(())
-    }
-
-    /// Samples every row of the plan's sampling step through the sampling module: the greedy rows
-    /// by the argmax, the others by their draws, each path over every row and each row read from
-    /// its own path.
-    fn sample_rows(&self, forward: &Forward<'_>, plan: &Plan, hidden: Operand) -> Result<()> {
-        let rows = plan.samples.len() as u64;
-        if rows == 0 {
-            return Ok(());
-        }
-        let spec = self
-            .speculation
-            .as_ref()
-            .ok_or(Error::State("speculation"))?;
-        let sampling = self
-            .sampling
-            .as_ref()
-            .ok_or(Error::State("a speculating runner samples"))?;
-        let gathered = nn::IndexRows
-            .gather(forward, hidden, spec.indices.extent(0..rows))
-            .map_err(Error::from)?;
-        let logits = self
-            .model
-            .compute_logits(forward, gathered)
-            .map_err(Error::from)?;
-        let state = SamplerState {
-            counts: sampling.counts,
-            parameters: spec.parameters.shaped(&[rows, COLUMNS as u64]),
-            slots: spec.sample_slots.extent(0..rows),
-            extras: Some(spec.extras.shaped(&[rows, u64::from(spec.drafts)])),
-            bias: sampling.bias,
-            adjustments: spec.adjustments.shaped(&[rows, 2]),
-            bans: spec.bans.shaped(&[
-                spec.rows,
-                u64::from(ops::sampler::ban_words(spec.vocabulary)),
-            ]),
-        };
-        let greedy = plan
-            .samples
-            .iter()
-            .any(|row| row.parameters[TEMPERATURE as usize] == 0.0);
-        let drawn = plan
-            .samples
-            .iter()
-            .any(|row| row.parameters[TEMPERATURE as usize] != 0.0);
-        let sampler = self
-            .verifier
-            .as_ref()
-            .ok_or(Error::State("a speculating runner verifies"))?;
-        if greedy || !forward.launches() {
-            sampler.greedy(
-                forward,
-                logits,
-                &state,
-                &Samples {
-                    tokens: spec.greedy.extent(0..rows),
-                    scores: Some(spec.greedy_scores.views(forward, rows, spec.vocabulary)?),
-                },
-            )?;
-        }
-        if drawn || !forward.launches() {
-            sampler.forward(
-                forward,
-                logits,
-                &state,
-                spec.draws.extent(0..rows),
-                &Samples {
-                    tokens: spec.drawn.extent(0..rows),
-                    scores: Some(spec.drawn_scores.views(forward, rows, spec.vocabulary)?),
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Each call's accepted tokens from the sampled ones: a verification's agreed drafts and the
-    /// sample after them, every other call's samples.
-    fn accept(&self, plan: &Plan) -> Result<Vec<Accepted>> {
-        let spec = self
-            .speculation
-            .as_ref()
-            .ok_or(Error::State("speculation"))?;
-        let rows = plan.samples.len();
-        let (greedy, drawn) = (
-            Speculation::read_i32(&spec.greedy, rows),
-            Speculation::read_i32(&spec.drawn, rows),
-        );
-        let mut tokens = Vec::with_capacity(rows);
-        let mut logprobs = Vec::with_capacity(rows);
-        for (index, row) in plan.samples.iter().enumerate() {
-            let (token, scores) = if row.parameters[TEMPERATURE as usize] == 0.0 {
-                (greedy[index], &spec.greedy_scores)
-            } else {
-                (drawn[index], &spec.drawn_scores)
-            };
-            let token = u32::try_from(token)
-                .ok()
-                .filter(|token| *token < spec.vocabulary)
-                .ok_or_else(|| {
-                    Error::Invariant(format!(
-                        "sampling row {index} drew token {token} outside the vocabulary of {}",
-                        spec.vocabulary
-                    ))
-                })?;
-            tokens.push(token);
-            logprobs.push(scores.scored(index, token, spec.vocabulary));
-        }
-        Ok(plan
-            .calls
-            .iter()
-            .map(|call| {
-                let sampled = &tokens[call.samples.clone()];
-                let scores = &logprobs[call.samples.clone()];
-                let count = if plan.verify && !sampled.is_empty() {
-                    accepted_prefix(&call.drafts, sampled)
-                } else {
-                    sampled.len()
-                };
-                Accepted {
-                    tokens: sampled[..count].to_vec(),
-                    logprobs: scores[..count].to_vec(),
-                }
-            })
-            .collect())
-    }
-
-    /// Commits each call's accepted tokens into its slot's device state: the call's own commit row
-    /// with the token it installs and the span it advances by, and a count row per accepted draft,
-    /// which joins the slot's penalty history before that token.
-    fn commit_accepted(
-        &mut self,
-        forward: &Forward<'_>,
-        plan: &Plan,
-        accepted: &[Accepted],
-    ) -> Result<()> {
-        let staged = self.staging.commit().to_vec();
-        let calls = plan.calls.len();
-        if staged.is_empty() || calls == 0 {
-            return Ok(());
-        }
-        let stride = staged.len() / COMMIT_FIELDS;
-        let mut rows: Vec<[i64; COMMIT_FIELDS]> = Vec::new();
-        let mut tokens = Vec::new();
-        let mut points = Vec::new();
-        for (index, taken) in accepted.iter().enumerate() {
-            let mut cells = [0_i64; COMMIT_FIELDS];
-            for (field, cell) in cells.iter_mut().enumerate() {
-                *cell = staged[field * stride + index];
-            }
-            if cells[column::TASK] >= 0 {
-                let Some(&last) = taken.tokens.last() else {
-                    return Err(Error::Invariant(format!(
-                        "call {index} samples and accepted no token"
-                    )));
-                };
-                cells[column::TASK] = tokens.len() as i64;
-                tokens.push(last as i32);
-                points.push(taken.tokens.len() as i32);
-                let counts = cells[column::PENALTIES];
-                let slot = cells[column::SLOT];
-                rows.push(cells);
-                // The accepted drafts precede the installed token in the slot's history.
-                for &draft in &taken.tokens[..taken.tokens.len() - 1] {
-                    let mut count = [0_i64; COMMIT_FIELDS];
-                    count[column::SLOT] = slot;
-                    count[column::MODE] = mode::COUNT;
-                    count[column::TASK] = tokens.len() as i64;
-                    count[column::PENALTIES] = counts;
-                    tokens.push(draft as i32);
-                    points.push(0);
-                    rows.push(count);
-                }
-            } else {
-                rows.push(cells);
-            }
-        }
-        let spec = self
-            .speculation
-            .as_mut()
-            .ok_or(Error::State("speculation"))?;
-        let capacity = spec.capacity as usize;
-        if rows.len() > capacity {
-            return Err(Error::Invariant(format!(
-                "a step commits {} rows, the table holds {capacity}",
-                rows.len()
-            )));
-        }
-        let mut table = vec![0_i32; COMMIT_FIELDS * capacity];
-        for row in rows.len()..capacity {
-            table[column::SLOT * capacity + row] = -1;
-            table[column::TASK * capacity + row] = -1;
-        }
-        for (row, cells) in rows.iter().enumerate() {
-            for (field, value) in cells.iter().enumerate() {
-                table[field * capacity + row] = i32::try_from(*value).map_err(|_| {
-                    Error::Invalid(format!("a commit column value {value} does not fit i32"))
-                })?;
-            }
-        }
-        let encoded = &mut spec.encoded;
-        Speculation::write_i32(&mut spec.table, encoded, &table)?;
-        Speculation::write_i32(&mut spec.commit_tokens, encoded, &tokens)?;
-        Speculation::write_i32(&mut spec.points, encoded, &points)?;
-        Speculation::write_i32(&mut spec.flags, encoded, &vec![1; capacity])?;
-        spec.continuation.write(&vec![0_u8; capacity])?;
-        self.launch_commit(forward, rows.len() as u64)
-    }
-
-    /// Launches `slot_commit` over the first `count` rows of the written table.
-    fn launch_commit(&self, forward: &Forward<'_>, count: u64) -> Result<()> {
-        let spec = self
-            .speculation
-            .as_ref()
-            .ok_or(Error::State("speculation"))?;
-        let capacity = spec.capacity;
-        let descriptor = commit_descriptor(
-            capacity,
-            commit_block(capacity as u32),
-            self.model.vocabulary(),
-        );
-        let slots = u64::from(self.commit.slots);
-        let args = ops::commit::CommitArgs {
-            columns: Operand::with_strides(
-                spec.table.device.ptr,
-                DType::I32,
-                Shape::new(&[COMMIT_FIELDS as u64, capacity]),
-                ops::Strides::new(&[capacity, 1]),
-            ),
-            tokens: spec.commit_tokens.extent(0..capacity),
-            valid: spec.flags.extent(0..capacity),
-            active: spec.flags.extent(0..capacity),
-            continuation: spec.continuation.extent(0..capacity),
-            points: spec.points.extent(0..capacity),
-            future: Operand::with_strides(
-                self.commit.future.device.ptr,
-                DType::I32,
-                Shape::new(&[slots, 1]),
-                ops::Strides::new(&[1, 1]),
-            ),
-            predicates: self.commit.predicates.extent(0..slots),
-            logical: self.commit.logical.extent(0..slots),
-            sampling: self.commit.sampling.extent(0..slots),
-            verified: self.commit.verified.extent(0..slots),
-            penalties: self
-                .sampling
-                .as_ref()
-                .map(|sampling| sampling.counts)
-                .ok_or(Error::State("a speculating runner samples"))?,
-            count,
-        };
-        forward
-            .operate::<ops::commit::SlotCommit>(&descriptor, args)
-            .map_err(Error::from)
-    }
-
-    /// The drafter's entries of every call: the positions whose next token the step now knows.
-    ///
-    /// A verification's are its accepted positions, each reading the token committed after it; a
-    /// prompt row's are its positions, each reading the prompt's next token, the last reading the
-    /// row's sampled token or the call's lookahead and writing nothing when it knows neither.
-    fn entries(&self, plan: &Plan, accepted: &[Accepted]) -> Vec<CallEntries> {
-        let rows = self.staging.batch_rows();
-        let ids = self.staging.input_ids(plan.tokens);
-        plan.calls
-            .iter()
-            .zip(accepted)
-            .map(|(call, taken)| {
-                let mut entries = Vec::new();
-                if plan.verify {
-                    for (offset, token) in taken.tokens.iter().enumerate() {
-                        entries.push(Entry {
-                            position: call.start + offset as u32,
-                            next: *token as i32,
-                            hidden: (call.tokens.start + offset) as i32,
-                        });
-                    }
-                } else {
-                    for row in call.rows.clone() {
-                        let first = rows.query_offsets[row] as usize;
-                        let last = rows.query_offsets[row + 1] as usize;
-                        for token in first..last {
-                            let next = if token + 1 < last {
-                                Some(ids[token + 1])
-                            } else if rows.logits_rows[row] >= 0 {
-                                taken.tokens.last().map(|token| *token as i32)
-                            } else {
-                                call.draft.lookahead.map(|token| token as i32)
-                            };
-                            if let Some(next) = next {
-                                entries.push(Entry {
-                                    position: rows.positions[token].max(0) as u32,
-                                    next,
-                                    hidden: token as i32,
-                                });
-                            }
-                        }
-                    }
-                }
-                CallEntries {
-                    entries,
-                    proposals: call
-                        .draft
-                        .proposals
-                        .min(self.speculation.as_ref().map_or(0, |spec| spec.drafts)),
-                }
-            })
-            .collect()
-    }
-
-    /// The draft cache table of `slot`: its first page and units, empty when it holds none.
-    fn draft_table(&self, slot: i32) -> (u32, Vec<u32>) {
-        let (Some(spec), Some(cache)) = (self.speculation.as_ref(), self.kv.cache()) else {
-            return (0, Vec::new());
-        };
-        let Some(pool) = spec.pool else {
-            return (0, Vec::new());
-        };
-        let Ok(slot) = u32::try_from(slot) else {
-            return (0, Vec::new());
-        };
-        cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .installed_pages(slot, pool.group)
-            .unwrap_or_default()
-    }
-
-    /// Runs the drafter: its entries over the target's hidden states, then the drafts each call
-    /// proposes, step by step on the device, each step embedding the draft the step before chose
-    /// and reading the hidden state it left. Answers each call's proposals.
-    fn draft(
-        &mut self,
-        forward: &Forward<'_>,
-        plan: &Plan,
-        entries: &[CallEntries],
-        hidden: Operand,
-        workspace: Operand,
-    ) -> Result<Vec<Vec<u32>>> {
-        let recording = !forward.launches();
-        let pool = self
-            .speculation
-            .as_ref()
-            .and_then(|spec| spec.pool)
-            .ok_or(Error::State("a speculating runner's draft cache is bound"))?;
-        let tables: Vec<(u32, Vec<u32>)> = plan
-            .calls
-            .iter()
-            .map(|call| {
-                if recording {
-                    (0, Vec::new())
-                } else {
-                    self.draft_table(call.slot)
-                }
-            })
-            .collect();
-        let width = self.speculation.as_ref().map_or(0, |spec| spec.width);
-
-        // The entry rows: one per call with entries, its positions contiguous.
-        let mut positions = Vec::new();
-        let mut ids = Vec::new();
-        let mut slots = Vec::new();
-        let mut hidden_rows = Vec::new();
-        let mut lens = Vec::new();
-        let mut offsets = vec![0];
-        let mut table_rows = Vec::new();
-        // Per proposing call: its last entry's row in the entries, its last position and its table.
-        let mut proposing: Vec<(usize, i32, u32, u32)> = Vec::new();
-        for (index, (call, (first, units))) in entries.iter().zip(&tables).enumerate() {
-            let Some(last) = call.entries.last() else {
-                continue;
-            };
-            for entry in &call.entries {
-                positions.push(entry.position as i32);
-                ids.push(entry.next);
-                slots.push(pool.slot(*first, units, entry.position));
-                hidden_rows.push(entry.hidden);
-            }
-            lens.push(last.position as i32 + 1);
-            offsets.push(positions.len() as i32);
-            pool.row(*first, units, width, &mut table_rows);
-            if call.proposals > 0 {
-                proposing.push((
-                    index,
-                    positions.len() as i32 - 1,
-                    last.position,
-                    call.proposals,
-                ));
-            }
-        }
-        let mut proposals = vec![Vec::new(); plan.calls.len()];
-        if positions.is_empty() {
-            return Ok(proposals);
-        }
-        let drafter_rows = lens.len() as u64;
-        let tokens = positions.len() as u64;
-        let calls = proposing.len() as u64;
-        let steps = proposing
-            .iter()
-            .map(|(_, _, _, count)| *count)
-            .max()
-            .unwrap_or(0);
-
-        // Each chained step's rows: the proposing calls, one token each at the next position.
-        let mut chained_positions = Vec::new();
-        let mut chained_slots = Vec::new();
-        let mut chained_lens = Vec::new();
-        let mut chained_tables = Vec::new();
-        for step in 1..steps {
-            for (index, _, last, count) in &proposing {
-                let (first, units) = &tables[*index];
-                let position = last + step;
-                chained_positions.push(position as i32);
-                // A call that proposes fewer drafts writes nothing past its own.
-                chained_slots.push(if step < *count {
-                    pool.slot(*first, units, position)
-                } else {
-                    -1
-                });
-                chained_lens.push(position as i32 + 1);
-            }
-            // Each step's run starts at a 16-byte boundary, as the attention program reads it.
-            let end = (step as usize) * pitch(calls) as usize;
-            chained_positions.resize(end, 0);
-            chained_slots.resize(end, -1);
-            chained_lens.resize(end, 0);
-        }
-        for (index, _, _, _) in &proposing {
-            let (first, units) = &tables[*index];
-            pool.row(*first, units, width, &mut chained_tables);
-        }
-        let last_entries: Vec<i32> = proposing.iter().map(|(_, row, _, _)| *row).collect();
-        let chained_offsets: Vec<i32> = (0..=calls as i32).collect();
-        {
-            let spec = self.spec()?;
-            if tokens > spec.tokens || drafter_rows > spec.rows || calls > spec.rows {
-                return Err(Error::Invalid(format!(
-                    "the drafter's {tokens} entries in {drafter_rows} rows exceed the runner's \
-                     columns"
-                )));
-            }
-            let encoded = &mut spec.encoded;
-            Speculation::write_i32(&mut spec.draft_positions, encoded, &positions)?;
-            Speculation::write_i32(&mut spec.draft_ids, encoded, &ids)?;
-            Speculation::write_i32(&mut spec.draft_slots, encoded, &slots)?;
-            Speculation::write_i32(&mut spec.draft_hidden, encoded, &hidden_rows)?;
-            Speculation::write_i32(&mut spec.draft_lens, encoded, &lens)?;
-            Speculation::write_i32(&mut spec.draft_offsets, encoded, &offsets)?;
-            Speculation::write_i32(&mut spec.draft_tables, encoded, &table_rows)?;
-            Speculation::write_i32(&mut spec.chained_positions, encoded, &chained_positions)?;
-            Speculation::write_i32(&mut spec.chained_slots, encoded, &chained_slots)?;
-            Speculation::write_i32(&mut spec.chained_lens, encoded, &chained_lens)?;
-            Speculation::write_i32(&mut spec.chained_offsets, encoded, &chained_offsets)?;
-            Speculation::write_i32(&mut spec.chained_tables, encoded, &chained_tables)?;
-            Speculation::write_i32(&mut spec.last_entries, encoded, &last_entries)?;
-            let mut live = vec![0; 3 * pitch(1) as usize];
-            live[pitch(1) as usize] = tokens as i32;
-            live[2 * pitch(1) as usize] = calls as i32;
-            Speculation::write_i32(&mut spec.live, encoded, &live)?;
-        }
-
-        let drafter = self
-            .model
-            .drafter()
-            .ok_or(Error::State("a speculating model carries its drafter"))?;
-        let spec = self
-            .speculation
-            .as_ref()
-            .ok_or(Error::State("speculation"))?;
-        let planes = self.kv.draft_planes()?;
-        let page = pool.page;
-        let view = |tables: Operand| -> [nn::KvGroup<'_>; 1] {
-            [nn::KvGroup {
-                block_tables: tables,
-                page_size: page,
-                dtype: self.kv.dtype(),
-                layers: &planes,
-            }]
-        };
-
-        // The entries.
-        let entries_forward = forward_with_live(forward, spec.live.extent(0..1).shifted(pitch(1)));
-        let embedded = self
-            .model
-            .embed_input_ids(&entries_forward, spec.draft_ids.extent(0..tokens))
-            .map_err(Error::from)?;
-        // The target states each entry reads.
-        let states = nn::IndexRows
-            .gather(
-                &entries_forward,
-                hidden,
-                spec.draft_hidden.extent(0..tokens),
-            )
-            .map_err(Error::from)?;
-        let batch = TokenBatch {
-            positions: spec.draft_positions.extent(0..tokens),
-            slot_mapping: spec.draft_slots.extent(0..tokens),
-            seq_lens: spec.draft_lens.extent(0..drafter_rows),
-            query_offsets: spec.draft_offsets.extent(0..drafter_rows + 1),
-            logits_rows: spec.draft_lens.extent(0..drafter_rows),
-            phase: PhaseKind::Prefill,
-            page_size: page,
-            num_tokens: tokens as u32,
-            max_kv_len: self.max_kv_len,
+            token_ids: None,
+            ngram_context: None,
+            positions: self.column(Column::Positions, tokens)?,
+            slot_mapping: self.column(Column::SlotMapping, tokens)?,
+            seq_lens: self.column(Column::SeqLens, tokens)?,
+            query_offsets: self.column(Column::QueryOffsets, tokens + 1)?,
+            logits_rows: self.column(Column::LogitsRows, tokens)?,
+            phase: PhaseKind::Decode,
+            page_size: self.config.page_size,
+            num_tokens: bucket.tokens,
+            max_kv_len: self.config.max_kv_len,
             draft_lens: None,
             rope_positions: None,
+            live_tokens: Some(self.column(Column::LiveTokens, 1)?),
         };
-        let groups = view(
-            spec.draft_tables
-                .shaped(&[drafter_rows, u64::from(spec.width)]),
-        );
-        let drafted = drafter
-            .forward(
-                &entries_forward,
-                &batch,
-                &KvView {
-                    groups: &groups,
-                    workspace,
-                    state: None,
-                },
-                embedded,
-                states,
-            )
-            .map_err(Error::from)?;
-        if calls == 0 {
-            return Ok(proposals);
+        batch.check()?;
+
+        let state_slots = self.column(Column::StateSlots, rows)?;
+        let state = match (&self.state, &speculation.trail) {
+            (Some((live, checkpoint)), Some(trail)) => Some(RecurrentState {
+                verify: None,
+                query_offsets: self.column(Column::StateOffsets, rows + 1)?,
+                seq_lens: self.column(Column::StateLens, rows)?,
+                slots: state_slots.clone(),
+                checkpoints: self.column(Column::Checkpoints, rows)?,
+                live: live.clone(),
+                checkpoint: checkpoint.clone(),
+                trail: Some(trail.clone()),
+            }),
+            (Some(_), None) => {
+                return Err(Error::State(
+                    "a verification of a model that keeps a recurrent state was lent no trail",
+                ));
+            }
+            (None, _) => None,
+        };
+
+        let hidden = {
+            let embedded = self
+                .model
+                .embed_input_ids(&self.column(Column::InputIds, tokens)?)?;
+            self.model
+                .forward(&batch, &cache, state.as_ref(), None, &embedded)?
+        };
+
+        // ---- The selection of the token after every token ----
+
+        let logits = self.model.compute_logits(&hidden)?;
+        let parameters = self.column(Column::Parameters, (tokens, PARAMETER_COLUMNS as usize))?;
+        let adjustments = self.column(Column::Adjustments, (tokens, 2))?;
+        let bans = self.slots.bans().narrow(0, 0, tokens)?;
+        let extras = self.column(Column::Extras, (tokens, drafts))?;
+
+        let (chosen, valid) = if bucket.variant.greedy() {
+            let chosen = speculation.verifier.greedy(
+                &logits,
+                &slots,
+                &parameters,
+                &adjustments,
+                &bans,
+                Some(&extras),
+            )?;
+            (chosen, None)
+        } else {
+            let (chosen, valid) = speculation.verifier.forward(
+                &logits,
+                &slots,
+                &parameters,
+                &self.column(Column::Draws, tokens)?,
+                &adjustments,
+                &bans,
+                Some(&extras),
+            )?;
+            (chosen, Some(valid))
+        };
+
+        let scores = speculation.verifier.score(&logits, &chosen)?;
+        drop(logits);
+
+        // ---- The acceptance, and the recurrent state after the accepted prefix ----
+
+        let (agreed, last) = accept(
+            &chosen,
+            &self.column(Column::Drafts, tokens)?,
+            &self.column(Column::Windows, (rows, drafts + 1))?,
+            &self.column(Column::Firsts, rows)?,
+        )?;
+
+        if let (Some((live, _)), Some(trail)) = (&self.state, &speculation.trail) {
+            for (live, trail) in live.iter().flatten().zip(trail.iter().flatten()) {
+                // A slot's state becomes the state its verification left after the last
+                // token it accepted. A row on no slot names none, which the scatter skips.
+                let settled = trail.index_select(&last, 0)?;
+
+                let mut broadcast = vec![1; settled.rank()];
+                broadcast[0] = rows;
+                let index = state_slots
+                    .reshape(broadcast)?
+                    .broadcast_as(settled.shape())?;
+
+                live.scatter_set(&index, &settled, 0)?;
+            }
         }
 
-        // The first proposal of each call, from its last entry, then the chained steps.
-        let chained = forward_with_live(forward, spec.live.extent(0..1).shifted(2 * pitch(1)));
-        let mut current = nn::IndexRows
-            .gather(&chained, drafted, spec.last_entries.extent(0..calls))
-            .map_err(Error::from)?;
-        let argmax = ops::sampler::ArgMaxDescriptor {
-            dtype: LOGITS_DTYPE,
-            width: self.model.vocabulary(),
-            ids: DType::I32,
-            pdl: nn::layers::launch::PDL,
+        // ---- The commit: each verification's row, then a count row per draft ----
+
+        let counts = rows * drafts;
+        let ones = self.column(Column::Valid, tokens)?;
+
+        let tasks = Tensor::cat(
+            &[
+                &chosen.index_select(&last, 0)?,
+                &self
+                    .column(Column::DraftTokens, (rows, drafts))?
+                    .flatten_all()?,
+            ],
+            0,
+        )?;
+        let counted = match &valid {
+            Some(valid) => Tensor::cat(
+                &[&valid.index_select(&last, 0)?, &ones.narrow(0, 0, counts)?],
+                0,
+            )?,
+            None => ones.clone(),
         };
-        let proposal = |step: u32| -> Operand {
-            let at = u64::from(step) * pitch(calls);
-            Operand::new(
-                spec.proposals.device.offset_elements(at),
-                DType::I32,
-                Shape::new(&[calls]),
-            )
-        };
-        let propose = |step: u32, current: Operand| -> Result<()> {
-            let logits = self
-                .model
-                .compute_logits(&chained, current)
-                .map_err(Error::from)?;
-            chained
-                .operate::<ops::sampler::ArgMax>(
-                    &argmax,
-                    ops::sampler::ArgMaxArgs {
-                        values: logits,
-                        out: proposal(step),
-                    },
-                )
-                .map_err(Error::from)
-        };
-        propose(0, current)?;
-        let chained_groups = view(spec.chained_tables.shaped(&[calls, u64::from(spec.width)]));
-        for step in 1..steps {
-            let at = u64::from(step - 1) * pitch(calls);
-            let column = |column: &Column| -> Operand {
-                Operand::new(
-                    column.device.offset_elements(at),
-                    DType::I32,
-                    Shape::new(&[calls]),
-                )
-            };
-            let step_embedded = self
-                .model
-                .embed_input_ids(&chained, proposal(step - 1))
-                .map_err(Error::from)?;
-            let batch = TokenBatch {
-                positions: column(&spec.chained_positions),
-                slot_mapping: column(&spec.chained_slots),
-                seq_lens: column(&spec.chained_lens),
-                query_offsets: spec.chained_offsets.extent(0..calls + 1),
-                logits_rows: column(&spec.chained_lens),
-                phase: PhaseKind::Decode,
-                page_size: page,
-                num_tokens: calls as u32,
-                max_kv_len: self.max_kv_len,
-                draft_lens: None,
-                rope_positions: None,
-            };
-            current = drafter
-                .forward(
-                    &chained,
-                    &batch,
-                    &KvView {
-                        groups: &chained_groups,
-                        workspace,
-                        state: None,
-                    },
-                    step_embedded,
-                    current,
-                )
-                .map_err(Error::from)?;
-            propose(step, current)?;
+
+        // A draft counts when it lies before the length its row agreed.
+        let accepted = self
+            .column(Column::DraftSteps, (rows, drafts))?
+            .broadcast_lt(&agreed.reshape((rows, 1))?)?
+            .flatten_all()?
+            .to_dtype(DType::I32)?;
+        let active = Tensor::cat(&[&self.column(Column::Active, rows)?, &accepted], 0)?;
+
+        // A verification advances by its agreed drafts and the sample after them.
+        let span = agreed.view(DType::I32)?.add(&ones.narrow(0, 0, rows)?)?;
+        let points = Tensor::cat(&[&span, &self.column(Column::Points, counts)?], 0)?;
+
+        let table = self
+            .column(Column::Commit, (COMMIT_FIELDS, self.layout.rows()))?
+            .narrow(1, 0, tokens)?;
+        let [future, predicates, logical, sampling, verified] = self.slots.committed()?;
+
+        speculation.verifier.commit_(
+            &table,
+            &tasks,
+            &counted,
+            &active,
+            &self.column(Column::Continuation, tokens)?,
+            &points,
+            &future,
+            &predicates,
+            &logical,
+            &sampling,
+            &verified,
+        )?;
+
+        let call_slots = self.column(Column::CallSlots, rows)?;
+        let logical = self.slots.logical().index_select(&call_slots, 0)?;
+        let sampling = self.slots.sampling().index_select(&call_slots, 0)?;
+
+        // ---- What the drafter and the completion read ----
+
+        let kept = &speculation.kept;
+        let mut scores = scores.into_iter();
+        let mut outputs = vec![kept.keep(CHOSEN, &chosen)?];
+
+        for (entry, score) in [LOGPROBS, RANKS].into_iter().zip(scores.by_ref()) {
+            outputs.push(kept.keep(entry, &score)?);
         }
-        if recording {
-            return Ok(proposals);
+        outputs.push(kept.keep(LOGICAL, &logical)?);
+        outputs.push(kept.keep(SAMPLING, &sampling)?);
+        for (entry, score) in [TOP_VALUES, TOP_IDS].into_iter().zip(scores) {
+            outputs.push(kept.keep(entry, &score)?);
         }
-        forward.stream().map_err(Error::from)?.synchronize()?;
-        let drawn =
-            Speculation::read_i32(&spec.proposals, (u64::from(steps) * pitch(calls)) as usize);
-        for (rank, (index, _, _, count)) in proposing.iter().enumerate() {
-            for step in 0..*count {
-                let token = drawn[step as usize * pitch(calls) as usize + rank];
-                // A drafter row with no numeric logit answers past the vocabulary; its proposals
-                // stop there, and the verification verifies those before it.
-                match u32::try_from(token) {
-                    Ok(token) if token < spec.vocabulary => proposals[*index].push(token),
-                    _ => break,
-                }
+        if let Some(valid) = &valid {
+            outputs.push(kept.keep(VALID, valid)?);
+        }
+        outputs.push(kept.keep(AGREED, &agreed)?);
+
+        kept.keep(HIDDEN, &hidden)?;
+        Ok(outputs)
+    }
+
+    /// The forward of the drafter's bucket (module documentation): `drafts` outputs, the
+    /// proposal of each chained step for every row, `[rows]` U32.
+    pub(super) fn forward_drafter(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
+        let speculation = self.speculating()?;
+        let drafter = self.model.drafter().ok_or(Error::State(
+            "a speculating runner's model carries its drafter",
+        ))?;
+        let lent = speculation
+            .draft
+            .as_ref()
+            .ok_or(Error::State("a speculating runner was lent no draft cache"))?;
+
+        let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
+        let drafts = speculation.drafts as usize;
+        let kept = &speculation.kept;
+        let cap = self.column(Column::TokenCap, tokens)?;
+
+        let cache = KvCache {
+            block_tables: self.column(Column::DraftTables, (rows, self.layout.pages()))?,
+            ..lent.clone()
+        };
+
+        // ---- The entries ----
+
+        // The token after each entry: the one the batch states, or the one its sampling row
+        // chose, held to the vocabulary so a row that chose none embeds a token.
+        let chosen = kept
+            .tensor(CHOSEN)
+            .index_select(&self.column(Column::NextRows, tokens)?, 0)?;
+        let next = self
+            .column(Column::NextIds, tokens)?
+            .add(&chosen)?
+            .minimum(&cap)?;
+
+        // An entry of a verification is written up to the length its row agreed.
+        let bound = kept
+            .tensor(AGREED)
+            .index_select(&self.column(Column::EntryRows, tokens)?, 0)?;
+        let written = self.column(Column::EntrySteps, tokens)?.le(&bound)?;
+        let slot_mapping = written.where_cond(
+            &self.column(Column::DraftSlots, tokens)?,
+            &self.column(Column::NoSlots, tokens)?,
+        )?;
+
+        let lens = self.column(Column::DraftLens, rows)?;
+        let batch = TokenBatch {
+            token_ids: None,
+            ngram_context: None,
+            positions: self.column(Column::Positions, tokens)?,
+            slot_mapping,
+            seq_lens: lens.clone(),
+            query_offsets: self.column(Column::StateOffsets, rows + 1)?,
+            logits_rows: lens,
+            phase: PhaseKind::Prefill,
+            page_size: speculation.pool.page,
+            num_tokens: bucket.tokens,
+            max_kv_len: self.config.max_kv_len,
+            draft_lens: None,
+            rope_positions: None,
+            live_tokens: Some(self.column(Column::LiveTokens, 1)?),
+        };
+        batch.check()?;
+
+        let drafted = {
+            let embedded = self.model.embed_input_ids(&next)?;
+            let hidden = kept.tensor(HIDDEN).narrow(0, 0, tokens)?;
+
+            drafter.forward(&batch, &cache, &embedded, &hidden)?
+        };
+
+        // ---- The proposals: the first from each row's last entry, then the chained steps ----
+
+        let ahead = kept
+            .tensor(AGREED)
+            .index_select(&self.column(Column::ProposalRows, rows)?, 0)?;
+        let ahead_positions = ahead.view(DType::I32)?;
+        let last = self.column(Column::LastEntries, rows)?.add(&ahead)?;
+
+        let slots = self
+            .column(Column::ChainSlots, (rows, 3 * drafts))?
+            .flatten_all()?;
+        let step_column = |column: Column, step: usize| -> Result<Tensor> {
+            Ok(self
+                .column(column, (drafts, self.layout.rows()))?
+                .narrow(0, step, 1)?
+                .squeeze(0)?
+                .narrow(0, 0, rows)?)
+        };
+
+        let mut current = drafted.index_select(&last, 0)?;
+        let mut proposals: Vec<Tensor> = Vec::with_capacity(drafts);
+
+        for step in 0..drafts {
+            if let Some(previous) = proposals.last() {
+                let lens = step_column(Column::ChainLens, step)?.add(&ahead)?;
+                let index = step_column(Column::ChainIndex, step)?.add(&ahead)?;
+
+                let batch = TokenBatch {
+                    token_ids: None,
+                    ngram_context: None,
+                    positions: step_column(Column::ChainPositions, step)?.add(&ahead_positions)?,
+                    slot_mapping: slots.index_select(&index, 0)?,
+                    seq_lens: lens.clone(),
+                    query_offsets: self.column(Column::ChainOffsets, rows + 1)?,
+                    logits_rows: lens,
+                    phase: PhaseKind::Decode,
+                    page_size: speculation.pool.page,
+                    num_tokens: bucket.rows,
+                    max_kv_len: self.config.max_kv_len,
+                    draft_lens: None,
+                    rope_positions: None,
+                    live_tokens: Some(self.column(Column::LiveRows, 1)?),
+                };
+
+                // A row whose step before proposed no token embeds one all the same: its
+                // proposals end there, where the completion reads them.
+                let embedded = self
+                    .model
+                    .embed_input_ids(&previous.minimum(&cap.narrow(0, 0, rows)?)?)?;
+                current = drafter.forward(&batch, &cache, &embedded, &current)?;
             }
+
+            proposals.push(functional::argmax(&self.model.compute_logits(&current)?)?);
         }
         Ok(proposals)
-    }
-
-    /// Walks the speculative step of every bucket on recording forwards: the programs its target
-    /// forward, sampling, commit and drafter launch, and the extent they reach in the stream's
-    /// region, at each bucket's worst case.
-    pub(super) fn record_speculation(&mut self, footprint: &mut Footprint) -> Result<()> {
-        let Some(drafts) = self.speculation.as_ref().map(|spec| spec.drafts) else {
-            return Ok(());
-        };
-        for bucket in self.capture_plan() {
-            if !bucket.variant.samples() || bucket.variant == ipc::execution::Variant::ExpertJoin {
-                continue;
-            }
-            let plan = Plan::recorded(bucket, drafts);
-            let bounds = self
-                .speculation
-                .as_ref()
-                .map_or((0, 0), |spec| (spec.tokens, spec.verify_tokens));
-            if plan.tokens as u64 > bounds.0 || (plan.verify && plan.tokens as u64 > bounds.1) {
-                continue;
-            }
-            footprint.walk(Some(bucket), |walk| self.walk_speculation(walk, &plan))?;
-        }
-        Ok(())
-    }
-
-    /// One recorded speculative step of `plan`.
-    fn walk_speculation(&mut self, walk: &Walk, plan: &Plan) -> Result<()> {
-        let forward = walk.forward(self.tensor.as_deref())?;
-        let workspace = forward.empty(DType::U8, ops::Shape::new(&[ATTENTION_WORKSPACE_BYTES]))?;
-        let hidden = self.target(&forward, plan, workspace)?;
-        self.sample_rows(&forward, plan, hidden)?;
-        self.launch_commit(&forward, plan.calls.len() as u64)?;
-        let entries: Vec<CallEntries> = plan
-            .calls
-            .iter()
-            .map(|call| CallEntries {
-                entries: call
-                    .tokens
-                    .clone()
-                    .map(|token| Entry {
-                        position: token as u32,
-                        next: 0,
-                        hidden: token as i32,
-                    })
-                    .collect(),
-                proposals: call.draft.proposals,
-            })
-            .collect();
-        self.draft(&forward, plan, &entries, hidden, workspace)?;
-        Ok(())
-    }
-}
-
-/// The i32 elements a run of `count` takes in a column of several runs: whole 16-byte units, as
-/// the programs that read a run's first element in vector loads need it aligned.
-fn pitch(count: u64) -> u64 {
-    count.max(1).next_multiple_of(4)
-}
-
-/// `forward` bounded by the token count at `live`: what a step's MoE sort reads.
-fn forward_with_live<'a>(forward: &Forward<'a>, live: Operand) -> Forward<'a> {
-    forward.clone().with_live_tokens(live)
-}
-
-/// A view's start moved past its first `elements`: the column's entry the view names.
-trait Shifted {
-    fn shifted(self, elements: u64) -> Operand;
-}
-
-impl Shifted for Operand {
-    fn shifted(self, elements: u64) -> Operand {
-        Operand::new(self.offset_elements(elements), self.dtype, self.shape)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{DraftPool, accepted_prefix};
-
-    #[test]
-    fn a_verification_commits_the_agreed_drafts_and_the_sample_after_them() {
-        // The samples agree with the first two drafts, so the third position's sample stands.
-        assert_eq!(accepted_prefix(&[7, 8, 9], &[7, 8, 4, 5]), 3);
-        // Every draft agreed: the bonus sample after the last stands as well.
-        assert_eq!(accepted_prefix(&[7, 8], &[7, 8, 3]), 3);
-        // The first draft disagreed: the first sample alone stands, as a decode's token would.
-        assert_eq!(accepted_prefix(&[7, 8], &[1, 8, 3]), 1);
-        // No drafts: a verification of one token decodes it.
-        assert_eq!(accepted_prefix(&[], &[5]), 1);
-    }
-
-    #[test]
-    fn a_draft_page_is_read_as_runs_of_the_pools_pages() {
-        // Pages of 512 tokens over eight runs of 64, in a pool of 100 units.
-        let pool = DraftPool {
-            group: 1,
-            span: 8,
-            page: 64,
-            units: 100,
-        };
-        // A table from draft page 2 holding units 7 and 0 (no unit for page 3).
-        let units = [7, 0];
-        // Position 1100 is draft page 2, run 1, offset 12: run 1 of unit 7 is page 107.
-        assert_eq!(pool.page(2, &units, 1100), (107, true));
-        assert_eq!(pool.slot(2, &units, 1100), 107 * 64 + 12);
-        // Page 3 holds no unit: nothing is written there.
-        assert_eq!(pool.slot(2, &units, 1600), -1);
-        // A page before the table's first holds none either.
-        assert_eq!(pool.slot(2, &units, 10), -1);
-        let mut row = Vec::new();
-        pool.row(2, &units, 18, &mut row);
-        assert_eq!(&row[16..18], &[7, 100 + 7]);
     }
 }

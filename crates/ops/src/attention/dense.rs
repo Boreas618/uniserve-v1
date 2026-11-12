@@ -9,7 +9,7 @@
 //! key         [kv_tokens, kv_heads, head_dim]
 //! value       [kv_tokens, kv_heads, head_dim]
 //! out         [q_tokens, q_heads, head_dim]
-//! cu_seq_lens_q [batch + 1] i32        row offsets of the queries of each sequence
+//! cu_seq_lens_q [batch + 1] u32        row offsets of the queries of each sequence
 //!
 //! ## One sequence without offsets
 //!
@@ -18,7 +18,7 @@
 //! directions. Without offsets the call is one sequence: `batch` is one, and the program attends
 //! `[0, q_tokens)` against `[0, kv_tokens)` without reading a table. It is a separate compilation,
 //! so a program never branches on a missing port, and no launch is ever handed a null view.
-//! cu_seq_lens_k [batch + 1] i32        row offsets of the keys of each sequence
+//! cu_seq_lens_k [batch + 1] u32        row offsets of the keys of each sequence
 //! ```
 //!
 //! For query row `i` of sequence `b`, head `h`, with `s_j = scale · q_i,h · k_{j,h}` over the keys
@@ -142,12 +142,12 @@ pub struct DenseArgs {
     pub key: Operand,
     /// `[kv_tokens, kv_heads, head_dim]` values.
     pub value: Operand,
-    /// `[batch + 1]` i32: the first query row of each sequence, then `q_tokens`.
+    /// `[batch + 1]` u32: the first query row of each sequence, then `q_tokens`.
     ///
     /// Both offsets are `None` exactly when the descriptor says the launch has none. One absent and
     /// one given is refused: they describe one sequence layout together.
     pub cu_seq_lens_q: Option<Operand>,
-    /// `[batch + 1]` i32: the first key row of each sequence, then `kv_tokens`.
+    /// `[batch + 1]` u32: the first key row of each sequence, then `kv_tokens`.
     pub cu_seq_lens_k: Option<Operand>,
     /// `[q_tokens, q_heads, head_dim]` output.
     pub out: Operand,
@@ -534,7 +534,7 @@ impl Op for DenseAttention {
 
 /// The batch a launch attends, from its offsets and its descriptor's declared form.
 ///
-/// Two given offsets must be `[batch + 1]` i32 tables of the same length — the *values* are the
+/// Two given offsets must be `[batch + 1]` u32 tables of the same length — the *values* are the
 /// scheduler's, and the two tables need not end at the same row: a cross-attention has
 /// `q_tokens > kv_tokens` with no offsets and one padded sequence on each side. Both absent is one
 /// sequence. A launch that disagrees with the descriptor, or gives one table and not the other, is
@@ -583,10 +583,10 @@ fn sequence_layout(
     q.require_shape(operator, Shape::new(&[batch + 1]))?;
     k.require_shape(operator, Shape::new(&[batch + 1]))?;
     for (name, view) in [("cu_seq_lens_q", q), ("cu_seq_lens_k", k)] {
-        if view.dtype != DType::I32 {
+        if view.dtype != DType::U32 {
             return Err(Error::argument(
                 operator,
-                format!("expected i32 {name}, found {}", abi::name(view.dtype)),
+                format!("expected u32 {name}, found {}", abi::name(view.dtype)),
             ));
         }
     }
@@ -639,7 +639,7 @@ mod tests {
     fn table(extent: u64) -> Operand {
         Operand::new(
             crate::tensor::DevicePtr::new(0),
-            DType::I32,
+            DType::U32,
             Shape::new(&[extent]),
         )
     }

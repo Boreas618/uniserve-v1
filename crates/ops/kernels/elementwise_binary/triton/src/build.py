@@ -9,7 +9,8 @@ compilation options. The Build Server's Triton source drives
 The function, the element type and the number of axes are compiled in. The shape
 and both inputs' strides are words, so one module serves every shape and every
 broadcast that traverses ``rank`` axes. A comparison's output is ``u8`` whatever
-the inputs hold.
+the inputs hold. The functions of the integer element types alone name no
+module for a floating one.
 """
 
 import elementwise_binary as kernels
@@ -19,10 +20,29 @@ from uniserve_build_server import triton as driver
 #: The functions whose output is a ``u8`` truth value.
 COMPARISONS = ("eq", "ne", "lt", "le", "gt", "ge")
 
+#: The functions that exist on the integer element types alone.
+INTEGRAL = (
+    "remainder",
+    "bitwise_and",
+    "bitwise_or",
+    "bitwise_xor",
+    "bitwise_left_shift",
+    "bitwise_right_shift",
+)
+
+#: The integer element types that hold a sign.
+SIGNED = ("i16", "i32", "i64")
+
 
 def spec(fields, parameters, target):
     """The compilation of one elementwise_binary descriptor."""
     block = int(fields["block"])
+    compute = strided.compute(fields["dtype"])
+    if fields["function"] in INTEGRAL and compute != "int":
+        raise SystemExit(
+            f"{fields['function']} exists on the integer element types alone, "
+            f"not on {fields['dtype']}"
+        )
     compares = fields["function"] in COMPARISONS
     pointer = strided.pointer(fields["dtype"])
     pdl = fields["pdl"] == "true" and driver.capability(target) >= 100
@@ -40,6 +60,7 @@ def spec(fields, parameters, target):
             "FUNCTION": "constexpr",
             "COMPARES": "constexpr",
             "COMPUTE": "constexpr",
+            "SIGNED": "constexpr",
             "RANK": "constexpr",
             "BLOCK": "constexpr",
             "PDL": "constexpr",
@@ -47,7 +68,8 @@ def spec(fields, parameters, target):
         "constexprs": {
             "FUNCTION": fields["function"],
             "COMPARES": compares,
-            "COMPUTE": strided.compute(fields["dtype"]),
+            "COMPUTE": compute,
+            "SIGNED": fields["dtype"] in SIGNED,
             "RANK": int(fields["rank"]),
             "BLOCK": block,
             "PDL": pdl,

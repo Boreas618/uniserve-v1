@@ -71,7 +71,7 @@ pub struct ZeroPaddingArgs {
     /// `[tiles · tile_rows, heads, width]`, unit column stride; rows past a tile's valid size become
     /// zeros.
     pub values: Operand,
-    /// `[tiles]` i32: the valid rows of each tile.
+    /// `[tiles]` u32: the valid rows of each tile.
     pub sizes: Operand,
 }
 
@@ -105,7 +105,7 @@ impl Op for VsaZeroPadding {
         }
         let tiles = rows / u64::from(descriptor.tile_rows);
         args.sizes.require_shape(Self::NAME, Shape::new(&[tiles]))?;
-        args.sizes.require_row(Self::NAME, DType::I32, tiles)?;
+        args.sizes.require_row(Self::NAME, DType::U32, tiles)?;
         Ok(())
     }
 
@@ -512,15 +512,15 @@ impl fmt::Display for SelectTilesDescriptor {
 pub struct SelectTilesArgs {
     /// `[heads, query tiles, tiles]` FP32, contiguous: the pooled (query tile, key tile) scores.
     pub scores: Operand,
-    /// `[tiles]` i32: the segment of each key tile.
+    /// `[tiles]` i32: the segment of each key tile, negative for a tile outside every segment.
     pub segments: Operand,
-    /// `[tiles]` i32: the valid rows of each key tile.
+    /// `[tiles]` u32: the valid rows of each key tile.
     pub sizes: Operand,
-    /// `[segments]` i32: how many tiles of each segment to keep.
+    /// `[segments]` u32: how many tiles of each segment to keep.
     pub keep: Operand,
-    /// `[heads, query tiles, tiles]` i32: receives each query tile's key tiles, kept first.
+    /// `[heads, query tiles, tiles]` u32: receives each query tile's key tiles, kept first.
     pub indices: Operand,
-    /// `[heads, query tiles]` i32: receives each query tile's kept-tile count.
+    /// `[heads, query tiles]` u32: receives each query tile's kept-tile count.
     pub counts: Operand,
     /// The sequence tile of the scores' first query tile.
     pub query_offset: u64,
@@ -554,25 +554,30 @@ impl Op for VsaSelectTiles {
                 "the scores are not contiguous".to_owned(),
             ));
         }
-        for (name, table) in [("segment", &args.segments), ("size", &args.sizes)] {
+        // A tile's segment is signed, because a negative entry marks a tile outside every
+        // segment; its size, like every count and index here, is unsigned.
+        for (name, table, dtype) in [
+            ("segment", &args.segments, DType::I32),
+            ("size", &args.sizes, DType::U32),
+        ] {
             table.require_shape(Self::NAME, Shape::new(&[tiles]))?;
-            table.require_row(Self::NAME, DType::I32, tiles)?;
-            if table.dtype != DType::I32 {
+            table.require_row(Self::NAME, dtype, tiles)?;
+            if table.dtype != dtype {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("the {name} table is not i32"),
+                    format!("the {name} table is not {}", abi::name(dtype)),
                 ));
             }
         }
         let segments = args.segments.shape.dim(0);
-        if args.keep.shape.dim(0) != segments || args.keep.dtype != DType::I32 {
+        if args.keep.shape.dim(0) != segments || args.keep.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
-                "the keep table does not hold one i32 entry per segment".to_owned(),
+                "the keep table does not hold one u32 entry per segment".to_owned(),
             ));
         }
         args.indices.require_shape(Self::NAME, args.scores.shape)?;
-        args.indices.require_row(Self::NAME, DType::I32, tiles)?;
+        args.indices.require_row(Self::NAME, DType::U32, tiles)?;
         if args.indices.strides != crate::tensor::Strides::row_major(args.indices.shape) {
             return Err(Error::argument(
                 Self::NAME,
@@ -582,7 +587,7 @@ impl Op for VsaSelectTiles {
         args.counts
             .require_shape(Self::NAME, Shape::new(&[heads, query_tiles]))?;
         args.counts
-            .require_row(Self::NAME, DType::I32, query_tiles)?;
+            .require_row(Self::NAME, DType::U32, query_tiles)?;
         if args.query_offset > tiles - query_tiles {
             return Err(Error::argument(
                 Self::NAME,
@@ -724,7 +729,7 @@ pub struct PrepareTilesArgs {
     pub cosine: Option<Operand>,
     /// `[rows, rotated / 2]`: the sine factor table, on the same condition.
     pub sine: Option<Operand>,
-    /// `[tiles]` i32: the valid rows of each tile.
+    /// `[tiles]` u32: the valid rows of each tile.
     pub sizes: Operand,
     /// `[tiles, heads, width]` FP32, contiguous: receives the query tiles' means.
     pub pooled_query: Operand,
@@ -816,7 +821,7 @@ impl Op for VsaPrepareTiles {
         }
         let tiles = rows / u64::from(descriptor.tile_rows);
         args.sizes.require_shape(Self::NAME, Shape::new(&[tiles]))?;
-        args.sizes.require_row(Self::NAME, DType::I32, tiles)?;
+        args.sizes.require_row(Self::NAME, DType::U32, tiles)?;
         let pooled = Shape::new(&[tiles, heads, width]);
         for (name, view) in [
             ("query", &args.pooled_query),
@@ -1284,7 +1289,7 @@ pub struct CompressPooledArgs {
     pub scores: Operand,
     /// `[tiles, heads, width]` FP32: the pooled value rows, in `vsa_prepare_tiles`' layout.
     pub values: Operand,
-    /// `[tiles]` i32: the live rows of each key tile.
+    /// `[tiles]` u32: the live rows of each key tile.
     ///
     /// A tile of no live rows is invisible to the softmax — its score is masked, not merely zeroed —
     /// because a zeroed pooled value under a live score would still take weight and scale the sum
@@ -1387,7 +1392,7 @@ impl Op for VsaCompressPooled {
             ));
         }
         args.sizes.require_shape(Self::NAME, Shape::new(&[tiles]))?;
-        args.sizes.require_row(Self::NAME, DType::I32, tiles)?;
+        args.sizes.require_row(Self::NAME, DType::U32, tiles)?;
         args.out
             .require_shape(Self::NAME, Shape::new(&[heads, query_tiles, width]))?;
         if args.out.dtype != descriptor.dtype {

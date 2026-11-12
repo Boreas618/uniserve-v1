@@ -303,6 +303,341 @@ fn a_selection_a_product_and_a_composed_expression_state_their_kernels() {
 }
 
 #[test]
+fn integer_operations_and_a_sigmoid_state_their_kernels() {
+    let table_of = launches(|| {
+        let tokens = input((4, 8), DType::I64);
+        let multipliers = input((4, 8), DType::I64);
+        let sizes = input(8, DType::I64);
+
+        // The n-gram hash of the reference: a wrapping product, an exclusive or, and the
+        // remainder by one table size per column, which repeats along the rows.
+        let mixed = tokens.mul(&multipliers)?.bitwise_xor(&tokens)?;
+        let rows = mixed.broadcast_remainder(&sizes)?;
+        assert_eq!(rows.dims(), [4, 8]);
+        assert_eq!(rows.dtype(), DType::I64);
+        assert_eq!(rows.device().location(), META);
+
+        assert_eq!(tokens.bitwise_and(&mixed)?.dtype(), DType::I64);
+        assert_eq!(tokens.bitwise_or(&mixed)?.dims(), [4, 8]);
+        assert_eq!(tokens.bitwise_left_shift(&mixed)?.dims(), [4, 8]);
+
+        // A transposed operand against a contiguous one traverses two axes.
+        let counts = input((8, 4), DType::I64);
+        let shifted = tokens.bitwise_right_shift(&counts.t()?)?;
+        assert_eq!(shifted.dims(), [4, 8]);
+
+        let words = input((4, 8), DType::U32);
+        assert_eq!(words.remainder(&words)?.dtype(), DType::U32);
+
+        // A scalar operand of an integer tensor is the operation of two tensors: the scalar is
+        // one value repeated everywhere, which is one axis.
+        let next = (&tokens + 1.0)?;
+        assert_eq!(next.dtype(), DType::I64);
+        let halved = (&tokens / 2.0)?;
+        assert_eq!(halved.dims(), [4, 8]);
+        let low = tokens.bitwise_and(0xffff_i64)?;
+        assert_eq!(low.dims(), [4, 8]);
+
+        let gate = input((4, 8), DType::BF16);
+        let opened = gate.sigmoid()?;
+        assert_eq!(opened.dims(), [4, 8]);
+        assert_eq!(opened.dtype(), DType::BF16);
+        Ok(())
+    });
+
+    let binary = |function: &str, dtype: &str, rank: u8| {
+        (
+            "elementwise_binary",
+            format!("function_{function}_dtype_{dtype}_rank_{rank}_{TAIL}"),
+        )
+    };
+    assert_eq!(
+        table_of,
+        table(&[
+            binary("mul", "i64", 1),
+            binary("bitwise_xor", "i64", 1),
+            binary("remainder", "i64", 2),
+            binary("bitwise_and", "i64", 1),
+            binary("bitwise_or", "i64", 1),
+            binary("bitwise_left_shift", "i64", 1),
+            binary("bitwise_right_shift", "i64", 2),
+            binary("remainder", "u32", 1),
+            binary("add", "i64", 1),
+            binary("div", "i64", 1),
+            binary("bitwise_and", "i64", 1),
+            (
+                "elementwise_unary",
+                format!("function_sigmoid_dtype_bf16_rank_1_{TAIL}")
+            ),
+        ])
+    );
+}
+
+#[test]
+fn an_integer_operation_on_floats_and_a_sigmoid_of_integers_are_refused() {
+    let context = Context::meta(None);
+    context.record_launches();
+    let _guard = context.enter();
+
+    let floats = input((4, 8), DType::F32);
+    for refused in [
+        floats.remainder(&floats),
+        floats.bitwise_and(&floats),
+        floats.bitwise_or(&floats),
+        floats.bitwise_xor(&floats),
+        floats.bitwise_left_shift(&floats),
+        floats.bitwise_right_shift(&floats),
+    ] {
+        assert!(matches!(
+            cause(&refused.unwrap_err()),
+            Error::Launch {
+                operator: "elementwise_binary",
+                ..
+            }
+        ));
+    }
+
+    let counts = input((4, 8), DType::I64);
+    assert!(matches!(
+        cause(&counts.sigmoid().unwrap_err()),
+        Error::Launch {
+            operator: "elementwise_unary",
+            ..
+        }
+    ));
+
+    // A scalar that is no value of the element type never reaches the backend.
+    assert!(matches!(
+        plain(&(&counts * 0.5).unwrap_err()),
+        uniserve_tensor::Error::Msg(_)
+    ));
+
+    assert!(context.take_launches().is_empty());
+}
+
+#[test]
+fn a_view_as_another_element_type_shares_the_storage_and_launches_nothing() {
+    let context = Context::meta(None);
+    context.record_launches();
+    let _guard = context.enter();
+
+    let floats = empty((4, 8), DType::F32).unwrap();
+    assert_eq!(context.peak(), 256);
+
+    let bits = floats.view(DType::U32).unwrap();
+    assert_eq!(bits.dims(), [4, 8]);
+    assert_eq!(bits.dtype(), DType::U32);
+    assert_eq!(bits.device().location(), META);
+    assert_eq!(address(&bits), address(&floats));
+
+    // A strided tensor read as another element type keeps its shape, its strides and its start.
+    {
+        let window = floats.t().unwrap().narrow(0, 2, 3).unwrap();
+        let signed = operand(&window.view(DType::I32).unwrap()).unwrap();
+        assert_eq!(signed.dtype, DType::I32);
+        assert_eq!(signed.ptr.address(), address(&window));
+        assert_eq!(signed.shape.dims(), [3, 4]);
+        assert_eq!(signed.strides.as_slice(), [1, 8]);
+    }
+
+    // An element type of another size would hold another number of elements.
+    for dtype in [DType::I64, DType::BF16, DType::U8, DType::F4] {
+        let refused = floats.view(dtype).unwrap_err();
+        assert!(
+            matches!(cause(&refused), Error::ElementType { .. }),
+            "{dtype:?}"
+        );
+    }
+
+    // Nothing was allocated and nothing launched.
+    assert_eq!(context.peak(), 256);
+    assert!(context.take_launches().is_empty());
+
+    // The block is the two tensors' together: it is free once both are dropped.
+    let first = address(&floats);
+    drop(floats);
+    let other = empty((4, 8), DType::F32).unwrap();
+    assert_ne!(address(&other), first);
+    assert_eq!(context.peak(), 512);
+
+    drop(bits);
+    let reused = empty((4, 8), DType::F32).unwrap();
+    assert_eq!(address(&reused), first);
+    assert_eq!(context.peak(), 512);
+
+    // Lent memory is read as another element type where it is.
+    let bytes = retained(0x4000, (2, 8), DType::U8, &cuda(0)).unwrap();
+    let narrow = bytes.view(DType::F8E4M3).unwrap();
+    assert_eq!(narrow.dtype(), DType::F8E4M3);
+    assert_eq!(address(&narrow), 0x4000);
+    assert_eq!(narrow.device().location(), cuda(0).location());
+    assert_eq!(context.peak(), 512);
+}
+
+#[test]
+fn an_fp8_tensor_is_zeroed_copied_gathered_and_selected_as_its_bytes() {
+    let table_of = launches(|| {
+        let table = input((16, 8), DType::F8E4M3);
+        let ids = input(3, DType::U32);
+
+        let zeros = Tensor::zeros((2, 8), DType::F8E4M3, &meta())?;
+        assert_eq!(zeros.dtype(), DType::F8E4M3);
+
+        let rows = table.index_select(&ids, 0)?;
+        assert_eq!(rows.dims(), [3, 8]);
+        assert_eq!(rows.dtype(), DType::F8E4M3);
+
+        let columns = input((16, 2), DType::I64);
+        assert_eq!(table.gather(&columns, 1)?.dims(), [16, 2]);
+
+        let joined = Tensor::cat(&[&rows, &zeros], 0)?;
+        assert_eq!(joined.dims(), [5, 8]);
+
+        let transposed = table.t()?.contiguous()?;
+        assert_eq!(transposed.dims(), [8, 16]);
+
+        let cloned = table.copy()?;
+        assert_eq!(cloned.dtype(), DType::F8E4M3);
+
+        let mask = input((3, 8), DType::U8);
+        let chosen = mask.where_cond(&rows, &rows.zeros_like()?)?;
+        assert_eq!(chosen.dtype(), DType::F8E4M3);
+
+        // Rows written back into a table, and the table's bytes read as they are.
+        let target = empty((16, 8), DType::F8E4M3).unwrap();
+        target.slice_set(&rows, 0, 4)?;
+        assert_eq!(target.view(DType::U8)?.dtype(), DType::U8);
+        Ok(())
+    });
+
+    let copy = |rank: u8| ("copy_strided", format!("dtype_f8e4m3_rank_{rank}_{TAIL}"));
+    let fill = ("fill", format!("dtype_f8e4m3_rank_1_{TAIL}"));
+    assert_eq!(
+        table_of,
+        table(&[
+            fill.clone(),
+            (
+                "index",
+                format!("function_gather_dtype_f8e4m3_indices_u32_rank_2_{TAIL}")
+            ),
+            (
+                "index",
+                format!("function_gather_dtype_f8e4m3_indices_i64_rank_2_{TAIL}")
+            ),
+            copy(1),
+            copy(1),
+            copy(2),
+            copy(1),
+            fill,
+            (
+                "elementwise_where",
+                format!("dtype_f8e4m3_condition_u8_rank_1_{TAIL}")
+            ),
+            copy(1),
+        ])
+    );
+}
+
+#[test]
+fn computing_with_an_fp8_tensor_and_moving_a_packed_one_are_refused() {
+    let context = Context::meta(None);
+    context.record_launches();
+    let _guard = context.enter();
+
+    let launch_refused = |result: Result<Tensor>, operator: &str| match cause(&result.unwrap_err())
+    {
+        Error::Launch {
+            operator: named, ..
+        } => assert_eq!(*named, operator),
+        other => panic!("expected a refused launch of {operator}, not {other}"),
+    };
+
+    // An FP8 element moves and is never computed with: its arithmetic is a fused operator's.
+    let narrow = input((4, 8), DType::F8E4M3);
+    launch_refused(narrow.add(&narrow), "elementwise_binary");
+    launch_refused(narrow.relu(), "elementwise_unary");
+    launch_refused(narrow.sum_keepdim(1), "reduce");
+    launch_refused(narrow.to_dtype(DType::F32), "cast");
+    launch_refused(input((4, 8), DType::F32).to_dtype(DType::F8E4M3), "cast");
+
+    let ids = input(4, DType::U32);
+    launch_refused(narrow.index_add(&ids, &narrow, 0), "index");
+
+    // Two NVFP4 elements share a byte: no primitive addresses one.
+    let packed = input(16, DType::F4);
+    launch_refused(packed.copy(), "copy_strided");
+    launch_refused(Tensor::zeros(16, DType::F4, &meta()), "fill");
+    assert!(matches!(
+        cause(&packed.view(DType::U8).unwrap_err()),
+        Error::ElementType { .. }
+    ));
+
+    // Its packed bytes, stated as the bytes they are, move like any other tensor.
+    let bytes = input(8, DType::U8);
+    assert_eq!(bytes.copy().unwrap().dims(), [8]);
+
+    let launched = context.take_launches();
+    // The copy an `index_add` starts with, and the copy of the bytes.
+    assert_eq!(launched.len(), 2);
+    assert!(
+        launched
+            .iter()
+            .all(|(operator, ..)| *operator == "copy_strided")
+    );
+}
+
+#[test]
+fn operands_a_product_or_a_convolution_cannot_read_in_place_are_made_contiguous_first() {
+    let table_of = launches(|| {
+        // A row repeated over the batch has no stride between its rows; every other row has one.
+        let row = input((1, 8), DType::F32);
+        let weight = input((8, 5), DType::F32);
+        let repeated = row.broadcast_as((4, 8))?.matmul(&weight)?;
+        assert_eq!(repeated.dims(), [4, 5]);
+
+        // Every other column of a wider weight is no run of elements in either order.
+        let wide = input((8, 10), DType::F32);
+        let stepped = Tensor::cat(&[&wide.narrow(1, 0, 1)?, &wide.narrow(1, 4, 1)?], 1)?;
+        assert_eq!(stepped.dims(), [8, 2]);
+        let x = input((4, 8), DType::F32);
+        assert_eq!(x.matmul(&wide.narrow(1, 2, 5)?)?.dims(), [4, 5]);
+
+        // `[n, l, c]` read as `[n, c, l]`, and a signal one sample repeated over the batch.
+        let signal = input((1, 16, 2), DType::F32).transpose(1, 2)?;
+        let filter = input((3, 2, 4), DType::F32);
+        assert_eq!(signal.conv1d(&filter, 1, 2, 1, 1)?.dims(), [1, 3, 8]);
+
+        let batch = input((1, 2, 16), DType::F32).broadcast_as((4, 2, 16))?;
+        assert_eq!(batch.conv1d(&filter, 1, 2, 1, 1)?.dims(), [4, 3, 8]);
+        Ok(())
+    });
+
+    let copy = |rank: u8| ("copy_strided", format!("dtype_f32_rank_{rank}_{TAIL}"));
+    let gemm = (
+        "gemm",
+        "input_f32_weight_f32_accumulate_f32_output_f32_order_kxn_epilogue_none".to_owned(),
+    );
+    let conv1d = ("conv1d", "input_f32_weight_f32_output_f32".to_owned());
+    assert_eq!(
+        table_of,
+        table(&[
+            // The repeated row copied into four rows, then the product.
+            copy(2),
+            gemm.clone(),
+            // The two columns of the concatenation.
+            copy(1),
+            copy(1),
+            // A window of a wider weight keeps the wider weight's row stride: read in place.
+            gemm,
+            copy(2),
+            conv1d.clone(),
+            copy(2),
+            conv1d,
+        ])
+    );
+}
+
+#[test]
 fn a_batch_of_distinct_matrices_is_one_product_per_member() {
     let table_of = launches(|| {
         let lhs = input((3, 4, 8), DType::BF16);
@@ -569,8 +904,14 @@ fn a_host_tensor_moved_to_the_device_writes_its_bytes_into_the_input_buffer() {
     assert_eq!(memory[256..556], [9; 300]);
     assert_eq!(context.input_peak(), 556);
 
-    // A meta context issues nothing, so it has no input copy to hand to a graph.
-    assert!(context.take_input_copies().is_empty());
+    // A meta context issues nothing and states the input copies a capture would record: the
+    // offsets and the sizes of the last forward's copies.
+    let copies: Vec<(u64, u64)> = context
+        .take_input_copies()
+        .into_iter()
+        .map(|(offset, _, bytes)| (offset, bytes))
+        .collect();
+    assert_eq!(copies, [(0, 12), (256, 300)]);
 }
 
 #[test]

@@ -525,8 +525,17 @@ mod tests {
             latent_restores: Vec::new(),
             host_outputs: Vec::new(),
             images: Vec::new(),
+            buffers: Vec::new(),
             frees: Vec::new(),
-            media: Some(MediaColumns::staged(computation, &[staged])),
+            media: Some(MediaColumns::staged(
+                computation,
+                &[staged],
+                &[&ipc::Call::new(
+                    ipc::RequestKey::new(1, ipc::RequestId(9), 0),
+                    ipc::CallId::new(id, 0),
+                    CallKind::Media(MediaCall::Denoising),
+                )],
+            )),
         }
     }
 

@@ -370,6 +370,7 @@ fn token_batch() -> execution::Batch {
         latent_restores: Vec::new(),
         host_outputs: Vec::new(),
         images: Vec::new(),
+        buffers: Vec::new(),
         frees: Vec::new(),
         media: None,
     }
@@ -831,6 +832,33 @@ fn a_batch_names_one_host_encoder_output_per_request() {
         ..token_batch()
     };
     assert!(refusal(batch.validate()).contains("two host encoder outputs"));
+}
+
+#[test]
+fn a_batch_places_a_product_once_on_each_rank() {
+    let span = |offset| BufferAllocation {
+        buffer: BufferId {
+            owner: key_for_request(1),
+            producer_call_id: CallId::new(1, 0),
+            output_index: 0,
+            generation: 1,
+        },
+        offset,
+        bytes: 256,
+    };
+    let placed = execution::Batch {
+        buffers: vec![(0, span(0)), (1, span(512))],
+        ..token_batch()
+    };
+    placed
+        .validate()
+        .expect("one product has a span on each of two ranks");
+
+    let repeated = execution::Batch {
+        buffers: vec![(0, span(0)), (0, span(512))],
+        ..token_batch()
+    };
+    assert!(refusal(repeated.validate()).contains("one product twice on one rank"));
 }
 
 #[test]

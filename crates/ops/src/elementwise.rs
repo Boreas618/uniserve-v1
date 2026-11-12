@@ -2,9 +2,14 @@
 //!
 //! ```text
 //! elementwise_unary    out[i] = f(x[i])
-//! elementwise_binary   out[i] = lhs[i] ∘ rhs[i]         (arithmetic, or a comparison writing u8)
+//! elementwise_binary   out[i] = lhs[i] ∘ rhs[i]         (arithmetic, integer and bit operations,
+//!                                                        or a comparison writing u8)
 //! elementwise_where    out[i] = condition[i] ≠ 0 ? on_true[i] : on_false[i]
 //! ```
+//!
+//! A selection converts nothing, so its values are any element a primitive moves
+//! ([`crate::strided::MOVED`]), an FP8 (`f8e4m3`) element included; the other two operators
+//! compute, on the element types of [`crate::strided`]'s `ELEMENTS`.
 //!
 //! `i` ranges over one shape that every operand of a call has. An input is read through its
 //! strides, so a permuted view needs no copy and a broadcast operand is one whose stride is zero
@@ -20,6 +25,20 @@
 //! a zero integer divisor leaves its element unspecified. `maximum` and `minimum` return the
 //! left operand unless the right one is strictly beyond it, and a comparison with a NaN is false
 //! (`ne` alone is true), as IEEE 754 orders them.
+//!
+//! Six binary functions exist on the integer element types alone ([`BinaryFunction::integral`]),
+//! named as PyTorch names them and exact as all integer arithmetic is:
+//!
+//! ```text
+//! remainder            lhs − rhs · ⌊lhs / rhs⌋: zero, or of the sign of rhs (torch.remainder)
+//! bitwise_and          lhs & rhs          bitwise_or     lhs | rhs          bitwise_xor   lhs ^ rhs
+//! bitwise_left_shift   lhs << rhs         bitwise_right_shift   lhs >> rhs
+//! ```
+//!
+//! A right shift repeats the sign bit of a signed element and clears the high bits of an
+//! unsigned one. A shift count that is negative or not below the element's width in bits, and a
+//! zero divisor of a `remainder`, leave their element unspecified; the remainder of the smallest
+//! signed value by minus one is zero.
 //!
 //! The unary functions follow the tensor library's host formulas:
 //!
@@ -370,11 +389,19 @@ pub enum BinaryFunction {
     Le,
     Gt,
     Ge,
+    /// The remainder of the floored quotient: zero, or of the sign of the right operand.
+    Remainder,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseLeftShift,
+    /// A shift toward the low bits that repeats the sign bit of a signed element.
+    BitwiseRightShift,
 }
 
 impl BinaryFunction {
     /// Every function, in the order the package declares them.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 18] = [
         Self::Add,
         Self::Sub,
         Self::Mul,
@@ -387,7 +414,26 @@ impl BinaryFunction {
         Self::Le,
         Self::Gt,
         Self::Ge,
+        Self::Remainder,
+        Self::BitwiseAnd,
+        Self::BitwiseOr,
+        Self::BitwiseXor,
+        Self::BitwiseLeftShift,
+        Self::BitwiseRightShift,
     ];
+
+    /// Whether the function exists on the integer element types alone.
+    pub const fn integral(self) -> bool {
+        matches!(
+            self,
+            Self::Remainder
+                | Self::BitwiseAnd
+                | Self::BitwiseOr
+                | Self::BitwiseXor
+                | Self::BitwiseLeftShift
+                | Self::BitwiseRightShift
+        )
+    }
 
     /// Whether the function is a comparison, whose result is `u8`: one where it holds, zero
     /// where it does not.
@@ -419,6 +465,12 @@ impl fmt::Display for BinaryFunction {
             Self::Le => "le",
             Self::Gt => "gt",
             Self::Ge => "ge",
+            Self::Remainder => "remainder",
+            Self::BitwiseAnd => "bitwise_and",
+            Self::BitwiseOr => "bitwise_or",
+            Self::BitwiseXor => "bitwise_xor",
+            Self::BitwiseLeftShift => "bitwise_left_shift",
+            Self::BitwiseRightShift => "bitwise_right_shift",
         })
     }
 }
@@ -485,6 +537,16 @@ impl Op for ElementwiseBinary {
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::ELEMENTS)?;
+        if descriptor.dtype.is_float() && descriptor.function.integral() {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{} exists on the integer element types alone and the descriptor's dtype is {}",
+                    descriptor.function,
+                    abi::name(descriptor.dtype)
+                ),
+            ));
+        }
         strided::require_block(Self::NAME, descriptor.block)?;
 
         let output = descriptor.function.output(descriptor.dtype);
@@ -544,8 +606,9 @@ impl Op for ElementwiseBinary {
                 // One operation in the computing type, rounded once into the element type.
                 Tolerance::rounding(1, tolerance::accumulate(dtype), dtype)
             }
-            // Integer arithmetic wraps the same way everywhere; a maximum or a minimum is one of
-            // its operands, and a comparison that differs is a wrong decision, not a rounding.
+            // Integer arithmetic wraps the same way everywhere, and a remainder, a combination
+            // of bits and a shift are integer arithmetic; a maximum or a minimum is one of its
+            // operands, and a comparison that differs is a wrong decision, not a rounding.
             _ => Tolerance::exact(),
         }
     }
@@ -614,7 +677,7 @@ impl Op for ElementwiseWhere {
     type Args<'a> = WhereArgs;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::ELEMENTS)?;
+        strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::MOVED)?;
         strided::require_element(
             Self::NAME,
             "condition",
@@ -956,6 +1019,84 @@ mod tests {
     }
 
     #[test]
+    fn every_binary_function_has_a_name_of_its_own_and_the_first_twelve_keep_theirs() {
+        let names: Vec<String> = BinaryFunction::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let distinct: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(distinct.len(), BinaryFunction::ALL.len());
+
+        // A stored module is found under the key its function was first given.
+        assert_eq!(
+            names[..12],
+            [
+                "add", "sub", "mul", "div", "maximum", "minimum", "eq", "ne", "lt", "le", "gt",
+                "ge"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_integer_function_takes_integer_elements_alone_and_is_exact() {
+        let integral = [
+            (BinaryFunction::Remainder, "remainder"),
+            (BinaryFunction::BitwiseAnd, "bitwise_and"),
+            (BinaryFunction::BitwiseOr, "bitwise_or"),
+            (BinaryFunction::BitwiseXor, "bitwise_xor"),
+            (BinaryFunction::BitwiseLeftShift, "bitwise_left_shift"),
+            (BinaryFunction::BitwiseRightShift, "bitwise_right_shift"),
+        ];
+        for function in BinaryFunction::ALL {
+            let named = integral.iter().any(|(listed, _)| *listed == function);
+            assert_eq!(function.integral(), named, "{function}");
+        }
+
+        for (function, name) in integral {
+            for dtype in [DType::U8, DType::U32, DType::I16, DType::I32, DType::I64] {
+                let lhs = contiguous(dtype, &[4, 8]);
+                let args = binary(lhs, lhs, function);
+                let descriptor = BinaryDescriptor::of(function, &args, BLOCK, false);
+
+                assert_eq!(
+                    descriptor.to_string(),
+                    format!(
+                        "function_{name}_dtype_{}_rank_1_block_1024_pdl_false",
+                        abi::name(dtype)
+                    )
+                );
+                assert_eq!(args.out.dtype, dtype);
+                ElementwiseBinary::check(&descriptor, &args).unwrap();
+                assert_eq!(
+                    ElementwiseBinary::tolerance(&descriptor),
+                    Tolerance::exact()
+                );
+            }
+
+            for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+                let lhs = contiguous(dtype, &[4, 8]);
+                let args = binary(lhs, lhs, function);
+                let descriptor = BinaryDescriptor::of(function, &args, BLOCK, false);
+
+                let message = refusal(ElementwiseBinary::check(&descriptor, &args));
+                assert!(
+                    message.contains("exists on the integer element types alone"),
+                    "{message}"
+                );
+            }
+        }
+
+        // A broadcast shift count traverses the axes it repeats, as any right operand does.
+        let lhs = contiguous(DType::I64, &[4, 8]);
+        let count = operand(DType::I64, &[4, 8], &[0, 0]);
+        let args = binary(lhs, count, BinaryFunction::BitwiseRightShift);
+        let descriptor =
+            BinaryDescriptor::of(BinaryFunction::BitwiseRightShift, &args, BLOCK, false);
+        assert_eq!(descriptor.rank, 1);
+        ElementwiseBinary::check(&descriptor, &args).unwrap();
+    }
+
+    #[test]
     fn a_binary_tolerance_is_one_rounding_for_float_arithmetic_and_exact_otherwise() {
         let tolerance = |function, dtype| {
             let lhs = contiguous(dtype, &[16]);
@@ -1003,6 +1144,41 @@ mod tests {
         );
         ElementwiseWhere::check(&descriptor, &args).unwrap();
         assert_eq!(ElementwiseWhere::tolerance(&descriptor), Tolerance::exact());
+    }
+
+    #[test]
+    fn a_selection_moves_fp8_values_as_their_bytes() {
+        let args = selection(
+            contiguous(DType::U8, &[4, 8]),
+            operand(DType::F8E4M3, &[4, 8], &[0, 1]),
+        );
+        let descriptor = WhereDescriptor::of(&args, BLOCK, false);
+        assert_eq!(
+            descriptor.to_string(),
+            "dtype_f8e4m3_condition_u8_rank_2_block_1024_pdl_false"
+        );
+        ElementwiseWhere::check(&descriptor, &args).unwrap();
+        assert_eq!(ElementwiseWhere::tolerance(&descriptor), Tolerance::exact());
+
+        // Two NVFP4 elements share a byte: there is no element to select.
+        let packed = selection(
+            contiguous(DType::U8, &[4, 8]),
+            contiguous(DType::F4, &[4, 8]),
+        );
+        let message = refusal(ElementwiseWhere::check(
+            &WhereDescriptor::of(&packed, BLOCK, false),
+            &packed,
+        ));
+        assert!(message.contains("dtype is f4e2m1"), "{message}");
+
+        // Arithmetic on an FP8 element is no primitive's.
+        let lhs = contiguous(DType::F8E4M3, &[4, 8]);
+        let sum = binary(lhs, lhs, BinaryFunction::Add);
+        let message = refusal(ElementwiseBinary::check(
+            &BinaryDescriptor::of(BinaryFunction::Add, &sum, BLOCK, false),
+            &sum,
+        ));
+        assert!(message.contains("dtype is f8e4m3"), "{message}");
     }
 
     #[test]

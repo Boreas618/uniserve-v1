@@ -1,87 +1,64 @@
 //! The Qwen3 causal language models: `Qwen3MoeForCausalLM` and the language model of
-//! `Qwen3_5MoeForConditionalGeneration` (Qwen3.6-35B-A3B among them), one implementation over the
-//! family's [`DecoderStack`].
+//! `Qwen3_5MoeForConditionalGeneration` (Qwen3.6-35B-A3B among them), one implementation over
+//! the family's [`DecoderLayer`].
 //!
 //! ```text
 //! embedding:  hidden = Σ_ranks embed_shard(ids)                         (vocabulary parallel)
-//! layers:     the decoder stack, paged attention over the prefix cache  (crate::decoder)
+//! layers:     attention over the paged key/value cache                  (crate::decoder)
 //!             or gated delta networks over the request slots' state     (Qwen3.5's linear layers)
-//! experts:    combine(routes, experts(x)) [+ sigmoid(g · x) · shared(x)] (top-k, FP32 weights)
-//! final:      hidden = norm(hidden)
+//! experts:    Σ_routes weight · expert(x) [+ sigmoid(g · x) · shared(x)] (top-k, FP32 weights)
+//! final:      hidden = norm(hidden + residual)
 //! logits:     the vocabulary-parallel head, FP32
 //! ```
 //!
 //! ## Rotary positions
 //!
-//! A Qwen3.5 checkpoint rotates the leading quarter of each attention head by interleaved M-RoPE
-//! over three axes. A text batch places every token at the same position on all three axes, under
-//! which interleaved M-RoPE is the default spectrum over the rotated channels, so a text batch
-//! turns by that spectrum over its one position axis; a batch carrying image rows states three
-//! axes ([`TokenBatch::rope_positions`]) and turns by the sectioned spectrum.
+//! A Qwen3.5 checkpoint rotates the leading quarter of each attention head by interleaved
+//! M-RoPE over three axes. A text batch places every token at the same position on all three
+//! axes, under which interleaved M-RoPE is the default spectrum over the rotated channels, so
+//! a text batch turns by that spectrum over its one position axis; a batch that holds image
+//! rows states three axes ([`TokenBatch::rope_positions`]) and turns by the sectioned
+//! spectrum.
 //!
 //! ## Experts
 //!
-//! The routed experts of each layer are held in the slots an [`ExpertOrder`] states (`docs/admin.md`,
-//! Expert redistribution); one published table maps every routed layer's logical experts to its
-//! slots, so a redistribution changes the table's contents and the stacks, never a capture.
+//! The routed experts of each layer are held in the slots an [`ExpertOrder`] states
+//! (`docs/admin.md`, Expert redistribution), by the module path [`expert_module`] names.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
-use nn::blocks::{AttentionKind, GatedDeltaNet, Keys, RopeFactors, SharedExpert, SharedExpertSpec};
-use nn::capability::{CausalLm, KvView, PixelNorm, TokenBatch, Vision};
-use nn::family::{
-    CacheShape, Drafter, ExpertOrder, ExpertShape, Split, StateShape, TextModel, TextPlacement,
+use nn::family::{CacheShape, ExpertOrder, ExpertShape, StateShape, TextModel, TextPlacement};
+use nn::modules::{
+    Embedding, EmbeddingConfig, LmHead, LmHeadConfig, RmsNorm, Rotary, RotaryConfig, Spectrum,
 };
-use nn::layers::{
-    ExpertNames, ExpertSlots, Moe, MoeSpec, PagedAttention, ParallelLMHead, ResidualStream,
-    RmsNorm, Rotary, Spectrum, StackedExperts, VocabParallelEmbedding,
+use nn::{
+    CausalLm, DType, Drafter, ExpertExchange, KvCache, RecurrentState, Split, Tensor, TokenBatch,
+    VarBuilder, Vision, functional,
 };
-use nn::quantization::Declaration;
-use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Forward, Operand, Weight};
 
-use crate::config::{Config, Mixer, QWEN3_MOE};
-use crate::decoder::{self, DecoderStack, Mlp};
+use crate::config::{Config, QWEN3_MOE};
+use crate::decoder::{self, DecoderLayer};
 use crate::mtp::Mtp;
 use crate::vision::VisionTower;
 use crate::{Error, Result};
-use processing::qwen_vl::ProcessorConfig;
 
-/// The fence class of the whole decoder stack, at path `model`.
+/// The profiler class of the whole decoder stack, at path `model`.
 const TRANSFORMER: &str = "models.qwen3.transformer.Transformer";
-
-/// The module names a checkpoint states a routed block under: `mlp.gate` routes, and `mlp.experts`
-/// holds every expert either stacked (`gate_up_proj`, `down_proj`, as released Qwen3.5 BF16
-/// checkpoints store them) or one module per expert (Qwen3-MoE, and every calibrated export).
-const EXPERT_NAMES: ExpertNames<'static> = ExpertNames {
-    router: "gate",
-    experts: "experts",
-    up: "up_proj",
-    gate: "gate_proj",
-    down: "down_proj",
-    stacked: Some(StackedExperts {
-        gate_up: "gate_up_proj",
-        down: "down_proj",
-    }),
-};
 
 /// A Qwen3 causal language model.
 pub struct Qwen3ForCausalLm {
     config: Config,
     tensor: Split,
-    dtype: DType,
-    embedding: VocabParallelEmbedding,
+    embed_tokens: Embedding,
     /// The rotation of a batch of one position axis.
-    rotary: Rotary,
+    rotary_emb: Rotary,
     /// The sectioned rotation a batch with image rows turns by, when the model takes images.
     mrope: Option<Rotary>,
-    stack: DecoderStack,
+    layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    head: ParallelLMHead,
-    /// Whether the checkpoint's experts were read as calibrated NVFP4.
-    experts_encoded: bool,
-    drafter: Option<Mtp>,
-    vision: Option<VisionTower>,
+    lm_head: LmHead,
+    mtp: Option<Mtp>,
+    visual: Option<VisionTower>,
 }
 
 /// The module path the language model's modules sit under.
@@ -93,21 +70,16 @@ fn language_model(config: &Config) -> &'static str {
     }
 }
 
-/// The spectrum a batch of one position axis turns by: the default spectrum over the rotated
-/// channels of an interleaved M-RoPE (module documentation), or the configuration's own.
-pub(crate) fn text_spectrum(rope: Spectrum) -> Spectrum {
-    match rope {
-        Spectrum::Sectioned {
-            theta,
-            dim,
-            precision,
-            ..
-        } => Spectrum::Default {
-            theta,
-            dim,
-            precision,
+/// The rotary embedding a batch of one position axis turns by: the default spectrum over the
+/// rotated channels of an interleaved M-RoPE (module documentation), or the configuration's
+/// own.
+pub(crate) fn text_rotary(rope: RotaryConfig) -> RotaryConfig {
+    match rope.spectrum {
+        Spectrum::Sectioned { .. } => RotaryConfig {
+            spectrum: Spectrum::Default,
+            ..rope
         },
-        other => other,
+        _ => rope,
     }
 }
 
@@ -116,94 +88,98 @@ pub fn expert_module(layer: u32) -> String {
     format!("layers.{layer}.mlp.experts")
 }
 
+/// The routed experts of every layer of `config` by module path, each with its expert count:
+/// what an expert redistribution may order.
+pub fn expert_layers(config: &Config) -> BTreeMap<String, u32> {
+    let Some(moe) = &config.moe else {
+        return BTreeMap::new();
+    };
+
+    (0..config.text.num_hidden_layers)
+        .filter(|layer| config.routes(*layer))
+        .map(|layer| (expert_module(layer), moe.num_experts))
+        .collect()
+}
+
 impl Qwen3ForCausalLm {
-    /// Load the model `config` and `declaration` describe at the ranks `placement` states, with
-    /// the routed experts in the slots `order` states, the drafter when the deployment speculates,
-    /// and the vision tower when `images` states the processor its images are sized by.
+    /// The model `config` describes, its modules read under `vb` (the checkpoint's root), at
+    /// the ranks `placement` states, with the routed experts in the slots `order` states, the
+    /// drafter when the deployment speculates, and the vision tower when the configuration
+    /// states the processor its images are sized by.
     ///
     /// # Errors
     ///
-    /// A split the model does not divide, a drafter the checkpoint does not carry, a tower with
-    /// DeepStack features (a causal LM's prefill adds none), or a module the loader refuses.
+    /// A split the model does not divide, an order that names no routed layer, a drafter the
+    /// checkpoint does not carry, a tower with DeepStack features (a causal LM's prefill adds
+    /// none), or a module the loader refuses.
     pub fn load(
         config: &Config,
-        declaration: &Declaration,
+        vb: VarBuilder<'_, '_>,
         placement: &TextPlacement,
-        loader: &mut WeightLoader<'_>,
         order: &ExpertOrder,
-        images: Option<(ProcessorConfig, PixelNorm)>,
     ) -> Result<Self> {
-        let (tensor, experts) = (placement.tensor, placement.experts);
-        config.check_splits(tensor, experts)?;
-        loader.declare(declaration);
-        let text = &config.text;
-        let prefix = language_model(config);
+        let splits = (placement.tensor, placement.experts);
+        config.check_splits(splits.0, splits.1)?;
 
-        let embedding = VocabParallelEmbedding::load(
-            &mut loader.scope(format!("{prefix}.embed_tokens")),
-            text.vocab_size,
-            text.hidden_size,
-            tensor,
+        let routed = expert_layers(config);
+        if let Some(stray) = order.keys().find(|module| !routed.contains_key(*module)) {
+            return Err(Error::Config(format!(
+                "{stray} is not a routed expert layer of this model"
+            )));
+        }
+
+        let text = &config.text;
+        let model = vb.pp(language_model(config));
+
+        let embed_tokens = Embedding::load(
+            &EmbeddingConfig {
+                vocabulary: text.vocab_size,
+                hidden: text.hidden_size,
+                split: splits.0,
+            },
+            model.pp("embed_tokens"),
         )?;
-        let dtype = embedding.weight().dtype();
-        let head = if text.tie_word_embeddings {
-            ParallelLMHead::tied(&embedding)?
+        let lm_head = if text.tie_word_embeddings {
+            LmHead::tied(&embed_tokens)?
         } else {
-            ParallelLMHead::load(
-                &mut loader.scope("lm_head"),
-                text.vocab_size,
-                text.hidden_size,
-                tensor,
+            LmHead::load(
+                &LmHeadConfig {
+                    vocabulary: text.vocab_size,
+                    hidden: text.hidden_size,
+                    split: splits.0,
+                },
+                vb.pp("lm_head"),
             )?
         };
-        let norm = RmsNorm::load(
-            &mut loader.scope(format!("{prefix}.norm")),
-            text.hidden_size,
-            text.rms_norm_eps,
-            text.rms_norm_gain,
-            dtype,
-        )?;
-        let rotary = decoder::rotary(
-            &mut loader.scope(format!("{prefix}.rotary_emb")),
-            text,
-            text_spectrum(text.rope),
-            tensor,
-        )?;
 
-        let routing: Vec<u32> = (0..text.num_hidden_layers)
-            .filter(|layer| config.routes(*layer))
-            .collect();
-        let slots = expert_slots(config, &routing, order, loader.scope(prefix))?;
-        let attention = AttentionKind::Paged {
-            max_kv_len: text.max_position_embeddings,
-            window: None,
-        };
-        let stack = DecoderStack::load(
-            &mut loader.scope(prefix),
-            config,
-            0..text.num_hidden_layers,
-            attention,
-            tensor,
-            dtype,
-            &mut |layer, scope| match &slots {
-                Some(slots) if config.routes(layer) => {
-                    routed(scope, config, slots, layer, (tensor, experts))
-                }
-                _ => Mlp::dense(scope, text, tensor),
-            },
-        )?;
+        let layers = (0..text.num_hidden_layers)
+            .map(|layer| {
+                DecoderLayer::load(
+                    config,
+                    model.pp("layers").pp(layer),
+                    text.linear_layers[layer as usize],
+                    config.routes(layer),
+                    splits,
+                    order.get(&expert_module(layer)),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let drafter = if placement.drafter {
-            Some(Mtp::load(config, (tensor, experts), dtype, loader)?)
+        let mtp = if placement.drafter {
+            Some(Mtp::load(config, vb.pp("mtp"), splits)?)
         } else {
             None
         };
-        let (vision, mrope) = match images {
-            None => (None, None),
-            Some((processor, norm)) => {
-                let vision = config.vision.as_ref().ok_or_else(|| {
-                    Error::Config("the checkpoint states processor files and no tower".to_owned())
-                })?;
+
+        let rotary = model.pp("rotary_emb");
+        let (visual, mrope) = match (config.images, &config.vision) {
+            (None, _) => (None, None),
+            (Some(_), None) => {
+                return Err(Error::Config(
+                    "the checkpoint states processor files and no tower".to_owned(),
+                ));
+            }
+            (Some((processor, pixels)), Some(vision)) => {
                 if !vision.deepstack_visual_indexes.is_empty() {
                     return Err(Error::Config(
                         "a causal language model's prefill adds no DeepStack features, but the \
@@ -211,31 +187,30 @@ impl Qwen3ForCausalLm {
                             .to_owned(),
                     ));
                 }
-                let mrope = decoder::rotary(
-                    &mut loader.scope(format!("{prefix}.rotary_emb.sectioned")),
-                    text,
-                    text.rope,
-                    tensor,
-                )?;
+
                 (
-                    Some(VisionTower::load(loader, vision, processor, norm, dtype)?),
-                    Some(mrope),
+                    Some(VisionTower::load(
+                        vision,
+                        vb.pp("model.visual"),
+                        processor,
+                        pixels,
+                    )?),
+                    Some(Rotary::load(&text.rope, rotary.pp("sectioned"))?),
                 )
             }
         };
+
         Ok(Self {
-            experts_encoded: declaration.is_encoded() && !routing.is_empty(),
             config: config.clone(),
-            tensor,
-            dtype,
-            embedding,
-            rotary,
+            tensor: splits.0,
+            embed_tokens,
+            rotary_emb: Rotary::load(&text_rotary(text.rope), rotary)?,
             mrope,
-            stack,
-            norm,
-            head,
-            drafter,
-            vision,
+            layers,
+            norm: RmsNorm::load(&decoder::stream_norm(text), model.pp("norm"))?,
+            lm_head,
+            mtp,
+            visual,
         })
     }
 
@@ -243,172 +218,35 @@ impl Qwen3ForCausalLm {
     pub const fn config(&self) -> &Config {
         &self.config
     }
-
-    /// The keys decoder layer `index` reads: its paged key/value layer when it attends, its
-    /// recurrent state layer when it is linear.
-    fn keys<'k>(
-        &self,
-        batch: &'k TokenBatch,
-        cache: &'k KvView<'k>,
-        index: usize,
-    ) -> Result<Keys<'k>> {
-        let ordinal = self.config.ordinal(index);
-        Ok(match self.config.mixers[index] {
-            Mixer::Attention => Keys::Paged {
-                batch,
-                cache: cache.layer(0, ordinal)?,
-            },
-            Mixer::Linear(_) => Keys::Recurrent {
-                batch,
-                cache,
-                layer: ordinal,
-            },
-        })
-    }
-}
-
-/// The routed block of layer `layer` at `scope` (its `mlp` module): the experts in the slots
-/// `slots` states and, when the configuration states one, the gated shared expert.
-pub(crate) fn routed(
-    scope: &mut Scope<'_, '_>,
-    config: &Config,
-    (orders, table, rows): &Slots,
-    layer: u32,
-    (tensor, experts): (Split, Split),
-) -> Result<Mlp> {
-    let text = &config.text;
-    let moe = config
-        .moe
-        .as_ref()
-        .ok_or_else(|| Error::Config(format!("layer {layer} routes in a dense model")))?;
-    let row = rows
-        .iter()
-        .position(|routed| *routed == layer)
-        .ok_or_else(|| Error::Config(format!("layer {layer} has no row of the expert table")))?;
-    let routed = Moe::load(
-        scope,
-        MoeSpec {
-            experts: moe.num_experts,
-            top: moe.num_experts_per_tok,
-            hidden: text.hidden_size,
-            intermediate: moe.moe_intermediate_size,
-            activation: text.hidden_act,
-            renormalize: moe.norm_topk_prob,
-        },
-        EXPERT_NAMES,
-        ExpertSlots {
-            order: &orders[&layer],
-            map: table.row(row as u64)?,
-        },
-        tensor,
-        experts,
-    )?;
-    let shared = moe
-        .shared_expert_intermediate_size
-        .map(|intermediate| {
-            SharedExpert::load(
-                scope,
-                SharedExpertSpec {
-                    mlp: decoder::gated_mlp(text.hidden_size, intermediate, text.hidden_act),
-                    module: "shared_expert",
-                    gate: "shared_expert_gate",
-                },
-                tensor,
-            )
-        })
-        .transpose()?;
-    Ok(Mlp::Experts { routed, shared })
-}
-
-/// Each routed layer's logical experts in slot order, the published `[routed layers, experts]`
-/// slot table a route reads its slot from, and the routed layers whose rows it holds, in row
-/// order.
-pub(crate) type Slots = (HashMap<u32, Vec<u32>>, Weight, Vec<u32>);
-
-/// The slots of the routed layers `layers`, from `order` (the checkpoint's order for a layer it
-/// does not name), and their table, published as `expert_slots` under `scope`; `None` without a
-/// routed layer.
-///
-/// Every layer's row is one weight's row: a retained weight takes a whole allocation granule, so
-/// one table per layer would hold a granule each for a few hundred bytes.
-///
-/// # Errors
-///
-/// An order naming a module that is no routed layer, or an order that is no permutation.
-pub(crate) fn expert_slots(
-    config: &Config,
-    layers: &[u32],
-    order: &ExpertOrder,
-    mut scope: Scope<'_, '_>,
-) -> Result<Option<Slots>> {
-    let Some(moe) = &config.moe else {
-        return Ok(None);
-    };
-    if layers.is_empty() {
-        return Ok(None);
-    }
-    let modules: Vec<String> = layers.iter().copied().map(expert_module).collect();
-    if let Some(stray) = order.keys().find(|module| !modules.contains(module)) {
-        return Err(Error::Config(format!(
-            "{stray} is not a routed expert layer of this model"
-        )));
-    }
-    let experts = moe.num_experts;
-    let mut orders = HashMap::with_capacity(layers.len());
-    let mut table = Vec::with_capacity(layers.len() * experts as usize);
-    for (&layer, module) in layers.iter().zip(&modules) {
-        let slots = order
-            .get(module)
-            .cloned()
-            .unwrap_or_else(|| (0..experts).collect());
-        if slots.len() != experts as usize {
-            return Err(Error::Config(format!(
-                "the order of {module} names {} experts of {experts}",
-                slots.len()
-            )));
-        }
-        let map = Moe::slot_map(&slots)
-            .map_err(|error| Error::Config(format!("the order of {module}: {error}")))?;
-        // A slot is below the expert count, which the router's i32 ids hold.
-        table.extend(map.iter().map(|&slot| slot as i32));
-        orders.insert(layer, slots);
-    }
-    let weight = scope.constant_i32(
-        "expert_slots",
-        &[layers.len() as u64, u64::from(experts)],
-        &table,
-    )?;
-    Ok(Some((orders, weight, layers.to_vec())))
 }
 
 impl CausalLm for Qwen3ForCausalLm {
-    fn embed_input_ids(&self, f: &Forward, ids: Operand) -> nn::Result<Operand> {
-        self.embedding.forward(f, ids)
+    fn embed_input_ids(&self, ids: &Tensor) -> nn::Result<Tensor> {
+        self.embed_tokens.forward(ids)
     }
 
-    /// The stack over the batch's embeddings `hidden`, which become the residual stream and are
-    /// updated in place, and the final norm, which adds the last layer's output into the stream.
+    /// The layers over the batch's embeddings `hidden`, which open the residual stream, and
+    /// the final norm, which adds the last layer's output into the stream as it normalizes.
     fn forward(
         &self,
-        f: &Forward,
         batch: &TokenBatch,
-        cache: &KvView<'_>,
-        hidden: Operand,
-    ) -> nn::Result<Operand> {
-        let tokens = batch.tokens();
-        let width = u64::from(self.config.text.hidden_size);
-        if hidden.shape.dims() != [tokens, width] || hidden.dtype != self.dtype {
+        cache: &[KvCache],
+        state: Option<&RecurrentState>,
+        exchange: Option<&ExpertExchange>,
+        hidden: &Tensor,
+    ) -> nn::Result<Tensor> {
+        let (tokens, width) = (batch.tokens(), self.config.text.hidden_size as usize);
+        if hidden.dims() != [tokens, width] {
             return Err(Error::Config(format!(
-                "hidden is {} {:?}, {} [{tokens}, {width}] expected",
-                ops::abi::name(hidden.dtype),
-                hidden.shape.dims(),
-                ops::abi::name(self.dtype)
+                "hidden is {:?}, [{tokens}, {width}] expected",
+                hidden.dims()
             ))
             .into());
         }
-        Ok(f.fenced(TRANSFORMER, format_args!("model"), || {
-            let (rotary, positions) = match (batch.rope_positions, &self.mrope) {
-                (None, _) => (&self.rotary, batch.positions),
+
+        let forward = || -> Result<Tensor> {
+            let (rotary, positions) = match (&batch.rope_positions, &self.mrope) {
+                (None, _) => (&self.rotary_emb, &batch.positions),
                 (Some(coordinates), Some(mrope)) => (mrope, coordinates),
                 (Some(_), None) => {
                     return Err(Error::Config(
@@ -417,37 +255,57 @@ impl CausalLm for Qwen3ForCausalLm {
                     ));
                 }
             };
-            let rope = RopeFactors {
-                rotary,
-                factors: rotary.factors(f, positions)?,
-            };
-            if self.config.attention_layers() > 0 {
-                // The workspace is the runtime's and every bucket's forward reuses it, so the
-                // decode program's arrival counters are cleared once before the first layer.
-                PagedAttention::zero_counters(f, cache.workspace)?;
+            let (cos, sin) = rotary.forward(positions)?;
+
+            // The model's attention layers share one cache group. Its workspace is execution's
+            // and every forward reuses it, so the decode kernel's arrival counters are cleared
+            // once before the first layer.
+            let group = cache.first();
+            if let Some(group) = group {
+                functional::zero_arrival_counters_(&group.workspace)?;
             }
-            let (last, residual) = self.stack.forward(
-                f,
-                hidden,
-                rope,
-                |index| self.keys(batch, cache, index),
-                |_, _| Ok(()),
-            )?;
-            Ok(self
-                .norm
-                .forward(f, last, Some(ResidualStream::in_place(residual)))?)
-        })?)
+
+            // Each layer reads its own layer of the cache or of the state: its place among
+            // the layers of its mixer.
+            let (mut attention, mut linear) = (0, 0);
+            let (mut hidden, mut residual) = (hidden.clone(), None);
+            for layer in &self.layers {
+                let ordinal = if layer.is_linear() {
+                    &mut linear
+                } else {
+                    &mut attention
+                };
+
+                let (output, stream) = layer.forward(
+                    &hidden,
+                    residual.as_ref(),
+                    (&cos, &sin),
+                    batch,
+                    group,
+                    state,
+                    exchange,
+                    *ordinal,
+                )?;
+                (hidden, residual) = (output, Some(stream));
+                *ordinal += 1;
+            }
+
+            let residual =
+                residual.ok_or_else(|| Error::Config("a decoder stack of no layers".to_owned()))?;
+            let (normalized, _) = self.norm.forward_residual(&hidden, &residual)?;
+            Ok(normalized)
+        };
+
+        Ok(nn::profiler::range(TRANSFORMER, "model", forward)?)
     }
 
-    fn compute_logits(&self, f: &Forward, hidden: Operand) -> nn::Result<Operand> {
-        self.head.forward(f, hidden)
+    fn compute_logits(&self, hidden: &Tensor) -> nn::Result<Tensor> {
+        self.lm_head.forward(hidden)
     }
 
-    fn join_expert_step(&self, f: &Forward) -> nn::Result<()> {
-        for layer in self.stack.layers() {
-            if let Mlp::Experts { routed, .. } = layer.mlp() {
-                f.scoped(|f| routed.join_expert_step(f))?;
-            }
+    fn join_expert_step(&self, exchange: &ExpertExchange) -> nn::Result<()> {
+        for experts in self.layers.iter().filter_map(DecoderLayer::experts) {
+            experts.join_expert_step(exchange)?;
         }
         Ok(())
     }
@@ -463,60 +321,49 @@ impl TextModel for Qwen3ForCausalLm {
     }
 
     fn dtype(&self) -> DType {
-        self.dtype
+        self.embed_tokens.weight().dtype()
     }
 
     fn cache(&self) -> CacheShape {
         let text = &self.config.text;
+
         CacheShape {
             layers: self.config.attention_layers(),
             // The load checked that the split divides the heads.
             kv_heads: text.num_key_value_heads / self.tensor.size,
             head_dim: text.head_dim,
+            index_keys: None,
         }
     }
 
     fn state(&self) -> Option<StateShape> {
-        let mut linear = self.config.mixers.iter().filter_map(|mixer| match mixer {
-            Mixer::Linear(spec) => Some(*spec),
-            Mixer::Attention => None,
-        });
-        let spec = linear.next()?;
+        let network = self.config.text.gated_delta_net?;
+
         Some(StateShape {
-            layers: 1 + linear.count() as u32,
-            fields: GatedDeltaNet::state_fields(&spec, self.dtype),
+            layers: self.config.linear_layers(),
+            fields: network.state_fields(self.dtype()),
         })
     }
 
     fn experts(&self) -> Option<ExpertShape> {
         let moe = self.config.moe.as_ref()?;
+        let routes = self.layers.iter().any(|layer| layer.experts().is_some());
+
         Some(ExpertShape {
             experts: moe.num_experts,
             intermediate: moe.moe_intermediate_size,
             top: moe.num_experts_per_tok,
-            encoded: self.experts_encoded,
+            encoded: routes && self.config.quantization.is_encoded(),
         })
     }
 
     fn drafter(&self) -> Option<&dyn Drafter> {
-        self.drafter.as_ref().map(|drafter| drafter as &dyn Drafter)
+        self.mtp.as_ref().map(|mtp| mtp as &dyn Drafter)
     }
 
     fn vision(&self) -> Option<&dyn Vision> {
-        self.vision.as_ref().map(|tower| tower as &dyn Vision)
+        self.visual.as_ref().map(|tower| tower as &dyn Vision)
     }
-}
-
-/// The routed experts of every layer of `config` by module path, each with its expert count: what
-/// an expert redistribution may order.
-pub fn expert_layers(config: &Config) -> BTreeMap<String, u32> {
-    let Some(moe) = &config.moe else {
-        return BTreeMap::new();
-    };
-    (0..config.text.num_hidden_layers)
-        .filter(|layer| config.routes(*layer))
-        .map(|layer| (expert_module(layer), moe.num_experts))
-        .collect()
 }
 
 impl std::fmt::Debug for Qwen3ForCausalLm {
@@ -524,7 +371,7 @@ impl std::fmt::Debug for Qwen3ForCausalLm {
         formatter
             .debug_struct("Qwen3ForCausalLm")
             .field("class", &self.config.class)
-            .field("layers", &self.stack.layers().len())
+            .field("layers", &self.layers.len())
             .field("tensor", &self.tensor)
             .finish_non_exhaustive()
     }
@@ -541,16 +388,28 @@ mod tests {
         let config = crate::config::fixtures::hybrid();
         let config =
             Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
-        let Spectrum::Default { dim, theta, .. } = text_spectrum(config.text.rope) else {
-            panic!("a default spectrum");
-        };
-        assert_eq!((dim, theta), (64, 1e7));
+
+        let text = text_rotary(config.text.rope);
+        assert_eq!(
+            (text.spectrum, text.dim, text.theta),
+            (Spectrum::Default, 64, 1e7)
+        );
+
         // Equal positions on every axis read the same frequencies under both spectra.
         assert_eq!(
-            text_spectrum(config.text.rope)
-                .inverse_frequencies()
-                .expect("frequencies"),
+            text.inverse_frequencies().expect("frequencies"),
             config.text.rope.inverse_frequencies().expect("frequencies"),
         );
+    }
+
+    #[test]
+    fn an_order_names_the_routed_layers_by_their_expert_modules() {
+        let config = crate::config::fixtures::moe();
+        let config =
+            Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
+
+        let layers = expert_layers(&config);
+        assert_eq!(layers.len(), 4);
+        assert_eq!(layers.get("layers.2.mlp.experts"), Some(&128));
     }
 }

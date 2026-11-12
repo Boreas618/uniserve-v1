@@ -31,8 +31,9 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-# `dtype_bf16_columns_128_tile_128`.
+# `dtype_bf16_columns_128_tile_128`, and `..._gate_sigmoid` for a sigmoid gate; a key that
+# states no gate is the SiLU gate's.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true } }
+dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, gate = ["sigmoid"] }
 
 [parameters]

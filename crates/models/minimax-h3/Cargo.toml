@@ -1,24 +1,27 @@
 [package]
 name = "minimax-h3"
-description = "MiniMax-H3: configuration, partition and the numerical model (base, FastH3 DMD, OmniRef)"
+description = "MiniMax-H3 and FastH3: configuration, module tree, checkpoint names and the family value"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
-# The numerical model composes `nn` layers; `nn` re-exports the `ops` kernel ABI. The loader reads
-# checkpoint metadata at this boundary, so the model's own types stay plain and typed.
+# A model crate computes on tensors and calls `nn`: it names no kernel, context or stream, so it
+# lists neither `ops`, `backend` nor `platform`. Request processing's prepared values and rules
+# are `processing`'s.
 [dependencies]
 nn = { path = "../../nn" }
-ops = { path = "../../ops" }
+uniserve-tensor.workspace = true
 processing.workspace = true
+# The Qwen3-VL model is this family's text encoder, served through `nn::Encoder`.
 qwen3.workspace = true
-proto.workspace = true
 thiserror.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
+# The tests install a meta context for the profile runs and write tiny checkpoints.
 [dev-dependencies]
+backend.workspace = true
+serde.workspace = true
 tempfile.workspace = true
 
 [lints]

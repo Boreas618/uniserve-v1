@@ -412,6 +412,14 @@ pub struct Batch {
     /// The images the batch's vision encodings read, by call: each encodes into the feature
     /// product its call declares, which later prefills read ([`VisionRows`]).
     pub images: Vec<ImageEncoding>,
+    /// Every persistent product the batch's calls read or write, once per backing rank: the rank
+    /// of the batch's group whose buffer pool holds the span, and the span there.
+    ///
+    /// The scheduler places every product; the worker holds no record of where one lies, so a
+    /// runner finds a product it names ([`MediaColumns::reads`], [`MediaColumns::writes`],
+    /// [`ImageEncoding::output`], [`VisionRows::feature`]) here, at the span of its own rank, and
+    /// the span of each other rank it copies an output to.
+    pub buffers: Vec<(u32, crate::BufferAllocation)>,
     /// The persistent products whose last reader has completed, which the rank releases before it
     /// serves the batch (`crate::BatchCommand::Free`).
     pub frees: Vec<crate::BufferId>,
@@ -437,7 +445,8 @@ impl Batch {
     /// - a page read fills only units the batch newly allocates, which the worker resets first;
     /// - a recurrent-state copy moves a page of one of its slot's tables, restores precede
     ///   checkpoints, and each checkpoint responds to a row's checkpoint token count;
-    /// - a request has at most one stored trajectory to restore and one host encoder output.
+    /// - a request has at most one stored trajectory to restore and one host encoder output;
+    /// - a product has at most one span on each rank.
     pub fn validate(&self) -> ValidationResult<()> {
         let mut calls = std::collections::HashSet::with_capacity(self.calls.len());
         ensure_valid!(
@@ -531,6 +540,17 @@ impl Batch {
                 .all(|(request, _)| hosted.insert(*request)),
             "a batch names two host encoder outputs for one request"
         );
+
+        // A product has one span in each rank's pool: two spans for one product on one rank would
+        // leave the runner unable to say which one it reads.
+        let mut placed = std::collections::HashSet::with_capacity(self.buffers.len());
+        for (rank, allocation) in &self.buffers {
+            allocation.validate()?;
+            ensure_valid!(
+                placed.insert((*rank, allocation.buffer)),
+                "a batch places one product twice on one rank"
+            );
+        }
         Ok(())
     }
 
@@ -949,14 +969,20 @@ pub struct MediaColumns {
     pub computation: Computation,
     /// Per request, in batch order, the buffers the model prepared for it.
     pub inputs: Vec<Vec<Vec<u8>>>,
+    /// Per request, in batch order, the persistent products its call reads, in
+    /// `crate::Call::buffer_inputs` order; each one's span is in [`Batch::buffers`].
+    pub reads: Vec<Vec<crate::BufferId>>,
+    /// Per request, in batch order, the persistent products its call writes, in
+    /// `crate::Call::buffer_outputs` order; each one's span is in [`Batch::buffers`].
+    pub writes: Vec<Vec<crate::BufferId>>,
 }
 
 impl MediaColumns {
     /// Whether the columns state the computation they are for (4.5).
     ///
-    /// The rules are the family's own: one set of inputs per request, no token column a language
-    /// model reads, and - except for an encode, which is sized by rows and tokens - an extent,
-    /// because a bucket captured for one resolution serves no other.
+    /// The rules are the family's own: one set of inputs, reads and writes per request, no token
+    /// column a language model reads, and - except for an encode, which is sized by rows and
+    /// tokens - an extent, because a bucket captured for one resolution serves no other.
     pub fn check(&self) -> ValidationResult<()> {
         let computation = self.computation;
         if !computation.stated() {
@@ -971,6 +997,14 @@ impl MediaColumns {
                 "a {:?} batch of {rows} rows carries {} request(s) of media inputs",
                 computation.call,
                 self.inputs.len()
+            )));
+        }
+        if self.reads.len() != rows || self.writes.len() != rows {
+            return Err(ValidationError::message(format!(
+                "a {:?} batch of {rows} rows states the products of {} and {} request(s)",
+                computation.call,
+                self.reads.len(),
+                self.writes.len()
             )));
         }
         // Three computations are sized by no extent at all: an encode by rows and tokens, and the
@@ -999,10 +1033,33 @@ impl MediaColumns {
     /// and resolution its noise is drawn from. It does not own what the model prepares on the device
     /// — the encoded conditioning rows, the latent trajectory — so a staged set carries the first
     /// and never a placeholder for the second.
-    pub fn staged(computation: Computation, requests: &[StagedRequest]) -> MediaColumns {
+    ///
+    /// `calls` are the batch's calls in the order of `requests`, one per request: each row reads
+    /// and writes the persistent products its call declares.
+    pub fn staged(
+        computation: Computation,
+        requests: &[StagedRequest],
+        calls: &[&crate::Call],
+    ) -> MediaColumns {
         MediaColumns {
             computation,
             inputs: requests.iter().map(StagedRequest::encode).collect(),
+            reads: calls
+                .iter()
+                .map(|call| {
+                    call.buffer_inputs()
+                        .map(crate::TensorRef::buffer_id)
+                        .collect()
+                })
+                .collect(),
+            writes: calls
+                .iter()
+                .map(|call| {
+                    call.buffer_outputs()
+                        .map(crate::TensorRef::buffer_id)
+                        .collect()
+                })
+                .collect(),
         }
     }
 
@@ -1421,6 +1478,19 @@ pub enum Variant {
     /// ([`BatchColumns::block_steps`]): the rows read their requests' cached context and write no
     /// cache page, and the step that stops a block reports the block's tokens.
     TokenDenoise,
+    /// One verification per row: a committed token followed by its drafts, each token evaluated
+    /// as the decode step at its position and sampled greedily; the row commits the drafts its
+    /// own samples agree with and the sample after them. A bucket of `rows` verifications holds
+    /// `rows` times one more than the deployment's drafts tokens.
+    VerifyGreedy,
+    /// A [`Self::VerifyGreedy`] whose tokens are drawn, a greedy row as a draw over its one
+    /// largest candidate.
+    VerifySampled,
+    /// The drafter's forward behind a prefill or a verification of the same rows and tokens:
+    /// its entries over the positions whose next token the step before it committed, then the
+    /// drafts each row proposes, chained on the device. No batch states it: the worker issues
+    /// it behind the batch it follows.
+    Draft,
 }
 
 impl Variant {
@@ -1429,6 +1499,8 @@ impl Variant {
     pub const fn stage(self) -> &'static str {
         match self {
             Self::DecodeGreedy | Self::DecodeSampled => "decode",
+            Self::VerifyGreedy | Self::VerifySampled => "verify",
+            Self::Draft => "draft",
             Self::PrefillWrite
             | Self::PrefillOutput
             | Self::PrefillGreedy
@@ -1469,6 +1541,9 @@ impl Variant {
             Self::ConditionEncode => "condition_encode",
             Self::ExpertJoin => "expert_join",
             Self::TokenDenoise => "token_denoise",
+            Self::VerifyGreedy => "verify_greedy",
+            Self::VerifySampled => "verify_sampled",
+            Self::Draft => "draft",
         }
     }
 
@@ -1547,7 +1622,7 @@ impl Variant {
     pub const fn greedy(self) -> bool {
         matches!(
             self,
-            Self::DecodeGreedy | Self::PrefillGreedy | Self::PrefillWrite
+            Self::DecodeGreedy | Self::PrefillGreedy | Self::PrefillWrite | Self::VerifyGreedy
         )
     }
 
@@ -2115,6 +2190,8 @@ mod media_tests {
                 extent: Extent::Latents(layout()),
             },
             inputs: vec![vec![vec![0u8; 64]]],
+            reads: vec![Vec::new()],
+            writes: vec![Vec::new()],
         };
         assert_eq!(denoise.bytes(), 64);
         denoise.check().expect("one request, its resolution stated");
@@ -2131,6 +2208,8 @@ mod media_tests {
                 extent: Extent::None,
             },
             inputs: vec![Vec::new()],
+            reads: vec![Vec::new()],
+            writes: vec![Vec::new()],
         };
         muxed
             .check()
@@ -2147,6 +2226,19 @@ mod media_tests {
         assert!(
             refusal.to_string().contains("2 request(s)"),
             "the refusal names the count: {refusal}"
+        );
+
+        // A row whose products are not stated would leave its runner without the spans it reads.
+        let unplaced = MediaColumns {
+            reads: Vec::new(),
+            ..denoise.clone()
+        };
+        let refusal = unplaced
+            .check()
+            .expect_err("a one-row batch states the products of one request");
+        assert!(
+            refusal.to_string().contains("products of 0 and 1"),
+            "the refusal names the counts: {refusal}"
         );
 
         let no_resolution = MediaColumns {
@@ -2174,6 +2266,8 @@ mod media_tests {
                 extent: Extent::None,
             },
             inputs: vec![vec![vec![1u8; 8]]],
+            reads: vec![Vec::new()],
+            writes: vec![Vec::new()],
         };
         assert_eq!(encode.computation.variant(), Some(Variant::Encode));
         encode
@@ -2230,6 +2324,11 @@ mod media_tests {
                 extent: Extent::Latents(layout()),
             },
             std::slice::from_ref(&staged),
+            &[&crate::Call::new(
+                staged.request,
+                crate::CallId::new(1, 0),
+                crate::CallKind::Media(crate::MediaCall::Denoising),
+            )],
         );
         assert_eq!(columns.request(0).expect("one row"), staged);
         let out_of_range = columns.request(1).expect_err("one row, asked for two");

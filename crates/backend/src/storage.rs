@@ -15,6 +15,11 @@
 //! The last two are one representation, a storage with no block to return; what tells them apart
 //! is who keeps the bytes alive, which is the caller's obligation and stated by the constructor.
 //!
+//! Several storages may be over the same bytes: a tensor read as another element type of the
+//! same size (`Tensor::view`) has a storage of its own over the memory of the tensor it came
+//! from. An allocated block is theirs together and returns to its allocator when the last of
+//! them drops.
+//!
 //! A storage is a **meta storage** when it has no data: one allocated under a meta context,
 //! whose block is an address nothing reads, and one made over the meta device. It reports the
 //! meta device, every operation on it states the kernel it would launch, and reading it is an
@@ -31,6 +36,26 @@ use crate::allocator::Allocator;
 use crate::device::{self, CudaDevice, MetaDevice};
 use crate::{Error, Result, context};
 
+/// A block of a context's allocator, returned to it when the last storage over it drops.
+#[derive(Debug)]
+struct Block {
+    allocator: Arc<Allocator>,
+    /// The device address of the block's first byte.
+    address: u64,
+    /// The length asked of the allocator, in bytes.
+    bytes: u64,
+    /// The allocator's reset the block was allocated under.
+    reset: u64,
+}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        // A block of an earlier reset is no longer part of its allocator's state, which the
+        // allocator tells by the reset number.
+        self.allocator.free(self.address, self.bytes, self.reset);
+    }
+}
+
 /// The elements of a tensor on a GPU, or the extent of a tensor that has none.
 #[derive(Debug)]
 pub(crate) struct CudaStorage {
@@ -42,10 +67,10 @@ pub(crate) struct CudaStorage {
     /// The GPU the bytes are on, or `None` for a meta storage, which has no data and reports the
     /// meta device.
     gpu: Option<usize>,
-    /// The allocator an allocated storage returns its block to on drop, with the reset the
-    /// block was allocated under. `None` for retained and external storage, which this type
-    /// never frees.
-    block: Option<(Arc<Allocator>, u64)>,
+    /// The block an allocated storage is over, shared with every storage that reads the same
+    /// bytes as another element type. `None` for retained and external storage, which this
+    /// type never frees.
+    block: Option<Arc<Block>>,
 }
 
 impl CudaStorage {
@@ -93,7 +118,12 @@ impl CudaStorage {
             bytes,
             dtype,
             gpu,
-            block: Some((allocator, reset)),
+            block: Some(Arc::new(Block {
+                allocator,
+                address,
+                bytes,
+                reset,
+            })),
         })
     }
 
@@ -133,6 +163,35 @@ impl CudaStorage {
 
     pub(crate) fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    /// A storage over the same bytes whose elements are read as `dtype`, an element type of the
+    /// same size: no kernel is launched and nothing is copied, so what is written through
+    /// either storage is read through the other. A meta storage gives a meta storage.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ElementType`] when `dtype` has another size than the storage's element type,
+    /// or either is narrower than a byte: the bytes would hold another number of elements. The
+    /// packed bytes of an NVFP4 tensor are stated as a `U8` tensor by whoever owns them
+    /// ([`retained`], [`external`]).
+    pub(crate) fn reinterpreted(&self, dtype: DType) -> Result<Self> {
+        let size = self.dtype.size_in_bytes();
+        if size == 0 || size != dtype.size_in_bytes() {
+            return Err(Error::ElementType {
+                operation: "a view of a tensor as another element type",
+                dtype,
+                reason: "the two element types differ in size, or one is narrower than a byte",
+            });
+        }
+
+        Ok(Self {
+            address: self.address,
+            bytes: self.bytes,
+            dtype,
+            gpu: self.gpu,
+            block: self.block.clone(),
+        })
     }
 
     /// The device address of the first byte.
@@ -294,16 +353,6 @@ impl CudaStorage {
         // SAFETY: the copy wrote every one of the `count` elements.
         unsafe { values.set_len(count) };
         Ok(values)
-    }
-}
-
-impl Drop for CudaStorage {
-    fn drop(&mut self) {
-        // A block of an earlier reset is no longer part of its allocator's state, which the
-        // allocator tells by the reset number.
-        if let Some((allocator, reset)) = self.block.take() {
-            allocator.free(self.address, self.bytes, reset);
-        }
     }
 }
 

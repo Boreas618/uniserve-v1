@@ -1,968 +1,1048 @@
 //! The rank's retained weights.
 //!
-//! A weight is converted once and kept: the loader reads a checkpoint tensor, converts it to the
-//! deployment's representation, publishes the bytes to the Storage Server under a key, and every
-//! later load of the same weight is a read-only mapping of what was published.
+//! A weight is converted once and kept: `nn::WeightLoader` reads a checkpoint tensor, converts
+//! it to the deployment's representation and publishes the bytes through
+//! [`nn::RetainedWeights`], which [`WeightStore`] implements over the host's Storage Server.
+//! Every later load of the same weight, by this rank, another rank of the GPU or a later
+//! epoch, is a read-only mapping of what was published.
 //!
-//! The key is [`nn::WeightKey`]'s own four inputs, canonicalized by its `Display`: the identity of
-//! every checkpoint file the weight was read from, the element type the loader resolved, the
-//! layout the reading operator declares, and the region inside the logical tensor. Two rules come
-//! with it (§8):
+//! ## The key
 //!
-//! - a **generation layer's** backend or revision is not part of the key: a generation update changes
-//!   which module reads a weight, not what the weight is, so the update keeps the storage warm;
-//! - anything that changes the mathematics, the precision or the format is a build-config change,
-//!   and then `dtype`, `layout` or `quantization` move the key with it.
+//! A weight is filed under the digest of [`nn::WeightKey`]'s text ([`storage_key`]): the
+//! identity of every checkpoint file the weight was read from, the element type the loader
+//! resolved, the layout the reading operator declares, and the region inside the logical
+//! tensor. No kernel's name or revision enters it, so a generation that changes which kernel
+//! reads a weight finds the weight retained; a change of mathematics, precision or format
+//! changes the element type, the layout or the checkpoint, and the key with it.
 //!
-//! The bytes themselves live at the Storage Server, under the rank's claim, inside the GPU's
-//! `budget` (§8's first operation table). This module owns the key and the store; how a key becomes
-//! a mapped region is [`WeightStorage`], which the rank's `Retained` client implements.
+//! A record names the allocation on the GPU that published it, so each GPU keeps a copy of its
+//! own under the key of that GPU (`storage::key::device_weight`): two ranks of one host never
+//! read one allocation across the link between their devices.
 //!
-//! The Storage Server imports a retained allocation in whole granules of the device's VMM
-//! granularity (2 MiB), so a weight of its own allocation takes its length rounded up to one. A
-//! weight smaller than a granule - a norm, a bias, a quantization scale - is packed instead: the
-//! store places it in a granule shared with other small weights ([`Placement::Packed`]), and the
-//! granule is published as one storage whose tensors lie at their offsets ([`WeightStorage::seal`]).
-//! A load that replaces such a weight places its successor at the same offset of a granule of its
-//! own, so the update maps the new granule at the old one's address (§7.6).
+//! ## The allocations
+//!
+//! A weight is published as a device allocation the Storage Server retains by its descriptor,
+//! outside the rank's own regions, and every reader maps it read-only: a kernel reads the
+//! weight in device memory with no copy at load, and none can write what the epochs share. A
+//! record that states host storage (an epoch's weights the daemon moved to the host,
+//! `storage::protocol::Request::Offload`) is refused by name rather than mapped, because every
+//! forward would then read the model across the host link; the daemon moves such weights back
+//! before the epoch's engines start (`Request::Restore`).
+//!
+//! The server imports an allocation in whole multiples of the device's allocation granularity
+//! (2 MiB), so a weight of its own allocation takes its length rounded up to one. A weight
+//! smaller than the granularity (a norm, a bias, a quantization scale) is **packed**: it lies
+//! in an allocation shared with other small weights, which is published as one storage whose
+//! tensors lie at their offsets when the load ends ([`WeightStore::finish`]). Every weight has
+//! a mapping of its own, a packed one included.
+//!
+//! A table a model writes after its load ([`nn::RetainedWeights::writable`]) is device storage
+//! of this process alone, since published storage is read-only.
+//!
+//! ## An update in place
+//!
+//! A weight tensor is `backend::retained` over the address the weight is mapped at, and the
+//! modules and the captured graphs of a rank hold that address. An in-place weight update
+//! (`/admin/update_weights`) keeps it: the checkpoint is loaded again beside the weights that
+//! serve ([`Reload`](crate::memory::reload::Reload)), each weight whose key changed is
+//! published where the one it replaces lies (in an allocation of the same length, or at the
+//! same offset of a shared allocation of its own), and [`WeightStore::rebind`] then maps each
+//! replacement's allocation at the address of the weight it replaces. No module is rebuilt and
+//! no published byte is written.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
+use std::os::fd::{AsFd, OwnedFd};
+use std::sync::{Arc, Mutex};
 
-use nn::{Backing, DType, RetainedWeights, Shape, WeightKey};
+use nn::{RetainedWeights, Shape, Tensor, WeightKey};
+use platform::{DeviceId, HandleType, Protection, Stream};
+use storage::protocol::Access;
+use storage::{Key, Location, Mode, StorageRecord, TensorRecord};
 
-use crate::{Error, Result};
+use crate::error::report;
+use crate::memory::allocation::Storage;
+use crate::memory::client::{StorageClient, byte_tensor};
+use crate::{Error, Result, lock};
 
-/// Where a weight's bytes are retained.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Placement {
-    /// An allocation of the weight's own, of `allocation` bytes: its true length rounded up to
-    /// whole granules.
-    Own { allocation: usize },
-    /// A granule shared with other weights smaller than one: at the first free offset when `at` is
-    /// `None`, else at byte `at` of a granule, as the weight it replaces lies in its own.
-    Packed { at: Option<usize> },
+/// The alignment of a packed weight's first byte in its allocation: what a device allocation
+/// of its own guarantees, so a kernel reads a packed weight as it reads any other.
+const PACKED_ALIGNMENT: usize = 256;
+
+/// The key `weight` is filed under at the Storage Server, before the GPU that holds a copy is
+/// named: the digest of its text, which is every file's identity, the element type, the layout
+/// name and the region, and nothing about which kernel reads it.
+pub fn storage_key(weight: &WeightKey) -> Key {
+    storage::key::weight(&weight.to_string())
 }
 
-/// Where a rank's retained weights live: the Storage Server, behind the rank's client (§8).
+/// The allocation a weight of `length` bytes takes when it has one of its own: its length
+/// rounded up to `granularity`, in which the Storage Server imports a retained allocation.
+/// `None` when the rounded length overflows.
 ///
-/// Both calls take the storage key [`retained_key`] derives, and both answer an
-/// [`nn::Backing`]: a read-only device region a layer's view is carved from. The bytes outlive the
-/// epoch - a new epoch on the same build config maps what an earlier one published - so a weight's
-/// storage record names no epoch and no segment.
-pub trait WeightStorage: Send + Sync {
-    /// The bytes already retained under `key`, mapped read-only, or `None` when the Storage Server
-    /// holds none.
-    fn fetch(&self, device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>>;
+/// A weight's length is its shape's, so it is a whole multiple of the granularity only by
+/// accident: an embedding of 622329856 bytes against a granularity of 2097152 is refused by
+/// the import unless its allocation is rounded.
+fn allocation_bytes(length: usize, granularity: usize) -> Option<usize> {
+    length.div_ceil(granularity).checked_mul(granularity)
+}
 
-    /// The allocation granularity the Storage Server imports a retained allocation in, on
-    /// `device`: the length it retains must be a positive multiple of it (§8).
-    fn granularity(&self, device: platform::DeviceId) -> Result<usize>;
+/// Where a weight of `length` bytes goes in a shared allocation of `allocation` bytes that
+/// holds weights at `taken`: at `at` when that range is free, else at the aligned end of what
+/// the allocation holds; `None` when it does not fit there.
+fn packed_offset(
+    taken: &[Range<usize>],
+    length: usize,
+    at: Option<usize>,
+    allocation: usize,
+) -> Option<usize> {
+    let offset = match at {
+        Some(at) => at,
+        None => taken
+            .iter()
+            .map(|range| range.end)
+            .max()
+            .unwrap_or(0)
+            .next_multiple_of(PACKED_ALIGNMENT),
+    };
+    let range = offset..offset.checked_add(length)?;
 
-    /// Retain `bytes` under `key` where `placement` says and answer the read-only region they are
-    /// mapped at.
-    ///
-    /// `bytes.len()` is the weight's true length, which is its shape's and is rarely a granule. A
-    /// weight of its own allocation is retained in `allocation` bytes, that length rounded up,
-    /// which is what the server imports: the bytes past `bytes.len()` are a tail nothing reads. A
-    /// store that publishes the true length instead is refused by the server's import, which is
-    /// why the rounding happens in [`WeightStore::publish`] rather than in the store. A packed
-    /// weight is mapped at once and published with its granule at the next [`Self::seal`].
-    ///
-    /// Storing a key twice is the caller's error; a store may publish it again or answer the region
-    /// it already holds.
-    fn store(
-        &self,
-        device: platform::DeviceId,
-        key: &[u8; 32],
-        bytes: &[u8],
-        placement: Placement,
-    ) -> Result<Backing>;
+    let free = taken
+        .iter()
+        .all(|taken| taken.end <= range.start || range.end <= taken.start);
+    (range.end <= allocation && free).then_some(offset)
+}
 
-    /// Publishes the granules of the weights packed on `device` since the last seal, each one
-    /// storage whose tensors lie at their offsets, and answers how many it published. A packed
-    /// weight is retained only once its granule is sealed: until then a reader of another process
-    /// misses it.
-    fn seal(&self, device: platform::DeviceId) -> Result<usize>;
+/// The bytes `shape` elements of `key`'s element type take.
+fn byte_length(key: &WeightKey, shape: &Shape) -> Result<u64> {
+    let element = ops::abi::bytes(key.dtype).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "a weight of {} has no whole-byte element",
+            ops::abi::name(key.dtype)
+        ))
+    })?;
 
-    /// `bytes` in a region of `allocation` bytes that kernels may write, held by this process.
-    ///
-    /// A store with no read-only mapping answers what [`Self::store`] does. The key is not
-    /// retained: the launch that fills the region runs in every load.
-    fn writable(
-        &self,
-        device: platform::DeviceId,
-        key: &[u8; 32],
-        bytes: &[u8],
-        allocation: usize,
-    ) -> Result<Backing> {
-        self.store(device, key, bytes, Placement::Own { allocation })
+    (shape.elem_count() as u64)
+        .checked_mul(element)
+        .ok_or_else(|| Error::Invalid(format!("{:?} elements overflow a length", shape.dims())))
+}
+
+/// A store's failure as a loader reports it for the weight `key`. A driver failure keeps its
+/// type, so it is classified by its result code wherever the load's failure arrives; any other
+/// failure is stated with the weight it met.
+pub(crate) fn refusal(key: &WeightKey, error: Error) -> nn::Error {
+    match error {
+        Error::Nn(error) => error,
+        Error::Cuda(error) => nn::Error::Backend(backend::Error::Platform(error)),
+        other => nn::Error::Weight {
+            tensor: key.to_string(),
+            problem: report(&other),
+        },
     }
 }
 
-/// A shared storage, as two owners of one rank's client use it: the store itself and whatever else
-/// the rank maps weights through.
-impl<S: WeightStorage + ?Sized> WeightStorage for std::sync::Arc<S> {
-    fn fetch(&self, device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
-        (**self).fetch(device, key)
-    }
-
-    fn writable(
-        &self,
-        device: platform::DeviceId,
-        key: &[u8; 32],
-        bytes: &[u8],
-        allocation: usize,
-    ) -> Result<Backing> {
-        (**self).writable(device, key, bytes, allocation)
-    }
-
-    fn granularity(&self, device: platform::DeviceId) -> Result<usize> {
-        (**self).granularity(device)
-    }
-
-    fn store(
-        &self,
-        device: platform::DeviceId,
-        key: &[u8; 32],
-        bytes: &[u8],
-        placement: Placement,
-    ) -> Result<Backing> {
-        (**self).store(device, key, bytes, placement)
-    }
-
-    fn seal(&self, device: platform::DeviceId) -> Result<usize> {
-        (**self).seal(device)
-    }
-}
-
-/// The storage key of `weight`, as §8 derives it from the model and its representation.
+/// A rank's read-only mapping of one retained weight.
 ///
-/// The digest covers [`nn::WeightKey`]'s canonical text, which is every file's identity, the
-/// element type, the layout name and the region - and nothing about which program reads it.
-pub fn retained_key(weight: &WeightKey) -> [u8; 32] {
-    ::storage::key::weight(&weight.to_string()).0
+/// The mapping is the weight's own, also when its allocation is shared with other weights, so
+/// an update maps another allocation at this weight's address without moving its neighbours.
+/// The mappings of a shared allocation share its physical memory.
+#[derive(Clone)]
+struct Mapping {
+    storage: Arc<Storage>,
+    /// The weight's first byte in the allocation.
+    offset: u64,
+    /// The weight's length in bytes, as its record states it.
+    length: u64,
 }
 
-/// One weight a model's load reached, in the load's order.
-///
-/// A load is deterministic in its order: the same code over a checkpoint of the same model asks for
-/// the same weights one after another. A position in this list is therefore the identity of a
-/// weight across two loads, which is what lets an update pair each serving weight with its
-/// replacement although every key differs (§7.6).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoadedWeight {
-    /// The weight's key.
-    pub key: WeightKey,
-    /// Whether the model writes this region after the load: it lives in this process alone, and
-    /// no update replaces it, because the model writes it again.
-    pub writable: bool,
+impl Mapping {
+    /// The device address of the weight's first byte.
+    fn address(&self) -> u64 {
+        self.storage.address() + self.offset
+    }
 }
 
-/// The epoch's retained weights: the keys this rank has mapped, beside the storage that holds them.
-///
-/// The store is the main process's, built once per rank and shared by every model load of the
-/// epoch. A hit is answered from the map; a miss asks the storage, and a miss there is not
-/// remembered, because another rank of the deployment may publish the same weight while this one
-/// serves.
-pub struct WeightStore<S: WeightStorage> {
-    storage: S,
-    /// The device this store's weights are mapped on. A `Backing` is one device's address, so a
-    /// rank that serves two devices holds one store per device: the storage is the same client.
-    device: platform::DeviceId,
-    /// Every weight this rank has mapped, by storage key.
-    mapped: BTreeMap<[u8; 32], Backing>,
-    /// How many weights this rank read back from the storage rather than converting itself.
+/// An allocation small weights are packed into, until its one storage record and their tensor
+/// records are published.
+struct Pack {
+    /// The allocation's writable mapping, which the weights are copied in through.
+    written: Arc<Storage>,
+    /// The descriptor the allocation is published with, and each weight's mapping imports.
+    descriptor: OwnedFd,
+    /// The byte ranges its weights take.
+    taken: Vec<Range<usize>>,
+    /// The records of its weights, published with the allocation.
+    tensors: Vec<TensorRecord>,
+}
+
+/// What a [`WeightStore`] changes while it serves loads.
+#[derive(Default)]
+struct State {
+    /// Every weight this rank has mapped on the device, by the key of the device's copy.
+    mapped: BTreeMap<Key, Mapping>,
+    /// The shared allocations of the weights packed since the last [`WeightStore::finish`].
+    packs: Vec<Pack>,
+    /// The tables a model writes after its load, which live as long as the store.
+    tables: Vec<Arc<Storage>>,
+    /// The weights the load in progress reached, in its order, each with whether the model
+    /// writes it after the load.
+    order: Vec<(WeightKey, bool)>,
+    /// How many weights this rank read back from the Storage Server instead of converting.
     from_store: usize,
-    /// How many weights this rank published to the storage, which is how many keys it added to a
-    /// store that never releases one (§8: a content-addressed cache that outlives its epochs).
+    /// How many weights this rank published.
     published: usize,
-    /// Every weight the load reached, in its order, for the updates of §7.6.
-    log: Vec<LoadedWeight>,
-    /// Of the weights published, how many were packed, the bytes their own allocations would have
-    /// taken, and the shared granules the seals published.
+    /// Of the weights published, how many were packed, and the allocations they share.
     packed: usize,
-    unpacked_bytes: u64,
-    packed_granules: usize,
-    /// The granularity the storage imports in, once asked.
-    granularity: Option<usize>,
+    packed_allocations: usize,
 }
 
-impl<S: WeightStorage> WeightStore<S> {
-    /// A store over `storage` that maps every weight on `device`, with nothing mapped yet.
-    pub fn new(storage: S, device: platform::DeviceId) -> Self {
-        Self {
-            storage,
-            device,
-            mapped: BTreeMap::new(),
-            from_store: 0,
-            published: 0,
-            log: Vec::new(),
-            packed: 0,
-            unpacked_bytes: 0,
-            packed_granules: 0,
-            granularity: None,
-        }
-    }
+/// A rank's retained weights on one device: the mappings of the weights it serves from, and
+/// the publication of the ones nobody published yet.
+///
+/// The store lives as long as the rank serves from its weights: a tensor it returned is over an
+/// address the store keeps mapped, and [`WeightStore::rebind`] and [`WeightStore::forget`] are
+/// the only calls that change what an address holds. A rank that serves two devices holds one
+/// store per device, over the same client.
+///
+/// A store serves one load at a time. A load asks for its weights in a deterministic order (the
+/// same code over a checkpoint of the same model asks for the same weights one after another),
+/// which the store records: [`WeightStore::finish`] or [`WeightStore::abandon`] ends the load
+/// and returns its order. A position in that order identifies a weight across two loads, which
+/// is what pairs each serving weight with its replacement in an update although their keys
+/// differ ([`paired`](crate::memory::reload::paired)).
+pub struct WeightStore {
+    client: Arc<StorageClient>,
+    /// The device this store's weights are mapped on.
+    device: DeviceId,
+    /// The UUID of the device's GPU, which the key of every copy on it names.
+    gpu: [u8; 16],
+    /// The granularity the Storage Server imports a retained allocation in, on the device.
+    granularity: usize,
+    /// The stream the store's copies run on, beside the streams the rank serves on.
+    stream: Stream,
+    state: Mutex<State>,
+}
 
-    /// Ends the load: publishes the granules of the weights packed since the last seal and answers
-    /// the weights the load reached, in its order, leaving the log empty.
+impl WeightStore {
+    /// A store over `client` that maps every weight on `device`, with nothing mapped yet.
     ///
     /// # Errors
     ///
-    /// When the storage refuses a granule: its weights are not retained, and the load fails.
-    pub fn finish(&mut self) -> Result<Vec<LoadedWeight>> {
-        self.packed_granules += self.storage.seal(self.device)?;
-        Ok(std::mem::take(&mut self.log))
-    }
-
-    /// Ends a load that will not serve: answers the weights it reached, whose granules are not
-    /// published, for the caller to forget.
-    pub fn abandon(&mut self) -> Vec<LoadedWeight> {
-        std::mem::take(&mut self.log)
-    }
-
-    /// The device bytes packing saved: what the packed weights' own allocations would have taken,
-    /// less the shared granules sealed so far.
-    pub fn packing_saved(&self) -> u64 {
-        let granule = self.granularity.unwrap_or(0) as u64;
-        self.unpacked_bytes
-            .saturating_sub(self.packed_granules as u64 * granule)
-    }
-
-    /// How many weights the load reached so far: the position of the next one.
-    pub fn logged(&self) -> usize {
-        self.log.len()
-    }
-
-    /// Records a weight this load published by another path than [`RetainedWeights::publish`].
-    pub fn adopt(&mut self, key: &WeightKey, backing: Backing) {
-        self.log.push(LoadedWeight {
-            key: key.clone(),
-            writable: false,
-        });
-        self.mapped.insert(retained_key(key), backing);
-        self.published += 1;
-    }
-
-    /// Records a table the load reached and holds no storage for.
-    pub fn note_table(&mut self, key: &WeightKey) {
-        self.log.push(LoadedWeight {
-            key: key.clone(),
-            writable: true,
-        });
-    }
-
-    /// How many weights this rank holds, for the metrics report and for tests.
-    pub fn mapped(&self) -> usize {
-        self.mapped.len()
-    }
-
-    /// How many weights this rank read back from the storage instead of converting them.
-    pub fn from_store(&self) -> usize {
-        self.from_store
-    }
-
-    /// How many weights this rank published to the storage.
-    ///
-    /// A retained store never releases a key, so this is exactly what the host gained: a run that
-    /// published nothing grew the store by nothing, and one that published after a key change added
-    /// that many records beside the ones the previous key left.
-    pub fn published(&self) -> usize {
-        self.published
-    }
-
-    /// The storage behind the store.
-    pub fn storage(&self) -> &S {
-        &self.storage
-    }
-
-    /// The allocation a weight of `bytes` bytes is retained in: its true length rounded up to the
-    /// granularity the Storage Server imports a retained allocation in (§8).
-    ///
-    /// The weight's length is its shape's, so it is a whole number of granules only by accident: an
-    /// embedding of 622329856 bytes against a 2097152-byte granule is refused by the import. The
-    /// rounded length is what the store allocates and publishes; the tensor keeps `bytes`, and a
-    /// reader maps the allocation and reads only the weight.
-    fn allocation_length(&mut self, bytes: usize) -> Result<usize> {
-        let granularity = self.granularity()?;
-        bytes
-            .div_ceil(granularity)
-            .checked_mul(granularity)
-            .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "a weight of {bytes} bytes has no whole-granule allocation"
-                ))
-            })
-    }
-
-    /// The granularity the storage imports a retained allocation in, on the store's device.
-    fn granularity(&mut self) -> Result<usize> {
-        if let Some(granularity) = self.granularity {
-            return Ok(granularity);
-        }
-        let granularity = self.storage.granularity(self.device).map_err(|error| {
-            Error::State(format!("the granularity of {}: {error}", self.device).leak())
-        })?;
+    /// When the device does not state its identity or its allocation granularity, or gives no
+    /// stream.
+    pub fn new(client: Arc<StorageClient>, device: DeviceId) -> Result<Self> {
+        let gpu = client.gpu(device)?;
+        let granularity = HandleType::Descriptor.granularity(device)?;
         if granularity == 0 {
-            return Err(Error::Invariant(
-                "the storage states a zero allocation granularity".into(),
-            ));
+            return Err(Error::Invariant(format!(
+                "{device} states a zero allocation granularity"
+            )));
         }
-        self.granularity = Some(granularity);
-        Ok(granularity)
-    }
 
-    /// Where a weight of `bytes` bytes is retained when nothing places it: packed when it is
-    /// smaller than a granule, else in an allocation of its own.
-    fn placement(&mut self, bytes: usize) -> Result<Placement> {
-        if bytes < self.granularity()? {
-            return Ok(Placement::Packed { at: None });
-        }
-        Ok(Placement::Own {
-            allocation: self.allocation_length(bytes)?,
+        Ok(Self {
+            client,
+            device,
+            gpu,
+            granularity,
+            stream: Stream::new(device)?,
+            state: Mutex::new(State::default()),
         })
     }
 
-    /// Publishes `bytes` under `key` as [`RetainedWeights::publish`] does, at `placement` rather
-    /// than where the store places a weight of its length: a load that replaces a serving weight
-    /// places its successor as the serving one lies (§7.6).
+    /// The device this store's weights are mapped on.
+    pub fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    /// Ends the load: publishes the shared allocations of the weights packed since the last
+    /// call and returns the weights the load reached, in its order, each with whether the
+    /// model writes it after the load.
+    ///
+    /// A packed weight is retained only from here on: until its allocation is published, a
+    /// reader of another process misses it.
     ///
     /// # Errors
     ///
-    /// As [`RetainedWeights::publish`].
-    pub fn publish_at(
-        &mut self,
-        key: &WeightKey,
-        dtype: DType,
-        shape: Shape,
-        bytes: &[u8],
-        placement: Placement,
-    ) -> nn::Result<Backing> {
-        self.publish_placed(key, dtype, shape, bytes, Some(placement))
+    /// When the Storage Server refuses an allocation: its weights are not retained, and the
+    /// load fails.
+    pub fn finish(&self) -> Result<Vec<(WeightKey, bool)>> {
+        let mut state = lock(&self.state);
+
+        for pack in std::mem::take(&mut state.packs) {
+            if pack.tensors.is_empty() {
+                continue;
+            }
+
+            let record = StorageRecord {
+                location: Location::Device { gpu: self.gpu },
+                segment: None,
+                bytes: pack.written.bytes() as u64,
+                fabric: None,
+            };
+            self.client
+                .call("publishing an allocation of packed weights", |client| {
+                    client.put(pack.tensors, &[(record, pack.descriptor.as_fd())])
+                })?;
+        }
+
+        Ok(std::mem::take(&mut state.order))
     }
 
-    fn publish_placed(
-        &mut self,
+    /// Ends a load that will not serve: returns the weights it reached, in its order, for the
+    /// caller to [`forget`](Self::forget). The shared allocations it packed stay unpublished.
+    pub fn abandon(&self) -> Vec<(WeightKey, bool)> {
+        std::mem::take(&mut lock(&self.state).order)
+    }
+
+    /// How many weights the load in progress reached: the position of the next one.
+    pub(crate) fn reached(&self) -> usize {
+        lock(&self.state).order.len()
+    }
+
+    /// Records a table the load in progress reached and that this store holds no storage for.
+    pub(crate) fn note_table(&self, key: &WeightKey) {
+        lock(&self.state).order.push((key.clone(), true));
+    }
+
+    /// How many weights this rank holds mapped.
+    pub fn mapped(&self) -> usize {
+        lock(&self.state).mapped.len()
+    }
+
+    /// How many weights this rank read back from the Storage Server instead of converting them.
+    pub fn from_store(&self) -> usize {
+        lock(&self.state).from_store
+    }
+
+    /// How many weights this rank published to the Storage Server.
+    ///
+    /// The server keeps a weight for as long as an epoch retains it, so this is what the host
+    /// gained: a load that published nothing grew the store by nothing, and one that published
+    /// after a key change added that many records beside the ones the previous key left.
+    pub fn published(&self) -> usize {
+        lock(&self.state).published
+    }
+
+    /// The device bytes packing saved: what the packed weights' own allocations would have
+    /// taken, less the allocations they share.
+    pub fn packing_saved(&self) -> u64 {
+        let state = lock(&self.state);
+
+        state.packed.saturating_sub(state.packed_allocations) as u64 * self.granularity as u64
+    }
+
+    /// The device bytes a replacement of the weight under `key` takes beside it: the weight's
+    /// own length when it shares an allocation, else its whole allocation.
+    ///
+    /// # Errors
+    ///
+    /// When this rank maps no weight under `key` and the Storage Server holds none.
+    pub fn replacement_bytes(&self, key: &WeightKey) -> Result<u64> {
+        let mapping = self
+            .mapping(&mut lock(&self.state), self.key(key))?
+            .ok_or_else(|| Error::Invariant(format!("the rank maps no weight {key}")))?;
+
+        Ok(if self.packs(mapping.length) {
+            mapping.length
+        } else {
+            mapping.storage.bytes() as u64
+        })
+    }
+
+    /// Publishes `bytes` under `key` as [`RetainedWeights::publish`] does, placed as the weight
+    /// under `replaced` lies, so that [`Self::rebind`] maps it at that weight's address: a
+    /// packed weight at the same offset of a shared allocation. A `replaced` this rank does not
+    /// map places the weight as a first load does.
+    pub(crate) fn publish_replacing(
+        &self,
         key: &WeightKey,
-        dtype: DType,
-        shape: Shape,
+        shape: &Shape,
         bytes: &[u8],
-        placement: Option<Placement>,
-    ) -> nn::Result<Backing> {
-        // The key already states the element type the bytes are in; a caller that publishes under
-        // a key of another type would make the next load read the bytes as the wrong numbers.
-        if dtype != key.dtype {
-            return Err(nn::Error::Unsupported(format!(
-                "a weight keyed as {} cannot be published as {dtype:?}",
+        replaced: &WeightKey,
+    ) -> Result<Tensor> {
+        self.publish_bytes(key, shape, bytes, Some(replaced))
+    }
+
+    /// Publishes under `key` the stack that is the weight under `replaced` with its slots in
+    /// another order: slot `to` of the published weight holds slot `slots[to]` of the one that
+    /// serves. Returns `None`, publishing nothing, when this rank maps no weight under
+    /// `replaced`.
+    ///
+    /// The bytes are on the device already, at the address the rank serves from, so they are
+    /// copied over the device's own memory rather than read from the checkpoint again: on the
+    /// store's stream, beside the batches, which read the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// When the two weights differ in length or `slots` is no order of the stack's slots, and
+    /// as [`RetainedWeights::publish`].
+    pub(crate) fn publish_rearranged(
+        &self,
+        key: &WeightKey,
+        shape: &Shape,
+        replaced: &WeightKey,
+        slots: &[usize],
+    ) -> Result<Option<Tensor>> {
+        let length = byte_length(key, shape)?;
+        let Some(source) = self.mapping(&mut lock(&self.state), self.key(replaced))? else {
+            return Ok(None);
+        };
+
+        let count = slots.len() as u64;
+        if count == 0
+            || source.length != length
+            || !length.is_multiple_of(count)
+            || slots.iter().any(|from| *from as u64 >= count)
+        {
+            return Err(Error::Invalid(format!(
+                "{key} of {length} bytes is no order of the {} slots of {replaced}, of {} bytes",
+                slots.len(),
+                source.length
+            )));
+        }
+        let slot = (length / count) as usize;
+        let base = source.address();
+
+        let tensor = self.publish_with(
+            key,
+            shape,
+            length as usize,
+            Some(replaced),
+            |target, stream| {
+                for (to, from) in slots.iter().enumerate() {
+                    // SAFETY: both ranges lie inside live device allocations of `length` bytes
+                    // from the weights' first bytes: the source is the serving weight's
+                    // read-only mapping, which `source` holds until the copies completed, and
+                    // the destination is the writable mapping this publication created.
+                    unsafe {
+                        platform::memcpy_async(
+                            target + (to * slot) as u64,
+                            base + (*from * slot) as u64,
+                            slot,
+                            stream,
+                        )?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        drop(source);
+
+        Ok(Some(tensor))
+    }
+
+    /// Puts each pair's replacement at the address of the weight that serves, and ends the
+    /// rank's retention of the weights replaced. Each pair is the key that serves and the key
+    /// that takes its place ([`paired`](crate::memory::reload::paired)).
+    ///
+    /// The address is what the rank's captured graphs and its modules' tensors hold, so it
+    /// stays; the allocation behind it becomes the replacement's, which the Storage Server
+    /// retains under the key a load of that checkpoint asks for. A relaunch therefore finds it
+    /// without this rank saying anything, and the mapping stays read-only throughout: no
+    /// process writes a published weight.
+    ///
+    /// The caller has retired every device read of the weights replaced. Returns how many
+    /// weights moved.
+    ///
+    /// # Errors
+    ///
+    /// When the rank maps no weight under a key of a pair, or a replacement does not lie as
+    /// the weight it replaces does: nothing moved, and the rank serves on. A driver failure
+    /// while the weights move leaves the rank with weights of two checkpoints, and the caller
+    /// retires the rank.
+    pub fn rebind(&self, pairs: &[(WeightKey, WeightKey)]) -> Result<usize> {
+        let mut state = lock(&self.state);
+
+        // Every pair is checked before any mapping changes, so a refusal changes nothing.
+        let mut named = BTreeSet::new();
+        for (serving, replacement) in pairs {
+            let (serving_key, replacement_key) = (self.key(serving), self.key(replacement));
+            if !named.insert(serving_key) || !named.insert(replacement_key) {
+                return Err(Error::Invariant(format!(
+                    "the weight {serving} or its replacement {replacement} is named by two pairs"
+                )));
+            }
+
+            let target = state.mapped.get(&serving_key).ok_or_else(|| {
+                Error::Invariant(format!("the rank maps no weight {serving} to rebind"))
+            })?;
+            let source = state.mapped.get(&replacement_key).ok_or_else(|| {
+                Error::Invariant(format!(
+                    "the rank mapped no weight {replacement} to rebind onto"
+                ))
+            })?;
+
+            // The replacement's allocation is mapped over the whole of the serving one: a
+            // packed weight's replacement lies at its offset of a shared allocation, so the
+            // address the rank's tensors and graphs hold is the replacement's first byte.
+            if (target.offset, target.storage.bytes()) != (source.offset, source.storage.bytes()) {
+                return Err(Error::Invariant(format!(
+                    "the weight {serving} lies at byte {} of {} and its replacement at byte {} \
+                     of {}",
+                    target.offset,
+                    target.storage.bytes(),
+                    source.offset,
+                    source.storage.bytes()
+                )));
+            }
+        }
+
+        let mut released = BTreeSet::new();
+        for (serving, replacement) in pairs {
+            let (serving_key, replacement_key) = (self.key(serving), self.key(replacement));
+            let (Some(target), Some(source)) = (
+                state.mapped.remove(&serving_key),
+                state.mapped.remove(&replacement_key),
+            ) else {
+                return Err(Error::Invariant(format!(
+                    "the weight {serving} or its replacement {replacement} left the store while \
+                     it moved"
+                )));
+            };
+            target.storage.rebind(&source.storage)?;
+
+            // The mapping the replacement was published through ends with `source`: its
+            // address is one nothing reads, and the allocation lives on behind the serving
+            // address.
+            state.mapped.insert(
+                replacement_key,
+                Mapping {
+                    length: source.length,
+                    ..target
+                },
+            );
+            released.insert(serving_key);
+        }
+
+        self.client
+            .end_retention(&released, "ending the retention of replaced weights")?;
+        Ok(released.len())
+    }
+
+    /// Unmaps the weights of `keys` and ends the rank's retention of them: a load that will
+    /// not serve leaves no storage behind. The caller holds no tensor over them that a kernel
+    /// may still read.
+    pub fn forget(&self, keys: &[WeightKey]) -> Result<()> {
+        let mut state = lock(&self.state);
+
+        let mut released = BTreeSet::new();
+        for key in keys {
+            let key = self.key(key);
+            state.mapped.remove(&key);
+            released.insert(key);
+        }
+
+        // A weight packed in an allocation not published yet is not published with it.
+        for pack in &mut state.packs {
+            pack.tensors
+                .retain(|tensor| !released.contains(&tensor.key));
+        }
+
+        self.client
+            .end_retention(&released, "releasing an abandoned weight load")
+    }
+
+    /// The key this device's copy of `weight` is retained under.
+    fn key(&self, weight: &WeightKey) -> Key {
+        storage::key::device_weight(&storage_key(weight), &self.gpu)
+    }
+
+    /// Whether a weight of `length` bytes shares an allocation with other weights rather than
+    /// taking one of its own.
+    fn packs(&self, length: u64) -> bool {
+        length < self.granularity as u64
+    }
+
+    /// The tensor of `shape` elements of `key`'s element type over `mapping`.
+    fn tensor(&self, mapping: &Mapping, key: &WeightKey, shape: &Shape) -> Result<Tensor> {
+        let expected = byte_length(key, shape)?;
+        if expected != mapping.length {
+            return Err(Error::Invalid(format!(
+                "the store holds {} bytes under {key}, and {:?} of {} take {expected}",
+                mapping.length,
+                shape.dims(),
                 ops::abi::name(key.dtype)
             )));
         }
-        let expected = shape
-            .numel()
-            .checked_mul(ops::abi::bytes(dtype).unwrap_or_default())
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .ok_or_else(|| {
-                nn::Error::Unsupported(format!(
-                    "a weight of shape {} in {dtype:?} has no byte length",
-                    shape
-                ))
-            })?;
-        if bytes.len() != expected {
-            return Err(nn::Error::Unsupported(format!(
-                "a weight of shape {} in {dtype:?} is {expected} bytes, not {}",
-                shape,
+
+        Ok(backend::retained(
+            mapping.address(),
+            shape.clone(),
+            key.dtype,
+            &backend::cuda(self.device.0 as usize),
+        )?)
+    }
+
+    /// The rank's mapping of the weight retained under `key`, mapped now when the rank has not
+    /// mapped it yet; `None` when the Storage Server holds nothing under the key. A miss is not
+    /// remembered: another rank of the deployment may publish the weight while this one serves.
+    fn mapping(&self, state: &mut State, key: Key) -> Result<Option<Mapping>> {
+        if let Some(mapping) = state.mapped.get(&key) {
+            return Ok(Some(mapping.clone()));
+        }
+
+        let Some(mapping) = self.fetch(key)? else {
+            return Ok(None);
+        };
+        state.mapped.insert(key, mapping.clone());
+        state.from_store += 1;
+        Ok(Some(mapping))
+    }
+
+    /// Maps the weight the Storage Server retains under `key` read-only on the store's device;
+    /// `None` when it holds nothing under the key.
+    fn fetch(&self, key: Key) -> Result<Option<Mapping>> {
+        let (got, descriptors) = self.client.call("taking a retained weight", |client| {
+            client.get(vec![key], Mode::Read, Vec::new())
+        })?;
+        let Some(tensor) = got.tensors.iter().find(|tensor| tensor.key == key) else {
+            return Ok(None);
+        };
+        let (record, descriptor) = got
+            .storages
+            .iter()
+            .zip(descriptors)
+            .nth(tensor.storage as usize)
+            .ok_or_else(|| Error::Interface("a retained weight names no storage".into()))?;
+
+        // Host storage registered with the device is addressable from a kernel, but every
+        // forward would read the model's bytes across the host link: the record is refused by
+        // name, where a mapping of it would hide the cost behind a slow run.
+        if let Location::Host { .. } = record.location {
+            return Err(Error::Interface(format!(
+                "the weight {} lies in host storage; a weight is mapped from a device allocation, \
+                 so the epoch's weights are moved back to their GPUs before its engines start",
+                key.hex()
+            )));
+        }
+        let storage = Storage::map_device(
+            &descriptor,
+            record.bytes as usize,
+            self.device,
+            &[],
+            Protection::ReadOnly,
+        )?;
+
+        let length = tensor.shape.iter().product::<u64>();
+        let inside = tensor
+            .offset
+            .checked_add(length)
+            .is_some_and(|end| end <= storage.bytes() as u64);
+        if !inside {
+            return Err(Error::Interface(format!(
+                "the weight {} is recorded as {length} bytes at byte {} of an allocation of {}",
+                key.hex(),
+                tensor.offset,
+                storage.bytes()
+            )));
+        }
+
+        Ok(Some(Mapping {
+            storage,
+            offset: tensor.offset,
+            length,
+        }))
+    }
+
+    /// Publishes the host bytes `bytes` under `key`, placed as `replaced` lies when it names a
+    /// weight this rank maps.
+    fn publish_bytes(
+        &self,
+        key: &WeightKey,
+        shape: &Shape,
+        bytes: &[u8],
+        replaced: Option<&WeightKey>,
+    ) -> Result<Tensor> {
+        // The key states the element type the bytes are in, so a length the shape does not
+        // state would make the next load read the bytes as other numbers.
+        let expected = byte_length(key, shape)?;
+        if bytes.len() as u64 != expected {
+            return Err(Error::Invalid(format!(
+                "{:?} of {} is {expected} bytes, not {}",
+                shape.dims(),
+                ops::abi::name(key.dtype),
                 bytes.len()
             )));
         }
 
-        let storage_key = retained_key(key);
-        self.log.push(LoadedWeight {
-            key: key.clone(),
-            writable: false,
-        });
-        // Publishing a key this rank already mapped answers the region it holds: the bytes are the
-        // same weight, and the second publication would be the caller's error (§8, `publish`).
-        if let Some(backing) = self.mapped.get(&storage_key) {
-            return Ok(*backing);
-        }
-        let placement = match placement {
-            Some(placement) => placement,
-            None => self
-                .placement(bytes.len())
-                .map_err(|error| nn::Error::Unsupported(format!("sizing weight {key}: {error}")))?,
-        };
-        let backing = self
-            .storage
-            .store(self.device, &storage_key, bytes, placement)
-            .map_err(|error| {
-                nn::Error::Unsupported(format!("publishing weight {key}: {}", with_causes(&error)))
-            })?;
-        if let Placement::Packed { .. } = placement {
-            let rounded = self
-                .allocation_length(bytes.len())
-                .map_err(|error| nn::Error::Unsupported(format!("sizing weight {key}: {error}")))?;
-            self.packed += 1;
-            self.unpacked_bytes += rounded as u64;
-        }
-        self.mapped.insert(storage_key, backing);
-        self.published += 1;
-        Ok(backing)
+        self.publish_with(key, shape, bytes.len(), replaced, |target, stream| {
+            // SAFETY: `target` is the first of `bytes.len()` writable device bytes of the
+            // mapping this publication created, and the pageable source is read before the
+            // call returns.
+            unsafe {
+                platform::memcpy_async(target, bytes.as_ptr() as u64, bytes.len(), stream)?;
+            }
+            Ok(())
+        })
     }
 
-    /// The backing of `key`, mapped if this rank has not mapped it yet.
-    fn backing(&mut self, key: &WeightKey) -> Result<Option<Backing>> {
-        let storage_key = retained_key(key);
-        if let Some(backing) = self.mapped.get(&storage_key) {
-            return Ok(Some(*backing));
+    /// Publishes a weight of `length` bytes under `key`, whose bytes `write` copies on the
+    /// device, and returns the tensor over its read-only mapping.
+    ///
+    /// `write` is given the device address of the weight's first byte in a writable mapping
+    /// and the store's stream to issue its copies on; the stream is waited for before the
+    /// weight's record is published, so no reader maps a weight that is partly written.
+    fn publish_with(
+        &self,
+        key: &WeightKey,
+        shape: &Shape,
+        length: usize,
+        replaced: Option<&WeightKey>,
+        write: impl FnOnce(u64, &Stream) -> Result<()>,
+    ) -> Result<Tensor> {
+        if length == 0 {
+            return Err(Error::Invalid(format!("the weight {key} holds no bytes")));
         }
-        let Some(backing) = self
-            .storage
-            .fetch(self.device, &storage_key)
-            .map_err(|error| {
-                Error::State(format!("mapping retained weight {key}: {error}").leak())
-            })?
-        else {
+        let storage_key = self.key(key);
+
+        let mut state = lock(&self.state);
+        state.order.push((key.clone(), false));
+
+        // Publishing a key this rank already mapped returns the tensor over the mapping it
+        // holds: the bytes are the same weight.
+        if let Some(mapping) = state.mapped.get(&storage_key) {
+            return self.tensor(mapping, key, shape);
+        }
+
+        let mapping = if self.packs(length as u64) {
+            // The replacement of a packed weight lies at that weight's offset of a shared
+            // allocation of its own, which the update then maps at the serving address.
+            let at = replaced
+                .and_then(|replaced| state.mapped.get(&self.key(replaced)))
+                .filter(|replaced| self.packs(replaced.length))
+                .map(|replaced| replaced.offset as usize);
+
+            let mapping = self.pack(&mut state, storage_key, length, at, write)?;
+            state.packed += 1;
+            mapping
+        } else {
+            // The copy of a whole allocation runs with the store free: a reader of this rank
+            // waits for no device work of a load.
+            drop(state);
+            let mapping = self.publish_own(storage_key, length, write)?;
+            state = lock(&self.state);
+            mapping
+        };
+
+        let tensor = self.tensor(&mapping, key, shape)?;
+        state.mapped.insert(storage_key, mapping);
+        state.published += 1;
+        Ok(tensor)
+    }
+
+    /// Publishes a weight of `length` bytes in an allocation of its own and maps it read-only.
+    ///
+    /// The allocation is the weight's length rounded up to the granularity, which is what the
+    /// record states and the server imports. The tensor states the weight's own length, and
+    /// the bytes past it are read by nothing.
+    fn publish_own(
+        &self,
+        key: Key,
+        length: usize,
+        write: impl FnOnce(u64, &Stream) -> Result<()>,
+    ) -> Result<Mapping> {
+        let allocation = allocation_bytes(length, self.granularity).ok_or_else(|| {
+            Error::Invalid(format!(
+                "a weight of {length} bytes has no allocation of whole multiples of {}",
+                self.granularity
+            ))
+        })?;
+
+        let (written, descriptor) = Storage::retained(self.device, allocation, &[])?;
+        write(written.address(), &self.stream)?;
+        self.stream.synchronize()?;
+
+        let record = StorageRecord {
+            location: Location::Device { gpu: self.gpu },
+            segment: None,
+            bytes: written.bytes() as u64,
+            fabric: None,
+        };
+        let tensor = byte_tensor(key, weight_name(&key), 0, length as u64, Access::ReadOnly);
+        self.client.call("publishing a retained weight", |client| {
+            client.put(vec![tensor], &[(record, descriptor.as_fd())])
+        })?;
+        drop(written);
+
+        // The weight is mapped as any reader maps it. When another rank published the key
+        // first, the server kept that allocation, and this is the one both read.
+        self.fetch(key)?.ok_or_else(|| {
+            Error::Interface("a published weight was not found under its own key".into())
+        })
+    }
+
+    /// Places a weight of `length` bytes in an allocation shared with other weights smaller
+    /// than the granularity, at `at` or the first free aligned offset, has `write` copy its
+    /// bytes in and maps it read-only. The allocation is published by [`Self::finish`].
+    fn pack(
+        &self,
+        state: &mut State,
+        key: Key,
+        length: usize,
+        at: Option<usize>,
+        write: impl FnOnce(u64, &Stream) -> Result<()>,
+    ) -> Result<Mapping> {
+        let allocation = self.granularity;
+
+        let found = state.packs.iter().enumerate().find_map(|(index, pack)| {
+            packed_offset(&pack.taken, length, at, allocation).map(|offset| (index, offset))
+        });
+        let (index, offset) = match found {
+            Some(found) => found,
+            None => {
+                let offset = packed_offset(&[], length, at, allocation).ok_or_else(|| {
+                    Error::Invariant(format!(
+                        "a weight of {length} bytes at {at:?} does not fit an empty allocation \
+                         of {allocation} bytes"
+                    ))
+                })?;
+                let (written, descriptor) = Storage::retained(self.device, allocation, &[])?;
+
+                state.packs.push(Pack {
+                    written,
+                    descriptor,
+                    taken: Vec::new(),
+                    tensors: Vec::new(),
+                });
+                state.packed_allocations += 1;
+                (state.packs.len() - 1, offset)
+            }
+        };
+        let pack = &mut state.packs[index];
+
+        write(pack.written.address() + offset as u64, &self.stream)?;
+        self.stream.synchronize()?;
+
+        // The weight's own read-only mapping of the allocation: the writable one is the pack's
+        // until it is published, and an update rebinds this one alone.
+        let storage = Storage::map_device(
+            &pack.descriptor,
+            allocation,
+            self.device,
+            &[],
+            Protection::ReadOnly,
+        )?;
+        pack.taken.push(offset..offset + length);
+        pack.tensors.push(byte_tensor(
+            key,
+            weight_name(&key),
+            offset as u64,
+            length as u64,
+            Access::ReadOnly,
+        ));
+
+        Ok(Mapping {
+            storage,
+            offset: offset as u64,
+            length: length as u64,
+        })
+    }
+
+    /// The weight retained under `key` as a tensor, when the store or the server holds it.
+    fn find(&self, key: &WeightKey, shape: &Shape) -> Result<Option<Tensor>> {
+        let mut state = lock(&self.state);
+
+        let Some(mapping) = self.mapping(&mut state, self.key(key))? else {
             return Ok(None);
         };
-        self.mapped.insert(storage_key, backing);
-        self.from_store += 1;
-        Ok(Some(backing))
+        let tensor = self.tensor(&mapping, key, shape)?;
+        state.order.push((key.clone(), false));
+        Ok(Some(tensor))
+    }
+
+    /// A table of `shape` elements holding `bytes`, in device storage of this process that
+    /// kernels may write.
+    fn table(&self, key: &WeightKey, shape: &Shape, bytes: &[u8]) -> Result<Tensor> {
+        let expected = byte_length(key, shape)?;
+        if bytes.len() as u64 != expected {
+            return Err(Error::Invalid(format!(
+                "{:?} of {} is {expected} bytes, not {}",
+                shape.dims(),
+                ops::abi::name(key.dtype),
+                bytes.len()
+            )));
+        }
+
+        let storage = Storage::retainable(self.device, bytes.len())?;
+        // SAFETY: the storage holds at least `bytes.len()` writable device bytes, and the
+        // pageable source is read before the call returns.
+        unsafe {
+            platform::memcpy_async(
+                storage.address(),
+                bytes.as_ptr() as u64,
+                bytes.len(),
+                &self.stream,
+            )?;
+        }
+        self.stream.synchronize()?;
+
+        let tensor = backend::retained(
+            storage.address(),
+            shape.clone(),
+            key.dtype,
+            &backend::cuda(self.device.0 as usize),
+        )?;
+
+        let mut state = lock(&self.state);
+        state.order.push((key.clone(), true));
+        state.tables.push(storage);
+        Ok(tensor)
     }
 }
 
-impl<S: WeightStorage> Drop for WeightStore<S> {
-    /// One line, when the epoch's store is released: what this rank's loads read back and what they
-    /// published.
+impl Drop for WeightStore {
+    /// One line when the store goes: what this rank's loads read back and what they published.
     ///
-    /// A retained store never releases a key, so a reader looking at its size after a key change has
-    /// no way to tell a run that reused it from one that grew it. These are those two figures, and
-    /// they are printed once per store rather than per weight because the question is about the
-    /// store, not about a weight.
+    /// A reader looking at the Storage Server's size after a key change cannot tell a rank that
+    /// reused its weights from one that grew the store; these two figures do, once per store
+    /// because the question is about the store and not about a weight.
     fn drop(&mut self) {
-        if self.from_store == 0 && self.published == 0 {
+        let state = lock(&self.state);
+        if state.from_store == 0 && state.published == 0 {
             return;
         }
+
         tracing::info!(
             device = %self.device,
-            mapped = self.mapped.len(),
-            from_store = self.from_store,
-            published = self.published,
-            packed = self.packed,
-            packed_granules = self.packed_granules,
-            packing_saved_bytes = self.packing_saved(),
-            "the epoch's retained weights: what this rank mapped, read back and published"
+            mapped = state.mapped.len(),
+            from_store = state.from_store,
+            published = state.published,
+            packed = state.packed,
+            packed_allocations = state.packed_allocations,
+            "the rank's retained weights: what it mapped, read back and published"
         );
     }
 }
 
-impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
-    fn retained(&mut self, key: &WeightKey) -> nn::Result<Option<Backing>> {
-        let backing = self
-            .backing(key)
-            .map_err(|error| nn::Error::Unsupported(error.to_string()))?;
-        if backing.is_some() {
-            self.log.push(LoadedWeight {
-                key: key.clone(),
-                writable: false,
-            });
-        }
-        Ok(backing)
+impl RetainedWeights for WeightStore {
+    fn retained(&self, key: &WeightKey, shape: &Shape) -> nn::Result<Option<Tensor>> {
+        self.find(key, shape).map_err(|error| refusal(key, error))
     }
 
-    fn publish(
-        &mut self,
-        key: &WeightKey,
-        dtype: DType,
-        shape: Shape,
-        bytes: &[u8],
-    ) -> nn::Result<Backing> {
-        self.publish_placed(key, dtype, shape, bytes, None)
+    fn publish(&self, key: &WeightKey, shape: &Shape, bytes: &[u8]) -> nn::Result<Tensor> {
+        self.publish_bytes(key, shape, bytes, None)
+            .map_err(|error| refusal(key, error))
     }
 
-    fn writable(
-        &mut self,
-        key: &WeightKey,
-        _dtype: DType,
-        _shape: Shape,
-        bytes: &[u8],
-    ) -> nn::Result<Backing> {
-        self.log.push(LoadedWeight {
-            key: key.clone(),
-            writable: true,
-        });
-        let allocation = self
-            .allocation_length(bytes.len())
-            .map_err(|error| nn::Error::Unsupported(format!("sizing table {key}: {error}")))?;
-        self.storage
-            .writable(self.device, &retained_key(key), bytes, allocation)
-            .map_err(|error| nn::Error::Unsupported(format!("allocating table {key}: {error}")))
+    /// The table lives in this process alone and is not retained: the launch that fills it
+    /// runs in every load.
+    fn writable(&self, key: &WeightKey, shape: &Shape, bytes: &[u8]) -> nn::Result<Tensor> {
+        self.table(key, shape, bytes)
+            .map_err(|error| refusal(key, error))
     }
 }
 
-/// `error` and every error that caused it, in the order they caused one another: a refusal of the
-/// Storage Server says why under the call that met it.
-fn with_causes(error: &dyn std::error::Error) -> String {
-    let mut text = error.to_string();
-    let mut cause = error.source();
-    while let Some(next) = cause {
-        text.push_str(": ");
-        text.push_str(&next.to_string());
-        cause = next.source();
-    }
-    text
+/// The name a weight's record is listed under at the Storage Server.
+fn weight_name(key: &Key) -> String {
+    format!("weight-{}", key.hex())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    use nn::weights::WeightRegion;
-    use nn::{FileIdentity, WeightLayout};
+    use nn::{DType, WeightLayout};
 
     use super::*;
+    use crate::memory::fixtures::identity;
 
-    /// A storage that keeps bytes in host memory and hands out fake device addresses, so the key
-    /// and the store's bookkeeping are tested without a device.
-    struct FakeStorage {
-        published: Mutex<BTreeMap<[u8; 32], Vec<u8>>>,
-        fetches: AtomicUsize,
-        stores: AtomicUsize,
-        next_address: AtomicUsize,
-        /// The granule the driver imports a retained allocation in. One byte unless a test states
-        /// otherwise, so a test that is not about rounding is not about rounding.
-        granularity: usize,
-        /// What the last store was handed: the weight's true length and its placement.
-        handed: Mutex<Option<(usize, Placement)>>,
-        /// The packed weights not sealed yet, and the granules each seal published.
-        unsealed: Mutex<Vec<[u8; 32]>>,
-        seals: Mutex<Vec<usize>>,
-    }
-
-    impl Default for FakeStorage {
-        fn default() -> Self {
-            Self {
-                published: Mutex::new(BTreeMap::new()),
-                fetches: AtomicUsize::new(0),
-                stores: AtomicUsize::new(0),
-                next_address: AtomicUsize::new(0),
-                granularity: 1,
-                handed: Mutex::new(None),
-                unsealed: Mutex::new(Vec::new()),
-                seals: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl FakeStorage {
-        /// A storage whose import, like the driver's, takes whole granules and refuses anything
-        /// else - the refusal that ended an epoch's model load.
-        fn with_granularity(granularity: usize) -> Self {
-            Self {
-                granularity,
-                ..Self::default()
-            }
-        }
-
-        fn address(&self) -> u64 {
-            // An address that is never dereferenced: the test reads the keys and the lengths only.
-            self.next_address.fetch_add(1 << 20, Ordering::Relaxed) as u64 + 0x1000
-        }
-    }
-
-    impl WeightStorage for FakeStorage {
-        fn fetch(&self, _device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
-            self.fetches.fetch_add(1, Ordering::Relaxed);
-            Ok(self.published.lock().unwrap().get(key).map(|bytes| {
-                let _ = bytes;
-                Backing::new(ops::DevicePtr::new(self.address()), bytes.len() as u64)
-            }))
-        }
-
-        fn granularity(&self, _device: platform::DeviceId) -> Result<usize> {
-            Ok(self.granularity)
-        }
-
-        fn store(
-            &self,
-            _device: platform::DeviceId,
-            key: &[u8; 32],
-            bytes: &[u8],
-            placement: Placement,
-        ) -> Result<Backing> {
-            self.stores.fetch_add(1, Ordering::Relaxed);
-            *self.handed.lock().unwrap() = Some((bytes.len(), placement));
-            match placement {
-                Placement::Own { allocation } => {
-                    if allocation < bytes.len() || !allocation.is_multiple_of(self.granularity) {
-                        return Err(Error::Invalid(format!(
-                            "a retained allocation of {allocation} bytes is not a positive \
-                             multiple of the {}-byte granularity",
-                            self.granularity
-                        )));
-                    }
-                    self.published.lock().unwrap().insert(*key, bytes.to_vec());
-                    Ok(Backing::new(
-                        ops::DevicePtr::new(self.address()),
-                        allocation as u64,
-                    ))
-                }
-                Placement::Packed { .. } => {
-                    // A packed weight is retained once its granule is sealed.
-                    self.unsealed.lock().unwrap().push(*key);
-                    self.published.lock().unwrap().insert(*key, bytes.to_vec());
-                    Ok(Backing::new(
-                        ops::DevicePtr::new(self.address()),
-                        bytes.len() as u64,
-                    ))
-                }
-            }
-        }
-
-        fn seal(&self, _device: platform::DeviceId) -> Result<usize> {
-            let packed = std::mem::take(&mut *self.unsealed.lock().unwrap()).len();
-            // The fake packs every weight of a seal in one granule.
-            let granules = usize::from(packed > 0);
-            self.seals.lock().unwrap().push(granules);
-            Ok(granules)
-        }
-    }
-
-    /// The identity of a checkpoint file, as a Hugging Face cache stores it.
-    ///
-    /// A file under `blobs/` is identified by its name alone, so the fixture states identity
-    /// without waiting for a write to settle: `FileIdentity::of` gives a file younger than a second
-    /// an identity that matches no later read, and a checkpoint under test must not depend on that.
-    fn identity(name: &str) -> FileIdentity {
-        let directory = std::env::temp_dir()
-            .join("uniserve-weight-key-tests")
-            .join("blobs");
-        std::fs::create_dir_all(&directory).expect("a temporary directory");
-        // A blob's name is a 64-digit hexadecimal content hash; the content is the fixture's own.
-        let digest: String = name
-            .bytes()
-            .flat_map(|byte| format!("{byte:02x}").into_bytes())
-            .map(char::from)
-            .take(64)
-            .collect();
-        let blob = format!("{digest:0<64}");
-        let path = directory.join(blob);
-        if !path.exists() {
-            std::fs::write(&path, name).expect("a temporary checkpoint file");
-        }
-        FileIdentity::of(&path).expect("the identity of a checkpoint file")
-    }
-
-    fn region(tensor: &str) -> WeightRegion {
-        WeightRegion {
+    fn key(directory: &std::path::Path, file: &str, dtype: DType, tensor: &str) -> WeightKey {
+        WeightKey {
+            files: vec![identity(directory, file)],
+            dtype,
+            layout: WeightLayout::ROW_MAJOR,
             tensors: vec![tensor.to_owned()],
             start: 0,
-            shape: ops::Shape::new(&[4, 8]),
+            shape: Shape::from((4, 8)),
             stride: None,
-        }
-    }
-
-    fn key(file: &str, dtype: DType, tensor: &str) -> WeightKey {
-        WeightKey {
-            files: vec![identity(file)],
-            dtype,
-            layout: WeightLayout::named("row_major"),
-            region: region(tensor),
             provenance: None,
         }
     }
 
-    /// A computed weight: no file names it, so its provenance does.
-    fn computed(producer: &'static str, bytes: &[u8]) -> WeightKey {
-        WeightKey {
-            files: Vec::new(),
-            dtype: DType::F32,
-            layout: WeightLayout::named("row_major"),
-            region: region("denoiser.video.student_heads.weight"),
-            provenance: Some(nn::weights::Provenance::computed(producer, bytes)),
-        }
-    }
-
     #[test]
-    fn the_key_is_the_same_weight_reached_twice() {
-        let first = retained_key(&key("blob:aaa", DType::BF16, "model.layers.0.mlp.up"));
-        let second = retained_key(&key("blob:aaa", DType::BF16, "model.layers.0.mlp.up"));
-        assert_eq!(first, second);
-    }
+    fn a_changed_file_element_type_layout_or_region_changes_the_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let base = key(root, "aaa", DType::BF16, "model.layers.0.mlp.up");
 
-    #[test]
-    fn a_changed_file_dtype_layout_or_region_moves_the_key() {
-        let base = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
-        // The same tensor read from a different checkpoint file.
-        assert_ne!(
-            retained_key(&base),
-            retained_key(&key("blob:bbb", DType::BF16, "model.layers.0.mlp.up"))
+        // The same weight reached again is the same key.
+        assert_eq!(
+            storage_key(&base),
+            storage_key(&key(root, "aaa", DType::BF16, "model.layers.0.mlp.up"))
         );
-        // The same file and tensor in another representation (§8: precision moves the key).
+
+        // The same tensor read from another checkpoint file.
         assert_ne!(
-            retained_key(&base),
-            retained_key(&key("blob:aaa", DType::F32, "model.layers.0.mlp.up"))
+            storage_key(&base),
+            storage_key(&key(root, "bbb", DType::BF16, "model.layers.0.mlp.up"))
         );
-        // The same tensor, another region of it.
+        // The same file and tensor in another representation.
         assert_ne!(
-            retained_key(&base),
-            retained_key(&key("blob:aaa", DType::BF16, "model.layers.0.mlp.down"))
+            storage_key(&base),
+            storage_key(&key(root, "aaa", DType::F32, "model.layers.0.mlp.up"))
+        );
+        // Another tensor of the same file.
+        assert_ne!(
+            storage_key(&base),
+            storage_key(&key(root, "aaa", DType::BF16, "model.layers.0.mlp.down"))
         );
         // Another layout of the same bytes.
-        let mut other = base.clone();
-        other.layout = WeightLayout::named("column_major");
-        assert_ne!(retained_key(&base), retained_key(&other));
+        let other = WeightKey {
+            layout: WeightLayout::UP_GATE,
+            ..base.clone()
+        };
+        assert_ne!(storage_key(&base), storage_key(&other));
     }
 
+    /// A rank's load publishes through its store on one thread while the engine reads the store
+    /// on another and the executor rebinds it at a boundary, all over the rank's one client.
     #[test]
-    fn a_program_change_does_not_move_the_key() {
-        // §8: the key carries no program backend and no revision, so a generation that changes
-        // which module reads a weight still finds it retained.
-        let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
-        let first = retained_key(&weight);
-        let second = retained_key(&weight);
-        assert_eq!(first, second);
+    fn a_store_and_its_client_are_shared_by_the_threads_of_a_rank() {
+        fn shared<T: Send + Sync>() {}
+        shared::<WeightStore>();
+        shared::<StorageClient>();
     }
 
+    /// A weight's length is its shape's, and the Storage Server imports whole multiples of the
+    /// granularity: the allocation is the length rounded up, and a multiple stays as it is.
     #[test]
-    fn a_published_weight_is_a_hit_and_asks_the_storage_once() {
-        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
-        let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
-        let bytes = vec![0_u8; 4 * 8 * 2];
-        let published = store
-            .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &bytes)
-            .expect("a well-formed weight");
-
-        // The same rank reading it back maps nothing again.
-        let mapped = store.retained(&weight).expect("a hit").expect("a backing");
-        assert_eq!(published.address(), mapped.address());
-        assert_eq!(store.storage().stores.load(Ordering::Relaxed), 1);
-        assert_eq!(store.storage().fetches.load(Ordering::Relaxed), 0);
-        assert_eq!(store.mapped(), 1);
-    }
-
-    #[test]
-    fn a_weight_another_rank_published_is_fetched_once_and_then_answered_from_the_map() {
-        let storage = std::sync::Arc::new(FakeStorage::default());
-        let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
-        let bytes = vec![0_u8; 4 * 8 * 2];
-
-        // Another rank of the deployment publishes it first.
-        let mut other = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
-        other
-            .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &bytes)
-            .expect("a well-formed weight");
-
-        let mut mine = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
-        assert!(mine.retained(&weight).expect("a hit").is_some());
-        assert!(mine.retained(&weight).expect("a hit").is_some());
-        assert_eq!(storage.fetches.load(Ordering::Relaxed), 1);
-        assert_eq!(mine.mapped(), 1);
-    }
-
-    #[test]
-    fn a_computed_weight_of_one_deployment_is_not_answered_to_another() {
-        let storage = Arc::new(FakeStorage::default());
-        let shape = ops::Shape::new(&[4, 8]);
-        let base = computed("transformer", &[0_u8; 128]);
-        let reference = computed("transformer_ref", &[1_u8; 128]);
-
-        let mut first = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
-        first
-            .publish(&base, DType::F32, shape, &[0_u8; 128])
-            .expect("the base deployment publishes its fused heads");
-
-        // The reference deployment asks for its own table under the same label and extent. It
-        // must not be answered the base's bytes: a label is not an identity, and the mapping is
-        // indistinguishable from a correct one once it is handed over.
-        let mut second = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
-        assert!(second.retained(&reference).expect("a miss").is_none());
-        second
-            .publish(&reference, DType::F32, shape, &[1_u8; 128])
-            .expect("the reference deployment publishes its own");
-        assert_eq!(storage.stores.load(Ordering::Relaxed), 2);
-
-        // And each deployment's own restart maps its own table rather than recomputing it.
-        let mut restarted = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
-        assert!(restarted.retained(&reference).expect("a hit").is_some());
-
-        // The two figures a reader needs to tell a run that grew the store from one that reused it:
-        // the first deployment published and read nothing back, the restart read and published
-        // nothing.
-        assert_eq!((first.from_store(), first.published()), (0, 1));
-        assert_eq!((second.from_store(), second.published()), (0, 1));
-        assert_eq!((restarted.from_store(), restarted.published()), (1, 0));
-    }
-
-    #[test]
-    fn a_weight_nothing_published_is_a_miss_that_is_not_remembered() {
-        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
-        let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
-        assert!(store.retained(&weight).expect("a miss").is_none());
-        assert!(store.retained(&weight).expect("a miss").is_none());
-        // Another rank may publish it while this one serves, so a miss is asked again.
-        assert_eq!(store.storage().fetches.load(Ordering::Relaxed), 2);
-        assert_eq!(store.mapped(), 0);
-    }
-
-    #[test]
-    fn publishing_under_a_key_of_another_element_type_is_refused() {
-        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
-        let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
-        let error = store
-            .publish(&weight, DType::F32, ops::Shape::new(&[4, 8]), &[0_u8; 128])
-            .expect_err("the key states the type the bytes are in");
-        assert!(error.to_string().contains("cannot be published as"));
-        assert_eq!(store.storage().stores.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn publishing_a_byte_count_the_shape_does_not_state_is_refused() {
-        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
-        let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
-        let error = store
-            .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &[0_u8; 7])
-            .expect_err("4 x 8 BF16 is 64 bytes");
-        assert!(error.to_string().contains("is 64 bytes, not 7"));
-        assert_eq!(store.storage().stores.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn publishing_the_same_weight_twice_answers_the_region_it_holds() {
-        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
-        let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
-        let bytes = vec![0_u8; 4 * 8 * 2];
-        let first = store
-            .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &bytes)
-            .expect("a well-formed weight");
-        let second = store
-            .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &bytes)
-            .expect("the region it holds");
-        assert_eq!(first.address(), second.address());
-        assert_eq!(store.storage().stores.load(Ordering::Relaxed), 1);
-    }
-
-    /// A weight's byte length is its shape's, so it is a whole number of granules only by accident;
-    /// the Storage Server imports a retained allocation in whole granules and refuses the rest.
-    #[test]
-    fn a_weight_whose_length_is_not_a_granule_is_retained_in_a_rounded_allocation() {
-        const GRANULE: usize = 64;
-        let storage = std::sync::Arc::new(FakeStorage::with_granularity(GRANULE));
-        let mut store = WeightStore::new(
-            Shared(std::sync::Arc::clone(&storage)),
-            platform::DeviceId(0),
-        );
-        // The embedding that ended the epoch's model load is 622329856 bytes against a 2097152-byte
-        // granule, which is 296 granules and 190210304 bytes over; this is the same shape, small.
-        let bytes = vec![3_u8; 2 * GRANULE + 2];
-        let published = store
-            .publish(
-                &key("blob:aaa", DType::BF16, "model.embed_tokens"),
-                DType::BF16,
-                ops::Shape::new(&[5, 13]),
-                &bytes,
-            )
-            .expect("a weight retained in a rounded allocation");
-        // What the store was handed: the true length to state, and the granules to import.
-        let (length, placement) = storage.handed.lock().unwrap().expect("a store");
-        assert_eq!(length, 130);
+    fn a_weight_of_its_own_takes_its_length_rounded_up_to_the_granularity() {
+        assert_eq!(allocation_bytes(130, 64), Some(192));
+        assert_eq!(allocation_bytes(128, 64), Some(128));
         assert_eq!(
-            placement,
-            Placement::Own {
-                allocation: 3 * GRANULE
-            }
+            allocation_bytes(622_329_856, 2_097_152),
+            Some(297 * 2_097_152)
         );
-        assert_eq!(published.bytes(), 3 * GRANULE as u64);
-        // A reader maps the allocation, and a second publication answers the same region.
-        let again = store
-            .publish(
-                &key("blob:aaa", DType::BF16, "model.embed_tokens"),
-                DType::BF16,
-                ops::Shape::new(&[5, 13]),
-                &bytes,
-            )
-            .expect("the region it holds");
-        assert_eq!(published.address(), again.address());
+        assert_eq!(allocation_bytes(usize::MAX, 2_097_152), None);
     }
 
-    /// Weights smaller than a granule share one, which the end of the load publishes: a reader
-    /// addresses each weight's own bytes, and the store counts the granules the packing saved.
+    /// Packed weights lie back to back at offsets a kernel can read from, and a weight that
+    /// replaces another lies at that weight's offset of an allocation where the range is free.
     #[test]
-    fn weights_smaller_than_a_granule_are_packed_and_published_when_the_load_ends() {
-        const GRANULE: usize = 1 << 21;
-        let storage = std::sync::Arc::new(FakeStorage::with_granularity(GRANULE));
-        let mut store = WeightStore::new(
-            Shared(std::sync::Arc::clone(&storage)),
-            platform::DeviceId(0),
-        );
-        let norms = ["model.layers.0.input_norm", "model.layers.0.post_norm"];
-        for norm in norms {
-            let published = store
-                .publish(
-                    &key("blob:aaa", DType::BF16, norm),
-                    DType::BF16,
-                    ops::Shape::new(&[4, 8]),
-                    &[0_u8; 64],
-                )
-                .expect("a packed weight");
-            assert_eq!(published.bytes(), 64);
-            let (_, placement) = storage.handed.lock().unwrap().expect("a store");
-            assert_eq!(placement, Placement::Packed { at: None });
-        }
-        assert!(storage.seals.lock().unwrap().is_empty());
+    fn a_packed_weight_lies_at_an_aligned_free_offset_of_its_allocation() {
+        const ALLOCATION: usize = 1 << 21;
 
-        let log = store.finish().expect("the granule is published");
-        assert_eq!(log.len(), 2);
-        assert_eq!(*storage.seals.lock().unwrap(), [1]);
-        // Two weights of their own would have taken two granules; they share one.
-        assert_eq!(store.packing_saved(), GRANULE as u64);
-    }
+        // The offset of a weight of `length` bytes in an allocation whose weights take the
+        // byte ranges `taken`, each a first byte and the byte past the last.
+        let offset = |taken: &[[usize; 2]], length: usize, at: Option<usize>| {
+            let taken: Vec<Range<usize>> = taken.iter().map(|[start, end]| *start..*end).collect();
+            packed_offset(&taken, length, at, ALLOCATION)
+        };
 
-    /// A load that replaces a packed weight places its successor where the serving one lies.
-    #[test]
-    fn a_placed_publication_keeps_its_placement() {
-        let storage = std::sync::Arc::new(FakeStorage::with_granularity(1 << 21));
-        let mut store = WeightStore::new(
-            Shared(std::sync::Arc::clone(&storage)),
-            platform::DeviceId(0),
-        );
-        let at = Placement::Packed { at: Some(512) };
-        store
-            .publish_at(
-                &key("blob:bbb", DType::BF16, "model.layers.0.input_norm"),
-                DType::BF16,
-                ops::Shape::new(&[4, 8]),
-                &[0_u8; 64],
-                at,
-            )
-            .expect("a placed weight");
-        assert_eq!(storage.handed.lock().unwrap().expect("a store").1, at);
-    }
+        // The first weight starts the allocation, and the next one follows at the alignment.
+        assert_eq!(offset(&[], 64, None), Some(0));
+        assert_eq!(offset(&[[0, 64]], 100, None), Some(256));
+        assert_eq!(offset(&[[0, 64], [256, 356]], 8, None), Some(512));
 
-    /// A storage shared by two stores, as two ranks of one deployment share the Storage Server.
-    struct Shared(std::sync::Arc<FakeStorage>);
+        // A weight that does not fit behind what the allocation holds goes elsewhere, and one
+        // that ends at the allocation's last byte fits.
+        let nearly_full = [[0, ALLOCATION - 256]];
+        assert_eq!(offset(&nearly_full, 257, None), None);
+        assert_eq!(offset(&nearly_full, 256, None), Some(ALLOCATION - 256));
 
-    impl WeightStorage for Shared {
-        fn fetch(&self, _device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
-            self.0.fetch(platform::DeviceId(0), key)
-        }
-
-        fn granularity(&self, _device: platform::DeviceId) -> Result<usize> {
-            self.0.granularity(platform::DeviceId(0))
-        }
-
-        fn store(
-            &self,
-            _device: platform::DeviceId,
-            key: &[u8; 32],
-            bytes: &[u8],
-            placement: Placement,
-        ) -> Result<Backing> {
-            self.0.store(platform::DeviceId(0), key, bytes, placement)
-        }
-
-        fn seal(&self, _device: platform::DeviceId) -> Result<usize> {
-            self.0.seal(platform::DeviceId(0))
-        }
+        // A replacement is placed where the weight it replaces lies, when nothing holds the
+        // range there and the allocation holds the weight from there.
+        assert_eq!(offset(&[], 64, Some(512)), Some(512));
+        assert_eq!(offset(&[[0, 64]], 64, Some(512)), Some(512));
+        assert_eq!(offset(&[[500, 600]], 64, Some(512)), None);
+        assert_eq!(offset(&[], 64, Some(ALLOCATION - 32)), None);
     }
 }

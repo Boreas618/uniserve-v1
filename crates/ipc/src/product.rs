@@ -24,6 +24,9 @@ pub const VIDEO_LATENTS: &str = "video_latents";
 pub const AUDIO_LATENTS: &str = "audio_latents";
 /// The video decoder's RGB media units.
 pub const VIDEO_UNITS: &str = "video_units";
+/// The video decoder's splice tail of each media unit, `[3, overlap frames, rows, columns]`
+/// per unit: the last frames of unit `n` that the decode of unit `n + 1` splices onto.
+pub const VIDEO_TAIL: &str = "video_tail";
 /// The video codec's encoded media unit rows.
 pub const ENCODED_UNITS: &str = "encoded_units";
 /// The audio decoder's PCM track.

@@ -11,6 +11,10 @@
 //! contiguous, the output of a `gather` and the tensor a scatter updates in place. Indices are
 //! `u8`, `u32` or `i64`.
 //!
+//! A `gather` and a `scatter_set` convert nothing, so their elements are any a primitive moves
+//! ([`crate::strided::MOVED`]): an FP8 (`f8e4m3`) table is looked up as the bytes its elements
+//! are. A `scatter_add` computes, on the element types the primitives compute with.
+//!
 //! # The five backend primitives
 //!
 //! The indices have the shape of the side that is traversed — the destination of a `gather`, the
@@ -223,7 +227,12 @@ impl Op for Index {
     type Args<'a> = Args;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::ELEMENTS)?;
+        // An addition computes; the other two functions move elements.
+        let elements: &[DType] = match descriptor.function {
+            Function::Gather | Function::ScatterSet => &strided::MOVED,
+            Function::ScatterAdd => &strided::ELEMENTS,
+        };
+        strided::require_element(Self::NAME, "dtype", descriptor.dtype, elements)?;
         strided::require_element(Self::NAME, "indices", descriptor.indices, &strided::INDICES)?;
         strided::require_block(Self::NAME, descriptor.block)?;
 
@@ -464,6 +473,49 @@ mod tests {
         let descriptor = Descriptor::of(Function::ScatterAdd, &vector, BLOCK, false);
         assert_eq!(descriptor.rank, 1);
         Index::check(&descriptor, &vector).unwrap();
+    }
+
+    #[test]
+    fn an_fp8_table_is_gathered_and_set_as_its_bytes_and_never_added() {
+        // The rows of an FP8 table, as an embedding lookup selects them.
+        let lookup = Args {
+            source: contiguous(DType::F8E4M3, &[1000, 64]),
+            indices: operand(DType::U32, &[7, 64], &[1, 0]),
+            destination: contiguous(DType::F8E4M3, &[7, 64]),
+            axis: 0,
+        };
+        let descriptor = Descriptor::of(Function::Gather, &lookup, BLOCK, false);
+        assert_eq!(
+            descriptor.to_string(),
+            "function_gather_dtype_f8e4m3_indices_u32_rank_2_block_1024_pdl_false"
+        );
+        Index::check(&descriptor, &lookup).unwrap();
+
+        // The same rows written back, and added, into the table.
+        let scatter = Args {
+            source: contiguous(DType::F8E4M3, &[7, 64]),
+            indices: operand(DType::U32, &[7, 64], &[1, 0]),
+            destination: contiguous(DType::F8E4M3, &[1000, 64]),
+            axis: 0,
+        };
+        let descriptor = Descriptor::of(Function::ScatterSet, &scatter, BLOCK, false);
+        assert_eq!(
+            descriptor.to_string(),
+            "function_scatter_set_dtype_f8e4m3_indices_u32_rank_1_block_1024_pdl_false"
+        );
+        Index::check(&descriptor, &scatter).unwrap();
+
+        let message = refusal(Function::ScatterAdd, &scatter);
+        assert!(message.contains("dtype is f8e4m3"), "{message}");
+
+        // Two NVFP4 elements share a byte: no index names one.
+        let packed = Args {
+            source: contiguous(DType::F4, &[1000, 64]),
+            destination: contiguous(DType::F4, &[7, 64]),
+            ..lookup
+        };
+        let message = refusal(Function::Gather, &packed);
+        assert!(message.contains("dtype is f4e2m1"), "{message}");
     }
 
     #[test]

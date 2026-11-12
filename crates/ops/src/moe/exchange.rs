@@ -13,8 +13,10 @@
 //!
 //! The transport is a device-resident workspace shared between the ranks of one expert group. It is
 //! an execution resource, so the worker creates it through the package's own lifecycle entries
-//! ([`Transport`]), keeps it across a standby's suspend and restore, and hands it to this operator as
-//! a borrowed handle ([`ExchangeTransport`]); `ops` launches over a handle and never sizes one.
+//! ([`Transport`]), keeps it across a standby's suspend and restore, and sets its borrowed handle
+//! ([`ExchangeTransport`]) on the execution context of the forwards that exchange; the context
+//! states it in each launch, so a model never holds it. `ops` launches over a handle and never
+//! sizes one.
 //!
 //! # The step's capacity
 //!
@@ -167,17 +169,19 @@ impl fmt::Display for Descriptor {
 /// layer's expert operands in `fused`. Views a mode does not read are empty (`[0]`-element) views.
 #[derive(Clone, Copy)]
 pub struct ExchangeArgs {
-    /// The group's transport, created and owned by the worker through the package.
-    pub transport: ExchangeTransport,
+    /// The group's transport, created and owned by the worker through the package and stated by
+    /// the execution context at the launch. `None` in a call that is checked before any
+    /// transport exists (a profile run); a launch refuses it.
+    pub transport: Option<ExchangeTransport>,
     /// Rows of this launch's extent: the captured bucket's, of which `live` are the batch's.
     pub tokens: u32,
     /// `[tokens, hidden]` states to send.
     pub state: Operand,
-    /// `[tokens, top]` i32 expert ids.
+    /// `[tokens, top]` u32 expert ids.
     pub ids: Operand,
     /// `[tokens, top]` FP32 route weights.
     pub weights: Operand,
-    /// `[1]` i32 on the device: the rows of `tokens` the batch holds, or `None` for all of them.
+    /// `[1]` u32 on the device: the rows of `tokens` the batch holds, or `None` for all of them.
     pub live: Option<Operand>,
     /// `[tokens, hidden]` combined rows, written.
     pub out: Operand,
@@ -445,10 +449,10 @@ impl TransportShape {
         let top = u64::from(self.top);
         [
             (self.dtype, Shape::new(&[rows, hidden])),
-            (DType::I32, Shape::new(&[rows, top])),
+            (DType::U32, Shape::new(&[rows, top])),
             (DType::F32, Shape::new(&[rows, top])),
             (self.dtype, Shape::new(&[rows, hidden])),
-            (DType::I32, Shape::new(&[1])),
+            (DType::U32, Shape::new(&[1])),
             (DType::U8, Shape::new(&[max_tokens, hidden / 2])),
             (DType::F8E4M3, Shape::new(&[max_tokens, hidden / 16])),
         ]
@@ -462,13 +466,13 @@ pub struct TransportViews {
     pub transport: ExchangeTransport,
     /// `[ranks * capacity, hidden]`: the rows this rank received.
     pub states: Operand,
-    /// `[ranks * capacity, top]` i32: their expert ids.
+    /// `[ranks * capacity, top]` u32: their expert ids.
     pub ids: Operand,
     /// `[ranks * capacity, top]` f32: their route weights.
     pub weights: Operand,
     /// `[ranks * capacity, hidden]`: where the rank's experts leave their sums.
     pub combined: Operand,
-    /// `[1]` i32: the leading rows of those views this step holds.
+    /// `[1]` u32: the leading rows of those views this step holds.
     pub live: Operand,
     /// `[capacity, hidden / 2]` u8: where a fused launch reads this rank's encoded rows.
     pub packed: Operand,
@@ -644,13 +648,10 @@ impl Op for ExpertExchange {
         }
         if let Some(live) = args.live {
             live.require_shape(Self::NAME, Shape::new(&[1]))?;
-            if live.dtype != DType::I32 {
+            if live.dtype != DType::U32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!(
-                        "expected an i32 live count, found {}",
-                        abi::name(live.dtype)
-                    ),
+                    format!("expected a u32 live count, found {}", abi::name(live.dtype)),
                 ));
             }
         }
@@ -667,10 +668,10 @@ impl Op for ExpertExchange {
                 args.state
                     .require_row(Self::NAME, descriptor.dtype, hidden)?;
             }
-            if args.ids.dtype != DType::I32 || args.weights.dtype != DType::F32 {
+            if args.ids.dtype != DType::U32 || args.weights.dtype != DType::F32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    "a dispatch sends i32 expert ids and FP32 route weights",
+                    "a dispatch sends u32 expert ids and FP32 route weights",
                 ));
             }
         }
@@ -697,15 +698,18 @@ impl Op for ExpertExchange {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        // The transport is the group's launch resource, like the stream and the kernel: a recorded
-        // walk checks the call before any transport exists, so its presence is a launch rule and
+        // The transport is the group's launch resource, like the stream and the kernel: a profile
+        // run checks the call before any transport exists, so its presence is a launch rule and
         // not one of `check`'s argument rules.
-        if args.transport.handle().is_null() {
-            return Err(Error::argument(
-                Self::NAME,
-                "the call passed no transport; the exchange runs over the group's workspace",
-            ));
-        }
+        let transport = args
+            .transport
+            .filter(|transport| !transport.handle().is_null())
+            .ok_or_else(|| {
+                Error::argument(
+                    Self::NAME,
+                    "the call passed no transport; the exchange runs over the group's workspace",
+                )
+            })?;
         let hidden = u64::from(descriptor.hidden);
         let top = u64::from(descriptor.top);
         let experts = u64::from(descriptor.experts);
@@ -715,7 +719,7 @@ impl Op for ExpertExchange {
         let fused = args.fused;
 
         let mut call = Call {
-            transport: args.transport.handle(),
+            transport: transport.handle(),
             states: address(args.state.ptr) as usize as *const c_void,
             ids: address(args.ids.ptr) as usize as *const i32,
             weights: address(args.weights.ptr) as usize as *const f32,
@@ -784,7 +788,7 @@ mod tests {
     }
 
     /// A dispatch whose views meet its descriptor passes `check` before any transport exists, as
-    /// the recorded walk calls it; the transport is required only by a launch.
+    /// a profile run calls it; the transport is required only by a launch.
     #[test]
     fn a_dispatch_without_a_transport_passes_its_check() {
         let descriptor = Descriptor {
@@ -806,11 +810,10 @@ mod tests {
             )
         };
         let args = ExchangeArgs {
-            // SAFETY: `check` reads no handle; this call is never launched.
-            transport: unsafe { ExchangeTransport::from_handle(std::ptr::null_mut()) },
+            transport: None,
             tokens: 4,
             state: view(DType::BF16, &[4, 64]),
-            ids: view(DType::I32, &[4, 2]),
+            ids: view(DType::U32, &[4, 2]),
             weights: view(DType::F32, &[4, 2]),
             live: None,
             out: view(DType::BF16, &[4, 64]),

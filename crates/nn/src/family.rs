@@ -1,10 +1,10 @@
 //! Model families: what a concrete model supplies to execution and to request processing.
 //!
 //! A model crate exports one [`Family`] value, and the executable registers it once: execution
-//! resolves a checkpoint to the family that claims its declared class ([`Catalogue`]) and from then
-//! on dispatches by capability alone ([`Family::model`]); request processing reads only the
-//! family's request side ([`Family::request`], a [`processing::Family`]) from a catalogue built of
-//! the same list, and links no numerical crate. The two kinds of model differ in what they
+//! resolves a checkpoint to the family that claims its declared class ([`Registry`]) and from
+//! then on dispatches by capability alone ([`Family::model`]); request processing reads only the
+//! family's request side ([`Family::request`], a [`processing::Family`]) from a registry built
+//! of the same list, and links no numerical crate. The two kinds of model differ in what they
 //! compute:
 //!
 //! - a [`TextFamily`] loads a causal language model ([`TextModel`]), which execution serves with
@@ -15,26 +15,31 @@
 //!
 //! The interface is numerical. A family reads its checkpoint and states its mathematical facts
 //! (widths, cache shape, frame rule, the requests its graphs are captured for); it receives the
-//! deployment's mathematical partition ([`Split`], [`SequenceSplit`]) and the deployment's serving
-//! bounds ([`VideoServing`]), and it holds no runtime object: execution owns the devices, streams,
-//! memory, graphs and scheduling.
+//! deployment's mathematical partition ([`Split`], [`SequenceSplit`]) and the deployment's
+//! serving bounds ([`VideoServing`]), and it holds no runtime object: execution owns the devices,
+//! streams, memory, graphs and scheduling.
 //!
 //! ## One shape for every family
 //!
-//! Execution opens a [`Checkpoint`] and hands it to the family: `open` reads and normalizes the
+//! Execution opens a [`Checkpoint`] and gives it to the family: `open` reads and normalizes the
 //! configuration once, from the checkpoint's own sidecars, into the opened checkpoint value that
-//! holds it; `load` builds the deployment's share from that configuration, the same checkpoint and
-//! a loader, and takes no path. Nothing between the two reads a configuration file again.
+//! holds it; `load` builds the deployment's share from that configuration, the same checkpoint
+//! and a loader, and takes no path. Nothing between the two reads a configuration file again.
+//! The loader decides what a load is: over a store of a device it loads the model execution
+//! serves, over [`CpuWeights`](crate::CpuWeights) the model a host check computes, and a meta
+//! loader the model of a profile run, by the same `load`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::capability::{
-    CausalLm, Decoder, Denoiser, Encoder, KvView, MediaFormat, Splicer, TokenBatch, Vision,
-    WarmPrompt, WarmRequest,
-};
-use crate::{Checkpoint, Forward, Operand, Result, WeightLoader};
 use uniserve_tensor::DType;
+
+use crate::capability::{
+    CausalLm, ConditionShape, Decoder, Denoiser, Drafter, Encoder, MediaFormat, Splicer,
+    VideoRequest, Vision,
+};
+use crate::collective::Split;
+use crate::{Checkpoint, Result, WeightLoader};
 
 /// One model family a build serves: what execution loads of its checkpoints, beside how they
 /// declare it and what request processing serves ([`processing::Family`]).
@@ -77,24 +82,24 @@ impl PartialEq for Family {
 
 impl Eq for Family {}
 
-/// The families an executable loads, each claiming the `model_type`s and classes its checkpoints
-/// declare.
+/// The families an executable loads, each claiming the `model_type`s and classes its
+/// checkpoints declare.
 ///
 /// The claims are request processing's registry ([`processing::Registry`]) of the same families,
 /// so both sides resolve a checkpoint by one rule.
 #[derive(Clone, Debug, Default)]
-pub struct Catalogue {
+pub struct Registry {
     families: Vec<Family>,
     claims: processing::Registry,
 }
 
-impl Catalogue {
-    /// A catalogue of `families`.
+impl Registry {
+    /// A registry of `families`.
     ///
     /// # Errors
     ///
-    /// Fails, naming the class, when two families claim one `model_type` or class: a checkpoint of
-    /// it would resolve to either.
+    /// Fails, naming the class, when two families claim one `model_type` or class: a checkpoint
+    /// of it would resolve to either.
     pub fn new(families: impl IntoIterator<Item = Family>) -> Result<Self> {
         let families: Vec<Family> = families.into_iter().collect();
         let claims = processing::Registry::new(families.iter().map(|family| family.request))
@@ -118,25 +123,11 @@ impl Catalogue {
     }
 }
 
-/// One rank's place in a split of `size` ranks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Split {
-    /// Ranks the split spans; one is no split.
-    pub size: u32,
-    /// This rank's position in it, below `size`.
-    pub rank: u32,
-}
-
-impl Split {
-    /// No split: one rank holds the whole.
-    pub const WHOLE: Self = Self { size: 1, rank: 0 };
-}
-
-/// One block of a video pipeline, by the name a deployment file places it under and execution
+/// One stage of a video pipeline, by the name a deployment file places it under and execution
 /// reports it by.
 ///
-/// The vocabulary is the pipeline stages' (`model_index.json`'s names), shared by every video
-/// family; which checkpoint directories a block reads is the family's own mapping.
+/// The names are `model_index.json`'s, shared by every video family; which checkpoint
+/// directories a stage reads is the family's own mapping.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Stage {
     /// The text encoder and its vision tower.
@@ -194,17 +185,18 @@ impl Stage {
     }
 }
 
-/// A set of pipeline stages: the blocks one rank places.
+/// A set of pipeline stages: the stages one rank places.
 ///
-/// A deployment places a handful of blocks out of seven, so the set is a bit per block and `Copy`.
+/// A deployment places a handful of stages out of seven, so the set is a bit per stage and
+/// `Copy`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Stages(u8);
 
 impl Stages {
-    /// Every block a deployment may place.
+    /// Every stage a deployment may place.
     pub const ALL: Stages = Stages((1 << Stage::ALL.len()) - 1);
 
-    /// No block.
+    /// No stage.
     pub const NONE: Stages = Stages(0);
 
     /// The set of `stages`.
@@ -227,7 +219,7 @@ impl Stages {
         self.0 & (1 << stage.bit()) != 0
     }
 
-    /// The blocks placed, in deployment order.
+    /// The stages placed, in deployment order.
     pub fn iter(self) -> impl Iterator<Item = Stage> {
         Stage::ALL
             .into_iter()
@@ -264,8 +256,8 @@ pub trait TextCheckpoint: Send + Sync {
     fn end_of_text(&self) -> Option<&'static str>;
 
     /// Loads the model's share of `checkpoint`, the checkpoint [`TextFamily::open`] read, for
-    /// `placement`, its weights reached through `loader`, its routed experts in the slots
-    /// `experts` states.
+    /// `placement`, its weights reached through `loader` (whose root builder the model's modules
+    /// load from), its routed experts in the slots `experts` states.
     ///
     /// # Errors
     ///
@@ -279,8 +271,8 @@ pub trait TextCheckpoint: Send + Sync {
     ) -> Result<Arc<dyn TextModel>>;
 }
 
-/// The expert slots of each routed layer, by module path: entry `i` is the checkpoint expert held
-/// in slot `i`. A layer it does not name keeps the checkpoint's order.
+/// The expert slots of each routed layer, by module path: entry `i` is the checkpoint expert
+/// held in slot `i`. A layer it does not name keeps the checkpoint's order.
 pub type ExpertOrder = BTreeMap<String, Vec<u32>>;
 
 /// How a deployment splits a causal language model, and this rank's place in the split.
@@ -293,6 +285,10 @@ pub struct TextPlacement {
     /// Whether the deployment speculates with the checkpoint's own drafter, so its layers load
     /// beside the model's ([`TextModel::drafter`]); a deployment that does not leaves them unread.
     pub drafter: bool,
+    /// The tokens a step of the deployment drafts beyond the one it commits, zero for a
+    /// deployment that does not speculate: a model whose state fields hold a window per request
+    /// ([`crate::capability::VerifySlots`]) sizes them by it.
+    pub draft_tokens: u32,
 }
 
 /// A loaded causal language model, as execution sizes and serves it.
@@ -313,6 +309,21 @@ pub trait TextModel: CausalLm + Send + Sync {
     /// model whose every layer attends over the key/value cache.
     fn state(&self) -> Option<StateShape>;
 
+    /// The recurrent state of a model whose layers do not all keep the same fields: one entry
+    /// per run of layers that do, in the order [`crate::capability::RecurrentState::live`]
+    /// holds their buffers (every layer of the first entry, then of the second). The one entry
+    /// of [`Self::state`] for every other model.
+    fn state_layers(&self) -> Vec<StateShape> {
+        self.state().into_iter().collect()
+    }
+
+    /// The width of the rows [`CausalLm::forward`] returns, which [`CausalLm::compute_logits`]
+    /// and the drafter read: [`Self::hidden`], or the residual streams' joint width for a model
+    /// that carries several and reads them out at its head.
+    fn stream_width(&self) -> u32 {
+        self.hidden()
+    }
+
     /// Its routed experts, when it has any.
     fn experts(&self) -> Option<ExpertShape>;
 
@@ -325,56 +336,29 @@ pub trait TextModel: CausalLm + Send + Sync {
     fn vision(&self) -> Option<&dyn Vision> {
         None
     }
+
+    /// Whether a layer reads the batch's token ids beside its embeddings, such as an n-gram
+    /// hash embedding: execution then lends [`crate::capability::TokenBatch::token_ids`] and
+    /// [`crate::capability::TokenBatch::ngram_context`] to every forward, and lends neither
+    /// when this is `false`.
+    fn reads_token_ids(&self) -> bool {
+        false
+    }
 }
 
-/// A causal language model's own drafter: multi-token-prediction layers that propose the token
-/// after the next from the model's hidden state and the next token (DeepSeek-V3's and Qwen3-Next's
-/// MTP module, vLLM's and SGLang's `*MTP` drafters).
-///
-/// The drafter's entry at position `i` reads the model's final hidden state at `i` (the output of
-/// its [`CausalLm::forward`]) and the embedding of the token at `i + 1`; its own hidden state there
-/// is what [`CausalLm::compute_logits`] turns into the distribution of the token at `i + 2`, and
-/// what its next entry reads in place of the model's when it drafts further ahead. The drafter
-/// embeds its tokens with the model's [`CausalLm::embed_input_ids`] and projects with the model's
-/// head; its own layers attend over a key/value cache of their own, the draft cache, which the
-/// infrastructure allocates as it does the model's ([`KvView`]).
-///
-/// Which positions a step evaluates, which drafts it proposes and how a verification accepts them
-/// are execution's: the drafter computes one forward over the rows it is handed.
-pub trait Drafter: Send + Sync {
-    /// The key/value cache its layers read, the draft cache, as this rank holds it.
-    fn cache(&self) -> CacheShape;
-
-    /// Run the drafter over `batch`: `embedded [tokens, hidden]` holds the embedding of each
-    /// entry's next token and `hidden [tokens, hidden]` the hidden state each entry reads; answers
-    /// the drafter's own normalized hidden state, `[tokens, hidden]`. `cache` holds the draft
-    /// cache's one attention group, which the batch's slot mapping writes.
-    ///
-    /// # Errors
-    ///
-    /// A view a layer refuses.
-    fn forward(
-        &self,
-        f: &Forward,
-        batch: &TokenBatch,
-        cache: &KvView<'_>,
-        embedded: Operand,
-        hidden: Operand,
-    ) -> Result<Operand>;
-}
-
-/// The recurrent state a causal language model keeps per request slot, as one rank holds it: every
-/// recurrent layer keeps the same fields, each a `[slots, …]` bank the infrastructure allocates
-/// ([`crate::capability::StateLayer`]).
+/// The recurrent state a causal language model keeps per request slot, as one rank holds it:
+/// every recurrent layer keeps the same fields, each a `[slots, …]` buffer execution allocates
+/// ([`crate::capability::RecurrentState`]).
 ///
 /// A layer's state after token `t` summarizes every token up to `t`, so a request that resumes
-/// from a cached prefix resumes from the state its prefix's last token left; the prefix cache keeps
-/// such checkpoints of every field ([`crate::capability::StateView::checkpoints`]).
+/// from a cached prefix resumes from the state its prefix's last token left; the prefix cache
+/// keeps such checkpoints of every field
+/// ([`crate::capability::RecurrentState::checkpoints`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateShape {
     /// Layers that keep a recurrent state.
     pub layers: u32,
-    /// The fields one layer keeps, in the order its banks are handed to it.
+    /// The fields one layer keeps, in the order its buffers are lent to it.
     pub fields: Vec<StateField>,
 }
 
@@ -383,17 +367,23 @@ pub struct StateShape {
 pub struct StateField {
     /// What the field holds, for diagnostics and the cache's field names.
     pub name: &'static str,
-    /// The element type of its bank.
+    /// The element type of its buffer.
     pub dtype: DType,
     /// Its extents after the slot axis.
-    pub dims: Vec<u64>,
+    pub dims: Vec<usize>,
+    /// Whether the field keeps the state after each token of a decode-phase row in a slot of
+    /// its own, so a verification's acceptance chooses the slot that stands rather than copying
+    /// state ([`crate::capability::VerifySlots`]): a request of a speculating deployment then
+    /// owns `draft_tokens + 1` slots of the field. A field that keeps one slot per request, such
+    /// as a convolution window that holds its draft rows inside its own slot, is not stepwise.
+    pub stepwise: bool,
 }
 
 impl StateField {
     /// The bytes one slot of the field occupies.
     pub fn bytes(&self) -> u64 {
-        let elements: u64 = self.dims.iter().product();
-        elements * ops::abi::bytes(self.dtype).unwrap_or(0)
+        let elements: usize = self.dims.iter().product();
+        elements as u64 * ops::abi::bytes(self.dtype).unwrap_or(0)
     }
 }
 
@@ -413,6 +403,19 @@ pub struct CacheShape {
     pub kv_heads: u32,
     /// Width of one head.
     pub head_dim: u32,
+    /// The index keys each layer stores beside its keys and values
+    /// ([`crate::capability::KvPlanes::index_keys`]), for a model whose attention reads the
+    /// tokens an indexer selects; `None` otherwise.
+    pub index_keys: Option<IndexKeys>,
+}
+
+/// The index-key plane of an attention layer: one key per `ratio` consecutive tokens of a page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexKeys {
+    /// Elements of one index key.
+    pub width: u32,
+    /// Tokens one key stands for; it divides the page size.
+    pub ratio: u32,
 }
 
 /// The routed experts of a causal language model, as an expert exchange carries them.
@@ -451,8 +454,8 @@ pub trait VideoFamily: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Fails when the family does not recognize `adapter` as an adapter of its checkpoints, which
-    /// is every adapter for a family that serves none.
+    /// Fails when the family does not recognize `adapter` as an adapter of its checkpoints,
+    /// which is every adapter for a family that serves none.
     fn adapter_stage(
         &self,
         checkpoint: &Checkpoint,
@@ -510,7 +513,7 @@ pub struct VideoPlacement {
 /// captured for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoServing {
-    /// The output rasters it serves, `(width, height)` in pixels.
+    /// The output resolutions it serves, `(width, height)` in pixels.
     pub sizes: Vec<(u32, u32)>,
     /// The longest output it serves, in seconds.
     pub max_seconds: f64,
@@ -553,7 +556,7 @@ pub enum Projection {
 
 /// A loaded video generation pipeline, as execution sizes and serves it.
 ///
-/// Each block is absent when this rank does not place it. Execution binds one runner per block
+/// Each stage is absent when this rank does not place it. Execution binds one runner per stage
 /// present and states to its scheduler the calls those runners serve.
 pub trait VideoModel: Send + Sync {
     /// The text encoder: a prompt, and the vision content it presents, to conditioning rows.
@@ -591,7 +594,7 @@ pub trait VideoModel: Send + Sync {
     /// The frames one decode call produces: the video decoder's window.
     fn decode_window(&self) -> u32;
 
-    /// How the pipeline's encoders read a request's condition media, which the runtime lays out.
+    /// How the pipeline's encoders read a request's condition media, which execution lays out.
     ///
     /// # Errors
     ///
@@ -617,17 +620,36 @@ pub trait VideoModel: Send + Sync {
     fn condition_bounds(&self) -> ConditionBounds;
 
     /// The requests a deployment serving `serving` captures its denoiser's graphs for: one per
-    /// distinct layout a request of it may take.
+    /// distinct layout a request of it may take, each with the condition sets a request of the
+    /// layout may open with.
+    ///
+    /// A capture happens before the first request of a shape, so a model states one request per
+    /// layout its deployment serves and the bucket is derived from it
+    /// ([`Denoiser::layout`]). The second value lists the condition sets, each in request order
+    /// as the request presents them: a request's opening encodes its own conditions eagerly,
+    /// outside any captured graph, so the profile run opens the layout once per set to measure
+    /// that encode and state its kernels. They are not the request's own conditions, which it
+    /// states none of; the list is empty for a layout whose requests state no condition, or
+    /// whose conditions follow the client's media and nothing the deployment serves.
     ///
     /// # Errors
     ///
     /// Fails when `serving` states a size, duration or capacity the pipeline does not serve.
-    fn candidates(&self, serving: &VideoServing) -> Result<Vec<WarmRequest>>;
+    fn candidates(
+        &self,
+        serving: &VideoServing,
+    ) -> Result<Vec<(VideoRequest, Vec<Vec<ConditionShape>>)>>;
 
     /// The prompts with vision blocks a deployment serving `serving` admits whose grids the
-    /// deployment fixes: one per distinct set of grids, each as a request of a served canvas
-    /// presents it. The text encoder's recorded walk encodes each beside the captured encodes, so
-    /// the stream region it claims holds the eager vision encode as well.
+    /// deployment fixes: one per distinct set of grids, each as a request of a served resolution
+    /// presents it, as the patch grids (`[time, rows, columns]`) of its vision blocks in
+    /// presentation order and the vision placeholder tokens those blocks present.
+    ///
+    /// A prompt that presents vision blocks is encoded eagerly over its own layout and not by a
+    /// captured graph, in the same stream region the captured encodes take their memory from,
+    /// so the text encoder's profile run encodes each beside the captured encodes and the
+    /// region's peak holds the eager vision encode as well. A prompt holding the blocks is at
+    /// least their tokens long, so it rides only an encode bucket of at least that many tokens.
     ///
     /// Empty for a deployment whose tasks present no vision block.
     ///
@@ -635,7 +657,7 @@ pub trait VideoModel: Send + Sync {
     ///
     /// Fails when `serving` states a size the pipeline does not serve, or when a task presents
     /// vision blocks and the checkpoint states no rule to size them.
-    fn warm_prompts(&self, serving: &VideoServing) -> Result<Vec<WarmPrompt>>;
+    fn warm_prompts(&self, serving: &VideoServing) -> Result<Vec<(Vec<[u32; 3]>, u32)>>;
 
     /// What the placed denoiser serves under `serving`, as the deployment's request processing
     /// admits requests against it.
@@ -676,7 +698,7 @@ mod tests {
 
     use super::*;
 
-    /// A model that opens nothing: the catalogue reads only a family's claims.
+    /// A model that opens nothing: the registry reads only a family's claims.
     struct Unopened;
 
     impl TextFamily for Unopened {
@@ -702,22 +724,22 @@ mod tests {
     /// A checkpoint resolves to the numerical family whose request side claims its class.
     #[test]
     fn a_family_is_found_by_its_declared_class() {
-        let catalogue = Catalogue::new([CHAT]).unwrap();
-        assert_eq!(catalogue.by_class("ChatForCausalLM"), Some(CHAT));
-        assert_eq!(catalogue.by_class("chat_model"), None);
+        let registry = Registry::new([CHAT]).unwrap();
+        assert_eq!(registry.by_class("ChatForCausalLM"), Some(CHAT));
+        assert_eq!(registry.by_class("chat_model"), None);
     }
 
     /// Two families that claim one class are refused, as request processing refuses them.
     #[test]
     fn two_families_may_not_claim_one_class() {
-        let twin = Family {
+        let second = Family {
             request: processing::Family {
-                id: "twin",
+                id: "second",
                 ..CHAT.request
             },
             ..CHAT
         };
-        let error = Catalogue::new([CHAT, twin]).unwrap_err();
+        let error = Registry::new([CHAT, second]).unwrap_err();
         assert!(error.to_string().contains("chat_model"), "{error}");
     }
 }

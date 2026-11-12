@@ -48,6 +48,9 @@ pub(crate) struct VideoState {
     /// Decoded media units by the cursor of the round that produced them,
     /// until their encode round retires them.
     pub(crate) decoded_units: BTreeMap<u32, (u32, TensorRef)>,
+    /// The splice tails of the last scheduled video decode round, whose last
+    /// unit's tail the next round reads; `None` before the first round.
+    pub(crate) video_tail: Option<TensorRef>,
     /// Encoded media units by the cursor of the round that produced them,
     /// until the muxer is given them.
     pub(crate) encoded_units: BTreeMap<u32, (u32, TensorRef)>,
@@ -104,6 +107,7 @@ impl VideoState {
             conditioning: None,
             latents: Vec::new(),
             decoded_units: BTreeMap::new(),
+            video_tail: None,
             encoded_units: BTreeMap::new(),
             encoded_ready: BTreeMap::new(),
             muxed_units: 0,
@@ -271,7 +275,10 @@ impl Scheduler {
     /// ready once their predecessor is scheduled; they name their inputs by
     /// product reference and do not wait here for the producer to complete.
     /// Video and audio encoding wait until the call producing their input has
-    /// completed, and muxing waits for completed encode rounds.
+    /// completed, and muxing waits for completed encode rounds. A video decode
+    /// round after the first waits until the previous round has completed:
+    /// its first unit splices onto the tail of that round's last unit, which
+    /// the completion orders before the read on every device.
     pub(crate) fn video_ready_calls(&self, state: &VideoState) -> Vec<MediaCall> {
         let sampling = state.request.sampling;
         let graph = &state.graph;
@@ -380,7 +387,9 @@ impl Scheduler {
         if graph.pending(MediaCall::AudioEncoding) && state.audio.as_ref().is_some_and(produced) {
             ready.push(MediaCall::AudioEncoding);
         }
-        if state.scheduled_decode_units < sampling.video_units {
+        if state.scheduled_decode_units < sampling.video_units
+            && state.video_tail.as_ref().is_none_or(produced)
+        {
             ready.push(MediaCall::VideoDecoding);
         }
         if graph.pending(MediaCall::AudioDecoding) {
@@ -1056,7 +1065,11 @@ impl Scheduler {
             .chain(state.condition_video_latents.iter().cloned())
             .chain(state.condition_audio_latents.iter().cloned())
             .collect(),
-            MediaCall::VideoDecoding => vec![state.latents[0].clone()],
+            // The latents, then the previous round's splice tails, of which the
+            // round reads its first unit's predecessor: the last.
+            MediaCall::VideoDecoding => std::iter::once(state.latents[0].clone())
+                .chain(state.video_tail.clone())
+                .collect(),
             MediaCall::AudioDecoding => vec![state.latents[1].clone()],
             MediaCall::VideoEncoding => {
                 let range = decode.as_ref().ok_or("a video write has an input range")?;
@@ -1117,16 +1130,20 @@ impl Scheduler {
                 declared.push((product::AUDIO_LATENTS, None));
             }
             // A media unit round writes its own slice of the track's
-            // reservation, whether the slice holds decoded media units or
-            // the rows encoded from them.
-            MediaCall::VideoDecoding | MediaCall::VideoEncoding => {
+            // reservations: its decoded media units and their splice tails,
+            // or the rows encoded from them.
+            MediaCall::VideoDecoding => {
                 let range = decode.as_ref().ok_or("a media round has a unit range")?;
-                let name = if media_call == MediaCall::VideoDecoding {
-                    product::VIDEO_UNITS
-                } else {
-                    product::ENCODED_UNITS
-                };
-                declared.push((name, Some((range.max_units, range.cursor))));
+                let slice = Some((range.max_units, range.cursor));
+                declared.push((product::VIDEO_UNITS, slice));
+                declared.push((product::VIDEO_TAIL, slice));
+            }
+            MediaCall::VideoEncoding => {
+                let range = decode.as_ref().ok_or("a media round has a unit range")?;
+                declared.push((
+                    product::ENCODED_UNITS,
+                    Some((range.max_units, range.cursor)),
+                ));
             }
             MediaCall::AudioDecoding => declared.push((product::AUDIO_SAMPLES, None)),
             _ => {}
@@ -1274,6 +1291,7 @@ impl Scheduler {
                 state
                     .decoded_units
                     .insert(range.cursor, (range.max_units, call.outputs[0].clone()));
+                state.video_tail = call.outputs.get(1).cloned();
             }
             MediaCall::AudioDecoding => {
                 state.audio = Some(call.outputs[0].clone());

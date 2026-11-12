@@ -10,6 +10,7 @@
 //! | `binary`, `cmp` | `elementwise_binary` |
 //! | `where_cond` | `elementwise_where` |
 //! | `to_dtype` | `cast`, and `copy_strided` between one element type and itself |
+//! | `view` | none: a storage over the same bytes |
 //! | `copy_strided_src`, `copy2d`, `try_clone` | `copy_strided` |
 //! | `reduce` | `reduce` |
 //! | `index_select`, `gather` | `index` (gather) |
@@ -30,8 +31,22 @@
 //! produces.
 //!
 //! The generic primitives compute on `u8`, `u32`, `i16`, `i32`, `i64`, `f16`, `bf16`, `f32` and
-//! `f64`. A tensor of a packed element type (`f8e4m3`, `f4`) is an operand of the fused
-//! operators of `nn` alone, and a primitive on it is refused by the operator's own check.
+//! `f64`; `remainder`, the `bitwise_` combinations and the shifts exist on the five integer
+//! types alone. What an operator does not compute is refused by its own check.
+//!
+//! An FP8 tensor (`f8e4m3`) is moved and never computed with: `fill`, `copy_strided`, `index`
+//! (gather and scatter_set) and `elementwise_where` carry its elements as the bytes they are,
+//! so it is zeroed, set, copied, cloned, concatenated, padded, gathered and selected like any
+//! other tensor, and read as `u8` and back by `view`. Arithmetic on it, a reduction, a
+//! `scatter_add` and a conversion to or from another element type are refused: they are the
+//! fused operators' of `nn`, which decode an FP8 operand themselves.
+//!
+//! An NVFP4 tensor (`f4`) packs two elements into a byte, so no layout addresses one of them
+//! and every primitive refuses it. Its storage is moved as bytes: whoever owns the memory
+//! states it as a `u8` tensor of the packed bytes ([`crate::retained`], [`crate::external`]),
+//! which every primitive above then carries, while the `f4` tensor over the same memory is
+//! the operand of the operators that decode it.
+//!
 //! Pooling, upsampling and `conv_transpose2d` have no operator and are refused with
 //! [`Error::Unsupported`].
 
@@ -665,6 +680,7 @@ impl BackendStorage for CudaStorage {
             UnaryOp::Erf => UnaryFunction::Erf,
             UnaryOp::Relu => UnaryFunction::Relu,
             UnaryOp::Silu => UnaryFunction::Silu,
+            UnaryOp::Sigmoid => UnaryFunction::Sigmoid,
             UnaryOp::Tanh => UnaryFunction::Tanh,
             UnaryOp::Floor => UnaryFunction::Floor,
             UnaryOp::Ceil => UnaryFunction::Ceil,
@@ -689,6 +705,12 @@ impl BackendStorage for CudaStorage {
             BinaryOp::Div => BinaryFunction::Div,
             BinaryOp::Maximum => BinaryFunction::Maximum,
             BinaryOp::Minimum => BinaryFunction::Minimum,
+            BinaryOp::Remainder => BinaryFunction::Remainder,
+            BinaryOp::BitwiseAnd => BinaryFunction::BitwiseAnd,
+            BinaryOp::BitwiseOr => BinaryFunction::BitwiseOr,
+            BinaryOp::BitwiseXor => BinaryFunction::BitwiseXor,
+            BinaryOp::BitwiseLeftShift => BinaryFunction::BitwiseLeftShift,
+            BinaryOp::BitwiseRightShift => BinaryFunction::BitwiseRightShift,
         };
 
         Ok(Box::new(self.zip(function, rhs, lhs_layout, rhs_layout)?))
@@ -764,6 +786,10 @@ impl BackendStorage for CudaStorage {
         dtype: DType,
     ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(self.converted(layout, dtype)?))
+    }
+
+    fn view(&self, dtype: DType) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+        Ok(Box::new(self.reinterpreted(dtype)?))
     }
 
     fn matmul(

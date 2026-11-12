@@ -1,5 +1,5 @@
-//! The execution context: which stream, kernels, allocator, input buffer, group and profiler a
-//! device operation uses.
+//! The execution context: which stream, kernels, allocator, input buffer, group, expert exchange
+//! and profiler a device operation uses.
 //!
 //! Execution builds one context per runner and installs it on its thread around a model call
 //! ([`Context::enter`]), as PyTorch's current stream and graph memory pool are the thread's. A
@@ -21,10 +21,12 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use ops::moe::ExchangeTransport;
 use ops::platform::{DeviceRange, Stream};
 use ops::{Generation, Route};
 
 use crate::allocator::{ALIGNMENT, Allocator};
+use crate::breaks::HostWork;
 use crate::collective::Group;
 use crate::profiler::Profiler;
 use crate::{Error, Result};
@@ -58,8 +60,17 @@ pub(crate) struct State {
     /// This rank's index in the group and the group's member count, when the forward is
     /// partitioned.
     pub(crate) split: Option<(u64, u64)>,
+    /// The transport the expert exchange of this context's forwards runs over: the package's
+    /// handle for this device and expert group, borrowed from execution, which keeps it alive
+    /// for as long as it is set.
+    pub(crate) exchange: Option<ExchangeTransport>,
+    /// What an eager forward calls before each exchange launch to meet the other ranks of the
+    /// expert group on the host ([`Context::set_exchange`]).
+    pub(crate) meet: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     /// What launches the range markers of the modules a forward enters.
     pub(crate) profiler: Option<Arc<dyn Profiler>>,
+    /// What takes the graph breaks of a forward execution captures ([`Context::set_breaks`]).
+    pub(crate) breaks: Option<Arc<dyn Fn(HostWork) -> Result<()> + Send + Sync>>,
 
     /// The launch table being recorded, as `(operator, key, module path)` in launch order, or
     /// `None` while none is.
@@ -75,7 +86,7 @@ pub(crate) struct State {
     /// The furthest `input_cursor` any forward reached.
     pub(crate) input_peak: u64,
     /// The input copies of this forward, as `(buffer offset, device address, bytes)`: the
-    /// host-to-device copies made while the stream was being captured.
+    /// host-to-device copies made while the stream was being captured, or under a meta context.
     pub(crate) input_copies: Vec<(u64, u64, u64)>,
 }
 
@@ -157,6 +168,12 @@ impl Context {
         self.allocator.peak()
     }
 
+    /// The most bytes any forward of this context allocated in total: the bytes of everything
+    /// one forward writes into tensors of its own.
+    pub fn allocated_peak(&self) -> u64 {
+        self.allocator.allocated_peak()
+    }
+
     /// The furthest byte of the input buffer any forward reached.
     pub fn input_peak(&self) -> u64 {
         self.state().input_peak
@@ -192,8 +209,9 @@ impl Context {
         self.state().launches.take().unwrap_or_default()
     }
 
-    /// The input copies recorded while the stream was captured, as
-    /// `(buffer offset, device address, bytes)` in the order the forward made them.
+    /// The input copies of the forward since the last reset, as
+    /// `(buffer offset, device address, bytes)` in the order the forward made them: those a
+    /// capture recorded, or those a meta forward states a capture of it records.
     pub fn take_input_copies(&self) -> Vec<(u64, u64, u64)> {
         std::mem::take(&mut self.state().input_copies)
     }
@@ -268,9 +286,43 @@ impl Context {
         Ok(())
     }
 
+    /// The expert exchange of this context's forwards: `transport` is the package's transport for
+    /// this device and expert group, which an exchange launch runs over
+    /// ([`crate::collective::expert_exchange`]), and `None` withdraws it.
+    ///
+    /// `meet`, when given, is called on the forward's thread before each exchange launch of a
+    /// context that launches, and returns once every rank of the expert group has called it. An
+    /// exchange launch waits on its device for the same launch of every rank, and the first use
+    /// of a kernel takes a lock of the whole process and waits for its device; the ranks of a
+    /// host are threads of one process, so execution gives a warm-up forward a `meet` that
+    /// keeps every rank out of the waiting launch until each has finished the first uses before
+    /// it, and gives none once every kernel is ready.
+    ///
+    /// A meta context launches nothing and needs neither. The transport is borrowed: execution
+    /// keeps it valid, as the handle's constructor requires, for as long as it is set here.
+    pub fn set_exchange(
+        &self,
+        transport: Option<ExchangeTransport>,
+        meet: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+    ) {
+        let mut state = self.state();
+        state.exchange = transport;
+        state.meet = meet;
+    }
+
     /// What launches the range markers of the modules a forward enters, or `None`.
     pub fn set_profiler(&self, profiler: Option<Arc<dyn Profiler>>) {
         self.state().profiler = profiler;
+    }
+
+    /// What takes the graph breaks of this context's forwards ([`crate::graph_break`]), or
+    /// `None` to run each break's host work where the forward states it.
+    ///
+    /// Execution sets a taker around a capture: the taker ends the segment being captured,
+    /// keeps the host work for the replays and begins the next segment. It is called on the
+    /// forward's thread, between two launches of the forward.
+    pub fn set_breaks(&self, taker: Option<Arc<dyn Fn(HostWork) -> Result<()> + Send + Sync>>) {
+        self.state().breaks = taker;
     }
 
     /// Whether this is a meta context: one with no stream, which launches and copies nothing.
@@ -312,7 +364,10 @@ impl State {
             route: None,
             group: None,
             split: None,
+            exchange: None,
+            meet: None,
             profiler: None,
+            breaks: None,
             launches: None,
             paths: Vec::new(),
             input_memory: None,

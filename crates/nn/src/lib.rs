@@ -1,97 +1,100 @@
-//! The shared computation library: tensor views, numerical layers, capability traits, the model
-//! families execution loads, and the checkpoint and weight-loading boundary.
+//! The neural-network library: modules, fused operators, weight loading and the capability traits
+//! execution serves a model through, over the tensor library.
 //!
 //! ## Where this crate sits
 //!
-//! The call chain of one forward is `runner → model → layer → operator → kernel`. A
-//! model package composes the layers here; a layer calls the operators of
-//! [`ops`] and nothing below them; the operator's launch code reaches the loaded kernel. `nn` owns
-//! no runtime object: it never allocates device memory, creates a stream, captures a graph or
-//! selects a program. Everything a forward needs arrives borrowed in [`Forward`].
+//! Three layers, as in PyTorch: the tensor library (`uniserve-tensor`: tensors, views, the CPU
+//! device), the device backend (`backend`: the CUDA and meta devices, the execution context, the
+//! one dispatch point of every kernel) and this crate, the `torch.nn` of the tree. A model crate
+//! depends on this crate, the tensor library and `processing` only; what it may name of the
+//! layers below is re-exported here ([`Tensor`], [`DType`], [`Device`], [`Shape`], [`D`],
+//! [`IndexOp`], [`Module`], [`collective`], [`profiler`]).
 //!
-//! ## The tensors
+//! `nn` owns no runtime object: it never creates a context, a stream or a graph, and it
+//! allocates only through the tensor operations and fused operators it computes with. Which
+//! stream, kernels and memory a forward uses is the execution context installed on the thread
+//! by execution, which a model never names.
 //!
-//! [`Operand`], [`Shape`], [`Strides`], [`DType`] and [`DevicePtr`] are [`ops`] types: they are
-//! the ABI of an operator's arguments, and `nn` re-exports them rather than defining a second
-//! representation. A [`Weight`] pairs a view with the [`Backing`] the worker's retained storage
-//! gives it, so a layer's weights are plainly borrowed and plainly retained.
+//! ## Conventions
 //!
-//! ## The layers
+//! Every module, here and in a model crate, has one shape:
 //!
-//! [`layers`] holds what a model composes: [`Linear`],
-//! [`RmsNorm`], [`LayerNorm`], [`Rotary`],
-//! [`VocabParallelEmbedding`](layers::VocabParallelEmbedding), [`DenseAttention`](layers::DenseAttention),
-//! [`PagedAttention`](layers::PagedAttention), [`Moe`],
-//! [`Conv3d`], [`Conv1d`],
-//! [`ConvTranspose1d`], [`UlyssesAttention`](layers::UlyssesAttention),
-//! and [`ParallelLMHead`]; the diffusion and
-//! video models add [`Patchify`](layers::Patchify), [`Copy`](layers::Copy),
-//! [`Transpose`](layers::Transpose) and [`VsaAttention`](layers::VsaAttention), and the
-//! audio path adds
-//! [`Snake`], [`AdaptiveAvgPool2d`] and
-//! [`ChannelAffine`](layers::ChannelAffine). Each holds weight views and geometry, and its forward calls
-//! operators.
+//! - A **module** is a struct that holds its weights, as [`Tensor`]s, and its sub-modules. It
+//!   holds nothing of execution.
+//! - Its **config** is an immutable typed struct, named `<Module>Config`, of the widths, names
+//!   and arithmetic choices the checkpoint states for it and of this rank's share
+//!   ([`collective::Split`]); it derives `serde` where it is read from a checkpoint's JSON. A
+//!   module's constructor consumes typed fields and reparses nothing.
+//! - It is built by `Module::load(config: &Config, vb: VarBuilder) -> Result<Self>`, or
+//!   `load(vb)` when it has no config. The builder names the module's tensors under its path
+//!   ([`VarBuilder::pp`], [`VarBuilder::get`]), so one `load` serves a device, the CPU and a
+//!   profile run: what a load is follows from the [`WeightLoader`] the builder is over.
+//! - It is computed by `forward`, which takes and returns tensors and returns this crate's
+//!   [`Result`]. A module of one input also implements the tensor library's [`Module`], so it
+//!   composes with `Tensor::apply`; a module of more inputs takes them as arguments.
+//! - A function of [`functional`] takes and returns tensors and holds no state: a fused
+//!   operator with its CPU formula, or a stateless function.
+//! - Nothing takes a context, a stream, an arena or a kernel argument. A destination argument
+//!   exists only for memory execution owns and lends: key/value pages, recurrent state,
+//!   latents and product buffers ([`capability`]).
+//! - A module states its forward as a profiler range ([`profiler::range`]) where a deployment
+//!   times it, with its class and the path its builder loaded it under
+//!   ([`VarBuilder::path`]).
+//! - A failure is this crate's [`Error`], which holds the tensor library's and the backend's
+//!   as typed causes; a model crate converts it into its own.
 //!
-//! Beside the layers, [`diffusion`] holds the flow-matching schedules and the Euler step, [`tiling`]
-//! the tiled VAE grid, blends and encode and decode drivers, [`vocoder`] the BigVGAN generator and
-//! [`codec`] the DAC encoder.
+//! ## What a forward does
 //!
-//! ## The capabilities
+//! There are no execution modes. On CPU tensors a function computes its formula with tensor
+//! operations; on tensors of a GPU it launches kernels through the context; on meta tensors,
+//! under a meta context, it checks its arguments, states the kernel it would launch and
+//! computes nothing, which is a profile run. The same `forward` is all three.
 //!
-//! A model's blocks implement the capabilities execution calls: [`Encoder`], [`Denoiser`],
-//! [`Decoder`] or [`CausalLm`] ([`capability`]). A model crate exports its [`family::Family`], the
-//! one value execution resolves a checkpoint with and receives the loaded model's blocks from; it
-//! dispatches by the capability, never by the concrete model.
+//! ## The parts
 //!
-//! ## Checkpoints and weights
-//!
-//! [`Checkpoint`] is a set of safetensors shards with the identity of every file;
-//! [`WeightLoader`] converts a tensor once into the layout its operator declares and publishes it
-//! to retained storage, keyed by the identity of the files it was read from, its converted element
-//! type, its layout and its region.
+//! | Module | Holds |
+//! | --- | --- |
+//! | [`var_builder`], [`weights`], [`checkpoint`], [`quantization`], [`adapter`] | [`VarBuilder`], [`WeightLoader`] and retained storage, safetensors shards, the quantization a checkpoint declares and its packed representations, adapter fusion |
+//! | [`config`] | The strict reader of a checkpoint's JSON configuration |
+//! | [`functional`] | The fused operators and stateless functions |
+//! | [`modules`] | `Linear`, `Embedding`, `LmHead`, `RmsNorm`, `LayerNorm`, `Mlp`, `MoE`, `SharedExpert` and their parallel forms |
+//! | [`capability`] | The traits execution calls and the input values of their methods |
+//! | [`diffusion`] | Flow-matching schedules, the solver formulas and the sinusoidal time embedding |
+//! | [`vae`] | The tiles of a raster, their blend and stitch, the tiled encode and the temporal clips |
+//! | [`family`] | The family traits, the registry and the shapes execution sizes a model by |
+//! | [`collective`], [`profiler`] | The model-facing forms of the backend's collectives and profiler ranges |
 
 pub mod adapter;
-pub mod blocks;
 pub mod capability;
 pub mod checkpoint;
-pub mod codec;
+pub mod collective;
 pub mod config;
 pub mod diffusion;
 pub mod error;
 pub mod family;
-pub mod forward;
-pub mod group;
-pub mod layers;
+pub mod functional;
+pub mod modules;
+pub mod profiler;
 pub mod quantization;
-pub mod tensor;
-pub mod tiling;
-pub mod timestep;
-pub mod vocoder;
+pub mod vae;
+pub mod var_builder;
 pub mod weights;
 
 pub use adapter::{Adapter, Fusion};
 pub use capability::{
-    CausalLm, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
-    Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput,
-    ImageShape, KvGroup, KvLayer, KvPlanes, KvView, Latents, MediaFormat, PatchFormat, PixelNorm,
-    Placed, Seed, Splicer, StateLayer, StateView, Step, TokenBatch, VideoRequest, WarmPrompt,
-    WarmRequest,
+    CausalLm, Clip, ConditionPiece, ConditionShape, Conditioning, Decoder, Denoiser, Drafter,
+    Encoder, EncoderLayout, ExpertExchange, KvCache, KvPlanes, MediaFormat, MediaInput, NO_SLOT,
+    PatchFormat, PixelNorm, RecurrentState, Splice, Splicer, Step, TokenBatch, VerifySlots,
+    VideoRequest, Vision,
 };
-pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
+pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
+pub use collective::Split;
 pub use error::{Error, Result};
-pub use forward::{Arena, Fence, Forward, HostValue, Split, Staging};
-pub use group::{Group, Transfer};
-pub use layers::{
-    Activation, AdaptiveAvgPool2d, Axpby, Cast, CausalPad, Conv1d, Conv3d, ConvSpec,
-    ConvTranspose1d, Epilogue, GateBias, GatedActivation, Gelu, GroupNorm, Halves, IndexRows,
-    LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding, ParallelLMHead, Residual,
-    ResidualStream, RmsNorm, Rotary, Rounding, Scale, Silu, Snake,
-};
-pub use ops::{DevicePtr, MAX_RANK, Operand, Shape, Strides};
 pub use proto::module::PhaseKind;
-pub use tensor::Backing;
-pub use uniserve_tensor::DType;
+pub use proto::video::{ConditionRole, LatentShape, Layout, VisionGrid};
+pub use uniserve_tensor::{D, DType, Device, IndexOp, Module, Shape, Tensor};
+pub use var_builder::VarBuilder;
 pub use weights::{
-    ExpertStack, Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, ScaleLayouts,
-    Scope, StackLayout, ValueLayout, Weight, WeightKey, WeightLayout, WeightLoader,
+    CpuWeights, PartBlock, Provenance, Quantization, RetainedWeights, WeightKey, WeightLayout,
+    WeightLoader, WeightSource,
 };

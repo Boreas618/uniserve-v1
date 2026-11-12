@@ -45,11 +45,14 @@ pub const WARPS_PER_BLOCK: u64 = 4;
 /// The tokens one `topk_softmax` thread block routes.
 pub const TOKENS_PER_BLOCK: u64 = WARPS_PER_BLOCK;
 
-/// The largest expert count one warp holds.
-pub const MAX_EXPERTS: u32 = 256;
+/// The largest expert count a router of this build selects over: the widest served block's
+/// (512, Qwen3.8 Flash Next). The kernel holds `ceil(experts / 32)` scores per lane, compiled
+/// in, up to 1024 experts.
+pub const MAX_EXPERTS: u32 = 512;
 
-/// The largest top-k the renormalizing butterfly holds.
-pub const MAX_TOP: u32 = 8;
+/// The largest top-k a router of this build keeps: the widest served block's (10). The kernel's
+/// renormalizing sum is over a zero-padded warp and holds up to 32.
+pub const MAX_TOP: u32 = 10;
 
 /// One compilation of `topk_softmax`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -89,11 +92,11 @@ pub struct TopkArgs {
     pub scores: Operand,
     /// `[experts]` per-expert scale multiplied into the weights, when the descriptor has one.
     pub scale: Option<Operand>,
-    /// `[tokens, top]` i32 expert ids, written.
+    /// `[tokens, top]` u32 expert ids, written.
     pub ids: Operand,
     /// `[tokens, top]` FP32 route weights, written.
     pub weights: Operand,
-    /// `[experts]` i32 weight row of each logical expert, when the block's experts are not in
+    /// `[experts]` u32 weight row of each logical expert, when the block's experts are not in
     /// logical order: `ids` then holds rows.
     pub map: Option<Operand>,
 }
@@ -157,10 +160,10 @@ impl Op for TopkSoftmax {
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.weights
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        if args.ids.dtype != DType::I32 {
+        if args.ids.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 ids, found {}", abi::name(args.ids.dtype)),
+                format!("expected u32 ids, found {}", abi::name(args.ids.dtype)),
             ));
         }
         if args.weights.dtype != DType::F32 {
@@ -204,10 +207,10 @@ impl Op for TopkSoftmax {
 
         if let Some(map) = args.map {
             map.require_shape(Self::NAME, Shape::new(&[experts]))?;
-            if map.dtype != DType::I32 {
+            if map.dtype != DType::U32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected an i32 expert map, found {}", abi::name(map.dtype)),
+                    format!("expected a u32 expert map, found {}", abi::name(map.dtype)),
                 ));
             }
         }

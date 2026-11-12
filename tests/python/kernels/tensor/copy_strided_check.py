@@ -19,7 +19,7 @@ What is covered, by the backend primitive it serves:
   offset, which is how a concatenation along the last axis places each operand;
 - **`cat`, `pad` and `slice_set`**: a source of rank 2 to 5 written into an interior block of a
   larger tensor, whose strides the destination keeps;
-- **every element type**, and among the floats a NaN, an infinity and a negative zero.
+- **every element type**, an FP8 (`f8e4m3`) tensor as the bytes its elements are, and among the floats a NaN, an infinity and a negative zero.
 """
 
 import sys
@@ -28,21 +28,19 @@ import sys
 import operands
 import torch
 
-DTYPES = operands.FLOATS + operands.INTEGERS
-
-#: The name `ops::DType` prints for each torch element type.
-NAMES = {element: name for name, element in operands.ELEMENTS.items()}
+#: Every element type a copy moves: an FP8 (`f8e4m3`) tensor is held as its bytes.
+DTYPES = operands.FLOATS + operands.INTEGERS + tuple(operands.MOVED)
 
 
-def copy(source, destination):
-    """One launch of `source` into the view `destination`."""
+def copy(dtype, source, destination):
+    """One launch of `source`, of `dtype` elements, into the view `destination`."""
     extents, (source_strides, destination_strides) = operands.merged(
         [source, destination]
     )
     elements = destination.numel()
 
     # `Descriptor`'s `Display`.
-    key = f"dtype_{NAMES[source.dtype]}_rank_{len(extents)}_block_{operands.BLOCK}_pdl_false"
+    key = f"dtype_{dtype}_rank_{len(extents)}_block_{operands.BLOCK}_pdl_false"
     operands.launch(
         "copy_strided",
         key,
@@ -57,13 +55,13 @@ def copy(source, destination):
     )
 
 
-def check(name, source, buffer, block):
+def check(name, dtype, source, buffer, block):
     """Copy `source` into `buffer[block]` and hold the whole buffer to torch's assignment."""
     expected = buffer.clone()
     expected[block] = source.contiguous()
 
-    copy(source, buffer[block])
-    label = f"{NAMES[source.dtype]} {name} {tuple(source.shape)}"
+    copy(dtype, source, buffer[block])
+    label = f"{dtype} {name} {tuple(source.shape)}"
     return operands.same(label, buffer, expected)
 
 
@@ -80,7 +78,7 @@ def main():
 
     # A strided source made contiguous, at an element offset of a longer buffer.
     layouts = 0
-    for dtype in ("bf16", "f32", "i64", "u8"):
+    for dtype in ("bf16", "f32", "i64", "u8", "f8e4m3"):
         for name, view in operands.views(dtype, 11):
             offset = 5
             buffer = sentinel(dtype, (view.numel() + 11,), layouts)
@@ -89,7 +87,7 @@ def main():
             # is the one `copy_strided_src` makes.
             expected = buffer.clone()
             expected[run] = view.contiguous().reshape(-1)
-            copy(view, buffer[run].view(view.shape))
+            copy(dtype, view, buffer[run].view(view.shape))
             checked += operands.same(
                 f"{dtype} contiguous at an offset, {name}", buffer, expected
             )
@@ -99,11 +97,15 @@ def main():
     for seed, dtype in enumerate(DTYPES):
         permuted = operands.values(dtype, (3, 4, 5), seed).permute(2, 0, 1)
         buffer = sentinel(dtype, (5, 3, 4), seed)
-        checked += check("permuted", permuted, buffer, (slice(None),) * 3)
+        checked += check(
+            "permuted", dtype, permuted, buffer, (slice(None),) * 3
+        )
 
         repeated = operands.values(dtype, (1, 6), seed + 20).expand(4, 6)
         buffer = sentinel(dtype, (4, 6), seed + 20)
-        checked += check("broadcast", repeated, buffer, (slice(None),) * 2)
+        checked += check(
+            "broadcast", dtype, repeated, buffer, (slice(None),) * 2
+        )
 
     # The two-dimensional copy: rows read from an offset of a wider source and written at an
     # offset of a wider destination, the two row strides differing.
@@ -113,18 +115,19 @@ def main():
         buffer = sentinel(dtype, (5, 12), seed + 40)
         checked += check(
             "rows of differing strides",
+            dtype,
             source,
             buffer,
             (slice(2, 5), slice(4, 9)),
         )
 
     # A concatenation along the last axis: each operand lands in its columns of the result.
-    for dtype in ("bf16", "i32"):
+    for dtype in ("bf16", "i32", "f8e4m3"):
         left = operands.values(dtype, (3, 5), 61)
         right = operands.values(dtype, (3, 7), 62).flip(0).contiguous()
         result = sentinel(dtype, (3, 12), 63)
-        copy(left, result[:, :5])
-        copy(right, result[:, 5:])
+        copy(dtype, left, result[:, :5])
+        copy(dtype, right, result[:, 5:])
         expected = torch.cat([left, right], dim=1)
         checked += operands.same(f"{dtype} concatenation", result, expected)
 
@@ -152,7 +155,7 @@ def main():
             .transpose(0, -1)
         )
         buffer = sentinel(dtype, outer, 72)
-        checked += check("an interior block", source, buffer, block)
+        checked += check("an interior block", dtype, source, buffer, block)
 
     # Values a bitwise comparison tells apart.
     for dtype in operands.FLOATS:
@@ -161,7 +164,7 @@ def main():
         )
         buffer = sentinel(dtype, (2, 6), 81)
         checked += check(
-            "special values", special.flip(0), buffer, (1, slice(None))
+            "special values", dtype, special.flip(0), buffer, (1, slice(None))
         )
 
     print(

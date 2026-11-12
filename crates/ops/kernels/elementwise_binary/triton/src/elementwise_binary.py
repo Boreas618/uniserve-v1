@@ -14,6 +14,15 @@ operand unless the right one is strictly beyond it, which is the tensor
 library's host rule and decides what a NaN does. A comparison (``eq``, ``ne``,
 ``lt``, ``le``, ``gt``, ``ge``) writes one ``u8`` per element: one where it
 holds, zero where it does not.
+
+Six functions exist on the integer element types alone and are exact, as all
+integer arithmetic is. ``remainder`` is ``torch.remainder``: the remainder of
+the floored quotient, zero or of the divisor's sign. ``bitwise_and``,
+``bitwise_or`` and ``bitwise_xor`` combine the two elements' bits, and
+``bitwise_left_shift`` and ``bitwise_right_shift`` shift the left element by
+the right one, a right shift repeating the sign bit of a signed element. A
+shift count outside the element's width and a zero divisor leave their
+element unspecified.
 """
 
 import strided
@@ -48,6 +57,7 @@ def _elementwise_binary_kernel(
     FUNCTION: tl.constexpr,  # noqa: N803
     COMPARES: tl.constexpr,  # noqa: N803
     COMPUTE: tl.constexpr,  # noqa: N803
+    SIGNED: tl.constexpr,  # noqa: N803
     RANK: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803
     PDL: tl.constexpr,  # noqa: N803
@@ -56,7 +66,8 @@ def _elementwise_binary_kernel(
 
     Grid: ``ceil(elements / BLOCK)`` programs. ``d1..d5`` are the output's
     extents, ``l0..l5`` and ``r0..r5`` the two inputs' strides, right-aligned.
-    ``COMPARES`` says that ``FUNCTION`` is a comparison, whose output is ``u8``.
+    ``COMPARES`` says that ``FUNCTION`` is a comparison, whose output is ``u8``,
+    and ``SIGNED`` that the element type is an integer with a sign.
     """
     strided.pdl_prologue(PDL)
 
@@ -100,8 +111,34 @@ def _elementwise_binary_kernel(
         result = left <= right
     elif FUNCTION == "gt":
         result = left > right
-    else:
+    elif FUNCTION == "ge":
         result = left >= right
+    elif FUNCTION == "remainder":
+        # The quotient truncates toward zero, so what it leaves has the sign
+        # of the dividend; the floored quotient leaves one divisor more where
+        # that sign is not the divisor's.
+        divisor = right
+        if SIGNED:
+            # The smallest value by minus one overflows as a quotient. Every
+            # value is a multiple of minus one, as it is of one.
+            divisor = tl.where(right == -1, 1, right)
+        truncated = left - (left // divisor) * divisor
+        if SIGNED:
+            crosses = (truncated != 0) & ((truncated < 0) != (divisor < 0))
+            result = tl.where(crosses, truncated + divisor, truncated)
+        else:
+            result = truncated
+    elif FUNCTION == "bitwise_and":
+        result = left & right
+    elif FUNCTION == "bitwise_or":
+        result = left | right
+    elif FUNCTION == "bitwise_xor":
+        result = left ^ right
+    elif FUNCTION == "bitwise_left_shift":
+        result = left << right
+    else:
+        # A signed element shifts arithmetically, an unsigned one logically.
+        result = left >> right
 
     if COMPARES:
         tl.store(out + index, result.to(tl.uint8), mask=live)
