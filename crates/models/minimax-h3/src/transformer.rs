@@ -61,17 +61,26 @@ const INPUTS: [&str; 4] = ["to_q", "to_k", "to_v", "to_gate_compress"];
 /// The index of the compression gate among [`INPUTS`].
 const GATE: usize = 3;
 
+/// The module the stack's blocks are stored under, `transformer_blocks.<i>`.
+pub(crate) const BLOCKS: &str = "transformer_blocks";
+
+/// The two projections of a block's feed-forward, relative to the block: the one that fuses
+/// the value half and the gate half, and the one back to the hidden width.
+pub(crate) const FEED_FORWARD: [&str; 2] = ["ff.net.0.proj", "ff.net.2"];
+
 /// The value-first SwiGLU of a block: the checkpoint fuses the feed-forward's value half first
 /// and its gate half second, and `silu(gate)` and the product each round once, as the
 /// reference's activation rounds.
 pub(crate) fn mlp_config(config: &TransformerConfig) -> MlpConfig {
+    let [gate_up, down] = FEED_FORWARD;
+
     MlpConfig {
         hidden: config.hidden_size,
         intermediate: config.intermediate_size,
         activation: Activation::Silu,
         rounding: Rounding::Stepwise,
-        gate_up: GateUp::ValueFirst("ff.net.0.proj"),
-        down: "ff.net.2",
+        gate_up: GateUp::ValueFirst(gate_up),
+        down,
         bias: false,
         split: Split::WHOLE,
     }
@@ -642,14 +651,7 @@ impl Transformer {
         };
 
         let blocks = (0..transformer.num_hidden_layers)
-            .map(|index| {
-                Block::load(
-                    config,
-                    sequence,
-                    max_rows,
-                    vb.pp("transformer_blocks").pp(index),
-                )
-            })
+            .map(|index| Block::load(config, sequence, max_rows, vb.pp(BLOCKS).pp(index)))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {

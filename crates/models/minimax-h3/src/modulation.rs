@@ -128,7 +128,7 @@ impl Modulation {
             )?,
             blocks: (0..config.num_hidden_layers)
                 .map(|index| {
-                    let block = vb.pp("transformer_blocks").pp(index);
+                    let block = vb.pp(crate::transformer::BLOCKS).pp(index);
                     projection(block.pp("adaln_proj").pp("linear"), BLOCK_COLUMNS)
                 })
                 .collect::<nn::Result<Vec<_>>>()?,

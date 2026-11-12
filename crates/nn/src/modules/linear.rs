@@ -13,6 +13,12 @@
 //! fused into the bytes the weight is read from ([`crate::adapter`]), so a projection it edits
 //! is loaded fused.
 //!
+//! A calibrated NVFP4 module's fields are read in the spelling the declaration states
+//! ([`Nvfp4Names`](crate::quantization::Nvfp4Names)), and its activation scale is the one the
+//! declaration states for the module, when the export keeps its calibration in a manifest, and
+//! the tensor beside the weight otherwise ([`crate::quantization`]). Its bias, when the module
+//! states one, joins the rounded product ([`functional::linear_nvfp4`]).
+//!
 //! ## Parallelism
 //!
 //! [`Parallel::Column`] holds this rank's block of the output channels: its rows of the
@@ -33,13 +39,17 @@ use uniserve_tensor::{DType, Module, Shape, Tensor};
 use crate::collective::{self, Split};
 use crate::error::{Error, Result};
 use crate::functional::{self, WeightOrder};
-use crate::quantization::{Nvfp4Names, Nvfp4Weight, Scheme};
+use crate::quantization::{Nvfp4Weight, Scheme};
 use crate::var_builder::VarBuilder;
 use crate::weights::{WeightLayout, WeightSource, extents};
 
 /// The arrangement a calibrated ModelOpt export stores its block scales in: linear, one E4M3
 /// scale per sixteen elements, row-major. The published table is built from it at load.
 const FILE_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
+
+/// The class the constants a packed projection computes at load are filed under: the producer
+/// of their retained keys. Its text is part of every stored key of such a constant.
+const PRODUCER: &str = "nn::Linear";
 
 /// The arrangement the packed product reads the weight's block scales in.
 const PRODUCT_SCALE_LAYOUT: ScaleLayout = functional::PRODUCT_SCALE_LAYOUT;
@@ -136,14 +146,15 @@ impl Linear {
     /// The projection the module at `vb` states, split as `config.parallel` says.
     ///
     /// The checkpoint stores the module as `weight` `[outputs, inputs]` and, with a bias, `bias`
-    /// `[outputs]`; a calibrated NVFP4 export stores `weight` packed beside `weight_scale`,
-    /// `weight_scale_2` and `input_scale`, and the declaration the model's loader was given
-    /// decides which this module is.
+    /// `[outputs]`; a calibrated NVFP4 export stores the weight's packed values beside its
+    /// block scales and its tensor scale, under the names of its spelling, and the declaration
+    /// the model's loader was given decides which this module is.
     ///
     /// # Errors
     ///
     /// When the split does not divide the split axis, a tensor is missing or of another extent,
-    /// a dense matrix is all zero, or a packed module states a bias.
+    /// a dense matrix is all zero, or a packed module has no activation scale or states it
+    /// twice.
     pub fn load(config: &LinearConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
         let (inputs, outputs) = (u64::from(config.inputs), u64::from(config.outputs));
         let parallel = config.parallel;
@@ -222,15 +233,10 @@ impl Linear {
             }
 
             Scheme::Nvfp4 => {
-                if config.bias {
-                    return Err(Error::weight(
-                        &name,
-                        "a packed projection states a bias, and no calibrated NVFP4 export \
-                         writes one",
-                    ));
-                }
-
                 let mut linear = Self::load_nvfp4(&vb, inputs, local_in, local_out, parallel)?;
+
+                // The bias is `local_out` elements by its read: the packed weight's rows.
+                linear.bias = load_bias(&vb, config.bias, local_out, parallel)?;
                 linear.reduce = reduce;
                 Ok(linear)
             }
@@ -303,14 +309,19 @@ impl Linear {
         Self::new(weight, bias, WeightOrder::NxK)
     }
 
-    /// The packed fields of the module at `vb`, at this rank's block.
+    /// The packed fields of the module at `vb`, at this rank's block, read in the spelling the
+    /// loader's declaration states.
     ///
     /// The checkpoint stores two E2M1 codes a byte along the contraction, so a row is `in / 2`
     /// bytes and its block scales are `in / 16` of them; a rank's block is the same rows or
-    /// columns of both. The weight's `weight_scale_2` and the activation's `input_scale` are one
-    /// positive float each: the encoder reads the activation's reciprocal, and the product's
-    /// alpha is the two scales' product, published once as a `[1]` F32 constant beside the
-    /// weights.
+    /// columns of both. The weight's tensor scale and the activation's are one positive float
+    /// each: the encoder reads the activation's reciprocal, and the product's alpha is the two
+    /// scales' product, published once as a `[1]` F32 constant beside the weights.
+    ///
+    /// The activation's scale is the declaration's when the export keeps its calibration in a
+    /// manifest: no checkpoint tensor holds it, so its reciprocal is published as a constant of
+    /// this projection, keyed by the bytes it holds. Otherwise it is the `input_scale` tensor
+    /// beside the weight, whose reciprocal the loader publishes under the tensor's file.
     fn load_nvfp4(
         vb: &VarBuilder<'_, '_>,
         inputs: u64,
@@ -318,7 +329,8 @@ impl Linear {
         local_out: u64,
         parallel: Parallel,
     ) -> Result<Self> {
-        let spelling = Nvfp4Names::vllm();
+        let declaration = vb.loader().declaration();
+        let spelling = declaration.names();
         let values = weight_source(
             &vb.name(spelling.values),
             inputs / 2,
@@ -337,24 +349,49 @@ impl Linear {
 
         let global_scale = vb.tensor_scale(spelling.tensor_scale)?;
 
-        // A dense product dequantizes `code * block_scale` on both sides, so its alpha is the
-        // two tensor scales' product: the weight's and the activation's.
-        let product_alpha = global_scale * vb.tensor_scale(spelling.input_scale)?;
-        let weight = vb.loader().nvfp4(
+        let stated = declaration.activation_scale(vb.path())?;
+        let activation_scale = match stated {
+            // Two statements of one calibration are two numbers a loader would have to choose
+            // between.
+            Some(_) if vb.contains(spelling.input_scale) => {
+                return Err(Error::weight(
+                    &input_scale,
+                    "the export's manifest states this projection's activation scale, and the \
+                     checkpoint stores one beside the weight as well",
+                ));
+            }
+            Some(scale) => scale,
+            None => vb.tensor_scale(spelling.input_scale)?,
+        };
+
+        let mut weight = vb.loader().nvfp4(
             &values,
             &scales,
-            Some(&input_scale),
+            stated.is_none().then_some(input_scale.as_str()),
             spelling,
             (FILE_SCALE_LAYOUT, PRODUCT_SCALE_LAYOUT),
             global_scale,
         )?;
+        if stated.is_some() {
+            // The encoder's factor, under the name the loader publishes a tensor's under.
+            weight.input_scale = Some(vb.loader().constant(
+                &format!("{input_scale}__nvfp4_input_scale"),
+                DType::F32,
+                &Shape::from(1),
+                &(1.0 / activation_scale).to_le_bytes(),
+                PRODUCER,
+            )?);
+        }
+
+        // A dense product dequantizes `code * block_scale` on both sides, so its alpha is the
+        // two tensor scales' product: the weight's and the activation's.
+        let product_alpha = global_scale * activation_scale;
         let alpha = vb.loader().constant(
             &vb.name("alpha"),
             DType::F32,
             &Shape::from(1),
             &product_alpha.to_le_bytes(),
-            // The producer's text is part of the stored key.
-            "nn::Linear",
+            PRODUCER,
         )?;
 
         Self::nvfp4(&weight, alpha)
@@ -507,7 +544,7 @@ impl Linear {
                 scales,
                 input_scale,
                 alpha,
-            } => functional::linear_nvfp4(x, values, scales, input_scale, alpha)?,
+            } => functional::linear_nvfp4(x, values, scales, bias, input_scale, alpha)?,
             Weight::Fp8 {
                 weight,
                 input_scale,

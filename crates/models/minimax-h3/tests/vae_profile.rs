@@ -7,7 +7,8 @@
 //! the stage by: the launches, the distinct kernel keys, which operators are generic tensor
 //! primitives and which are fused operators of `nn`, and the allocator's peak.
 //!
-//! The runs need the checkpoint at [`CHECKPOINT`] and are ignored without it:
+//! The runs need the checkpoint at [`CHECKPOINT`], and the packed decoder's the export at
+//! [`NVFP4_EXPORT`], and are ignored without them:
 //!
 //! ```text
 //! cargo test -p minimax-h3 --test vae_profile -- --ignored --nocapture
@@ -31,6 +32,11 @@ use support::{meta, recorded, report};
 
 /// The released checkpoint the runs read the headers of.
 const CHECKPOINT: &str = "/workspace/models/MiniMax-H3";
+
+/// The four-step FastH3 student's ModelOpt NVFP4 export, whose manifest calibrates the
+/// attention and feed-forward projections of the video decoder's blocks.
+const NVFP4_EXPORT: &str =
+    "/workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4";
 
 /// The stage `name` of the released checkpoint, opened by its headers.
 fn stage(name: &str) -> Checkpoint {
@@ -73,13 +79,10 @@ fn served_resolutions() -> [(u32, u32); 2] {
     [resolutions[0], resolutions[resolutions.len() - 1]]
 }
 
-#[test]
-#[ignore = "requires /workspace/models/MiniMax-H3"]
-fn the_video_decoder_profiles_one_clip_at_a_small_and_a_large_resolution() {
-    let (checkpoint, config) = video_stage();
-    let loader = WeightLoader::meta(&checkpoint, None, None);
-    let decoder = VideoDecoder::load(&config, loader.root()).unwrap();
-    let clips = video_vae::temporal_clips(&config);
+/// Profiles `decoder`, the video decoder of the checkpoint `name` built from `config`: the
+/// gather and the decode of one temporal unit at the smallest and the largest resolution.
+fn profile_decoder(name: &str, decoder: &VideoDecoder, config: &VideoVaeConfig) {
+    let clips = video_vae::temporal_clips(config);
 
     for (width, height) in served_resolutions() {
         // One temporal unit: the clip's window of latent frames, decoded whole.
@@ -100,17 +103,51 @@ fn the_video_decoder_profiles_one_clip_at_a_small_and_a_large_resolution() {
         let (gathered, recording) =
             recorded(|| decoder.gather_latents(&layout, &trajectory, clips.start(2), &block));
         gathered.unwrap();
-        report(&format!("video gather {width}x{height}"), &recording);
+        report(
+            &format!("{name}: video gather {width}x{height}"),
+            &recording,
+        );
 
         let raster = (3, clip.frames as usize, height as usize, width as usize);
         let video = meta(raster, decoder.element_type());
         let (decoded, recording) = recorded(|| decoder.decode(&layout, &block, Some(&video), None));
         decoded.unwrap();
         report(
-            &format!("video decode {width}x{height}, {rows} latent rows"),
+            &format!("{name}: video decode {width}x{height}, {rows} latent rows"),
             &recording,
         );
     }
+}
+
+#[test]
+#[ignore = "requires /workspace/models/MiniMax-H3"]
+fn the_video_decoder_profiles_one_clip_at_a_small_and_a_large_resolution() {
+    let (checkpoint, config) = video_stage();
+    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let decoder = VideoDecoder::load(&config, loader.root()).unwrap();
+
+    profile_decoder("MiniMax-H3", &decoder, &config);
+}
+
+/// The export's decoder is loaded as the family loads it: the stage's loader is given the
+/// quantization the export's manifest declares of the stage, and the blocks' projections load
+/// packed.
+#[test]
+#[ignore = "requires /workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4"]
+fn the_nvfp4_export_s_video_decoder_profiles_one_clip_at_a_small_and_a_large_resolution() {
+    let root = Path::new(NVFP4_EXPORT);
+    assert!(
+        root.is_dir(),
+        "the profile run reads the headers of {NVFP4_EXPORT}, which is missing"
+    );
+    let checkpoint = Checkpoint::open(root).unwrap();
+    let config = minimax_h3::Config::open(&checkpoint).unwrap().video_vae;
+
+    let mut loader = WeightLoader::meta(checkpoint.stage("vae").unwrap(), None, None);
+    loader.declare(&config.quantization).unwrap();
+    let decoder = VideoDecoder::load(&config, loader.root()).unwrap();
+
+    profile_decoder("FastH3 4-step NVFP4", &decoder, &config);
 }
 
 #[test]

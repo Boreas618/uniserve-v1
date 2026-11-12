@@ -46,8 +46,20 @@
 //! ([`VarBuilder::load`](crate::VarBuilder::load)), so its products are the 16-bit products the
 //! declaration states. Every other packed tensor reaching a module is refused by name instead of
 //! being read as a matrix.
+//!
+//! ## The spelling and the activation scales
+//!
+//! A calibrated NVFP4 projection is four fields (packed values, block scales, a tensor scale and
+//! the activation's tensor scale), and two things about them are the export's and not the
+//! format's: the names of the fields ([`Nvfp4Names`]) and where the activation's scale is
+//! stated. A unified export states both in its tensors (the vLLM spelling, an `input_scale`
+//! beside each weight). A packed export of a diffusers pipeline states its calibration in a
+//! manifest ([`ModeloptManifest`]): its fields are in the diffusers spelling and each module's
+//! activation scale is the manifest's. A declaration holds both facts, and every module that
+//! reads packed fields reads them by the declaration its loader was given
+//! ([`Declaration::names`], [`Declaration::activation_scale`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -55,8 +67,10 @@ use crate::checkpoint::Checkpoint;
 use crate::config::Fields;
 use crate::error::{Error, Result};
 
+mod modelopt;
 mod nvfp4;
 
+pub use modelopt::ModeloptManifest;
 pub use nvfp4::{Nvfp4Names, Nvfp4Share, Nvfp4Stack, Nvfp4Weight, ValueLayout};
 
 /// The declaration's own file, when the export writes one beside `config.json`.
@@ -67,8 +81,11 @@ const DECLARATION_FILE: &str = "hf_quant_config.json";
 pub enum Scheme {
     /// The checkpoint's own floating-point representation.
     Dense,
-    /// ModelOpt NVFP4: `weight` (packed E2M1), `weight_scale` (K16 block scales in `F8_E4M3`),
-    /// `weight_scale_2` (one tensor scale) and `input_scale` (the calibration's activation scale).
+    /// ModelOpt NVFP4: packed E2M1 values, K16 block scales in `F8_E4M3`, one tensor scale and
+    /// the calibration's activation scale, under the names of the export's spelling (`weight`,
+    /// `weight_scale`, `weight_scale_2` and `input_scale` in a unified export; `weight_packed`,
+    /// `weight_scale` and `weight_tensor_scale` with the activation scale in the manifest in a
+    /// packed one).
     Nvfp4,
     /// ModelOpt `W4A16_NVFP4`: the same fields, and activations that stay in their 16-bit type, so
     /// the product is the 16-bit activation times the matrix the codes and scales state.
@@ -93,7 +110,7 @@ pub enum KvCacheScheme {
 }
 
 /// What a checkpoint declares about the representation of its weights.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Declaration {
     /// The scheme the calibration applies to the linear projections it covers.
     scheme: Scheme,
@@ -110,6 +127,12 @@ pub struct Declaration {
     /// The weights whose shards store a `weight_scale_inv` beside them, once [`Self::resolve`]
     /// has read the shards: block-scaled FP8, whatever the declaration states.
     blocks: Option<BTreeSet<String>>,
+    /// The spelling the export writes a calibrated NVFP4 projection's fields in.
+    names: Nvfp4Names,
+    /// Each calibrated module's activation tensor scale, by the module's name in the checkpoint,
+    /// when the export states its calibration in a manifest; `None` when each packed weight
+    /// stores its activation scale beside it.
+    activations: Option<BTreeMap<String, f32>>,
 }
 
 impl Declaration {
@@ -122,6 +145,8 @@ impl Declaration {
             packed: None,
             layers: None,
             blocks: None,
+            names: Nvfp4Names::vllm(),
+            activations: None,
         }
     }
 
@@ -187,7 +212,15 @@ impl Declaration {
 
     /// This declaration with every weight's packing taken from what `checkpoint`'s shards hold: a
     /// weight is packed when the shard stores a `weight_scale` beside it.
-    pub fn resolve(&self, checkpoint: &Checkpoint) -> Self {
+    ///
+    /// Both spellings name the block scales `weight_scale`, so a packed module's weight is
+    /// `<module>.weight` under either, whichever tensor holds its values.
+    ///
+    /// # Errors
+    ///
+    /// When a manifest calibrates a module whose shard stores no packed weight: the export
+    /// states an activation scale for a product the checkpoint cannot compute encoded.
+    pub fn resolve(&self, checkpoint: &Checkpoint) -> Result<Self> {
         let beside = |suffix: &'static str| -> BTreeSet<String> {
             checkpoint
                 .names()
@@ -201,16 +234,31 @@ impl Declaration {
         let blocks = beside("_scale_inv");
         let blocks = (!blocks.is_empty()).then_some(blocks);
         if self.scheme == Scheme::Dense && self.layers.is_none() {
-            return Self {
+            return Ok(Self {
                 blocks,
                 ..self.clone()
-            };
+            });
         }
-        Self {
-            packed: Some(beside("_scale")),
+        let packed = beside("_scale");
+
+        for module in self.activations.iter().flat_map(BTreeMap::keys) {
+            if !packed.contains(&format!("{module}.weight")) {
+                return Err(Error::weight(
+                    &format!("{module}.{}", self.names.values),
+                    format!(
+                        "the export's manifest calibrates the activations of `{module}`, and the \
+                         checkpoint stores no packed weight for it (no `{module}.{}`)",
+                        self.names.block_scale
+                    ),
+                ));
+            }
+        }
+
+        Ok(Self {
+            packed: Some(packed),
             blocks,
             ..self.clone()
-        }
+        })
     }
 
     /// How the checkpoint stores `weight`, a weight's full checkpoint name.
@@ -265,6 +313,35 @@ impl Declaration {
     /// The scheme the key/value cache scales follow.
     pub fn kv_cache(&self) -> KvCacheScheme {
         self.kv_cache
+    }
+
+    /// The spelling the checkpoint's calibrated NVFP4 fields are read in.
+    pub fn names(&self) -> Nvfp4Names {
+        self.names
+    }
+
+    /// The calibrated activation tensor scale of `module`, a module's name in the checkpoint,
+    /// when the export states its calibration in a manifest. `None` says the scale is the
+    /// tensor the export's spelling names beside the module's weight
+    /// ([`Nvfp4Names::input_scale`]).
+    ///
+    /// # Errors
+    ///
+    /// When a manifest calibrates the checkpoint and lists nothing for `module`: a packed
+    /// projection it does not calibrate has no scale to encode its activations by.
+    pub fn activation_scale(&self, module: &str) -> Result<Option<f32>> {
+        let Some(activations) = &self.activations else {
+            return Ok(None);
+        };
+
+        activations.get(module).copied().map(Some).ok_or_else(|| {
+            Error::config(
+                ModeloptManifest::FILE,
+                module,
+                "is stored packed, and the manifest lists no calibration that names it: its \
+                 activations have no tensor scale to be encoded by",
+            )
+        })
     }
 }
 
@@ -553,6 +630,8 @@ fn declaration(
         packed: None,
         layers,
         blocks: None,
+        names: Nvfp4Names::vllm(),
+        activations: None,
     })
 }
 

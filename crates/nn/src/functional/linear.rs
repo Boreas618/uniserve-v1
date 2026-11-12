@@ -9,9 +9,12 @@
 //!               encoding of [`super::nvfp4_quantize`]) and the packed product (`nvfp4_gemm`)
 //! ```
 //!
-//! Every product accumulates in FP32 and rounds once into its input's element type.
+//! Every product accumulates in FP32 and rounds once into its input's element type; a bias
+//! joins the accumulator, except the packed product's, which joins the rounded product.
 
-use ops::fp4::{BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, ScaleLayout};
+use ops::fp4::{
+    BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, PACKED_M_CLASSES, ScaleLayout,
+};
 use ops::fp8::{E4M3_MAX, Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor};
 use ops::gemm::{Args, Descriptor, Epilogue, Gemm};
 use uniserve_tensor::{D, DType, Tensor};
@@ -212,13 +215,14 @@ pub fn linear_fp8(
     like_rows(out, x)
 }
 
-/// `x · weightᵀ` over a calibrated NVFP4 weight: the activation is encoded into the weight's
-/// own representation and the product is taken over the two encodings.
+/// `x · weightᵀ + bias` over a calibrated NVFP4 weight: the activation is encoded into the
+/// weight's own representation and the product is taken over the two encodings.
 ///
 /// ```text
 /// encode   scale[row, block] = e4m3(amax(block) · input_scale / 6)
 ///          code[row, element] = e2m1(x / (scale · (1 / input_scale)))
-/// product  out = (Σ_k code_x · scale_x · code_w · scale_w) · alpha
+/// product  p   = round((Σ_k code_x · scale_x · code_w · scale_w) · alpha)
+/// bias     out = round(p + bias)
 /// ```
 ///
 /// `values` is the packed weight, `[n, k / 2]` U8 with two E2M1 codes a byte, the even element
@@ -228,9 +232,15 @@ pub fn linear_fp8(
 /// the weight's tensor scale and the activation's. `x` is a BF16 or FP16 activation of
 /// `[..., k]`, and the result is `[..., n]` in its element type.
 ///
-/// The packed product is compiled per row class ([`ops::fp4::packed_rows`]) and writes whole
-/// tiles, so its buffers are taken at the class of `x`'s rows and the result is the first rows
-/// of the product's block.
+/// The packed product has no bias epilogue, so `bias`, `[n]` when given, joins the product
+/// after it has rounded into the activation's type, and the sum rounds again: one rounding
+/// more than a dense product, whose bias joins the FP32 accumulator.
+///
+/// The packed product is compiled per row class ([`ops::fp4::PACKED_M_CLASSES`]) and writes
+/// whole tiles. Rows up to the largest class are one launch at the smallest class that holds
+/// them; more rows are computed block by block, every block the largest class's rows and the
+/// last one the rest at its own class. Each block's buffers are taken at its class, and the
+/// result is the leading rows of the blocks' products.
 ///
 /// The CPU formula divides where the device's encoder multiplies by the hardware's approximate
 /// reciprocal, so a code that lies on a rounding boundary may differ from the device's by one
@@ -239,12 +249,13 @@ pub fn linear_fp8(
 /// # Errors
 ///
 /// When a field is not the element type or the extents the weight's rows and columns take, the
-/// activation is not BF16 or FP16 or has no rows, the row count is above the largest packed
-/// class, or an operator refuses its arguments.
+/// bias is another width, the activation is not BF16 or FP16 or has no rows, or an operator
+/// refuses its arguments.
 pub fn linear_nvfp4(
     x: &Tensor,
     values: &Tensor,
     scales: &Tensor,
+    bias: Option<&Tensor>,
     input_scale: &Tensor,
     alpha: &Tensor,
 ) -> Result<Tensor> {
@@ -302,77 +313,120 @@ pub fn linear_nvfp4(
             ops::abi::name(x.dtype())
         )));
     }
+    let outputs = u32::try_from(n).map_err(|_| refuse(format!("{n} output channels")))?;
+    if let Some(bias) = bias {
+        vector(OWNER, "bias", bias, outputs)?;
+    }
     let rows = as_rows(OWNER, x)?;
     let count = rows.dims()[0];
     if count == 0 {
         return Err(refuse("a projection of no rows has no kernel".to_owned()));
     }
 
-    if on_cpu(x) {
-        let product = nvfp4_formula(&rows, values, scales, input_scale, alpha)?;
-        return like_rows(product.to_dtype(x.dtype())?, x);
-    }
-
-    let counted = u32::try_from(count).map_err(|_| refuse(format!("{count} activation rows")))?;
-    let class = ops::fp4::packed_rows(counted)? as usize;
-
-    // 1. Encode the activation into the layout the product reads.
-    //
-    // The buffers are class-height and the encode writes the activation's rows into their
-    // first rows; the product's rows past those are computed from bytes nothing reads and are
-    // not part of the result.
-    let packed_rows = backend::empty((class, packed), DType::U8)?;
-    let class_scales = PRODUCT_SCALE_LAYOUT.shape(class as u64, u64::from(k));
-    let packed_scales = backend::empty(
-        (class_scales.dim(0) as usize, class_scales.dim(1) as usize),
-        DType::U8,
-    )?;
-    let token_scale = backend::empty(class, DType::F32)?;
-
-    let row_scales = PRODUCT_SCALE_LAYOUT.shape(count as u64, u64::from(k));
-    launch_quantize(
-        &rows,
-        input_scale,
-        PRODUCT_SCALE_LAYOUT,
-        (
-            backend::operand(&packed_rows.narrow(0, 0, count)?)?,
-            backend::operand(&packed_scales.narrow(0, 0, row_scales.dim(0) as usize)?)?,
-            // One scalar per row, so the tensor has one axis.
-            backend::operand(&token_scale.narrow(0, 0, count)?)?,
-        ),
-    )?;
-
-    // 2. Multiply the encoded activation by the weight, over the class's rows.
-    let descriptor = GemmDescriptor {
-        packed: DType::U8,
-        scale: scales.dtype(),
-        accumulate: ACCUMULATE,
-        output: x.dtype(),
-        layout: PRODUCT_SCALE_LAYOUT,
-        epilogue: Epilogue::None,
-        m: class as u32,
-        n: u32::try_from(n).map_err(|_| refuse(format!("{n} output channels")))?,
-        k,
+    let product = if on_cpu(x) {
+        nvfp4_formula(&rows, values, scales, input_scale, alpha)?.to_dtype(x.dtype())?
+    } else {
+        packed_product(&rows, values, scales, input_scale, alpha)?
     };
 
-    // The scale's type is the checkpoint's own statement, so scales declared as anything but
-    // E4M3 make a key no store built: refused here, where the function can say which tensor.
-    ops::fp4::check_gemm(&descriptor)?;
+    // The bias joins the rounded product in the activation's type.
+    let out = match bias {
+        Some(bias) => product.broadcast_add(&bias.to_dtype(x.dtype())?)?,
+        None => product,
+    };
+    like_rows(out, x)
+}
 
-    let out = backend::empty((class, n), x.dtype())?;
-    backend::launch::<Nvfp4Gemm>(
-        &descriptor,
-        GemmArgs {
-            input: backend::operand(&packed_rows)?,
-            weight: backend::operand(values)?,
-            input_scales: backend::operand(&packed_scales)?,
-            weight_scales: backend::operand(scales)?,
-            alpha: backend::operand(alpha)?,
-            bias: None,
-            out: backend::operand(&out)?,
-        },
-    )?;
-    like_rows(out.narrow(0, 0, count)?, x)
+/// The packed product of [`linear_nvfp4`] on a device: `rows`, the `[m, k]` activation, encoded
+/// and multiplied by the packed weight block by block, `[m, n]` in the activation's type.
+fn packed_product(
+    rows: &Tensor,
+    values: &Tensor,
+    scales: &Tensor,
+    input_scale: &Tensor,
+    alpha: &Tensor,
+) -> Result<Tensor> {
+    let (count, k) = (rows.dims()[0], rows.dims()[1]);
+    let (n, packed) = (values.dims()[0], values.dims()[1]);
+
+    // The blocks the rows are computed in, `(first row, rows, class)`: the largest class's rows
+    // each, and the rest at the smallest class that holds them.
+    let largest = PACKED_M_CLASSES[PACKED_M_CLASSES.len() - 1] as usize;
+    let mut blocks = Vec::with_capacity(count.div_ceil(largest));
+    let mut first = 0;
+    while first < count {
+        let held = (count - first).min(largest);
+        let class = ops::fp4::packed_rows(held as u32)? as usize;
+
+        blocks.push((first, held, class));
+        first += held;
+    }
+
+    // A product writes its class's rows. Every block but the last holds exactly its class, so
+    // the products laid end to end are the rows in order, and only the last block's rows past
+    // the activation's trail them.
+    let padded: usize = blocks.iter().map(|(_, _, class)| class).sum();
+    let out = backend::empty((padded, n), rows.dtype())?;
+
+    for (first, held, class) in blocks {
+        // 1. Encode the block's rows into the layout the product reads.
+        //
+        // The buffers are class-height and the encode writes the block's rows into their first
+        // rows; the product's rows past those are computed from bytes nothing reads and are not
+        // part of the result.
+        let packed_rows = backend::empty((class, packed), DType::U8)?;
+        let class_scales = PRODUCT_SCALE_LAYOUT.shape(class as u64, k as u64);
+        let packed_scales = backend::empty(
+            (class_scales.dim(0) as usize, class_scales.dim(1) as usize),
+            DType::U8,
+        )?;
+        let token_scale = backend::empty(class, DType::F32)?;
+
+        let row_scales = PRODUCT_SCALE_LAYOUT.shape(held as u64, k as u64);
+        launch_quantize(
+            &rows.narrow(0, first, held)?,
+            input_scale,
+            PRODUCT_SCALE_LAYOUT,
+            (
+                backend::operand(&packed_rows.narrow(0, 0, held)?)?,
+                backend::operand(&packed_scales.narrow(0, 0, row_scales.dim(0) as usize)?)?,
+                // One scalar per row, so the tensor has one axis.
+                backend::operand(&token_scale.narrow(0, 0, held)?)?,
+            ),
+        )?;
+
+        // 2. Multiply the encoded rows by the weight, over the class's rows.
+        let descriptor = GemmDescriptor {
+            packed: DType::U8,
+            scale: scales.dtype(),
+            accumulate: ACCUMULATE,
+            output: rows.dtype(),
+            layout: PRODUCT_SCALE_LAYOUT,
+            epilogue: Epilogue::None,
+            m: class as u32,
+            n: n as u32,
+            k: k as u32,
+        };
+
+        // The scale's type is the checkpoint's own statement, so scales declared as anything
+        // but E4M3 make a key no store built: refused here, where the function can say which
+        // tensor.
+        ops::fp4::check_gemm(&descriptor)?;
+
+        backend::launch::<Nvfp4Gemm>(
+            &descriptor,
+            GemmArgs {
+                input: backend::operand(&packed_rows)?,
+                weight: backend::operand(values)?,
+                input_scales: backend::operand(&packed_scales)?,
+                weight_scales: backend::operand(scales)?,
+                alpha: backend::operand(alpha)?,
+                bias: None,
+                out: backend::operand(&out.narrow(0, first, class)?)?,
+            },
+        )?;
+    }
+    Ok(out.narrow(0, 0, count)?)
 }
 
 /// The FP32 product of [`linear_nvfp4`] on CPU tensors, before its one rounding: `rows` is the

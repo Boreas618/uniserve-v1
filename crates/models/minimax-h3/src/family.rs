@@ -37,7 +37,8 @@ use qwen3::Qwen3VlModel;
 
 use crate::audio_vae::{AudioDecoder, AudioEncoder};
 use crate::config::{
-    AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, FPS, FRAMES, NETWORKS, RETAINED_LAYERS, network,
+    AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, FPS, FRAMES, NETWORKS, RETAINED_LAYERS,
+    VIDEO_VAE, network,
 };
 use crate::denoiser::{Denoiser, SAMPLE_DTYPE};
 use crate::splice::VideoPostprocessor;
@@ -163,19 +164,6 @@ impl MinimaxH3 {
         loader: &WeightLoader<'_>,
         placement: &VideoPlacement,
     ) -> Result<Self> {
-        // A ModelOpt NVFP4 export states its packed projections as `weight_packed`,
-        // `weight_scale` and `weight_tensor_scale` and their activation scales in a manifest;
-        // the loading boundary reads neither yet, and reading the stage as dense would look
-        // for weights it does not hold.
-        if checkpoint.sidecar("modelopt_manifest.json")?.is_some() {
-            return Err(Error::Unsupported(format!(
-                "{} is a ModelOpt NVFP4 export of MiniMax-H3: its packed projections \
-                 (`weight_packed`, `weight_scale`, `weight_tensor_scale`) and the activation \
-                 scales of its `modelopt_manifest.json` have no reader at the loading boundary",
-                checkpoint.root().display()
-            )));
-        }
-
         let serving = &placement.serving;
         let tasks = served_tasks(
             &config.tasks(),
@@ -235,7 +223,8 @@ impl MinimaxH3 {
                         .to_owned(),
                 )
             })?;
-            let stage = loader.reborrow(checkpoint.stage("text_encoder")?)?;
+            let mut stage = loader.reborrow(checkpoint.stage(Stage::TextEncoder.name())?)?;
+            stage.declare(&config.text_encoder.quantization)?;
 
             model.text_encoder = Some(Arc::new(Qwen3VlModel::load(
                 &config.text_encoder,
@@ -257,7 +246,8 @@ impl MinimaxH3 {
 
             // The two condition encoders are the denoiser's conditioning half.
             let encoders = if stages.contains(Stage::LatentEncoder) {
-                let video = loader.reborrow(checkpoint.stage("vae")?)?;
+                let mut video = loader.reborrow(checkpoint.stage(VIDEO_VAE)?)?;
+                video.declare(&config.video_vae.quantization)?;
                 let audio = loader.reborrow(checkpoint.stage("audio_vae")?)?;
 
                 Some((
@@ -268,7 +258,9 @@ impl MinimaxH3 {
                 None
             };
 
-            let network = loader.reborrow(checkpoint.stage(stage.name())?)?;
+            let mut network = loader.reborrow(checkpoint.stage(stage.name())?)?;
+            network.declare(&denoiser.quantization)?;
+
             model.denoiser = Some((
                 stage,
                 Arc::new(Denoiser::load(
@@ -299,7 +291,8 @@ impl MinimaxH3 {
             // The deployment's sizes are checked here, where a size the checkpoint does not
             // generate would otherwise be found at the first decode.
             served_resolutions(&serving.sizes)?;
-            let stage = loader.reborrow(checkpoint.stage("vae")?)?;
+            let mut stage = loader.reborrow(checkpoint.stage(VIDEO_VAE)?)?;
+            stage.declare(&config.video_vae.quantization)?;
 
             model.video_decoder = Some(Arc::new(VideoDecoder::load(
                 &config.video_vae,

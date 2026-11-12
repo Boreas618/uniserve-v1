@@ -623,16 +623,30 @@ fn linear_nvfp4_multiplies_the_encoded_activation_by_the_decoded_weight() {
         .map(|product| product * alpha)
         .collect();
 
-    let out = functional::linear_nvfp4(
-        &tensor(&x, (m, k), DType::BF16),
-        &Tensor::from_slice(&packed, (n, k / 2), &Device::Cpu).unwrap(),
-        &tensor(&table, (128, 4), DType::F8E4M3),
-        &tensor(&[input_scale], 1, DType::F32),
-        &tensor(&[alpha], 1, DType::F32),
-    )
-    .unwrap();
+    let project = |bias: Option<&Tensor>| {
+        functional::linear_nvfp4(
+            &tensor(&x, (m, k), DType::BF16),
+            &Tensor::from_slice(&packed, (n, k / 2), &Device::Cpu).unwrap(),
+            &tensor(&table, (128, 4), DType::F8E4M3),
+            bias,
+            &tensor(&[input_scale], 1, DType::F32),
+            &tensor(&[alpha], 1, DType::F32),
+        )
+        .unwrap()
+    };
+    let out = project(None);
     assert_eq!((out.dims(), out.dtype()), (&[m, n][..], DType::BF16));
     assert_close(&values(&out), &values_of_bf16(&expected), 1.0 / 128.0);
+
+    // A bias joins the product after it has rounded, and the sum rounds again: exactly the
+    // BF16 sum of the unbiased result and the bias.
+    let bias = [0.75_f32, -2.5, 16.0];
+    let biased = project(Some(&tensor(&bias, n, DType::BF16)));
+    let sums: Vec<f32> = values(&out)
+        .chunks(n)
+        .flat_map(|row| row.iter().zip(&bias).map(|(product, bias)| product + bias))
+        .collect();
+    assert_eq!(values(&biased), values_of_bf16(&sums));
 }
 
 // ---- Embedding and logits ---------------------------------------------------------------------
@@ -886,6 +900,7 @@ fn nvfp4_launches(
             &meta((rows, 64), input),
             &meta((8, 32), DType::U8),
             &meta((128, 4), scale),
+            None,
             &meta(1, DType::F32),
             &meta(1, DType::F32),
         )?;
@@ -930,6 +945,22 @@ fn a_packed_product_is_keyed_per_row_class_and_a_dense_one_is_not() {
     assert_eq!(
         keys_of(&one, "nvfp4_quantize"),
         ["input_bf16_columns_64_layout_swizzled_128x4_block_64_pdl_false"]
+    );
+
+    // Rows above the largest class are computed block by block: whole blocks of the largest
+    // class, and the rest at the smallest class that holds them.
+    let blocks = launched(2 * 16384 + 200);
+    assert_eq!(
+        operators(&blocks),
+        ["nvfp4_quantize", "nvfp4_gemm"].repeat(3)
+    );
+    let classes: Vec<&str> = keys_of(&blocks, "nvfp4_gemm")
+        .iter()
+        .map(|key| key.split("_m_").nth(1).unwrap())
+        .collect();
+    assert_eq!(
+        classes,
+        ["16384_n_8_k_64", "16384_n_8_k_64", "256_n_8_k_64"]
     );
 
     // A dense projection's key takes no row count at all.

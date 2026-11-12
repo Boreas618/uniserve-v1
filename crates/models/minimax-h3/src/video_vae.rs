@@ -100,6 +100,21 @@ const STREAM: DType = DType::F32;
 /// The zero frames a causal convolution of three taps reads before a clip's first frame.
 const CAUSAL_FRONT: usize = 2;
 
+/// The module the decoder's blocks are stored under, `decoder.transformer_blocks.<i>`.
+pub(crate) const BLOCKS: &str = "decoder.transformer_blocks";
+
+/// The attention of a decoder block, relative to the block: its module, and below it the
+/// query, key and value projections and the output projection.
+pub(crate) const ATTENTION: &str = "attn";
+pub(crate) const QKV: [&str; 3] = ["to_q", "to_k", "to_v"];
+pub(crate) const ATTENTION_OUTPUT: &str = "to_out.0";
+
+/// The feed-forward of a decoder block, relative to the block: its module, and below it the
+/// projection that fuses the value half and the gate half and the one back to the block's
+/// width.
+pub(crate) const FEED_FORWARD: &str = "ff";
+pub(crate) const FEED_FORWARD_PROJECTIONS: [&str; 2] = ["net.0.proj", "net.2"];
+
 /// The temporal clips the checkpoint's decoder decodes a timeline in, by the frame rule
 /// ([`FRAMES`]).
 ///
@@ -250,11 +265,14 @@ fn unpatchify(
 ///
 /// The projections are read in the element type the block's builder pins, and the rows they
 /// read are normalized into it; the normalizations' weights and the scales are the stream's
-/// FP32.
+/// FP32. A calibrated NVFP4 export packs the six projections, which then encode the rows they
+/// read from that same type.
 pub struct TransformerBlock {
     /// `norm1.weight`, `[width]`.
     norm1: Tensor,
     attn: Attention,
+    /// The element type the projections read their rows in.
+    activation: DType,
     /// `scale1`, `[width]`: the attention update's per-channel scale.
     scale1: Tensor,
     /// `norm2.weight`, `[width]`.
@@ -274,7 +292,8 @@ impl TransformerBlock {
     ///
     /// # Errors
     ///
-    /// A tensor the checkpoint lacks or holds at another extent, or a head of no width.
+    /// A tensor the checkpoint lacks or holds at another extent, a head of no width, or packed
+    /// projections under a builder that pins no element type for their rows.
     pub fn load(config: &VideoVaeConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
         let (heads, head_dim) = (
             config.decoder_num_attention_heads,
@@ -292,11 +311,11 @@ impl TransformerBlock {
                     kv_heads: heads,
                     head_dim,
                     gated: false,
-                    names: QkvNames::Separate(["to_q", "to_k", "to_v"]),
+                    names: QkvNames::Separate(QKV),
                     bias: QkvBias::Present,
                     split: Split::WHOLE,
                 },
-                output: "to_out.0",
+                output: ATTENTION_OUTPUT,
                 output_bias: true,
                 qk_norm: QkNorm::Fused {
                     gains: None,
@@ -310,27 +329,45 @@ impl TransformerBlock {
                 // states from its layout; the module adds no bound of its own.
                 max_kv_len: u32::MAX,
             },
-            vb.pp("attn"),
+            vb.pp(ATTENTION),
         )?;
 
+        let [gate_up, down] = FEED_FORWARD_PROJECTIONS;
         let ff = Mlp::load(
             &MlpConfig {
                 hidden: width,
                 intermediate: width * config.decoder_ffn_mult,
                 activation: Activation::Silu,
                 rounding: Rounding::ValueProduct,
-                gate_up: GateUp::ValueFirst("net.0.proj"),
-                down: "net.2",
+                gate_up: GateUp::ValueFirst(gate_up),
+                down,
                 bias: true,
                 split: Split::WHOLE,
             },
-            vb.pp("ff"),
+            vb.pp(FEED_FORWARD),
         )?;
+
+        // The rows the projections read are normalized into the projections' own type: the
+        // builder's pin, or a dense weight's own type under a builder that pins none. A packed
+        // weight has no element type its rows could take.
+        let query = attn.query();
+        let activation = match vb.dtype() {
+            Some(pinned) => pinned,
+            None if query.is_packed() => {
+                return Err(Error::config(format!(
+                    "the packed projections of {} encode rows of the element type their builder \
+                     pins, and it pins none",
+                    vb.path()
+                )));
+            }
+            None => query.weight().dtype(),
+        };
 
         let width = width as usize;
         Ok(Self {
             norm1: stream.pp("norm1").get(width, "weight")?,
             attn,
+            activation,
             scale1: stream.get(width, "scale1")?,
             norm2: stream.pp("norm2").get(width, "weight")?,
             ff,
@@ -364,10 +401,9 @@ impl TransformerBlock {
             .map_err(|_| Error::request("a stream of more rows than a launch addresses"))?;
 
         // The rows the projections read are normalized into the projections' own type.
-        let activation = self.attn.query().weight().dtype();
         let (normalized, hidden) = match pending {
             None => (
-                functional::rms_norm(&hidden, &self.norm1, self.eps, false, activation)?,
+                functional::rms_norm(&hidden, &self.norm1, self.eps, false, self.activation)?,
                 hidden,
             ),
             Some((update, scale)) => functional::scaled_residual_rms_norm_(
@@ -478,10 +514,9 @@ impl VideoDecoder {
         let stream = decoder.to_dtype(STREAM);
         let post_quant = vb.pp("post_quant_conv").to_dtype(ACTIVATION);
 
+        let blocks = vb.pp(BLOCKS).to_dtype(ACTIVATION);
         let transformer_blocks = (0..config.decoder_num_layers)
-            .map(|index| {
-                TransformerBlock::load(config, projections.pp("transformer_blocks").pp(index))
-            })
+            .map(|index| TransformerBlock::load(config, blocks.pp(index)))
             .collect::<Result<Vec<_>>>()?;
 
         let norm_out = stream.pp("norm_out");

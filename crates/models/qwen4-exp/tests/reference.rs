@@ -116,7 +116,9 @@ fn with_fixture<T>(name: &str, check: impl FnOnce(&Config, VarBuilder<'_, '_>) -
     let store = CpuWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
     let config = Config::open(&checkpoint).expect("the configuration");
-    loader.declare(&Declaration::read(&checkpoint).expect("the declaration"));
+    loader
+        .declare(&Declaration::read(&checkpoint).expect("the declaration"))
+        .expect("the declaration agrees with the shards");
 
     check(&config, loader.root())
 }

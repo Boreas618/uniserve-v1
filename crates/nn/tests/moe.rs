@@ -885,7 +885,9 @@ fn the_packed_products_multiply_the_encoded_rows_by_the_experts_decoded_weights(
     let (checkpoint, fields) = packed_checkpoint(directory.path(), 2);
     let store = CpuWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
-    loader.declare(&Declaration::read(&checkpoint).unwrap());
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
     let (up_gate, down) = routed_stacks(&loader);
 
     let (tokens, top, hidden, intermediate) = (3_usize, 2_usize, 32_usize, 16_usize);
@@ -1431,7 +1433,9 @@ fn a_calibrated_block_runs_the_packed_products_over_its_stacks() {
     let (checkpoint, _) = packed_checkpoint(directory.path(), 2);
     let store = CpuWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
-    loader.declare(&Declaration::read(&checkpoint).unwrap());
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
     let block = MoE::load(&packed_config(), loader.root().pp("mlp")).unwrap();
 
     // The block computes what the functions compute over the stacks in the routed products'
@@ -1614,7 +1618,9 @@ fn a_calibrated_block_over_an_expert_group_runs_in_the_exchange_s_one_launch() {
     let directory = tempfile::tempdir().unwrap();
     let (checkpoint, _) = packed_checkpoint(directory.path(), 2);
     let mut loader = WeightLoader::meta(&checkpoint, None, None);
-    loader.declare(&Declaration::read(&checkpoint).unwrap());
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
     let block = MoE::load(
         &MoEConfig {
             exchange: Split { size: 2, rank: 0 },
