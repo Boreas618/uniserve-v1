@@ -121,9 +121,10 @@ pub(crate) fn f32_values(bytes: &[u8]) -> Vec<f32> {
         bytes.len()
     );
 
-    bytes
-        .chunks_exact(4)
-        .map(|element| f32::from_le_bytes([element[0], element[1], element[2], element[3]]))
+    let (elements, _) = bytes.as_chunks::<4>();
+    elements
+        .iter()
+        .map(|element| f32::from_le_bytes(*element))
         .collect()
 }
 
