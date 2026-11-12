@@ -1,5 +1,6 @@
 //! The operators of a mixture-of-experts block: the router's top-k, the sort that groups the
-//! routes by expert, the two grouped expert products and the weighted combine.
+//! routes by expert, the two grouped expert products, the weighted combine, and the exchange of
+//! routes between the ranks of an expert group.
 //!
 //! ```text
 //! topk_softmax        router scores                 -> each token's expert ids and route weights
@@ -18,11 +19,24 @@
 //!
 //! The packed forms ([`gather_gemm_nvfp4`], [`route_gemm_nvfp4`]) read calibrated NVFP4 expert
 //! stacks and encode their own activation, as [`linear_nvfp4`](super::linear_nvfp4) does.
+//!
+//! ## Expert parallelism
+//!
+//! The ranks of an expert group each hold a window of the experts. A rank routes its tokens
+//! over every expert, sends each route to the rank that holds its expert ([`expert_dispatch`]),
+//! multiplies the routes it received with its own experts, leaves their sums where its peers
+//! read them ([`moe_unpermute`] into the exchange's rows) and takes its own tokens' sums back
+//! ([`expert_combine`]); or one launch does all of it ([`expert_exchange_fused`]). The
+//! transport that carries the rows is the execution context's, so these functions state
+//! tensors only. They compute on tensors of the device backend alone: one process holds one
+//! rank, so CPU tensors are refused as every collective refuses them.
 
 use std::ops::Range;
 
 use ops::fp4::{BLOCK_ELEMENTS, ScaleLayout};
+use ops::moe::ExchangeArgs;
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
+use ops::moe::exchange::{self, FusedLayer, Mode};
 use ops::moe::grouped::{
     GatherGemm, GatherGemmArgs, GatherGemmDescriptor, GatherGemmNvfp4, GatherGemmNvfp4Args,
     GatherGemmNvfp4Descriptor, RouteGemm, RouteGemmArgs, RouteGemmDescriptor, RouteGemmNvfp4,
@@ -35,6 +49,7 @@ use uniserve_tensor::{D, DType, Device, Tensor};
 use super::activation::activate;
 use super::nvfp4::{decoded, encoded, integer, launch_quantize, remainder};
 use super::{ACCUMULATE, Activation, columns, on_cpu};
+use crate::capability::ExpertExchange;
 use crate::error::{Error, Result};
 use crate::quantization::Nvfp4Stack;
 
@@ -797,9 +812,10 @@ pub fn route_gemm_nvfp4(
 /// is zeros. `experts` is the router's expert count, which names the kernel. The result is
 /// `[tokens, hidden]`.
 ///
-/// `combined`, when given, is where the sums are written and what is returned: rows execution
-/// lends for the sums, `[tokens, hidden]` in `products`' element type. Without it the result is
-/// a new tensor.
+/// `combined`, when given, is where the sums are written and what is returned: the rows an
+/// expert exchange lends for the sums this rank's experts return to their tokens' ranks
+/// ([`crate::ExpertExchange::combined`]), `[tokens, hidden]` in `products`' element type.
+/// Without it the result is a new tensor.
 ///
 /// # Errors
 ///
@@ -883,6 +899,198 @@ pub fn moe_unpermute(
             expanded_to_permuted: backend::operand(&route_rows(maps, tokens, top)?)?,
             scales: backend::operand(weights)?,
             out: backend::operand(&out)?,
+        },
+    )?;
+    Ok(out)
+}
+
+/// Sends the routes of this rank's tokens to the ranks that hold their experts: `hidden`,
+/// `[tokens, hidden]`, with the routes' `ids` (weight rows of the whole group's experts) and
+/// `weights`, both `[tokens, top]`. What the rank received stands in `exchange`'s tensors
+/// afterwards.
+///
+/// `live_tokens`, when given, is the `[1]` U32 count of token rows the batch fills. `experts`
+/// is the router's expert count and `intermediate` one expert's gated width, which name the
+/// kernel. A rank that joins a step with no tokens sends zero rows.
+///
+/// # Errors
+///
+/// When the tensors are CPU tensors, more rows are sent than a rank's block holds, or the
+/// exchange refuses.
+pub fn expert_dispatch(
+    hidden: &Tensor,
+    ids: &Tensor,
+    weights: &Tensor,
+    live_tokens: Option<&Tensor>,
+    exchange: &ExpertExchange,
+    experts: u32,
+    intermediate: u32,
+) -> Result<()> {
+    const OWNER: &str = "expert_dispatch";
+
+    let descriptor = exchange_descriptor(
+        Mode::Dispatch,
+        exchange,
+        (experts, intermediate),
+        exchange.states.dtype(),
+    )?;
+    backend::collective::expert_exchange(
+        &descriptor,
+        ExchangeArgs {
+            transport: None,
+            tokens: sent(OWNER, hidden.dims()[0], exchange)?,
+            state: backend::operand(hidden)?,
+            ids: backend::operand(ids)?,
+            weights: backend::operand(weights)?,
+            live: live_tokens.map(backend::operand).transpose()?,
+            out: unread(),
+            fused: None,
+            ranks: exchange.ranks,
+        },
+    )?;
+    Ok(())
+}
+
+/// Takes back the sums of this rank's `tokens` tokens from the ranks whose experts computed
+/// them, rounded once: `[tokens, hidden]` in the exchanged rows' element type.
+///
+/// Each rank has left the sums of the rows it received in `exchange`'s `combined` rows
+/// ([`moe_unpermute`]). `live_tokens`, `experts` and `intermediate` are as [`expert_dispatch`]
+/// takes them.
+///
+/// # Errors
+///
+/// When the exchange's tensors are CPU tensors, more rows are asked than a rank's block holds,
+/// or the exchange refuses.
+pub fn expert_combine(
+    tokens: usize,
+    live_tokens: Option<&Tensor>,
+    exchange: &ExpertExchange,
+    experts: u32,
+    intermediate: u32,
+) -> Result<Tensor> {
+    const OWNER: &str = "expert_combine";
+
+    let dtype = exchange.states.dtype();
+    let descriptor = exchange_descriptor(Mode::Combine, exchange, (experts, intermediate), dtype)?;
+    let out = own_rows(tokens, exchange, dtype)?;
+
+    backend::collective::expert_exchange(
+        &descriptor,
+        ExchangeArgs {
+            transport: None,
+            tokens: sent(OWNER, tokens, exchange)?,
+            state: unread(),
+            ids: unread(),
+            weights: unread(),
+            live: live_tokens.map(backend::operand).transpose()?,
+            out: backend::operand(&out)?,
+            fused: None,
+            ranks: exchange.ranks,
+        },
+    )?;
+    Ok(out)
+}
+
+/// The whole expert layer of an expert group in one launch: the routes of this rank's tokens
+/// are exchanged, every rank's packed experts run over the rows they receive, and each token's
+/// sums come back. The result is `[tokens, hidden]` in `hidden`'s element type.
+///
+/// `hidden` is encoded first, into the rows `exchange` lends for it (`packed`,
+/// `packed_scales`), where the peers' kernels read it. `ids` and `weights` are the
+/// `[tokens, top]` routes. `up_gate` and `down` are this rank's stacks in the arrangement the
+/// launch reads (each gate block before its up block, the block scales swizzled), and `tables`
+/// its three `[local]` FP32 tables in the order the kernel multiplies them in: what
+/// dequantizes the first product, what dequantizes the second, and the scale the gated rows are
+/// encoded with. `experts` is the router's expert count.
+///
+/// # Errors
+///
+/// When the tensors are CPU tensors, more rows are sent than a rank's block holds, or an
+/// operator refuses its arguments.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the launch reads the routes, the lent rows and every operand of the layer's experts"
+)]
+pub fn expert_exchange_fused(
+    hidden: &Tensor,
+    ids: &Tensor,
+    weights: &Tensor,
+    live_tokens: Option<&Tensor>,
+    exchange: &ExpertExchange,
+    up_gate: &Nvfp4Stack,
+    down: &Nvfp4Stack,
+    tables: [&Tensor; 3],
+    experts: u32,
+) -> Result<Tensor> {
+    const OWNER: &str = "expert_exchange_fused";
+
+    let tokens = hidden.dims()[0];
+    let local = up_gate.values.dims().first().copied().unwrap_or(0).max(1);
+    let intermediate = up_gate.values.dims().get(1).copied().unwrap_or(0) / 2;
+
+    // The rows are encoded straight into the rows the transport's peers read, with the encoder
+    // the stack's other products take: the encoding is the module's, and the kernel starts
+    // from the bytes.
+    if tokens > 0 {
+        let token_scale = backend::empty(tokens, DType::F32)?;
+        let scales = backend::operand(&exchange.packed_scales.narrow(0, 0, tokens)?)?;
+
+        launch_quantize(
+            hidden,
+            &up_gate.encode_scale,
+            ScaleLayout::Linear,
+            (
+                backend::operand(&exchange.packed.narrow(0, 0, tokens)?)?,
+                // The encoder writes each scale's byte, whatever type the transport labels
+                // its rows.
+                ops::Operand {
+                    dtype: DType::U8,
+                    ..scales
+                },
+                backend::operand(&token_scale)?,
+            ),
+        )?;
+    }
+
+    let address = |tensor: &Tensor| -> Result<u64> { Ok(backend::operand(tensor)?.ptr.address()) };
+    let expert_bytes = |tensor: &Tensor| -> Result<i64> {
+        i64::try_from(tensor.elem_count() / local)
+            .map_err(|_| Error::shape(OWNER, "a scale table beyond i64".to_owned()))
+    };
+    let [up_gate_alpha, down_alpha, gated_scale] = tables;
+    let layer = FusedLayer {
+        up_gate: address(&up_gate.values)?,
+        up_gate_scales: address(&up_gate.scales)?,
+        down: address(&down.values)?,
+        down_scales: address(&down.scales)?,
+        up_gate_alpha: address(up_gate_alpha)?,
+        down_alpha: address(down_alpha)?,
+        gated_scale: address(gated_scale)?,
+        up_gate_scale_bytes: expert_bytes(&up_gate.scales)?,
+        down_scale_bytes: expert_bytes(&down.scales)?,
+    };
+
+    let descriptor = exchange_descriptor(
+        Mode::Fused,
+        exchange,
+        (experts, intermediate as u32),
+        hidden.dtype(),
+    )?;
+    let out = own_rows(tokens, exchange, hidden.dtype())?;
+
+    backend::collective::expert_exchange(
+        &descriptor,
+        ExchangeArgs {
+            transport: None,
+            tokens: sent(OWNER, tokens, exchange)?,
+            state: unread(),
+            ids: backend::operand(ids)?,
+            weights: backend::operand(weights)?,
+            live: live_tokens.map(backend::operand).transpose()?,
+            out: backend::operand(&out)?,
+            fused: Some(layer),
+            ranks: exchange.ranks,
         },
     )?;
     Ok(out)
@@ -1008,6 +1216,71 @@ fn workspace_bytes(routes: u64, width: u64) -> u64 {
     let bars = (padded / token_tile) * width.div_ceil(u64::from(MMA_TILE.1)) / 2 * 4;
 
     ENTRY_PREAMBLE + kibibytes(row_maxima) + kibibytes(bars) + 4
+}
+
+/// The descriptor of one launch of the expert exchange in `mode` over `exchange`'s group, for a
+/// block of `experts` experts of `intermediate` gated width whose rows are `dtype`.
+fn exchange_descriptor(
+    mode: Mode,
+    exchange: &ExpertExchange,
+    (experts, intermediate): (u32, u32),
+    dtype: DType,
+) -> Result<exchange::Descriptor> {
+    let (&[_, hidden], &[_, top]) = (exchange.states.dims(), exchange.ids.dims()) else {
+        return Err(Error::shape(
+            "expert_exchange",
+            format!(
+                "the exchange's rows are {:?} with routes of {:?}",
+                exchange.states.dims(),
+                exchange.ids.dims()
+            ),
+        ));
+    };
+
+    Ok(exchange::Descriptor {
+        mode,
+        hidden: hidden as u32,
+        intermediate,
+        top: top as u32,
+        experts,
+        max_tokens: exchange.rank_rows,
+        ranks: exchange.ranks,
+        attention: exchange.attention,
+        dtype,
+    })
+}
+
+/// `tokens`, the rows one launch of the exchange sends or takes back, as the launch states
+/// them: at most one rank's block.
+fn sent(owner: &'static str, tokens: usize, exchange: &ExpertExchange) -> Result<u32> {
+    u32::try_from(tokens)
+        .ok()
+        .filter(|tokens| *tokens <= exchange.rank_rows)
+        .ok_or_else(|| {
+            Error::shape(
+                owner,
+                format!(
+                    "the batch has {tokens} tokens, the exchange carries {} per rank",
+                    exchange.rank_rows
+                ),
+            )
+        })
+}
+
+/// The `[tokens, hidden]` rows of `dtype` an exchange writes this rank's sums into: a new
+/// tensor, or no rows of the exchange's own for a rank that joined with no tokens.
+fn own_rows(tokens: usize, exchange: &ExpertExchange, dtype: DType) -> Result<Tensor> {
+    if tokens == 0 {
+        return Ok(exchange.combined.narrow(0, 0, 0)?);
+    }
+
+    let hidden = exchange.states.dims().last().copied().unwrap_or(0);
+    Ok(backend::empty((tokens, hidden), dtype)?)
+}
+
+/// The argument of a tensor a launch of the exchange does not read: no elements at no address.
+fn unread() -> ops::Operand {
+    ops::Operand::new(ops::DevicePtr::new(0), DType::U8, ops::Shape::new(&[0]))
 }
 
 /// The route maps of [`moe_sort`] on CPU tensors, for `tiles` tiles of `rows` permuted rows.

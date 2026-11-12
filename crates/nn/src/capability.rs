@@ -331,15 +331,13 @@ pub struct RecurrentState {
 ///
 /// A tensor-parallel deployment replicates the router and keeps each rank's experts, so a token
 /// routed to another rank travels there. The kernel package owns the transport (its buffers, its
-/// ordering, its state) and execution creates it once per device and group; what a model reads
-/// are the tensors the transport wrote and the extents of the layout they are in. `ranks ×
-/// rank_rows` rows exist, and `live` states how many of them the running step holds, which the
-/// ranks agree on the device.
+/// ordering, its state); execution creates it once per device and group and sets it on the
+/// execution context of the forward, so no value here holds it. What a model reads are the
+/// tensors the transport wrote and the extents of the layout they are in. `ranks × rank_rows`
+/// rows exist, and `live` states how many of them the running step holds, which the ranks agree
+/// on the device.
 #[derive(Clone)]
 pub struct ExpertExchange {
-    /// The package's transport for this device and group: a borrowed handle the exchange
-    /// operator is handed back, valid for as long as execution keeps the group.
-    pub transport: ops::moe::exchange::ExchangeTransport,
     /// Ranks in the expert-parallel group; the leading axis of the received layout.
     pub ranks: u32,
     /// Leading ranks of the group that hold no experts.
@@ -371,6 +369,88 @@ pub struct ExpertExchange {
     pub fused: bool,
     /// This rank holds no experts: it sends routes and takes sums back, and computes nothing.
     pub source_only: bool,
+}
+
+impl ExpertExchange {
+    /// Checks the received tensors against the extents the exchange laid them out with: the
+    /// shapes and element types a kernel reads by address.
+    ///
+    /// Execution builds this value, so a wrong extent is a wiring error; refusing it here keeps
+    /// it out of a launch that would read unrelated memory.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Shape`], naming the tensor that disagrees.
+    pub fn check(&self) -> Result<()> {
+        const OWNER: &str = "ExpertExchange";
+
+        let (&[_, hidden], &[_, top]) = (self.states.dims(), self.ids.dims()) else {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "the received states are {:?} and their expert ids {:?}, not rows of hidden \
+                     elements and rows of routes",
+                    self.states.dims(),
+                    self.ids.dims()
+                ),
+            ));
+        };
+        if top == 0 || hidden == 0 {
+            return Err(Error::shape(
+                OWNER,
+                "an exchange of zero hidden elements or zero experts computes nothing".to_owned(),
+            ));
+        }
+        if self.rank_rows == 0 || self.ranks == 0 {
+            return Err(Error::shape(
+                OWNER,
+                "the exchange holds no row: a rank sends at least one".to_owned(),
+            ));
+        }
+        if self.step_rows == 0 || self.step_rows > self.rank_rows || self.attention >= self.ranks {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "a step of {} rows per rank in blocks of {}, with {} of {} ranks holding no \
+                     experts",
+                    self.step_rows, self.rank_rows, self.attention, self.ranks
+                ),
+            ));
+        }
+
+        let rows = self.ranks as usize * self.rank_rows as usize;
+        let activation = self.states.dtype();
+        for (name, tensor, expected, dtype) in [
+            ("states", &self.states, [rows, hidden], activation),
+            ("ids", &self.ids, [rows, top], DType::U32),
+            ("weights", &self.weights, [rows, top], DType::F32),
+            ("combined", &self.combined, [rows, hidden], activation),
+        ] {
+            if tensor.dims() != expected || tensor.dtype() != dtype {
+                return Err(Error::shape(
+                    OWNER,
+                    format!(
+                        "the exchange's {name} is {} {:?}, {} {expected:?} expected",
+                        ops::abi::name(tensor.dtype()),
+                        tensor.dims(),
+                        ops::abi::name(dtype)
+                    ),
+                ));
+            }
+        }
+
+        if self.live.elem_count() != 1 || self.live.dtype() != DType::U32 {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "the exchange's live count is {} {} elements, one u32 expected",
+                    self.live.elem_count(),
+                    ops::abi::name(self.live.dtype())
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The shape of one encode: the rows it fills and the image grids it merges.

@@ -13,8 +13,10 @@
 //!
 //! The transport is a device-resident workspace shared between the ranks of one expert group. It is
 //! an execution resource, so the worker creates it through the package's own lifecycle entries
-//! ([`Transport`]), keeps it across a standby's suspend and restore, and hands it to this operator as
-//! a borrowed handle ([`ExchangeTransport`]); `ops` launches over a handle and never sizes one.
+//! ([`Transport`]), keeps it across a standby's suspend and restore, and sets its borrowed handle
+//! ([`ExchangeTransport`]) on the execution context of the forwards that exchange; the context
+//! states it in each launch, so a model never holds it. `ops` launches over a handle and never
+//! sizes one.
 //!
 //! # The step's capacity
 //!
@@ -167,8 +169,10 @@ impl fmt::Display for Descriptor {
 /// layer's expert operands in `fused`. Views a mode does not read are empty (`[0]`-element) views.
 #[derive(Clone, Copy)]
 pub struct ExchangeArgs {
-    /// The group's transport, created and owned by the worker through the package.
-    pub transport: ExchangeTransport,
+    /// The group's transport, created and owned by the worker through the package and stated by
+    /// the execution context at the launch. `None` in a call that is checked before any
+    /// transport exists (a profile run); a launch refuses it.
+    pub transport: Option<ExchangeTransport>,
     /// Rows of this launch's extent: the captured bucket's, of which `live` are the batch's.
     pub tokens: u32,
     /// `[tokens, hidden]` states to send.
@@ -694,15 +698,18 @@ impl Op for ExpertExchange {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        // The transport is the group's launch resource, like the stream and the kernel: a recorded
-        // walk checks the call before any transport exists, so its presence is a launch rule and
+        // The transport is the group's launch resource, like the stream and the kernel: a profile
+        // run checks the call before any transport exists, so its presence is a launch rule and
         // not one of `check`'s argument rules.
-        if args.transport.handle().is_null() {
-            return Err(Error::argument(
-                Self::NAME,
-                "the call passed no transport; the exchange runs over the group's workspace",
-            ));
-        }
+        let transport = args
+            .transport
+            .filter(|transport| !transport.handle().is_null())
+            .ok_or_else(|| {
+                Error::argument(
+                    Self::NAME,
+                    "the call passed no transport; the exchange runs over the group's workspace",
+                )
+            })?;
         let hidden = u64::from(descriptor.hidden);
         let top = u64::from(descriptor.top);
         let experts = u64::from(descriptor.experts);
@@ -712,7 +719,7 @@ impl Op for ExpertExchange {
         let fused = args.fused;
 
         let mut call = Call {
-            transport: args.transport.handle(),
+            transport: transport.handle(),
             states: address(args.state.ptr) as usize as *const c_void,
             ids: address(args.ids.ptr) as usize as *const i32,
             weights: address(args.weights.ptr) as usize as *const f32,
@@ -781,7 +788,7 @@ mod tests {
     }
 
     /// A dispatch whose views meet its descriptor passes `check` before any transport exists, as
-    /// the recorded walk calls it; the transport is required only by a launch.
+    /// a profile run calls it; the transport is required only by a launch.
     #[test]
     fn a_dispatch_without_a_transport_passes_its_check() {
         let descriptor = Descriptor {
@@ -803,8 +810,7 @@ mod tests {
             )
         };
         let args = ExchangeArgs {
-            // SAFETY: `check` reads no handle; this call is never launched.
-            transport: unsafe { ExchangeTransport::from_handle(std::ptr::null_mut()) },
+            transport: None,
             tokens: 4,
             state: view(DType::BF16, &[4, 64]),
             ids: view(DType::U32, &[4, 2]),

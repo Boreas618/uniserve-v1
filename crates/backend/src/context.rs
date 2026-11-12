@@ -1,5 +1,5 @@
-//! The execution context: which stream, kernels, allocator, input buffer, group and profiler a
-//! device operation uses.
+//! The execution context: which stream, kernels, allocator, input buffer, group, expert exchange
+//! and profiler a device operation uses.
 //!
 //! Execution builds one context per runner and installs it on its thread around a model call
 //! ([`Context::enter`]), as PyTorch's current stream and graph memory pool are the thread's. A
@@ -21,6 +21,7 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use ops::moe::ExchangeTransport;
 use ops::platform::{DeviceRange, Stream};
 use ops::{Generation, Route};
 
@@ -58,6 +59,13 @@ pub(crate) struct State {
     /// This rank's index in the group and the group's member count, when the forward is
     /// partitioned.
     pub(crate) split: Option<(u64, u64)>,
+    /// The transport the expert exchange of this context's forwards runs over: the package's
+    /// handle for this device and expert group, borrowed from execution, which keeps it alive
+    /// for as long as it is set.
+    pub(crate) exchange: Option<ExchangeTransport>,
+    /// What an eager forward calls before each exchange launch to meet the other ranks of the
+    /// expert group on the host ([`Context::set_exchange`]).
+    pub(crate) meet: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     /// What launches the range markers of the modules a forward enters.
     pub(crate) profiler: Option<Arc<dyn Profiler>>,
 
@@ -268,6 +276,30 @@ impl Context {
         Ok(())
     }
 
+    /// The expert exchange of this context's forwards: `transport` is the package's transport for
+    /// this device and expert group, which an exchange launch runs over
+    /// ([`crate::collective::expert_exchange`]), and `None` withdraws it.
+    ///
+    /// `meet`, when given, is called on the forward's thread before each exchange launch of a
+    /// context that launches, and returns once every rank of the expert group has called it. An
+    /// exchange launch waits on its device for the same launch of every rank, and the first use
+    /// of a kernel takes a lock of the whole process and waits for its device; the ranks of a
+    /// host are threads of one process, so execution gives a warm-up forward a `meet` that
+    /// keeps every rank out of the waiting launch until each has finished the first uses before
+    /// it, and gives none once every kernel is ready.
+    ///
+    /// A meta context launches nothing and needs neither. The transport is borrowed: execution
+    /// keeps it valid, as the handle's constructor requires, for as long as it is set here.
+    pub fn set_exchange(
+        &self,
+        transport: Option<ExchangeTransport>,
+        meet: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+    ) {
+        let mut state = self.state();
+        state.exchange = transport;
+        state.meet = meet;
+    }
+
     /// What launches the range markers of the modules a forward enters, or `None`.
     pub fn set_profiler(&self, profiler: Option<Arc<dyn Profiler>>) {
         self.state().profiler = profiler;
@@ -312,6 +344,8 @@ impl State {
             route: None,
             group: None,
             split: None,
+            exchange: None,
+            meet: None,
             profiler: None,
             launches: None,
             paths: Vec::new(),

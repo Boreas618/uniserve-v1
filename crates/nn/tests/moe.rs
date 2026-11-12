@@ -14,7 +14,7 @@ use std::path::Path;
 
 use nn::functional::{self, Activation};
 use nn::quantization::{Declaration, Nvfp4Names, Nvfp4Stack, ValueLayout};
-use nn::{Checkpoint, CpuWeights, DType, Device, Tensor, WeightLoader};
+use nn::{Checkpoint, CpuWeights, DType, Device, ExpertExchange, Tensor, WeightLoader};
 use ops::fp4::ScaleLayout;
 use support::{assert_close, encode, f32_bytes, meta, recorded, sequence, shard, tensor, values};
 
@@ -997,4 +997,58 @@ fn the_packed_products_name_the_checkpoint_s_scale_type_and_their_activation_lay
         ]
         .map(|(operator, key)| (operator, key.to_owned()))
     );
+}
+
+// ---- The exchange -----------------------------------------------------------------------------
+
+/// The rows of an exchange over `ranks` ranks of `rank_rows` rows each, of `hidden` elements
+/// routed to `top` experts, as meta tensors.
+fn exchange(ranks: u32, rank_rows: u32, hidden: usize, top: usize) -> ExpertExchange {
+    let rows = (ranks * rank_rows) as usize;
+
+    ExpertExchange {
+        ranks,
+        attention: 0,
+        rank_rows,
+        step_rows: rank_rows,
+        states: meta((rows, hidden), DType::BF16),
+        ids: meta((rows, top), DType::U32),
+        weights: meta((rows, top), DType::F32),
+        combined: meta((rows, hidden), DType::BF16),
+        live: meta(1, DType::U32),
+        packed: meta((rank_rows as usize, hidden / 2), DType::U8),
+        packed_scales: meta((rank_rows as usize, hidden / 16), DType::F8E4M3),
+        fused: false,
+        source_only: false,
+    }
+}
+
+#[test]
+fn an_exchange_s_rows_are_checked_against_its_own_extents() {
+    exchange(2, 64, 2048, 8).check().unwrap();
+
+    // Rows of another rank count, ids of another type, a step beyond a rank's block.
+    let mut combined = exchange(2, 64, 2048, 8);
+    combined.combined = exchange(4, 64, 2048, 8).combined;
+    assert!(
+        combined
+            .check()
+            .unwrap_err()
+            .to_string()
+            .contains("combined")
+    );
+
+    let mut ids = exchange(2, 64, 2048, 8);
+    ids.ids = meta((128, 8), DType::I32);
+    assert!(ids.check().unwrap_err().to_string().contains("ids"));
+
+    let step = ExpertExchange {
+        step_rows: 65,
+        ..exchange(2, 64, 2048, 8)
+    };
+    assert!(step.check().is_err());
+
+    let mut none = exchange(2, 64, 2048, 8);
+    none.ids = meta((128, 0), DType::U32);
+    assert!(none.check().is_err());
 }

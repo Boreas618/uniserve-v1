@@ -15,10 +15,17 @@
 //! ([`start_all_to_all`], [`start_gather_rows`], [`finish`]): it runs on the group's side stream
 //! while the forward's stream goes on computing, and what it received is readable once the
 //! forward's stream finished it.
+//!
+//! The ranks of an expert group meet through the **expert exchange** ([`expert_exchange`]): a
+//! kernel package's transport moves each route to the rank that holds its expert and each
+//! token's sums back. The transport is the context's, beside the group
+//! ([`Context::set_exchange`]), so a module states the exchange's tensors and never the handle.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use ops::moe::exchange::Descriptor as ExchangeDescriptor;
+use ops::moe::{ExchangeArgs, ExpertExchange};
 use ops::platform::{
     CaptureStatus, CollectiveType, Communicator, DeviceRange, Event, EventFlags, PlatformDevicePtr,
     ReduceOp, Stream, collective_group,
@@ -27,7 +34,7 @@ use ops::{Operand, collective_type};
 use uniserve_tensor::Tensor;
 
 use crate::context::{self, Context};
-use crate::{Error, Result, storage};
+use crate::{Error, Result, launch, storage};
 
 /// The priority of a group's side stream: the driver clamps it to the device's highest.
 ///
@@ -369,6 +376,45 @@ pub fn settle() -> Result<()> {
     }
 }
 
+/// One launch of the expert exchange `descriptor` over the context's transport.
+///
+/// `args` states the launch's tensors and leaves its transport unset: the context's is used
+/// ([`Context::set_exchange`]). The launch is checked, resolved and recorded as every launch is
+/// ([`launch()`]), so under a meta context it checks its tensors and states its key with no
+/// transport set.
+///
+/// An exchange launch waits on its device for the same launch of every rank of the expert
+/// group. Under a context that launches, the context's `meet` is therefore called first, and the
+/// stream is waited for afterwards unless it is being captured ([`settle`]).
+///
+/// # Errors
+///
+/// [`Error::NoContext`]; [`Error::Collective`] when a context that launches holds no transport;
+/// what `meet` returns; [`Error::Launch`] as [`launch()`]; [`Error::Platform`] when the stream
+/// cannot be waited for.
+pub fn expert_exchange(descriptor: &ExchangeDescriptor, args: ExchangeArgs) -> Result<()> {
+    let context = context::current("an expert exchange")?;
+    let (transport, meet) = {
+        let state = context.state();
+        (state.exchange, state.meet.clone())
+    };
+
+    if !context.is_meta() {
+        if transport.is_none() {
+            return Err(misuse(
+                "expert_exchange",
+                "an exchange runs over the expert group's transport, and the context holds none",
+            ));
+        }
+        if let Some(meet) = meet {
+            meet()?;
+        }
+    }
+
+    launch::<ExpertExchange>(descriptor, ExchangeArgs { transport, ..args })?;
+    settle()
+}
+
 /// The thread's context and its group's member count, for the collective `name`.
 fn member(name: &'static str) -> Result<(Arc<Context>, u64)> {
     let context = context::current("a collective")?;
@@ -524,11 +570,17 @@ fn wait_unless_captured(stream: &Stream) -> Result<()> {
 mod tests {
     use uniserve_tensor::{DType, Device, Tensor};
 
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ops::moe::ExchangeArgs;
+    use ops::moe::exchange::{Descriptor, Mode};
+
     use super::{
-        all_gather, all_reduce, all_to_all, finish, settle, split, start_all_to_all,
-        start_gather_rows,
+        all_gather, all_reduce, all_to_all, expert_exchange, finish, settle, split,
+        start_all_to_all, start_gather_rows,
     };
-    use crate::{Context, Error, meta, retained};
+    use crate::{Context, Error, meta, operand, retained};
 
     /// A meta buffer of `elements` elements of `dtype`: no context reads its address.
     fn buffer(dtype: DType, elements: usize) -> Tensor {
@@ -623,6 +675,102 @@ mod tests {
         // Rows 3..7 leave a rank's five rows, and four rows per rank are not this sequence.
         assert!(misused(start_gather_rows(&gathered, 5, 3, 4)));
         assert!(misused(start_gather_rows(&gathered, 4, 0, 4)));
+    }
+
+    /// The dispatch of four rows of sixty-four elements routed to two experts each, by a rank of
+    /// a two-rank expert group.
+    fn dispatch(ranks: u32) -> (Descriptor, ExchangeArgs) {
+        let descriptor = Descriptor {
+            mode: Mode::Dispatch,
+            hidden: 64,
+            intermediate: 128,
+            top: 2,
+            experts: 8,
+            max_tokens: 16,
+            ranks: 2,
+            attention: 0,
+            dtype: DType::BF16,
+        };
+        let tensor = |shape: (usize, usize), dtype| {
+            operand(&retained(0x4000, shape, dtype, &meta()).unwrap()).unwrap()
+        };
+        let args = ExchangeArgs {
+            transport: None,
+            tokens: 4,
+            state: tensor((4, 64), DType::BF16),
+            ids: tensor((4, 2), DType::U32),
+            weights: tensor((4, 2), DType::F32),
+            live: None,
+            out: tensor((4, 64), DType::BF16),
+            fused: None,
+            ranks,
+        };
+
+        (descriptor, args)
+    }
+
+    #[test]
+    fn an_expert_exchange_needs_a_context() {
+        let (descriptor, args) = dispatch(2);
+
+        assert!(matches!(
+            expert_exchange(&descriptor, args),
+            Err(Error::NoContext {
+                operation: "an expert exchange"
+            })
+        ));
+    }
+
+    #[test]
+    fn a_meta_context_checks_an_expert_exchange_and_states_its_key_without_a_transport() {
+        let context = Context::meta(None);
+        context.record_launches();
+        let _guard = context.enter();
+
+        let (descriptor, args) = dispatch(2);
+        expert_exchange(&descriptor, args).unwrap();
+
+        // A launch over another group size than the kernel is compiled for is refused by the
+        // operator's own check, and a refused call is not a launch.
+        let (descriptor, wider) = dispatch(4);
+        assert!(matches!(
+            expert_exchange(&descriptor, wider),
+            Err(Error::Launch {
+                operator: "expert_exchange",
+                ..
+            })
+        ));
+
+        assert_eq!(
+            context.take_launches(),
+            [(
+                "expert_exchange",
+                "mode_dispatch_hidden_64_intermediate_128_top_2_experts_8_max_tokens_16_ranks_2_\
+                 attention_0_dtype_bf16"
+                    .to_owned(),
+                String::new()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_meta_context_issues_no_exchange_and_meets_no_rank() {
+        let met = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&met);
+
+        let context = Context::meta(None);
+        context.set_exchange(
+            None,
+            Some(Arc::new(move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })),
+        );
+        let _guard = context.enter();
+
+        let (descriptor, args) = dispatch(2);
+        expert_exchange(&descriptor, args).unwrap();
+        assert_eq!(met.load(Ordering::Relaxed), 0);
     }
 
     #[test]

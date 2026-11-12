@@ -55,8 +55,9 @@ pub use linear::{WeightOrder, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
 pub use moe::{
     EXPANDED_TO_PERMUTED, NUM_NON_EXITING_TILES, PERMUTED_TO_EXPANDED, PERMUTED_TO_TOKEN,
-    SORT_MAPS, TILE_ROWS, TILE_TO_EXPERT, TILE_TO_LIMIT, TOTAL_PADDED_TOKENS, gather_gemm,
-    gather_gemm_nvfp4, moe_sort, moe_unpermute, route_gemm, route_gemm_nvfp4, topk_softmax,
+    SORT_MAPS, TILE_ROWS, TILE_TO_EXPERT, TILE_TO_LIMIT, TOTAL_PADDED_TOKENS, expert_combine,
+    expert_dispatch, expert_exchange_fused, gather_gemm, gather_gemm_nvfp4, moe_sort,
+    moe_unpermute, route_gemm, route_gemm_nvfp4, topk_softmax,
 };
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
 pub use nvfp4::{ENCODE_CHUNK, encode_block, nvfp4_quantize};
