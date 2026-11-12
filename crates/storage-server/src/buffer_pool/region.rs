@@ -1,0 +1,429 @@
+//! Runs of units and the regions they are taken from.
+//!
+//! A [`Run`] is the only thing that stands for units: it is made when a
+//! region is created, it is split and joined, and it is never cloned, so a
+//! unit is in one run at a time and a run is in one place at a time: a
+//! region's free list, the runs outside the region, or one block.
+
+use std::collections::BTreeMap;
+
+use storage::protocol::Key;
+use storage::runtime::Tier;
+
+/// A contiguous range of units of one region.
+#[derive(Debug)]
+pub(crate) struct Run {
+    region: u8,
+    first: u32,
+    count: u32,
+}
+
+impl Run {
+    pub(crate) fn region(&self) -> u8 {
+        self.region
+    }
+
+    pub(crate) fn first(&self) -> u32 {
+        self.first
+    }
+
+    pub(crate) fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// The run as a completion states it.
+    pub(crate) fn stated(&self) -> storage::runtime::Run {
+        (self.region, self.first, self.count)
+    }
+
+    /// Splits off the first `count` units; the rest stays in `self`.
+    fn split(&mut self, count: u32) -> Run {
+        debug_assert!(count < self.count);
+        let head = Run {
+            region: self.region,
+            first: self.first,
+            count,
+        };
+        self.first += count;
+        self.count -= count;
+        head
+    }
+}
+
+/// The memory blocks are taken from, on one tier and in one layout.
+///
+/// A region's units are numbered from 0 up to a fixed limit. Each is in the
+/// free list, in a block, or outside the region: given back to the
+/// deployment's quota by a shrink, or not yet taken from it. Unit `i`
+/// occupies the bytes from `i * unit_bytes` of the region's memory, which
+/// regions of other layouts may occupy too, so a unit enters the region only
+/// when its bytes are in no other region (R10).
+pub(crate) struct Region {
+    pub(crate) tier: Tier,
+    /// The memory space whose bytes the region's units occupy; regions of
+    /// two layouts over the same memory state the same space.
+    pub(crate) space: u8,
+    pub(crate) unit_bytes: u64,
+    /// The free runs by their first unit; neighbours are joined.
+    free: BTreeMap<u32, Run>,
+    /// The runs outside the region by their first unit.
+    outside: BTreeMap<u32, Run>,
+    /// The units in the region: free or in a block.
+    units: u32,
+    /// The units numbered for the region: from the first that can be
+    /// allocated up to the limit.
+    span: (u32, u32),
+    /// The slot rows given back, the last one last: a row is taken from here
+    /// first, so a group reuses the row it gave up last.
+    returned: Vec<u32>,
+    /// Per queue pair (its session and its scheduler's index), the keys its
+    /// allocations may evict here, first first.
+    pub(crate) orders: BTreeMap<(u32, u16), Vec<Key>>,
+}
+
+impl Region {
+    /// A region of `limit` units numbered from 0, of which those from
+    /// `reserved` to `reserved + units` are in the region and free; the units
+    /// before `reserved` are never allocated, and the rest are outside.
+    pub(crate) fn new(
+        id: u8,
+        tier: Tier,
+        space: u8,
+        unit_bytes: u64,
+        reserved: u32,
+        units: u32,
+        limit: u32,
+    ) -> Self {
+        let mut region = Self {
+            tier,
+            space,
+            unit_bytes,
+            free: BTreeMap::new(),
+            outside: BTreeMap::new(),
+            units,
+            span: (reserved, limit),
+            returned: Vec::new(),
+            orders: BTreeMap::new(),
+        };
+        if units > 0 {
+            region.free.insert(
+                reserved,
+                Run {
+                    region: id,
+                    first: reserved,
+                    count: units,
+                },
+            );
+        }
+        let rest = limit - reserved - units;
+        if rest > 0 {
+            let first = reserved + units;
+            region.outside.insert(
+                first,
+                Run {
+                    region: id,
+                    first,
+                    count: rest,
+                },
+            );
+        }
+        region
+    }
+
+    /// The units in the region.
+    pub(crate) fn units(&self) -> u32 {
+        self.units
+    }
+
+    /// The first unit that can be allocated and the limit of the numbering.
+    pub(crate) fn span(&self) -> (u32, u32) {
+        self.span
+    }
+
+    /// The free units.
+    pub(crate) fn free_units(&self) -> u32 {
+        self.free.values().map(Run::count).sum()
+    }
+
+    /// The free runs as `(first, count)`, for the exported state.
+    pub(crate) fn free_runs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.free.values().map(|run| (run.first, run.count))
+    }
+
+    /// The runs outside the region as `(first, count)`.
+    pub(crate) fn outside_runs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.outside.values().map(|run| (run.first, run.count))
+    }
+
+    /// Takes a run of `count` units from the free list: the lowest free run
+    /// that holds it.
+    pub(crate) fn take(&mut self, count: u32) -> Option<Run> {
+        let first = self.free.values().find(|run| run.count >= count)?.first;
+        let mut run = self.free.remove(&first)?;
+        if run.count == count {
+            return Some(run);
+        }
+        let head = run.split(count);
+        self.free.insert(run.first, run);
+        Some(head)
+    }
+
+    /// Takes one unit: the one given back last that is still free, and
+    /// otherwise the lowest free one.
+    pub(crate) fn take_row(&mut self) -> Option<Run> {
+        while let Some(unit) = self.returned.pop() {
+            // The free run that holds the unit, when a shrink has not taken it.
+            let holder = self
+                .free
+                .range(..=unit)
+                .next_back()
+                .map(|(first, run)| (*first, run.count));
+            let Some((first, count)) = holder.filter(|(first, count)| unit < first + count) else {
+                continue;
+            };
+            let Some(mut run) = self.free.remove(&first) else {
+                continue;
+            };
+
+            // Cut the unit out of the run: what lies before it and after it stays free.
+            if unit > first {
+                let head = run.split(unit - first);
+                self.free.insert(head.first, head);
+            }
+            if first + count > unit + 1 {
+                let row = run.split(1);
+                self.free.insert(run.first, run);
+                return Some(row);
+            }
+            return Some(run);
+        }
+        self.take(1)
+    }
+
+    /// Returns a run to the free list (R2: only [`super::BufferPool::reclaim`]
+    /// calls this, with the runs of a block nothing else holds).
+    pub(crate) fn give(&mut self, run: Run) {
+        insert_joined(&mut self.free, run);
+    }
+
+    /// As [`Self::give`], for a slot row: it is the next one [`Self::take_row`] takes.
+    pub(crate) fn give_row(&mut self, run: Run) {
+        self.returned.push(run.first);
+        self.give(run);
+    }
+
+    /// Shrinks the region by up to `count` free units, highest first, and
+    /// returns the byte ranges that left it.
+    pub(crate) fn shrink(&mut self, count: u32) -> Vec<(u64, u64)> {
+        let mut left = Vec::new();
+        let mut wanted = count;
+        while wanted > 0 {
+            let Some(first) = self.free.keys().next_back().copied() else {
+                break;
+            };
+            let Some(mut run) = self.free.remove(&first) else {
+                break;
+            };
+            // Take the run's tail when it is longer than what is wanted.
+            let taken = if run.count > wanted {
+                let keep = run.count - wanted;
+                let head = run.split(keep);
+                self.free.insert(head.first, head);
+                run
+            } else {
+                run
+            };
+            wanted -= taken.count;
+            self.units -= taken.count;
+            left.push((
+                u64::from(taken.first) * self.unit_bytes,
+                u64::from(taken.count) * self.unit_bytes,
+            ));
+            insert_joined(&mut self.outside, taken);
+        }
+        left
+    }
+
+    /// Grows the region by up to `count` units that are outside it and whose
+    /// bytes `takes` grants (R10: bytes that have left every other region),
+    /// lowest first. `takes(offset, bytes)` returns whether it took the range
+    /// out of the quota.
+    pub(crate) fn grow(&mut self, count: u32, mut takes: impl FnMut(u64, u64) -> bool) -> u32 {
+        let mut grown = 0;
+        let firsts: Vec<u32> = self.outside.keys().copied().collect();
+        for first in firsts {
+            let Some(mut run) = self.outside.remove(&first) else {
+                continue;
+            };
+            // One unit at a time: a unit enters only with all of its bytes.
+            let mut joined = 0;
+            while joined < run.count && grown < count {
+                let unit = run.first + joined;
+                if !takes(u64::from(unit) * self.unit_bytes, self.unit_bytes) {
+                    break;
+                }
+                joined += 1;
+                grown += 1;
+            }
+            if joined == run.count {
+                insert_joined(&mut self.free, run);
+            } else if joined > 0 {
+                let head = run.split(joined);
+                insert_joined(&mut self.free, head);
+                self.outside.insert(run.first, run);
+            } else {
+                self.outside.insert(run.first, run);
+            }
+            if grown == count {
+                break;
+            }
+        }
+        self.units += grown;
+        grown
+    }
+}
+
+#[cfg(test)]
+impl Region {
+    /// A second region in the same state, for a second buffer pool: the
+    /// enumeration of request sequences branches from a state this way.
+    pub(super) fn duplicate(&self) -> Self {
+        let runs = |runs: &BTreeMap<u32, Run>| {
+            runs.iter()
+                .map(|(first, run)| (*first, run.duplicate()))
+                .collect()
+        };
+        Self {
+            tier: self.tier,
+            space: self.space,
+            unit_bytes: self.unit_bytes,
+            free: runs(&self.free),
+            outside: runs(&self.outside),
+            units: self.units,
+            span: self.span,
+            returned: self.returned.clone(),
+            orders: self.orders.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Region {
+    /// The rows given back and not taken again, the last one last.
+    pub(super) fn returned(&self) -> &[u32] {
+        &self.returned
+    }
+}
+
+#[cfg(test)]
+impl Run {
+    /// The same units for a second buffer pool; see [`Region::duplicate`].
+    pub(super) fn duplicate(&self) -> Self {
+        Self {
+            region: self.region,
+            first: self.first,
+            count: self.count,
+        }
+    }
+}
+
+/// Inserts a run into a list of runs by first unit, joining it with the runs
+/// that end where it begins or begin where it ends.
+fn insert_joined(runs: &mut BTreeMap<u32, Run>, mut run: Run) {
+    if let Some(next) = runs.remove(&(run.first + run.count)) {
+        run.count += next.count;
+    }
+    let before = runs
+        .range(..run.first)
+        .next_back()
+        .map(|(first, previous)| (*first, previous.count));
+    if let Some((first, count)) = before
+        && first + count == run.first
+        && let Some(mut previous) = runs.remove(&first)
+    {
+        previous.count += run.count;
+        run = previous;
+    }
+    runs.insert(run.first, run);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn region(units: u32, limit: u32) -> Region {
+        Region::new(0, Tier::Device, 0, 64, 1, units, limit)
+    }
+
+    #[test]
+    fn runs_are_taken_lowest_first_and_joined_when_given_back() {
+        let mut region = region(8, 9);
+        let first = region.take(3).unwrap();
+        let second = region.take(2).unwrap();
+        assert_eq!((first.stated(), second.stated()), ((0, 1, 3), (0, 4, 2)));
+        assert_eq!(region.free_units(), 3);
+
+        // The middle run comes back first: it joins the free tail, then the head joins both.
+        region.give(second);
+        assert_eq!(region.free_runs().collect::<Vec<_>>(), [(4, 5)]);
+        region.give(first);
+        assert_eq!(region.free_runs().collect::<Vec<_>>(), [(1, 8)]);
+    }
+
+    #[test]
+    fn a_run_is_refused_when_no_free_run_holds_it() {
+        let mut region = region(4, 5);
+        let head = region.take(1).unwrap();
+        let middle = region.take(2).unwrap();
+        region.give(head);
+
+        // Two units are free, in runs of one each.
+        assert_eq!(region.free_units(), 2);
+        assert!(region.take(2).is_none());
+        region.give(middle);
+        assert!(region.take(4).is_some());
+    }
+
+    #[test]
+    fn a_row_is_the_one_given_back_last_and_otherwise_the_lowest() {
+        let mut region = region(4, 5);
+        let rows: Vec<Run> = (0..3).map(|_| region.take_row().unwrap()).collect();
+        assert_eq!(rows.iter().map(Run::first).collect::<Vec<_>>(), [1, 2, 3]);
+
+        // Rows 1 and then 3 come back: 3 is reused first, then 1, then the lowest free one.
+        let mut rows = rows.into_iter();
+        let (first, second, third) = (
+            rows.next().unwrap(),
+            rows.next().unwrap(),
+            rows.next().unwrap(),
+        );
+        region.give_row(first);
+        region.give_row(third);
+        assert_eq!(region.take_row().unwrap().first(), 3);
+        assert_eq!(region.take_row().unwrap().first(), 1);
+        assert_eq!(region.take_row().unwrap().first(), 4);
+        assert!(region.take_row().is_none());
+        region.give_row(second);
+        assert_eq!(region.free_runs().collect::<Vec<_>>(), [(2, 1)]);
+    }
+
+    #[test]
+    fn a_shrink_takes_free_units_from_the_top_and_a_grow_puts_granted_ones_back() {
+        let mut region = region(6, 7);
+        let held = region.take(2).unwrap();
+
+        // Four units are free; a shrink of ten stops at them.
+        let left = region.shrink(10);
+        assert_eq!(left, [(3 * 64, 4 * 64)]);
+        assert_eq!((region.units(), region.free_units()), (2, 0));
+        assert_eq!(region.outside_runs().collect::<Vec<_>>(), [(3, 4)]);
+
+        // The quota grants the first two units' bytes only.
+        let grown = region.grow(4, |offset, _| offset < 5 * 64);
+        assert_eq!(grown, 2);
+        assert_eq!((region.units(), region.free_units()), (4, 2));
+        assert_eq!(region.outside_runs().collect::<Vec<_>>(), [(5, 2)]);
+        region.give(held);
+        assert_eq!(region.free_runs().collect::<Vec<_>>(), [(1, 4)]);
+    }
+}

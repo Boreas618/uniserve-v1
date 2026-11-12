@@ -28,6 +28,7 @@
 //! its connection's queue until then, while every other connection is
 //! served on.
 
+pub mod buffer_pool;
 mod child;
 pub mod command;
 mod error;
