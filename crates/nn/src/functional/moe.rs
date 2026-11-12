@@ -1,6 +1,6 @@
 //! The operators of a mixture-of-experts block: the router's top-k, the sort that groups the
-//! routes by expert, the two grouped expert products, the weighted combine, and the exchange of
-//! routes between the ranks of an expert group.
+//! routes by expert, the two grouped expert products, the weighted combine, the exchange of
+//! routes between the ranks of an expert group, and the gated add of a shared expert.
 //!
 //! ```text
 //! topk_softmax        router scores                 -> each token's expert ids and route weights
@@ -44,11 +44,12 @@ use ops::moe::grouped::{
 };
 use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
+use ops::residual::{SigmoidGatedAdd, SigmoidGatedAddArgs, SigmoidGatedAddDescriptor};
 use uniserve_tensor::{D, DType, Device, Tensor};
 
 use super::activation::activate;
 use super::nvfp4::{decoded, encoded, integer, launch_quantize, remainder};
-use super::{ACCUMULATE, Activation, columns, on_cpu};
+use super::{ACCUMULATE, Activation, as_rows, columns, on_cpu, row_tile, same_rows};
 use crate::capability::ExpertExchange;
 use crate::error::{Error, Result};
 use crate::quantization::{Nvfp4Stack, ValueLayout};
@@ -1108,6 +1109,68 @@ pub fn expert_exchange_fused(
         },
     )?;
     Ok(out)
+}
+
+/// A shared expert's join, in place: `target + sigmoid(gate) · update`, each row's update scaled
+/// by the sigmoid of its own logit, in FP32 and rounded once into `target`'s element type.
+///
+/// `target` and `update` are `[..., columns]` of one element type and `gate` is `[..., 1]` in
+/// the same type, one logit per row. `target` is taken by value, updated in its own storage and
+/// returned: every tensor that shares its storage sees the sum.
+///
+/// # Errors
+///
+/// When `update` is not `target`'s shape and element type, `gate` is not one logit per row,
+/// `target` is a strided view, or the operator refuses its arguments.
+pub fn sigmoid_gated_add_(target: Tensor, update: &Tensor, gate: &Tensor) -> Result<Tensor> {
+    const OWNER: &str = "sigmoid_gated_add_";
+
+    let width = columns(OWNER, &target)?;
+    same_rows(OWNER, "update", update, &target)?;
+
+    let leading = &target.dims()[..target.rank() - 1];
+    let logits = &gate.dims()[..gate.rank().saturating_sub(1)];
+    if gate.dims().last() != Some(&1) || logits != leading || gate.dtype() != target.dtype() {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "the gate is {} {:?}, and rows of {} {:?} take one logit each",
+                ops::abi::name(gate.dtype()),
+                gate.dims(),
+                ops::abi::name(target.dtype()),
+                target.dims()
+            ),
+        ));
+    }
+    if !target.is_contiguous() {
+        return Err(Error::shape(
+            OWNER,
+            "a strided view has no rows to update in place".to_owned(),
+        ));
+    }
+
+    if on_cpu(&target) {
+        let scaled = activate(&gate.to_dtype(ACCUMULATE)?, Activation::Sigmoid)?
+            .broadcast_mul(&update.to_dtype(ACCUMULATE)?)?;
+        let sum = (target.to_dtype(ACCUMULATE)? + scaled)?.to_dtype(target.dtype())?;
+
+        target.slice_set(&sum, 0, 0)?;
+        return Ok(target);
+    }
+
+    backend::launch::<SigmoidGatedAdd>(
+        &SigmoidGatedAddDescriptor {
+            dtype: target.dtype(),
+            columns: width,
+            block: row_tile(width).min(1024),
+        },
+        SigmoidGatedAddArgs {
+            target: backend::operand(&as_rows(OWNER, &target)?)?,
+            update: backend::operand(&as_rows(OWNER, update)?)?,
+            gate: backend::operand(&as_rows(OWNER, gate)?)?,
+        },
+    )?;
+    Ok(target)
 }
 
 /// The token and route counts of `routes`, a `[tokens, top]` tensor of route ids or weights

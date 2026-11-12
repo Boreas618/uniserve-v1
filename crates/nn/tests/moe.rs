@@ -13,8 +13,8 @@ use std::ops::Range;
 use std::path::Path;
 
 use nn::collective::Split;
-use nn::functional::{self, Activation};
-use nn::modules::{MoE, MoEConfig};
+use nn::functional::{self, Activation, Rounding};
+use nn::modules::{GateUp, MlpConfig, MoE, MoEConfig, SharedExpert, SharedExpertConfig};
 use nn::quantization::{Declaration, Nvfp4Names, Nvfp4Stack, ValueLayout};
 use nn::{Checkpoint, CpuWeights, DType, Device, ExpertExchange, Tensor, WeightLoader};
 use ops::fp4::ScaleLayout;
@@ -1647,4 +1647,180 @@ fn an_exchange_s_rows_are_checked_against_its_own_extents() {
     let mut none = exchange(2, 64, 2048, 8);
     none.ids = meta((128, 0), DType::U32);
     assert!(none.check().is_err());
+}
+
+// ---- The shared expert ------------------------------------------------------------------------
+
+#[test]
+fn sigmoid_gated_add_updates_its_target_s_storage() {
+    let (rows, width) = (3, 4);
+    let (target, update, gate) = (
+        sequence(rows * width, 90),
+        sequence(rows * width, 91),
+        [0.5_f32, -1.5, 2.0],
+    );
+    let expected: Vec<f32> = (0..rows * width)
+        .map(|index| target[index] + update[index] / (1.0 + (-gate[index / width]).exp()))
+        .collect();
+
+    // A second tensor over the target's storage sees the sum: nothing was copied.
+    let storage = tensor(&target, (rows, width), DType::F32);
+    let returned = functional::sigmoid_gated_add_(
+        storage.clone(),
+        &tensor(&update, (rows, width), DType::F32),
+        &tensor(&gate, (rows, 1), DType::F32),
+    )
+    .unwrap();
+    assert_close(&values(&returned), &expected, F32_TOLERANCE);
+    assert_eq!(values(&storage), values(&returned));
+
+    // One logit per row, of the target's type, over the update's rows.
+    let rows_of = |values: &[f32], shape: (usize, usize)| tensor(values, shape, DType::F32);
+    assert!(
+        functional::sigmoid_gated_add_(
+            rows_of(&target, (rows, width)),
+            &rows_of(&update, (rows, width)),
+            &rows_of(&update, (rows, width)),
+        )
+        .is_err()
+    );
+    assert!(
+        functional::sigmoid_gated_add_(
+            rows_of(&target, (rows, width)),
+            &rows_of(&update[..8], (2, width)),
+            &rows_of(&gate, (rows, 1)),
+        )
+        .is_err()
+    );
+
+    // On the device the target is the kernel's one in-out argument.
+    let (output, launches) = recorded(|| {
+        functional::sigmoid_gated_add_(
+            meta((rows, 2048), DType::BF16),
+            &meta((rows, 2048), DType::BF16),
+            &meta((rows, 1), DType::BF16),
+        )
+    });
+    assert_eq!(output.unwrap().dims(), [rows, 2048]);
+    assert_eq!(
+        launches,
+        [(
+            "sigmoid_gated_add",
+            "dtype_bf16_columns_2048_block_1024".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn a_shared_expert_adds_its_gated_mlp_into_the_routed_output() {
+    let (hidden, intermediate, rows) = (4, 6, 3);
+    let (gate_proj, up_proj, down_proj, gate) = (
+        sequence(intermediate * hidden, 92),
+        sequence(intermediate * hidden, 93),
+        sequence(hidden * intermediate, 94),
+        sequence(hidden, 95),
+    );
+    let directory = tempfile::tempdir().unwrap();
+    shard(
+        directory.path(),
+        "model.safetensors",
+        &[
+            (
+                "mlp.shared_expert.gate_proj.weight",
+                DType::F32,
+                vec![intermediate, hidden],
+                f32_bytes(&gate_proj),
+            ),
+            (
+                "mlp.shared_expert.up_proj.weight",
+                DType::F32,
+                vec![intermediate, hidden],
+                f32_bytes(&up_proj),
+            ),
+            (
+                "mlp.shared_expert.down_proj.weight",
+                DType::F32,
+                vec![hidden, intermediate],
+                f32_bytes(&down_proj),
+            ),
+            (
+                "mlp.shared_expert_gate.weight",
+                DType::F32,
+                vec![1, hidden],
+                f32_bytes(&gate),
+            ),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    let config = SharedExpertConfig {
+        mlp: MlpConfig {
+            hidden: hidden as u32,
+            intermediate: intermediate as u32,
+            activation: Activation::Silu,
+            rounding: Rounding::Fused,
+            gate_up: GateUp::Split {
+                gate: "gate_proj",
+                up: "up_proj",
+            },
+            down: "down_proj",
+            bias: false,
+            split: Split::WHOLE,
+        },
+        module: "shared_expert",
+        gate: "shared_expert_gate",
+    };
+
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let shared = SharedExpert::load(&config, loader.root().pp("mlp")).unwrap();
+
+    let (x, routed) = (sequence(rows * hidden, 96), sequence(rows * hidden, 97));
+    let expected: Vec<f32> = x
+        .chunks(hidden)
+        .zip(routed.chunks(hidden))
+        .flat_map(|(row, routed)| {
+            let mlp = expert_by_hand(
+                row,
+                &[up_proj.clone(), gate_proj.clone(), down_proj.clone()],
+            );
+            let logit = product(&gate, row)[0];
+
+            routed
+                .iter()
+                .zip(mlp)
+                .map(|(routed, mlp)| routed + mlp / (1.0 + (-logit).exp()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // The routed output is updated in place and returned.
+    let routed = tensor(&routed, (rows, hidden), DType::F32);
+    let out = shared
+        .forward(&tensor(&x, (rows, hidden), DType::F32), routed.clone())
+        .unwrap();
+    assert_close(&values(&out), &expected, F32_TOLERANCE);
+    assert_eq!(values(&routed), values(&out));
+
+    // Under a meta context: the MLP's products and gate, the gate's logit, and the gated add.
+    let meta_loader = WeightLoader::meta(&checkpoint, None, None);
+    let shared = SharedExpert::load(&config, meta_loader.root().pp("mlp")).unwrap();
+    let (output, launches) = recorded(|| {
+        shared.forward(
+            &meta((rows, hidden), DType::F32),
+            meta((rows, hidden), DType::F32),
+        )
+    });
+    assert_eq!(output.unwrap().dims(), [rows, hidden]);
+    assert_eq!(
+        operators(&launches),
+        [
+            "gemm",
+            "gemm",
+            "act_and_mul",
+            "gemm",
+            "gemm",
+            "sigmoid_gated_add"
+        ]
+    );
+    assert_eq!(launches[5].1, "dtype_f32_columns_4_block_4");
 }

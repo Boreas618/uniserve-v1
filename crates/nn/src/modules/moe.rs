@@ -1,4 +1,4 @@
-//! The mixture-of-experts block of a transformer layer.
+//! The mixture-of-experts block of a transformer layer, and the shared expert beside it.
 //!
 //! ```text
 //! scores  = router(x)                                  one score per expert, replicated
@@ -48,7 +48,8 @@ use crate::error::{Error, Result};
 use crate::functional::{
     self, Activation, DOWN_VALUE_LAYOUT, GATED_VALUE_LAYOUT, WEIGHT_SCALE_LAYOUT, WeightOrder,
 };
-use crate::modules::linear::Linear;
+use crate::modules::linear::{Linear, LinearConfig, Parallel};
+use crate::modules::mlp::{Mlp, MlpConfig};
 use crate::quantization::{Nvfp4Names, Nvfp4Stack, Scheme, ValueLayout};
 use crate::var_builder::VarBuilder;
 use crate::weights::{PartBlock, WeightLayout, WeightSource, extents};
@@ -797,5 +798,64 @@ impl MoE {
 
         // 4. Combine: the ranks' sums for this rank's tokens.
         functional::expert_combine(tokens, live_tokens, exchange, self.count, self.intermediate)
+    }
+}
+
+/// The module names of a [`SharedExpert`] and the gated MLP it holds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SharedExpertConfig {
+    /// The shared expert's gated MLP.
+    pub mlp: MlpConfig,
+    /// The name of the module that holds the MLP.
+    pub module: &'static str,
+    /// The name of the `[1, hidden]` gate projection beside it.
+    pub gate: &'static str,
+}
+
+/// A shared expert beside a routed block: a gated MLP every token passes through, its output
+/// scaled by the sigmoid of a per-token gate and added into the routed output (Qwen2-MoE,
+/// Qwen3-Next, Qwen3.5):
+///
+/// ```text
+/// routed ← routed + sigmoid(gate · x) · mlp(x)
+/// ```
+pub struct SharedExpert {
+    mlp: Mlp,
+    gate: Linear,
+}
+
+impl SharedExpert {
+    /// The shared expert the modules under `vb` state, at the MLP's split. The gate is
+    /// replicated: one logit per token on every rank.
+    ///
+    /// # Errors
+    ///
+    /// A module the loader refuses or a split the MLP refuses.
+    pub fn load(config: &SharedExpertConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
+        let mlp = Mlp::load(&config.mlp, vb.pp(config.module))?;
+        let gate = Linear::load(
+            &LinearConfig {
+                inputs: config.mlp.hidden,
+                outputs: 1,
+                bias: false,
+                parallel: Parallel::None,
+            },
+            vb.pp(config.gate),
+        )?;
+
+        Ok(Self { mlp, gate })
+    }
+
+    /// Adds the shared expert's gated output of `x [..., hidden]` into `routed`, the routed
+    /// block's output of the same rows, in place, and returns it.
+    ///
+    /// # Errors
+    ///
+    /// Rows a projection refuses, or an operator's refusal.
+    pub fn forward(&self, x: &Tensor, routed: Tensor) -> Result<Tensor> {
+        let update = self.mlp.forward(x)?;
+        let gate = self.gate.forward(x)?;
+
+        functional::sigmoid_gated_add_(routed, &update, &gate)
     }
 }
