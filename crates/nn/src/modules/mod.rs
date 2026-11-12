@@ -8,14 +8,19 @@
 //! A module of one input also implements the tensor library's [`Module`](crate::Module), so it
 //! composes with `Tensor::apply`.
 
+mod attention;
 mod embedding;
+mod gated_delta_net;
 mod head;
 mod linear;
 mod mlp;
 mod moe;
 mod norm;
+mod rotary;
 
+pub use attention::{Attention, AttentionConfig, QkNorm};
 pub use embedding::{Embedding, EmbeddingConfig};
+pub use gated_delta_net::{GatedDeltaNet, GatedDeltaNetConfig};
 pub use head::{LmHead, LmHeadConfig};
 pub use linear::{Linear, LinearConfig, Parallel, QkvBias, QkvLinear, QkvLinearConfig, QkvNames};
 pub use mlp::{GateUp, Mlp, MlpConfig};
@@ -23,3 +28,4 @@ pub use moe::{MoE, MoEConfig, SharedExpert, SharedExpertConfig};
 pub use norm::{
     GatedRmsNorm, GatedRmsNormConfig, LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig,
 };
+pub use rotary::{Precision, Rotary, RotaryConfig, Spectrum, Yarn};

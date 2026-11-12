@@ -18,9 +18,9 @@
 //! row's new tokens and `seq_lens [rows]` counts every token the row has seen, so a row's new tokens
 //! sit at absolute positions `seq_lens[r] − (offsets[r + 1] − offsets[r]) ..  seq_lens[r]`. A row
 //! that starts at position zero begins from a zero state; any other row continues from the state its
-//! request slot holds, `slots[r]` naming the slot of the `[slots, …]` banks. A row of a negative slot
-//! is padding: it reads and writes no state and writes zeros into its output rows, so a captured
-//! bucket wider than its batch carries finite values.
+//! request slot holds, `slots[r]` naming the slot of the `[slots, …]` banks. A row whose slot is
+//! `u32::MAX` is padding: it reads and writes no state and writes zeros into its output rows, so a
+//! captured bucket wider than its batch carries finite values.
 //!
 //! A row also names `checkpoints[r]`, an absolute token count at which its state is kept for the
 //! prefix cache: when `start < checkpoints[r] ≤ end`, the state after the token at
@@ -61,13 +61,13 @@ use crate::{Error, Op, Result, Twins};
 /// The batch columns a recurrent operator reads, as paged attention reads them.
 #[derive(Clone, Copy)]
 pub struct RowColumns {
-    /// `[rows + 1]` i32: packed offsets of each row's new tokens.
+    /// `[rows + 1]` u32: packed offsets of each row's new tokens.
     pub query_offsets: Operand,
-    /// `[rows]` i32: tokens each row has seen, its new ones included.
+    /// `[rows]` u32: tokens each row has seen, its new ones included.
     pub seq_lens: Operand,
-    /// `[rows]` i32: each row's slot in the state banks; negative for a padding row.
+    /// `[rows]` u32: each row's slot in the state banks; `u32::MAX` for a padding row.
     pub slots: Operand,
-    /// `[rows]` i32: the absolute token count each row keeps a checkpoint at, zero for none.
+    /// `[rows]` u32: the absolute token count each row keeps a checkpoint at, zero for none.
     pub checkpoints: Operand,
 }
 
@@ -84,7 +84,7 @@ impl RowColumns {
         ] {
             view.require_shape(operator, Shape::new(&[count]))
                 .map_err(|error| Error::argument(operator, format!("{name}: {error}")))?;
-            view.require_row(operator, DType::I32, count)
+            view.require_row(operator, DType::U32, count)
                 .map_err(|error| Error::argument(operator, format!("{name}: {error}")))?;
         }
         if rows == 0 {

@@ -28,9 +28,9 @@ use uniserve_tensor::{D, DType, Tensor};
 use super::{PDL, as_rows, columns, like_rows, on_cpu, row_tile, same_rows, vector};
 use crate::error::{Error, Result};
 
-/// `rows`, FP32 `[rows, columns]`, scaled by the reciprocal root of each row's mean square plus
+/// `rows`, FP32 `[..., columns]`, scaled by the reciprocal root of each row's mean square plus
 /// `eps`.
-fn rms_scaled(rows: &Tensor, eps: f32) -> Result<Tensor> {
+pub(super) fn rms_scaled(rows: &Tensor, eps: f32) -> Result<Tensor> {
     let mean_square = rows.sqr()?.mean_keepdim(D::Minus1)?;
     let scale = (mean_square + f64::from(eps))?.sqrt()?.recip()?;
 
@@ -38,7 +38,7 @@ fn rms_scaled(rows: &Tensor, eps: f32) -> Result<Tensor> {
 }
 
 /// The FP32 gain a row is multiplied by: the weight, or one plus it when `centred`.
-fn gain(weight: &Tensor, centred: bool) -> Result<Tensor> {
+pub(super) fn gain(weight: &Tensor, centred: bool) -> Result<Tensor> {
     let weight = weight.to_dtype(DType::F32)?;
 
     if centred {
