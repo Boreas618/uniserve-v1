@@ -1,7 +1,7 @@
 //! What a KV cache may hold of its GPU, from the GPU's storage usage.
 //!
 //! The host's Storage Server keeps one usage per GPU for the deployment
-//! (`storage::GpuLedger`): the quota `⌊total × fraction⌋` of the whole GPU,
+//! (`storage::Quota`): the quota `⌊total × fraction⌋` of the whole GPU,
 //! and every item the deployment's epochs and the Transfer Server hold on it
 //! (weights, each KV cache segment, the other exclusive storages, graph
 //! pools, process storage, staging, the Transfer Server's context), each once
@@ -16,7 +16,7 @@
 
 use ipc::memory::CacheStorageReport;
 use serde::Serialize;
-use storage::LedgerEntry;
+use storage::Reservation;
 
 /// One device's room for the device storage a profiling session holds:
 /// what its usage and its free storage leave, and the tail segments the KV
@@ -58,11 +58,11 @@ pub(super) fn room(report: &CacheStorageReport, bytes: u64, floor: u32) -> Resul
     };
     let gpu = storage::protocol::gpu_name(&usage.gpu);
     let quota = usage
-        .quota
+        .limit
         .ok_or_else(|| format!("no epoch states a quota in the storage usage of GPU {gpu}"))?;
     // A process outside the deployment may hold more of the device than the
     // quota leaves it.
-    let available = quota.saturating_sub(usage.used()).min(report.free_bytes);
+    let available = quota.saturating_sub(usage.usage()).min(report.free_bytes);
     let mut freed = 0;
     let mut kept = report.held;
     while available + freed < bytes && kept > floor {
@@ -73,7 +73,7 @@ pub(super) fn room(report: &CacheStorageReport, bytes: u64, floor: u32) -> Resul
         host: report.host.clone(),
         gpu,
         quota,
-        reserved: usage.used(),
+        reserved: usage.usage(),
         free: report.free_bytes,
         bytes,
         kv_floor: (0..floor.min(report.held))
@@ -82,7 +82,11 @@ pub(super) fn room(report: &CacheStorageReport, bytes: u64, floor: u32) -> Resul
         segments_kept: kept,
         segments_held: report.held,
         feasible: available + freed >= bytes,
-        entries: usage.entries.iter().map(LedgerEntry::describe).collect(),
+        entries: usage
+            .reservations
+            .iter()
+            .map(Reservation::describe)
+            .collect(),
     })
 }
 
@@ -123,18 +127,18 @@ pub(super) fn growable(report: &CacheStorageReport, released: bool) -> u32 {
     let (Some(usage), Some(epoch)) = (&report.usage, report.epoch) else {
         return 0;
     };
-    let Some(quota) = usage.quota else {
+    let Some(quota) = usage.limit else {
         return 0;
     };
     let ending = if released {
         usage.bytes(|entry| {
-            entry.item.booked() && !entry.epochs.is_empty() && !entry.epochs.contains(&epoch)
+            entry.item.of_process() && !entry.epochs.is_empty() && !entry.epochs.contains(&epoch)
         })
     } else {
         0
     };
     let mut room = (quota + ending)
-        .saturating_sub(usage.used())
+        .saturating_sub(usage.usage())
         .min(report.free_bytes + ending);
     let mut fit = 0;
     for index in report.held as usize..report.segments.len() {

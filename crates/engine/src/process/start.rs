@@ -230,7 +230,7 @@ impl MainProcess {
             let client = client.context("a serving rank holds its Storage Server client")?;
             for (device, worker, generation) in spawned {
                 // The precopy shadows a replaced operator beside the serving one, so the region it
-                // runs in is mapped before any batch: the worker books it from the scratch pool
+                // runs in is mapped before any batch: the worker reserves it from the scratch pool
                 // the graph storage sized. Nothing is serving yet, so the control thread waits here;
                 // `serve` never does.
                 //
@@ -242,7 +242,7 @@ impl MainProcess {
                 let shadow = worker.set_shadow()?;
                 device_command(&watchdog, device, "shadow region", shadow)
                     .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
-                // The park's and the wake's commands reach the Storage Server's ledger from the
+                // The park's and the wake's commands reach the Storage Server's quota from the
                 // device thread, which owns the stream a wake resets its units on, so the client is
                 // bound beside the cache handle rather than kept only here.
                 worker.bind_storage(Arc::clone(&client));

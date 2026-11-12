@@ -17,7 +17,7 @@
 //! What lives in a GPU's context belongs to that GPU's session, so that the
 //! context is released once no work needs it; a session drops what it made
 //! for an allocation once the allocation is taken back and no copy holds it
-//! ([`Mapped`]'s drop). A mapping that fails stays failed for the
+//! ([`Mapping`]'s drop). A mapping that fails stays failed for the
 //! allocation, or for the session: the tasks that copy it fail.
 //! Read-only content (a storage of read-only tensors) is mapped read-only,
 //! a guard beside the server's check that no copy writes it; another host
@@ -36,7 +36,7 @@ use super::contexts::Contexts;
 use super::devices::Gpus;
 
 /// A mapping made once, or why it could not be made.
-type Made<T> = OnceLock<Result<T, String>>;
+type Once<T> = OnceLock<Result<T, String>>;
 
 /// The key of the next NIXL registration of the process (`nixl::Region::key`):
 /// keys are never reused while the process, and with it its agent, lives.
@@ -52,7 +52,7 @@ pub(super) fn nixl_key() -> u64 {
 static IDS: AtomicU64 = AtomicU64::new(1);
 
 /// One allocation the server gave.
-pub(super) struct Mapped {
+pub(super) struct Mapping {
     id: u64,
     pub(super) end: LinkEnd,
     pub(super) bytes: u64,
@@ -66,15 +66,15 @@ pub(super) struct Mapped {
     /// A host allocation's registration with the process's NIXL agent, made
     /// at its first READ or exposure. It is undone before the mapping it
     /// registers is unmapped: fields drop in declaration order.
-    nixl: Made<nixl::Registration>,
-    host: Made<HostMap>,
+    nixl: Once<nixl::Registration>,
+    host: Once<HostMap>,
     /// The allocation's POSIX handle or memfd. Declared last: every
     /// mapping holds its own reference, so the descriptor only needs to
     /// outlive their creation.
     descriptor: OwnedFd,
 }
 
-impl Mapped {
+impl Mapping {
     pub(super) fn new(
         end: LinkEnd,
         bytes: u64,
@@ -198,7 +198,7 @@ impl Mapped {
     }
 }
 
-impl Drop for Mapped {
+impl Drop for Mapping {
     fn drop(&mut self) {
         // The server took the allocation back and no copy holds it: the
         // sessions drop its mappings and registrations, which hold its
@@ -213,7 +213,7 @@ pub(super) struct Fabric {
     handle: [u8; 64],
     bytes: u64,
     device: DeviceId,
-    mapping: Made<PeerMapping>,
+    mapping: Once<PeerMapping>,
 }
 
 impl Fabric {
@@ -247,8 +247,8 @@ pub(super) struct HostMap {
     bytes: usize,
 }
 
-// SAFETY: the mapping is plain shared memory; the struct only hands out
-// its address, and copies through it are ordered by the lanes' tasks.
+// SAFETY: the mapping is plain shared memory; the struct only passes out
+// its address, and copies through it are ordered by the copy threads' tasks.
 unsafe impl Send for HostMap {}
 // SAFETY: as for Send above; shared references only read the address.
 unsafe impl Sync for HostMap {}

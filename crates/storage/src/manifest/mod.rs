@@ -37,16 +37,15 @@
 //! 5. Padding the target holds is zeroed ([`Fill`]); regions no source
 //!    holds are reported ([`Missing`]) for the target to load.
 //!
-//! A [`Planner`] caches each pair's executable manifest. Participating
-//! workers consume that concrete plan. [`BoundManifest::spans`]
+//! Participating workers consume one concrete manifest. [`BoundManifest::spans`]
 //! turns the copies into the spans of a transfer between the chunks the
-//! Storage Server retains ([`crate::protocol::Request::Transfer`]), which
+//! Storage Server retains ([`crate::protocol::Request::Submit`]), which
 //! its Transfer Server executes. The source epoch of weights is what the
 //! manifests an epoch retains name ([`weights::sources`]).
 
 pub mod cache;
+mod compute;
 pub mod layout;
-mod plan;
 pub mod region;
 mod tasks;
 #[cfg(test)]
@@ -62,15 +61,7 @@ pub use tasks::{BoundManifest, Spans};
 use crate::Key;
 use crate::protocol::{LinkBandwidth, LinkEnd, Location};
 
-/// Why a manifest cannot be computed or applied.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// A layout or request contradicts itself.
-    #[error("invalid copy manifest input: {0}")]
-    Invalid(String),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
+pub use crate::error::{Error, Result};
 
 use crate::key::Digest;
 
@@ -105,7 +96,7 @@ impl Binding {
         match self {
             Self::Rank => gpu
                 .map(|gpu| LinkEnd::Device { gpu })
-                .ok_or_else(|| Error::Invalid("rank storage names no GPU".into())),
+                .ok_or_else(|| Error::Manifest("rank storage names no GPU".into())),
             Self::Local {
                 at: Location::Host { .. },
             } => Ok(LinkEnd::Host),
@@ -179,7 +170,7 @@ impl Storage {
     ) -> Result<Self> {
         layout.validate()?;
         if page_bytes == 0 {
-            return Err(Error::Invalid("pages of no bytes hold no storage".into()));
+            return Err(Error::Manifest("pages of no bytes hold no storage".into()));
         }
         let pages = layout.bytes.div_ceil(page_bytes);
         let chunks = (0..pages)
@@ -265,7 +256,7 @@ impl Epoch {
     /// this epoch's order and with its bindings; a rank left without
     /// storages is dropped. Readings of retained sources taken at other
     /// times or from other hosts list other storages and bind them from
-    /// their own host; the ranks that plan one manifest together plan it
+    /// their own host; the ranks that compute one manifest together compute it
     /// from this one epoch, which each of them binds ([`Epoch::reading_of`]).
     pub fn common<'a>(&self, others: impl IntoIterator<Item = &'a Epoch> + Clone) -> Epoch {
         let ranks = self
@@ -290,12 +281,12 @@ impl Epoch {
         Epoch { ranks }
     }
 
-    /// This reading's storages that `plan` names, in `plan`'s order and
-    /// with this reading's bindings: the source epoch a plan made from
-    /// `plan` binds on this reader's host ([`Manifest::bind`]). `None` when
+    /// This reading's storages that `source` names, in `source`'s order and
+    /// with this reading's bindings: the source epoch a manifest computed from
+    /// `source` binds on this reader's host ([`Manifest::bind`]). `None` when
     /// this reading lacks one of them.
-    pub fn reading_of(&self, plan: &Epoch) -> Option<Epoch> {
-        let ranks = plan
+    pub fn reading_of(&self, source: &Epoch) -> Option<Epoch> {
+        let ranks = source
             .ranks
             .iter()
             .map(|rank| {
@@ -341,7 +332,7 @@ impl Request {
     /// The digest of everything the manifest is computed from.
     pub fn digest(&self) -> Result<[u8; 32]> {
         let encoded = rmp_serde::to_vec(self)
-            .map_err(|error| Error::Invalid(format!("encoding a manifest request: {error}")))?;
+            .map_err(|error| Error::Manifest(format!("encoding a manifest request: {error}")))?;
         let mut digest = Digest::new(b"uniserve-manifest-request");
         digest.bytes(&encoded);
         Ok(digest.finish())
@@ -483,8 +474,8 @@ pub struct Manifest {
 
 impl Manifest {
     /// Compute the manifest of `request`.
-    pub fn plan(request: &Request) -> Result<Self> {
-        plan::plan(request)
+    pub fn compute(request: &Request) -> Result<Self> {
+        compute::compute(request)
     }
 
     /// The digest of everything the manifest directs.
@@ -501,7 +492,7 @@ impl Manifest {
             &self.missing,
         );
         let encoded = rmp_serde::to_vec(&directed)
-            .map_err(|error| Error::Invalid(format!("encoding a manifest: {error}")))?;
+            .map_err(|error| Error::Manifest(format!("encoding a manifest: {error}")))?;
         let mut digest = Digest::new(b"uniserve-manifest");
         digest.bytes(&encoded);
         Ok(digest.finish())
@@ -547,9 +538,3 @@ impl Manifest {
         peak
     }
 }
-
-/// Computes each request's manifest once.
-#[derive(Default)]
-pub struct Planner {}
-
-impl Planner {}

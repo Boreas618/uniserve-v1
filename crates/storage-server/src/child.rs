@@ -27,7 +27,7 @@ pub struct Launch {
 }
 
 /// One child process the server keeps running.
-pub(super) struct Supervised {
+pub(super) struct Process {
     /// What the child is, for the log.
     name: &'static str,
     launch: Option<Launch>,
@@ -37,7 +37,7 @@ pub(super) struct Supervised {
     restart: Option<Instant>,
 }
 
-impl Supervised {
+impl Process {
     /// A child started by `launch`, due at once; none without a launch.
     pub(super) fn new(name: &'static str, launch: Option<Launch>) -> Self {
         let restart = launch.as_ref().map(|_| Instant::now());
@@ -100,7 +100,7 @@ impl Supervised {
         }
     }
 
-    /// End the child and wait for it, as a hot restart does before its
+    /// End the child and wait for it, as a restart in place does before its
     /// successor starts one of its own; none starts here again.
     pub(super) fn stop(&mut self) {
         self.launch = None;

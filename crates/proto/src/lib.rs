@@ -48,13 +48,28 @@ pub mod handoff {
     include!(concat!(env!("OUT_DIR"), "/uniserve.handoff.rs"));
 }
 
+/// The revision of the messages this crate states (the process, request and
+/// handoff interfaces). A change that only adds messages or fields leaves it;
+/// any other change raises it.
+const MESSAGES_REVISION: u32 = 1;
+
+/// The storage protocol's version at version 1 of the engine interface.
+const STORAGE_PROTOCOL_BASE: u32 = 21;
+
 /// The version of the engine interface: every message an engine exchanges with
 /// the daemon (the process and request interfaces), the Storage Server and the
 /// Build Server. The interface has this one version. The engine package's
 /// manifest states it, an engine sends it in its hello, and a daemon refuses
-/// an engine built for another version. A change that only adds messages or
-/// fields leaves the version; any other change raises it.
-pub const ENGINE_INTERFACE_VERSION: u32 = 1;
+/// an engine built for another version.
+///
+/// The version carries the storage protocol's (`storage::protocol::VERSION`):
+/// each version of that protocol past the base raises it by one, as each
+/// change of this crate's messages that is not an addition does. Neither
+/// term ever falls, so an engine built for another storage protocol states
+/// another interface version and is refused at its hello, before any of its
+/// ranks reaches the Storage Server.
+pub const ENGINE_INTERFACE_VERSION: u32 =
+    MESSAGES_REVISION + (storage::protocol::VERSION - STORAGE_PROTOCOL_BASE);
 
 /// The environment variable that names a supervised process's lifeline: the
 /// descriptor number of the read end of a pipe whose write end its daemon

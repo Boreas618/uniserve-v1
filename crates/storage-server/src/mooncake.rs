@@ -33,28 +33,17 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use mooncake_store::{MooncakeStore, StoreError};
+use mooncake_store::MooncakeStore;
 use rustix::event::{PollFd, PollFlags, poll};
 
 use ::storage::client::Client;
 use ::storage::connector::Settings;
-use ::storage::protocol::{Event, Key, PageShape, Reply, Request, Role};
+use ::storage::protocol::{Event, Key, PageShape, Request, Response, Role};
 
 /// The most pages one Mooncake call carries.
 pub const BATCH_PAGES: usize = 128;
 
-/// Why the connector stopped.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("mooncake: {0}")]
-    Mooncake(#[from] StoreError),
-    #[error(transparent)]
-    Storage(#[from] ::storage::client::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error("{0}")]
-    Settings(String),
-}
+use crate::Error;
 
 /// The bytes Mooncake's client keeps for transfers that do not come from a
 /// registered buffer. Every page moves between a registered pool and
@@ -63,14 +52,14 @@ const LOCAL_BUFFER_BYTES: u64 = 16 << 20;
 
 /// One page pool, mapped into the connector and registered with Mooncake.
 #[derive(Clone, Copy)]
-struct Mapped {
+struct Mapping {
     /// The address of slot 0.
     base: usize,
     slots: u64,
     shape: PageShape,
 }
 
-impl Mapped {
+impl Mapping {
     /// The object key of `key`'s page in this pool.
     fn object(&self, key: &Key) -> String {
         format!(
@@ -111,7 +100,7 @@ enum Job {
 /// The connector's state shared with its worker threads.
 struct Shared {
     store: MooncakeStore,
-    pools: Mutex<HashMap<u64, Mapped>>,
+    pools: Mutex<HashMap<u64, Mapping>>,
     /// Results of finished tasks, waiting for the main thread to report
     /// them.
     finished: Mutex<Vec<(u64, Vec<bool>)>>,
@@ -174,9 +163,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
             Ok(()) => {}
             // The server closes the connection when it stops, which ends
             // the connector.
-            Err(::storage::client::Error::Io(error))
-                if error.kind() == io::ErrorKind::UnexpectedEof =>
-            {
+            Err(::storage::Error::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
                 tracing::info!("the storage server closed the connection");
                 return Ok(());
             }
@@ -216,17 +203,17 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
                 }
                 // The events of heads, workers and the Transfer Server.
                 Event::Prefetched { .. }
-                | Event::TransferProgress { .. }
-                | Event::Transferred { .. }
+                | Event::TaskProgress { .. }
+                | Event::TaskEnded { .. }
                 | Event::Allocation { .. }
                 | Event::AllocationReleased { .. }
-                | Event::Transfer { .. }
+                | Event::Task { .. }
                 | Event::Cancel { .. }
                 | Event::Throttle { .. }
                 | Event::Register { .. }
                 | Event::Deregister { .. }
                 | Event::Allocate { .. }
-                | Event::TransferSession { .. } => {}
+                | Event::Session { .. } => {}
             }
         }
         let finished = std::mem::take(&mut *lock(&shared.finished));
@@ -236,8 +223,8 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
         // The server acknowledges each report; an error names a task it no
         // longer holds, which changes nothing here.
         reports.retain(|id| match client.take(*id) {
-            Some(answer) => {
-                if let Reply::Error { message, .. } = answer.reply {
+            Some((response, _)) => {
+                if let Response::Error { message, .. } = response {
                     tracing::warn!(message, "the storage server refused a task's results");
                 }
                 false
@@ -302,7 +289,7 @@ impl Shared {
         }
     }
 
-    fn pool(&self, pool: u64) -> Option<Mapped> {
+    fn pool(&self, pool: u64) -> Option<Mapping> {
         lock(&self.pools).get(&pool).copied()
     }
 
@@ -376,7 +363,7 @@ fn map(
     descriptor: OwnedFd,
     shape: PageShape,
     slots: u64,
-) -> io::Result<Mapped> {
+) -> io::Result<Mapping> {
     let bytes = (slots * shape.page_bytes) as usize;
     // SAFETY: a fresh shared mapping of the whole memfd, which the server
     // sized to `slots * page_bytes`.
@@ -395,7 +382,7 @@ fn map(
     unsafe { store.register_buffer(base, bytes) }.map_err(|error| {
         io::Error::other(format!("registering a page pool with Mooncake: {error}"))
     })?;
-    Ok(Mapped {
+    Ok(Mapping {
         base: base as usize,
         slots,
         shape,
@@ -403,7 +390,7 @@ fn map(
 }
 
 /// Unregister a released pool's mapping from Mooncake and unmap it.
-fn unmap(store: &MooncakeStore, mapped: Mapped) {
+fn unmap(store: &MooncakeStore, mapped: Mapping) {
     let base = mapped.base as *mut c_void;
     // SAFETY: a mapping `map` registered; no task reads or writes it.
     if let Err(error) = unsafe { store.unregister_buffer(base) } {

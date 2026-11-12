@@ -14,7 +14,7 @@ those tokens. The client reads one uninterrupted stream, equal to the count
 the committed epoch decodes for the same request alone, with the same usage.
 
 - A commit releases the previous epoch: its engine's process exits and the
-  ledgers book the committed epoch alone. The trial refuses another change
+  quotas reserve the committed epoch alone. The trial refuses another change
   meanwhile. The deployment runs on one GPU, as two schedulers sharing their
   experts (``--data-parallel-size 2`` with expert parallelism), or as
   attention and expert workers exchanging through DeepEP.
@@ -32,7 +32,7 @@ the committed epoch decodes for the same request alone, with the same usage.
 What the tests check is what the admin API reports: ``PUT /admin/config``
 answers the change it started, ``GET /admin/config`` the epoch that executes
 (``executing``), the update with its phase (``update``), the node's main
-processes (``processes``) and every GPU's storage ledger (``ledgers``), and
+processes (``processes``) and every GPU's quota (``quotas``), and
 ``/metrics`` the prefix cache's counters. The tests print the pause of every
 promotion. Each runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points
 the daemon at a directory of the test's, and the server the daemon starts
@@ -418,26 +418,26 @@ def _planned(base_url: str, *assignments: str, **body: object) -> dict:
     return plan
 
 
-def _ledgers(status: dict) -> list[dict]:
-    """Every GPU's storage ledger ``GET /admin/config`` reports, each of
+def _quotas(status: dict) -> list[dict]:
+    """Every GPU's quota ``GET /admin/config`` reports, each of
     whose entries' bytes sum to no more than its quota.
     """  # noqa: D205
-    nodes = status["ledgers"]
+    nodes = status["quotas"]
     assert isinstance(nodes, list) and nodes, status
-    ledgers = [ledger for node in nodes for ledger in node["ledgers"]]
-    assert ledgers, status
-    for ledger in ledgers:
-        used = sum(entry["bytes"] for entry in ledger["entries"])
-        assert ledger["quota"] is not None and used <= ledger["quota"], ledger
-    return ledgers
+    quotas = [quota for node in nodes for quota in node["quotas"]]
+    assert quotas, status
+    for quota in quotas:
+        used = sum(entry["bytes"] for entry in quota["reservations"])
+        assert quota["limit"] is not None and used <= quota["limit"], quota
+    return quotas
 
 
-def _epochs_of(ledgers: list[dict], item: str) -> set[tuple[int, ...]]:
-    """The sets of epochs holding the ledgers' entries of `item`."""
+def _epochs_of(quotas: list[dict], item: str) -> set[tuple[int, ...]]:
+    """The sets of epochs holding the quotas' entries of `item`."""
     return {
         tuple(entry["epochs"])
-        for ledger in ledgers
-        for entry in ledger["entries"]
+        for quota in quotas
+        for entry in quota["reservations"]
         if entry["item"] == item
     }
 
@@ -463,11 +463,11 @@ def test_a_epoch_change_continues_a_streaming_request_and_commits(
     with _serve(tmp_path, name, devices, options) as base_url:
         serving = _executing(base_url)
         engines_before = _engine_pids(base_url)
-        # Every GPU's ledger books the serving epoch alone, within its
+        # Every GPU's quota reserves the serving epoch alone, within its
         # quota: its weights, KV cache segments, graph pool and process.
-        ledgers = _ledgers(admin_config(base_url))
+        quotas = _quotas(admin_config(base_url))
         for item in ("weights", "cache_segment", "graph_pool", "process"):
-            assert _epochs_of(ledgers, item) == {(serving,)}, ledgers
+            assert _epochs_of(quotas, item) == {(serving,)}, quotas
 
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
@@ -488,14 +488,14 @@ def test_a_epoch_change_continues_a_streaming_request_and_commits(
         # The successor serves on trial beside the parked previous epoch,
         # whose main process still runs, and the trial refuses another
         # change. Both epochs share each GPU's quota: the weights and the
-        # segments the successor maps are booked once, held by both, beside
+        # segments the successor maps are reserved once, held by both, beside
         # each epoch's graph pool and process.
         assert all(runs(pid) for pid in engines_before), engines_before
-        ledgers = _ledgers(admin_config(base_url))
+        quotas = _quotas(admin_config(base_url))
         both = (serving, epoch)
-        assert _epochs_of(ledgers, "weights") == {both}, ledgers
-        assert both in _epochs_of(ledgers, "cache_segment"), ledgers
-        assert _epochs_of(ledgers, "process") == {(serving,), (epoch,)}
+        assert _epochs_of(quotas, "weights") == {both}, quotas
+        assert both in _epochs_of(quotas, "cache_segment"), quotas
+        assert _epochs_of(quotas, "process") == {(serving,), (epoch,)}
         refused = _apply(base_url, "max_running_requests=4")
         assert refused.status_code == 409, refused.text
 
@@ -519,17 +519,17 @@ def test_a_epoch_change_continues_a_streaming_request_and_commits(
         graphs = tomllib.loads(status["config"])["cuda_graph_config"]
         assert graphs["decode_batch_sizes"] == [1, 2, 4, 8, 16], graphs
         # The commit released everything only the previous epoch held: the
-        # segments the successor mapped are its own on the ledger now. The
-        # previous epoch's workers end their bookings as their processes
+        # segments the successor mapped are its own on the quota now. The
+        # previous epoch's workers end their reservations as their processes
         # exit, a moment after its engine's.
         items = ("weights", "cache_segment", "graph_pool", "process")
         wait_until(
             lambda: all(
-                _epochs_of(_ledgers(admin_config(base_url)), item) == {(epoch,)}
+                _epochs_of(_quotas(admin_config(base_url)), item) == {(epoch,)}
                 for item in items
             ),
             30,
-            "the ledgers did not book the committed epoch alone",
+            "the quotas did not reserve the committed epoch alone",
         )
         # The previous epoch's engine exited at the commit.
         for pid in engines_before:
@@ -710,7 +710,7 @@ def test_a_change_of_the_executable_alone_invalidates_nothing(tmp_path: Path):
         # Graph capture changes none of the weights or page keys: the
         # successor maps every weight the serving epoch holds.
         _, epoch = _epoch_change(base_url, CHANGE)
-        weights = _epochs_of(_ledgers(admin_config(base_url)), "weights")
+        weights = _epochs_of(_quotas(admin_config(base_url)), "weights")
         assert weights == {(serving, epoch)}, weights
         _commit(base_url)
 
@@ -776,7 +776,7 @@ WEIGHTS_SHARE = ("--set", "mem_fraction_static=0.9")
 
 def _weights_of(base_url: str) -> set[tuple[int, ...]]:
     """The sets of epochs holding weights on the deployment's GPUs."""
-    return _epochs_of(_ledgers(admin_config(base_url)), "weights")
+    return _epochs_of(_quotas(admin_config(base_url)), "weights")
 
 
 @pytest.mark.parametrize(
@@ -835,7 +835,7 @@ def test_a_change_of_model_files_loads_the_successors_weights(
         # The successor answers with its own weights. Both epochs hold the
         # tensors the checkpoints share; the previous epoch keeps its other
         # weights on the GPU, or in host storage, which leaves no weights of
-        # the previous epoch alone in the GPU's ledger.
+        # the previous epoch alone in the GPU's quota.
         changed = _chat(base_url, name, CACHED_PROMPT)
         assert changed != original, "the checkpoints answer alike"
         shared = {(previous, epoch)}
@@ -932,8 +932,8 @@ def _segments_of(base_url: str, epoch: int) -> int:
     """The KV cache segments `epoch` holds on the deployment's GPUs."""
     return sum(
         1
-        for ledger in _ledgers(admin_config(base_url))
-        for entry in ledger["entries"]
+        for quota in _quotas(admin_config(base_url))
+        for entry in quota["reservations"]
         if entry["item"] == "cache_segment" and epoch in entry["epochs"]
     )
 

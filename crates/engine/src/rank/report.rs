@@ -74,7 +74,7 @@ impl MediaBounds {
 
 /// The products `component` publishes, under the names a request's graph asks for them.
 ///
-/// A media rank's products stay in the process, in the product store, and the scheduler books
+/// A media rank's products stay in the process, in the product store, and the scheduler reserves
 /// nothing for a rank with no buffer pool. So what this states is the name and the one axis a
 /// request's extent binds, with the deployment's real bound on it: admission refuses a request past
 /// that bound, which is the check a batch that fits no bucket would otherwise fail much later. The

@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use ipc::{CallId, EncoderPoolInfo, HostOutput, RequestKey};
 use storage::key::{encoder_output as content, encoder_page as page_key};
-use storage::protocol::{PageSlot, Reply};
+use storage::protocol::{PageSlot, Response};
 use storage::{Key, Scope};
 
 use crate::host_pages::{Purpose, Servers};
@@ -678,7 +678,7 @@ impl EncoderStore {
                 (Asked::Pin { request, output }, reply) => {
                     moved = true;
                     let slots = match reply {
-                        Reply::Pinned { slots } => slots,
+                        Response::Pinned { slots } => slots,
                         other => {
                             tracing::warn!(?other, "a host encoder pool pin failed");
                             Vec::new()
@@ -689,7 +689,7 @@ impl EncoderStore {
                 (Asked::Reserve { request, output }, reply) => {
                     moved = true;
                     let slots = match reply {
-                        Reply::Reserved { slots } => slots,
+                        Response::Reserved { slots } => slots,
                         other => {
                             tracing::warn!(?other, "a host encoder pool reservation failed");
                             Vec::new()

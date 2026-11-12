@@ -8,7 +8,7 @@
 //!
 //! - **Source.** The server has the Transfer Server register allocations a
 //!   peer asked it to expose ([`Event::Register`]): host storage with the
-//!   allocation ([`Mapped::nixl_host_region`]), device storage in its GPU's
+//!   allocation ([`Mapping::nixl_host_region`]), device storage in its GPU's
 //!   session, which the exposure holds until the peer ends it
 //!   ([`Event::Deregister`]); the report carries each range and the agent's
 //!   metadata taken after the registrations ([`register`]).
@@ -18,13 +18,13 @@
 //!   it as a [`Role::Peer`], to expose the task's regions there
 //!   ([`Request::Expose`]), loads the metadata of the agent that registered
 //!   them, checks each span against its region's range and registers each
-//!   destination with this agent; network lanes then post the READs
-//!   ([`super::lanes`]). Once the task ended, its exposures end
+//!   destination with this agent; network copy threads then post the READs
+//!   ([`super::threads`]). Once the task ended, its exposures end
 //!   ([`Network::unexpose`]), so that the other host releases what it holds
 //!   for them, GPU contexts among them.
 //!
 //! A source whose creator recorded its device allocation's fabric handle
-//! ([`Registered::fabric`]) is copied over the NVLink fabric instead,
+//! ([`Registration::fabric`]) is copied over the NVLink fabric instead,
 //! whenever the handle imports on the destination's GPU: the destination's
 //! copy engines read it as they read another host's region a task names by
 //! fabric handle. A handle that does not import (the GPUs share no fabric,
@@ -32,7 +32,7 @@
 //! the registration the exposure made.
 //!
 //! An agent's name is unique to its process, so a peer whose Transfer
-//! Server restarted answers with another agent: its metadata is loaded and
+//! Server restarted responds with another agent: its metadata is loaded and
 //! the previous agent's forgotten, and the new one registers the regions
 //! afresh, since its server gives it every allocation again. Regions are
 //! exposed for each task, not remembered between tasks: a region's
@@ -49,17 +49,17 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::storage::Client;
-use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registered};
+use ::storage::protocol::{FabricExport, Link, LinkEnd, Region, Registration};
 use platform::DeviceId;
 
 use super::contexts::Hold;
-use super::lanes::{End, LaneKey, Piece, Runner};
-use super::storage::{Fabric, Mapped};
+use super::storage::{Fabric, Mapping};
+use super::threads::{End, Piece, Runner, ThreadKey};
 
 /// How long another host's Storage Server may take to accept the connection
-/// and to answer an exposure: far longer than registering the largest
+/// and to respond to an exposure: far longer than registering the largest
 /// region takes there (pinning a host page pool of tens of GiB takes
-/// seconds), so that only a host that stopped answering reaches it.
+/// seconds), so that only a host that stopped responding to reaches it.
 const PEER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The process's NIXL agent and its connections to other hosts' Storage
@@ -109,7 +109,7 @@ pub(super) struct Inbound {
     pub(super) deployment: String,
     pub(super) region: Region,
     pub(super) source_offset: u64,
-    pub(super) destination: Arc<Mapped>,
+    pub(super) destination: Arc<Mapping>,
     pub(super) hold: Option<Hold>,
     pub(super) destination_offset: u64,
     /// The bytes of each row, the rows, and their pitches on each side, as
@@ -126,16 +126,16 @@ pub(super) struct Lease {
     exposure: u64,
 }
 
-/// A task's pieces from other hosts, each on its lane, and the exposures
+/// A task's pieces from other hosts, each on its copy thread, and the exposures
 /// it ends when it ends.
 pub(super) struct Sources {
-    pub(super) pieces: Vec<(LaneKey, Piece)>,
+    pub(super) pieces: Vec<(ThreadKey, Piece)>,
     pub(super) leases: Vec<Lease>,
 }
 
 /// An allocation exposed to another host, with the hold on its GPU for
 /// device storage.
-pub(super) type Exposed = (Arc<Mapped>, Option<Hold>);
+pub(super) type Exposed = (Arc<Mapping>, Option<Hold>);
 
 impl Network {
     pub(super) fn new(library: Option<PathBuf>) -> Self {
@@ -164,13 +164,13 @@ impl Network {
             .map_err(Clone::clone)
     }
 
-    /// The pieces of task `task`'s moves from other hosts, each on the lane
+    /// The pieces of task `task`'s moves from other hosts, each on the copy thread
     /// of its link from the source host's storage, and the exposures the task
     /// ends when it ends: every host exposes the task's regions there in one
     /// request per deployment, and every destination is registered with this
     /// agent, so a task whose sources or destinations cannot be read or
     /// written fails before its first READ, ending the exposures it got.
-    /// Blocks on the other hosts' answers and on the destinations' GPU
+    /// Blocks on the other hosts' responses and on the destinations' GPU
     /// contexts.
     pub(super) fn pieces(&self, task: u64, moves: Vec<Inbound>) -> Result<Sources, String> {
         let mut leases = Vec::new();
@@ -190,7 +190,7 @@ impl Network {
         task: u64,
         moves: Vec<Inbound>,
         leases: &mut Vec<Lease>,
-    ) -> Result<Vec<(LaneKey, Piece)>, String> {
+    ) -> Result<Vec<(ThreadKey, Piece)>, String> {
         let mut wanted: HashMap<(String, String), Vec<Region>> = HashMap::new();
         for copy in &moves {
             let regions = wanted
@@ -283,13 +283,13 @@ impl Network {
             };
             if let (Some(fabric), Some(hold)) = (source.fabric, hold) {
                 match over_fabric(source, fabric, mapped, hold, &mut imports) {
-                    Ok((lane, import)) => {
+                    Ok((thread, import)) => {
                         let source_offset = fabric
                             .offset
                             .checked_add(read.source_offset)
                             .ok_or("a span's source offset overflows")?;
                         pieces.push((
-                            lane,
+                            thread,
                             Piece {
                                 source: import,
                                 source_offset,
@@ -314,7 +314,7 @@ impl Network {
                 destination: mapped.end.clone(),
             };
             pieces.push((
-                LaneKey {
+                ThreadKey {
                     link,
                     runner: Runner::Network,
                 },
@@ -361,7 +361,7 @@ impl Network {
         endpoint: &str,
         deployment: &str,
         regions: Vec<Region>,
-    ) -> Result<(String, u64, Vec<Registered>), String> {
+    ) -> Result<(String, u64, Vec<Registration>), String> {
         let host = self.host(endpoint);
         let mut host = host.lock().unwrap_or_else(PoisonError::into_inner);
         tracing::debug!(
@@ -409,7 +409,7 @@ impl Host {
         endpoint: &str,
         deployment: &str,
         regions: Vec<Region>,
-    ) -> ::storage::Result<(u64, Vec<u8>, Vec<Registered>)> {
+    ) -> ::storage::Result<(u64, Vec<u8>, Vec<Registration>)> {
         let mut retry = self.client.is_some();
         loop {
             let client = match &mut self.client {
@@ -426,15 +426,15 @@ impl Host {
                     }
                     retry = false;
                 }
-                // The server's answer, an exposure or a refusal, leaves the
+                // The server's response, an exposure or a refusal, leaves the
                 // connection usable.
-                answered => return answered,
+                responded => return responded,
             }
         }
     }
 }
 
-/// The lane and the source end of a move from `source`, which its host
+/// The copy thread and the source end of a move from `source`, which its host
 /// exposed with the fabric handle `fabric`, into `destination`, copied over
 /// the NVLink fabric by the copy engines of the destination's GPU, which
 /// `hold` holds; the move's source offset counts from the exposed range's
@@ -445,10 +445,10 @@ impl Host {
 fn over_fabric(
     source: &Source,
     fabric: FabricExport,
-    destination: &Mapped,
+    destination: &Mapping,
     hold: &Hold,
     imports: &mut HashMap<([u8; 64], DeviceId), Arc<Fabric>>,
-) -> Result<(LaneKey, End), String> {
+) -> Result<(ThreadKey, End), String> {
     let LinkEnd::Remote { gpu: Some(gpu), .. } = &source.end else {
         return Err("a fabric handle names device storage".into());
     };
@@ -462,7 +462,7 @@ fn over_fabric(
     );
     import.address()?;
     Ok((
-        LaneKey {
+        ThreadKey {
             link: Link {
                 source: LinkEnd::Device { gpu: *gpu },
                 destination: destination.end.clone(),
@@ -483,7 +483,7 @@ fn over_fabric(
 pub(super) fn register(
     network: &Network,
     allocations: &[Exposed],
-) -> Result<(Vec<u8>, Vec<Registered>), String> {
+) -> Result<(Vec<u8>, Vec<Registration>), String> {
     let agent = network.agent()?;
     let ranges = allocations
         .iter()
@@ -492,7 +492,7 @@ pub(super) fn register(
                 Some(hold) => hold.session()?.nixl_region(agent, mapped)?,
                 None => mapped.nixl_host_region(agent)?,
             };
-            Ok(Registered {
+            Ok(Registration {
                 end: mapped.end.clone(),
                 key: region.key,
                 address: region.address,
@@ -509,7 +509,7 @@ pub(super) fn register(
 }
 
 /// A range another host's agent registered, as this agent's READs name it.
-fn source_region(range: &Registered) -> Result<nixl::Region, String> {
+fn source_region(range: &Registration) -> Result<nixl::Region, String> {
     let segment = match range.end {
         LinkEnd::Host => nixl::Segment::Host,
         LinkEnd::Device { .. } => nixl::Segment::Device,

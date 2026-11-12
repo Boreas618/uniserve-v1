@@ -1,10 +1,10 @@
-//! Device storage accounting against the GPU's storage ledger.
+//! Device storage accounting against the GPU's quota.
 //!
 //! A deployment may use `⌊total × fraction⌋` of a GPU (its quota), and every
 //! epoch of the deployment that uses the GPU, with the host's Transfer
 //! Server, holds its storage within that one quota: the host's Storage Server
-//! keeps the GPU's ledger (`::storage::GpuLedger`). A rank's grant is the
-//! quota less everything the ledger books beside the rank's own process
+//! keeps the GPU's quota (`::storage::Quota`). A rank's grant is the
+//! quota less everything the quota reserves beside the rank's own process
 //! (another epoch's weights, KV cache segments, graph pool and process, the
 //! Transfer Server's context, the storages this rank's scope retains) and
 //! less what the process holds now, never more than the device has free.
@@ -20,7 +20,7 @@
 //! returns unused cached blocks, so reusable cache does not count against
 //! the grant. NVML attributes storage held only through descriptors to no
 //! process, so the storages the Storage Server retains count through the
-//! ledger instead: the weights, the exclusive storages and the KV cache
+//! quota instead: the weights, the exclusive storages and the KV cache
 //! segments. So does the part of the plugins' communication buffers NVML
 //! attributes to no process, which counts as the process's own.
 //!
@@ -28,27 +28,27 @@
 //! the rank has not taken yet are about to be reused or released by its
 //! owners, so they count as free.
 //!
-//! Once warm, the rank books what the server cannot see in the ledger
-//! ([`DeviceBudget::book`]): its graph pools' storage and what its process
+//! Once warm, the rank reserves what the server cannot see in the quota
+//! ([`DeviceBudget::reserve`]): its graph pools' storage and what its process
 //! holds beside them, with the product storage it has yet to make resident.
 //!
 //! An expert transport is such storage, and it comes late: the rank creates it
 //! at its first capture, because only then does it hold the program that knows
 //! its size. The plan therefore fits the cache around a bound of it
 //! (`RankFacts::transport_bytes`), the rank compares that bound with what the
-//! creation took, and the booking after warmup counts the real figure in the
+//! creation took, and the reservation after warmup counts the real figure in the
 //! process's item.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ::storage::{GpuLedger, Item};
+use ::storage::{Item, Quota};
 use platform::{DeviceId, Nvml};
 
 use crate::memory::retained::Retained;
 use crate::{Error, Result};
 
-/// Per-process device storage measurements against the GPU's ledger.
+/// Per-process device storage measurements against the GPU's quota.
 pub struct DeviceBudget {
     nvml: Nvml,
     retained: Arc<Retained>,
@@ -102,26 +102,26 @@ impl DeviceBudget {
     /// scope retains there.
     #[allow(
         dead_code,
-        reason = "the warm booking reads `own_bytes`; this states the whole"
+        reason = "the warm reservation reads `own_bytes`; this states the whole"
     )]
     pub(crate) fn process_bytes(&self, device: DeviceId) -> Result<u64> {
         Ok(self.own_bytes(device)? + self.retained.scope_bytes(device)?.held)
     }
 
-    /// What the warm rank books on `device`, for `fraction` of it: its graph
+    /// What the warm rank reserves on `device`, for `fraction` of it: its graph
     /// pools' `graph` bytes, and what the process holds beside them and the
     /// retained storages, with the `pending` bytes of product storage it
     /// has yet to make resident.
-    pub fn booking(
+    pub fn reservation(
         &self,
         device: DeviceId,
         fraction: f64,
         graph: u64,
         pending: u64,
-    ) -> Result<DeviceBooking> {
+    ) -> Result<DeviceReservation> {
         let own = self.own_bytes(device)?;
         let total = device.memory_info()?.total;
-        Ok(DeviceBooking {
+        Ok(DeviceReservation {
             device,
             total,
             quota: super::quota(total, fraction),
@@ -132,10 +132,10 @@ impl DeviceBudget {
     }
 }
 
-/// What a warm rank books on one device: the items of its process the
+/// What a warm rank reserves on one device: the items of its process the
 /// Storage Server cannot see.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeviceBooking {
+pub struct DeviceReservation {
     pub device: DeviceId,
     /// The device's total storage.
     pub total: u64,
@@ -149,22 +149,22 @@ pub struct DeviceBooking {
     pub process: u64,
     /// The device storage a profiling session's collectors hold while the
     /// session runs (the range profiler's pass), which the process's item
-    /// books beside `process`; 0 without a session.
+    /// reserves beside `process`; 0 without a session.
     pub profiling: u64,
 }
 
-impl DeviceBooking {
-    /// Books the items in the GPU's ledger, the graph pool only while
+impl DeviceReservation {
+    /// Reserves the items in the GPU's quota, the graph pool only while
     /// `graphs` are resident: a sleeping rank's graph storage is released.
-    /// Returns the ledger after the booking.
+    /// Returns the quota after the reservation.
     ///
-    /// Fails when the booking takes the ledger past its quota: the rank's
+    /// Fails when the reservation takes a GPU past its quota: the rank's
     /// initialized runtime, with a profiling session's storage, exceeds what
     /// the deployment may hold.
-    pub fn submit(&self, retained: &Retained, graphs: bool) -> Result<GpuLedger> {
+    pub fn submit(&self, retained: &Retained, graphs: bool) -> Result<Quota> {
         let graph = if graphs { self.graph } else { 0 };
         let process = self.process + self.profiling;
-        let ledger = retained.book(
+        let quota = retained.reserve(
             self.device,
             self.total,
             self.quota,
@@ -175,10 +175,10 @@ impl DeviceBooking {
             graph_pool = graph,
             process,
             profiling = self.profiling,
-            booked = ledger.used(),
-            quota = ledger.quota,
-            "booked the worker's device storage"
+            reserved = quota.usage(),
+            quota = quota.limit,
+            "reserved the worker's device storage"
         );
-        Ok(ledger)
+        Ok(quota)
     }
 }

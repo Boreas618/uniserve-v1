@@ -4,13 +4,13 @@
 //!
 //! An operator's [`Request::Restart`] starts the successor (`uniserve
 //! storage-server serve ... --predecessor FD`) with one end of a socket pair at that
-//! descriptor and answers with its process id. The server serves on until
+//! descriptor and responds with its process id. The server serves on until
 //! nothing is in flight: no request waits, no shoot-down runs, neither the
 //! connector nor the Transfer Server runs a task, and every reply was
-//! written. It then stops both, and hands the successor its state with
+//! written. It then stops both, and passes the successor its state with
 //! every descriptor it holds: the
 //! listening sockets and their lock, each client's connection and pidfd,
-//! each storage's storage and each page pool's memfd ([`Server::hand_over`]).
+//! each storage's storage and each page pool's memfd ([`Server::handoff`]).
 //! The successor goes on from there ([`Server::resume`]), starts its own
 //! connector and Transfer Server, says it serves, and this server exits. A client's request
 //! sent meanwhile waits in its connection until the successor reads it.
@@ -29,8 +29,8 @@ use ::storage::transport::{Connection, Socket};
 use serde::{Deserialize, Serialize};
 
 use crate::kv_storage::KvStorage;
-use crate::ledger::Ledgers;
-use crate::pages::{HandedPools, Pools};
+use crate::pages::{Pools, PoolsHandoff};
+use crate::quota::Quotas;
 use crate::transfers::Transfers;
 use crate::{ClientId, Deployment, Holder, Launch, Server, StorageEntry, TensorEntry};
 use ::storage::protocol::Retainer;
@@ -38,7 +38,7 @@ use ::storage::protocol::Retainer;
 /// The descriptor a successor finds the handoff socket at.
 pub const PREDECESSOR_DESCRIPTOR: i32 = 3;
 
-/// How long the successor takes to answer.
+/// How long the successor takes to respond.
 const STEP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A restart under way: the successor and this server's end of the
@@ -52,8 +52,8 @@ pub struct Pending {
 #[derive(Debug, Serialize, Deserialize)]
 enum Message {
     /// What the server holds; the descriptors travel in the order
-    /// [`HandedServer`] names them.
-    Takeover(Box<HandedServer>),
+    /// [`Handoff`] names them.
+    Takeover(Box<Handoff>),
     /// The successor serves.
     Serving,
     /// The successor gives up, and why.
@@ -62,52 +62,39 @@ enum Message {
 
 /// A server's state, its descriptors travelling apart: first the listener
 /// and its lock, then the TCP listener when there is one, then every pidfd
-/// of [`HandedServer::pidfds`], every client's connection, every storage's
+/// of [`Handoff::pidfds`], every client's connection, every storage's
 /// storage and every page pool's memfd.
 #[derive(Debug, Serialize, Deserialize)]
-struct HandedServer {
+struct Handoff {
     tcp: Option<String>,
     /// How many pidfds travel; holders and clients name theirs by index.
     pidfds: usize,
-    clients: Vec<HandedClient>,
+    clients: Vec<ClientHandoff>,
     next_client: ClientId,
     storages: Vec<(u64, StorageRecord, usize)>,
     /// The host copies of epochs' weights, with the GPU each left
-    /// ([`crate::moves`]); a predecessor that moved no weights hands none.
-    #[serde(default)]
+    /// ([`crate::moves`]).
     moved: Vec<(u64, [u8; 16])>,
     next_storage: u64,
-    tensors: Vec<(Key, HandedTensor)>,
-    deployments: Vec<(String, Claim, Option<ClientId>)>,
-    /// The epochs each deployment claims, and those it discarded; a
-    /// predecessor that knew no visibility of epochs hands none over, and
-    /// its deployments claim none.
-    #[serde(default)]
-    epochs: Vec<(String, BTreeSet<u64>, BTreeSet<u64>)>,
-    /// Explicit committed epochs. Protocol 12 handoffs describe one
-    /// committed epoch implicitly as the first claimed epoch.
-    #[serde(default)]
-    published: Option<Vec<(String, BTreeSet<u64>)>>,
+    tensors: Vec<(Key, TensorHandoff)>,
+    /// Each deployment's claim, its head and its epochs.
+    deployments: Vec<(String, Deployment)>,
     /// The pidfds of the processes shot down that left every GPU, and of
     /// those that did not leave one in time.
     shot_finished: Vec<usize>,
     shot_failed: Vec<usize>,
-    pages: HandedPools,
+    pages: PoolsHandoff,
     host_reserve: u64,
     relaunch: Vec<String>,
-    /// The GPUs' totals, the epochs' quotas and the bookings of the
-    /// clients the handoff carries; empty from a predecessor that kept no
-    /// ledgers, whose clients book again when they next book.
-    #[serde(default)]
-    ledgers: Ledgers,
-    /// What each deployment's transfer tasks copied, by priority; empty
-    /// from a predecessor that counted none.
-    #[serde(default)]
-    transfer_totals: Vec<(String, Vec<::storage::protocol::TransferTotal>)>,
+    /// The GPUs' totals, the epochs' limits and the reservations of the
+    /// clients the handoff carries.
+    quotas: Quotas,
+    /// What each deployment's tasks copied, by priority.
+    task_totals: Vec<(String, Vec<::storage::protocol::TaskTotal>)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct HandedClient {
+struct ClientHandoff {
     id: ClientId,
     unix: bool,
     pid: i32,
@@ -118,7 +105,7 @@ struct HandedClient {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct HandedTensor {
+struct TensorHandoff {
     name: String,
     storage: u64,
     offset: u64,
@@ -126,30 +113,21 @@ struct HandedTensor {
     shape: Vec<u64>,
     strides: Vec<u64>,
     access: Access,
-    /// The scopes a predecessor that knew no epochs handed over, which
-    /// retain the tensor in epoch 0.
-    #[serde(default)]
-    scopes: BTreeSet<Scope>,
-    #[serde(default)]
     retainers: BTreeSet<Retainer>,
-    /// The deployment and epoch that published the tensor; a predecessor
-    /// that knew no visibility of epochs hands over tensors every epoch
-    /// reads (epoch 0).
-    #[serde(default)]
+    /// The deployment and epoch that published the tensor.
     publisher: (String, u64),
-    writer: Option<HandedHolder>,
-    standby: Vec<HandedHolder>,
+    writer: Option<HolderHandoff>,
+    standby: Vec<HolderHandoff>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct HandedHolder {
+struct HolderHandoff {
     client: Option<ClientId>,
     pid: i32,
     pidfd: usize,
     scope: Scope,
     generation: u64,
     claim: Claim,
-    #[serde(default)]
     epoch: u64,
 }
 
@@ -172,8 +150,8 @@ impl Pidfds {
         self.descriptors.len() - 1
     }
 
-    fn holder(&mut self, holder: &Holder) -> HandedHolder {
-        HandedHolder {
+    fn holder(&mut self, holder: &Holder) -> HolderHandoff {
+        HolderHandoff {
             client: holder.client,
             pid: holder.pid,
             pidfd: self.index(&holder.pidfd),
@@ -186,7 +164,7 @@ impl Pidfds {
 }
 
 impl Server {
-    /// Starts the successor of a hot restart as `executable` (this
+    /// Starts the successor of a restart in place as `executable` (this
     /// server's own when `None`), with the arguments this server was
     /// started with ([`Server::set_relaunch`]); the handoff follows once
     /// nothing is in flight.
@@ -249,7 +227,7 @@ impl Server {
         self.relaunch = arguments;
     }
 
-    /// Hands everything to the successor of `pending`, and returns once it
+    /// Passes everything to the successor of `pending`, and returns once it
     /// serves; this server holds nothing afterwards. `lock` is the
     /// listening socket's lock, which the successor holds from then on.
     ///
@@ -257,7 +235,7 @@ impl Server {
     ///
     /// Fails when the handoff socket fails or the successor gives up; the
     /// server's state is gone either way.
-    pub fn hand_over(mut self, pending: Pending, lock: OwnedFd) -> io::Result<u32> {
+    pub fn handoff(mut self, pending: Pending, lock: OwnedFd) -> io::Result<u32> {
         // The successor starts a connector and a Transfer Server of its own.
         self.kv_storage.process.stop();
         self.transfers.process.stop();
@@ -266,13 +244,13 @@ impl Server {
         let mut client_descriptors = Vec::with_capacity(self.clients.len());
         for (id, client) in std::mem::take(&mut self.clients) {
             let pidfd = client.pidfd.as_ref().map(|pidfd| pidfds.index(pidfd));
-            let (socket, received) = client.connection.hand_over()?;
+            let (socket, received) = client.connection.handoff()?;
             let (descriptor, unix) = match socket {
                 Socket::Unix(stream) => (OwnedFd::from(stream), true),
                 Socket::Tcp(stream) => (OwnedFd::from(stream), false),
             };
             client_descriptors.push(descriptor);
-            clients.push(HandedClient {
+            clients.push(ClientHandoff {
                 id,
                 unix,
                 pid: client.pid,
@@ -286,7 +264,7 @@ impl Server {
         for ((key, _), tensor) in std::mem::take(&mut self.tensors) {
             tensors.push((
                 key,
-                HandedTensor {
+                TensorHandoff {
                     name: tensor.name,
                     storage: tensor.storage,
                     offset: tensor.offset,
@@ -294,7 +272,6 @@ impl Server {
                     shape: tensor.shape,
                     strides: tensor.strides,
                     access: tensor.access,
-                    scopes: BTreeSet::new(),
                     retainers: tensor.retainers,
                     publisher: tensor.publisher,
                     writer: tensor.writer.as_ref().map(|holder| pidfds.holder(holder)),
@@ -326,7 +303,7 @@ impl Server {
             moved.extend(storage.moved_from.map(|gpu| (id, gpu)));
             storage_descriptors.push(storage._descriptor);
         }
-        let (pages, pool_descriptors) = self.pages.hand_over();
+        let (pages, pool_descriptors) = self.pages.handoff();
 
         let tcp = self.tcp.take();
         let mut descriptors: Vec<OwnedFd> = vec![OwnedFd::from(self.listener.try_clone()?), lock];
@@ -339,7 +316,7 @@ impl Server {
         descriptors.extend(client_descriptors);
         descriptors.extend(storage_descriptors);
         descriptors.extend(pool_descriptors);
-        let handed = HandedServer {
+        let handoff = Handoff {
             tcp: tcp.map(|(_, address)| address),
             pidfds: pidfds.descriptors.len(),
             clients,
@@ -348,35 +325,14 @@ impl Server {
             moved,
             next_storage: self.next_storage,
             tensors,
-            epochs: self
-                .deployments
-                .iter()
-                .map(|(name, deployment)| {
-                    (
-                        name.clone(),
-                        deployment.epochs.clone(),
-                        deployment.discarded.clone(),
-                    )
-                })
-                .collect(),
-            published: Some(
-                self.deployments
-                    .iter()
-                    .map(|(name, deployment)| (name.clone(), deployment.published.clone()))
-                    .collect(),
-            ),
-            deployments: self
-                .deployments
-                .drain()
-                .map(|(name, deployment)| (name, deployment.claim, deployment.head))
-                .collect(),
+            deployments: self.deployments.drain().collect(),
             shot_finished,
             shot_failed,
             pages,
             host_reserve: self.host_reserve,
             relaunch: std::mem::take(&mut self.relaunch),
-            ledgers: std::mem::take(&mut self.ledgers),
-            transfer_totals: self.transfers.handed_totals(),
+            quotas: std::mem::take(&mut self.quotas),
+            task_totals: self.transfers.task_totals(),
         };
 
         let Pending {
@@ -386,7 +342,7 @@ impl Server {
         let pid = successor.id();
         let mut connection = Connection::new(channel);
         let borrowed: Vec<BorrowedFd<'_>> = descriptors.iter().map(|fd| fd.as_fd()).collect();
-        connection.send(&Message::Takeover(Box::new(handed)), &borrowed)?;
+        connection.send(&Message::Takeover(Box::new(handoff)), &borrowed)?;
         while !connection.flush()? {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -403,7 +359,7 @@ impl Server {
                         "the successor server gave up: {reason}"
                     ))),
                     Message::Takeover(_) => Err(io::Error::other(
-                        "the successor server answered out of protocol",
+                        "the successor server responded out of protocol",
                     )),
                 };
             }
@@ -413,14 +369,14 @@ impl Server {
                 )));
             }
             if Instant::now() >= deadline || connection.is_closed() {
-                return Err(io::Error::other("the successor server did not answer"));
+                return Err(io::Error::other("the successor server did not respond"));
             }
             std::thread::sleep(Duration::from_millis(5));
             connection.receive()?;
         }
     }
 
-    /// Goes on with the server a predecessor hands over on the handoff
+    /// Goes on with the server a predecessor passed on over the handoff
     /// socket at `descriptor`, running the connector `connector` and the
     /// Transfer Server `transfer` as the predecessor did; returns the server
     /// and the listening socket's lock.
@@ -450,10 +406,10 @@ impl Server {
             connection.receive()?;
             std::thread::sleep(Duration::from_millis(5));
         };
-        let Message::Takeover(handed) = message else {
+        let Message::Takeover(handoff) = message else {
             return Err(io::Error::other("the predecessor sent no takeover"));
         };
-        match Self::rebuild(*handed, descriptors, connector, transfer) {
+        match Self::rebuild(*handoff, descriptors, connector, transfer) {
             Ok(resumed) => {
                 connection.send(&Message::Serving, &[])?;
                 while !connection.flush()? {
@@ -475,7 +431,7 @@ impl Server {
     }
 
     fn rebuild(
-        handed: HandedServer,
+        handoff: Handoff,
         descriptors: Vec<OwnedFd>,
         connector: Option<Launch>,
         transfer: Option<Launch>,
@@ -492,7 +448,7 @@ impl Server {
         let listener = UnixListener::from(next()?);
         listener.set_nonblocking(true)?;
         let lock = next()?;
-        let tcp = match handed.tcp {
+        let tcp = match handoff.tcp {
             Some(address) => {
                 let listener = std::net::TcpListener::from(next()?);
                 listener.set_nonblocking(true)?;
@@ -500,7 +456,7 @@ impl Server {
             }
             None => None,
         };
-        let pidfds: Vec<Arc<OwnedFd>> = (0..handed.pidfds)
+        let pidfds: Vec<Arc<OwnedFd>> = (0..handoff.pidfds)
             .map(|_| next().map(Arc::new))
             .collect::<io::Result<_>>()?;
         let pidfd = |index: usize| {
@@ -509,7 +465,7 @@ impl Server {
             })
         };
         let mut clients = BTreeMap::new();
-        for client in handed.clients {
+        for client in handoff.clients {
             let descriptor = next()?;
             let socket = if client.unix {
                 let stream = UnixStream::from(descriptor);
@@ -532,7 +488,7 @@ impl Server {
                 },
             );
         }
-        let holder = |holder: HandedHolder| -> io::Result<Holder> {
+        let holder = |holder: HolderHandoff| -> io::Result<Holder> {
             Ok(Holder {
                 client: holder.client,
                 pid: holder.pid,
@@ -544,18 +500,18 @@ impl Server {
             })
         };
         // A tensor lies where its storage lies.
-        let locations: HashMap<u64, Location> = handed
+        let locations: HashMap<u64, Location> = handoff
             .storages
             .iter()
             .map(|(id, record, _)| (*id, record.location))
             .collect();
-        let mut tensors = HashMap::with_capacity(handed.tensors.len());
+        let mut tensors = HashMap::with_capacity(handoff.tensors.len());
         let mut copies: HashMap<Key, Vec<Location>> = HashMap::new();
-        for (key, tensor) in handed.tensors {
+        for (key, tensor) in handoff.tensors {
             let location = *locations.get(&tensor.storage).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("handed tensor {} names no storage", tensor.name),
+                    format!("the handoff's tensor {} names no storage", tensor.name),
                 )
             })?;
             copies.entry(key).or_default().push(location);
@@ -569,16 +525,7 @@ impl Server {
                     shape: tensor.shape,
                     strides: tensor.strides,
                     access: tensor.access,
-                    retainers: tensor
-                        .retainers
-                        .into_iter()
-                        .chain(
-                            tensor
-                                .scopes
-                                .into_iter()
-                                .map(|scope| Retainer { scope, epoch: 0 }),
-                        )
-                        .collect(),
+                    retainers: tensor.retainers,
                     publisher: tensor.publisher,
                     writer: tensor.writer.map(holder).transpose()?,
                     standby: tensor
@@ -589,9 +536,9 @@ impl Server {
                 },
             );
         }
-        let moved: HashMap<u64, [u8; 16]> = handed.moved.into_iter().collect();
-        let mut storages = HashMap::with_capacity(handed.storages.len());
-        for (id, record, count) in handed.storages {
+        let moved: HashMap<u64, [u8; 16]> = handoff.moved.into_iter().collect();
+        let mut storages = HashMap::with_capacity(handoff.storages.len());
+        for (id, record, count) in handoff.storages {
             storages.insert(
                 id,
                 StorageEntry {
@@ -604,67 +551,37 @@ impl Server {
             );
         }
         let pool_descriptors: Vec<OwnedFd> = descriptors.collect();
-        let pages = Pools::resume(handed.pages, pool_descriptors)?;
+        let pages = Pools::resume(handoff.pages, pool_descriptors)?;
         let mut shootdowns = crate::shoot::ShootDowns::default();
-        for index in handed.shot_finished {
+        for index in handoff.shot_finished {
             shootdowns.note_finished(pidfd(index)?);
         }
-        for index in handed.shot_failed {
+        for index in handoff.shot_failed {
             shootdowns.note_failed(pidfd(index)?);
         }
         let server = Self {
             listener,
             tcp,
             clients,
-            next_client: handed.next_client,
+            next_client: handoff.next_client,
             storages,
-            next_storage: handed.next_storage,
+            next_storage: handoff.next_storage,
             tensors,
             copies,
-            deployments: {
-                let mut published = handed
-                    .published
-                    .map(|entries| entries.into_iter().collect::<HashMap<_, _>>());
-                let mut epochs: HashMap<String, (BTreeSet<u64>, BTreeSet<u64>)> = handed
-                    .epochs
-                    .into_iter()
-                    .map(|(name, epochs, discarded)| (name, (epochs, discarded)))
-                    .collect();
-                handed
-                    .deployments
-                    .into_iter()
-                    .map(|(name, claim, head)| {
-                        let (epochs, discarded) = epochs.remove(&name).unwrap_or_default();
-                        let published = match &mut published {
-                            Some(entries) => entries.remove(&name).unwrap_or_default(),
-                            None => epochs.first().copied().into_iter().collect(),
-                        };
-                        (
-                            name,
-                            Deployment {
-                                claim,
-                                head,
-                                epochs,
-                                published,
-                                discarded,
-                            },
-                        )
-                    })
-                    .collect()
-            },
+            deployments: handoff.deployments.into_iter().collect(),
             shootdowns,
             pages,
-            host_reserve: handed.host_reserve,
-            ledgers: handed.ledgers,
+            host_reserve: handoff.host_reserve,
+            quotas: handoff.quotas,
             kv_storage: KvStorage::new(connector),
             transfers: {
                 let mut transfers = Transfers::new(transfer);
-                transfers.resume_totals(handed.transfer_totals);
+                transfers.resume_totals(handoff.task_totals);
                 transfers
             },
             moves: crate::moves::Moves::default(),
             events: Vec::new(),
-            relaunch: handed.relaunch,
+            relaunch: handoff.relaunch,
             restart: None,
         };
         tracing::info!(
@@ -711,7 +628,7 @@ mod tests {
     use super::*;
 
     /// A server running on a thread of its own until `stop`, which then
-    /// hands it back.
+    /// passes it back.
     fn running(
         mut server: Server,
         stop: Arc<AtomicBool>,
@@ -728,7 +645,7 @@ mod tests {
         (thread, waker)
     }
 
-    /// A server handed over goes on serving its clients' connections, the
+    /// A server passed on goes on serving its clients' connections, the
     /// tensors they put and its listening socket from the successor.
     #[test]
     fn a_successor_serves_what_the_server_held() {
@@ -753,7 +670,7 @@ mod tests {
         )
         .unwrap();
         let claim = head.claim(0, vec![scope.clone()], Vec::new()).unwrap();
-        head.publish_epochs(vec![0]).unwrap();
+        head.publish(vec![0]).unwrap();
         let mut worker = Client::connect(
             &path,
             Role::Worker {
@@ -789,10 +706,10 @@ mod tests {
                 )],
             )
             .unwrap();
-        // The worker books its process storage on a GPU under a quota.
+        // The worker reserves its process storage on a GPU under a quota.
         let gpu = [9; 16];
         worker
-            .book(gpu, 1000, Some(700), vec![(Item::Process, 300)])
+            .reserve(gpu, 1000, Some(700), vec![(Item::Process, 300)])
             .unwrap();
 
         // Committed replicas share their outputs; a candidate's output is
@@ -833,7 +750,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        head.publish_epochs(vec![2]).unwrap();
+        head.publish(vec![2]).unwrap();
 
         // Stop the server between two rounds and hand it to a successor on
         // another thread; a sleeping process stands for the successor's.
@@ -851,7 +768,7 @@ mod tests {
             successor: placeholder,
             channel: ours,
         };
-        let pid = server.hand_over(pending, lock.hand_over()).unwrap();
+        let pid = server.handoff(pending, lock.hand_over()).unwrap();
         let (resumed, lock) = successor.join().unwrap();
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
@@ -862,7 +779,7 @@ mod tests {
 
         // The same connections go on: the worker finds its tensor, the head
         // still holds the claim, and a new client reaches the socket.
-        let got = worker
+        let (got, _) = worker
             .get(vec![Key([1; 32])], Mode::Read, Vec::new())
             .unwrap();
         assert!(got.missing.is_empty());
@@ -871,24 +788,25 @@ mod tests {
         let listing = operator.list().unwrap();
         assert_eq!(listing.tensors.len(), 3);
         assert_eq!(listing.deployments.len(), 1);
-        let got = worker
+        let (got, _) = worker
             .get(vec![Key([2; 32]), Key([3; 32])], Mode::Read, Vec::new())
             .unwrap();
         assert_eq!(got.missing, vec![Key([3; 32])]);
-        head.publish_epochs(vec![3]).unwrap();
+        head.publish(vec![3]).unwrap();
         assert!(
             worker
                 .get(vec![Key([3; 32])], Mode::Read, Vec::new())
                 .unwrap()
+                .0
                 .missing
                 .is_empty()
         );
-        // The ledger goes on too: its quota and the worker's booking, which
-        // the successor holds against a booking past the quota.
-        let ledgers = worker.ledger(vec![gpu]).unwrap().ledgers;
-        assert_eq!(ledgers.len(), 1);
-        assert_eq!((ledgers[0].quota, ledgers[0].used()), (Some(700), 300));
-        let refused = worker.book(gpu, 1000, None, vec![(Item::Staging, 401)]);
+        // The quota goes on too: its quota and the worker's reservation, which
+        // the successor holds against a reservation past the quota.
+        let quotas = worker.usage(vec![gpu]).unwrap().quotas;
+        assert_eq!(quotas.len(), 1);
+        assert_eq!((quotas[0].limit, quotas[0].usage()), (Some(700), 300));
+        let refused = worker.reserve(gpu, 1000, None, vec![(Item::Staging, 401)]);
         assert!(
             matches!(
                 refused,

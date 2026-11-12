@@ -219,6 +219,8 @@ fn a_stopped_daemon_takes_its_processes_with_it() {
     assert!(!alive(pid), "a process outlived its daemon's stop");
 }
 
+/// The engine interface's version carries the storage protocol's, so the next version is what
+/// an engine built for the next storage protocol states.
 #[test]
 fn an_engine_of_another_major_version_is_refused() {
     let directory = tempfile::tempdir().unwrap();

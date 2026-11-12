@@ -116,7 +116,7 @@ pub struct CacheStorageReport {
     /// The deployment's usage of the cache's GPU; `None` for a rank that
     /// keeps its storage itself, which no other epoch shares.
     #[serde(default)]
-    pub usage: Option<storage::GpuLedger>,
+    pub usage: Option<storage::Quota>,
 }
 
 impl CacheStorageReport {

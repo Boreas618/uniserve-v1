@@ -37,7 +37,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 
 use ::storage::protocol::{
-    Key, ListedPool, PageAnchor, PageShape, PageSlot, PageWindow, PeerPool, Scope,
+    Key, PageAnchor, PageShape, PageSlot, PageWindow, PeerPool, PoolListing, Scope,
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,7 +71,6 @@ enum Slot {
         /// transfer tasks ended.
         head: Option<ClientId>,
         /// The epoch whose head reserved the slot, which publishes its page.
-        #[serde(default)]
         epoch: u64,
     },
     /// Reserved for the connector, which reads the page from the
@@ -88,13 +87,11 @@ enum Slot {
         pins: Vec<(Scope, Option<ClientId>)>,
         /// The peers pinning the page (other hosts' schedulers, whose
         /// Transfer Servers READ it), one entry per pin.
-        #[serde(default)]
         peers: Vec<ClientId>,
         /// The connector's uploads of the page in flight.
         uploads: u32,
         /// The epoch that published the page (`Visibility`); zero for a
         /// page every epoch shares, such as one read from the KV storage.
-        #[serde(default)]
         epoch: u64,
     },
 }
@@ -201,10 +198,10 @@ pub(super) struct Pools {
     releasing: BTreeSet<u64>,
 }
 
-/// A pool's state as a hot restart hands it to the successor server; its
+/// A pool's state as a restart in place passes it to the successor server; its
 /// memfd travels apart.
 #[derive(Debug, Serialize, Deserialize)]
-pub(super) struct HandedPool {
+pub(super) struct PoolHandoff {
     id: u64,
     deployment: String,
     shape: PageShape,
@@ -220,7 +217,6 @@ pub(super) struct HandedPool {
     next_window: u64,
     removed: Vec<Key>,
     ended: Vec<(u64, Option<PageAnchor>)>,
-    #[serde(default)]
     users: Vec<(Scope, u64)>,
 }
 
@@ -230,11 +226,11 @@ type PoolIdentity = (String, PageShape, Option<u32>);
 /// The windows that follow an anchor page (`Pools::anchors`).
 type AnchorWindows = ((u64, Key), Vec<(u64, u64)>);
 
-/// Every pool's state as a hot restart hands it over; each pool's memfd
+/// Every pool's state as a restart in place passes it over; each pool's memfd
 /// travels apart, in `pools` order.
 #[derive(Debug, Serialize, Deserialize)]
-pub(super) struct HandedPools {
-    pools: Vec<HandedPool>,
+pub(super) struct PoolsHandoff {
+    pools: Vec<PoolHandoff>,
     by_shape: Vec<(PoolIdentity, u64)>,
     next: u64,
     pool_bytes: u64,
@@ -245,14 +241,14 @@ pub(super) struct HandedPools {
 impl Pools {
     /// Every pool's state and memfd, for a successor server to go on with
     /// ([`Pools::resume`]); this server holds no pool afterwards.
-    pub(super) fn hand_over(&mut self) -> (HandedPools, Vec<OwnedFd>) {
+    pub(super) fn handoff(&mut self) -> (PoolsHandoff, Vec<OwnedFd>) {
         let mut descriptors = Vec::with_capacity(self.pools.len());
         let pools = self
             .pools
             .drain()
             .map(|(id, pool)| {
                 descriptors.push(pool.descriptor);
-                HandedPool {
+                PoolHandoff {
                     id,
                     deployment: pool.deployment,
                     shape: pool.shape,
@@ -273,7 +269,7 @@ impl Pools {
             })
             .collect();
         (
-            HandedPools {
+            PoolsHandoff {
                 pools,
                 by_shape: self.by_shape.drain().collect(),
                 next: self.next,
@@ -285,20 +281,20 @@ impl Pools {
         )
     }
 
-    /// Goes on with the pools a predecessor handed over, with their memfds
+    /// Goes on with the pools a predecessor passed on, with their memfds
     /// in its order.
     ///
     /// # Errors
     ///
     /// Fails when a memfd is missing.
-    pub(super) fn resume(handed: HandedPools, descriptors: Vec<OwnedFd>) -> io::Result<Self> {
-        if handed.pools.len() != descriptors.len() {
+    pub(super) fn resume(handoff: PoolsHandoff, descriptors: Vec<OwnedFd>) -> io::Result<Self> {
+        if handoff.pools.len() != descriptors.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "a handed-over page pool lacks its storage",
+                "a passed-on page pool lacks its storage",
             ));
         }
-        let pools = handed
+        let pools = handoff
             .pools
             .into_iter()
             .zip(descriptors)
@@ -328,11 +324,11 @@ impl Pools {
             .collect();
         Ok(Self {
             pools,
-            by_shape: handed.by_shape.into_iter().collect(),
-            next: handed.next,
-            pool_bytes: handed.pool_bytes,
-            anchors: handed.anchors.into_iter().collect(),
-            releasing: handed.releasing.into_iter().collect(),
+            by_shape: handoff.by_shape.into_iter().collect(),
+            next: handoff.next,
+            pool_bytes: handoff.pool_bytes,
+            anchors: handoff.anchors.into_iter().collect(),
+            releasing: handoff.releasing.into_iter().collect(),
         })
     }
 
@@ -724,8 +720,8 @@ impl Pools {
         self.settle();
     }
 
-    pub(super) fn listing(&self) -> Vec<ListedPool> {
-        let mut pools: Vec<ListedPool> = self
+    pub(super) fn listing(&self) -> Vec<PoolListing> {
+        let mut pools: Vec<PoolListing> = self
             .pools
             .iter()
             .map(|(&pool, entry)| entry.listed(pool))
@@ -1423,7 +1419,7 @@ impl Pool {
         }
     }
 
-    fn listed(&self, pool: u64) -> ListedPool {
+    fn listed(&self, pool: u64) -> PoolListing {
         let (mut ready, mut reserved, mut pinned, mut uploading) = (0, 0, 0, 0);
         for slot in &self.slots {
             match slot {
@@ -1441,7 +1437,7 @@ impl Pool {
                 }
             }
         }
-        ListedPool {
+        PoolListing {
             pool,
             deployment: self.deployment.clone(),
             shape: self.shape,
@@ -1465,7 +1461,7 @@ pub(crate) fn shared_memory(name: &str, bytes: u64, numa_node: Option<u32>) -> i
     // Huge pages hold a pool in fewer TLB entries for the copies that read
     // and write it. A hugetlb memfd takes any size, but a shared mapping
     // reserves its pages: a mapping the host cannot reserve fails, so one
-    // is made and dropped here before the pool is handed out.
+    // is made and dropped here before the pool is passed on.
     const HUGE_PAGE: u64 = 2 << 20;
     let huge = bytes.next_multiple_of(HUGE_PAGE);
     let (descriptor, size) = match memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::HUGETLB) {

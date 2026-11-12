@@ -631,7 +631,7 @@ def admin_config(base_url: str) -> dict[str, Any]:
     """``GET /admin/config``: the configuration, the epoch that executes
     (``executing``), the update in flight or the last one (``update``), the
     epoch records (``epochs``), the node's processes (``processes``) and the
-    storage ledgers (``ledgers``).
+    quotas (``quotas``).
     """  # noqa: D205
     response = httpx.get(f"{base_url}/admin/config", timeout=60)
     response.raise_for_status()

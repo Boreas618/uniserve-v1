@@ -2,6 +2,7 @@
 
 #![cfg(test)]
 
+mod claim;
 mod peer;
 mod remote;
 mod server;

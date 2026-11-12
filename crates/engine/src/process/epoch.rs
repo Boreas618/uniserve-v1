@@ -361,11 +361,11 @@ impl MainProcess {
         // An early `Serve` is honoured here rather than at its arrival: this is the pass that
         // admits, so the request waiting in the frontend is exactly what it was waiting for.
         self.pending_serve = false;
-        // What the ranks hold to serve is warm by now, so the ledger hears of it before any request
+        // What the ranks hold to serve is warm by now, so the quota hears of it before any request
         // can ask for more. A rank past its quota does not serve.
         self.data
-            .book_serving()
-            .context("booking what the ranks hold in their devices' ledgers")?;
+            .reserve_serving()
+            .context("reservation what the ranks hold in their devices' quotas")?;
         self.resume_schedulers()?;
         // The serving path's warm-up submits ordinary requests straight to each scheduler, so it
         // obeys the rule above too: it starts here, where every bucket its batches replay is

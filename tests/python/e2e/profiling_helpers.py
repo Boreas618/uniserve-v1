@@ -28,7 +28,7 @@ from tests.python.e2e.http_helpers import (
 NAME = "qwen3-profiling"
 
 # The device storage a range_metrics session's range profiler pass holds on
-# GB200 (docs/profiling.md), which the worker's process item books while
+# GB200 (docs/profiling.md), which the worker's process item reserves while
 # the session runs.
 RANGE_PASS_STORAGE = 727_711_744
 PROMPT = (

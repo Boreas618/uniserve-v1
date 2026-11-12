@@ -599,21 +599,21 @@ def _engine_pids(base_url: str) -> set[int]:
     return {process["pid"] for process in engine_processes(base_url)}
 
 
-def _ledger_entries(base_url: str) -> list[dict]:
-    """Every entry of the storage ledgers ``GET /admin/config`` reports."""
+def _quota_reservations(base_url: str) -> list[dict]:
+    """Every entry of the quotas ``GET /admin/config`` reports."""
     return [
         entry
-        for node in admin_config(base_url)["ledgers"]
-        for ledger in node["ledgers"]
-        for entry in ledger["entries"]
+        for node in admin_config(base_url)["quotas"]
+        for quota in node["quotas"]
+        for entry in quota["reservations"]
     ]
 
 
 def _weight_bytes(base_url: str) -> int:
-    """The bytes of weights the deployment's ledgers book."""
+    """The bytes of weights the deployment's quotas reserve."""
     return sum(
         entry["bytes"]
-        for entry in _ledger_entries(base_url)
+        for entry in _quota_reservations(base_url)
         if entry["item"] == "weights"
     )
 
@@ -1299,8 +1299,8 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         _change_epoch(base_url, CHANGE)
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
-        # The ledger books a storage once however many epochs map it, so a
-        # successor that read the checkpoint again would book its weights beside
+        # The quota reserves a storage once however many epochs map it, so a
+        # successor that read the checkpoint again would reserve its weights beside
         # these.
         assert _weight_bytes(base_url) == weights
 
@@ -1391,7 +1391,7 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
         assert done.is_set(), "the count did not end"
         numbers = [int(word) for word in re.findall(r"\d+", "".join(read))]
         assert numbers[:200] == list(range(1, 201)), "".join(read)[:400]
-        # The serving epoch's ledger books at least the KV cache it held.
+        # The serving epoch's quota reserves at least the KV cache it held.
         assert admin_config(base_url)["executing"]["epoch"] == serving
         assert _cache_bytes(base_url, serving) >= cache, (
             "the switch shrank the serving epoch's KV cache"
@@ -1403,10 +1403,10 @@ def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
 
 
 def _cache_bytes(base_url: str, epoch: int) -> int:
-    """The bytes of KV cache segments `epoch` holds on the ledgers."""
+    """The bytes of KV cache segments `epoch` holds on the quotas."""
     return sum(
         entry["bytes"]
-        for entry in _ledger_entries(base_url)
+        for entry in _quota_reservations(base_url)
         if entry["item"] == "cache_segment" and epoch in entry["epochs"]
     )
 
@@ -2053,13 +2053,13 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
         if not trial["host_refused"]:
             assert trial["previous_epoch_kept"] == previous_epoch, trial
         if previous_epoch == "weights":
-            # The previous epoch keeps its weights alone: each GPU's ledger
-            # books nothing else of it once its processes exited, the
+            # The previous epoch keeps its weights alone: each GPU's quota
+            # reserves nothing else of it once its processes exited, the
             # segments the target maps being the target's.
             def kept() -> set[str]:
                 return {
                     entry["item"]
-                    for entry in _ledger_entries(base_url)
+                    for entry in _quota_reservations(base_url)
                     if previous in entry["epochs"]
                 }
 

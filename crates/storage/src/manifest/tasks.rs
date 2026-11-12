@@ -1,5 +1,5 @@
 //! A manifest's copies as the spans of a transfer between the storage the
-//! Storage Server retains ([`crate::protocol::Request::Transfer`]).
+//! Storage Server retains ([`crate::protocol::Request::Submit`]).
 //!
 //! The Transfer Server knows storage only as regions the Storage Server
 //! holds: every chunk is retained under its key in its bound host or device storage,
@@ -25,7 +25,7 @@ impl Manifest {
         Key(digest.finish())
     }
 
-    /// Bind this plan to the source allocations visible to the submitting
+    /// Bind this manifest to the source allocations visible to the submitting
     /// host. `sources` must describe the same ranks, layouts and retained
     /// chunks as `request.source`, in the same order; only their transport
     /// bindings may differ. GPU assignments and numerical copies stay fixed.
@@ -38,7 +38,7 @@ impl Manifest {
     }
 }
 
-/// An executable plan viewed from one submitting host. Source locations
+/// An executable manifest viewed from one submitting host. Source locations
 /// are resolved here once; consumers submit the resulting regions directly.
 #[derive(Clone, Copy)]
 pub struct BoundManifest<'m> {
@@ -80,13 +80,13 @@ impl<'m> BoundManifest<'m> {
         match endpoint.space {
             Space::Staging { staging } => {
                 let gpu = gpu
-                    .ok_or_else(|| Error::Invalid(format!("rank {} has no GPU", endpoint.rank)))?;
+                    .ok_or_else(|| Error::Manifest(format!("rank {} has no GPU", endpoint.rank)))?;
                 let bytes = self
                     .manifest
                     .stagings
                     .get(staging as usize)
                     .map(|staging| staging.bytes)
-                    .ok_or_else(|| Error::Invalid(format!("staging {staging} does not exist")))?;
+                    .ok_or_else(|| Error::Manifest(format!("staging {staging} does not exist")))?;
                 Ok((
                     Region::Tensor {
                         key: self.manifest.staging_key(staging),
@@ -101,14 +101,16 @@ impl<'m> BoundManifest<'m> {
                     .ranks
                     .get(endpoint.rank as usize)
                     .and_then(|rank| rank.storages.get(storage as usize))
-                    .ok_or_else(|| Error::Invalid(format!("storage {storage} does not exist")))?
+                    .ok_or_else(|| Error::Manifest(format!("storage {storage} does not exist")))?
                     .chunks;
                 let index = chunks.partition_point(|chunk| chunk.offset + chunk.length <= offset);
                 let chunk = chunks
                     .get(index)
                     .filter(|chunk| chunk.offset <= offset)
                     .ok_or_else(|| {
-                        Error::Invalid(format!("byte {offset} of storage {storage} is in no chunk"))
+                        Error::Manifest(format!(
+                            "byte {offset} of storage {storage} is in no chunk"
+                        ))
                     })?;
                 Ok((
                     chunk.binding.region(chunk.key, gpu)?,
@@ -126,7 +128,7 @@ impl Binding {
     pub fn region(&self, key: Key, gpu: Option<Gpu>) -> Result<Region> {
         let at = match self {
             Self::Rank => Location::Device {
-                gpu: gpu.ok_or_else(|| Error::Invalid("rank storage names no GPU".into()))?,
+                gpu: gpu.ok_or_else(|| Error::Manifest("rank storage names no GPU".into()))?,
             },
             Self::Local { at } | Self::Remote { at, .. } => *at,
         };
@@ -188,7 +190,7 @@ impl Spans<'_> {
             .min(source_left)
             .min(destination_left);
         if bytes == 0 {
-            return Err(Error::Invalid("a copy reaches past its region".into()));
+            return Err(Error::Manifest("a copy reaches past its region".into()));
         }
         Ok(Span {
             source,

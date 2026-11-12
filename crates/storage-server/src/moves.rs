@@ -9,24 +9,24 @@
 //! Transfer Server copy each storage there. A restore takes every host
 //! storage an offload of the epoch left, has the Transfer Server create
 //! device storage of each one's size on the GPU it came from (admitted
-//! against that GPU's ledger first) and copy it back. Only once every copy
+//! against that GPU's quota first) and copy it back. Only once every copy
 //! of a move ended do its tensors lie in the copies and the storages they
-//! left go: each GPU's ledger then books the move's effect at once, the
+//! left go: each GPU's quota then reserves the move's effect at once, the
 //! device storage an offload freed for the other epoch, the device storage a
 //! restore took for the epoch that starts again. A copy that fails leaves
 //! every tensor where it was and releases the copies made so far.
 //!
-//! The head's request is answered when its move ends, and holds its
+//! The head's request gets its response when its move ends, and holds its
 //! connection meanwhile, as an exposure does.
 
 use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 
 use ::storage::protocol::{
-    Access, Allocation, ErrorKind, Event, LinkEnd, Location, Reply, StorageRecord, TransferEnd,
+    Access, Allocation, ErrorKind, Event, LinkEnd, Location, Response, StorageRecord, TaskStatus,
 };
 
-use crate::{ClientId, Outcome, Server, StorageEntry, StorageId, invalid};
+use crate::{ClientId, Handling, Server, StorageEntry, StorageId, invalid};
 
 /// The moves under way and the Transfer Server's allocations they wait
 /// for.
@@ -38,14 +38,6 @@ pub(crate) struct Moves {
     /// allocation request's number, with the move and the item.
     allocating: BTreeMap<u64, (u64, usize)>,
     next_allocation: u64,
-}
-
-/// A move a head asked for, checked: its deployment, its direction and
-/// its storages.
-pub(crate) struct Planned {
-    deployment: String,
-    to_host: bool,
-    items: Vec<Item>,
 }
 
 /// A move under way: the head waiting for it, and its storages.
@@ -60,7 +52,7 @@ struct Moving {
 }
 
 /// One storage a move copies.
-struct Item {
+pub(crate) struct Item {
     source: StorageId,
     /// The GPU the storage lies on (an offload) or returns to (a restore).
     gpu: [u8; 16],
@@ -74,19 +66,19 @@ struct Item {
 impl Server {
     /// Checks a head's [`Request::Offload`] (`to_host`) or
     /// [`Request::Restore`] of `epoch` of `deployment` and picks its
-    /// storages: answered at once when there is none, refused when the
-    /// host (an offload) or a GPU's ledger (a restore) cannot hold them,
+    /// storages: responded at once when there is none, refused when the
+    /// host (an offload) or a GPU's quota (a restore) cannot hold them,
     /// or when no Transfer Server runs.
     ///
     /// [`Request::Offload`]: ::storage::protocol::Request::Offload
     /// [`Request::Restore`]: ::storage::protocol::Request::Restore
-    pub(crate) fn plan_move(
+    pub(crate) fn check_move(
         &self,
         id: ClientId,
         deployment: &str,
         epoch: u64,
         to_host: bool,
-    ) -> Result<Outcome, (ErrorKind, String)> {
+    ) -> Result<Handling, (ErrorKind, String)> {
         if !self
             .deployments
             .get(deployment)
@@ -128,8 +120,8 @@ impl Server {
             });
         }
         if items.is_empty() {
-            return Ok(Outcome::Reply(
-                Reply::Moved {
+            return Ok(Handling::Response(
+                Response::Moved {
                     storages: 0,
                     bytes: 0,
                 },
@@ -150,28 +142,30 @@ impl Server {
                 self.admit_device(deployment, gpu, bytes, &format!("epoch {epoch}'s weights"))?;
             }
         }
-        Ok(Outcome::Moving(Planned {
+        Ok(Handling::Moving {
             deployment: deployment.to_owned(),
             to_host,
             items,
-        }))
+        })
     }
 
-    /// Starts the checked move `planned` for the head `client`, whose
-    /// `request` is answered when it ends: an offload creates each host
+    /// Starts the checked move of `items` of `deployment` for the head
+    /// `client`, whose `request` gets its response when it ends: an offload creates each host
     /// copy and has the Transfer Server copy into it; a restore has the
     /// Transfer Server create each device copy first ([`Self::allocated`]).
-    pub(crate) fn begin_move(&mut self, client: ClientId, request: u64, planned: Planned) {
+    pub(crate) fn begin_move(
+        &mut self,
+        client: ClientId,
+        request: u64,
+        deployment: String,
+        to_host: bool,
+        items: Vec<Item>,
+    ) {
         if let Some(entry) = self.clients.get_mut(&client) {
             entry.held = true;
         }
         let number = self.moves.next;
         self.moves.next += 1;
-        let Planned {
-            deployment,
-            to_host,
-            items,
-        } = planned;
         let count = items.len();
         self.moves.active.insert(
             number,
@@ -273,11 +267,11 @@ impl Server {
 
     /// The copy of a move's item ended, as the Transfer Server reported
     /// (`end`).
-    pub(crate) fn moved(&mut self, number: u64, index: usize, end: &TransferEnd) {
+    pub(crate) fn moved(&mut self, number: u64, index: usize, end: &TaskStatus) {
         let failure = match end {
-            TransferEnd::Complete => None,
-            TransferEnd::Cancelled => Some("the copy was cancelled".to_owned()),
-            TransferEnd::Failed { message } => Some(message.clone()),
+            TaskStatus::Complete => None,
+            TaskStatus::Cancelled => Some("the copy was cancelled".to_owned()),
+            TaskStatus::Failed { message } => Some(message.clone()),
         };
         self.item_ended(number, index, failure);
     }
@@ -345,7 +339,7 @@ impl Server {
 
     /// Move `number` ended: its tensors lie in the copies and the storages
     /// they left are released, or, when a copy failed, every tensor stays
-    /// and the copies are released. Answers the head.
+    /// and the copies are released. Responds to the head.
     fn end_move(&mut self, number: u64) {
         let Some(moving) = self.moves.active.remove(&number) else {
             return;
@@ -356,7 +350,7 @@ impl Server {
                     self.release_storage(target);
                 }
                 tracing::warn!(failure, to_host = moving.to_host, "a weight move failed");
-                Reply::Error {
+                Response::Error {
                     kind: ErrorKind::Resource,
                     message: format!("moving the weights failed: {failure}"),
                 }
@@ -391,13 +385,13 @@ impl Server {
                     to_host = moving.to_host,
                     "moved an epoch's weights"
                 );
-                Reply::Moved {
+                Response::Moved {
                     storages: moving.items.len() as u64,
                     bytes,
                 }
             }
         };
-        self.answer(moving.client, moving.request, reply, &[]);
+        self.respond(moving.client, moving.request, reply, &[]);
         if let Some(entry) = self.clients.get_mut(&moving.client) {
             entry.held = false;
         }
@@ -448,7 +442,7 @@ impl Server {
     }
 
     /// Refuses `bytes` of new device storage on `gpu` that would take
-    /// `deployment`'s ledger of it past its quota, naming `what`.
+    /// `deployment`'s quota of it past its quota, naming `what`.
     pub(crate) fn admit_device(
         &self,
         deployment: &str,
@@ -456,19 +450,19 @@ impl Server {
         bytes: u64,
         what: &str,
     ) -> Result<(), (ErrorKind, String)> {
-        for ledger in self.ledgers_of(&[gpu], Some(deployment)) {
-            let (Some(quota), used) = (ledger.quota, ledger.used()) else {
+        for quota in self.quotas_of(&[gpu], Some(deployment)) {
+            let (Some(limit), usage) = (quota.limit, quota.usage()) else {
                 continue;
             };
-            if used + bytes > quota {
+            if usage + bytes > limit {
                 return Err((
                     ErrorKind::Quota,
                     format!(
-                        "{bytes} bytes of {what} would take the storage ledger of GPU {} to {} \
-                         bytes, past its quota of {quota} bytes:\n{}",
+                        "{bytes} bytes of {what} would take the usage of GPU {} to {} \
+                         bytes, past its quota of {limit} bytes:\n{}",
                         ::storage::protocol::gpu_name(&gpu),
-                        used + bytes,
-                        ledger.describe()
+                        usage + bytes,
+                        quota.describe()
                     ),
                 ));
             }

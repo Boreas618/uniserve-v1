@@ -746,7 +746,7 @@ impl CachePlanes {
     /// zero, scales one.
     ///
     /// A wake either brings back every segment of both value planes or none:
-    /// the storages are booked and mapped one at a time, so a failure part way
+    /// the storages are reserved and mapped one at a time, so a failure part way
     /// through is undone here, and `released_from` still says these segments
     /// are given back. A failure that left them mapped would make the pool's
     /// figure disagree with its mappings, and the next wake would ask the
@@ -803,7 +803,7 @@ impl CachePlanes {
         }
         if let Some(error) = failure {
             // Put the pool back as asleep as it was: the segments this call restored go back
-            // through the same owner that restored them, so its own booking ends with them.
+            // through the same owner that restored them, so its own reservation ends with them.
             for field in 0..restored {
                 owner
                     .release_segments(&spec_of(field), &self.values[field], &indices)

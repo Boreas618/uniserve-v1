@@ -351,6 +351,21 @@ mod tests {
         assert!(refusal.contains(&(launched + 1).to_string()), "{refusal}");
     }
 
+    /// The engine package's manifest states the engine interface's version, which carries the
+    /// storage protocol's: an engine built from this tree is the one a daemon of this tree
+    /// accepts at its hello.
+    #[test]
+    fn the_engine_package_states_the_engine_interface_version() {
+        let manifest: toml::Table = include_str!("../../package.toml")
+            .parse()
+            .expect("the engine package's manifest is TOML");
+
+        assert_eq!(
+            manifest["interface_version"].as_integer(),
+            Some(i64::from(proto::ENGINE_INTERFACE_VERSION))
+        );
+    }
+
     /// The revisions a module set fixed for an operator are its named packages' and its
     /// candidates', each once; a candidate is no preference.
     #[test]

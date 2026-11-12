@@ -74,7 +74,7 @@ impl LoadedRank {
         // pool holds every rank's host tasks.
         self.inventory.host_task_capacity *= u32::try_from(count).unwrap_or(u32::MAX);
         // The device's one pool set is the resident owners' allocator: it is opened with the memory
-        // and handed to the worker thread, so every owner and every runner books against the same
+        // and handed to the worker thread, so every owner and every runner reserves against the same
         // allowance.
         let pools = self.memory.pools();
         let products: Arc<dyn worker::runners::products::Products> =

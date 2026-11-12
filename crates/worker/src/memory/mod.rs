@@ -47,7 +47,7 @@ pub struct Memory {
     /// The device this rank's memory lives on, as the plan states it.
     pub device: crate::config::Device,
     /// The device's pools, which the scratch page set a paired forward writes
-    /// is taken from: its bytes are booked against the same allowance as every
+    /// is taken from: its bytes are reserved against the same allowance as every
     /// other pool, so the shadow never writes memory the report cannot see.
     pub pools: Arc<Mutex<crate::arena::Pools>>,
 }
@@ -73,15 +73,15 @@ pub struct OpenMemory<'a> {
 /// Release the resident cache segments of `cache`, which the Storage Server
 /// keeps for the next epoch: what a sleep gives back and a wake maps again.
 ///
-/// The device storage the segments held is booked as released before it is
-/// given back (`ExclusiveStorage::release_segments`), so the ledger of the GPU
+/// The device storage the segments held is reserved as released before it is
+/// given back (`ExclusiveStorage::release_segments`), so the quota of the GPU
 /// never counts storage no process maps. A pool that is not segmented has no
 /// segment to give back, which is not an error.
 ///
 /// **Only the segments go back.** The graph pool and the scratch region stay
 /// mapped: a capture's addresses are fixed for the life of its pool, so a wake
-/// is a remap and never a recapture, and a sleep that released a capture's book
-/// while its mapping stayed would let the next capture book the same bytes
+/// is a remap and never a recapture, and a sleep that released a capture's reserve
+/// while its mapping stayed would let the next capture reserve the same bytes
 /// twice. A park therefore returns the KV and not the graphs.
 ///
 /// One body for both callers: [`Memory::sleep`] on the control thread and the
@@ -109,7 +109,7 @@ pub fn sleep(cache: &Arc<Mutex<PrefixCache>>, storage: &mut dyn ExclusiveStorage
 }
 
 /// Map the released cache segments of `cache` again, `limit` of them or all,
-/// booking their storage first: a booking the GPU's quota refuses leaves the
+/// reservation their storage first: a reservation the GPU's quota refuses leaves the
 /// rank asleep rather than half woken.
 ///
 /// Resets the units of the segments it created, on `stream`, which is
@@ -135,13 +135,13 @@ impl Memory {
     /// Allocates every resident owner the plan sized, in one call: the cache
     /// planes and block tables, on a rank that keeps a paged cache.
     ///
-    /// This is the epoch's budget becoming real: each owner is booked against
+    /// This is the epoch's budget becoming real: each owner is reserved against
     /// the device's allowance as it is mapped, so the first `mapped <= budget`
     /// reading after warmup counts every byte the plan charged.
     ///
     /// `storage` is the rank's Storage Server client; it stays the main
     /// process's, so `sleep` and `wake` are the only calls that reach the
-    /// ledger. The resets the owners queue run on `request.stream` before any
+    /// quota. The resets the owners queue run on `request.stream` before any
     /// worker thread exists.
     pub fn new(request: OpenMemory<'_>, storage: &mut dyn ExclusiveStorage) -> Result<Self> {
         let plan = request.plan;

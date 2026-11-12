@@ -637,8 +637,8 @@ impl EngineClient {
             .collect()
     }
 
-    /// The storage ledgers every node's Storage Server keeps for the
-    /// deployment, one JSON result per node: `{"host": ..., "ledgers":
+    /// The quotas every node's Storage Server keeps for the
+    /// deployment, one JSON result per node: `{"host": ..., "quotas":
     /// [...], "host_storage": {...}}`. No worker is asked: each node's daemon
     /// reads them over its claim.
     ///
@@ -716,8 +716,8 @@ impl EngineClient {
     }
 
     /// Gives back the tail of the engine's KV cache until each device's
-    /// storage ledger has room for `bytes`, overridden by `devices` on named
-    /// GPUs, beside everything it books; the requests that hold the tail
+    /// quota has room for `bytes`, overridden by `devices` on named
+    /// GPUs, beside everything it reserves; the requests that hold the tail
     /// run on, and the answer comes once they let it go. Returns each
     /// device's plan.
     ///

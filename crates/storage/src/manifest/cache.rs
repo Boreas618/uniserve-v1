@@ -84,7 +84,7 @@ pub struct Copy {
     pub spans: Vec<crate::protocol::Span>,
 }
 
-/// One round of cache copies, as the daemon hands it to every rank: the
+/// One round of cache copies, as the daemon passes it to every rank: the
 /// spans each owner submits as one Transfer Server task, at `priority`.
 /// The promotion's backfill and a rollback's restore run at
 /// [`crate::protocol::Priority::Promotion`], since the pause waits for them;
@@ -117,9 +117,9 @@ pub enum Operation {
         tokens: Option<u32>,
     },
     /// How far the requests in flight reached the host KV cache, which an epoch
-    /// on the same pages reads: each answered `Prefix` states the tokens its
+    /// on the same pages reads: each responded `Prefix` states the tokens its
     /// request computed (`computed`) and those whose pages the host holds
-    /// (`cached`), and no pages. No answer at all for a scheduler without a
+    /// (`cached`), and no pages. No response at all for a scheduler without a
     /// host KV cache, which has nothing to warm through.
     Warmed,
     Retain {

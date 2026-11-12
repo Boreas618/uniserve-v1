@@ -19,7 +19,7 @@
 //! the decode group starts with the request's next token.
 //!
 //! The scheduler holds the transfer contexts of the GPUs of its groups on
-//! each host for as long as it serves (`Request::OpenTransfer`), so a
+//! each host for as long as it serves (`Request::OpenSession`), so a
 //! transfer pays for no context creation. Units are copied only once the
 //! call that wrote them was accepted, so their device work completed.
 
@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
 use ipc::{CachePlaneRun, PrefixCacheInfo, RequestId};
-use storage::protocol::{Event, Priority, Region, Reply, Request, Span, TransferEnd};
+use storage::protocol::{Event, Priority, Region, Request, Response, Span, TaskStatus};
 
 use crate::host_pages::{Purpose, Servers};
 use crate::worker::WorkerGroupId;
@@ -143,7 +143,7 @@ impl Transfers {
         // Each host's Transfer Server keeps the contexts of its groups' GPUs
         // while the scheduler serves; the connection closing ends the session.
         for (client, gpus) in gpus {
-            let open = Request::OpenTransfer {
+            let open = Request::OpenSession {
                 gpus: gpus.into_iter().collect(),
             };
             servers.submit(client, &open, Purpose::Store(Asked::Session));
@@ -206,7 +206,7 @@ impl Transfers {
             }
             copy.bytes += spans.iter().map(Span::copied).sum::<u64>();
             copy.spans += spans.len();
-            let transfer = Request::Transfer {
+            let transfer = Request::Submit {
                 spans,
                 priority: Priority::Request,
                 update: 0,
@@ -249,7 +249,7 @@ impl Transfers {
         let (events, responses) = self.servers.take();
         for (purpose, reply) in responses {
             match (purpose, reply) {
-                (Asked::Transfer { request, client }, Reply::Transferring { task }) => {
+                (Asked::Transfer { request, client }, Response::Submitted { task }) => {
                     self.tasks.insert((client, task), request);
                 }
                 (Asked::Transfer { request, .. }, other) => {
@@ -258,23 +258,26 @@ impl Transfers {
                         Some(format!("the transfer's copy task was refused: {other:?}")),
                     );
                 }
-                (Asked::Session, Reply::TransferOpened { .. }) => {}
+                (Asked::Session, Response::SessionOpened { .. }) => {}
                 (Asked::Session, other) => {
                     tracing::warn!(?other, "a host refused to hold its GPUs' transfer contexts");
                 }
             }
         }
         for (client, event) in events {
-            let Event::Transferred { task, end, .. } = event else {
+            let Event::TaskEnded {
+                task, status: end, ..
+            } = event
+            else {
                 continue;
             };
             let Some(request) = self.tasks.remove(&(client, task)) else {
                 continue;
             };
             let failure = match end {
-                TransferEnd::Complete => None,
-                TransferEnd::Cancelled => Some("the transfer's copy task was cancelled".to_owned()),
-                TransferEnd::Failed { message } => Some(message),
+                TaskStatus::Complete => None,
+                TaskStatus::Cancelled => Some("the transfer's copy task was cancelled".to_owned()),
+                TaskStatus::Failed { message } => Some(message),
             };
             self.task_ended(request, failure);
         }

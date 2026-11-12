@@ -69,7 +69,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ::storage::protocol::{
-    Event, FabricHandle, LinkEnd, Priority, Region, Reply, Request, Span, TransferEnd,
+    Event, FabricHandle, LinkEnd, Priority, Region, Request, Response, Span, TaskStatus,
 };
 use ::storage::{Access, Client, Key, Location, Role, Scope, StorageRecord, TensorRecord};
 use anyhow::{Context, bail, ensure};
@@ -528,8 +528,8 @@ fn hold(options: &Options) -> anyhow::Result<()> {
         Some(Ok(Some(ShareableHandle::Fabric(handle)))) => Some(handle),
         _ => None,
     };
-    let endpoint = match head.call(&Request::Endpoint, &[])?.reply {
-        Reply::Endpoint { tcp: Some(tcp) } => tcp,
+    let endpoint = match head.call(&Request::Endpoint, &[])?.0 {
+        Response::Endpoint { tcp: Some(tcp) } => tcp,
         other => bail!("the server accepts no other host ({other:?}): start it with --tcp"),
     };
     emit(
@@ -568,17 +568,17 @@ fn wait_for(worker: &mut Client, task: u64, patience: Duration) -> anyhow::Resul
     loop {
         worker.pump()?;
         while let Some((event, _)) = worker.next_event() {
-            if let Event::Transferred {
+            if let Event::TaskEnded {
                 task: ended,
                 bytes,
-                end,
+                status: end,
             } = event
                 && ended == task
             {
                 return match end {
-                    TransferEnd::Complete => Ok(bytes),
-                    TransferEnd::Cancelled => bail!("task {task} was cancelled"),
-                    TransferEnd::Failed { message } => bail!("task {task} failed: {message}"),
+                    TaskStatus::Complete => Ok(bytes),
+                    TaskStatus::Cancelled => bail!("task {task} was cancelled"),
+                    TaskStatus::Failed { message } => bail!("task {task} failed: {message}"),
                 };
             }
         }
@@ -743,7 +743,7 @@ fn read(options: &Options) -> anyhow::Result<()> {
             destination.clear(bytes)?;
 
             let started = Instant::now();
-            let task = worker.transfer(
+            let task = worker.copy(
                 vec![Span {
                     source: link.region(&source, fabric.as_ref())?,
                     source_offset: 0,

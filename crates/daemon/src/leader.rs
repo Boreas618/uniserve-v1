@@ -2973,7 +2973,7 @@ impl Replica {
     }
 
     /// What each host of the serving engine can keep of a parked standby (`StandbyRoom`), as the
-    /// Storage Servers' ledgers state it now.
+    /// Storage Servers' quotas state it now.
     async fn standby_rooms(
         &self,
         control: &Arc<EngineControl>,
@@ -2984,11 +2984,11 @@ impl Replica {
         match reports {
             Ok(Ok(reports)) => crate::standby::rooms(&reports, &deployment),
             Ok(Err(error)) => {
-                warn!("the nodes' storage ledgers could not be read: {error:#}");
+                warn!("the nodes' quotas could not be read: {error:#}");
                 BTreeMap::new()
             }
             Err(error) => {
-                warn!("reading the nodes' storage ledgers did not complete: {error}");
+                warn!("reading the nodes' quotas did not complete: {error}");
                 BTreeMap::new()
             }
         }

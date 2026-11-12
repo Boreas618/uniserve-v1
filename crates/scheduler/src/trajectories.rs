@@ -95,7 +95,7 @@ use storage::key::latent_content as content;
 pub(crate) use storage::key::latent_seed;
 use storage::manifest::region::{Span, atoms};
 use storage::manifest::{Storage as PagedStorage, StorageLayout};
-use storage::protocol::{PageSlot, Reply, Request};
+use storage::protocol::{PageSlot, Request, Response};
 use storage::{Key, Scope};
 
 use crate::host_pages::{Purpose, Servers};
@@ -1099,7 +1099,7 @@ impl TrajectoryStore {
             match (purpose, reply) {
                 (Asked::Reserve { request, rank }, reply) => {
                     let slots = match reply {
-                        Reply::Reserved { slots } => slots,
+                        Response::Reserved { slots } => slots,
                         other => {
                             tracing::warn!(?other, "a host latent pool reservation failed");
                             Vec::new()
@@ -1108,7 +1108,7 @@ impl TrajectoryStore {
                     self.reserved(request, rank, slots);
                 }
                 (Asked::Commit { request }, reply) => {
-                    let committed = matches!(reply, Reply::Committed);
+                    let committed = matches!(reply, Response::Committed);
                     if !committed {
                         tracing::warn!(?reply, "a host latent pool commit failed");
                     }
@@ -1125,7 +1125,7 @@ impl TrajectoryStore {
                 }
                 (Asked::Pin { request, source }, reply) => {
                     let slots = match reply {
-                        Reply::Pinned { slots } => slots,
+                        Response::Pinned { slots } => slots,
                         other => {
                             tracing::warn!(?other, "a host latent pool pin failed");
                             Vec::new()
