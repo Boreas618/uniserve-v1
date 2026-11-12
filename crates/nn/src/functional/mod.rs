@@ -2,8 +2,8 @@
 //!
 //! A fused operator is a computation the kernel library has one kernel for where a composition of
 //! tensor operations would launch several and round between them: a normalization with its row
-//! statistics, a gated activation, a product over packed weights. Each is one function with two
-//! bodies that state the same arithmetic:
+//! statistics, a gated activation, a product over packed weights, the routed products of a
+//! mixture of experts. Each is one function with two bodies that state the same arithmetic:
 //!
 //! - on **CPU tensors** it computes its formula with tensor operations, in FP32, rounding where
 //!   the kernel rounds. This is what a host check runs and the reference a device check compares
@@ -38,7 +38,9 @@ mod activation;
 mod embedding;
 mod linear;
 mod logits;
+mod moe;
 mod norm;
+mod nvfp4;
 
 use uniserve_tensor::{DType, Device, Shape, Tensor};
 
@@ -49,9 +51,17 @@ pub use activation::{
 };
 pub use embedding::{embedding, vocabulary_shard};
 pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
-pub use linear::{ENCODE_CHUNK, WeightOrder, encode_block, linear, linear_fp8, linear_nvfp4};
+pub use linear::{WeightOrder, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
+pub(crate) use moe::{DOWN_VALUE_LAYOUT, GATED_VALUE_LAYOUT, WEIGHT_SCALE_LAYOUT};
+pub use moe::{
+    EXPANDED_TO_PERMUTED, NUM_NON_EXITING_TILES, PERMUTED_TO_EXPANDED, PERMUTED_TO_TOKEN,
+    SORT_MAPS, TILE_ROWS, TILE_TO_EXPERT, TILE_TO_LIMIT, TOTAL_PADDED_TOKENS, expert_combine,
+    expert_dispatch, expert_exchange_fused, gather_gemm, gather_gemm_nvfp4, moe_sort,
+    moe_unpermute, route_gemm, route_gemm_nvfp4, sigmoid_gated_add_, topk_softmax,
+};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
+pub use nvfp4::{ENCODE_CHUNK, encode_block, nvfp4_quantize};
 
 /// Whether the descriptors this crate builds are the programmatic-dependent-launch variants.
 pub(crate) const PDL: bool = false;

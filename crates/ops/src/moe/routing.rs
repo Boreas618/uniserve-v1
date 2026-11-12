@@ -89,11 +89,11 @@ pub struct TopkArgs {
     pub scores: Operand,
     /// `[experts]` per-expert scale multiplied into the weights, when the descriptor has one.
     pub scale: Option<Operand>,
-    /// `[tokens, top]` i32 expert ids, written.
+    /// `[tokens, top]` u32 expert ids, written.
     pub ids: Operand,
     /// `[tokens, top]` FP32 route weights, written.
     pub weights: Operand,
-    /// `[experts]` i32 weight row of each logical expert, when the block's experts are not in
+    /// `[experts]` u32 weight row of each logical expert, when the block's experts are not in
     /// logical order: `ids` then holds rows.
     pub map: Option<Operand>,
 }
@@ -157,10 +157,10 @@ impl Op for TopkSoftmax {
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.weights
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        if args.ids.dtype != DType::I32 {
+        if args.ids.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 ids, found {}", abi::name(args.ids.dtype)),
+                format!("expected u32 ids, found {}", abi::name(args.ids.dtype)),
             ));
         }
         if args.weights.dtype != DType::F32 {
@@ -204,10 +204,10 @@ impl Op for TopkSoftmax {
 
         if let Some(map) = args.map {
             map.require_shape(Self::NAME, Shape::new(&[experts]))?;
-            if map.dtype != DType::I32 {
+            if map.dtype != DType::U32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected an i32 expert map, found {}", abi::name(map.dtype)),
+                    format!("expected a u32 expert map, found {}", abi::name(map.dtype)),
                 ));
             }
         }

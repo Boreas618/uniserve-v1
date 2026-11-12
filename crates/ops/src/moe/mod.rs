@@ -23,6 +23,12 @@
 //! [`max_tiles`] tiles and [`max_permuted_rows`] permuted rows (the same bounds as
 //! `flashinfer.fused_moe.cute_dsl.moe_utils.get_max_num_tiles` and `..._permuted_tokens`), so a
 //! captured graph replays them for any routing the batch can produce.
+//!
+//! # Index operands
+//!
+//! Route ids, expert maps, the sort's tile and permutation maps and the live counts are `U32`
+//! tensors: 32-bit indices, which the packages read as `int32_t`. An entry a package writes as
+//! `-1` (a route this rank does not hold, a tile's padding row) therefore reads as `u32::MAX`.
 
 pub mod combine;
 pub mod exchange;
@@ -63,21 +69,21 @@ pub(crate) fn row_stride(view: &crate::tensor::Operand) -> u64 {
     }
 }
 
-/// Check that `view` is an `i32` metadata vector whose elements are contiguous.
+/// Check that `view` is a `u32` metadata vector whose elements are contiguous.
 ///
 /// The entries index this metadata from its first element, so what they need is a unit stride on
 /// the last axis. They do **not** need a row width of one: a vector's last axis is its length, so a
 /// width check here refuses every list longer than a single element, which is every list a real
 /// batch produces.
-pub(crate) fn require_i32_vector(
+pub(crate) fn require_u32_vector(
     operator: &'static str,
     view: &crate::tensor::Operand,
 ) -> crate::Result<()> {
-    if view.dtype != uniserve_tensor::DType::I32 {
+    if view.dtype != uniserve_tensor::DType::U32 {
         return Err(crate::Error::argument(
             operator,
             format!(
-                "expected i32 metadata, found {}",
+                "expected u32 metadata, found {}",
                 crate::abi::name(view.dtype)
             ),
         ));
@@ -170,24 +176,23 @@ mod tests {
         );
     }
 
-    /// A plan's tile and route lists are as long as the plan says.
+    /// A sort's tile and route lists are as long as the sort's bounds say.
     ///
-    /// The metadata check demanded a row width of one on these lists, which is true only of a plan
-    /// with a single tile: the first decode batch (15 tokens, 8 routes each, 120 tiles) was refused
-    /// by our own check with `expected 1 elements on the last axis, found 120`.
+    /// A check that demanded a row width of one on these lists holds only for a sort of a single
+    /// tile: a decode batch of 15 tokens with 8 routes each has 120 tiles.
     #[test]
     fn a_metadata_vector_longer_than_one_element_is_accepted() {
-        let list = Operand::new(DevicePtr::new(0x1000), DType::I32, Shape::new(&[120]));
-        assert!(require_i32_vector("moe_sort", &list).is_ok());
+        let list = Operand::new(DevicePtr::new(0x1000), DType::U32, Shape::new(&[120]));
+        assert!(require_u32_vector("moe_sort", &list).is_ok());
     }
 
     /// The same check still refuses what the entries cannot read.
     #[test]
     fn a_metadata_vector_of_the_wrong_element_type_is_refused() {
         let list = Operand::new(DevicePtr::new(0x1000), DType::BF16, Shape::new(&[120]));
-        let error = require_i32_vector("moe_sort", &list).unwrap_err();
+        let error = require_u32_vector("moe_sort", &list).unwrap_err();
         assert!(
-            error.to_string().contains("expected i32 metadata"),
+            error.to_string().contains("expected u32 metadata"),
             "{error}"
         );
     }

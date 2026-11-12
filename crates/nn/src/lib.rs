@@ -57,7 +57,7 @@
 //! | [`var_builder`], [`weights`], [`checkpoint`], [`quantization`], [`adapter`] | [`VarBuilder`], [`WeightLoader`] and retained storage, safetensors shards, the quantization a checkpoint declares and its packed representations, adapter fusion |
 //! | [`config`] | The strict reader of a checkpoint's JSON configuration |
 //! | [`functional`] | The fused operators and stateless functions |
-//! | [`modules`] | `Linear`, `Embedding`, `LmHead`, `RmsNorm`, `LayerNorm`, `Mlp` and their parallel forms |
+//! | [`modules`] | `Linear`, `Embedding`, `LmHead`, `RmsNorm`, `LayerNorm`, `Mlp`, `MoE`, `SharedExpert` and their parallel forms |
 //! | [`capability`] | The traits execution calls and the input values of their methods |
 //! | [`family`] | The family traits, the registry and the shapes execution sizes a model by |
 //! | [`collective`], [`profiler`] | The model-facing forms of the backend's collectives and profiler ranges |

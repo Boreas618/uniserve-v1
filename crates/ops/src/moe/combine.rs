@@ -105,7 +105,7 @@ pub struct UnpermuteArgs {
     /// `[rows, hidden]` every route's expert product, in the descriptor's [`Layout`]: permuted (one
     /// row per permuted row, found through `expanded_to_permuted`) or expanded (`token · top + route`).
     pub routes: Operand,
-    /// `[tokens, top]` i32: the permuted row of each `(token, route)` pair, `-1` when absent.
+    /// `[tokens, top]` u32: the permuted row of each `(token, route)` pair, `-1` when absent.
     ///
     /// The module reads `routes` as the **permuted** buffer through this map. The dense `route_gemm`
     /// writes the other convention - one row per expanded route - so a dense deployment's combine
@@ -222,11 +222,11 @@ impl Op for MoeUnpermute {
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.scales
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        if args.expanded_to_permuted.dtype != DType::I32 {
+        if args.expanded_to_permuted.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected i32 route maps, found {}",
+                    "expected u32 route maps, found {}",
                     abi::name(args.expanded_to_permuted.dtype)
                 ),
             ));

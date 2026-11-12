@@ -5,36 +5,22 @@
 //! linear        a dense weight: one `gemm`
 //! linear_fp8    a per-tensor FP8 weight: one `fp8_gemm`, which encodes the activation by its
 //!               static scale as it loads it
-//! linear_nvfp4  a calibrated NVFP4 weight: the activation encoded (`nvfp4_quantize`) and the
-//!               packed product (`nvfp4_gemm`)
+//! linear_nvfp4  a calibrated NVFP4 weight: the activation encoded (`nvfp4_quantize`, the
+//!               encoding of [`super::nvfp4_quantize`]) and the packed product (`nvfp4_gemm`)
 //! ```
 //!
 //! Every product accumulates in FP32 and rounds once into its input's element type.
 
-use ops::fp4::{
-    BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, Nvfp4Quantize, QuantizeArgs,
-    QuantizeDescriptor, ScaleLayout,
-};
+use ops::fp4::{BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, ScaleLayout};
 use ops::fp8::{E4M3_MAX, Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor};
 use ops::gemm::{Args, Descriptor, Epilogue, Gemm};
-use uniserve_tensor::{D, DType, Device, Tensor};
+use uniserve_tensor::{D, DType, Tensor};
 
+use super::nvfp4::{decoded, encoded, launch_quantize};
 use super::{ACCUMULATE, as_rows, columns, like_rows, on_cpu, vector};
 use crate::error::{Error, Result};
-use crate::quantization::e4m3;
 
 pub use ops::gemm::WeightOrder;
-
-/// Elements of a row one activation-encoding kernel covers.
-///
-/// A whole number of sixteen-element scale blocks, as the layout requires, and a key field of
-/// `nvfp4_quantize`: every packed projection and expert block states this one value, so one
-/// launch site compiles one kernel.
-pub const ENCODE_CHUNK: u32 = 1024;
-
-/// The encoder's chunk is a whole number of scale blocks; a chunk that were not would have a
-/// partial block with no scale to name it.
-const _: () = assert!(ENCODE_CHUNK.is_multiple_of(BLOCK_ELEMENTS));
 
 /// The arrangement the packed product reads block scales in, the weight's and the encoded
 /// activation's alike.
@@ -43,20 +29,6 @@ pub(crate) const PRODUCT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
 /// The tile an `fp8_gemm` kernel covers, `(rows, output columns, contraction elements)`: one
 /// kernel set serves every projection.
 const FP8_TILE: (u32, u32, u32) = (64, 128, 128);
-
-/// The tile one encoding of a `columns`-wide row runs in.
-///
-/// The package refuses a tile that does not divide the row, so the requested tile is halved
-/// until it divides. A row narrower than the largest tile, such as the mixture-of-experts'
-/// 768-element second encode, gets the largest tile that fits it instead of a key no package
-/// can build.
-pub fn encode_block(columns: u32, requested: u32) -> u32 {
-    let mut block = requested.max(1);
-    while block > 1 && !columns.is_multiple_of(block) {
-        block /= 2;
-    }
-    block
-}
 
 /// `x · weightᵀ + bias` over a dense weight: `[..., n]` in `x`'s element type for `x` of
 /// `[..., k]`.
@@ -349,31 +321,25 @@ pub fn linear_nvfp4(
     // The buffers are class-height and the encode writes the activation's rows into their
     // first rows; the product's rows past those are computed from bytes nothing reads and are
     // not part of the result.
-    let encoded = backend::empty((class, packed), DType::U8)?;
+    let packed_rows = backend::empty((class, packed), DType::U8)?;
     let class_scales = PRODUCT_SCALE_LAYOUT.shape(class as u64, u64::from(k));
-    let encoded_scales = backend::empty(
+    let packed_scales = backend::empty(
         (class_scales.dim(0) as usize, class_scales.dim(1) as usize),
         DType::U8,
     )?;
     let token_scale = backend::empty(class, DType::F32)?;
 
     let row_scales = PRODUCT_SCALE_LAYOUT.shape(count as u64, u64::from(k));
-    backend::launch::<Nvfp4Quantize>(
-        &QuantizeDescriptor {
-            input: x.dtype(),
-            columns: k,
-            layout: PRODUCT_SCALE_LAYOUT,
-            block: encode_block(k, ENCODE_CHUNK),
-            pdl: false,
-        },
-        QuantizeArgs {
-            input: backend::operand(&rows)?,
-            values: backend::operand(&encoded.narrow(0, 0, count)?)?,
-            scales: backend::operand(&encoded_scales.narrow(0, 0, row_scales.dim(0) as usize)?)?,
-            global_scale: backend::operand(input_scale)?,
+    launch_quantize(
+        &rows,
+        input_scale,
+        PRODUCT_SCALE_LAYOUT,
+        (
+            backend::operand(&packed_rows.narrow(0, 0, count)?)?,
+            backend::operand(&packed_scales.narrow(0, 0, row_scales.dim(0) as usize)?)?,
             // One scalar per row, so the tensor has one axis.
-            token_scale: backend::operand(&token_scale.narrow(0, 0, count)?)?,
-        },
+            backend::operand(&token_scale.narrow(0, 0, count)?)?,
+        ),
     )?;
 
     // 2. Multiply the encoded activation by the weight, over the class's rows.
@@ -397,9 +363,9 @@ pub fn linear_nvfp4(
     backend::launch::<Nvfp4Gemm>(
         &descriptor,
         GemmArgs {
-            input: backend::operand(&encoded)?,
+            input: backend::operand(&packed_rows)?,
             weight: backend::operand(values)?,
-            input_scales: backend::operand(&encoded_scales)?,
+            input_scales: backend::operand(&packed_scales)?,
             weight_scales: backend::operand(scales)?,
             alpha: backend::operand(alpha)?,
             bias: None,
@@ -408,12 +374,6 @@ pub fn linear_nvfp4(
     )?;
     like_rows(out.narrow(0, 0, count)?, x)
 }
-
-/// The eight magnitudes an E2M1 code states, then the same negated: a code's fourth bit is its
-/// sign.
-const E2M1: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-];
 
 /// The FP32 product of [`linear_nvfp4`] on CPU tensors, before its one rounding: `rows` is the
 /// `[m, k]` activation.
@@ -425,131 +385,18 @@ fn nvfp4_formula(
     alpha: &Tensor,
 ) -> Result<Tensor> {
     let (m, k) = (rows.dims()[0], rows.dims()[1]);
-    let blocks = k / BLOCK_ELEMENTS as usize;
-    let global = input_scale.reshape(())?;
 
-    // The activation, encoded and decoded: each block's E4M3 scale under the global scale, and
-    // each element's E2M1 code relative to it.
-    let x = rows.to_dtype(ACCUMULATE)?.reshape((m, blocks, 16))?;
-    let amax = x.abs()?.max(D::Minus1)?;
-    let scale = (amax / 6.0)?
-        .broadcast_mul(&global)?
-        .to_dtype(DType::F8E4M3)?
-        .to_dtype(ACCUMULATE)?;
-
-    // A block whose scale rounds to zero encodes to zeros: the encoder multiplies by zero
-    // there, where the reciprocal of a zero scale is not a number.
-    let token = global.recip()?;
-    let relative = scale.broadcast_mul(&token)?;
-    let inverse = relative
-        .ne(0.0)?
-        .where_cond(&relative.recip()?, &relative.zeros_like()?)?;
-    let codes = e2m1(&x.broadcast_mul(&inverse.unsqueeze(D::Minus1)?)?)?;
+    // The activation, encoded and decoded: each element's E2M1 code times its block's E4M3
+    // scale. The row factor and the two tensor scales are one number, `alpha`.
+    let (codes, scale) = encoded(rows, input_scale)?;
     let activation = codes
         .broadcast_mul(&scale.unsqueeze(D::Minus1)?)?
         .reshape((m, k))?;
 
     // The weight, decoded: its codes times its block scales, read out of the swizzled table.
-    let n = values.dims()[0];
-    let high = values.broadcast_div(&integer(16, values)?)?;
-    let low = remainder(values, 16)?;
-    let nibbles = Tensor::stack(&[low, high], D::Minus1)?.flatten_all()?;
-    let weight_codes = Tensor::new(&E2M1, &Device::Cpu)?
-        .index_select(&nibbles, 0)?
-        .reshape((n, blocks, 16))?;
-
-    let padded_columns = scales.dims()[1];
-    let weight_scales = e4m3_values(
-        &scales
-            .flatten_all()?
-            .index_select(&swizzled_offsets(n, blocks, padded_columns)?, 0)?,
-    )?
-    .reshape((n, blocks, 1))?;
-    let weight = weight_codes
-        .broadcast_mul(&weight_scales)?
-        .reshape((n, k))?;
+    let weight = decoded(values, scales, PRODUCT_SCALE_LAYOUT)?;
 
     Ok(activation
         .matmul(&weight.t()?)?
         .broadcast_mul(&alpha.reshape(())?)?)
-}
-
-/// `x`, FP32, rounded to the nearest E2M1 value, ties to the code whose mantissa bit is zero,
-/// saturating at ±6: the eight magnitudes are 0, 0.5, 1, 1.5, 2, 3, 4 and 6.
-fn e2m1(x: &Tensor) -> Result<Tensor> {
-    let magnitude = x.abs()?;
-
-    // Each step of the grid, by the midpoint below it. A midpoint belongs to the neighbour with
-    // the even mantissa, which is the lower value at 0.25, 1.25, 2.5 and 5 and the upper one at
-    // 0.75, 1.75 and 3.5.
-    let step = |reached: Tensor, height: f64| -> Result<Tensor> {
-        Ok(reached.to_dtype(ACCUMULATE)?.affine(height, 0.0)?)
-    };
-    let steps = [
-        step(magnitude.gt(0.25)?, 0.5)?,
-        step(magnitude.ge(0.75)?, 0.5)?,
-        step(magnitude.gt(1.25)?, 0.5)?,
-        step(magnitude.ge(1.75)?, 0.5)?,
-        step(magnitude.gt(2.5)?, 1.0)?,
-        step(magnitude.ge(3.5)?, 1.0)?,
-        step(magnitude.gt(5.0)?, 2.0)?,
-    ];
-
-    let mut rounded = magnitude.zeros_like()?;
-    for step in &steps {
-        rounded = (rounded + step)?;
-    }
-    Ok((rounded * x.sign()?)?)
-}
-
-/// The FP32 values of `scales`, E4M3 block scales stored as `F8_E4M3` or as their bytes.
-fn e4m3_values(scales: &Tensor) -> Result<Tensor> {
-    if scales.dtype() == DType::F8E4M3 {
-        return Ok(scales.to_dtype(ACCUMULATE)?);
-    }
-
-    // Raw bytes have no cast: each byte selects its value from the format's 256.
-    let table: Vec<f32> = (0..=u8::MAX).map(e4m3).collect();
-    Ok(Tensor::new(table.as_slice(), &Device::Cpu)?.index_select(scales, 0)?)
-}
-
-/// `value` as a one-element tensor of `like`'s integer element type, for integer arithmetic,
-/// which the scalar operators of the tensor library evaluate in floating point.
-fn integer(value: u32, like: &Tensor) -> Result<Tensor> {
-    Ok(Tensor::new(value, &Device::Cpu)?.to_dtype(like.dtype())?)
-}
-
-/// `values mod modulus`, elementwise over an integer tensor.
-fn remainder(values: &Tensor, modulus: u32) -> Result<Tensor> {
-    let modulus = integer(modulus, values)?;
-    let whole = values.broadcast_div(&modulus)?.broadcast_mul(&modulus)?;
-
-    Ok(values.broadcast_sub(&whole)?)
-}
-
-/// The flat offsets, `[rows · blocks]` U32 in row-major order, of a `[rows, blocks]` block-scale
-/// matrix inside its swizzled 128x4 table of `padded_columns` scale columns: column groups of
-/// four stride 512, thirty-two-row groups stride 16, groups of 128 rows stride
-/// `128 · padded_columns`.
-fn swizzled_offsets(rows: usize, blocks: usize, padded_columns: usize) -> Result<Tensor> {
-    let row = Tensor::arange(0_u32, rows as u32, &Device::Cpu)?;
-    let column = Tensor::arange(0_u32, blocks as u32, &Device::Cpu)?;
-    let times = |values: Tensor, factor: usize| -> Result<Tensor> {
-        Ok(values.broadcast_mul(&integer(factor as u32, &values)?)?)
-    };
-    let over = |values: &Tensor, divisor: u32| -> Result<Tensor> {
-        Ok(values.broadcast_div(&integer(divisor, values)?)?)
-    };
-
-    let lane = times(remainder(&row, 32)?, 16)?;
-    let group = times(over(&remainder(&row, 128)?, 32)?, 4)?;
-    let tile = times(over(&row, 128)?, 128 * padded_columns)?;
-    let row_offset = ((lane + group)? + tile)?;
-
-    let column_offset = (remainder(&column, 4)? + times(over(&column, 4)?, 512)?)?;
-
-    Ok(row_offset
-        .unsqueeze(1)?
-        .broadcast_add(&column_offset.unsqueeze(0)?)?
-        .flatten_all()?)
 }
