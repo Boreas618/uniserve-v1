@@ -94,6 +94,19 @@ impl Twins {
 
     /// A shadow buffer of the same geometry as `real`, recorded as its twin.
     pub fn shadow_of(&mut self, real: Operand) -> Operand {
+        // The buffer carved below holds the operand's elements back to back. A strided operand
+        // reaches further than that, so a kernel writing through its strides would write past
+        // the buffer: such an output is shadowed through the storage it reaches
+        // (`strided::shadow_window`), and one that arrives here is refused by name.
+        if !crate::strided::is_contiguous(&real) {
+            self.fail(Error::Shape(format!(
+                "a strided output of {:?} elements has no shadow buffer of its own extent: its \
+                 operator shadows it through the storage it reaches",
+                real.shape.dims()
+            )));
+            return real;
+        }
+
         match self.carve(real.shape, real.dtype) {
             Ok(address) => {
                 let shadow = Operand::with_strides(address, real.dtype, real.shape, real.strides);

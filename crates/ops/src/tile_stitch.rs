@@ -183,9 +183,10 @@ impl Op for TileStitch {
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+        // The stitched window may be a strided view of the frame it lands in: its shadow is the
+        // storage the window reaches, with the window's strides inside it.
         Args {
-            out: twins.shadow_of(args.out),
+            out: crate::strided::shadow_window(args.out, twins, stream),
             ..args
         }
     }
