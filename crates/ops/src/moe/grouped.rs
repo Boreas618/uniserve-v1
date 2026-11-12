@@ -146,20 +146,20 @@ pub struct GatherGemmArgs {
     pub hidden: Operand,
     /// `[experts, 2 · intermediate, hidden]` expert weights.
     pub weights: Operand,
-    /// `[tokens, top]` i32 route ids — the source of the expanded route count.
+    /// `[tokens, top]` u32 route ids — the source of the expanded route count.
     pub ids: Operand,
-    /// `[tokens, top]` i32: the permuted row of each `(token, route)` pair, as `moe_sort` writes it
+    /// `[tokens, top]` u32: the permuted row of each `(token, route)` pair, as `moe_sort` writes it
     /// (the same map `moe_unpermute` reads). It is the consumer's lookup, not this product's: the
     /// product writes row `p` of `out` at the sort's permuted row `p`, so the map is what lets the
     /// reader find a route afterwards.
     pub expanded_to_permuted: Operand,
-    /// `[max_tiles]` i32 expert of each tile.
+    /// `[max_tiles]` u32 expert of each tile.
     pub tile_to_expert: Operand,
-    /// `[max_tiles]` i32 live rows of each tile.
+    /// `[max_tiles]` u32 live rows of each tile.
     pub tile_to_limit: Operand,
-    /// `[max_permuted_rows]` i32 expanded route of each permuted row.
+    /// `[max_permuted_rows]` u32 expanded route of each permuted row.
     pub permuted_to_expanded: Operand,
-    /// `[1]` i32 live tiles.
+    /// `[1]` u32 live tiles.
     pub num_non_exiting_tiles: Operand,
     /// `[max_permuted_rows, intermediate]` gated products, written.
     pub out: Operand,
@@ -278,10 +278,10 @@ impl Op for GatherGemm {
             ("the route map", &args.expanded_to_permuted),
         ] {
             view.require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-            if view.dtype != DType::I32 {
+            if view.dtype != DType::U32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected i32 {what}, found {}", abi::name(view.dtype)),
+                    format!("expected u32 {what}, found {}", abi::name(view.dtype)),
                 ));
             }
         }
@@ -291,16 +291,16 @@ impl Op for GatherGemm {
             &args.permuted_to_expanded,
             &args.num_non_exiting_tiles,
         ] {
-            if view.dtype != DType::I32 {
+            if view.dtype != DType::U32 {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
-                        "expected i32 sort metadata, found {}",
+                        "expected u32 sort metadata, found {}",
                         abi::name(view.dtype)
                     ),
                 ));
             }
-            super::require_i32_vector(Self::NAME, view)?;
+            super::require_u32_vector(Self::NAME, view)?;
         }
         // The sort pads its permuted rows up to whole tiles, so the map holds at least one row per
         // route and exactly the rows the product writes.
@@ -421,11 +421,11 @@ impl Op for RouteGemm {
             .require_row(Self::NAME, descriptor.dtype, intermediate)?;
         args.ids
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        if args.ids.dtype != DType::I32 {
+        if args.ids.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected i32 route ids, found {}",
+                    "expected u32 route ids, found {}",
                     abi::name(args.ids.dtype)
                 ),
             ));
@@ -436,16 +436,16 @@ impl Op for RouteGemm {
             &args.permuted_to_expanded,
             &args.num_non_exiting_tiles,
         ] {
-            if view.dtype != DType::I32 {
+            if view.dtype != DType::U32 {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
-                        "expected i32 sort metadata, found {}",
+                        "expected u32 sort metadata, found {}",
                         abi::name(view.dtype)
                     ),
                 ));
             }
-            super::require_i32_vector(Self::NAME, view)?;
+            super::require_u32_vector(Self::NAME, view)?;
         }
         if rows != args.permuted_to_expanded.numel() {
             return Err(Error::argument(
@@ -537,15 +537,15 @@ pub struct RouteGemmArgs {
     pub rows: Operand,
     /// `[experts, hidden, intermediate]` expert weights.
     pub weights: Operand,
-    /// `[tokens, top]` i32 route ids.
+    /// `[tokens, top]` u32 route ids.
     pub ids: Operand,
-    /// `[max_tiles]` i32 expert of each tile.
+    /// `[max_tiles]` u32 expert of each tile.
     pub tile_to_expert: Operand,
-    /// `[max_tiles]` i32 live rows of each tile.
+    /// `[max_tiles]` u32 live rows of each tile.
     pub tile_to_limit: Operand,
-    /// `[max_permuted_rows]` i32 expanded route of each permuted row.
+    /// `[max_permuted_rows]` u32 expanded route of each permuted row.
     pub permuted_to_expanded: Operand,
-    /// `[1]` i32 live tiles.
+    /// `[1]` u32 live tiles.
     pub num_non_exiting_tiles: Operand,
     /// `[max_permuted_rows, hidden]` every permuted row's expert product, written unweighted: row
     /// `p` of `out` is the product of the sort's permuted row `p`, which is also `out`'s row count
@@ -707,15 +707,15 @@ pub struct GatherGemmNvfp4Args {
     /// interleaved `[experts, 2]`: an interleaved table cannot be handed to a reader that indexes
     /// `array[expert]`.
     pub global_scale: Operand,
-    /// `[tiles]` i32: the expert a tile's rows belong to.
+    /// `[tiles]` u32: the expert a tile's rows belong to.
     pub tile_to_expert: Operand,
-    /// `[tiles]` i32: the local row limit of that tile.
+    /// `[tiles]` u32: the local row limit of that tile.
     pub tile_to_limit: Operand,
-    /// `[routes]` i32: the token row each permuted row gathers, `-1` on a tile's padding. The
+    /// `[routes]` u32: the token row each permuted row gathers, `-1` on a tile's padding. The
     /// product indexes the token-major activations with it, so an expanded route here would read
     /// past the last token.
     pub permuted_to_token: Operand,
-    /// `[1]` i32: the number of tiles that have work.
+    /// `[1]` u32: the number of tiles that have work.
     pub num_non_exiting_tiles: Operand,
     /// `[routes, intermediate]` the gated product.
     pub out: Operand,
@@ -777,13 +777,13 @@ pub struct GatherNvfp4Call {
     pub global_scale: *const c_void,
     /// `[experts]` f32: the same for the gate projection.
     pub global_scale_gate: *const c_void,
-    /// `[tiles]` i32: the expert a tile's rows belong to.
+    /// `[tiles]` u32: the expert a tile's rows belong to.
     pub tile_to_expert: *const i32,
-    /// `[tiles]` i32: the local row limit of that tile.
+    /// `[tiles]` u32: the local row limit of that tile.
     pub tile_to_limit: *const i32,
-    /// `[routes]` i32: the gathered row of each route.
+    /// `[routes]` u32: the gathered row of each route.
     pub permuted_to_token: *const i32,
-    /// `[1]` i32: the number of tiles that have work.
+    /// `[1]` u32: the number of tiles that have work.
     pub num_non_exiting_tiles: *const i32,
     /// `[routes, intermediate]`: the gated product.
     pub out: *mut c_void,
@@ -866,13 +866,13 @@ pub struct RouteNvfp4Call {
     /// `[experts, 1]` f32: each expert's tensor scale, as the checkpoint states it — a factor the
     /// product multiplies, not its reciprocal.
     pub global_scale: *const c_void,
-    /// `[tiles]` i32: the expert a tile's rows belong to.
+    /// `[tiles]` u32: the expert a tile's rows belong to.
     pub tile_to_expert: *const i32,
-    /// `[tiles]` i32: the local row limit of that tile.
+    /// `[tiles]` u32: the local row limit of that tile.
     pub tile_to_limit: *const i32,
-    /// `[routes]` i32: the gathered row of each route.
+    /// `[routes]` u32: the gathered row of each route.
     pub permuted_to_expanded: *const i32,
-    /// `[1]` i32: the number of tiles that have work.
+    /// `[1]` u32: the number of tiles that have work.
     pub num_non_exiting_tiles: *const i32,
     /// `[routes, hidden]`: the contracted rows.
     pub out: *mut c_void,
@@ -1104,11 +1104,11 @@ impl Op for GatherGemmNvfp4 {
         // computed.
         args.permuted_to_token
             .require_shape(Self::NAME, Shape::new(&[routes]))?;
-        if args.permuted_to_token.dtype != DType::I32 {
+        if args.permuted_to_token.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected i32 permuted rows, found {}",
+                    "expected u32 permuted rows, found {}",
                     abi::name(args.permuted_to_token.dtype)
                 ),
             ));
@@ -1389,13 +1389,13 @@ pub struct RouteGemmNvfp4Args {
     /// multiplies, not their reciprocals: the operand's own reconstruction already carries the
     /// encoder's factor, so a reciprocal here would divide the scale out twice.
     pub global_scale: Operand,
-    /// `[tiles]` i32: the expert a tile's rows belong to.
+    /// `[tiles]` u32: the expert a tile's rows belong to.
     pub tile_to_expert: Operand,
-    /// `[tiles]` i32: the local row limit of that tile.
+    /// `[tiles]` u32: the local row limit of that tile.
     pub tile_to_limit: Operand,
-    /// `[routes]` i32: the gathered row of each route.
+    /// `[routes]` u32: the gathered row of each route.
     pub permuted_to_expanded: Operand,
-    /// `[1]` i32: the number of tiles that have work.
+    /// `[1]` u32: the number of tiles that have work.
     pub num_non_exiting_tiles: Operand,
     /// `[routes, hidden]` the contracted rows, one per route: the `top` repeats are combined by
     /// `moe_unpermute`, not here.
@@ -1542,11 +1542,11 @@ impl Op for RouteGemmNvfp4 {
         }
         args.permuted_to_expanded
             .require_shape(Self::NAME, Shape::new(&[routes]))?;
-        if args.permuted_to_expanded.dtype != DType::I32 {
+        if args.permuted_to_expanded.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected i32 permuted rows, found {}",
+                    "expected u32 permuted rows, found {}",
                     abi::name(args.permuted_to_expanded.dtype)
                 ),
             ));
@@ -1652,10 +1652,10 @@ mod nvfp4_launch_tests {
             weights: table(DType::U8, &[128, 1536, 1024]),
             scales: table(DType::F8E4M3, &[128, 1536, 128]),
             global_scale: table(DType::F32, &[2, 128]),
-            tile_to_expert: table(DType::I32, &[2]),
-            tile_to_limit: table(DType::I32, &[2]),
-            permuted_to_token: table(DType::I32, &[32]),
-            num_non_exiting_tiles: table(DType::I32, &[1]),
+            tile_to_expert: table(DType::U32, &[2]),
+            tile_to_limit: table(DType::U32, &[2]),
+            permuted_to_token: table(DType::U32, &[32]),
+            num_non_exiting_tiles: table(DType::U32, &[1]),
             out: table(DType::BF16, &[32, 768]),
             workspace: table(DType::U8, &[4096]),
         }

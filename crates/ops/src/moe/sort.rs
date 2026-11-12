@@ -79,37 +79,36 @@ impl fmt::Display for Descriptor {
 /// The arguments of one sort.
 #[derive(Clone, Copy)]
 pub struct SortArgs {
-    /// `[tokens, top]` i32 route ids.
+    /// `[tokens, top]` u32 route ids.
     pub ids: Operand,
     /// `[tokens, top]` route weights, in the descriptor's scale dtype.
     pub scales: Operand,
-    /// `[max_tiles]` i32: the expert each tile belongs to.
+    /// `[max_tiles]` u32: the expert each tile belongs to.
     pub tile_to_expert: Operand,
-    /// `[max_tiles]` i32: live rows of each tile.
+    /// `[max_tiles]` u32: the permuted row one past each tile's last live row.
     pub tile_to_limit: Operand,
-    /// `[tokens, top]` i32: permuted row of each expanded route, and `-1` for a route this rank does
+    /// `[tokens, top]` u32: permuted row of each expanded route, and `-1` for a route this rank does
     /// not hold, which the sort writes. The buffer needs no initial value.
     ///
     /// `-1` means one thing here and only one: **this rank does not hold the route**. A *token* row a
     /// bucket holds but the batch does not fill is a different subject - a row that is not live has no
-    /// route for any rank to own - and it is not written at all today, because nothing in a launch
-    /// knows how many of a bucket's rows the batch fills.
+    /// route for any rank to own - and its routes are written `-2` ([`SortArgs::live_tokens`]).
     pub expanded_to_permuted: Operand,
-    /// `[max_permuted_rows]` i32: expanded route of each permuted row.
+    /// `[max_permuted_rows]` u32: expanded route of each permuted row.
     pub permuted_to_expanded: Operand,
-    /// `[max_permuted_rows]` i32: the token row each permuted row gathers, and `-1` on a tile's
+    /// `[max_permuted_rows]` u32: the token row each permuted row gathers, and `-1` on a tile's
     /// padding. It is the expanded route over `top`, written beside it, because a product that
     /// gathers its own rows indexes the token-major activations and takes no `top` to divide by.
     pub permuted_to_token: Operand,
-    /// `[1]` i32: padded **permuted** rows the GEMMs must cover.
+    /// `[1]` u32: padded **permuted** rows the GEMMs must cover.
     ///
     /// This is the tail of an expert's last tile, and it is not the same subject as a token row a batch
     /// does not fill: one is a permuted row inside a tile group, the other is a row of the batch's own
     /// extent. A reader who needs the second cannot read it from this count.
     pub total_padded_tokens: Operand,
-    /// `[1]` i32: tiles that hold live rows.
+    /// `[1]` u32: tiles that hold live rows.
     pub num_non_exiting_tiles: Operand,
-    /// `[1]` i32: the token rows **of this batch** that are live, device-resident.
+    /// `[1]` u32: the token rows **of this batch** that are live, device-resident.
     ///
     /// The subject is the batch's own rows, not the rows a buffer holds: `tokens` may be a bucket
     /// wider than the batch, and on an expert-parallel path it is a count of delivered route rows
@@ -117,7 +116,7 @@ pub struct SortArgs {
     /// count, has padding to mark.
     ///
     /// A captured bucket is wider than the batch that fills it, and a row past the batch's extent has
-    /// no route: the program writes `-1` into `expanded_to_permuted` for every route of such a
+    /// no route: the program writes `-2` into `expanded_to_permuted` for every route of such a
     /// row, which the combine skips because it refuses any negative index. The value lives on the
     /// device rather than in [`Call`]'s host scalars because it changes per replay of one captured
     /// graph, and a host value is read once at launch. `None` states no count, which every row live
@@ -260,11 +259,11 @@ impl Op for MoeSort {
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.scales
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        if args.ids.dtype != DType::I32 {
+        if args.ids.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected i32 route ids, found {}",
+                    "expected u32 route ids, found {}",
                     abi::name(args.ids.dtype)
                 ),
             ));
@@ -290,11 +289,11 @@ impl Op for MoeSort {
         }
         for view in [&args.tile_to_expert, &args.tile_to_limit] {
             view.require_shape(Self::NAME, Shape::new(&[tiles]))?;
-            super::require_i32_vector(Self::NAME, view)?;
+            super::require_u32_vector(Self::NAME, view)?;
         }
         args.expanded_to_permuted
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        super::require_i32_vector(Self::NAME, &args.expanded_to_permuted)?;
+        super::require_u32_vector(Self::NAME, &args.expanded_to_permuted)?;
         args.permuted_to_expanded
             .require_shape(Self::NAME, Shape::new(&[permuted]))?;
         args.permuted_to_token
@@ -305,7 +304,7 @@ impl Op for MoeSort {
             .require_shape(Self::NAME, Shape::new(&[1]))?;
         if let Some(live_tokens) = args.live_tokens {
             live_tokens.require_shape(Self::NAME, Shape::new(&[1]))?;
-            live_tokens.require_row(Self::NAME, DType::I32, 1)?;
+            live_tokens.require_row(Self::NAME, DType::U32, 1)?;
         }
         for view in [
             &args.expanded_to_permuted,
@@ -314,10 +313,10 @@ impl Op for MoeSort {
             &args.total_padded_tokens,
             &args.num_non_exiting_tiles,
         ] {
-            if view.dtype != DType::I32 {
+            if view.dtype != DType::U32 {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("expected i32 metadata, found {}", abi::name(view.dtype)),
+                    format!("expected u32 metadata, found {}", abi::name(view.dtype)),
                 ));
             }
         }
