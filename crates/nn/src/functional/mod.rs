@@ -40,6 +40,7 @@ mod embedding;
 mod linear;
 mod logits;
 mod norm;
+mod recurrent;
 mod rotary;
 
 use uniserve_tensor::{DType, Device, Shape, Tensor};
@@ -57,6 +58,7 @@ pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
 pub use linear::{ENCODE_CHUNK, WeightOrder, encode_block, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
+pub use recurrent::{DELTA_RULE_CHUNK, causal_conv1d, gated_delta_rule};
 pub use rotary::{grid_positions, qk_norm_rope, qk_norm_rope_, rotary, rotary_factors};
 
 /// Whether the descriptors this crate builds are the programmatic-dependent-launch variants.
