@@ -80,7 +80,7 @@ pub fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 }
 
 /// `activation` of the FP32 tensor `x`, elementwise.
-fn activate(x: &Tensor, activation: Activation) -> Result<Tensor> {
+pub(super) fn activate(x: &Tensor, activation: Activation) -> Result<Tensor> {
     Ok(match activation {
         Activation::Silu => x.silu()?,
         Activation::Gelu => x.gelu_erf()?,
