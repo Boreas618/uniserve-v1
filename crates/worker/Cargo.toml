@@ -38,6 +38,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The device cases resolve the kernels their profile runs state at a running Build Server.
+build-server.workspace = true
 
 [lints]
 workspace = true
