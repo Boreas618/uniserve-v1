@@ -23,6 +23,8 @@
 //! | --- | --- |
 //! | [`buckets`] | [`Bucket`](buckets::Bucket), the key that fixes a graph's shapes, and the bucket sets a runner captures |
 //! | [`error`] | The crate's one error and its classification for the engine |
+//! | [`graphs`] | [`Graphs`]: the profile run, capture, replay through the input buffer, and the switch of generations, for every runner |
+//! | [`runner`] | The [`Runner`] interface a stage's runner implements |
 //!
 //! ## Rules every module keeps
 //!
@@ -36,8 +38,12 @@
 
 pub mod buckets;
 pub mod error;
+pub mod graphs;
+pub mod runner;
 
 pub use error::{Error, Failure, Result};
+pub use graphs::Graphs;
+pub use runner::{Runner, RunnerId};
 
 /// Locks `mutex`, keeping the state a panicking holder left.
 ///
