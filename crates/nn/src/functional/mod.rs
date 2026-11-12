@@ -77,7 +77,7 @@ pub use moe::{
     expert_dispatch, expert_exchange_fused, gather_gemm, gather_gemm_nvfp4, moe_sort,
     moe_unpermute, route_gemm, route_gemm_nvfp4, sigmoid_gated_add_, topk_softmax,
 };
-pub use noise::{philox_normal, philox_normal_rows};
+pub use noise::{philox_normal, philox_normal_like, philox_normal_rows};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
 pub use nvfp4::{ENCODE_CHUNK, encode_block, nvfp4_quantize};
 pub use pool::adaptive_avg_pool2d;
