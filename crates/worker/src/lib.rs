@@ -32,6 +32,7 @@
 //! | [`stream`] | [`EventPool`](stream::EventPool), the event leases storage owners defer their releases behind |
 //! | [`thread_pool`] | [`ThreadPool`](thread_pool::ThreadPool), a bounded pool of threads for one kind of blocking host work |
 //! | [`memory`] | The rank's storage at the host's Storage Server: [`Storage`](memory::allocation::Storage), the [`StorageClient`](memory::client::StorageClient) and the exclusive storages it takes, host page pools, and the [`WeightStore`](memory::weights::WeightStore) that `nn::WeightLoader` publishes to |
+//! | [`sampler`] | [`Sampler`](sampler::Sampler), the token selection that ends a causal forward, the commit of its tokens into the slots' state, and the host encodings of the columns it reads |
 //!
 //! ## Rules every module keeps
 //!
@@ -52,6 +53,7 @@ pub mod memory;
 pub mod parallel;
 pub mod profiling;
 pub mod runner;
+pub mod sampler;
 pub mod stream;
 pub mod thread_pool;
 
