@@ -141,9 +141,6 @@ impl ProcessCommands {
 /// A running daemon. Dropping it stops its service and ends every process
 /// it supervises.
 pub struct Daemon {
-    /// The command channel to the engines this node's daemon supervises;
-    /// `None` on a member daemon, which supervises none.
-    commands: Option<ProcessCommands>,
     /// The updater's ends of the service on the leader: its requests down,
     /// and the peers and exits up. `None` on a member. Taken once, by the
     /// updater's [`processes::Processes`]; behind a lock because a `Daemon` is
@@ -210,7 +207,7 @@ impl Daemon {
             wake: wake_reader,
         };
 
-        let (served, thread, commands, link, requests, awake, table) = if options.node_rank == 0 {
+        let (served, thread, link, requests, awake, table) = if options.node_rank == 0 {
             let (joins, members) = join_members(&options)?;
             let leader_address = leader_address(&options, &members);
             // Engines may run on any joined node. A deployment with a
@@ -274,12 +271,11 @@ impl Daemon {
                 requests: requests.clone(),
                 greetings: greetings_rx,
                 exits: exits_rx,
-                commands: commands.clone(),
+                commands,
             });
             (
                 Some((address, socket)),
                 thread,
-                Some(commands),
                 link,
                 Some(requests),
                 Some(awake),
@@ -293,11 +289,10 @@ impl Daemon {
                 .name("daemon".into())
                 .spawn(move || service::serve_member(local, leader, &stop))
                 .context("starting the daemon's service")?;
-            (None, thread, None, None, None, None, None)
+            (None, thread, None, None, None, None)
         };
         let (address, socket) = served.unzip();
         Ok(Self {
-            commands,
             table,
             _requests: requests,
             link: std::sync::Mutex::new(link),
@@ -363,26 +358,21 @@ impl Daemon {
                 )
             })
             .context("starting the daemon's service")?;
-        let commands = leader.then_some(ProcessCommands {
-            commands,
-            reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+        let link = leader.then(|| processes::ProcessLink {
+            requests: requests.clone(),
+            greetings: greetings_rx,
+            exits: exits_rx,
+            commands: ProcessCommands {
+                commands,
+                reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+            },
         });
-        let link = match (&commands, leader) {
-            (Some(commands), true) => Some(processes::ProcessLink {
-                requests: requests.clone(),
-                greetings: greetings_rx,
-                exits: exits_rx,
-                commands: commands.clone(),
-            }),
-            _ => None,
-        };
         let (address, socket) = address.unzip();
         Ok(Self {
             table: leader.then_some(table),
             _requests: leader.then_some(requests),
             link: std::sync::Mutex::new(link),
             awake: std::sync::Mutex::new(leader.then_some(awake)),
-            commands,
             address,
             socket: socket.flatten(),
             requested,
@@ -415,12 +405,6 @@ impl Daemon {
             .join()
             .map_err(|_| anyhow::anyhow!("the daemon's service panicked"))??
             .context("the daemon's service stopped before it handed over")
-    }
-
-    /// The command channel to the engines this node's daemon
-    /// supervises; `None` on a member, which supervises none here.
-    pub fn commands(&self) -> Option<ProcessCommands> {
-        self.commands.clone()
     }
 
     /// The updater's ends of this node's service: `None` on a member daemon,

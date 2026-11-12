@@ -104,7 +104,14 @@ struct State {
     unavailable: BTreeMap<String, Unavailable>,
     /// Epochs an update dropped whose storage the next claim retires.
     retire: Vec<u64>,
+    /// How the last updates ended, by number, oldest first: what a follower
+    /// of one reads once the slot is free, or taken by the next update.
+    ended: std::collections::VecDeque<(u64, Phase)>,
 }
+
+/// How many ended updates the updater remembers the final phase of: more
+/// than can end before the follower of the first reads it.
+const ENDED_KEPT: usize = 16;
 
 impl State {
     /// `report` with what the update's trial, transfers and warming read.
@@ -146,6 +153,7 @@ impl Updater {
                 last: None,
                 unavailable: BTreeMap::new(),
                 retire: Vec::new(),
+                ended: std::collections::VecDeque::new(),
             }),
             phase: tokio::sync::watch::Sender::new(None),
             transitions,
@@ -172,6 +180,22 @@ impl Updater {
     /// The number and phase of the update in flight.
     pub(crate) fn in_flight(&self) -> Option<(u64, Phase)> {
         *self.phase.borrow()
+    }
+
+    /// The phase of update `number`: where it is while it is in flight, and
+    /// how it ended afterwards; `None` for an update the updater never ran or
+    /// no longer remembers.
+    pub(crate) fn phase_of(&self, number: u64) -> Option<Phase> {
+        let state = self.lock();
+        match state.update.as_ref() {
+            Some(update) if update.number() == number => Some(update.phase()),
+            _ => state
+                .ended
+                .iter()
+                .rev()
+                .find(|(ended, _)| *ended == number)
+                .map(|(_, phase)| *phase),
+        }
     }
 
     /// The epochs an earlier update dropped, for the update that starts next
@@ -264,6 +288,10 @@ impl Updater {
             );
         }
         state.retire.extend_from_slice(update.retire());
+        if state.ended.len() == ENDED_KEPT {
+            state.ended.pop_front();
+        }
+        state.ended.push_back((number, phase));
         state.last = Some(report);
         state.trial = None;
         state.transfers = None;

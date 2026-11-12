@@ -43,13 +43,13 @@ pub(crate) const INTERVAL: Duration = Duration::from_millis(100);
 
 /// One replica's reports a trial reads: the epoch the update serves it from,
 /// and what serving reported before the promotion.
-pub(crate) struct Observed {
+pub(crate) struct Baseline {
     pub(crate) observer: Arc<Observer>,
     pub(crate) epoch: u64,
     pub(crate) baseline: Option<Rates>,
 }
 
-impl Observed {
+impl Baseline {
     /// `epoch`'s reports through `observer`, with the baseline of `previous`,
     /// the epoch that served, over `window` up to `promotion`.
     pub(crate) fn new(
@@ -74,7 +74,7 @@ impl Observed {
 /// An update on trial, as far as its thresholds read it.
 pub(crate) struct Trial {
     thresholds: RollbackConfig,
-    observed: Vec<Observed>,
+    baselines: Vec<Baseline>,
     /// When the trial began: reports and request counts start from here.
     began: Instant,
     /// The requests that had ended, and those of them that had failed, when the trial began.
@@ -86,12 +86,12 @@ impl Trial {
     /// of requests so far.
     pub(crate) fn begin(
         thresholds: RollbackConfig,
-        observed: Vec<Observed>,
+        baselines: Vec<Baseline>,
         counts: (u64, u64),
     ) -> Self {
         Self {
             thresholds,
-            observed,
+            baselines,
             began: Instant::now(),
             counts,
         }
@@ -130,10 +130,10 @@ impl Trial {
         if self.began.elapsed() < window {
             return None;
         }
-        for observed in &self.observed {
+        for replica in &self.baselines {
             let (Some(baseline), Some(rates)) = (
-                observed.baseline,
-                observed.observer.rates(observed.epoch, self.began, window),
+                replica.baseline,
+                replica.observer.rates(replica.epoch, self.began, window),
             ) else {
                 continue;
             };
@@ -172,14 +172,14 @@ impl Trial {
         let (ended, failed) = self.since(counts);
         let window = self.thresholds.window;
         let rates: Vec<_> = self
-            .observed
+            .baselines
             .iter()
-            .map(|observed| {
+            .map(|replica| {
                 let rates = window
-                    .and_then(|window| observed.observer.rates(observed.epoch, self.began, window));
+                    .and_then(|window| replica.observer.rates(replica.epoch, self.began, window));
                 json!({
-                    "epoch": observed.epoch,
-                    "baseline": observed.baseline,
+                    "epoch": replica.epoch,
+                    "baseline": replica.baseline,
                     "rates": rates,
                 })
             })
@@ -215,14 +215,14 @@ mod tests {
     /// of 1000 us at 100 tokens a batch, and a whole window of it already past.
     fn trial(thresholds: RollbackConfig, observer: &Arc<Observer>) -> Trial {
         observer.record(1, 0, &stats(1_000, 100, 10_000));
-        let observed = Observed::new(
+        let replica = Baseline::new(
             Arc::clone(observer),
             2,
             1,
             thresholds.window,
             Instant::now(),
         );
-        let trial = Trial::begin(thresholds, vec![observed], (10, 1));
+        let trial = Trial::begin(thresholds, vec![replica], (10, 1));
         std::thread::sleep(WINDOW);
         trial
     }
@@ -271,15 +271,15 @@ mod tests {
         let observed_before = stats(1_000, 100, 10_000);
         observer.record(1, 0, &observed_before);
         let thresholds = regressions(None, Some(0.5));
-        let observed = Observed::new(
+        let replica = Baseline::new(
             Arc::clone(&observer),
             2,
             1,
             thresholds.window,
             Instant::now(),
         );
-        let baseline = observed.baseline.expect("a report before the promotion");
-        let trial = Trial::begin(thresholds, vec![observed], (0, 0));
+        let baseline = replica.baseline.expect("a report before the promotion");
+        let trial = Trial::begin(thresholds, vec![replica], (0, 0));
         std::thread::sleep(WINDOW);
         let close = (baseline.tokens_per_second * 0.6) as u64;
         observer.record(2, 0, &stats(1_000, 100, close));
@@ -301,7 +301,7 @@ mod tests {
         };
         let trial = Trial::begin(
             thresholds,
-            vec![Observed::new(observer, 2, 1, None, Instant::now())],
+            vec![Baseline::new(observer, 2, 1, None, Instant::now())],
             (100, 50),
         );
         assert_eq!(trial.breach((100, 50)), None, "nothing ended on trial");
@@ -321,14 +321,14 @@ mod tests {
             window: Some(Duration::from_secs(3600)),
             ..Default::default()
         };
-        let observed = Observed::new(
+        let replica = Baseline::new(
             Arc::clone(&observer),
             2,
             1,
             thresholds.window,
             Instant::now(),
         );
-        let trial = Trial::begin(thresholds, vec![observed], (0, 0));
+        let trial = Trial::begin(thresholds, vec![replica], (0, 0));
         observer.record(2, 0, &stats(9_000, 100, 10_000));
         assert_eq!(trial.breach((0, 0)), None);
     }
@@ -339,14 +339,14 @@ mod tests {
     fn a_trial_without_a_baseline_decides_nothing_and_reports_it() {
         let observer = Arc::new(Observer::default());
         let thresholds = regressions(Some(0.1), Some(0.1));
-        let observed = Observed::new(
+        let replica = Baseline::new(
             Arc::clone(&observer),
             2,
             1,
             thresholds.window,
             Instant::now(),
         );
-        let trial = Trial::begin(thresholds, vec![observed], (0, 0));
+        let trial = Trial::begin(thresholds, vec![replica], (0, 0));
         std::thread::sleep(WINDOW);
         observer.record(2, 0, &stats(9_000, 100, 1));
         assert_eq!(trial.breach((0, 0)), None);

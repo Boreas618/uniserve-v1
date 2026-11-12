@@ -737,7 +737,7 @@ async fn apply(state: &AdminState, body: ConfigBody, operator: bool) -> Response
     let started = operation
         .result
         .as_ref()
-        .is_some_and(|result| result["update"]["phase"] == "preparing");
+        .is_some_and(|result| result.get("update").is_some());
     if !started {
         return (status, Json(operation)).into_response();
     }
@@ -745,16 +745,12 @@ async fn apply(state: &AdminState, body: ConfigBody, operator: bool) -> Response
     // The update runs on by itself: the response states it as it stands when
     // its trial begins or it ends before one.
     loop {
-        let stated = *phases.borrow_and_update();
-        match stated {
-            Some((update, phase)) if update == number => {
-                if !matches!(phase, Phase::Preparing | Phase::Switching) {
-                    break;
-                }
-            }
-            _ => break,
-        }
-        if phases.changed().await.is_err() {
+        phases.borrow_and_update();
+        let moving = matches!(
+            leader.updates.phase_of(number),
+            Some(Phase::Preparing | Phase::Switching)
+        );
+        if !moving || phases.changed().await.is_err() {
             break;
         }
     }

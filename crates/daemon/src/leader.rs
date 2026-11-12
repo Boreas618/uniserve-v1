@@ -1825,10 +1825,10 @@ impl Replica {
                 }
             }
         }
-        let stated = *phases.borrow_and_update();
-        stated
-            .filter(|(stated, _)| *stated == number)
-            .map(|(_, phase)| phase)
+        // The watch only wakes: the phase is the update's own, which the
+        // updater keeps after the update ended and another began.
+        phases.borrow_and_update();
+        updater.phase_of(number)
     }
 
     /// [`Self::follow`] for the generation form.
@@ -1843,10 +1843,7 @@ impl Replica {
     ) {
         let mut phases = updater.watch();
         let mut trial: Option<Arc<crate::updates::trial::Trial>> = None;
-        let mut phase = phases
-            .borrow_and_update()
-            .filter(|(stated, _)| *stated == number)
-            .map(|(_, phase)| phase);
+        let mut phase = updater.phase_of(number);
         loop {
             match phase {
                 Some(Phase::Trial) if trial.is_none() => {
@@ -1854,7 +1851,7 @@ impl Replica {
                     // ends where the switch began.
                     let began = updater.switch_began().unwrap_or_else(Instant::now);
                     let observed = self.hold.client().map(|client| {
-                        crate::updates::trial::Observed::new(
+                        crate::updates::trial::Baseline::new(
                             Arc::clone(&self.observer),
                             client.epoch(),
                             client.epoch(),
@@ -1915,12 +1912,6 @@ impl Replica {
     ) {
         let host = config.host_identity.clone();
         let mut phases = updater.watch();
-        let stated = |phases: &mut watch::Receiver<Option<(u64, Phase)>>| {
-            phases
-                .borrow_and_update()
-                .filter(|(stated, _)| *stated == number)
-                .map(|(_, phase)| phase)
-        };
 
         // While the target prepares, its transfers yield to the serving
         // epoch's steps (`update_config.transfer_slowdown`); the guard ends
@@ -2023,7 +2014,7 @@ impl Replica {
         // Until the target serves, this replica's requests are the previous
         // epoch's: they end as migratable at its drain and wait in the hold.
         let mut served = updater.epochs().served();
-        let mut phase = stated(&mut phases);
+        let mut phase = updater.phase_of(number);
         loop {
             if *served.borrow_and_update() >= epoch {
                 break;
@@ -2075,7 +2066,7 @@ impl Replica {
         let previous_epoch = previous.as_ref().map_or(0, |client| client.epoch());
         let trial = Arc::new(crate::updates::trial::Trial::begin(
             options.rollback.clone(),
-            vec![crate::updates::trial::Observed::new(
+            vec![crate::updates::trial::Baseline::new(
                 Arc::clone(&self.observer),
                 epoch,
                 previous_epoch,
@@ -2092,7 +2083,7 @@ impl Replica {
             .then(|| previous.as_ref().map(|client| client.states()))
             .flatten();
         let mut relaunched = None;
-        let mut phase = stated(&mut phases);
+        let mut phase = updater.phase_of(number);
         while phase.is_some_and(|phase| !phase.ended()) {
             // A rollback of an epoch whose engines the trial stopped starts
             // them again on the weights they kept, once the target stopped.
@@ -2101,7 +2092,7 @@ impl Replica {
                     self.relaunch_previous(&control, updater, before.clone(), &config_before)
                         .await,
                 );
-                phase = stated(&mut phases);
+                phase = updater.phase_of(number);
                 continue;
             }
             let ended = async {

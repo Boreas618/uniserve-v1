@@ -510,9 +510,14 @@ fn one_update_is_in_flight_and_an_early_commit_is_kept() {
         deployment.entered(),
         ["preparing", "switching", "trial", "committed"]
     );
-    // The slot is free again.
+    // The slot is free again, and the update's follower still reads how
+    // it ended once another is in flight.
+    assert_eq!(deployment.updater.phase_of(1), Some(Phase::Committed));
     let third = deployment.generation(3, 1, None);
     assert!(deployment.updater.apply(third).is_ok());
+    assert_eq!(deployment.updater.phase_of(1), Some(Phase::Committed));
+    assert_eq!(deployment.updater.phase_of(3), Some(Phase::Preparing));
+    assert_eq!(deployment.updater.phase_of(2), None, "it never ran");
 }
 
 /// A serving engine that exits during the trial ends it: the record returns
