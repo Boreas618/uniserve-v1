@@ -21,7 +21,10 @@
 
 pub mod config;
 
-pub use config::{AudioVaeConfig, VideoVaeConfig};
+pub use config::{
+    AudioVaeConfig, Config, DenoiserConfig, ScheduleConfig, TransformerConfig, VideoVaeConfig,
+    VsaConfig,
+};
 pub use processing::minimax_h3::VideoTask;
 
 /// What this crate can fail with.
@@ -74,6 +77,13 @@ impl Error {
 impl From<uniserve_tensor::Error> for Error {
     /// A tensor operation's refusal, as the shared library reports it.
     fn from(error: uniserve_tensor::Error) -> Self {
+        Self::Nn(error.into())
+    }
+}
+
+impl From<qwen3::Error> for Error {
+    /// A refusal of the Qwen3 family this crate composes, as the shared library reports it.
+    fn from(error: qwen3::Error) -> Self {
         Self::Nn(error.into())
     }
 }

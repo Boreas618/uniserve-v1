@@ -2685,6 +2685,7 @@ dependencies = [
  "backend",
  "nn",
  "processing",
+ "qwen3",
  "serde",
  "serde_json",
  "tempfile",

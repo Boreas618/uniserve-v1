@@ -13,6 +13,8 @@ publish = false
 nn = { path = "../../nn" }
 uniserve-tensor.workspace = true
 processing.workspace = true
+# The Qwen3-VL model is this family's text encoder, served through `nn::Encoder`.
+qwen3.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
 
