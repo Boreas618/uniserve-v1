@@ -8,6 +8,7 @@
 //! A module of one input also implements the tensor library's [`Module`](crate::Module), so it
 //! composes with `Tensor::apply`.
 
+mod attention;
 mod embedding;
 mod head;
 mod linear;
@@ -15,6 +16,7 @@ mod mlp;
 mod norm;
 mod rotary;
 
+pub use attention::{Attention, AttentionConfig, QkNorm};
 pub use embedding::{Embedding, EmbeddingConfig};
 pub use head::{LmHead, LmHeadConfig};
 pub use linear::{Linear, LinearConfig, Parallel, QkvBias, QkvLinear, QkvLinearConfig, QkvNames};

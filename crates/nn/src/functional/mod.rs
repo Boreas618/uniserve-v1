@@ -35,6 +35,7 @@
 //! every launch site of an operator states the same key.
 
 mod activation;
+mod attention;
 mod embedding;
 mod linear;
 mod logits;
@@ -47,6 +48,9 @@ use crate::error::{Error, Result};
 
 pub use activation::{
     Activation, Rounding, act_and_mul, gelu, gelu_tanh, silu, snake, swiglu, value_first_swiglu,
+};
+pub use attention::{
+    dense_attention, dense_attention_varlen, kv_write_, paged_attention, zero_arrival_counters_,
 };
 pub use embedding::{embedding, vocabulary_shard};
 pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
