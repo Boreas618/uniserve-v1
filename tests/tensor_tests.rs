@@ -1937,6 +1937,26 @@ fn pad_with_same() -> Result<()> {
 }
 
 #[test]
+fn a_shape_hashes_by_its_dimensions() {
+    use std::collections::HashSet;
+    use uniserve_tensor::Shape;
+
+    let shapes: HashSet<Shape> = [
+        Shape::from((2, 3)),
+        Shape::from(vec![2, 3]),
+        Shape::from((3, 2)),
+        Shape::from(6),
+        Shape::from(()),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(shapes.len(), 4);
+    assert!(shapes.contains(&Shape::from_dims(&[2, 3])));
+    assert!(!shapes.contains(&Shape::from_dims(&[1, 6])));
+}
+
+#[test]
 fn i64_abs() -> Result<()> {
     let t = Tensor::new(&[-42i64, 1337], &Device::Cpu)?;
     let t = t.abs()?;

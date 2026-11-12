@@ -2,7 +2,7 @@
 #![allow(clippy::redundant_closure_call)]
 use crate::{Error, Result};
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Shape(Vec<usize>);
 
 pub const SCALAR: Shape = Shape(vec![]);
