@@ -16,6 +16,10 @@ reduction for each of them at a time: a ``[ROWS, TILE]`` tile per step, and
 reduction of few outputs (``TILE`` is the whole block) and a short one of
 many (``TILE`` is the reduction's class) both read a full block per step.
 
+A sum adds each tile into ``[ROWS, TILE]`` partial sums, one per position of
+the tile, and folds a row's partial sums once after the last step. An
+extremum folds its tile at every step.
+
 A floating element accumulates in FP32, or in FP64 when it is FP64, and
 rounds to nearest even once into the element type. An integer accumulates in
 64 bits and is stored at its own width, which is the wrapped sum. Each
@@ -104,6 +108,15 @@ def _reduce_kernel(
         best = tl.full([ROWS], NEUTRAL, tl.int64)
     position = tl.zeros([ROWS], dtype=tl.int64)
 
+    # A sum is reduced along the tile once, after the loop, and never inside
+    # it. Triton 3.7 rewrites a floating reduction of a loaded tile that
+    # accumulates across a loop into per-thread partial sums, regrouping each
+    # thread's elements; where a thread holds elements of several rows and
+    # the rows are known to be adjacent in memory, the regrouping pairs
+    # elements of different rows and the stored sums are wrong.
+    if FUNCTION == "sum":
+        partial = tl.zeros([ROWS, TILE], dtype=best.dtype)
+
     for start in range(0, length, TILE):
         columns = start + tl.arange(0, TILE).to(tl.int64)
         live = live_rows[:, None] & (columns[None, :] < length)
@@ -121,7 +134,7 @@ def _reduce_kernel(
         values = tl.where(live, loaded, best[:, None])
 
         if FUNCTION == "sum":
-            best += tl.sum(loaded, axis=1)
+            partial += loaded
         elif FUNCTION == "min":
             best = tl.minimum(best, tl.min(values, axis=1))
         elif FUNCTION == "max":
@@ -138,6 +151,9 @@ def _reduce_kernel(
             at = start + tl.argmax(values, axis=1).to(tl.int64)
             position = tl.where(taken, at, position)
             best = tl.where(taken, highest, best)
+
+    if FUNCTION == "sum":
+        best += tl.sum(partial, axis=1)
 
     if FUNCTION == "argmin":
         tl.store(out + rows, position.to(tl.uint32), mask=live_rows)
