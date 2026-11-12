@@ -22,6 +22,7 @@
 pub mod audio_vae;
 pub mod config;
 pub mod denoiser;
+pub mod family;
 pub mod modulation;
 pub mod packing;
 pub mod refiner;
@@ -33,6 +34,7 @@ pub use config::{
     AudioVaeConfig, Config, DenoiserConfig, ScheduleConfig, TransformerConfig, VideoVaeConfig,
     VsaConfig,
 };
+pub use family::{FAMILY, MinimaxH3};
 pub use processing::minimax_h3::VideoTask;
 
 /// What this crate can fail with.

@@ -92,7 +92,7 @@ const TILE_OVERLAP_MIN: usize = 64;
 
 /// The element type of the decoder's projections, of the rows they read and write, and of the
 /// raster (module documentation).
-const ACTIVATION: DType = DType::F16;
+pub const ACTIVATION: DType = DType::F16;
 
 /// The element type of the latents a decode reads and of the residual stream.
 const STREAM: DType = DType::F32;
