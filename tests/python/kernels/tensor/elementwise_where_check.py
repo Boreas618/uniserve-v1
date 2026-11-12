@@ -11,7 +11,8 @@ selection moves one of its two values, so the operator's tolerance is exact.
 
 What is covered:
 
-- **every value type under every condition type** (`u8`, `u32`, `i64`), contiguous;
+- **every value type under every condition type** (`u8`, `u32`, `i64`), contiguous, an FP8
+  (`f8e4m3`) value selected as the byte it is;
 - **a condition that is any nonzero value**, not only one: 2, 200 and, where the type is signed, a
   negative number select `on_true` as 1 does, which a kernel comparing against one would miss;
 - **every layout** of `operands.views` as the condition, with a permuted, stepped or broadcast
@@ -39,15 +40,15 @@ def conditions(dtype, shape, seed):
     return operands.tensor(torch.tensor(truths)[drawn], dtype)
 
 
-def check(name, condition, on_true, on_false):
-    """One launch held to torch's selection, bit for bit."""
+def check(name, dtype, condition, on_true, on_false):
+    """One launch over values of `dtype` held to torch's selection, bit for bit."""
     out = operands.empty(condition.shape, on_true.dtype)
     extents, strides = operands.merged([condition, on_true, on_false, out])
     elements = out.numel()
 
     # `WhereDescriptor`'s `Display`.
     key = (
-        f"dtype_{NAMES[on_true.dtype]}_condition_{NAMES[condition.dtype]}"
+        f"dtype_{dtype}_condition_{NAMES[condition.dtype]}"
         f"_rank_{len(extents)}_block_{operands.BLOCK}_pdl_false"
     )
     operands.launch(
@@ -69,7 +70,7 @@ def check(name, condition, on_true, on_false):
     # The selection as torch states it, on contiguous copies so that no layout is involved.
     holds = condition.contiguous() != 0
     expected = torch.where(holds, on_true.contiguous(), on_false.contiguous())
-    label = f"{on_true.dtype} under {condition.dtype} {name} {tuple(condition.shape)}"
+    label = f"{dtype} under {condition.dtype} {name} {tuple(condition.shape)}"
     return operands.same(label, out, expected)
 
 
@@ -78,7 +79,7 @@ def main():
         return 0
 
     checked = 0
-    dtypes = operands.FLOATS + operands.INTEGERS
+    dtypes = operands.FLOATS + operands.INTEGERS + tuple(operands.MOVED)
 
     # Every value type under every condition type.
     for dtype in dtypes:
@@ -86,7 +87,7 @@ def main():
             condition = conditions(condition_dtype, (5, 7), seed)
             on_true = operands.values(dtype, (5, 7), seed + 10)
             on_false = operands.values(dtype, (5, 7), seed + 20)
-            checked += check("contiguous", condition, on_true, on_false)
+            checked += check("contiguous", dtype, condition, on_true, on_false)
 
     # Values a bitwise comparison tells apart.
     for dtype in operands.FLOATS:
@@ -97,7 +98,7 @@ def main():
         for pattern in ([1, 1, 0, 0], [0, 0, 1, 1], [1, 0, 1, 0]):
             condition = operands.tensor(pattern, "u8")
             checked += check(
-                "a NaN and a negative zero", condition, on_true, on_false
+                "a NaN and a negative zero", dtype, condition, on_true, on_false
             )
 
     # Every layout as the condition; the values take other layouts of the same shape.
@@ -107,6 +108,7 @@ def main():
         ("f32", "u32"),
         ("i64", "i64"),
         ("u8", "u8"),
+        ("f8e4m3", "u32"),
     ):
         cases = zip(
             operands.views(condition_dtype, 5, make=conditions),
@@ -118,12 +120,13 @@ def main():
             on_false = operands.values(dtype, (1,) * len(shape), 205).expand(
                 shape
             )
-            checked += check(name, condition, on_true, on_false)
+            checked += check(name, dtype, condition, on_true, on_false)
 
             # The same condition repeated along its last axis, over contiguous values.
             repeated = condition[..., :1].expand(shape)
             checked += check(
                 f"{name}, repeated",
+                dtype,
                 repeated,
                 operands.values(dtype, shape, 305),
                 on_false,

@@ -6,8 +6,11 @@
 # driver the Build Server runs for one descriptor and target).
 #
 # `out[i] = lhs[i] o rhs[i]` over two inputs read through their strides, into a
-# contiguous output: arithmetic in the inputs' element type, or a comparison
-# writing `u8`. A broadcast operand is a zero stride, so the function, the
+# contiguous output: arithmetic in the inputs' element type, a comparison
+# writing `u8`, or one of the functions of the integer element types alone
+# (`remainder`, the three `bitwise_` combinations and the two shifts), which
+# `src/build.py` refuses for a floating element type. A broadcast operand is a
+# zero stride, so the function, the
 # element type and the number of axes the call traverses are all a compilation
 # holds; the shape and the strides are launch words. The key is the one
 # `BinaryDescriptor`'s `Display` prints, e.g.
@@ -40,6 +43,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { function = ["add", "sub", "mul", "div", "maximum", "minimum", "eq", "ne", "lt", "le", "gt", "ge"], dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
+dimensions = { function = ["add", "sub", "mul", "div", "maximum", "minimum", "eq", "ne", "lt", "le", "gt", "ge", "remainder", "bitwise_and", "bitwise_or", "bitwise_xor", "bitwise_left_shift", "bitwise_right_shift"], dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
 
 [parameters]

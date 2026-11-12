@@ -23,6 +23,14 @@ is loaded and rounded to nearest even once when it is stored; FP32, FP64 and
 the integers compute in their own type, the integers wrapping. Every
 conversion to or from a half-precision type goes through FP32, the one such
 conversion Triton lowers.
+
+**Elements that only move.** An FP8 (``f8e4m3``) element is one byte, and the
+primitives that convert nothing (``fill``, ``copy_strided``,
+``elementwise_where``, and the ``gather`` and ``scatter_set`` of ``index``)
+address it as ``u8`` and store the bits they loaded. No primitive computes with
+one (``compute`` refuses it). Two NVFP4 elements share a byte, so no strided
+kernel addresses one: its storage is moved as the ``u8`` tensor of its packed
+bytes.
 """
 
 import triton
@@ -31,8 +39,13 @@ import triton.language as tl
 #: The most axes an operand has (``ops::MAX_RANK``).
 MAX_RANK = 6
 
-#: Triton's name for each element type the primitives compute with, by the
-#: name ``ops::DType`` prints.
+#: The element types the primitives move and never compute with: an element is
+#: the byte it is stored in.
+MOVED = ("f8e4m3",)
+
+#: Triton's name for each element type an operand holds, by the name
+#: ``ops::abi::name`` prints. An element that only moves is addressed as its
+#: byte.
 ELEMENTS = {
     "u8": "u8",
     "u32": "u32",
@@ -43,6 +56,7 @@ ELEMENTS = {
     "bf16": "bf16",
     "f32": "fp32",
     "f64": "fp64",
+    "f8e4m3": "u8",
 }
 
 #: The unsigned integer as wide as each element type: what holds its bits.
@@ -56,6 +70,7 @@ BITS = {
     "bf16": "u16",
     "f32": "u32",
     "f64": "u64",
+    "f8e4m3": "u8",
 }
 
 
@@ -65,7 +80,16 @@ def pointer(dtype):
 
 
 def compute(dtype):
-    """The type a kernel computes ``dtype`` elements in."""
+    """The type a kernel computes ``dtype`` elements in.
+
+    An element type that only moves has none: a descriptor that asks a kernel
+    to compute with one names no module.
+    """
+    if dtype in MOVED:
+        raise SystemExit(
+            f"{dtype} elements move as their bytes: no primitive computes "
+            f"with them"
+        )
     if dtype == "f64":
         return "fp64"
     if dtype in ("f16", "bf16", "f32"):

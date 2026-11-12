@@ -47,6 +47,30 @@ pub(crate) const ELEMENTS: [DType; 9] = [
     DType::F64,
 ];
 
+/// The element types the primitives move without computing: `fill`, `copy_strided`,
+/// `elementwise_where`, and the `gather` and `scatter_set` of `index`.
+///
+/// They are the types of [`ELEMENTS`] and `f8e4m3`, whose elements travel as the byte each one
+/// is: a program addresses the operand as `u8` and stores the bits it loaded, so an FP8 tensor
+/// is zeroed, copied, concatenated, gathered and selected with no conversion to round. No
+/// primitive computes with an FP8 element; arithmetic on one is a fused operator's.
+///
+/// The NVFP4 element (`f4`) is not among them. Two of its elements share a byte, so no strided
+/// program can address one: a caller that moves NVFP4 storage states it as the `u8` tensor of
+/// its packed bytes, and the operators that decode it name its packed layout themselves.
+pub(crate) const MOVED: [DType; 10] = [
+    DType::U8,
+    DType::U32,
+    DType::I16,
+    DType::I32,
+    DType::I64,
+    DType::F16,
+    DType::BF16,
+    DType::F32,
+    DType::F64,
+    DType::F8E4M3,
+];
+
 /// The element types an index or a condition is read in.
 pub(crate) const INDICES: [DType; 3] = [DType::U8, DType::U32, DType::I64];
 

@@ -931,20 +931,20 @@ fn element_type(path: &Path, tensor: &str, dtype: FormatDtype) -> Result<DType> 
     };
     match dtype {
         FormatDtype::U8 => Ok(DType::U8),
+        FormatDtype::U32 => Ok(DType::U32),
         FormatDtype::I16 => Ok(DType::I16),
         FormatDtype::I32 => Ok(DType::I32),
         FormatDtype::I64 => Ok(DType::I64),
         FormatDtype::F16 => Ok(DType::F16),
         FormatDtype::BF16 => Ok(DType::BF16),
         FormatDtype::F32 => Ok(DType::F32),
+        FormatDtype::F64 => Ok(DType::F64),
         FormatDtype::F8_E4M3 => Ok(DType::F8E4M3),
         FormatDtype::F4 => Ok(DType::F4),
         FormatDtype::BOOL => refuses("BOOL"),
         FormatDtype::I8 => refuses("I8"),
         FormatDtype::U16 => refuses("U16"),
-        FormatDtype::U32 => refuses("U32"),
         FormatDtype::U64 => refuses("U64"),
-        FormatDtype::F64 => refuses("F64"),
         FormatDtype::C64 => refuses("C64"),
         FormatDtype::F6_E2M3 => refuses("F6_E2M3"),
         FormatDtype::F6_E3M2 => refuses("F6_E3M2"),
@@ -1111,6 +1111,50 @@ mod tests {
             words,
             "and its own bytes"
         );
+    }
+
+    /// Every format type the operator ABI numbers is read as that element type, the unsigned
+    /// 32-bit integers of an index table and the FP64 values of a schedule among them.
+    #[test]
+    fn a_tensor_of_every_element_type_the_abi_numbers_keeps_its_type() {
+        let root = tempfile::tempdir().expect("a temp directory");
+        // Sixteen bytes: two FP64 or I64 elements, four of 32 bits, eight of 16 bits, sixteen
+        // of one byte and thirty-two of four bits.
+        let bytes: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+        let stored: [(&str, DType, usize); 11] = [
+            ("U8", DType::U8, 16),
+            ("U32", DType::U32, 4),
+            ("I16", DType::I16, 8),
+            ("I32", DType::I32, 4),
+            ("I64", DType::I64, 2),
+            ("F16", DType::F16, 8),
+            ("BF16", DType::BF16, 8),
+            ("F32", DType::F32, 4),
+            ("F64", DType::F64, 2),
+            ("F8_E4M3", DType::F8E4M3, 16),
+            ("F4", DType::F4, 32),
+        ];
+        let shapes: Vec<[usize; 1]> = stored.iter().map(|(_, _, count)| [*count]).collect();
+        let tensors: Vec<(&str, &str, &[usize], &[u8])> = stored
+            .iter()
+            .zip(&shapes)
+            .map(|((name, _, _), shape)| (*name, *name, &shape[..], &bytes[..]))
+            .collect();
+        shard(root.path(), &tensors);
+
+        let checkpoint = Checkpoint::open(root.path()).expect("the shard opens");
+        for (name, dtype, count) in stored {
+            let located = checkpoint.locate(name).expect(name);
+            assert_eq!(located.dtype, dtype, "{name}");
+            assert_eq!(located.shape.dims(), [count], "{name}");
+            assert_eq!(checkpoint.read(name).expect(name), bytes, "{name}");
+
+            // The ABI numbers every type a checkpoint may hold.
+            assert!(ops::abi::code(dtype).is_ok(), "{name}");
+        }
     }
 
     /// A shard whose tensor is a real format type the operator ABI does not speak is refused **at

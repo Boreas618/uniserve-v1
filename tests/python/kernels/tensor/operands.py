@@ -88,6 +88,13 @@ ELEMENTS = {
 FLOATS = ("f16", "bf16", "f32", "f64")
 INTEGERS = ("u8", "u32", "i16", "i32", "i64")
 
+#: The element types the primitives move and never compute with
+#: (``strided::MOVED`` beyond ``ELEMENTS``), with the torch type that holds
+#: their storage. Torch has no FP8 element type, and such an element is the
+#: byte it is stored in: a check holds an FP8 tensor as its bytes and names
+#: the element type in the key.
+MOVED = {"f8e4m3": torch.uint8}
+
 #: The unit round-off of each floating element type (``DType::unit_roundoff``).
 UNIT = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24, "f64": 2.0**-53}
 
@@ -163,13 +170,22 @@ def accumulate(dtype: str) -> str:
     return "f64" if dtype == "f64" else "f32"
 
 
+def element(dtype: str) -> torch.dtype:
+    """Torch's element type for the storage of ``dtype`` elements."""
+    return MOVED[dtype] if dtype in MOVED else ELEMENTS[dtype]
+
+
 def values(dtype: str, shape, seed: int, scale: float = 3.0) -> torch.Tensor:
     """A contiguous tensor of ``dtype`` values drawn from one seed.
 
     A floating tensor is normal with deviation ``scale``; an integer one is
     uniform over a range its element type holds, both signs where it has one.
+    An element type that only moves is uniform over every byte, which holds
+    its NaNs, both zeros and its largest values.
     """
     generator = torch.Generator().manual_seed(seed)
+    if dtype in MOVED:
+        return tensor(torch.randint(0, 256, shape, generator=generator), dtype)
     if dtype in FLOATS:
         drawn = torch.randn(shape, generator=generator, dtype=torch.float64)
         return tensor(drawn * scale, dtype)
@@ -179,7 +195,7 @@ def values(dtype: str, shape, seed: int, scale: float = 3.0) -> torch.Tensor:
 
 def tensor(data, dtype: str) -> torch.Tensor:
     """``data`` as a contiguous tensor of ``dtype`` where the check runs."""
-    return torch.as_tensor(data).to(ELEMENTS[dtype]).to(TARGET)
+    return torch.as_tensor(data).to(element(dtype)).to(TARGET)
 
 
 def empty(shape, element: torch.dtype) -> torch.Tensor:
