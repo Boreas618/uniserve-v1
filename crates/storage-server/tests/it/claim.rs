@@ -42,7 +42,7 @@ fn a_claim_lasts_as_long_as_its_client_and_holds_every_epoch() {
     assert_eq!(found.missing, vec![key(1)]);
 }
 
-/// A claim handed to another process goes on over the same connection: the
+/// A claim passed to another process goes on over the same connection: the
 /// server sees the same head, so the successor claims further epochs under
 /// the same token, and what the claim knew of its epochs crosses with it.
 #[test]

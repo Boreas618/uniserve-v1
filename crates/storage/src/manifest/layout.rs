@@ -822,7 +822,7 @@ mod tests {
                     let global = (rank * groups + group) as usize;
                     assert_eq!(part[group as usize].1, whole[global].1);
                 }
-                // Its keys and values are a fraction of a granule: they
+                // Its keys and values are a fraction of a allocation: they
                 // share no chunk with the whole projection's.
                 for (_, key) in &part[groups as usize..] {
                     assert!(whole.iter().all(|(_, other)| other != key));
@@ -833,8 +833,8 @@ mod tests {
 
     #[test]
     fn a_vocabulary_shard_shares_the_aligned_rows_of_the_whole() {
-        // 151936 rows of 4 KiB: a quarter ends mid-granule, and the chunks
-        // up to the granule before it are the whole table's.
+        // 151936 rows of 4 KiB: a quarter ends mid-allocation, and the chunks
+        // up to the allocation before it are the whole table's.
         let degrees = [1, 2, 4];
         let whole = StorageLayout {
             bytes: 151_936 * 4096,

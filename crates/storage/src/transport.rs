@@ -65,7 +65,7 @@ pub struct Connection {
     stream: Socket,
     /// Received bytes not yet parsed into frames.
     inbox: Vec<u8>,
-    /// Received descriptors not yet handed to a frame, in arrival order.
+    /// Received descriptors not yet given to a frame, in arrival order.
     descriptors: VecDeque<OwnedFd>,
     /// Frames, or parts of frames, not yet written.
     outbox: VecDeque<Segment>,
@@ -91,23 +91,23 @@ impl Connection {
     /// The connection's socket and the bytes received and not yet taken
     /// as frames, for another process to go on with ([`Self::resume`]),
     /// once nothing waits to be written and no descriptor is held: a
-    /// Storage Server's hot restart hands its clients' connections to its
+    /// Storage Server's restart in place passes its clients' connections to its
     /// successor.
     ///
     /// # Errors
     ///
     /// Fails when frames wait to be written or descriptors are held.
-    pub fn hand_over(self) -> io::Result<(Socket, Vec<u8>)> {
+    pub fn handoff(self) -> io::Result<(Socket, Vec<u8>)> {
         if !self.descriptors.is_empty() || !self.outbox.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "a connection with frames to write cannot be handed over",
+                "a connection with frames to write cannot be passed on",
             ));
         }
         Ok((self.stream, self.inbox))
     }
 
-    /// Goes on with a connection another process handed over, with the
+    /// Goes on with a connection another process passed on, with the
     /// bytes it had received.
     pub fn resume(stream: Socket, inbox: Vec<u8>) -> Self {
         Self {
@@ -120,7 +120,7 @@ impl Connection {
     }
 
     /// The connection's socket, for another process to go on with, once
-    /// nothing is buffered either way: a daemon's hot restart hands its
+    /// nothing is buffered either way: a daemon's restart in place passes its
     /// idle connections to its successor.
     ///
     /// # Errors
@@ -130,7 +130,7 @@ impl Connection {
         if !self.inbox.is_empty() || !self.descriptors.is_empty() || !self.outbox.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "a connection with buffered frames cannot be handed over",
+                "a connection with buffered frames cannot be passed on",
             ));
         }
         Ok(self.stream)
@@ -241,7 +241,7 @@ impl Connection {
             if !self.receive()? && !self.closed {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "the storage server did not answer within the connection's timeout",
+                    "the storage server did not response within the connection's timeout",
                 ));
             }
         }

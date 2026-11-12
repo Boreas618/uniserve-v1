@@ -150,7 +150,7 @@ fn a_process_of_another_host_reads_a_small_read_only_tensor_of_bytes() {
     let mut worker = worker(&host.socket, scope("text", 0), 1, claim);
 
     // Text 16 bytes into its storage; an exclusive tensor; a read-only
-    // tensor of two dimensions; and one longer than a read answers with.
+    // tensor of two dimensions; and one longer than a read responds with.
     let text = sequence(100, 3);
     let mut held = vec![0; 16];
     held.extend_from_slice(&text);
@@ -646,7 +646,7 @@ mod device {
         let last = DeviceId(DeviceId::count().unwrap() - 1);
         assert_eq!(HandleType::probe(first).unwrap(), HandleType::Fabric);
         let granularity = DeviceAllocation::granularity(first).unwrap();
-        // Each source is as long as the two 64 MiB chunks a network lane
+        // Each source is as long as the two 64 MiB chunks a network copy thread
         // times before it reports a link from another host, so a READ of
         // one source is listed.
         let bytes = (128 << 20) / granularity * granularity;

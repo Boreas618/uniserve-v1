@@ -680,7 +680,7 @@ fn run(options: &Options) -> anyhow::Result<()> {
             ("context_a", context(gpu_a).to_string()),
             ("context_b", context(gpu_b).to_string()),
             (
-                "ledgers_a",
+                "quotas_a",
                 format!(
                     "[{}]",
                     quotas

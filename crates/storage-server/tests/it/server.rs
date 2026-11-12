@@ -530,7 +530,7 @@ fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
     }
 
     // The next launch of the same scope takes the tensor: the server kills
-    // the child, waits for it to exit and hands write access on.
+    // the child, waits for it to exit and passes write access on.
     let mut relaunched = worker(&server.socket, scope("flow", 0), 2, claim);
     let (got, descriptors) = relaunched
         .get(vec![key(5)], Mode::Write, Vec::new())
@@ -589,7 +589,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
         )
         .unwrap();
     let Response::Pool { pool, slots, .. } = response else {
-        panic!("a page pool request answered {response:?}");
+        panic!("a page pool request responded {response:?}");
     };
     assert_eq!((slots, descriptors.len()), (4, 1));
 
@@ -739,7 +739,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         panic!("the reservation was refused");
     };
     let [PageSlot::Reserved { slot }] = slots[..] else {
-        panic!("the reservation answered {slots:?}");
+        panic!("the reservation responded {slots:?}");
     };
     head.call(
         &Request::Commit {
@@ -894,7 +894,7 @@ fn page_pool(worker: &mut Client, bytes: Option<u64>) -> Result<(u64, u64), Erro
     )?;
     match response {
         Response::Pool { pool, slots, .. } => Ok((pool, slots)),
-        reply => panic!("a page pool request answered {reply:?}"),
+        reply => panic!("a page pool request responded {reply:?}"),
     }
 }
 
@@ -1706,7 +1706,7 @@ fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
         match worker.call(&request, &[]).unwrap().0 {
             Response::Pool { slots, .. } => Some(slots),
             Response::Error { .. } => None,
-            reply => panic!("a page pool request answered {reply:?}"),
+            reply => panic!("a page pool request responded {reply:?}"),
         }
     };
 
@@ -1902,7 +1902,7 @@ fn await_usage(client: &mut Client, usage: u64) {
 /// Two epochs of a deployment share a GPU within one quota: each storage is
 /// reserved once, however many epochs map it, an epoch's reserved items end with
 /// its processes, nothing takes a GPU past its quota, and a commit
-/// hands the predecessor's segments the successor maps to the successor on
+/// passes the predecessor's segments the successor maps to the successor on
 /// the quota, as a transfer rather than a release and an allocation.
 #[test]
 fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
@@ -2096,7 +2096,7 @@ fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
 /// A head moves an epoch's weights between its GPUs and host storage only
 /// through the Transfer Server: without one, an offload of weights is
 /// refused and moves nothing, while an epoch with no weights to move (none
-/// that it alone retains on a GPU, none in host storage) is answered at once.
+/// that it alone retains on a GPU, none in host storage) gets its response at once.
 /// Only the head moves weights.
 #[test]
 fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
@@ -2243,7 +2243,7 @@ fn reservations_end_with_a_withdrawal_or_the_epoch_s_retirement() {
 /// past its quota (as a smaller fraction an epoch states since may) shrinks
 /// it but never grows it.
 #[test]
-fn a_ledger_past_its_quota_shrinks_but_never_grows() {
+fn a_usage_past_its_quota_shrinks_but_never_grows() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();

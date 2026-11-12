@@ -13,7 +13,7 @@
 //! (`storage-server transfer`).
 //!
 //! `list` prints what a running server holds, `retire` releases the storage
-//! of a deployment that is no longer served, and `restart` hands the running
+//! of a deployment that is no longer served, and `restart` passes the running
 //! server to a successor.
 
 use std::path::PathBuf;
@@ -71,7 +71,7 @@ pub enum Command {
         #[arg(long)]
         nixl_library: Option<PathBuf>,
         /// The descriptor of the handoff socket to the server this one
-        /// succeeds in a hot restart (`storage-server restart`), which it goes on
+        /// succeeds in a restart in place (`storage-server restart`), which it goes on
         /// with.
         #[arg(long, hide = true, value_name = "FD")]
         predecessor: Option<i32>,
@@ -112,7 +112,7 @@ pub enum Command {
     },
     /// Hand the running server to a successor, of this build or the one
     /// `--executable` names, which goes on with every connection, tensor and
-    /// page pool once nothing is in flight (a hot restart).
+    /// page pool once nothing is in flight (a restart in place).
     Restart {
         #[arg(long)]
         socket: Option<PathBuf>,

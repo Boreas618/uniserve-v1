@@ -978,7 +978,7 @@ pub(crate) mod device {
                 gpus: vec![gpu],
                 links: head.list().unwrap().transfer.unwrap().links,
             };
-            let manifest = Manifest::plan(&request).unwrap();
+            let manifest = Manifest::compute(&request).unwrap();
             let spans = manifest
                 .bind(&request, &request.source)
                 .spans()
@@ -1019,7 +1019,7 @@ pub(crate) mod device {
 
     /// The Transfer Server's context as the deployment's quota of `gpu`
     /// reserves it, if it does.
-    fn booked_context(client: &mut ::storage::Client, gpu: [u8; 16]) -> Option<u64> {
+    fn reserved_context(client: &mut ::storage::Client, gpu: [u8; 16]) -> Option<u64> {
         let quotas = client.usage(vec![gpu]).unwrap().quotas;
         quotas
             .iter()
@@ -1040,7 +1040,7 @@ pub(crate) mod device {
     fn await_release(nvml: &Nvml, client: &mut ::storage::Client, device: DeviceId, pid: i32) {
         let gpu = device.uuid().unwrap().0;
         let deadline = Instant::now() + Duration::from_secs(10);
-        while holds_context(nvml, device, pid) || booked_context(client, gpu).is_some() {
+        while holds_context(nvml, device, pid) || reserved_context(client, gpu).is_some() {
             assert!(
                 Instant::now() < deadline,
                 "the Transfer Server still holds or reserves its context on {device}"
@@ -1087,7 +1087,7 @@ pub(crate) mod device {
                 ],
             )
             .unwrap();
-        assert_eq!(booked_context(&mut head, gpu), None);
+        assert_eq!(reserved_context(&mut head, gpu), None);
         // The quota states the bandwidth from host storage to the GPU the
         // Transfer Server measured.
         let quotas = head.usage(vec![gpu]).unwrap().quotas;
@@ -1122,7 +1122,7 @@ pub(crate) mod device {
                 _ => {}
             }
         }
-        assert_eq!(booked_context(&mut head, gpu), Some(context));
+        assert_eq!(reserved_context(&mut head, gpu), Some(context));
         assert!(holds_context(&nvml, first, pid));
         assert_eq!(
             end_of(&mut worker, task),
@@ -1135,7 +1135,7 @@ pub(crate) mod device {
         // or reservation it until a task actually uses the GPU.
         let session = worker.open_session(vec![gpu]).unwrap();
         let other_session = head.open_session(vec![gpu]).unwrap();
-        assert_eq!(booked_context(&mut head, gpu), None);
+        assert_eq!(reserved_context(&mut head, gpu), None);
         let tail: u64 = 2 << 20;
         let task = worker
             .copy(
@@ -1145,10 +1145,10 @@ pub(crate) mod device {
             )
             .unwrap();
         assert_eq!(end_of(&mut worker, task), (tail, TaskStatus::Complete));
-        assert_eq!(booked_context(&mut head, gpu), Some(context));
+        assert_eq!(reserved_context(&mut head, gpu), Some(context));
         assert!(holds_context(&nvml, first, pid));
         worker.close_session(session).unwrap();
-        assert_eq!(booked_context(&mut head, gpu), Some(context));
+        assert_eq!(reserved_context(&mut head, gpu), Some(context));
         head.close_session(other_session).unwrap();
         await_release(&nvml, &mut head, first, pid);
 
@@ -1162,7 +1162,7 @@ pub(crate) mod device {
             )
             .unwrap();
         assert_eq!(end_of(&mut worker, task), (tail, TaskStatus::Complete));
-        assert_eq!(booked_context(&mut head, gpu), Some(context));
+        assert_eq!(reserved_context(&mut head, gpu), Some(context));
         drop(worker);
         await_release(&nvml, &mut head, first, pid);
     }
@@ -1173,7 +1173,7 @@ pub(crate) mod device {
     /// quota stays within its quota.
     #[test]
     #[ignore = "requires a CUDA device"]
-    fn a_ledger_without_room_for_the_context_fails_the_task_that_needs_the_gpu() {
+    fn a_quota_without_room_for_the_context_fails_the_task_that_needs_the_gpu() {
         let server = serving(Gpus::Visible);
         let pid = super::transfer_pid(&server.socket, None);
         let nvml = Nvml::init().unwrap();

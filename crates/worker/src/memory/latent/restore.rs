@@ -90,7 +90,7 @@ pub(crate) fn copies(
             bytes_per_second: 1,
         }],
     };
-    let planned = Manifest::plan(&request).map_err(invalid)?;
+    let planned = Manifest::compute(&request).map_err(invalid)?;
     if !planned.missing.is_empty() {
         return Err(Error::Invalid(format!(
             "the stored pages do not hold every latent value of the rank: {:?}",

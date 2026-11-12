@@ -112,7 +112,7 @@ use serde::{Deserialize, Serialize};
 /// storage protocol is refused at its hello to the daemon as well.
 pub const VERSION: u32 = 21;
 
-/// The most bytes a [`Request::Read`] answers with: a weight manifest of the
+/// The most bytes a [`Request::Read`] responds with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
 /// this size holds the server's loop for a few milliseconds on a host's
 /// network.
@@ -160,7 +160,7 @@ impl std::fmt::Display for Scope {
 
 /// The token a deployment's claim carries: the server issues one when a head
 /// first claims the deployment and keeps it for every later claim of that
-/// head, of whatever epoch, and the head hands it to its workers, which
+/// head, of whatever epoch, and the head passes it to its workers, which
 /// state it in their [`Role`]. A worker that states another token belongs to
 /// a previous head of the deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -216,7 +216,7 @@ pub struct Hello {
     pub role: Role,
 }
 
-/// The server's answer to [`Hello`].
+/// The server's response to [`Hello`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Welcome {
@@ -312,7 +312,7 @@ pub enum Item {
     CacheSegment,
     /// Exclusive device storages the server retains beside the KV cache's
     /// value planes: the cache's flags and scales, the buffer pool, the
-    /// latent banks.
+    /// latent buffers.
     Exclusive,
     /// A worker's CUDA graph storage pool: the storage its captured graphs
     /// address. Reserved by the worker.
@@ -384,7 +384,7 @@ pub struct Quota {
     /// GPU while it holds one, as it measured it when it started; 0 when no
     /// Transfer Server measured the GPU. The quota reserves it as an entry
     /// ([`Item::TransferContext`]) only while the Transfer Server holds the
-    /// context, from its first work on the GPU to its last, so a plan that
+    /// context, from its first work on the GPU to its last, so a division of the GPU that
     /// leaves room for transfers counts it whether or not it is reserved.
     pub transfer_context: u64,
 }
@@ -908,7 +908,7 @@ pub enum Request {
     /// every other exclusive tensor ends. A tensor no other epoch retains
     /// is released, while segments mapped by the successor remain retained
     /// by that successor. Call after the predecessor's processes exit.
-    /// Answered with `Retained`.
+    /// Responded with `Retained`.
     KeepWeights {
         epochs: Vec<u64>,
         cache_keys: Vec<Key>,
@@ -921,7 +921,7 @@ pub enum Request {
     /// moving nothing, when the host cannot hold it all), has its Transfer
     /// Server copy each storage there, and then the tensors' copies lie in
     /// host storage and the device storages are released: each GPU's quota
-    /// leaves their storage to the other epoch. Answered with `Moved` once
+    /// leaves their storage to the other epoch. Responded with `Moved` once
     /// every copy ended; refused while no Transfer Server runs.
     Offload { epoch: u64 },
     /// From a head: epoch `epoch`'s weights that `Offload` moved to host
@@ -930,7 +930,7 @@ pub enum Request {
     /// size on its GPU, admitted against the GPU's quota (refused, moving
     /// nothing, past the quota), and copies each storage there; then the
     /// tensors' copies lie on those GPUs again and the host copies are
-    /// released. Answered with `Moved` once every copy ended.
+    /// released. Responded with `Moved` once every copy ended.
     Restore { epoch: u64 },
     /// The copies of `keys` that exist at the locations `at` lists (at
     /// every location when `at` is empty), with their storages'
@@ -977,7 +977,7 @@ pub enum Request {
     /// From a process of another host ([`Role::Peer`]): the bytes of the
     /// copy of `key` in host storage that a scope of `deployment` retains
     /// read-only, a one-dimensional tensor of `uint8` elements (such as a
-    /// weight manifest) of at most [`READ_BYTES`] bytes. Answered with
+    /// weight manifest) of at most [`READ_BYTES`] bytes. Responded with
     /// [`Response::Read`]; refused when the deployment retains no such tensor,
     /// or a longer one.
     Read { deployment: String, key: Key },
@@ -985,12 +985,12 @@ pub enum Request {
     /// claim: the deployment is no longer served. Refused while its head is
     /// connected.
     Retire { deployment: String },
-    /// Hand the server to a successor server of `executable` (this
+    /// Pass the server to a successor server of `executable` (this
     /// server's own when `None`), which goes on with every connection, the
     /// listening sockets, the tensors' storage and the page pools once no
     /// request, shoot-down, connector task or transfer is in flight (a hot
     /// restart);
-    /// the server then exits. Answered with the successor's process id
+    /// the server then exits. Responded with the successor's process id
     /// once it started.
     Restart { executable: Option<String> },
     /// A worker's page pool for pages of `shape` on `numa_node`: the pool
@@ -1048,7 +1048,7 @@ pub enum Request {
     /// of epochs every epoch of the deployment shares are found: a page an
     /// epoch on trial or a rolled-back epoch published is not. A pinned
     /// page stays readable and is not evicted until the peer unpins it
-    /// ([`Request::PeerUnpin`]) or its connection closes. Answered with
+    /// ([`Request::PeerUnpin`]) or its connection closes. Responded with
     /// [`Response::PeerPinned`]. The request carries no credential (see
     /// [`Role::Peer`]).
     PeerPin {
@@ -1063,7 +1063,7 @@ pub enum Request {
     /// Where the server accepts connections from other hosts.
     Endpoint,
     /// Read the pages of `keys` the pool does not hold from the KV storage
-    /// into slots reserved for them. Answered at once; the event
+    /// into slots reserved for them. Responded at once; the event
     /// [`Event::Prefetched`] with the same `tag` follows when the reads
     /// end.
     Prefetch { pool: u64, keys: Vec<Key>, tag: u64 },
@@ -1076,7 +1076,7 @@ pub enum Request {
     /// available storage (bounded by the server's storage cgroup limit, and
     /// counting the deployment's page pools no epoch maps, which the server
     /// releases for a new pool) less what the page pools have yet to
-    /// allocate and the server's reserve. Answered with [`Response::HostCache`].
+    /// allocate and the server's reserve. Responded with [`Response::HostCache`].
     HostCache {
         tokens: u64,
         token_bytes: Vec<u64>,
@@ -1113,7 +1113,7 @@ pub enum Request {
     /// operator.
     Usage { gpus: Vec<[u8; 16]> },
     /// From a head or a worker: copy `spans` as one task of `update`, which
-    /// takes its turn at `priority` on every link it uses. Answered with the
+    /// takes its turn at `priority` on every link it uses. Responded with the
     /// task's number at once; [`Event::TaskProgress`] follows as it
     /// copies and [`Event::TaskEnded`] when it ends. Refused, copying
     /// nothing, when no Transfer Server runs, when a region is not storage
@@ -1137,7 +1137,7 @@ pub enum Request {
     /// holds until physical completion; this releases only the session.
     CloseSession { session: u64 },
     /// From a head or a worker: cancel `tasks` and, with `update`, every
-    /// task of that update, of the caller's deployment. Answered at once;
+    /// task of that update, of the caller's deployment. Responded at once;
     /// each task's [`Event::TaskEnded`] follows once the Transfer Server
     /// copies none of its bytes any more.
     Cancel {
@@ -1172,7 +1172,7 @@ pub enum Request {
     /// From another host's Transfer Server ([`Role::Peer`]): have this
     /// host's Transfer Server register `regions`, retained tensors or page
     /// pools of `deployment` on this host, with its NIXL agent, for that
-    /// Transfer Server's READs. Answered with [`Response::Exposed`] once they
+    /// Transfer Server's READs. Responded with [`Response::Exposed`] once they
     /// are registered; refused when a region is not storage of the
     /// deployment, when no Transfer Server is connected, or when it cannot
     /// register them. The regions stay registered for the exposure until
@@ -1188,7 +1188,7 @@ pub enum Request {
     /// `exposure` ended. This host's Transfer Server lets its registrations
     /// go once no other exposure holds them. An exposure the server does
     /// not hold for the caller (it ended with its Transfer Server, or the
-    /// caller's previous connection) is answered alike.
+    /// caller's previous connection) gets its response alike.
     Unexpose { exposure: u64 },
     /// From the Transfer Server: the allocations of the server's
     /// [`Event::Register`] `request` are registered with its NIXL agent:
@@ -1236,7 +1236,7 @@ pub enum ErrorKind {
     Quota,
 }
 
-/// The server's answer to one request.
+/// The server's response to one request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
@@ -1424,7 +1424,7 @@ pub struct TaskListing {
 }
 
 /// What the transfer tasks of one deployment at one priority copied on a
-/// host since its Storage Server started (a hot restart hands the totals
+/// host since its Storage Server started (a restart in place passes the totals
 /// over): the tasks the deployment's heads and workers submitted and the
 /// weight moves the server made for it, ended or running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1501,7 +1501,7 @@ pub struct DeploymentListing {
     pub head_connected: bool,
 }
 
-/// A message the server sends outside the answers to requests: the
+/// A message the server sends outside the responses to requests: the
 /// completion of a head's prefetch and of a transfer, the connector's work
 /// and the Transfer Server's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

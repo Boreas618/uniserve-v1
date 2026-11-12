@@ -1,9 +1,9 @@
-//! The lanes that run copies: one thread per link and copy runner, its
+//! The copy threads that run copies: one thread per link and copy runner, its
 //! queue of pieces by priority, and its link's byte budget.
 //!
-//! A task's moves become pieces, each queued on the lane of its link and of
+//! A task's moves become pieces, each queued on the copy thread of its link and of
 //! the GPU whose copy engine runs it (or the CPU, between host buffers). A
-//! lane repeatedly takes one chunk off the front piece of its highest
+//! copy thread repeatedly takes one chunk off the front piece of its highest
 //! priority that has one, waits until its link's budget covers the chunk,
 //! and copies it:
 //!
@@ -18,29 +18,29 @@
 //!   after its restoration it grows back by [`RESTORE_PER_SECOND`] of the
 //!   bandwidth per second, so the head's statistics, once a second, see
 //!   each step of the recovery.
-//! - **Completion.** A GPU lane keeps [`DEPTH`] chunks submitted on its own
+//! - **Completion.** A GPU copy thread keeps [`DEPTH`] chunks submitted on its own
 //!   stream, so its copy engine never waits for the host, and counts a
 //!   chunk copied only once the event recorded after it completed, as the
-//!   host observes. A network lane keeps [`DEPTH`] NIXL READs posted and
+//!   host observes. A network copy thread keeps [`DEPTH`] NIXL READs posted and
 //!   counts a chunk copied once its READ completed, as the host polls it:
 //!   a READ passes through no CUDA stream. A task ends when its last chunk
 //!   completed: complete, cancelled or failed. A cancelled or failed task's
 //!   queued pieces leave at once, and it ends once its submitted chunks
 //!   completed, since only then are its regions free of copies.
 //! - **Links from other hosts.** Nobody measured them when the process
-//!   started: a network lane (a READ's link) or a GPU lane (a link from
+//!   started: a network copy thread (a READ's link) or a GPU copy thread (a link from
 //!   another host's GPU of the NVLink fabric) times its contiguous chunks
 //!   of [`MEASURE_BYTES`], one at a time, until [`MEASURE_SAMPLES`] of them
 //!   took the link's bandwidth, and reports it; until then its chunks are
-//!   of that size and wait for no budget. A bandwidth a lane measures is
-//!   kept for the lane's next thread.
-//! - **Threads and contexts.** A lane's thread runs while the lane has
+//!   of that size and wait for no budget. A bandwidth a copy thread measures is
+//!   kept for the next thread of its link and runner.
+//! - **Threads and contexts.** A copy thread runs while its queue has
 //!   chunks queued or in flight, and ends when it has none; the next piece
-//!   queued on the lane starts another. A GPU lane's thread holds its GPU
+//!   queued for its link and runner starts another. A GPU copy thread holds its GPU
 //!   ([`Hold`]) and creates its stream in the GPU's context, and every piece
 //!   holds the GPUs whose storage or context its ends need, so a GPU's
 //!   context is released once its last task's last chunk completed and its
-//!   lanes' threads ended ([`super::contexts`]).
+//!   copy threads ended ([`super::contexts`]).
 //!
 //! A device fault (a failed copy submission or completion) leaves the CUDA
 //! context unusable, so the process ends: the Storage Server fails every
@@ -59,7 +59,7 @@ use platform::{
 
 use super::contexts::{Contexts, Hold};
 use super::network::{Network, Source};
-use super::storage::{Fabric, Mapped};
+use super::storage::{Fabric, Mapping};
 
 /// How often a running task reports its progress, at most.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -71,7 +71,7 @@ const MIN_CHUNK: u64 = 256 << 10;
 /// Chunks are whole multiples of this.
 const CHUNK_ALIGN: u64 = 64 << 10;
 
-/// The chunk a lane times to learn the bandwidth of a link from another
+/// The chunk a copy thread times to learn the bandwidth of a link from another
 /// host: as long as a measured copy when the process starts
 /// (`devices::SAMPLE_BYTES`), so that the fixed cost of submitting a copy
 /// or posting a READ and seeing it complete is a few percent of its time
@@ -86,7 +86,7 @@ const MEASURE_BYTES: u64 = 64 << 20;
 /// maps its pages on the GPU.
 const MEASURE_SAMPLES: usize = 2;
 
-/// The chunks a GPU or network lane keeps in flight: one copying while the host
+/// The chunks a GPU or network copy thread keeps in flight: one copying while the host
 /// waits for the other.
 const DEPTH: usize = 2;
 
@@ -96,13 +96,13 @@ const FLOOR_SHARE: f64 = 1.0 / 64.0;
 /// How fast a restored link's share grows back, per second.
 const RESTORE_PER_SECOND: f64 = 1.0 / 8.0;
 
-/// How long a GPU lane sleeps between checks of its oldest chunk.
+/// How long a GPU copy thread sleeps between checks of its oldest chunk.
 const POLL: Duration = Duration::from_micros(20);
 
-/// What runs a lane's copies.
+/// What runs a copy thread's copies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Runner {
-    /// The copy engines of this GPU, on a stream of the lane's.
+    /// The copy engines of this GPU, on a stream of the copy thread's.
     Device(DeviceId),
     /// The CPU, between host buffers.
     Host,
@@ -111,15 +111,15 @@ pub(super) enum Runner {
     Network,
 }
 
-/// A lane: the link it moves bytes over and what runs its copies.
+/// A copy thread: the link it moves bytes over and what runs its copies.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct LaneKey {
+pub(super) struct ThreadKey {
     pub(super) link: Link,
     pub(super) runner: Runner,
 }
 
 /// One end of a piece: an allocation the server gave, another host's
-/// allocation imported on the lane's GPU, or another host's storage that a
+/// allocation imported on the copy thread's GPU, or another host's storage that a
 /// READ reaches. Each holds the GPU whose context reaches it, declared after
 /// what lives in that context, so that it is dropped last.
 #[derive(Clone)]
@@ -129,7 +129,7 @@ pub(super) enum End {
     /// storage, the GPU whose copy engines run the copy, and none when the
     /// CPU copies it or a READ writes it.
     Given {
-        mapped: Arc<Mapped>,
+        mapped: Arc<Mapping>,
         hold: Option<Hold>,
     },
     /// Another host's allocation of the fabric, imported on the GPU that
@@ -196,7 +196,7 @@ impl Piece {
     }
 }
 
-/// A task as the lanes run it.
+/// A task as the copy threads run it.
 struct TaskState {
     /// Pieces queued and not taken whole.
     pieces: usize,
@@ -207,7 +207,7 @@ struct TaskState {
     end: Option<TaskStatus>,
     reported: Instant,
     /// When the task's pieces were queued, and how many there were: the
-    /// task's time on the lanes, which its end reports.
+    /// task's time on the copy threads, which its end reports.
     queued: Instant,
     queued_pieces: usize,
     /// The links its pieces copy over, which a halving of its tasks names.
@@ -276,30 +276,30 @@ impl Budget {
     }
 }
 
-/// The pieces of one lane, by priority.
+/// The pieces of one copy thread, by priority.
 #[derive(Default)]
 struct Queue {
     levels: [VecDeque<Piece>; Priority::COUNT],
 }
 
-/// What the lanes share with the main thread.
+/// What the copy threads share with the main thread.
 struct State {
     tasks: HashMap<u64, TaskState>,
-    queues: HashMap<LaneKey, Queue>,
-    /// The lanes whose thread runs.
-    running: HashSet<LaneKey>,
+    queues: HashMap<ThreadKey, Queue>,
+    /// The copy threads whose thread runs.
+    running: HashSet<ThreadKey>,
     budgets: HashMap<Link, Budget>,
     /// Each link's bandwidth in bytes per second: measured when the process
-    /// started, or by a lane since.
+    /// started, or by a copy thread since.
     bandwidths: HashMap<Link, f64>,
     /// Each report: the task, the bytes it copied, and its end once it
     /// ended.
     reports: Vec<(u64, u64, Option<TaskStatus>)>,
-    /// Links from other hosts that lanes measured, not reported yet.
+    /// Links from other hosts that copy threads measured, not reported yet.
     measured: Vec<LinkBandwidth>,
 }
 
-/// What a lane's thread does next.
+/// What a copy thread does next.
 enum Next {
     /// Copy this chunk.
     Chunk(Piece),
@@ -311,9 +311,9 @@ enum Next {
 
 impl State {
     /// One chunk of at most `chunk` bytes off the front piece of the
-    /// highest priority `lane` has.
-    fn take(&mut self, lane: &LaneKey, chunk: u64) -> Option<Piece> {
-        let queue = self.queues.get_mut(lane)?;
+    /// highest priority `copy thread` has.
+    fn take(&mut self, thread: &ThreadKey, chunk: u64) -> Option<Piece> {
+        let queue = self.queues.get_mut(thread)?;
         let level = queue.levels.iter_mut().find(|level| !level.is_empty())?;
         let front = level.front_mut()?;
         let mut taken = front.clone();
@@ -380,8 +380,8 @@ impl State {
                 task,
                 pieces = state.queued_pieces,
                 bytes = copied,
-                lanes_ms = now.duration_since(state.queued).as_millis() as u64,
-                "a transfer task left the lanes"
+                queued_ms = now.duration_since(state.queued).as_millis() as u64,
+                "a transfer task left the threads"
             );
             self.tasks.remove(&task);
             self.reports.push((task, copied, Some(end)));
@@ -443,19 +443,19 @@ impl Shared {
         let _ = rustix::io::write(&self.wake, b"x");
     }
 
-    /// What `lane`'s thread does next: copy a chunk of at most `chunk`
-    /// bytes; complete a chunk in flight when `busy` and nothing is queued;
-    /// or end. A thread that ends leaves the lane under the lock that saw
-    /// its queue empty, so a piece queued after it starts a new thread.
-    fn next(&self, lane: &LaneKey, chunk: u64, busy: bool) -> Next {
+    /// What the copy thread `thread` does next: copy a chunk of at most
+    /// `chunk` bytes; complete a chunk in flight when `busy` and nothing is
+    /// queued; or end. A thread that ends leaves under the lock that saw its
+    /// queue empty, so a piece queued after it starts a new thread.
+    fn next(&self, thread: &ThreadKey, chunk: u64, busy: bool) -> Next {
         let mut state = self.lock();
-        if let Some(piece) = state.take(lane, chunk) {
+        if let Some(piece) = state.take(thread, chunk) {
             return Next::Chunk(piece);
         }
         if busy {
             return Next::Busy;
         }
-        state.running.remove(lane);
+        state.running.remove(thread);
         Next::Idle
     }
 
@@ -486,7 +486,7 @@ impl Shared {
         }
     }
 
-    /// A lane measured `link`, from another host, at `bandwidth` bytes per
+    /// A copy thread measured `link`, from another host, at `bandwidth` bytes per
     /// second: it is kept, and reported to the server.
     fn measured(&self, link: &Link, bandwidth: f64) {
         tracing::info!(
@@ -504,28 +504,28 @@ impl Shared {
         self.wake_main();
     }
 
-    /// Fail every chunk queued on `lane` with `message`, until nothing is
-    /// queued: its thread cannot copy. It ends when the lane is idle.
-    fn refuse(&self, lane: &LaneKey, message: &str) {
-        while let Next::Chunk(piece) = self.next(lane, u64::MAX, false) {
+    /// Fail every chunk queued for `thread` with `message`, until nothing is
+    /// queued: the thread cannot copy. It ends when its queue is idle.
+    fn refuse(&self, thread: &ThreadKey, message: &str) {
+        while let Next::Chunk(piece) = self.next(thread, u64::MAX, false) {
             self.complete(&piece, Some(message.to_owned()));
         }
     }
 }
 
-/// The lanes and their shared state, as the main thread drives them.
-pub(super) struct Lanes {
+/// The copy threads and their shared state, as the main thread drives them.
+pub(super) struct CopyThreads {
     shared: Arc<Shared>,
     /// The time a chunk lasts at its link's bandwidth.
     chunk: Duration,
-    /// The NIXL agent network lanes post their READs with.
+    /// The NIXL agent network copy threads post their READs with.
     network: Arc<Network>,
-    /// The GPUs' contexts, which GPU lanes hold while their threads run.
+    /// The GPUs' contexts, which GPU copy threads hold while their threads run.
     contexts: Arc<Contexts>,
 }
 
-impl Lanes {
-    /// Lanes with each link's bandwidth as measured when the process
+impl CopyThreads {
+    /// CopyThreads with each link's bandwidth as measured when the process
     /// started.
     pub(super) fn new(
         wake: OwnedFd,
@@ -553,9 +553,14 @@ impl Lanes {
         }
     }
 
-    /// Queue task `task`'s pieces, each on its lane, at `priority`, and
-    /// start the thread of every lane that has none.
-    pub(super) fn submit(&mut self, task: u64, priority: Priority, pieces: Vec<(LaneKey, Piece)>) {
+    /// Queue task `task`'s pieces, each for its copy thread, at `priority`,
+    /// and start every copy thread that does not run.
+    pub(super) fn submit(
+        &mut self,
+        task: u64,
+        priority: Priority,
+        pieces: Vec<(ThreadKey, Piece)>,
+    ) {
         let mut started = Vec::new();
         let mut state = self.shared.lock();
         state.tasks.insert(
@@ -568,19 +573,22 @@ impl Lanes {
                 reported: Instant::now(),
                 queued: Instant::now(),
                 queued_pieces: pieces.len(),
-                links: pieces.iter().map(|(lane, _)| lane.link.clone()).collect(),
+                links: pieces
+                    .iter()
+                    .map(|(thread, _)| thread.link.clone())
+                    .collect(),
             },
         );
-        for (lane, piece) in pieces {
-            if state.running.insert(lane.clone()) {
-                let bandwidth = state.bandwidths.get(&lane.link).copied();
-                started.push((lane.clone(), bandwidth));
+        for (thread, piece) in pieces {
+            if state.running.insert(thread.clone()) {
+                let bandwidth = state.bandwidths.get(&thread.link).copied();
+                started.push((thread.clone(), bandwidth));
             }
-            state.queues.entry(lane).or_default().levels[priority.rank()].push_back(piece);
+            state.queues.entry(thread).or_default().levels[priority.rank()].push_back(piece);
         }
         drop(state);
-        for (lane, bandwidth) in started {
-            self.spawn(lane, bandwidth);
+        for (thread, bandwidth) in started {
+            self.spawn(thread, bandwidth);
         }
     }
 
@@ -649,24 +657,24 @@ impl Lanes {
         std::mem::take(&mut self.shared.lock().measured)
     }
 
-    /// Start a thread for `lane`, whose link's bandwidth is `bandwidth`
+    /// Start a thread for `copy thread`, whose link's bandwidth is `bandwidth`
     /// when known.
-    fn spawn(&self, lane: LaneKey, bandwidth: Option<f64>) {
+    fn spawn(&self, thread: ThreadKey, bandwidth: Option<f64>) {
         let shared = Arc::clone(&self.shared);
         let network = Arc::clone(&self.network);
         let contexts = Arc::clone(&self.contexts);
         let chunk = self.chunk;
         let spawned = std::thread::Builder::new()
-            .name("uniserve-transfer-lane".into())
-            .spawn(move || match lane.runner {
+            .name("uniserve-transfer-thread".into())
+            .spawn(move || match thread.runner {
                 Runner::Device(device) => {
-                    device_lane(&shared, &lane, &contexts, device, bandwidth, chunk);
+                    device_thread(&shared, &thread, &contexts, device, bandwidth, chunk);
                 }
-                Runner::Host => host_lane(&shared, &lane, bandwidth, chunk),
-                Runner::Network => network_lane(&shared, &lane, &network, bandwidth, chunk),
+                Runner::Host => host_thread(&shared, &thread, bandwidth, chunk),
+                Runner::Network => network_thread(&shared, &thread, &network, bandwidth, chunk),
             });
         if let Err(error) = spawned {
-            fatal("starting a lane's thread", &error);
+            fatal("starting a thread's thread", &error);
         }
     }
 }
@@ -707,16 +715,16 @@ fn sample(samples: &mut Samples, piece: &Piece, seconds: f64) -> Option<f64> {
     (samples.completed >= MEASURE_SAMPLES).then_some(samples.fastest)
 }
 
-/// Run `lane`'s chunks on the copy engines of `device`, until nothing is
+/// Run `copy thread`'s chunks on the copy engines of `device`, until nothing is
 /// queued or in flight.
 ///
 /// The thread holds the GPU and makes its stream in the GPU's context. A
 /// context it cannot retain, or a stream it cannot make (the GPU has no
-/// storage left for them), fails the lane's chunks, not the process: no copy
+/// storage left for them), fails the copy thread's chunks, not the process: no copy
 /// ran in the context.
-fn device_lane(
+fn device_thread(
     shared: &Shared,
-    lane: &LaneKey,
+    thread: &ThreadKey,
     contexts: &Contexts,
     device: DeviceId,
     mut bandwidth: Option<f64>,
@@ -733,8 +741,8 @@ fn device_lane(
     let (_hold, stream) = match started {
         Ok(started) => started,
         Err(message) => {
-            tracing::warn!(message, "a GPU lane cannot copy");
-            shared.refuse(lane, &message);
+            tracing::warn!(message, "a GPU thread cannot copy");
+            shared.refuse(thread, &message);
             return;
         }
     };
@@ -742,7 +750,7 @@ fn device_lane(
     let mut samples = Samples::default();
     loop {
         let bytes = chunk_bytes(bandwidth, chunk);
-        let piece = match shared.next(lane, bytes, !flight.is_empty()) {
+        let piece = match shared.next(thread, bytes, !flight.is_empty()) {
             Next::Chunk(piece) => piece,
             Next::Busy => {
                 // Nothing is queued: the oldest chunk in flight completes
@@ -757,7 +765,7 @@ fn device_lane(
         };
         if let Some(bandwidth) = bandwidth {
             shared.pace(
-                &lane.link,
+                &thread.link,
                 piece.copied(),
                 bandwidth,
                 (DEPTH as u64 * bytes) as f64,
@@ -765,8 +773,8 @@ fn device_lane(
         }
         let addresses = piece
             .destination
-            .address(lane.runner)
-            .and_then(|destination| Ok((destination, piece.source.address(lane.runner)?)));
+            .address(thread.runner)
+            .and_then(|destination| Ok((destination, piece.source.address(thread.runner)?)));
         let (destination, source) = match addresses {
             Ok(addresses) => addresses,
             Err(message) => {
@@ -818,7 +826,7 @@ fn device_lane(
             wait(&event);
             if let Some(measured) = sample(&mut samples, &piece, started.elapsed().as_secs_f64()) {
                 bandwidth = Some(measured);
-                shared.measured(&lane.link, measured);
+                shared.measured(&thread.link, measured);
             }
             shared.complete(&piece, None);
             continue;
@@ -833,17 +841,17 @@ fn device_lane(
     }
 }
 
-/// Run `lane`'s chunks, between host buffers, on the CPU, until nothing is
+/// Run `copy thread`'s chunks, between host buffers, on the CPU, until nothing is
 /// queued.
-fn host_lane(shared: &Shared, lane: &LaneKey, bandwidth: Option<f64>, chunk: Duration) {
+fn host_thread(shared: &Shared, thread: &ThreadKey, bandwidth: Option<f64>, chunk: Duration) {
     loop {
         let bytes = chunk_bytes(bandwidth, chunk);
-        let Next::Chunk(piece) = shared.next(lane, bytes, false) else {
+        let Next::Chunk(piece) = shared.next(thread, bytes, false) else {
             return;
         };
         if let Some(bandwidth) = bandwidth {
             shared.pace(
-                &lane.link,
+                &thread.link,
                 piece.copied(),
                 bandwidth,
                 (DEPTH as u64 * bytes) as f64,
@@ -876,7 +884,7 @@ fn host_lane(shared: &Shared, lane: &LaneKey, bandwidth: Option<f64>, chunk: Dur
     }
 }
 
-/// Run `lane`'s chunks, from another host's storage into this host's, as
+/// Run `copy thread`'s chunks, from another host's storage into this host's, as
 /// NIXL READs this process's agent posts, until nothing is queued or in
 /// flight.
 ///
@@ -885,9 +893,9 @@ fn host_lane(shared: &Shared, lane: &LaneKey, bandwidth: Option<f64>, chunk: Dur
 /// fastest of the first [`MEASURE_SAMPLES`] byte windows becomes the link's
 /// bandwidth. Contiguous smaller chunks accumulate bytes and elapsed time
 /// into each window.
-fn network_lane(
+fn network_thread(
     shared: &Shared,
-    lane: &LaneKey,
+    thread: &ThreadKey,
     network: &Network,
     mut bandwidth: Option<f64>,
     chunk: Duration,
@@ -896,7 +904,7 @@ fn network_lane(
     let mut samples = Samples::default();
     loop {
         let bytes = chunk_bytes(bandwidth, chunk);
-        let piece = match shared.next(lane, bytes, !flight.is_empty()) {
+        let piece = match shared.next(thread, bytes, !flight.is_empty()) {
             Next::Chunk(piece) => piece,
             Next::Busy => {
                 // Nothing is queued: the oldest READ in flight completes
@@ -911,7 +919,7 @@ fn network_lane(
         };
         if let Some(bandwidth) = bandwidth {
             shared.pace(
-                &lane.link,
+                &thread.link,
                 piece.copied(),
                 bandwidth,
                 (DEPTH as u64 * bytes) as f64,
@@ -932,7 +940,7 @@ fn network_lane(
                     sample(&mut samples, &piece, started.elapsed().as_secs_f64())
             {
                 bandwidth = Some(measured);
-                shared.measured(&lane.link, measured);
+                shared.measured(&thread.link, measured);
             }
             shared.complete(&piece, failure);
             continue;

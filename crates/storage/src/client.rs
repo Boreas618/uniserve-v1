@@ -111,7 +111,7 @@ impl Client {
     fn handoff(self) -> Result<(OwnedFd, u64)> {
         if !self.responses.is_empty() || !self.events.is_empty() {
             return Err(Error::Protocol(
-                "a connection with responses or events not taken cannot be handed over".into(),
+                "a connection with responses or events not taken cannot be passed on".into(),
             ));
         }
         let socket = match self.connection.into_socket()? {
@@ -121,7 +121,7 @@ impl Client {
         Ok((socket, self.next))
     }
 
-    /// Goes on with a Unix connection another process handed over.
+    /// Goes on with a Unix connection another process passed on.
     fn resume(descriptor: OwnedFd, next: u64) -> Self {
         Self {
             connection: Connection::new(UnixStream::from(descriptor)),
@@ -721,7 +721,7 @@ impl ClaimClient {
         self.client.endpoint()
     }
 
-    /// Hands the claim to another process ([`ClaimClient::resume`]): its
+    /// Passes the claim to another process ([`ClaimClient::resume`]): its
     /// state and the claiming connection's descriptor.
     ///
     /// # Errors
@@ -738,7 +738,7 @@ impl ClaimClient {
         Ok((handoff, descriptor))
     }
 
-    /// Goes on with a claim another process handed over, over its
+    /// Goes on with a claim another process passed on, over its
     /// connection's descriptor.
     pub fn resume(handoff: ClaimHandoff, descriptor: OwnedFd) -> Self {
         Self {

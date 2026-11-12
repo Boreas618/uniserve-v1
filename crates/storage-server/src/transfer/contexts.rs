@@ -8,7 +8,7 @@
 //!
 //! - A [`Hold`] is a claim on one GPU, counted per GPU, and taking or
 //!   dropping one waits for no CUDA call and no quota. Every piece of a
-//!   task holds the GPUs it reads, writes or runs on; a GPU lane holds its
+//!   task holds the GPUs it reads, writes or runs on; a GPU copy thread holds its
 //!   GPU while its thread runs; an exposure to another host holds the GPU of
 //!   each device allocation it exposes, until that host ends it.
 //!   An explicit transfer session also holds its operation's GPUs between
@@ -23,7 +23,7 @@
 //!   creates in the context lives in the session or under one of its holds:
 //!   device mappings of the server's allocations, host allocations
 //!   registered for the GPU's copy engines, NIXL registrations of device
-//!   storage, and the lanes' streams and events.
+//!   storage, and the copy threads' streams and events.
 //! - When the last hold of a GPU ends, its session closes ([`Slot::release`]):
 //!   the registrations, then the mappings, then the context are released,
 //!   the process waits for the driver calls it deferred (`platform::reclaim`),
@@ -46,15 +46,15 @@ use std::time::Instant;
 
 use platform::{DeviceId, HostRegistration, PeerMapping, PrimaryContext, Protection};
 
-use super::storage::{HostMap, Mapped};
+use super::storage::{HostMap, Mapping};
 
 /// A value made once, or why it could not be made.
-type Made<T> = OnceLock<Result<T, String>>;
+type Once<T> = OnceLock<Result<T, String>>;
 
 /// One GPU as its context is reserved: its device, UUID and total storage, and
 /// the bytes its context takes, as the Transfer Server measured them when
 /// it started.
-pub(super) struct Reserved {
+pub(super) struct GpuContext {
     pub(super) device: DeviceId,
     pub(super) uuid: [u8; 16],
     pub(super) total: u64,
@@ -69,9 +69,9 @@ pub(super) struct Reservation {
     pub(super) total: u64,
     /// The context's bytes; 0 ends the reservation.
     pub(super) bytes: u64,
-    /// Where the server's answer goes: a refusal's message, or nothing when
+    /// Where the server's response goes: a refusal's message, or nothing when
     /// it reserved. `None` for an ending, which is never refused.
-    pub(super) answer: Option<mpsc::SyncSender<Result<(), String>>>,
+    pub(super) response: Option<mpsc::SyncSender<Result<(), String>>>,
 }
 
 /// The way to the main thread for reservations: their queue and its wake pipe.
@@ -98,7 +98,7 @@ pub(super) struct Contexts {
 impl Contexts {
     /// A slot for each of `gpus`, with no context held, reservation through
     /// `reservations`.
-    pub(super) fn new(gpus: Vec<Reserved>, reservations: Reservations) -> Self {
+    pub(super) fn new(gpus: Vec<GpuContext>, reservations: Reservations) -> Self {
         let reservations = Arc::new(reservations);
         Self {
             slots: gpus
@@ -128,7 +128,7 @@ impl Contexts {
             .find(|slot| slot.gpu.device == device)
             .ok_or_else(|| format!("{device} is not visible to the Transfer Server"))?;
         slot.lock().holders += 1;
-        Ok(Hold(Arc::new(Claim {
+        Ok(Hold(Arc::new(Guard {
             slot: Arc::clone(slot),
         })))
     }
@@ -147,7 +147,7 @@ impl Contexts {
 
 /// One GPU's holds and, while one of them used the GPU, its session.
 pub(super) struct Slot {
-    gpu: Reserved,
+    gpu: GpuContext,
     reservations: Arc<Reservations>,
     state: Mutex<State>,
     /// Signalled when a session started or closed.
@@ -205,14 +205,14 @@ impl Slot {
     /// the server reserved them, retains the context. Its storage counts in the
     /// quotas from here until [`Slot::release`].
     fn retain(&self) -> Result<Arc<Session>, String> {
-        let (answer, answered) = mpsc::sync_channel(1);
+        let (response, responded) = mpsc::sync_channel(1);
         self.reservations.send(Reservation {
             gpu: self.gpu.uuid,
             total: self.gpu.total,
             bytes: self.gpu.context,
-            answer: Some(answer),
+            response: Some(response),
         })?;
-        answered
+        responded
             .recv()
             .map_err(|_| "the Transfer Server stops".to_owned())?
             .map_err(|refusal| {
@@ -227,7 +227,7 @@ impl Slot {
         let context = match PrimaryContext::retain(self.gpu.device) {
             Ok(context) => context,
             Err(error) => {
-                self.unbook();
+                self.release_reservation();
                 return Err(format!(
                     "retaining the CUDA context of {}: {error}",
                     self.name()
@@ -260,7 +260,7 @@ impl Slot {
         if let Err(error) = platform::reclaim::flush() {
             tracing::warn!(%error, gpu = %self.name(), "releasing a GPU's mappings failed");
         }
-        self.unbook();
+        self.release_reservation();
         tracing::info!(
             gpu = %self.name(),
             milliseconds = started.elapsed().as_secs_f64() * 1e3,
@@ -269,12 +269,12 @@ impl Slot {
     }
 
     /// End the context's reservation; the main thread places it without waiting.
-    fn unbook(&self) {
+    fn release_reservation(&self) {
         let _ = self.reservations.send(Reservation {
             gpu: self.gpu.uuid,
             total: self.gpu.total,
             bytes: 0,
-            answer: None,
+            response: None,
         });
     }
 
@@ -283,15 +283,16 @@ impl Slot {
     }
 }
 
-/// A claim on one GPU. Clones share the claim, which ends with the last.
+/// A hold on one GPU's context. Clones share the hold, which ends with the
+/// last.
 #[derive(Clone)]
-pub(super) struct Hold(Arc<Claim>);
+pub(super) struct Hold(Arc<Guard>);
 
-struct Claim {
+struct Guard {
     slot: Arc<Slot>,
 }
 
-impl Drop for Claim {
+impl Drop for Guard {
     fn drop(&mut self) {
         let slot = &self.slot;
         let mut state = slot.lock();
@@ -333,9 +334,9 @@ pub(super) struct Session {
 /// registration before the mapping it registers, the mappings and host
 /// registrations before the context they live in.
 struct Live {
-    nixl: HashMap<u64, Arc<Made<nixl::Registration>>>,
-    host: HashMap<u64, Arc<Made<HostRange>>>,
-    mappings: HashMap<u64, Arc<Made<PeerMapping>>>,
+    nixl: HashMap<u64, Arc<Once<nixl::Registration>>>,
+    host: HashMap<u64, Arc<Once<HostRange>>>,
+    mappings: HashMap<u64, Arc<Once<PeerMapping>>>,
     _context: PrimaryContext,
 }
 
@@ -353,10 +354,10 @@ impl Session {
     /// while, and other allocations' entries are used meanwhile.
     fn entry<T>(
         &self,
-        table: impl FnOnce(&mut Live) -> &mut HashMap<u64, Arc<Made<T>>>,
+        table: impl FnOnce(&mut Live) -> &mut HashMap<u64, Arc<Once<T>>>,
         id: u64,
         make: impl FnOnce() -> Result<T, String>,
-    ) -> Result<Arc<Made<T>>, String> {
+    ) -> Result<Arc<Once<T>>, String> {
         let entry = {
             let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
             let live = live.as_mut().ok_or("the GPU's transfer session closed")?;
@@ -368,7 +369,7 @@ impl Session {
 
     /// The device address of byte 0 of `mapped`, a device allocation on this
     /// GPU, mapped with access for every GPU that can address it.
-    pub(super) fn device_address(&self, mapped: &Mapped) -> Result<u64, String> {
+    pub(super) fn device_address(&self, mapped: &Mapping) -> Result<u64, String> {
         let entry = self.entry(
             |live| &mut live.mappings,
             mapped.id(),
@@ -405,7 +406,7 @@ impl Session {
     /// read-only mapping as a plain registration. Either way the Transfer
     /// Server only reads a read-only allocation: the server refuses it as a
     /// destination.
-    pub(super) fn host_address(&self, mapped: &Mapped) -> Result<u64, String> {
+    pub(super) fn host_address(&self, mapped: &Mapping) -> Result<u64, String> {
         let entry = self.entry(
             |live| &mut live.host,
             mapped.id(),
@@ -447,7 +448,7 @@ impl Session {
     pub(super) fn nixl_region(
         &self,
         agent: &nixl::Agent,
-        mapped: &Mapped,
+        mapped: &Mapping,
     ) -> Result<nixl::Region, String> {
         let address = self.device_address(mapped)?;
         let entry = self.entry(

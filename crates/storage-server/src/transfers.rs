@@ -2,7 +2,7 @@
 //! storage the server holds.
 //!
 //! The server runs the Transfer Server ([`crate::transfer`]) as a child
-//! process ([`Supervised`]) and starts it again when it ends. It connects
+//! process ([`Process`]) and starts it again when it ends. It connects
 //! as [`Role::Transfer`](::storage::protocol::Role::Transfer), reports the
 //! bandwidth of every link and its CUDA contexts' device storage
 //! ([`Request::Measured`](::storage::protocol::Request::Measured)), and runs
@@ -37,7 +37,7 @@
 //! NIXL agent ([`Event::Register`]); the peer's request waits until the
 //! Transfer Server reports the ranges and its agent's metadata
 //! ([`Request::Registered`](::storage::protocol::Request::Registered)), which
-//! answer it ([`Response::Exposed`]). The exposure lives until the peer ends it
+//! respond to it ([`Response::Exposed`]). The exposure lives until the peer ends it
 //! ([`Request::Unexpose`](::storage::protocol::Request::Unexpose)) or its
 //! connection closes; the Transfer Server then lets its registrations go
 //! ([`Event::Deregister`]), and the GPU contexts they held with them.
@@ -58,8 +58,8 @@ use ::storage::protocol::{
     TaskListing, TaskStatus, TaskTotal, Throttle, TransferListing,
 };
 
-use crate::child::{Launch, Supervised};
-use crate::{Attachment, ClientId, Outcome, Server, StorageId, invalid};
+use crate::child::{Launch, Process};
+use crate::{Attachment, ClientId, Handling, Server, StorageId, invalid};
 
 /// A task the Transfer Server runs, as the server keeps it.
 pub(super) struct Task {
@@ -85,7 +85,7 @@ enum Owner {
 
 /// The Transfer Server process, its connection and its tasks.
 pub(super) struct Transfers {
-    pub(super) process: Supervised,
+    pub(super) process: Process,
     /// The connected Transfer Server's client.
     pub(super) client: Option<ClientId>,
     pub(super) tasks: BTreeMap<u64, Task>,
@@ -108,7 +108,7 @@ pub(super) struct Transfers {
     /// What each deployment's tasks copied since the server started, by
     /// priority (indexed by [`Priority::rank`]): the bytes of the tasks
     /// submitted, and the bytes copied of them as the Transfer Server
-    /// reported its progress. A hot restart hands them over, so an epoch
+    /// reported its progress. A restart in place passes them over, so an epoch
     /// change's head reads how much its update moved across restarts.
     totals: BTreeMap<String, [Total; Priority::COUNT]>,
 }
@@ -123,7 +123,7 @@ struct Total {
 impl Transfers {
     pub(super) fn new(launch: Option<Launch>) -> Self {
         Self {
-            process: Supervised::new("Transfer Server", launch),
+            process: Process::new("Transfer Server", launch),
             client: None,
             tasks: BTreeMap::new(),
             next_task: 1,
@@ -157,17 +157,17 @@ impl Transfers {
             .collect()
     }
 
-    /// Every deployment's totals, as a hot restart hands them over.
-    pub(super) fn handed_totals(&self) -> Vec<(String, Vec<TaskTotal>)> {
+    /// Every deployment's totals, as a restart in place passes them over.
+    pub(super) fn task_totals(&self) -> Vec<(String, Vec<TaskTotal>)> {
         self.totals
             .keys()
             .map(|deployment| (deployment.clone(), self.totals(deployment)))
             .collect()
     }
 
-    /// Takes over the totals a predecessor handed over.
-    pub(super) fn resume_totals(&mut self, handed: Vec<(String, Vec<TaskTotal>)>) {
-        for (deployment, totals) in handed {
+    /// Takes over the totals a predecessor passed on.
+    pub(super) fn resume_totals(&mut self, handoff: Vec<(String, Vec<TaskTotal>)>) {
+        for (deployment, totals) in handoff {
             let entry = self.totals.entry(deployment).or_default();
             for total in totals {
                 entry[total.priority.rank()] = Total {
@@ -194,18 +194,7 @@ impl Transfers {
     }
 }
 
-/// The regions of a peer's exposure, checked and resolved: the allocations
-/// the Transfer Server registers, each once, and for each region the index
-/// of its allocation among them and the offset of its first byte there.
-pub(super) struct Exposing {
-    allocations: Vec<Allocation>,
-    regions: Vec<(usize, u64)>,
-    /// Each allocation's fabric handle and length, when its creator
-    /// recorded one.
-    fabric: Vec<Option<(FabricHandle, u64)>>,
-}
-
-/// A peer's exposure the server answers once its Transfer Server reported
+/// A peer's exposure the server responds to once its Transfer Server reported
 /// the registrations: the peer's client and request, and its regions.
 struct Exposure {
     client: ClientId,
@@ -276,7 +265,7 @@ impl Server {
         id: ClientId,
         request: &::storage::protocol::Request,
         role: &Role,
-    ) -> Result<Outcome, (ErrorKind, String)> {
+    ) -> Result<Handling, (ErrorKind, String)> {
         use ::storage::protocol::Request;
 
         let deployment = Self::deployment_of(role)
@@ -289,7 +278,7 @@ impl Server {
                 update,
             } => {
                 let task = self.submit(id, &deployment, spans, *priority, *update)?;
-                Ok(Outcome::Response(Response::Submitted { task }, Vec::new()))
+                Ok(Handling::Response(Response::Submitted { task }, Vec::new()))
             }
             Request::OpenSession { gpus } => {
                 let transfer = self
@@ -316,7 +305,7 @@ impl Server {
                     },
                     Vec::new(),
                 ));
-                Ok(Outcome::Response(
+                Ok(Handling::Response(
                     Response::SessionOpened { session },
                     Vec::new(),
                 ))
@@ -326,7 +315,7 @@ impl Server {
                     return Err(invalid("the connection owns no such transfer session"));
                 }
                 self.close_transfer(*session);
-                Ok(Outcome::Response(Response::SessionClosed, Vec::new()))
+                Ok(Handling::Response(Response::SessionClosed, Vec::new()))
             }
             Request::Cancel { tasks, update } => {
                 let selected: BTreeSet<u64> = tasks.iter().copied().collect();
@@ -334,7 +323,7 @@ impl Server {
                     task.deployment == deployment
                         && (selected.contains(&task_id) || Some(task.update) == *update)
                 });
-                Ok(Outcome::Response(
+                Ok(Handling::Response(
                     Response::Cancelled { tasks: cancelled },
                     Vec::new(),
                 ))
@@ -344,7 +333,7 @@ impl Server {
                     return Err(invalid("a head throttles links"));
                 }
                 self.throttle(&deployment, links, *throttle)?;
-                Ok(Outcome::Response(Response::Throttled, Vec::new()))
+                Ok(Handling::Response(Response::Throttled, Vec::new()))
             }
             _ => Err(invalid("not a transfer request")),
         }
@@ -354,7 +343,7 @@ impl Server {
     pub(super) fn transfer_report(
         &mut self,
         request: &::storage::protocol::Request,
-    ) -> Result<Outcome, (ErrorKind, String)> {
+    ) -> Result<Handling, (ErrorKind, String)> {
         use ::storage::protocol::Request;
 
         match request {
@@ -380,7 +369,7 @@ impl Server {
                         None => known.push(*context),
                     }
                 }
-                Ok(Outcome::Response(Response::Noted, Vec::new()))
+                Ok(Handling::Response(Response::Noted, Vec::new()))
             }
             Request::Copied {
                 task,
@@ -388,7 +377,7 @@ impl Server {
                 status,
             } => {
                 self.copied(*task, *bytes, status.clone());
-                Ok(Outcome::Response(Response::Noted, Vec::new()))
+                Ok(Handling::Response(Response::Noted, Vec::new()))
             }
             Request::Registered {
                 request,
@@ -397,7 +386,7 @@ impl Server {
                 failure,
             } => {
                 self.registered(*request, metadata, ranges, failure.as_deref());
-                Ok(Outcome::Response(Response::Noted, Vec::new()))
+                Ok(Handling::Response(Response::Noted, Vec::new()))
             }
             _ => Err(invalid("not a request of the Transfer Server")),
         }
@@ -412,7 +401,7 @@ impl Server {
         &mut self,
         deployment: &str,
         regions: &[Region],
-    ) -> Result<Outcome, (ErrorKind, String)> {
+    ) -> Result<Handling, (ErrorKind, String)> {
         let Some(transfer_server) = self.transfers.client else {
             return Err(unavailable());
         };
@@ -460,19 +449,26 @@ impl Server {
                 _ => None,
             })
             .collect();
-        Ok(Outcome::Exposing(Exposing {
+        Ok(Handling::Exposing {
             allocations,
             regions: placed,
             fabric,
-        }))
+        })
     }
 
     /// Have the Transfer Server register an exposure's allocations, and hold
     /// the connection of `client`, the peer, until it reports them and
-    /// `request` is answered: requests are answered in order.
-    pub(super) fn begin_exposure(&mut self, client: ClientId, request: u64, exposing: Exposing) {
+    /// `request` gets its response: requests get their responses in order.
+    pub(super) fn begin_exposure(
+        &mut self,
+        client: ClientId,
+        request: u64,
+        allocations: Vec<Allocation>,
+        regions: Vec<(usize, u64)>,
+        fabric: Vec<Option<(FabricHandle, u64)>>,
+    ) {
         let Some(transfer_server) = self.transfers.client else {
-            self.answer(client, request, error_reply(unavailable()), &[]);
+            self.respond(client, request, error_reply(unavailable()), &[]);
             return;
         };
         if let Some(entry) = self.clients.get_mut(&client) {
@@ -482,14 +478,14 @@ impl Server {
         self.transfers.next_registration += 1;
         tracing::debug!(
             exposure = number,
-            allocations = exposing.allocations.len(),
+            allocations = allocations.len(),
             "registering allocations for another host"
         );
         self.events.push((
             transfer_server,
             Event::Register {
                 request: number,
-                allocations: exposing.allocations,
+                allocations,
             },
             Vec::new(),
         ));
@@ -498,14 +494,14 @@ impl Server {
             Exposure {
                 client,
                 request,
-                regions: exposing.regions,
-                fabric: exposing.fabric,
+                regions,
+                fabric,
             },
         );
     }
 
     /// The Transfer Server registered the allocations of exposure
-    /// `number`, or failed to: the peer's request is answered, and its
+    /// `number`, or failed to: the peer's request gets its response, and its
     /// connection's next requests are served.
     fn registered(
         &mut self,
@@ -570,12 +566,12 @@ impl Server {
 
     /// A peer's [`Request::Unexpose`](::storage::protocol::Request::Unexpose):
     /// its exposure `exposure` ends, unless it holds no such exposure.
-    pub(super) fn unexpose(&mut self, peer: ClientId, exposure: u64) -> Outcome {
+    pub(super) fn unexpose(&mut self, peer: ClientId, exposure: u64) -> Handling {
         if self.transfers.live.get(&exposure) == Some(&peer) {
             self.transfers.live.remove(&exposure);
             self.deregister(exposure);
         }
-        Outcome::Response(Response::Unexposed, Vec::new())
+        Handling::Response(Response::Unexposed, Vec::new())
     }
 
     /// Have the Transfer Server let the registrations of exposure `number`
@@ -590,9 +586,9 @@ impl Server {
         }
     }
 
-    /// Answer a peer's exposure with `reply` and serve its connection on.
+    /// Respond to a peer's exposure with `reply` and serve its connection on.
     fn release_exposure(&mut self, exposure: Exposure, reply: Response) {
-        self.answer(exposure.client, exposure.request, reply, &[]);
+        self.respond(exposure.client, exposure.request, reply, &[]);
         if let Some(client) = self.clients.get_mut(&exposure.client) {
             client.held = false;
         }

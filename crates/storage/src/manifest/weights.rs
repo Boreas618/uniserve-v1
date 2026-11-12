@@ -7,7 +7,7 @@
 //! the rank's tensors as its library describes them, and
 //! its storages ([`RetainedStorage`]): each one's device among the rank's
 //! devices, layout and chunks. The worker writes it; the ranks of an epoch
-//! that receives weights and the ranks a daemon plans its preparation with
+//! that receives weights and the ranks a daemon prepares it with
 //! read the storages of every manifest an epoch retains as the source epoch
 //! of a copy manifest ([`sources`]), all from the same listing and texts and
 //! by the fingerprints of the whole model, so all compute the same source
@@ -162,8 +162,8 @@ pub struct Sources {
     pub links: Vec<LinkBandwidth>,
 }
 
-/// A daemon's executable weight redistribution plan. Main processes consume this
-/// exact request and manifest; they do not independently choose another plan.
+/// A daemon's executable weight redistribution. Main processes consume this
+/// exact request and manifest; they do not independently choose another.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transfer {
     pub request: super::Request,
@@ -180,7 +180,7 @@ pub struct Transfer {
 /// of the storage's chunks. Each GPU is one source rank, its storages once
 /// each in the order of their serialized form, so every reader of the same
 /// listing and texts with the same `fingerprints` computes the same epoch.
-/// The ranks that receive one copy manifest bind the epoch it was planned
+/// The ranks that receive one copy manifest bind the epoch it was computed
 /// from, so `fingerprints` must name every tensor of the model, not only
 /// those the reading rank holds: a rank that leaves out tensors another
 /// rank holds selects fewer storages, at other positions. `read` returns
@@ -246,7 +246,7 @@ pub fn sources<E>(
                 continue;
             }
             // Packed storage can hold independently keyed tensors. Keep
-            // each matching field available to the transfer planner; the
+            // each matching field available to the manifest's computation; the
             // chunks still name the original backing bytes.
             let mut source = storage.storage.clone();
             source.layout.fields.retain(|field| {

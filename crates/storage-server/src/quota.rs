@@ -78,7 +78,6 @@ pub(crate) struct Quotas {
     /// The reservations of each scope and epoch whose worker's process was
     /// lost, per GPU and item, until a process of the scope and epoch
     /// reserves the item again or the epoch retires.
-    #[serde(default)]
     lost: BTreeMap<(Scope, u64), ItemBytes>,
 }
 

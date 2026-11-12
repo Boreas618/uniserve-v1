@@ -5,7 +5,7 @@
 //!
 //! Each server runs on a thread of the test process and is reached by its
 //! TCP endpoint as another host reaches it. No GPU and no NIXL is needed:
-//! the pins are bookkeeping of the source host's server, and the transfer
+//! the pins are accounting of the source host's server, and the transfer
 //! that writes the reading host's reservation never reaches a READ.
 
 use std::io::Read;
@@ -23,7 +23,7 @@ use crate::transfer::{
     Gpus, Slow, pattern, read, remote_region, serving, slow, span, tensor_region, transfer_event,
 };
 
-/// How long a peer's blocking calls wait for an answer.
+/// How long a peer's blocking calls wait for an response.
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The layout of the pages `trial_pool` holds.
@@ -217,7 +217,7 @@ fn a_closed_peer_connection_ends_its_pins() {
 /// Transfer Server may write them until then; then they are aborted.
 ///
 /// The task's source lies on a host that accepts the Transfer Server's
-/// connection and never answers, which holds the task until the test
+/// connection and never responds to, which holds the task until the test
 /// closes that connection.
 #[test]
 fn a_disconnected_heads_task_reservations_end_after_its_task() {
@@ -251,7 +251,7 @@ fn a_disconnected_heads_task_reservations_end_after_its_task() {
         panic!("no slot was reserved: {slots:?}");
     };
 
-    // A source host that never answers the Transfer Server's hello.
+    // A source host that never responds to the Transfer Server's hello.
     let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let source_host = silent.local_addr().unwrap().to_string();
     let task = reader

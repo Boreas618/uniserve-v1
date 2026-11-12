@@ -13,7 +13,7 @@ use super::{
 use crate::Key;
 use crate::protocol::LinkEnd;
 
-/// The most tied GPU assignments whose transfers are planned to find the
+/// The most tied GPU assignments whose transfers are computed to find the
 /// one whose busiest link finishes first: every assignment of up to five
 /// ranks to five GPUs.
 const TIED_ASSIGNMENTS: usize = 120;
@@ -392,7 +392,7 @@ fn hungarian(local: &[Vec<u64>], gpus: usize) -> Vec<usize> {
     assignment
 }
 
-pub(super) fn plan(request: &Request) -> Result<Manifest> {
+pub(super) fn compute(request: &Request) -> Result<Manifest> {
     let context = Context::new(request)?;
     let ranks = request.target.ranks.len();
     // Target ranks already running on their GPUs keep them; otherwise the

@@ -52,14 +52,14 @@ const LOCAL_BUFFER_BYTES: u64 = 16 << 20;
 
 /// One page pool, mapped into the connector and registered with Mooncake.
 #[derive(Clone, Copy)]
-struct Mapped {
+struct Mapping {
     /// The address of slot 0.
     base: usize,
     slots: u64,
     shape: PageShape,
 }
 
-impl Mapped {
+impl Mapping {
     /// The object key of `key`'s page in this pool.
     fn object(&self, key: &Key) -> String {
         format!(
@@ -100,7 +100,7 @@ enum Job {
 /// The connector's state shared with its worker threads.
 struct Shared {
     store: MooncakeStore,
-    pools: Mutex<HashMap<u64, Mapped>>,
+    pools: Mutex<HashMap<u64, Mapping>>,
     /// Results of finished tasks, waiting for the main thread to report
     /// them.
     finished: Mutex<Vec<(u64, Vec<bool>)>>,
@@ -289,7 +289,7 @@ impl Shared {
         }
     }
 
-    fn pool(&self, pool: u64) -> Option<Mapped> {
+    fn pool(&self, pool: u64) -> Option<Mapping> {
         lock(&self.pools).get(&pool).copied()
     }
 
@@ -363,7 +363,7 @@ fn map(
     descriptor: OwnedFd,
     shape: PageShape,
     slots: u64,
-) -> io::Result<Mapped> {
+) -> io::Result<Mapping> {
     let bytes = (slots * shape.page_bytes) as usize;
     // SAFETY: a fresh shared mapping of the whole memfd, which the server
     // sized to `slots * page_bytes`.
@@ -382,7 +382,7 @@ fn map(
     unsafe { store.register_buffer(base, bytes) }.map_err(|error| {
         io::Error::other(format!("registering a page pool with Mooncake: {error}"))
     })?;
-    Ok(Mapped {
+    Ok(Mapping {
         base: base as usize,
         slots,
         shape,
@@ -390,7 +390,7 @@ fn map(
 }
 
 /// Unregister a released pool's mapping from Mooncake and unmap it.
-fn unmap(store: &MooncakeStore, mapped: Mapped) {
+fn unmap(store: &MooncakeStore, mapped: Mapping) {
     let base = mapped.base as *mut c_void;
     // SAFETY: a mapping `map` registered; no task reads or writes it.
     if let Err(error) = unsafe { store.unregister_buffer(base) } {

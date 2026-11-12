@@ -182,7 +182,7 @@ fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
     std::env::var_os("MOONCAKE_STORE_LIBRARY")
         .expect("MOONCAKE_STORE_LIBRARY must name libmooncake_store.so");
     // Every run writes pages of its own, which earlier runs' objects in
-    // the master cannot answer for.
+    // the master cannot response for.
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -213,7 +213,7 @@ fn a_page_one_server_commits_is_prefetched_by_another_through_mooncake() {
         panic!("the reservation was refused");
     };
     let [PageSlot::Reserved { slot }] = slots[..] else {
-        panic!("the reservation answered {slots:?}");
+        panic!("the reservation responded {slots:?}");
     };
     mapping.slot(slot).copy_from_slice(&page);
     reply(

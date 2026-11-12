@@ -37,16 +37,15 @@
 //! 5. Padding the target holds is zeroed ([`Fill`]); regions no source
 //!    holds are reported ([`Missing`]) for the target to load.
 //!
-//! A [`Planner`] caches each pair's executable manifest. Participating
-//! workers consume that concrete plan. [`BoundManifest::spans`]
+//! Participating workers consume one concrete manifest. [`BoundManifest::spans`]
 //! turns the copies into the spans of a transfer between the chunks the
 //! Storage Server retains ([`crate::protocol::Request::Submit`]), which
 //! its Transfer Server executes. The source epoch of weights is what the
 //! manifests an epoch retains name ([`weights::sources`]).
 
 pub mod cache;
+mod compute;
 pub mod layout;
-mod plan;
 pub mod region;
 mod tasks;
 #[cfg(test)]
@@ -257,7 +256,7 @@ impl Epoch {
     /// this epoch's order and with its bindings; a rank left without
     /// storages is dropped. Readings of retained sources taken at other
     /// times or from other hosts list other storages and bind them from
-    /// their own host; the ranks that plan one manifest together plan it
+    /// their own host; the ranks that compute one manifest together compute it
     /// from this one epoch, which each of them binds ([`Epoch::reading_of`]).
     pub fn common<'a>(&self, others: impl IntoIterator<Item = &'a Epoch> + Clone) -> Epoch {
         let ranks = self
@@ -282,12 +281,12 @@ impl Epoch {
         Epoch { ranks }
     }
 
-    /// This reading's storages that `plan` names, in `plan`'s order and
-    /// with this reading's bindings: the source epoch a plan made from
-    /// `plan` binds on this reader's host ([`Manifest::bind`]). `None` when
+    /// This reading's storages that `source` names, in `source`'s order and
+    /// with this reading's bindings: the source epoch a manifest computed from
+    /// `source` binds on this reader's host ([`Manifest::bind`]). `None` when
     /// this reading lacks one of them.
-    pub fn reading_of(&self, plan: &Epoch) -> Option<Epoch> {
-        let ranks = plan
+    pub fn reading_of(&self, source: &Epoch) -> Option<Epoch> {
+        let ranks = source
             .ranks
             .iter()
             .map(|rank| {
@@ -475,8 +474,8 @@ pub struct Manifest {
 
 impl Manifest {
     /// Compute the manifest of `request`.
-    pub fn plan(request: &Request) -> Result<Self> {
-        plan::plan(request)
+    pub fn compute(request: &Request) -> Result<Self> {
+        compute::compute(request)
     }
 
     /// The digest of everything the manifest directs.
@@ -539,9 +538,3 @@ impl Manifest {
         peak
     }
 }
-
-/// Computes each request's manifest once.
-#[derive(Default)]
-pub struct Planner {}
-
-impl Planner {}

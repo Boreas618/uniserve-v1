@@ -110,7 +110,7 @@ Three backend-name fields are read with `attention_backend` (`ModuleSet::of`, `c
 | `attention_backend` | `"auto"` | Attention package: `auto` has the Build Server select, for each attention descriptor key the deployment launches, the installed package that covers it by manifest priority; a package's backend name (`trtllm`, `triton`) serves every key it covers, and the others are selected as for `auto` |
 | `max_running_requests` | `128` | Concurrently resident requests, clamped to what the workers hold |
 | `max_num_batched_tokens` | `8192` | Token work admitted in one scheduling step; token models only |
-| `mem_fraction_static` | `0.7` | The deployment's share of each device's storage for weights, static allocations, graph pools and the KV cache, in (0, 1]: the quota `⌊total × fraction⌋` of the GPU's quota, which both epochs of a configuration change and the host's Transfer Server share (`docs/admin.md`); a deployment group's `mem_fraction_static` overrides it |
+| `mem_fraction_static` | `0.7` | The deployment's share of each device's storage for weights, static allocations, graph pools and the KV cache, in (0, 1]: the limit `⌊total × fraction⌋` of the GPU's quota, which both epochs of a configuration change and the host's Transfer Server share (`docs/admin.md`); a deployment group's `mem_fraction_static` overrides it |
 | `tensor_parallel_size` | `1` | Tensor-parallel workers of each scheduler's group without `worker_groups` |
 | `data_parallel_size` | `1` | DP ranks, each a scheduler with its own KV cache and worker groups. Independent replicas each run an engine of their own, and the leader sends a request to the one with the fewest in flight; with `moe_config.expert_parallel`, whose replicas exchange experts, one engine runs every replica's scheduler and the scheduling policy's `route` names each request's. With `worker_groups`, the file's groups that serve requests form the schedulers as equal consecutive blocks |
 | `worker_groups` | Unset | [Deployment file](#deployment-files) placing worker groups and their components |
@@ -538,3 +538,14 @@ The Program Server is the Build Server, and what it builds is named by the modul
 | `PUT /admin/config` answering `"change": "program"` with the report under `"program"` | `"change": "generation"`, the report under `"generation"` |
 | `GET /admin/config` records' `programs`, each entry's `program` | `modules`, each entry's `package` |
 | A package manifest without an interface version | `interface_version = 1` in every `package.toml` |
+
+The Storage Server's accounting of a GPU's storage is a quota: the deployment's limit on the GPU and the reservations against it. A copy its Transfer Server runs is a task. The names a script or an operator reads changed as follows.
+
+| Was | Is |
+| --- | --- |
+| `GET /admin/config` `ledgers`, each host's `ledgers` and `transfers` | `quotas`, each host's `quotas` and `tasks` |
+| A ledger's `quota` and `entries` | A quota's `limit` and `reservations` |
+| `uniserve storage-server list` printing `N bytes booked of a quota of Q` | `N bytes reserved of a limit of Q` |
+| The storage protocol's `Book`, `Ledger`, `Transfer`, `OpenTransfer`, `CloseTransfer`, `PagePool` and `PublishEpochs` requests, and its `Transferred` and `TransferProgress` events | `Quota`, `Usage`, `Submit`, `OpenSession`, `CloseSession`, `Pool` and `Publish`; `TaskEnded` and `TaskProgress` |
+| The process interface's `LedgerQuery` and `LedgerReport` | `UsageQuery` and `UsageReport` |
+| The storage protocol's version stated only at a Storage Server's hello | Also carried in the engine interface's version, which a package manifest states as `interface_version` |

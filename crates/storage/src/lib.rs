@@ -4,7 +4,7 @@
 //! Each host runs one Storage Server per serving user
 //! (`uniserve storage-server`, the `storage-server` crate), a host service
 //! (the `service` crate) listening on [`default_socket`]. It keeps model weights, the device prefix
-//! cache, the buffer pool and the latent banks of every worker on the host,
+//! cache, the buffer pool and the latent buffers of every worker on the host,
 //! so that a restarted worker maps the retained storage instead of loading it
 //! again.
 //!

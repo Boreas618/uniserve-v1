@@ -25,7 +25,7 @@ impl Manifest {
         Key(digest.finish())
     }
 
-    /// Bind this plan to the source allocations visible to the submitting
+    /// Bind this manifest to the source allocations visible to the submitting
     /// host. `sources` must describe the same ranks, layouts and retained
     /// chunks as `request.source`, in the same order; only their transport
     /// bindings may differ. GPU assignments and numerical copies stay fixed.
@@ -38,7 +38,7 @@ impl Manifest {
     }
 }
 
-/// An executable plan viewed from one submitting host. Source locations
+/// An executable manifest viewed from one submitting host. Source locations
 /// are resolved here once; consumers submit the resulting regions directly.
 #[derive(Clone, Copy)]
 pub struct BoundManifest<'m> {
