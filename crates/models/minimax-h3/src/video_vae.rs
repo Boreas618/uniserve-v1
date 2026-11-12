@@ -716,7 +716,7 @@ impl Decoder for VideoDecoder {
 
         // A voxel's channels lie a whole timeline apart in the trajectory and are one row of
         // the block.
-        let gathered = trajectory.index_select(&voxels, 1)?.t()?;
+        let gathered = trajectory.index_select(&voxels, 1)?.t()?.contiguous()?;
         Ok(block.slice_set(&gathered, 0, 0)?)
     }
 
