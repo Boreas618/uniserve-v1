@@ -11,7 +11,7 @@ use super::launch::ProcessInterface;
 /// Asks this node's daemon for the node's Storage Server.
 ///
 /// The socket and the claim are runtime facts of the node: the daemon mints the claim when it starts
-/// the server, so a launch file cannot carry either. The answer states the socket the server listens
+/// the server, so a launch file cannot carry either. The reply states the socket the server listens
 /// on, the token this rank presents, and where another host reaches its pages.
 pub(super) fn claim(
     process: &mut ProcessInterface,
@@ -46,7 +46,7 @@ pub(super) fn claim(
         bail!("the daemon refused this rank's claim: {}", reply.error);
     }
     let Some(proto::process::reply::Kind::Claimed(claimed)) = reply.kind else {
-        bail!("the daemon answered a claim with another reply");
+        bail!("the daemon replied to a claim with another reply");
     };
     Ok(ipc::StorageLaunch {
         socket: claimed.socket,
@@ -60,7 +60,7 @@ pub(super) fn claim(
         tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
         // The deployment's *storage* peers - where another node's Storage Server is reached for the
         // weights a rank receives from it - are empty because nothing this process is told states
-        // them: the claim's answer carries this node's own server only. A deployment of several
+        // them: the claim's reply carries this node's own server only. A deployment of several
         // hosts needs them before a cross-host weight transfer can be planned, and until then this
         // rank maps what its own node holds.
         peers: Vec::new(),
@@ -68,7 +68,7 @@ pub(super) fn claim(
         // The standby role is the epoch layer's: a standby maps its scope's storage
         // read-only until it is promoted, and claiming it writable would give the scope two
         // writers. The launch file states the role, so the process never has to infer it.
-        standby: launch.standby(),
+        standby: launch.parked(),
         standby_storage: launch.standby_storage,
     })
 }
@@ -80,6 +80,6 @@ fn claim_token(bytes: &[u8]) -> Result<[u8; 16]> {
         .map_err(|_| anyhow::anyhow!("a claim token is 16 bytes, not {}", bytes.len()))
 }
 
-/// How long the daemon may take to answer this rank's storage claim: starting a Storage
+/// How long the daemon may take to reply to this rank's storage claim: starting a Storage
 /// Server for the node is the slow part, and it is the daemon's to do.
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);

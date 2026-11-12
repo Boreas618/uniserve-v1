@@ -70,7 +70,7 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 /// or until the leader's connection closes.
 ///
 /// The leader serves the HTTP API. Its listener is bound once the engine has
-/// started, so the port accepts connections only when the server can answer
+/// started, so the port accepts connections only when the server can respond to
 /// them. Cancellation before the engine has started stops the start and
 /// returns `Ok(())` without binding a listener. Once it has started, the
 /// server shuts down as `serve_on` describes, and the engine is shut down
@@ -107,9 +107,9 @@ pub async fn serve(
     // once its processes are down.
     let retire = Arc::new(AtomicBool::new(false));
     let address = daemon.address().map(str::to_owned);
-    // The epoch records the admin reports and the epoch layer moves are one.
+    // The epoch records the admin reports and an update writes are one.
     let epoch_records = Arc::new(crate::epoch::Epochs::new());
-    let updates = daemon.updates(
+    let updates = daemon.updater(
         Arc::clone(&epoch_records),
         config.served_model_name().to_owned(),
     );
@@ -130,19 +130,12 @@ pub async fn serve(
         return stop_daemon(daemon).await;
     };
     let Some((updates, awake)) = updates else {
-        anyhow::bail!("the leader's daemon serves no epoch layer");
+        anyhow::bail!("the leader's daemon commands no engine");
     };
-    Daemon::advance_epochs(Arc::clone(&updates), awake)
-        .context("starting the epoch layer's thread")?;
-    // The daemon's channel down to the main processes, which the epoch's
-    // first package switch commands through.
-    let commands = daemon
-        .lock()
-        .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?
-        .as_ref()
-        .and_then(Daemon::commands);
+    Daemon::advance_updates(Arc::clone(&updates), awake)
+        .context("starting the updater's thread")?;
     let engine = tokio::select! {
-        engine = Leader::start(&families, &config, &stated, address, commands.as_ref(), updates) => {
+        engine = Leader::start(&families, &config, &stated, address, updates) => {
             engine.map(Arc::new)
         }
         () = shutdown.cancelled() => return stop_daemon(daemon).await,
@@ -187,13 +180,13 @@ pub async fn serve(
         .await
     }
     .await;
-    let handed_over = served.as_ref().is_ok_and(|handed| *handed);
+    let handoff_sent = served.as_ref().is_ok_and(|handoff_sent| *handoff_sent);
     finish(
         &config,
         &engine,
         daemon,
         retire,
-        handed_over,
+        handoff_sent,
         served.map(drop),
     )
     .await
@@ -226,7 +219,7 @@ pub(crate) async fn serve_leader(
         stated.clone(),
         accepting.clone(),
     )?);
-    let handed_over = Arc::clone(&restarter.handed_over);
+    let handoff_sent = Arc::clone(&restarter.handoff_sent);
     let restarting = restarter.restarting();
     let mut decided = restarter.decide();
     serve_on(
@@ -254,11 +247,11 @@ pub(crate) async fn serve_leader(
         if waited.is_err() {
             tracing::warn!(
                 "a restart was still in flight when this daemon stopped serving; its successor \
-                 may have been left holding a handoff nobody answers"
+                 may have been left holding a handoff nobody responds to"
             );
         }
     }
-    Ok(handed_over.load(Ordering::Acquire))
+    Ok(handoff_sent.load(Ordering::Acquire))
 }
 
 /// Ends a leader's serving: shuts its engine down, stops the daemon and,
@@ -276,10 +269,10 @@ pub(crate) async fn finish(
     engine: &Arc<Leader>,
     daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
     retire: Arc<AtomicBool>,
-    handed_over: bool,
+    handoff_sent: bool,
     served: Result<()>,
 ) -> Result<()> {
-    if handed_over {
+    if handoff_sent {
         info!("the successor daemon serves the deployment; this daemon exits");
         return served.and(engine.detach().await);
     }
@@ -367,14 +360,24 @@ async fn serve_on(
         Arc::clone(&jobs),
         server,
         video_body_limit(&config.media_config),
-        Arc::clone(admin),
         restarter.clone(),
     );
+    // The admin API has listeners of its own, apart from the client API.
+    admin::serve(
+        &config.admin_config,
+        admin::AdminState {
+            leader: Arc::clone(engine),
+            admin: Arc::clone(admin),
+            jobs: Arc::clone(&jobs),
+            restarter: restarter.clone(),
+        },
+        shutdown,
+    )?;
     info!(%bind_address, model = engine.served_model_name(), "starting HTTP server");
 
     // The daemon admits requests until its handoff's pause starts: from then
     // on the deployment's next request is the successor's, and each connection
-    // ends at its next request boundary (design §7.5.1 step 1). The registry
+    // ends at its next request boundary. The registry
     // exists once the router is built, and a daemon that cannot hand over (no
     // restarter) admits for as long as it serves.
     let admitting = restarter
@@ -384,7 +387,7 @@ async fn serve_on(
 
     // The responses the daemon this one replaced handed over go on here: each
     // connection writes the bytes the predecessor did not write and then goes
-    // on with the resumed body (design §7.5.1 step 4).
+    // on with the resumed body.
     for stream in crate::restart::streams::take_adopted() {
         let app = app.clone();
         let admitting = admitting.clone();
@@ -394,7 +397,7 @@ async fn serve_on(
             let adopted = request_id.clone();
             let ended = request_id.clone();
             // The adoption is recorded here and nowhere else: this process
-            // serves the response, and the moment §7.5.1 step 4 names is the
+            // serves the response, and the moment it records is the
             // one before its first frame of its own. The record of the
             // response's end names the response, not the connection this
             // process may go on serving.
@@ -414,7 +417,7 @@ async fn serve_on(
             .await
             .err();
             if let Some(error) = error {
-                tracing::warn!(%request_id, %error, "a handed-over connection ended");
+                tracing::warn!(%request_id, %error, "a connection of the handoff ended");
             }
         });
     }
@@ -447,13 +450,13 @@ async fn serve_on(
 
 /// Assembles the router of the tasks `engine` serves.
 ///
-/// Every engine answers the operational routes `/health` and `/metrics`,
+/// Every engine serves the operational routes `/health` and `/metrics`,
 /// which take no API key and are not counted in HTTP metrics, and `/version`,
 /// which takes the key but is not counted. `GET /v1/models` and the routes of
 /// each served task (`Leader::supported_tasks`) take the key and are counted.
 /// The generation routes (chat completions, image generation and synchronous
 /// video) share the in-flight limit. A path no
-/// route serves answers FastAPI's `404 {"detail": "Not Found"}`.
+/// route serves gets FastAPI's `404 {"detail": "Not Found"}`.
 ///
 /// Layers apply from the outside in: request ID (which also sets the
 /// `X-Request-Id` response header when enabled), tracing, body limit, API
@@ -465,7 +468,6 @@ pub(crate) fn router(
     jobs: Arc<VideoJobs>,
     server: &ServerConfig,
     video_body_limit: usize,
-    admin: Arc<admin::Admin>,
     restarter: Option<Arc<crate::restart::Restarter>>,
 ) -> Router {
     let handoff = Arc::new(handoff::Handoff::new());
@@ -517,19 +519,7 @@ pub(crate) fn router(
         .merge(generation)
         .layer(from_fn(middleware::track_http_metrics));
 
-    // An epoch change runs for as long as the successor epoch takes to
-    // start, so the admin routes are held to no request timeout or
-    // concurrency limit.
-    let admin = admin::router(admin::AdminState {
-        leader: Arc::clone(&engine),
-        admin,
-        jobs: Arc::clone(&jobs),
-        restarter,
-    });
-    let mut authenticated = Router::new()
-        .route("/version", get(version))
-        .merge(api)
-        .merge(admin);
+    let mut authenticated = Router::new().route("/version", get(version)).merge(api);
     if let Some(key) = &server.api_key {
         let key: Arc<str> = Arc::from(key.as_str());
         authenticated = authenticated.layer(from_fn(move |request: Request, next: Next| {
@@ -553,7 +543,7 @@ pub(crate) fn router(
         }))
 }
 
-/// Answers `200 OK` while any scheduler is alive (`Leader::is_healthy`),
+/// Responds `200 OK` while any scheduler is alive (`Leader::is_healthy`),
 /// then `503 Service Unavailable`.
 async fn health(State(engine): State<Arc<Leader>>) -> StatusCode {
     if engine.is_healthy() {
@@ -581,7 +571,7 @@ async fn version() -> Json<serde_json::Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
-/// Answers a path no route serves as FastAPI does.
+/// Responds to a path no route serves as FastAPI does.
 async fn not_found() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -603,7 +593,10 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::test_support::{SERVED_MODEL, post_json, router, router_with, send, served_engine};
+    use crate::test_support::{
+        SERVED_MODEL, admin_router, daemon_routers, harness_router, post_json, router, router_with,
+        send, served_engine,
+    };
 
     /// A `GET` request to `path`.
     fn get_request(path: &str) -> Request<Body> {
@@ -635,14 +628,15 @@ mod tests {
     /// generation is paused, and logs what it did.
     #[tokio::test]
     async fn the_admin_api_pauses_generation_and_logs_it() {
-        let app = router(served_engine(crate::test_support::CHAT));
+        let app = daemon_routers(served_engine(crate::test_support::CHAT));
         let (status, _, body) = send(&app, get_request("/admin/status")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["deployment"]["deployment"], json!(SERVED_MODEL));
-        assert_eq!(body["deployment"]["engine"], json!("ready"));
+        assert_eq!(body["deployment"]["engine"], json!("serving"));
         assert_eq!(body["deployment"]["paused"], json!(false));
         assert_eq!(body["deployment"]["held"], json!(0));
-        assert_eq!(body["deployment"]["standby"], json!(null));
+        assert_eq!(body["deployment"]["standby"], json!([]));
+        assert_eq!(body["deployment"]["update"], json!(null));
 
         let (status, _, body) = send(&app, post_json("/admin/pause_generation", &json!({}))).await;
         assert_eq!(
@@ -702,8 +696,8 @@ mod tests {
                 "continue_generation 2 succeeded",
             ]
         );
-        // An epoch change this leader cannot run (it has no engine process
-        // of its own) fails and is logged as failed.
+        // An update this leader cannot run (it has no engine process of its
+        // own) fails and is logged as failed.
         let request = Request::builder()
             .method("PUT")
             .uri("/admin/config")
@@ -723,7 +717,143 @@ mod tests {
                 .as_str()
                 .is_some_and(|config| !config.is_empty())
         );
-        assert!(body["trial"].is_null());
+        assert!(body["update"].is_null());
+    }
+
+    /// A path of `method` and `uri` with an empty JSON body.
+    fn request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    }
+
+    /// The admin API is not served with the client API; the operator's
+    /// listener serves every admin route, and the harness's the verbs of an
+    /// update and what it reads to decide one, never the operator's
+    /// operations.
+    #[tokio::test]
+    async fn each_listener_serves_its_own_routes() {
+        let update_routes = [
+            ("GET", "/admin/status"),
+            ("GET", "/admin/events"),
+            ("GET", "/admin/config"),
+            ("PUT", "/admin/config"),
+            ("POST", "/admin/config/commit"),
+            ("POST", "/admin/config/rollback"),
+        ];
+        let operator_routes = [
+            ("POST", "/admin/pause_generation"),
+            ("POST", "/admin/continue_generation"),
+            ("POST", "/admin/flush_cache"),
+            ("POST", "/admin/shutdown"),
+            ("POST", "/admin/restart"),
+            ("POST", "/admin/update_weights"),
+            ("POST", "/admin/rebalance_experts"),
+            ("POST", "/admin/sleep"),
+            ("POST", "/admin/wake_up"),
+            ("POST", "/admin/load_lora_adapter"),
+            ("POST", "/admin/unload_lora_adapter"),
+            ("GET", "/admin/profile"),
+        ];
+
+        // Whether a router serves a route: an unserved path is its 404, and
+        // an unserved method of a served path its 405.
+        async fn serves(app: &Router, method: &str, uri: &str) -> bool {
+            let response = app.clone().oneshot(request(method, uri)).await.unwrap();
+            !matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            )
+        }
+
+        let client = router(served_engine(crate::test_support::CHAT));
+        let admin = admin_router(served_engine(crate::test_support::CHAT));
+        let harness = harness_router(served_engine(crate::test_support::CHAT));
+        for (method, uri) in update_routes {
+            assert!(
+                !serves(&client, method, uri).await,
+                "{method} {uri} on the client API"
+            );
+            assert!(
+                serves(&admin, method, uri).await,
+                "{method} {uri} on the admin listener"
+            );
+            assert!(
+                serves(&harness, method, uri).await,
+                "{method} {uri} on the harness listener"
+            );
+        }
+        for (method, uri) in operator_routes {
+            assert!(
+                !serves(&client, method, uri).await,
+                "{method} {uri} on the client API"
+            );
+            assert!(
+                serves(&admin, method, uri).await,
+                "{method} {uri} on the admin listener"
+            );
+            assert!(
+                !serves(&harness, method, uri).await,
+                "{method} {uri} on the harness listener"
+            );
+        }
+        // The client API is not an admin route of either listener.
+        assert!(!serves(&admin, "POST", "/v1/chat/completions").await);
+        assert!(!serves(&harness, "GET", "/v1/models").await);
+    }
+
+    /// A harness applies package selections and the options the operator
+    /// lists for it; another option, a whole configuration and `force` are
+    /// refused before anything is resolved. The operator's listener takes
+    /// the same request.
+    #[tokio::test]
+    async fn a_harness_sets_only_what_the_operator_allows() {
+        let put = |body: Value| {
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/config")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let harness = harness_router(served_engine(crate::test_support::CHAT));
+        for refused in [
+            json!({ "set": ["worker_config.watchdog_timeout=301"] }),
+            json!({ "set": ["admin_config.harness_options=[\"dtype\"]"] }),
+            json!({ "config": "attention_backend = \"trtllm\"\n" }),
+            json!({ "set": ["attention_backend=trtllm"], "force": true }),
+            json!({ "set": ["attention_backend=trtllm"], "replica": 0 }),
+        ] {
+            let (status, _, body) = send(&harness, put(refused.clone())).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{refused}: {body}");
+        }
+        // A package selection passes the check: this leader starts no engine
+        // of its own, so the apply itself has nothing to move.
+        let (status, _, body) = send(
+            &harness,
+            put(json!({ "set": ["attention_backend=trtllm"], "deadline_s": 600 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+        let admin = admin_router(served_engine(crate::test_support::CHAT));
+        let (status, _, body) = send(
+            &admin,
+            put(json!({ "set": ["worker_config.watchdog_timeout=301"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+        // A deadline is a positive number of seconds.
+        let (status, _, body) = send(
+            &admin,
+            put(json!({ "set": ["attention_backend=trtllm"], "deadline_s": -1 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
 
     /// A sleeping deployment holds new requests and serves them once it
@@ -731,7 +861,7 @@ mod tests {
     /// run through their endpoints alone.
     #[tokio::test]
     async fn a_sleeping_deployment_serves_once_it_wakes() {
-        let app = router(served_engine(crate::test_support::CHAT));
+        let app = daemon_routers(served_engine(crate::test_support::CHAT));
         let (status, _, body) = send(&app, post_json("/admin/sleep", &json!({}))).await;
         assert_eq!(
             (status, &body["state"]),
@@ -777,7 +907,7 @@ mod tests {
     /// it ended, why and each worker's file.
     #[tokio::test]
     async fn a_profiling_session_runs_until_the_operator_ends_it() {
-        let app = router(served_engine(crate::test_support::CHAT));
+        let app = daemon_routers(served_engine(crate::test_support::CHAT));
         let (status, _, body) = send(&app, get_request("/admin/profile")).await;
         assert_eq!((status, &body["session"]), (StatusCode::OK, &json!(null)));
 
@@ -821,7 +951,7 @@ mod tests {
     /// request that runs no collector or names an unknown option is refused.
     #[tokio::test]
     async fn a_session_ends_after_its_seconds_and_a_faulty_request_is_refused() {
-        let app = router(served_engine(crate::test_support::CHAT));
+        let app = daemon_routers(served_engine(crate::test_support::CHAT));
         let output = tempfile::tempdir().expect("a profile directory");
         let (status, _, body) = send(
             &app,
@@ -857,7 +987,7 @@ mod tests {
     /// no adapter's.
     #[tokio::test]
     async fn a_loaded_adapter_is_served_under_its_name_until_unloaded() {
-        let app = router(served_engine(crate::test_support::CHAT));
+        let app = daemon_routers(served_engine(crate::test_support::CHAT));
         let adapter = json!({"lora_name": "tuned", "lora_path": "/adapters/tuned"});
         let (status, _, body) = send(&app, post_json("/admin/load_lora_adapter", &adapter)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -908,7 +1038,7 @@ mod tests {
     /// resolved is refused before the engine is asked.
     #[tokio::test]
     async fn a_weight_update_from_an_unknown_checkpoint_is_refused() {
-        let app = router(served_engine(crate::test_support::CHAT));
+        let app = daemon_routers(served_engine(crate::test_support::CHAT));
         let (status, _, _) = send(
             &app,
             post_json("/admin/update_weights", &json!({"path": "/nowhere"})),
@@ -931,7 +1061,7 @@ mod tests {
 
     /// A token model serves chat completions and no video route; a video
     /// model serves the video routes and no chat completions. A route the
-    /// model does not serve answers FastAPI's 404.
+    /// model does not serve gets FastAPI's 404.
     #[tokio::test]
     async fn routes_follow_the_served_tasks() {
         let not_found = json!({"detail": "Not Found"});
@@ -996,10 +1126,10 @@ mod tests {
         assert_eq!(body["data"][0]["id"], SERVED_MODEL);
     }
 
-    /// A request whose response head is not ready within the timeout answers
-    /// 504; a zero timeout expires before any generation can answer.
+    /// A request whose response head is not ready within the timeout gets
+    /// 504; a zero timeout expires before any generation can respond.
     #[tokio::test]
-    async fn a_request_past_the_timeout_answers_504() {
+    async fn a_request_past_the_timeout_gets_504() {
         let router = router_with(
             served_engine(crate::test_support::CHAT),
             &ServerConfig {
@@ -1168,7 +1298,7 @@ mod tests {
             }
         });
 
-        // The server answers `100 Continue` once the handler waits for the
+        // The server responds `100 Continue` once the handler waits for the
         // body, which this client never sends, so the request is in flight.
         let mut connection = TcpStream::connect(&address).await.unwrap();
         connection
@@ -1210,12 +1340,12 @@ mod tests {
     }
 
     /// An engine rejection reaches an asynchronous job with the error code the
-    /// synchronous route answers the same rejection with.
+    /// synchronous route reports the same rejection with.
     #[tokio::test]
     async fn a_rejected_job_reports_the_synchronous_error_code() {
         let router = video_router();
 
-        // The simulator has no video media components, so the engine rejects
+        // The simulator has no video media stages, so the engine rejects
         // the request as invalid on both routes.
         let (sync_status, _, sync_body) =
             send(&router, post_json("/v1/videos/sync", &video_request())).await;

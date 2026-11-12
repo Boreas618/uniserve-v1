@@ -1,7 +1,7 @@
-//! A stand-in for a main process's request interface, for the daemon's tests.
+//! A stand-in for an engine's request interface, for the daemon's tests.
 //!
 //! The daemon's tests drive a real `Leader` over the request interface. A
-//! serving deployment responds to that interface in the engine's main process
+//! serving deployment responds to that interface in the engine process
 //! (`engine::process::requests`), whose construction loads ranks onto devices
 //! from a launch file, so these tests serve it from here instead, over
 //! production schedulers whose worker is the batch-interface fake
@@ -115,15 +115,14 @@ struct Routing {
     /// Each connected daemon's frame queue, by the order it connected; a
     /// closed connection's entry is `None`.
     fronts: Mutex<Vec<Option<crossbeam_channel::Sender<Frame>>>>,
-    /// The published lifecycle state; only Ready admits requests.
+    /// The announced lifecycle state; only `Serving` admits requests.
     state: AtomicI32,
     /// Whether the engine failed, once reported.
     failed: AtomicBool,
-    /// Whether the engine's epoch is on trial, until its commit: the
-    /// engine fails once any scheduler stops, not every one, since the
-    /// daemon rolls a failing trial back rather than serving on.
-    trial: AtomicBool,
-    /// The control thread's routing policy (§4.4, §7.3).
+    /// Whether the engine parked by draining, so that a promotion resumes
+    /// its schedulers instead of handing them a predecessor's index.
+    drained: AtomicBool,
+    /// The control thread's routing policy.
     route: Mutex<Router>,
 }
 
@@ -143,7 +142,7 @@ impl Routing {
             .collect()
     }
 
-    /// `route`: the rank that serves a request that has just arrived (§4.4);
+    /// `route`: the rank that serves a request that has just arrived;
     /// `None` when no routing policy serves or the policy failed.
     fn route(&self, arrival: &Arrival) -> Option<usize> {
         let ranks = self.ranks();
@@ -156,7 +155,7 @@ impl Routing {
         }
     }
 
-    /// §7.3 steps 2 and 3 on the control thread for the epoch's starting
+    /// The preparation and the switch on the control thread for the epoch's starting
     /// policy: prepares the route instance of `package` and puts it in.
     fn install_route(
         &self,
@@ -168,11 +167,11 @@ impl Routing {
         let candidate = Router::prepare(source, package, &ranks, &router.ceilings())
             .map_err(|error| error.to_string())?;
         router.adopt(candidate);
-        router.switchover(&ranks).map_err(|error| error.to_string())
+        router.switch(&ranks).map_err(|error| error.to_string())
     }
 
     /// The epoch's counters for the daemons' `/metrics` (`wire::Metrics`),
-    /// additive per epoch as the message promises (§2.3).
+    /// additive per epoch as the message promises.
     ///
     /// `steps` is the epoch's steps — a scheduler takes one per policy step, and
     /// the ranks step together, so it is the largest count any rank reached —
@@ -180,7 +179,7 @@ impl Routing {
     /// because a step submits one batch per (phase, stage). `tokens` sums
     /// the tokens the workers' forwards carried, `queue` is each rank's waiting
     /// depth, and `policy_fuel` and `policy_calls` are the instances' own
-    /// figures, summed by [`policy_usage`] (§12). The device's counters and the
+    /// figures, summed by [`policy_usage`]. The device's counters and the
     /// allocators' figures are not this thread's: they come with the worker's
     /// `counters()` and the allocators' reports.
     fn metrics(&self) -> wire::Metrics {
@@ -216,7 +215,7 @@ impl Routing {
         metrics
     }
 
-    /// §12's cost counters for the control thread's own route instance, which
+    /// The cost counters of the control thread's own route instance, which
     /// serves under the same epoch policy as the schedulers'.
     fn route_usage(&self) -> PolicyUsage {
         lock(&self.route).usage()
@@ -261,16 +260,9 @@ impl Routing {
     }
 
     /// Why the engine failed, once it did: every scheduler stopped on a
-    /// fatal failure, or, on trial, any one did. Names the first error of a
-    /// scheduler that stopped.
+    /// fatal failure. Names the first error of a scheduler that stopped.
     fn failure(&self) -> Option<String> {
-        let trial = self.trial.load(Ordering::Acquire);
-        let dead = self
-            .slots
-            .iter()
-            .filter(|slot| slot.handle.is_dead())
-            .count();
-        if dead == 0 || (!trial && dead < self.slots.len()) {
+        if !self.slots.iter().all(|slot| slot.handle.is_dead()) {
             return None;
         }
         let first = self
@@ -278,11 +270,7 @@ impl Routing {
             .iter()
             .find_map(|slot| slot.handle.failure())
             .unwrap_or_else(|| "a scheduler stopped on a worker failure".to_owned());
-        Some(if trial {
-            format!("a scheduler of the epoch on trial stopped: {first}")
-        } else {
-            format!("every scheduler stopped: {first}")
-        })
+        Some(format!("every scheduler stopped: {first}"))
     }
 
     /// Reports the engine's failure to every connected daemon once it failed
@@ -358,14 +346,47 @@ pub fn serve_requests(
         Connection::from_unix(writer)?,
         schedulers,
         policy,
+        None,
+    )
+}
+
+/// The fake engine's process link: the commands a daemon sends it and the
+/// reports it sends back.
+pub struct ProcessLink {
+    pub commands: std::sync::mpsc::Receiver<proto::process::Command>,
+    pub reports: std::sync::mpsc::Sender<proto::process::Report>,
+}
+
+/// [`serve_requests`], with the engine's process link served as well: a
+/// `Drain` on it parks the schedulers, ending their requests as migratable,
+/// and a `Promote` makes a parked engine serve.
+///
+/// # Errors
+///
+/// As [`serve_requests`].
+pub fn serve_engine(
+    stream: UnixStream,
+    schedulers: Vec<SchedulerHandle>,
+    policy: Option<EpochPolicy>,
+    process: ProcessLink,
+) -> anyhow::Result<()> {
+    let writer = stream
+        .try_clone()
+        .context("sharing the daemon's connection")?;
+    serve(
+        Connection::from_unix(stream)?,
+        Connection::from_unix(writer)?,
+        schedulers,
+        policy,
+        Some(process),
     )
 }
 
 /// The policy an epoch starts with, when its owner installs it directly
-/// rather than through the process interface (§7.3).
+/// rather than through the process interface.
 ///
-/// Production installs an epoch's policy with the daemon's `Precopy` and
-/// `Switchover` commands, which the epoch's command thread applies. A caller
+/// Production installs an epoch's policy with the daemon's `Prepare` and
+/// `Switch` commands, which the epoch's command thread applies. A caller
 /// that owns the engine's connection itself and sends no commands — the
 /// daemon library's in-process client is one — names the same installation
 /// here, and the engine serves its requests under it from the first one. The
@@ -387,6 +408,7 @@ fn serve(
     writer: Connection,
     schedulers: Vec<SchedulerHandle>,
     start: Option<EpochPolicy>,
+    process: Option<ProcessLink>,
 ) -> anyhow::Result<()> {
     let prepared = schedulers.iter().any(SchedulerHandle::starts_on_trial);
     let ceilings = schedulers
@@ -405,21 +427,14 @@ fn serve(
         cache_routes: Mutex::default(),
         fronts: Mutex::default(),
         state: AtomicI32::new(if prepared {
-            wire::EngineState::Standby
+            wire::EngineState::Parked
         } else {
-            wire::EngineState::Ready
+            wire::EngineState::Serving
         } as i32),
         failed: AtomicBool::new(false),
-        trial: AtomicBool::new(false),
+        drained: AtomicBool::new(false),
         route: Mutex::new(Router::new(ceilings)),
     });
-    routing.trial.store(
-        routing
-            .slots
-            .iter()
-            .any(|slot| slot.handle.starts_on_trial()),
-        Ordering::Release,
-    );
     anyhow::ensure!(!routing.slots.is_empty(), "the engine runs no scheduler");
     // A caller that names the epoch's starting policy installs it before the
     // first submission is read: the control thread's route instance responds
@@ -430,6 +445,14 @@ fn serve(
             .map_err(|reason| {
                 anyhow::anyhow!("the epoch's starting policy was not installed: {reason}")
             })?;
+    }
+
+    if let Some(process) = process {
+        let routing = Arc::clone(&routing);
+        std::thread::Builder::new()
+            .name("process-link".into())
+            .spawn(move || serve_process(&process.commands, &process.reports, &routing))
+            .context("starting the process link")?;
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -478,7 +501,7 @@ fn serve(
     drop(streams);
     let _ = events_thread.join();
     lock(&routing.fronts).clear();
-    let mut outcome = opened;
+    let mut result = opened;
     for (writer, reader) in threads {
         let written = writer
             .join()
@@ -488,11 +511,11 @@ fn serve(
             .join()
             .map_err(|_| anyhow::anyhow!("a request reader panicked"))
             .and_then(|read| read);
-        if outcome.is_ok() {
-            outcome = written.and(read);
+        if result.is_ok() {
+            result = written.and(read);
         }
     }
-    outcome
+    result
 }
 
 /// The writer and reader threads of one daemon's connection.
@@ -592,7 +615,7 @@ fn read_requests(
         };
         match message.kind {
             Some(to_engine::Kind::Submit(submit))
-                if routing.state.load(Ordering::Acquire) != wire::EngineState::Ready as i32 =>
+                if routing.state.load(Ordering::Acquire) != wire::EngineState::Serving as i32 =>
             {
                 refuse_unready(submit, front, routing);
             }
@@ -602,15 +625,6 @@ fn read_requests(
                 Some(wire::engine_command::Kind::Shutdown(_)) => {
                     let _ = control.send(Control::Shutdown);
                     return Ok(());
-                }
-                Some(wire::engine_command::Kind::Park(park)) => {
-                    park_schedulers(park.id, park.lend, front, routing)
-                }
-                Some(wire::engine_command::Kind::Resume(resume)) => {
-                    resume_schedulers(resume, front, routing);
-                }
-                Some(wire::engine_command::Kind::Commit(commit)) => {
-                    commit_schedulers(commit, front, routing);
                 }
                 Some(wire::engine_command::Kind::DescribeCache(describe)) => {
                     describe_caches(describe.id, front, routing);
@@ -623,8 +637,8 @@ fn read_requests(
                 }
                 Some(wire::engine_command::Kind::DescribeStorage(describe)) => {
                     // As an engine process responds to it: the storage usage and the transfer
-                    // budgets are each node's daemon's, read over its lease, and an epoch's main
-                    // process holds no lease of the deployment's.
+                    // budgets are each node's daemon's, read over its lease, and an epoch's engine
+                    // holds no lease of the deployment's.
                     routing.send(
                         front,
                         Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
@@ -700,13 +714,7 @@ fn read_requests(
                 Some(wire::engine_command::Kind::Attach(attach)) => {
                     tracing::warn!(daemon = %attach.requests, "this engine takes no other daemon");
                 }
-                Some(wire::engine_command::Kind::Promote(promote))
-                    if routing.state.load(Ordering::Acquire)
-                        == wire::EngineState::Standby as i32 =>
-                {
-                    promote_schedulers(promote, routing);
-                }
-                Some(wire::engine_command::Kind::Promote(_)) | None => {}
+                None => {}
             },
             None => {}
         }
@@ -748,7 +756,7 @@ fn submit_all(
         let Some(index) = recovered.or_else(|| routing.route(&arrival)) else {
             // The route policy could not respond — it failed and no previous
             // policy could take over, or no rank is alive to serve — so the
-            // request cannot be placed in this epoch (§7.3).
+            // request cannot be placed in this epoch.
             let (event, _) = Event::Error {
                 message: "the engine has no policy to route this request".to_owned(),
             }
@@ -1167,265 +1175,168 @@ fn configure_schedulers(configure: wire::Configure, front: usize, routing: &Arc<
     }
 }
 
-/// Adopts each predecessor index through the ordinary scheduler owners,
-/// then opens request admission on the same connection used to prepare.
-fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
-    let routing = Arc::clone(routing);
-    let spawned = std::thread::Builder::new()
-        .name("promote".into())
-        .spawn(move || {
-            let promoted = std::thread::scope(|scope| {
-                let promoting: Vec<_> = routing
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .map(|(slot_index, slot)| {
-                        let parked = slot
-                            .handle
-                            .cache_group()
-                            .and_then(|group| {
-                                promote
-                                    .index
-                                    .iter()
-                                    .find(|indexed| indexed.worker_group == group)
-                            })
-                            .map(scheduler::ParkedCache::from_index)
-                            .unwrap_or_default();
-                        for resume in parked.pages.iter().filter_map(|page| page.resume) {
-                            lock(&routing.cache_routes).insert(resume, slot_index);
-                        }
-                        let (recompute, grows) = (promote.recompute, promote.grows);
-                        scope.spawn(move || slot.handle.promote(parked, recompute, grows))
-                    })
-                    .collect();
-                let mut result = Ok(());
-                for promotion in promoting {
-                    let completed = promotion.join().unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!("a scheduler's promotion panicked"))
-                    });
-                    if result.is_ok() {
-                        result = completed;
+/// Serves the fake engine's process link until the daemon's end of it
+/// closes: a drain parks every scheduler and a promotion makes them serve,
+/// and every command is acknowledged as [`crate::process::Engine`] does.
+fn serve_process(
+    commands: &std::sync::mpsc::Receiver<proto::process::Command>,
+    reports: &std::sync::mpsc::Sender<proto::process::Report>,
+    routing: &Arc<Routing>,
+) {
+    use proto::process::{command, report};
+
+    let mut engine = if routing.state.load(Ordering::Acquire) == wire::EngineState::Parked as i32 {
+        crate::process::Engine::parked(0)
+    } else {
+        crate::process::Engine::serving(0)
+    };
+    for command in commands {
+        let effect = match &command.kind {
+            Some(command::Kind::Drain(_)) => drain_schedulers(routing).map(Some),
+            Some(command::Kind::Promote(promote)) => {
+                promote_schedulers(promote.handoff.as_ref(), routing).map(|()| None)
+            }
+            _ => Ok(None),
+        };
+        let acknowledged = match effect {
+            Ok(index) => engine
+                .command(command)
+                .into_iter()
+                .map(|mut acknowledged| {
+                    // The drain hands over what the schedulers parked with.
+                    if let (Some(report::Kind::Drained(drained)), Some(index)) =
+                        (acknowledged.kind.as_mut(), index.as_ref())
+                    {
+                        drained.handoff = Some(proto::process::Handoff {
+                            index: index.clone(),
+                            ..Default::default()
+                        });
                     }
-                }
-                result
-            });
-            let (state, error) = match promoted {
-                Ok(()) => (wire::EngineState::Ready, String::new()),
-                Err(error) => {
-                    routing.failed.store(true, Ordering::Release);
-                    (wire::EngineState::Failed, format!("{error:#}"))
-                }
-            };
-            routing.state.store(state as i32, Ordering::Release);
-            routing.broadcast(|| {
-                Frame::plain(from_engine::Kind::State(wire::State {
-                    state: state as i32,
-                    info: None,
-                    error: error.clone(),
-                }))
-            });
-        });
-    if let Err(error) = spawned {
-        tracing::error!(%error, "the promotion thread did not start");
+                    acknowledged
+                })
+                .collect(),
+            Err(reason) => vec![engine.fault(&reason)],
+        };
+        for report in acknowledged {
+            if reports.send(report).is_err() {
+                return;
+            }
+        }
     }
 }
 
-/// Parks every scheduler at once, on a thread of its own, and responds to the
-/// daemon `front` with `Parked` and every scheduler's prefix cache index,
-/// each by the worker group whose cache it indexes; every daemon reads the
-/// engine's new state.
-fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
-    if routing
-        .state
-        .swap(wire::EngineState::Parked as i32, Ordering::AcqRel)
-        == wire::EngineState::Parked as i32
-    {
-        tracing::info!("the engine parks already");
+/// States the engine's lifecycle `state` to every daemon.
+fn announce(routing: &Routing, state: wire::EngineState, error: &str) {
+    routing.state.store(state as i32, Ordering::Release);
+    routing.broadcast(|| {
+        Frame::plain(from_engine::Kind::State(wire::State {
+            state: state as i32,
+            info: None,
+            error: error.to_owned(),
+        }))
+    });
+}
+
+/// A parked engine serves: one that never served adopts the index handed to
+/// it through the ordinary scheduler owners, and one that drained resumes its
+/// schedulers; request admission then opens.
+fn promote_schedulers(
+    handoff: Option<&proto::process::Handoff>,
+    routing: &Arc<Routing>,
+) -> Result<(), String> {
+    let drained = routing.drained.swap(false, Ordering::AcqRel);
+    let promoted = if drained {
+        let responses: Vec<_> = routing
+            .slots
+            .iter()
+            .map(|slot| slot.handle.resume(false))
+            .collect();
+        responses
+            .into_iter()
+            .try_for_each(|response| match response.recv() {
+                Ok(resumed) => resumed,
+                Err(_) => Err("a scheduler stopped".to_owned()),
+            })
+    } else {
+        let index = handoff
+            .map(|handoff| handoff.index.as_slice())
+            .unwrap_or_default();
+        let (recompute, grows) =
+            handoff.map_or((false, true), |handoff| (handoff.recompute, handoff.grows));
+        std::thread::scope(|scope| {
+            let promoting: Vec<_> = routing
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(slot_index, slot)| {
+                    let parked = slot
+                        .handle
+                        .cache_group()
+                        .and_then(|group| {
+                            index.iter().find(|indexed| indexed.worker_group == group)
+                        })
+                        .map(scheduler::ParkedCache::from_index)
+                        .unwrap_or_default();
+                    for resume in parked.pages.iter().filter_map(|page| page.resume) {
+                        lock(&routing.cache_routes).insert(resume, slot_index);
+                    }
+                    scope.spawn(move || slot.handle.promote(parked, recompute, grows))
+                })
+                .collect();
+            let mut result = Ok(());
+            for promotion in promoting {
+                let completed = promotion
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("a scheduler's promotion panicked")));
+                if result.is_ok() {
+                    result = completed.map_err(|error| format!("{error:#}"));
+                }
+            }
+            result
+        })
+    };
+    match &promoted {
+        Ok(()) => announce(routing, wire::EngineState::Serving, ""),
+        Err(error) => {
+            routing.failed.store(true, Ordering::Release);
+            announce(routing, wire::EngineState::Failed, error);
+        }
     }
-    tracing::info!("the engine parks");
-    // A scheduler that stopped on a fatal failure responds to no park: it given
-    // its requests back, or ended them, as it stopped, and its thread then
-    // closes its workers, which the park does not wait for.
+    promoted
+}
+
+/// Drains the engine: every scheduler parks, ending its requests in flight
+/// as migratable, and the engine is parked. Returns every scheduler's prefix
+/// cache index, each by the worker group whose cache it indexes, which is
+/// what the engine hands the one that serves after it.
+fn drain_schedulers(routing: &Arc<Routing>) -> Result<Vec<wire::GroupIndex>, String> {
+    announce(routing, wire::EngineState::Draining, "");
+    // A scheduler that stopped on a fatal failure responds to no park: it gave
+    // its requests back, or ended them, as it stopped.
     let responses: Vec<_> = routing
         .slots
         .iter()
         .enumerate()
         .map(|(index, slot)| {
-            let response = (!slot.handle.is_dead()).then(|| slot.handle.park(lend));
+            let response = (!slot.handle.is_dead()).then(|| slot.handle.park(false));
             (index, slot.handle.cache_workers(), response)
         })
         .collect();
-    let routing = Arc::clone(routing);
-    let spawned = std::thread::Builder::new()
-        .name("park".to_owned())
-        .spawn(move || {
-            let mut index = Vec::new();
-            let mut error = String::new();
-            for (slot_index, group, response) in responses {
-                let Some(response) = response else {
-                    if error.is_empty() {
-                        error = "a scheduler stopped".to_owned();
-                    }
-                    continue;
-                };
-                match response.recv() {
-                    Ok(Ok(parked)) => {
-                        for resume in parked.pages.iter().filter_map(|page| page.resume) {
-                            lock(&routing.cache_routes).insert(resume, slot_index);
-                        }
-                        index.extend(parked.into_indexes(&group));
-                    }
-                    Ok(Err(failed)) if error.is_empty() => error = failed,
-                    Ok(Err(_)) => {}
-                    Err(_) if error.is_empty() => error = "a scheduler stopped".to_owned(),
-                    Err(_) => {}
-                }
-            }
-            if error.is_empty() {
-                tracing::info!("the engine parked");
-                routing.broadcast(|| {
-                    Frame::plain(from_engine::Kind::State(wire::State {
-                        state: wire::EngineState::Parked as i32,
-                        info: None,
-                        error: String::new(),
-                    }))
-                });
-            }
-            routing.send(
-                front,
-                Frame::plain(from_engine::Kind::Parked(wire::Parked { id, error, index })),
-            );
-        });
-    if let Err(error) = spawned {
-        tracing::error!(%error, "the park thread did not start");
+    let mut index = Vec::new();
+    for (slot_index, group, response) in responses {
+        let parked = response
+            .ok_or_else(|| "a scheduler stopped".to_owned())?
+            .recv()
+            .map_err(|_| "a scheduler stopped".to_owned())??;
+        for resume in parked.pages.iter().filter_map(|page| page.resume) {
+            lock(&routing.cache_routes).insert(resume, slot_index);
+        }
+        index.extend(parked.into_indexes(&group));
     }
-}
-
-/// Resumes every parked scheduler, retires the epochs `resume` names first,
-/// on a thread of its own, and responds to the daemon `front` with `Hooked`;
-/// every daemon reads that the engine serves again.
-fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>) {
-    tracing::info!(retire = ?resume.retire, "the parked engine resumes");
-    let retired = routing
-        .slots
-        .first()
-        .map(|slot| slot.handle.retire(resume.retire.clone()));
-    // An epoch the resume retires writes none of the engine's storage any
-    // more: each scheduler takes back the cache units it lent it.
-    let preempt = !resume.retire.is_empty();
-    let responses: Vec<_> = routing
-        .slots
-        .iter()
-        .map(|slot| slot.handle.resume(preempt))
-        .collect();
-    let routing = Arc::clone(routing);
-    let spawned = std::thread::Builder::new()
-        .name("resume".to_owned())
-        .spawn(move || {
-            let mut error = String::new();
-            if let Some(retired) = retired {
-                match retired.recv() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(failed)) => error = failed,
-                    Err(_) => error = "a scheduler stopped".to_owned(),
-                }
-            }
-            for response in responses {
-                match response.recv() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(failed)) if error.is_empty() => error = failed,
-                    Ok(Err(_)) => {}
-                    Err(_) if error.is_empty() => error = "a scheduler stopped".to_owned(),
-                    Err(_) => {}
-                }
-            }
-            if error.is_empty() {
-                routing
-                    .state
-                    .store(wire::EngineState::Ready as i32, Ordering::Release);
-                routing.broadcast(|| {
-                    Frame::plain(from_engine::Kind::State(wire::State {
-                        state: wire::EngineState::Ready as i32,
-                        info: None,
-                        error: String::new(),
-                    }))
-                });
-            }
-            routing.send(
-                front,
-                Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
-                    id: resume.id,
-                    results: Vec::new(),
-                    error,
-                })),
-            );
-        });
-    if let Err(error) = spawned {
-        tracing::error!(%error, "the resume thread did not start");
-    }
-}
-
-/// Commits the engine's epoch: publishes its pages, retires the epochs `commit` names (the
-/// predecessor), then commits every scheduler, on a thread of its own, and
-/// responds to the daemon `front` with `Hooked` and every worker's report.
-fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>) {
-    tracing::info!(
-        retire = ?commit.retire,
-        "the engine's epoch is committed"
-    );
-    let routing = Arc::clone(routing);
-    let spawned = std::thread::Builder::new()
-        .name("commit".to_owned())
-        .spawn(move || {
-            let mut results = Vec::new();
-            let mut error = String::new();
-            if let Some(slot) = routing.slots.first() {
-                match slot.handle.publish_epoch().recv() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(failed)) => error = failed,
-                    Err(_) => error = "a scheduler stopped".to_owned(),
-                }
-            }
-            if error.is_empty()
-                && let Some(slot) = routing.slots.first()
-            {
-                match slot.handle.retire(commit.retire.clone()).recv() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(failed)) => error = failed,
-                    Err(_) => error = "a scheduler stopped".to_owned(),
-                }
-            }
-            if error.is_empty() {
-                let responses: Vec<_> = routing
-                    .slots
-                    .iter()
-                    .map(|slot| slot.handle.commit())
-                    .collect();
-                for response in responses {
-                    match response.recv() {
-                        Ok(Ok(found)) => results.extend(found),
-                        Ok(Err(failed)) if error.is_empty() => error = failed,
-                        Ok(Err(_)) => {}
-                        Err(_) if error.is_empty() => error = "a scheduler stopped".to_owned(),
-                        Err(_) => {}
-                    }
-                }
-            }
-            if error.is_empty() {
-                routing.trial.store(false, Ordering::Release);
-            }
-            routing.send(
-                front,
-                Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
-                    id: commit.id,
-                    results,
-                    error,
-                })),
-            );
-        });
-    if let Err(error) = spawned {
-        tracing::error!(%error, "the commit thread did not start");
-    }
+    routing.drained.store(true, Ordering::Release);
+    announce(routing, wire::EngineState::Parked, "");
+    tracing::info!("the engine drained and is parked");
+    Ok(index)
 }
 
 /// Reports every worker group's KV cache as it holds it now, on a thread of
@@ -1624,7 +1535,7 @@ fn forward_events(
                     }
                     None => {
                         // The last counters, before the epoch drains away
-                        // (§2.3: once more when it drains).
+                        // (once more when it drains).
                         let metrics = routing.metrics();
                         routing
                             .broadcast(|| Frame::plain(from_engine::Kind::Metrics(metrics.clone())));
@@ -1642,7 +1553,7 @@ fn forward_events(
                         }
                     }
                     // The epoch's counters, once a second beside the
-                    // statistics (design §2.3's `/metrics`).
+                    // statistics (the daemon's `/metrics`).
                     let metrics = routing.metrics();
                     routing.broadcast(|| Frame::plain(from_engine::Kind::Metrics(metrics.clone())));
                 }
@@ -1832,10 +1743,10 @@ fn write_frames(
     Ok(())
 }
 
-/// The epoch's policy cost (§12): the control thread's route instance and every
+/// The epoch's policy cost: the control thread's route instance and every
 /// scheduler's, summed. A scheduler that has no policy yet adds nothing.
 ///
-/// Each figure is cumulative per instance and a switchover carries a
+/// Each figure is cumulative per instance and a switch carries a
 /// scheduler's total forward, so the sum over the schedulers only grows.
 fn policy_usage(
     route: PolicyUsage,
@@ -1893,7 +1804,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     //! What routing sees of a request before a scheduler holds it, and what
-    //! the control thread's route instance is told as a request runs (§4.4).
+    //! the control thread's route instance is told as a request runs.
 
     use super::*;
     use proto::request::GenerationRequest;

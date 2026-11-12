@@ -2,7 +2,7 @@
 //!
 //! Responses in flight do not travel this way: at the handoff they are frozen
 //! at an event boundary and adopted by the successor, with their connections
-//! and their state (§7.5.1, `restart/streams.rs`). What this module carries is
+//! and their state (`restart/streams.rs`). What this module carries is
 //! the request the predecessor had already accepted but not yet submitted when
 //! the deployment was handed over: it asks the successor which engine serves
 //! the request now, and submits there, instead of failing a request the old
@@ -14,7 +14,7 @@
 //! Such a request has no stream to hand over, because nothing of it has run
 //! yet; forwarding it is what keeps an admitted request from becoming a
 //! client-visible failure. The old process forwards it and does not wait for
-//! it: what item 1 requires is that no *stream* keeps it alive (§7.5.1).
+//! it: what item 1 requires is that no *stream* keeps it alive.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,12 +40,13 @@ pub(crate) struct Attachment {
     pub kept: Option<Kept>,
 }
 
-type Answer = Result<Attachment, String>;
+/// The successor's response to one `Resume`: the engine it resolved, or why it resolved none.
+type Response = Result<Attachment, String>;
 
 pub(super) struct Requests {
     writer: Writer,
     next: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Response>>>,
 }
 
 impl Requests {
@@ -57,9 +58,9 @@ impl Requests {
         })
     }
 
-    pub(super) fn answer(&self, id: u64, answer: Answer) {
+    pub(super) fn respond(&self, id: u64, response: Response) {
         if let Some(pending) = crate::leader::locked(&self.pending).remove(&id) {
-            let _ = pending.send(answer);
+            let _ = pending.send(response);
         }
     }
 
@@ -77,8 +78,8 @@ impl Requests {
         previous_epoch: Option<u64>,
     ) -> Result<Attachment, SubmitError> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (answer, answered) = oneshot::channel();
-        crate::leader::locked(&self.pending).insert(id, answer);
+        let (sender, response) = oneshot::channel();
+        crate::leader::locked(&self.pending).insert(id, sender);
         if let Err(error) = send(
             &mut crate::leader::locked(&self.writer),
             &Message::Resume {
@@ -95,7 +96,7 @@ impl Requests {
                 "the successor daemon is unavailable: {error}"
             )));
         }
-        answered
+        response
             .await
             .unwrap_or_else(|_| Err("the successor daemon closed its continuation relay".into()))
             .map_err(SubmitError::Unavailable)

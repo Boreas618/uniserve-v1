@@ -90,9 +90,9 @@ fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
     };
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(support::policy_module()));
-    response("the precopy", handle.precopy_policy(package, source))
+    response("the precopy", handle.prepare_policy(package, source))
         .expect("the policy is precopied");
-    response("the switchover", handle.stage(Stage::Switchover)).expect("the policy serves");
+    response("the switchover", handle.stage(Stage::Switch)).expect("the policy serves");
 }
 
 /// Waits for a command's response.

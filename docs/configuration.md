@@ -140,13 +140,16 @@ A checkpoint that declares its own quantization (ModelOpt's `quantization_config
 
 ### `admin_config`
 
-**Destination: host layer, daemon.** The daemon's listener reads it: the serving path, the node's admin API without a deployment, and the rebind a hot restart binds before the handover (`crates/daemon/src/http/listener.rs`). `uniserve serve --host` and `--port` set it.
+**Destination: the daemon's own options.** The daemon's listeners read it: the client API's address, and the two Unix sockets the admin API is served on apart from it ([admin API](admin.md#listeners)). `uniserve serve --host` and `--port` set the address.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `host` | `"127.0.0.1"` | TCP address the daemon's server listens on |
-| `port` | `8000` | TCP port the daemon's server listens on |
-| `uds` | Unset | Unix domain socket the daemon's server listens on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
+| `host` | `"127.0.0.1"` | TCP address the daemon's client API listens on |
+| `port` | `8000` | TCP port the daemon's client API listens on |
+| `uds` | Unset | Unix domain socket the client API listens on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
+| `admin_uds` | `admin-<port>.sock` in the daemon's runtime directory (`$XDG_RUNTIME_DIR/uniserve`, or `/tmp/uniserve-<uid>`) | Unix socket of the operator's admin API, created with mode `0600`; it serves every admin route |
+| `harness_uds` | `harness-<port>.sock` in the daemon's runtime directory | Unix socket of the harness's subset of the admin API (apply, commit, rollback, status, events and the update's report), created with mode `0660`: the operator grants a harness access through the socket's group |
+| `harness_options` | `[]` | The option paths a harness may set through `PUT /admin/config` on the harness listener, beside the package selections it may always set (`worker_config.engine`, `worker_config.engine_revision`, `scheduler_config.policy`, `attention_backend`, `prefill_attention_backend`, `decode_attention_backend`, `moe_runner_backend`, `moe_config.exchange`) |
 
 ### `load_config`
 
@@ -222,21 +225,20 @@ A token request that generates text moves to the engine that serves next when it
 
 ### `update_config`
 
-**Destination: host layer, daemon.**
+**Destination: the daemon's own options.**
 
-
-How the deployment moves to a configuration that a new epoch executes (`PUT /admin/config`, [admin API](admin.md#configuration-changes-and-epochs)). An option that an update's own `set` states governs that update alone; the configuration keeps its own.
+How an update keeps and judges what it replaces (`PUT /admin/config`, [admin API](admin.md#updates)). An option that an update's own `set` states governs that update alone; the configuration keeps its own. An update's deadline is stated with the apply itself (`deadline_s`), not here.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `previous_epoch` | `"parked"` | What the previous epoch keeps while its successor is on trial: `parked`, its drained processes, communicators, graph storage and weights, so that a rollback serves it again at once; `weights`, its weights alone, its processes exiting as the trial begins and the rest of its storage released, so that a rollback starts it again on them; `host`, as `weights` with the weights its successor does not map moved to host storage through each host's Transfer Server, and a rollback returns them to the GPUs as it starts the previous epoch again. A host whose Storage Server runs no Transfer Server, or that cannot hold them under its host-storage rule, keeps them on its GPUs, and the update's status reports the previous epoch kept as `weights` with each host's reason (`previous_epoch_kept`, `host_refused`) |
-| `cache_tail_tokens` | Largest source or target cache page | The most tokens a request in flight may have computed past the pages the host KV cache holds of it when the switchover comes; a positive integer. The requests run on while their pages reach the host, each as it completes, and the target's admission reads them there, so this bounds what a request computes again on the target. The wait ends after a minute whatever is left, and the update's status says so (`warming.timed_out`). A deployment without a host KV cache (`host_tier`), and a main process of several devices, which keeps none yet, waits for nothing: `warming.warmed_requests` reads 0 and a request computes its whole state again on the target |
+| `cache_tail_tokens` | Largest source or target cache page | The most tokens a request in flight may have computed past the pages the host KV cache holds of it when the switch comes; a positive integer. The requests run on while their pages reach the host, each as it completes, and the target's admission reads them there, so this bounds what a request computes again on the target. The wait ends after a minute whatever is left, and the update's status says so (`warming.timed_out`). A deployment without a host KV cache (`host_tier`), and a main process of several devices, which keeps none yet, waits for nothing: `warming.warmed_requests` reads 0 and a request computes its whole state again on the target |
 | `cache_prefill_tokens` | Largest source or target cache page | Source prefill tokens per scheduling step after the first warming round whose tail is past `cache_tail_tokens`; a positive integer. Decode retains its ordinary budget, requests remain admitted, and promotion or preparation failure restores the configured prefill budget |
 | `transfer_slowdown` | `0.1` | How much longer than before the change a serving scheduler's step may take while the successor prepares, as a fraction (`0.1` for 10%), past which the leader halves the byte budgets of the links the change's transfers use on every node, each second while it lasts, and restores them once every scheduler's steps are back within it; the default is measured on GB200 (below) |
 | `rollback.failure_rate` | Unset | The share of the requests that end during the trial, in (0, 1], past which a trial whose requests failed rolls back |
-| `rollback.step_time_regression` | Unset | How much longer than the previous epoch's average step before its promotion the successor's may take, as a fraction (`0.2` for 20%), before the trial rolls back |
-| `rollback.throughput_regression` | Unset | How much lower than the previous epoch's token throughput before its promotion the successor's may fall, as a fraction, before the trial rolls back |
-| `rollback.window` | Unset | The span step time and throughput are averaged over, up to the promotion and up to now during the trial; a regression decides nothing before a whole span of the trial passed, or for a previous epoch that ran no batch in its span; required with either regression |
+| `rollback.step_time_regression` | Unset | How much longer than the previous epoch's average step before the switch the successor's may take, as a fraction (`0.2` for 20%), before the trial rolls back |
+| `rollback.throughput_regression` | Unset | How much lower than the previous epoch's token throughput before the switch the successor's may fall, as a fraction, before the trial rolls back |
+| `rollback.window` | Unset | The span step time and throughput are averaged over, up to the switch and up to now during the trial; a regression decides nothing before a whole span of the trial passed, or for a previous epoch that ran no batch in its span; required with either regression |
 
 A trial also rolls back, whatever these state, on a fault of the successor: an error that leaves a main process unusable (an illegal memory access), a stalled job, non-finite logits, or a main process's exit. None of the thresholds has a default: each is measured on the deployment's own workload. A threshold that is passed reverts the update as a fault does, with the threshold's name as the failure's `kind` and what it read as the `reason`; `GET /admin/config` reports the trial under `update.trial`: the thresholds, the requests that ended and failed, and each replica's baseline and rates. The same thresholds decide a generation update on probation.
 

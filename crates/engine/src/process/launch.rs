@@ -1,4 +1,4 @@
-//! What a main process starts from: the launch file, the handshake on the daemon's request
+//! What an engine process starts from: the launch file, the handshake on the daemon's request
 //! interface that states the epoch ([`Epoch`]), and the connection to the daemon's process
 //! interface ([`ProcessInterface`]) that carries the supervision frames.
 
@@ -12,14 +12,13 @@ use worker::control::Control;
 
 /// The epoch as this node takes it at start.
 ///
-/// The daemon fixes the epoch with a [`proto::config::EngineConfig`] and
-/// fills its operators and its scheduling interface with packages; the
-/// main process never receives package content, only the packages' names, and it
-/// resolves their modules from the Build Server itself.
+/// The daemon fixes the epoch with a [`proto::config::EngineConfig`] and a module set that
+/// names the packages of its operators and its scheduling policy; the engine never receives
+/// package content, only the packages' names, and it resolves their modules from the Build
+/// Server itself.
 pub(crate) struct Epoch {
-    /// The package revision the daemon numbered for the generation that serves
-    /// once this node switches over. Zero until the daemon's first `Precopy` names the
-    /// number it prepares: the number is the daemon's and this process never invents one.
+    /// The number of the generation each device's worker starts with: zero, which holds no
+    /// kernel. The engine numbers its own generations, and its start installs the first.
     pub generation: u64,
     /// The host identity of the node this process runs on, which the daemon knows and which the
     /// Storage Server's claim states.
@@ -47,21 +46,20 @@ pub(super) fn read_engine_args(path: &Path) -> Result<EngineArgs> {
 ///
 /// The daemon has two interfaces and they are two sockets with two vocabularies: the request one
 /// carries the epoch's requests, their events and the metrics, and this one carries the supervision
-/// frames - the storage claim, the generation reports, and every command the daemon sends an
-/// epoch. A frame of one sent on the other is unreadable at the far end, which is why the claim and
-/// the reports live here and not on the request connection.
+/// frames - the storage claim, the engine's reports, and every command the daemon sends an
+/// engine. A frame of one sent on the other is unreadable at the far end, which is why the claim
+/// and the reports live here and not on the request connection.
 pub(super) struct ProcessInterface {
     pub(super) connection: proto::Connection,
-    /// The commands read while waiting for the answer to something else. A daemon may send a
-    /// `Precopy` while a claim is outstanding, and dropping it would lose the epoch's first
-    /// generation.
+    /// The commands read while waiting for the reply to something else: a daemon may send one
+    /// while a claim is outstanding, and dropping it would lose it.
     pending: std::collections::VecDeque<proto::process::Command>,
     /// The daemon closed the interface: the epoch is over, and the process says so and goes.
     closed: bool,
 }
 
 impl ProcessInterface {
-    /// Connects to `address` and states this process's identity, which the daemon answers with the
+    /// Connects to `address` and states this process's identity, which the daemon replies to with the
     /// deployment's nodes or a refusal.
     pub(super) fn connect(address: &str, deployment: &str, engine: u64) -> Result<Self> {
         // A process link that cannot name its engine is refused here rather than sent: zero states
@@ -70,9 +68,9 @@ impl ProcessInterface {
         // one is the deployment's fault and this is where it is named.
         if engine == 0 {
             bail!(
-                "the launch file states engine 0, which names no main process: the daemon addresses \
-                 the epoch's generation commands by this number, so a process it started under \
-                 none cannot be commanded"
+                "the launch file states engine 0, which names no engine process: the daemon \
+                 addresses its commands by this number, so a process it started under none \
+                 cannot be commanded"
             );
         }
         let mut connection = proto::Connection::connect(address).with_context(|| {
@@ -88,8 +86,8 @@ impl ProcessInterface {
                     // process under, so a command it sends for engine N reaches this process and
                     // not whichever connection the daemon happened to accept Nth.
                     engine,
-                    // This is the process link: the one the daemon's generation commands
-                    // travel down. The request link, on its own socket, states `REQUESTS`, so the
+                    // This is the process link: the one the daemon's commands travel
+                    // down. The request link, on its own socket, states `REQUESTS`, so the
                     // two links of one engine are never confused for one another.
                     interface: proto::process::Interface::Process as i32,
                 },
@@ -100,7 +98,7 @@ impl ProcessInterface {
         // arrives.
         let welcome: proto::process::Welcome = connection
             .recv(HANDSHAKE_TIMEOUT)?
-            .context("the daemon did not answer this main process's process handshake")?;
+            .context("the daemon did not reply to this engine's process handshake")?;
         if !welcome.refusal.is_empty() {
             bail!(
                 "the daemon refused this main process's process connection: {}",
@@ -108,7 +106,7 @@ impl ProcessInterface {
             );
         }
         // A process the daemon admits and lists no node for is a refusal too: the nodes are what the
-        // claim and every later request are answered by, so a welcome with none would let this
+        // claim and every later request are replied to by, so a welcome with none would let this
         // process run on a deployment the daemon does not know it on.
         if welcome.nodes.is_empty() {
             bail!(
@@ -143,7 +141,7 @@ impl ProcessInterface {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("the daemon did not answer {what} within {timeout:?}");
+                bail!("the daemon did not reply to {what} within {timeout:?}");
             }
             connection.wait(remaining)?;
             if let Some(message) = connection.try_recv::<proto::process::Downstream>()? {
@@ -152,7 +150,7 @@ impl ProcessInterface {
         }
     }
 
-    /// Sends one request and answers its reply, filing every command that arrives meanwhile.
+    /// Sends one request and returns its reply, filing every command that arrives meanwhile.
     pub(super) fn request(
         &mut self,
         request: proto::process::Request,
@@ -171,7 +169,7 @@ impl ProcessInterface {
                 Some(proto::process::downstream::Kind::Reply(reply)) => {
                     tracing::warn!(
                         id = reply.id,
-                        "an answer to a request this process did not send"
+                        "a reply to a request this process did not send"
                     );
                 }
                 Some(proto::process::downstream::Kind::Event(event)) => self.file(event),
@@ -180,7 +178,7 @@ impl ProcessInterface {
         }
     }
 
-    /// Sends one report of this process's state, which the daemon needs no answer to.
+    /// Sends one report of this process's state, which the daemon sends no reply to.
     pub(super) fn report(&mut self, report: proto::process::Report) -> Result<()> {
         self.connection.send(&proto::process::Upstream {
             kind: Some(proto::process::upstream::Kind::Report(report)),
@@ -188,9 +186,10 @@ impl ProcessInterface {
         Ok(())
     }
 
-    /// The daemon's next command for this epoch, if one has arrived.
+    /// The daemon's next command for this engine, if one has arrived.
     ///
-    /// Nothing waits here: a command that has not arrived is one the next serve pass looks for.
+    /// Nothing waits here: the control thread watches this connection, and a command that
+    /// arrives wakes it.
     pub(super) fn take_command(&mut self) -> Result<Option<proto::process::Command>> {
         // The daemon owns this process's life: the interface closing is the end of the epoch and not
         // an error, so it stops the loop by name instead of surfacing as a failure the daemon never
@@ -215,7 +214,7 @@ impl ProcessInterface {
                 Some(proto::process::downstream::Kind::Reply(reply)) => {
                     tracing::warn!(
                         id = reply.id,
-                        "an answer to a request this process did not send"
+                        "a reply to a request this process did not send"
                     );
                 }
                 None => {}
@@ -247,17 +246,16 @@ impl ProcessInterface {
     }
 }
 
-/// How long the daemon's process interface may take to answer the handshake, which it answers at
+/// How long the daemon's process interface may take to reply to the handshake, which it does at
 /// once: the wait exists to fail a wrong address rather than hang the process.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The handshake with the daemon, which answers with the epoch this node serves.
+/// The handshake with the daemon; returns the epoch this node serves.
 ///
-/// The daemon states that this build may serve the epoch, and, later, the package revision of the
-/// generation it prepares. The launch file states the rest of what the epoch starts from:
-/// this node's host identity, the process this one succeeds, the expert order and the profiling.
-/// The packages themselves never come through this interface: the daemon names them and this
-/// process resolves their modules from the Build Server.
+/// The daemon states that this build may serve the epoch. The launch file states what the epoch
+/// starts from: this node's host identity, the process this one succeeds, the expert order, the
+/// profiling and the module set. The packages themselves never come through an interface: the
+/// launch file names them and this process resolves their modules from the Build Server.
 pub(super) fn handshake(control: &mut Control, launch: &EngineArgs) -> Result<Epoch> {
     control.daemon_mut().send(&proto::request::wire::Hello {
         engine: launch.engine,
@@ -284,11 +282,6 @@ impl Epoch {
     ///
     /// When the launch states no host identity.
     pub(super) fn of(launch: &EngineArgs) -> Result<Self> {
-        // The epoch's packages and the generation that serves at start are not in the launch file:
-        // the packages arrive as the daemon's first `Precopy` and the generation number
-        // is the daemon's own. Until it states one, this process serves generation zero, whose
-        // `Precopy` names the daemon's next number.
-        //
         // The host identity is the daemon's fact and nothing else can supply it: the Storage Server
         // keys this rank's claim by it, so an empty one would mint a claim on a host that does not
         // exist and every peer would compare its products against the wrong node.

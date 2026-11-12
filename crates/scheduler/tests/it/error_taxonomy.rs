@@ -281,7 +281,7 @@ impl Epoch {
         };
         let source: Arc<dyn PolicySource + Send + Sync> =
             Arc::new(PolicyBytes::new(failing.wasm()));
-        match response(self.handle.precopy_policy(package, source)) {
+        match response(self.handle.prepare_policy(package, source)) {
             Ok(()) => panic!("the trial refuses this package, and it did not"),
             Err(reason) => reason,
         }
@@ -317,8 +317,8 @@ impl Epoch {
             stated: Default::default(),
         };
         let source: Arc<dyn PolicySource + Send + Sync> = Arc::new(PolicyBytes::new(toy.wasm()));
-        response(self.handle.precopy_policy(package, source))?;
-        response(self.handle.switchover_policy())
+        response(self.handle.prepare_policy(package, source))?;
+        response(self.handle.switch_policy())
     }
 
     /// The revision of the package that serves: after a refused candidate or
@@ -333,7 +333,7 @@ impl Epoch {
     }
 
     /// Waits for the failure report the mechanism records for a failed policy.
-    fn failed(&self) -> scheduler::PolicyReverted {
+    fn failed(&self) -> scheduler::PolicyRolledBack {
         eventually(|| self.handle.take_policy_report().recv().ok().flatten())
     }
 }

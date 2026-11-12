@@ -1,28 +1,18 @@
-//! The daemon's messages: the process interface's commands, the request interface's frames, and
-//! the dispatch of every generation command ([`ipc::GenerationCommand`])
-//! to the stage that applies it, with the answer each one is owed.
+//! The daemon's messages: the request interface's frames, and the process interface's commands,
+//! each applied to the engine's state ([`super::lifecycle::State::command`]) and then carried out
+//! as the step that state returns.
 
 use anyhow::{Result, bail};
-use ipc::{GenerationCommand, GenerationStatus, UpdateFailure};
+use ipc::{GenerationCommand, UpdateFailure};
+use proto::process::command;
 
 use super::MainProcess;
-use super::reports::status_name;
-use super::requests::{Served, engine_command_name};
-
-/// The stage a generation command belongs to, for the log line each one leaves.
-fn generation_stage(command: &GenerationCommand) -> &'static str {
-    match command {
-        GenerationCommand::Precopy { .. } => "precopy",
-        GenerationCommand::Switchover { .. } => "switchover",
-        GenerationCommand::Commit { .. } => "commit",
-        GenerationCommand::Revert { .. } => "revert",
-        GenerationCommand::Purge { .. } => "purge",
-    }
-}
+use super::lifecycle::Step;
+use super::requests::{RequestStream, engine_command_name};
 
 impl MainProcess {
-    /// Serves the daemon's buffered messages: request submissions and commands
-    /// go to the schedulers, generation commands to [`Self::package`].
+    /// Serves the daemon's buffered messages: request submissions and per-request commands go
+    /// to the schedulers, engine commands to [`Self::engine_command`].
     pub(super) fn daemon_messages(&mut self) -> Result<Option<UpdateFailure>> {
         // Every front is read in turn, the launching daemon's first: a submission names the front
         // it came from, and so does every command for a request already admitted.
@@ -32,7 +22,7 @@ impl MainProcess {
                 continue;
             }
             // A frame from a closed front ends that front and nothing else: its requests stay
-            // parked for the takeover that claims them.
+            // for the takeover that takes them.
             while let Some(connection) = self.control.front_mut(front) {
                 let message = match connection.try_recv() {
                     Ok(Some(message)) => message,
@@ -41,7 +31,7 @@ impl MainProcess {
                         if front == 0 {
                             // The launching daemon leaving is the handover's own step: the
                             // attached daemons hold this process, and a front polled after it
-                            // closed answers every pass with the same error - which is a log
+                            // closed gives every read the same error - which is a log
                             // that hides the handover's own lines behind it.
                             self.daemon_closed = true;
                             tracing::warn!(
@@ -64,9 +54,9 @@ impl MainProcess {
         Ok(None)
     }
 
-    /// Serves the daemon's request interface: submissions and per-request
-    /// commands are routed to the scheduler that holds the request, and
-    /// generation commands run the generation update's driver.
+    /// Serves one frame of the daemon's request interface: a submission and a per-request
+    /// command are routed to the scheduler that holds the request, and an engine command to
+    /// what serves it.
     fn daemon_message(
         &mut self,
         front: usize,
@@ -80,25 +70,23 @@ impl MainProcess {
                 // Every request of one submission is queued before the next
                 // batch is formed.
                 // A routing policy that failed with no previous policy to take over fails the
-                // update once the submission's requests are answered.
+                // update once the submission's requests are responded to.
                 let mut routing_failure = None;
                 for wire in submit.requests {
                     let id = wire.id;
-                    // A drained epoch and a held gate admit nothing: the refusal is retryable
-                    // and the request is the frontend's to resubmit when the epoch serves again.
-                    if !self.serving || self.paused {
+                    // Only a serving engine whose gate is open admits: the refusal is retryable
+                    // and the request is the daemon's to resubmit when an engine serves.
+                    let refusal = if self.paused {
+                        Some("admissions are held")
+                    } else {
+                        self.state.lifecycle().refusal()
+                    };
+                    if let Some(refusal) = refusal {
                         self.reject(
                             front,
                             id,
                             proto::request::RejectionKind::Overloaded,
-                            if self.paused {
-                                "the frontend's admissions are held".to_owned()
-                            } else if !self.boundary {
-                                "the epoch is starting and has reached no batch boundary yet"
-                                    .to_owned()
-                            } else {
-                                "the epoch is drained and serves nothing".to_owned()
-                            },
+                            refusal.to_owned(),
                         );
                         continue;
                     }
@@ -119,7 +107,7 @@ impl MainProcess {
                     };
                     // An adapter's tensors load into their slot, and what computes with them
                     // is a kernel package this epoch does not hold: computing the base model
-                    // for a request that named an adapter would answer another model's text.
+                    // for a request that named an adapter would respond with another model's text.
                     if let proto::request::Request::Generation(generation) = &request
                         && generation.adapter != 0
                     {
@@ -155,7 +143,7 @@ impl MainProcess {
                     };
                     match scheduler.submit(request) {
                         Ok(stream) => {
-                            self.streams.push(Served {
+                            self.streams.push(RequestStream {
                                 request: id,
                                 rank,
                                 events: stream,
@@ -207,164 +195,84 @@ impl MainProcess {
         }
     }
 
-    /// Serves one command of the daemon's process interface.
-    ///
-    /// `ipc::GenerationCommand` is the one form the driver reads, whether the command came from the
-    /// daemon's Protobuf or from a peer of this epoch, so the conversion happens here and nowhere
-    /// else. The daemon's `Commit` and `Revert` carry no generation of their own; the one they
-    /// name is the generation this process is serving.
+    /// Serves one command of the daemon's process interface: the engine's state decides what
+    /// the command means now, and the step it returns is carried out here.
     pub(super) fn process_command(
         &mut self,
         command: proto::process::Command,
     ) -> Result<Option<UpdateFailure>> {
-        let current = self.update.current();
-        // A revert carries the daemon's own account of why, which `ipc::GenerationCommand` does not
-        // keep: read it here so the report repeats the operator's reason rather than inventing one.
-        let reverted_by = match &command.kind {
-            Some(proto::process::command::Kind::Revert(revert)) => {
-                Some(revert.reason.clone()).filter(|reason| !reason.is_empty())
-            }
-            _ => None,
-        };
-        let Some(package) = GenerationCommand::from_command(command.clone(), current)? else {
-            // The rest are this process's own lifecycle, and no scheduler's: sched's handle
-            // answers every one of them with exactly that (a park, promote, drain, serve or pause
-            // is the engine process's own command). Forwarding them there and ending the epoch on
-            // the refusal is how a drain used to end the epoch it was meant to keep alive.
-            match command.kind {
-                Some(proto::process::command::Kind::Drain(drain)) => self.drain(drain.epoch)?,
-                Some(proto::process::command::Kind::Serve(serve)) => self.resume(serve)?,
-                Some(proto::process::command::Kind::Pause(pause)) => {
-                    self.paused = pause.paused;
-                }
-                // A standby parks and is then promoted in place. Both commands park and
-                // resume the schedulers, and each has an answer the daemon's epoch layer waits
-                // for: it promotes a child only after `Parked`, and switches the frontend only
-                // after `Promoted`.
-                Some(proto::process::command::Kind::Park(_)) => {
-                    self.park_schedulers("parking for a promotion")?;
-                    self.send_report(proto::process::Report {
-                        kind: Some(proto::process::report::Kind::Parked(
-                            proto::process::Parked {
-                                // The daemon's epoch layer promotes a child by its
-                                // launch generation: this process's own number, not
-                                // the module generation (which is zero until a
-                                // `Precopy` names one).
-                                generation: self.control.engine(),
-                            },
-                        )),
-                    });
-                }
-                Some(proto::process::command::Kind::Promote(promote)) => {
-                    self.promote_in_place(promote.inherits)?;
-                }
-                Some(proto::process::command::Kind::Inherit(inherit)) => {
-                    self.inherit(inherit.index)?;
-                }
-                // The five package commands were converted above; a command that states no kind
-                // states nothing to apply.
-                _ => {}
-            }
+        let Some(kind) = command.kind else {
             return Ok(None);
         };
-        match self.package(package, reverted_by)? {
-            // A precopy answers when its installs finish, from `advance_precopy`.
-            None => Ok(None),
-            Some(status) => {
-                self.report(status);
-                Ok(None)
-            }
-        }
-    }
-
-    /// One generation command, with the daemon's own reason when it stated one.
-    ///
-    /// A revert's reason is the daemon's account of why an operator ended the probation; it is
-    /// carried into the epoch's record instead of a reason this process makes up, and the epoch's
-    /// own failures state their own.
-    ///
-    /// A precopy answers later, from [`Self::advance_precopy`], because its module builds run
-    /// between serve passes; every other stage answers at once.
-    fn package(
-        &mut self,
-        command: GenerationCommand,
-        reverted_by: Option<String>,
-    ) -> Result<Option<GenerationStatus>> {
-        // The generation layer's stages are the epoch's steps, and a step that never arrives is the
-        // failure this line is for: it names the command and the generation, so a log that stops
-        // after "claimed the deployment's storage" says which step the process is waiting for.
-        self.commands_seen += 1;
+        let step = self.state.command(&kind);
         tracing::info!(
-            stage = generation_stage(&command),
-            boundary = self.boundary,
-            serving = self.serving,
-            warming = self.warming.len(),
-            "a generation command arrived"
+            command = command_name(&kind),
+            ?step,
+            lifecycle = ?self.state.lifecycle(),
+            update = ?self.state.update(),
+            "a command of the daemon's process interface arrived"
         );
-        let status = match command {
-            GenerationCommand::Precopy {
-                generation,
-                packages,
-                policy,
-            } => {
-                // The receipt: this line says the daemon's step reached this process and what it
-                // carried, before anything is resolved, built or installed. A run that stops with
-                // no such line stopped before the daemon sent it, and one that stops after it
-                // stopped here.
-                tracing::info!(
-                    generation,
-                    operators = packages.len(),
-                    policy = %policy.backend,
-                    policy_revision = policy.revision,
-                    "the daemon's Precopy arrived"
+        match (step, kind) {
+            (Step::Prepare { generation }, kind @ command::Kind::Prepare(_)) => {
+                // The one conversion of the daemon's Protobuf into the packages it names.
+                let prepare = GenerationCommand::from_command(
+                    proto::process::Command { kind: Some(kind) },
+                    generation - 1,
                 );
-                self.start_precopy(generation, &packages, &policy)?;
-                return Ok(None);
-            }
-            GenerationCommand::Switchover { generation, step } => {
-                tracing::info!(
-                    generation,
-                    step = step.unwrap_or_default(),
-                    "received the daemon's switchover"
-                );
-                match self.switchover(generation, step)? {
-                    Some(status) => status,
-                    // The answer is owed to the warmup: it is sent from `advance_warmup` when
-                    // admission opens, or replaced by the failure that keeps admission shut.
-                    None => return Ok(None),
+                match prepare {
+                    Ok(Some(GenerationCommand::Prepare {
+                        packages, policy, ..
+                    })) => return self.start_prepare(generation, &packages, &policy),
+                    Ok(_) => bail!("a prepare did not read as one"),
+                    Err(error) => {
+                        let report = self.state.prepare_failed(generation, error.to_string());
+                        self.send_report(report);
+                    }
                 }
             }
-            GenerationCommand::Commit { generation } => self.commit(generation)?,
-            // The operator's rollback is the daemon's decision, and its reason - when the
-            // daemon states one - is what the record keeps. It is not a policy failure: nothing
-            // about the scheduling policy failed, and saying it did would put a policy error in
-            // the epoch's record and in the daemon's account of why the update ended.
-            GenerationCommand::Revert { generation } => self.revert(
-                generation,
-                UpdateFailure::Threshold {
-                    reason: reverted_by.unwrap_or_else(|| "the daemon reverted the update".into()),
-                },
-            )?,
-            GenerationCommand::Purge { generation } => self.purge(generation)?,
-        };
-        Ok(Some(status))
+            (Step::Switch { generation }, _) => return self.switch(generation),
+            (Step::Commit { kept }, _) => {
+                self.commit(kept);
+                let report = self.state.committed();
+                self.send_report(report);
+            }
+            (Step::Rollback { left, executed }, command::Kind::Rollback(rollback)) => {
+                self.roll_back(left, executed)?;
+                // The reason is the daemon's account of why the trial ended, and the
+                // acknowledgement repeats it rather than inventing one.
+                let reason = if rollback.reason.is_empty() {
+                    "the daemon rolled the update back".to_owned()
+                } else {
+                    rollback.reason
+                };
+                let report = self.state.rolled_back(reason);
+                self.send_report(report);
+            }
+            (Step::Drain { epoch, discarded }, _) => self.drain(epoch, discarded)?,
+            (Step::Promote, command::Kind::Promote(promote)) => self.promote(promote.handoff)?,
+            (Step::Pause(paused), _) => self.pause(paused),
+            (Step::Report(report), _) => self.send_report(report),
+            (Step::Ignore, _) => {}
+            // A step is returned for the command that asked for it.
+            (step, kind) => bail!(
+                "the step {step:?} does not belong to the command {}",
+                command_name(&kind)
+            ),
+        }
+        Ok(None)
     }
+}
 
-    /// Delivers a generation status to the daemon.
-    pub(super) fn answer(&mut self, status: GenerationStatus) {
-        // The generation layer's steps are answered here. A run that stops between two of them needs
-        // to know which one was answered last, and the daemon's own log of its commands is not this
-        // side's. The reason travels with the status, and a run that reads only this log needs it
-        // too.
-        let failure = match &status {
-            GenerationStatus::PrecopyFailed { failure, .. } => format!("{failure:?}"),
-            _ => String::new(),
-        };
-        tracing::info!(
-            status = status_name(&status),
-            failure,
-            "answering the epoch's generation layer"
-        );
-        self.report(status);
+/// The name of a process-interface command, for the line each one leaves.
+fn command_name(kind: &command::Kind) -> &'static str {
+    match kind {
+        command::Kind::Prepare(_) => "prepare",
+        command::Kind::Switch(_) => "switch",
+        command::Kind::Commit(_) => "commit",
+        command::Kind::Rollback(_) => "rollback",
+        command::Kind::Drain(_) => "drain",
+        command::Kind::Promote(_) => "promote",
+        command::Kind::Pause(_) => "pause",
+        command::Kind::Serve(_) => "serve",
     }
 }

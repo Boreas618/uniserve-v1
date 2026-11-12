@@ -15,7 +15,7 @@
 //! module in place until the next precopy, which is where §7.3's purge of it
 //! happens. A revert instantiates it on the state of that moment and puts it
 //! in. A policy that fails is reverted the same way and reported as
-//! [`PolicyReverted`]; the control thread forwards the report to the daemons,
+//! [`PolicyRolledBack`]; the control thread forwards the report to the daemons,
 //! which record the previous policy as the epoch's current one.
 //!
 //! Both instances — each scheduler thread's and the control thread's
@@ -493,14 +493,14 @@ pub trait Validators {
 /// scheduler at a batch boundary where no batch and no submission is in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
-    /// §7.3 step 3: the instance a precopy prepared becomes the serving one; the
-    /// module it replaces is kept to revert to.
-    Switchover,
-    /// §7.3 step 4: the previous policy is instantiated on the current state
-    /// and becomes the serving one.
-    Revert,
-    /// §7.3 step 6: the previous module is dropped, once no batch uses it.
-    Purge,
+    /// The instance a prepare made ready becomes the serving one; the module it
+    /// replaces is kept to roll back to.
+    Switch,
+    /// The previous policy is instantiated on the current state and becomes the
+    /// serving one.
+    Rollback,
+    /// The previous module is dropped, once no batch uses it.
+    Release,
     /// §7.3 step 5: the update is committed. The previous module stays until
     /// the next precopy, which replaces it.
     Commit,
@@ -658,7 +658,7 @@ impl Candidate {
 /// [`RoutePolicy::fail`] returning `Err`, which means no previous policy exists
 /// to serve under.
 #[derive(Clone, Debug)]
-pub struct PolicyReverted {
+pub struct PolicyRolledBack {
     /// The scheduler whose instance failed; `None` while the scheduler thread
     /// reports it, since a scheduler does not know its index, and `None` for the
     /// control thread's route instance. The control thread names the scheduler
@@ -677,7 +677,7 @@ pub struct PolicyReverted {
     pub fatal: bool,
 }
 
-impl PolicyReverted {}
+impl PolicyRolledBack {}
 
 /// A request that has just reached the main process, as the control thread
 /// sees it before any scheduler does: what the `route` decision orders by
@@ -1079,18 +1079,21 @@ impl PolicySlot {
     /// whose previous policy could not be instantiated is not one, it is an
     /// error — so a caller that only changes stages gets `None`; the failure
     /// path of a serving policy is [`Self::fail`].
-    pub fn boundary(&mut self, state: &TrialState) -> Result<Option<PolicyReverted>, PolicyError> {
+    pub fn boundary(
+        &mut self,
+        state: &TrialState,
+    ) -> Result<Option<PolicyRolledBack>, PolicyError> {
         match self.pending.take() {
             None | Some(Stage::Commit) => Ok(None),
-            Some(Stage::Switchover) => {
+            Some(Stage::Switch) => {
                 self.switch_over(state)?;
                 Ok(None)
             }
-            Some(Stage::Revert) => {
-                self.revert(state)?;
+            Some(Stage::Rollback) => {
+                self.rollback(state)?;
                 Ok(None)
             }
-            Some(Stage::Purge) => {
+            Some(Stage::Release) => {
                 self.previous = None;
                 Ok(None)
             }
@@ -1141,7 +1144,7 @@ impl PolicySlot {
     /// `Err` names why the revert could not be made: no previous module is
     /// kept, or it does not instantiate on this state. The epoch then has no
     /// policy to serve under.
-    fn revert(&mut self, state: &TrialState) -> Result<(), PolicyError> {
+    fn rollback(&mut self, state: &TrialState) -> Result<(), PolicyError> {
         self.candidate = None;
         let Some((package, module)) = self.previous.take() else {
             return Err(PolicyError::invalid(
@@ -1171,14 +1174,14 @@ impl PolicySlot {
         &mut self,
         error: &PolicyError,
         state: &TrialState,
-    ) -> Result<PolicyReverted, PolicyError> {
-        let report = PolicyReverted {
+    ) -> Result<PolicyRolledBack, PolicyError> {
+        let report = PolicyRolledBack {
             scheduler: None,
             package: self.package.clone(),
             reason: error.to_string(),
             fatal: false,
         };
-        self.revert(state)?;
+        self.rollback(state)?;
         Ok(report)
     }
 }
@@ -1261,7 +1264,7 @@ pub struct RouteRefusal {
     pub reason: String,
     /// The policy failure the refusal reverted, when a serving policy failed;
     /// `fatal` when no previous package could take over.
-    pub reverted: Option<Box<PolicyReverted>>,
+    pub reverted: Option<Box<PolicyRolledBack>>,
 }
 
 impl Router {
@@ -1327,7 +1330,7 @@ impl Router {
     /// §7.3 step 3: the prepared instance routes from now on. A switchover
     /// with no prepared instance fails rather than leaving the epoch without
     /// a router.
-    pub fn switchover(&mut self, ranks: &[RankView]) -> Result<(), PolicyError> {
+    pub fn switch(&mut self, ranks: &[RankView]) -> Result<(), PolicyError> {
         let Some(candidate) = self.candidate.take() else {
             return Err(PolicyError::invalid(
                 Call::Init,
@@ -1337,7 +1340,7 @@ impl Router {
         match self.slot.as_mut() {
             Some(slot) => {
                 slot.adopt(candidate);
-                slot.request(Stage::Switchover);
+                slot.request(Stage::Switch);
                 slot.boundary(&Self::state(ranks)).map(|_| ())
             }
             None => {
@@ -1361,12 +1364,12 @@ impl Router {
 
     /// §7.3 step 4: the previous package routes again, instantiated on
     /// `ranks`; a prepared candidate is dropped.
-    pub fn revert(&mut self, ranks: &[RankView]) -> Result<(), PolicyError> {
+    pub fn rollback(&mut self, ranks: &[RankView]) -> Result<(), PolicyError> {
         self.candidate = None;
         let Some(slot) = self.slot.as_mut() else {
             return Ok(());
         };
-        slot.request(Stage::Revert);
+        slot.request(Stage::Rollback);
         slot.boundary(&Self::state(ranks)).map(|_| ())
     }
 
@@ -1447,7 +1450,7 @@ impl Router {
                 // No previous package can route: the epoch has no router.
                 let package = slot.package().clone();
                 self.slot = None;
-                PolicyReverted {
+                PolicyRolledBack {
                     scheduler: None,
                     package,
                     reason: format!("{error}; no previous policy can take over: {fatal}"),

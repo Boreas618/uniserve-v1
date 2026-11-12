@@ -1037,11 +1037,11 @@ pub struct EngineArgs {
     pub engine: u64,
     /// The Build Server's socket.
     pub build_server: String,
-    /// The epoch's module set, as the daemon fixed it when the epoch's configuration was applied:
-    /// the node's daemon starts the engine package it names, and the process loads the kernel and
-    /// policy packages it names at the revisions it names. `None` in a launch built from a
-    /// configuration alone, which serves nothing.
-    pub modules: Option<crate::module::ModuleSet>,
+    /// The epoch's module set, as the daemon fixed it through the Build Server's `cover` when the
+    /// epoch's configuration was applied: the node's daemon starts the engine package it names,
+    /// and the engine resolves the kernel and policy packages it names, at the revisions it
+    /// names, for every key its profile runs state, before it serves or parks.
+    pub modules: crate::module::ModuleSet,
     /// The devices this rank serves, as CUDA ordinals.
     pub devices: Vec<u32>,
     /// This rank's worker group, which keys its storage claims.
@@ -1061,8 +1061,6 @@ pub struct EngineArgs {
     /// How long a job may run without progress before it is reported
     /// `Stalled`, when the daemon states it apart from the engine configuration.
     pub watchdog_timeout_s: Option<u64>,
-    /// The probation an update must survive before the daemon commits it.
-    pub rollback_s: Option<u64>,
     /// The rank layout's queue depth for this rank's worker groups.
     pub queue_depth: u32,
     /// The number of ranks in the epoch's worker group, on every host: this process's ranks and
@@ -1107,10 +1105,10 @@ pub struct Inherited {
 }
 
 impl EngineArgs {
-    /// The arguments of an engine process of `engine_config` before the daemon's engine control
-    /// states the process's place and interfaces: a new epoch, succeeding no process, with the
-    /// checkpoint's expert order.
-    pub fn new(engine_config: EngineConfig) -> Self {
+    /// The arguments of an engine process of `engine_config` that runs `modules`, before the
+    /// daemon's engine control states the process's place and interfaces: a new epoch, succeeding
+    /// no process, with the checkpoint's expert order.
+    pub fn new(engine_config: EngineConfig, modules: crate::module::ModuleSet) -> Self {
         Self {
             engine_config,
             epoch: 0,
@@ -1121,7 +1119,7 @@ impl EngineArgs {
             processes: String::new(),
             engine: 0,
             build_server: String::new(),
-            modules: None,
+            modules,
             devices: Vec::new(),
             group: String::new(),
             rank: 0,
@@ -1129,15 +1127,14 @@ impl EngineArgs {
             world: None,
             standby_storage: StandbyStorage::Resident,
             watchdog_timeout_s: None,
-            rollback_s: None,
             queue_depth: 0,
             world_size: 0,
         }
     }
 
-    /// Whether this process starts as the serving process's standby: it states the process it
-    /// succeeds.
-    pub fn standby(&self) -> bool {
+    /// Whether this engine starts parked: it states the engine it succeeds, whose storage it
+    /// maps read-only until it is promoted. A switch's target and a standby both start so.
+    pub fn parked(&self) -> bool {
         self.predecessor.is_some()
     }
 

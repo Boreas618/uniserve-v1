@@ -1204,7 +1204,7 @@ impl Watchdog {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::policy::{PolicyReverted, TrialState};
+    use crate::policy::{PolicyRolledBack, TrialState};
 
     use scheduling::guest::{RequestClass, Room, StageId, Storage};
 
@@ -1825,12 +1825,15 @@ mod tests {
             &mut self,
             error: &PolicyError,
             _state: &TrialState,
-        ) -> Result<PolicyReverted, PolicyError> {
+        ) -> Result<PolicyRolledBack, PolicyError> {
             self.failures += 1;
             Err(PolicyError::invalid(Call::Init, error.to_string()))
         }
 
-        fn boundary(&mut self, _state: &TrialState) -> Result<Option<PolicyReverted>, PolicyError> {
+        fn boundary(
+            &mut self,
+            _state: &TrialState,
+        ) -> Result<Option<PolicyRolledBack>, PolicyError> {
             Ok(None)
         }
     }

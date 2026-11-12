@@ -182,12 +182,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[derive(serde::Serialize, serde::Deserialize)]",
         );
     }
-    // A prefix cache index travels in the process interface's reports too (`Drained`), whose
+    // A prefix cache index travels in the process interface too (`Handoff`), whose
     // messages compare whole.
     for message in [
         ".uniserve.request.GroupIndex",
         ".uniserve.process.Drained",
-        ".uniserve.process.Inherit",
+        ".uniserve.process.Handoff",
         ".uniserve.process.Report",
     ] {
         config.type_attribute(message, "#[derive(Eq)]");

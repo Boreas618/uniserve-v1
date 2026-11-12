@@ -1,87 +1,15 @@
 //! What this process states to its daemon: the schedulers' and devices' counters once a second,
-//! the generation reports, and the engine's state and description on the request interface.
+//! its reports on the process interface, and its lifecycle state and description on the request
+//! interface.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use ipc::GenerationStatus;
 use worker::control::Control;
 
 use super::MainProcess;
 
-/// The name of a generation status, for the line that says which step was answered.
-pub(super) fn status_name(status: &GenerationStatus) -> &'static str {
-    match status {
-        GenerationStatus::Precopied { .. } => "precopied",
-        GenerationStatus::PrecopyFailed { .. } => "precopy_failed",
-        GenerationStatus::Switched { .. } => "switched",
-        GenerationStatus::Warming { .. } => "warming",
-        GenerationStatus::Committed { .. } => "committed",
-        GenerationStatus::Reverted { .. } => "reverted",
-        GenerationStatus::Purged { .. } => "purged",
-        GenerationStatus::PolicyReverted { .. } => "policy_reverted",
-        GenerationStatus::Failed { .. } => "failed",
-    }
-}
-
-/// The report one generation status states.
-///
-/// A status the daemon learns another way - none today - answers `None`, and the caller logs it
-/// instead of inventing a report.
-fn report_of(status: &GenerationStatus) -> Option<proto::process::Report> {
-    use proto::process::report::Kind;
-
-    let kind = match status {
-        GenerationStatus::Precopied {
-            generation,
-            uncompared,
-        } => Kind::Precopied(proto::process::Precopied {
-            generation: *generation,
-            uncompared: uncompared.clone(),
-        }),
-        GenerationStatus::PrecopyFailed { failure, .. } => {
-            Kind::PrecopyFailed(proto::process::PrecopyFailed {
-                reason: failure.reason(),
-            })
-        }
-        GenerationStatus::Switched { generation } => Kind::Switched(proto::process::Switched {
-            generation: *generation,
-        }),
-        GenerationStatus::Warming { generation, step } => Kind::Warming(proto::process::Warming {
-            generation: *generation,
-            step: step.clone(),
-        }),
-        GenerationStatus::Committed { .. } => Kind::Committed(proto::process::Committed {}),
-        GenerationStatus::Reverted { reason, .. } => Kind::Reverted(proto::process::Reverted {
-            reason: reason.clone(),
-        }),
-        GenerationStatus::Purged { generation } => Kind::Purged(proto::process::Purged {
-            generation: *generation,
-        }),
-        // A policy that failed is reported with the backend and revision it came from, so the
-        // daemon's record takes the previous policy back.
-        GenerationStatus::PolicyReverted {
-            scheduler,
-            backend,
-            revision,
-            reason,
-            fatal,
-        } => Kind::PolicyReverted(proto::process::PolicyReverted {
-            scheduler: Some(*scheduler),
-            backend: backend.clone(),
-            revision: *revision,
-            reason: reason.clone(),
-            fatal: *fatal,
-        }),
-        // A probation failure is not a fault of the device: the revert that follows it states the
-        // generation it left and the first error, so reporting it twice would name a device the
-        // failure did not happen on.
-        GenerationStatus::Failed { .. } => return None,
-    };
-    Some(proto::process::Report { kind: Some(kind) })
-}
-
-/// States a main process's state on the request interface.
+/// States an engine's lifecycle state on the request interface.
 pub(super) fn announce(
     control: &mut Control,
     state: proto::request::wire::EngineState,
@@ -119,21 +47,25 @@ pub(super) fn announce(
     }
 }
 
-/// States to the daemon that launched this process why its start failed.
+/// States on every live front that this engine failed, and why: the process ends next, and a
+/// connection that closes says only that it went.
 pub(super) fn state_failure(control: &mut Control, reason: &str) {
-    let sent = control
-        .daemon_mut()
-        .send(&proto::request::wire::FromEngine {
-            kind: Some(proto::request::wire::from_engine::Kind::State(
-                proto::request::wire::State {
-                    state: proto::request::wire::EngineState::Failed as i32,
-                    info: None,
-                    error: reason.to_owned(),
-                },
-            )),
-        });
-    if let Err(error) = sent {
-        tracing::warn!(%error, "the daemon was not told why this process's start failed");
+    let message = proto::request::wire::FromEngine {
+        kind: Some(proto::request::wire::from_engine::Kind::State(
+            proto::request::wire::State {
+                state: proto::request::wire::EngineState::Failed as i32,
+                info: None,
+                error: reason.to_owned(),
+            },
+        )),
+    };
+    for front in control.report_fronts() {
+        let Some(connection) = control.front_mut(front) else {
+            continue;
+        };
+        if let Err(error) = connection.send(&message) {
+            tracing::warn!(%error, front, "a daemon was not told why this engine failed");
+        }
     }
 }
 
@@ -153,8 +85,8 @@ impl MainProcess {
     /// policy's fuel and calls) come from the schedulers' handle and stay zero
     /// until it exists.
     pub(super) fn send_metrics(&mut self) {
-        // The driver calls this thread waited in, and the fence records an idle device left unread,
-        // reach the next batch result.
+        // The driver calls this thread waited in, and the range records an idle device left
+        // unread, reach the next batch output.
         let current = platform::cupti::blocking::Calls::current();
         worker::profiling::counters::add_blocking("control", &current.since(&self.control_calls));
         self.control_calls = current;
@@ -194,8 +126,8 @@ impl MainProcess {
         let (mut steps, mut batches, mut tokens, mut policy_fuel, mut policy_calls) =
             (0, 0, 0, 0, 0);
         for scheduler in &self.schedulers {
-            // A scheduler answers its counters on its own thread: a metrics report is not worth
-            // stalling the control thread for, so the pass takes what is there.
+            // A scheduler states its counters on its own thread: a metrics report is not worth
+            // stalling the control thread for, so the report takes what is there.
             let Ok(counters) = scheduler.counters().recv_timeout(METRICS_WAIT) else {
                 continue;
             };
@@ -280,55 +212,30 @@ impl MainProcess {
         }
     }
 
-    /// Reports a generation status to the daemon.
-    pub(super) fn report(&mut self, status: GenerationStatus) {
-        // The generation layer's answers, in the vocabulary the daemon's epoch record reads: a precopy
-        // that finished, the switchover, the commit, the revert and the purge, each naming its
-        // generation, and a failure carrying the first error. The daemon needs no answer to any of
-        // them; it marks the epoch's state with what it is told, and the probation's rules are
-        // applied on these reports.
-        let Some(report) = report_of(&status) else {
-            tracing::debug!(?status, "a generation status needs no report");
-            return;
-        };
-        self.send_report(report);
-    }
-
-    /// States one report to the daemon.
+    /// States the lifecycle state this engine is in on the request interface, to every live
+    /// front, `described` with what it serves: the limits, the batch capacity and the KV cache
+    /// segments a successor maps.
     ///
-    /// A report is unasked, so a failure to state it costs the daemon's record and not this
-    /// process's service: it is logged, and the epoch's own transition has already happened.
-    /// States what this process is on the request interface.
-    ///
-    /// The daemon's launch path waits for `Ready` (or `Standby`, for a process started beside a
-    /// serving one) and records the info it carries for the epoch. Nothing else on either side moves
-    /// before it: the first `Precopy` carries the scheduling policy and the first `Switchover` fills
-    /// the generation, so a process that waited to be ready until it had a policy would wait for the
-    /// command that waits for it - the deadlock the caller's stuck run shows.
-    pub(super) fn announce(&mut self, state: proto::request::wire::EngineState) -> Result<()> {
-        self.reported_state = state as i32;
-        let info = match state {
-            proto::request::wire::EngineState::Ready
-            | proto::request::wire::EngineState::Standby => Some(self.engine_info()?),
-            _ => None,
+    /// The daemon's launch path waits for the state a start ends in - `SERVING`, or `PARKED` for
+    /// an engine started beside a serving one - and records the description it carries. A state
+    /// that changes nothing of what the engine holds (a drain's `DRAINING` and `PARKED`) is
+    /// stated without one and keeps what was announced: describing the cache asks every scheduler
+    /// for what it holds.
+    pub(super) fn announce(&mut self, described: bool) -> Result<()> {
+        let state = self.state.lifecycle().state();
+        let info = if described {
+            let info = self.engine_info()?;
+            self.announced = Some(info.clone());
+            Some(info)
+        } else {
+            None
         };
-        // A parked process states no info and keeps what it announced: its cache's description
-        // holds until it serves again.
-        if info.is_some() {
-            self.announced = info.clone();
-        }
         tracing::info!(
             state = ?state,
             schedulers = self.schedulers.len(),
             devices = self.workers.len(),
-            "stating what this process is to the daemon"
+            "stating what this engine is to the daemon"
         );
-        if matches!(
-            state,
-            proto::request::wire::EngineState::Ready | proto::request::wire::EngineState::Standby
-        ) {
-            self.announced_at.get_or_insert_with(Instant::now);
-        }
         announce(&mut self.control, state, info)
     }
 
@@ -336,9 +243,8 @@ impl MainProcess {
     /// carries one, and nothing otherwise.
     pub(super) fn announced_info(&mut self) -> Option<proto::request::wire::EngineInfo> {
         // The value announced, not a fresh one: describing the cache asks every scheduler for
-        // what it holds, and a scheduler that is busy does not answer for as long as the stall
-        // bound - which is a control thread that cannot serve the handover's own attach
-        // (`501fa5e6f`: the engine read the attach and then said nothing for sixty seconds).
+        // what it holds, and a scheduler that is busy does not respond for as long as the stall
+        // bound - which is a control thread that cannot serve the handover's own attach.
         self.announced.clone()
     }
 
@@ -348,7 +254,7 @@ impl MainProcess {
     ///
     /// The figures are the workers' own (`SchedulerHandle::info`), except the cache segments, which
     /// each scheduler describes for itself: a successor needs what the workers hold now, not what
-    /// this process planned.
+    /// this process sized at its start.
     pub(super) fn engine_info(&self) -> Result<proto::request::wire::EngineInfo> {
         // A peer of an epoch over several hosts holds ranks and no scheduler: it admits no request
         // and holds no cache a successor maps, so it states that it schedules nothing.
@@ -364,9 +270,7 @@ impl MainProcess {
         for scheduler in &self.schedulers {
             // A group that cannot describe its cache is reported with what the others stated rather
             // than failing the start: the segments are what a *successor* maps, and a successor that
-            // finds one missing refuses by name, while a process that refused to state what it is
-            // over this would hang the epoch before its first policy - the deadlock this report
-            // exists to end.
+            // finds one missing refuses by name.
             let groups = match scheduler
                 .describe_cache()
                 .recv_timeout(self.watchdog.stall_bound())
@@ -432,9 +336,14 @@ impl MainProcess {
         })
     }
 
+    /// States one report to the daemon on the process interface.
+    ///
+    /// A report is unasked, so a failure to state it costs the daemon's record and not this
+    /// engine's service: it is logged, and the engine's own transition has already happened.
     pub(super) fn send_report(&mut self, report: proto::process::Report) {
+        tracing::info!(report = ?report.kind, "reporting to the daemon");
         if let Err(error) = self.process.report(report) {
-            tracing::warn!(%error, "reporting this epoch's state to the daemon failed");
+            tracing::warn!(%error, "reporting this engine's state to the daemon failed");
         }
     }
 }

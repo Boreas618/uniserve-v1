@@ -3,7 +3,6 @@
 //! admitted request produces, journaled so that a takeover replays what its consumer has not
 //! rendered ([`HANDOVER_JOURNAL`]).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,8 +10,6 @@ use anyhow::Result;
 use ipc::UpdateFailure;
 
 use super::MainProcess;
-use super::answer;
-use super::operations::Owing;
 
 /// How many of a request's events this process keeps for a takeover to replay.
 ///
@@ -40,7 +37,7 @@ pub(crate) const HANDOVER_JOURNAL: usize = 4096;
 /// what has to be replayed: the predecessor freezes its response at the pause,
 /// so its consumer stops advancing while this process goes on producing, and
 /// the successor's body resumes from the position it last rendered.
-pub(super) struct Served {
+pub(super) struct RequestStream {
     /// The daemon's identity for the request.
     pub(super) request: u64,
     /// The scheduler rank a command for the request is routed to.
@@ -62,12 +59,12 @@ pub(super) struct Served {
     /// client's pace, so the consumer can be further behind the producer than any
     /// window. The events the consumer reported consumed are dropped as they are
     /// reported.
-    pub(super) kept: std::collections::VecDeque<KeptEvent>,
+    pub(super) kept: std::collections::VecDeque<JournalEntry>,
 }
 
 /// One journaled event: its position in the request's stream, the event, and the artifact bytes it
 /// travels with. A replay without the bytes would be an artifact event the daemon cannot read.
-type KeptEvent = (
+type JournalEntry = (
     u64,
     proto::request::wire::Event,
     Option<std::sync::Arc<dyn proto::request::ArtifactMedia>>,
@@ -77,7 +74,7 @@ type KeptEvent = (
 const ARTIFACT_PART: usize = 1 << 20;
 
 /// Writes the fence probes' device switch (`docs/profiling.md`): `{"enabled": bool, "off":
-/// [patterns]}`. A process without probes answers so.
+/// [patterns]}`. A process without range markers says so.
 pub(super) fn fence_switch(payload: &str) -> std::result::Result<Vec<String>, String> {
     let payload: serde_json::Value =
         serde_json::from_str(payload).map_err(|error| format!("fence_switch: {error}"))?;
@@ -103,10 +100,10 @@ pub(super) fn fence_switch(payload: &str) -> std::result::Result<Vec<String>, St
     ])
 }
 
-/// How long a scheduler takes to answer a warming's read: its next pass.
-const WARMING_ANSWER: Duration = Duration::from_secs(2);
+/// How long a scheduler takes to respond to a warming's read: its next step.
+const WARMING_RESPONSE: Duration = Duration::from_secs(2);
 
-/// What a warming operation that copies pages is answered: pages reach a target through the host
+/// What a warming operation that copies pages is refused with: pages reach a target through the host
 /// KV cache, so this process runs no copy of its own.
 const PAGES_THROUGH_HOST: &str = "an epoch's pages reach its target through the host KV cache: this \
      process copies none itself";
@@ -117,7 +114,7 @@ const PAGES_THROUGH_HOST: &str = "an epoch's pages reach its target through the 
 /// process goes on producing, and the successor resumes from what it last rendered. Without the
 /// replay those events are rendered nowhere and the response loses the tokens the pause covered.
 fn replay_after(
-    kept: &std::collections::VecDeque<KeptEvent>,
+    kept: &std::collections::VecDeque<JournalEntry>,
     from: u64,
 ) -> Vec<(
     proto::request::wire::Event,
@@ -131,7 +128,7 @@ fn replay_after(
 
 /// Journals one event at `position`, dropping the oldest past `bound`.
 fn keep_event(
-    kept: &mut std::collections::VecDeque<KeptEvent>,
+    kept: &mut std::collections::VecDeque<JournalEntry>,
     position: u64,
     event: proto::request::wire::Event,
     media: Option<std::sync::Arc<dyn proto::request::ArtifactMedia>>,
@@ -143,11 +140,11 @@ fn keep_event(
     }
 }
 
-/// What the engine answers a command whose owner is the epoch layer: the same operation exists,
+/// What the engine refuses a lifecycle command of the request interface with: the same operation exists,
 /// and it is asked for through the process connection, where the driver applies it.
 const EPOCH_LIFECYCLE: &str = "this command is the epoch layer's, applied through the process connection rather than the \
      request connection";
-/// What the engine answers a command over the deployment's quotas or transfer budgets:
+/// What the engine refuses a command over the deployment's quotas with or transfer budgets:
 /// each node's daemon reads them over the claim it holds, not through an epoch's main process.
 pub(super) const QUOTAS: &str = "the quotas and transfer budgets are read by each node's daemon over its claim, not \
      by an epoch's main process";
@@ -158,16 +155,12 @@ pub(super) fn engine_command_name(
     use proto::request::wire::engine_command::Kind;
     match kind {
         Kind::Shutdown(_) => "shutdown",
-        Kind::Promote(_) => "promote",
         Kind::FlushCache(_) => "flush_cache",
         Kind::Hook(_) => "hook",
         Kind::Configure(_) => "configure",
         Kind::Attach(_) => "attach",
         Kind::ResizeCache(_) => "resize_cache",
         Kind::UpdateWeights(_) => "update_weights",
-        Kind::Park(_) => "park",
-        Kind::Resume(_) => "resume",
-        Kind::Commit(_) => "commit",
         Kind::DescribeCache(_) => "describe_cache",
         Kind::DescribeStorage(_) => "describe_storage",
         Kind::DescribeRequests(_) => "describe_requests",
@@ -201,7 +194,7 @@ impl MainProcess {
     /// Routes a request to the scheduler that serves it: the rank the routing policy's `route`
     /// decision names (`scheduler::Router::route`, whose documentation states which instance
     /// decides, how a node of one scheduler routes, and how a failed decision is retried by the
-    /// previous package). A refusal no previous package could answer is the update's failure
+    /// previous package). A refusal no previous package could decide is the update's failure
     /// (`Err` carries both).
     pub(super) fn route(
         &mut self,
@@ -336,7 +329,7 @@ impl MainProcess {
             _ => {}
         }
         // A command names its request, not the scheduler serving it, so the rank is read from the
-        // stream the submission answered with. A request that is not in flight here has already
+        // stream the submission returned. A request that is not in flight here has already
         // ended: a cancel or a stop for it is a no-op, not a fault, and ending an epoch because a
         // client disconnected a moment too late would be the daemon's most common message.
         let Some(rank) = self
@@ -359,39 +352,31 @@ impl MainProcess {
             );
             return Ok(());
         };
-        answer(
+        super::response(
             scheduler.request_command(command),
             self.watchdog.stall_bound(),
             "a request command",
         )
     }
 
-    /// A command to the whole main process: shutdown, drain, park or promote,
-    /// and the generation commands a single-rank node receives directly.
+    /// A command to the whole engine on the request interface: the shutdown, a daemon's
+    /// attach, the operator's operations and the descriptions a daemon reads.
     pub(super) fn engine_command(
         &mut self,
         front: usize,
         command: proto::request::wire::EngineCommand,
     ) -> Result<Option<UpdateFailure>> {
-        // The epoch's lifecycle - Park, Promote, Serve, Drain, Pause, the generation layer's
-        // stages - arrives on the process connection and is applied by the driver. On this
-        // connection the epoch owns exactly one command, `Shutdown`: every request finishes as
-        // aborted and the owners close in the order they need (`close`).
+        // The engine's lifecycle and its generation update arrive on the process connection. On
+        // this connection the lifecycle has exactly one command, `Shutdown`: every request
+        // finishes as aborted and the owners close in the order they need (`close`).
         //
-        // The data plane runs here too: each of its commands goes to whoever does the work,
-        // and the rest of the engine surface is answered with whose it is instead of being dropped.
-        // A command a process does not serve is otherwise a caller waiting for a reply that never
+        // The operator's operations run here too: each goes to whoever does the work, and the
+        // rest of the engine surface is refused with whose it is instead of being dropped. A
+        // command a process does not serve is otherwise a caller waiting for a reply that never
         // comes, which is a hang with no name in it.
         let refused = match command.kind {
             Some(proto::request::wire::engine_command::Kind::Shutdown(_)) => {
-                self.stopping = true;
-                return Ok(None);
-            }
-            // A lost process's standby is promoted by the daemon that held the two, on this
-            // connection, because no epoch switch is running to command it on the process one. The
-            // daemon moves the frontend when this process states that it serves.
-            Some(proto::request::wire::engine_command::Kind::Promote(_)) => {
-                self.promote_in_place(false)?;
+                self.state.stop();
                 return Ok(None);
             }
             // A hot restart's successor gives this engine a second daemon front, so
@@ -399,7 +384,7 @@ impl MainProcess {
             // is a failed handover and not this process's end: the daemon that asked is still
             // serving the requests it took.
             Some(proto::request::wire::engine_command::Kind::Attach(attach)) => {
-                let state = self.reported_state;
+                let state = self.state.lifecycle().state() as i32;
                 let info = self.announced_info();
                 match self.control.attach(&attach.requests, state, info) {
                     Ok(front) => tracing::info!(
@@ -415,10 +400,11 @@ impl MainProcess {
                 }
                 return Ok(None);
             }
-            // What the data plane changes inside the epoch. None of these waits here: each
-            // goes to whoever does the work and is answered by the pass that sees it end.
+            // The operator's operations inside the epoch (`operations`, `weights`). None of
+            // these waits here: each goes to whoever does the work and is acknowledged when its
+            // completion wakes this thread.
             Some(proto::request::wire::engine_command::Kind::Hook(hook)) => {
-                self.engine_operation(front, hook);
+                self.named_operation(front, hook);
                 return Ok(None);
             }
             Some(proto::request::wire::engine_command::Kind::ResizeCache(resize)) => {
@@ -430,54 +416,17 @@ impl MainProcess {
                 return Ok(None);
             }
             Some(proto::request::wire::engine_command::Kind::CommitExperts(commit)) => {
-                let order: BTreeMap<String, Vec<u32>> = commit
-                    .order
-                    .into_iter()
-                    .map(|(module, order)| (module, order.experts))
-                    .collect();
-                let together = scheduler::HookBarrier::new(self.schedulers.len());
-                let answers = self
-                    .schedulers
-                    .iter()
-                    .map(|scheduler| scheduler.commit_experts(order.clone(), Arc::clone(&together)))
-                    .collect();
-                self.owe(front, commit.id, answers, Owing::Storage);
+                self.commit_experts(front, commit);
+                return Ok(None);
+            }
+            Some(proto::request::wire::engine_command::Kind::FlushCache(_)) => {
+                self.flush_cache();
                 return Ok(None);
             }
             // A warming reads how far the requests in flight reached the host KV cache, and limits
             // what they prefill meanwhile; both are every scheduler's own state.
             Some(proto::request::wire::engine_command::Kind::CacheWarm(warm)) => Some(
                 proto::request::wire::from_engine::Kind::Hooked(self.warm_cache(warm)),
-            ),
-            Some(proto::request::wire::engine_command::Kind::FlushCache(_)) => {
-                for scheduler in &self.schedulers {
-                    scheduler.flush_cache();
-                }
-                return Ok(None);
-            }
-            // The worker era's park, resume and trial commit move a worker epoch between
-            // processes. The epoch parks, resumes and commits through the process connection, in
-            // front of the frontend rather than behind it.
-            Some(proto::request::wire::engine_command::Kind::Park(park)) => Some(
-                proto::request::wire::from_engine::Kind::Parked(proto::request::wire::Parked {
-                    id: park.id,
-                    error: EPOCH_LIFECYCLE.to_owned(),
-                    index: Vec::new(),
-                }),
-            ),
-            Some(proto::request::wire::engine_command::Kind::Resume(resume)) => Some(
-                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                    id: resume.id,
-                    results: Vec::new(),
-                    error: EPOCH_LIFECYCLE.to_owned(),
-                }),
-            ),
-            Some(proto::request::wire::engine_command::Kind::Commit(commit)) => Some(
-                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                    id: commit.id,
-                    results: Vec::new(),
-                    error: EPOCH_LIFECYCLE.to_owned(),
-                }),
             ),
             // The scheduling limits are the schedulers', applied at their next step through the
             // policy slot the process connection names.
@@ -498,20 +447,20 @@ impl MainProcess {
                     error: QUOTAS.to_owned(),
                 }),
             ),
-            // What the prefix cache holds is answered here, from what this process announced.
+            // What the prefix cache holds is described here, from what this process announced.
             //
-            // A standby that starts on these devices maps the serving epoch's segments read-only
-            // (the epoch switch's precopy), so reading them moves nothing and is not a lifecycle
-            // command. The answer is the description this process gave the daemon when it became
-            // ready: the segments are the pool's, and they are the same for as long as the epoch
-            // serves. Asking every scheduler afresh is what cannot be done from here - a scheduler
-            // holding paused streams does not answer until its stall bound, and a control thread
-            // waiting on one cannot serve the handover's own commands (`501fa5e6f`).
+            // An engine that starts parked on these devices maps the serving epoch's segments
+            // read-only, so reading them moves nothing and is not a lifecycle command. The
+            // description is the one this process gave the daemon when its start ended: the
+            // segments are the pool's, and they are the same for as long as the epoch serves.
+            // Asking every scheduler afresh is what cannot be done from here - a scheduler holding
+            // paused streams does not respond until its stall bound, and a control thread waiting
+            // on one cannot serve the handover's own commands.
             Some(proto::request::wire::engine_command::Kind::DescribeCache(describe)) => {
                 let (error, segments) = match &self.announced {
                     Some(info) => (String::new(), info.segments.clone()),
                     None => (
-                        "this process has announced no cache segments: it has not become ready"
+                        "this process has announced no cache segments: its start has not ended"
                             .to_owned(),
                         Vec::new(),
                     ),
@@ -545,12 +494,12 @@ impl MainProcess {
         Ok(None)
     }
 
-    /// Answers one operation of an epoch's warming from every scheduler.
+    /// Runs one operation of an epoch's warming on every scheduler and returns its result.
     ///
     /// Only the operations that stay inside a scheduler are this process's: the copies of the
     /// worker era's warming ran on its workers' hooks, and an epoch's pages reach a target through
-    /// the host KV cache. The operations asked here take no fence, so a scheduler answers at its
-    /// next pass; the bound is the one a scheduler that stopped answering is named by.
+    /// the host KV cache. The operations asked here take no fence, so a scheduler responds at its
+    /// next step; the bound is the one a scheduler that stopped responding is named by.
     fn warm_cache(
         &mut self,
         warm: proto::request::wire::CacheWarm,
@@ -569,20 +518,20 @@ impl MainProcess {
             return hooked(Vec::new(), PAGES_THROUGH_HOST.to_owned());
         }
         let together = scheduler::HookBarrier::new(self.schedulers.len());
-        let answers: Vec<_> = self
+        let responses: Vec<_> = self
             .schedulers
             .iter()
             .map(|scheduler| scheduler.cache_warm(operation.clone(), Arc::clone(&together)))
             .collect();
-        let mut results = Vec::with_capacity(answers.len());
-        for answer in answers {
-            match answer.recv_timeout(WARMING_ANSWER) {
+        let mut results = Vec::with_capacity(responses.len());
+        for response in responses {
+            match response.recv_timeout(WARMING_RESPONSE) {
                 Ok(Ok(result)) => results.extend(result),
                 Ok(Err(error)) => return hooked(Vec::new(), error),
                 Err(error) => {
                     return hooked(
                         Vec::new(),
-                        format!("a scheduler did not answer the warming: {error}"),
+                        format!("a scheduler did not respond to the warming: {error}"),
                     );
                 }
             }
@@ -662,7 +611,7 @@ impl MainProcess {
         }
     }
 
-    /// Ends one request with its refusal: a submission this process will not admit is answered with
+    /// Ends one request with its refusal: a submission this process will not admit ends with
     /// the event that says so, because the daemon has no other way to learn it.
     pub(super) fn reject(
         &mut self,

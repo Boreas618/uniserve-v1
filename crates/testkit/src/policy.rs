@@ -4,7 +4,7 @@
 //! scheduler with no policy decides nothing — no output, no admission, no batch — so an epoch that
 //! submits a request must be given a module. [`packaged_policy`] is that source: the real `fcfs`
 //! package this tree builds, with the arguments that make its declared limits fit the capacity the
-//! caller's epoch was built for. It installs through the same precopy and switchover a deployment
+//! caller's epoch was built for. It installs through the same preparation and switch a deployment
 //! uses, so a caller's fixtures exercise the mechanism rather than a stand-in for it, and there is
 //! no second policy in the tree to keep honest.
 
@@ -25,7 +25,7 @@ fn parameters_of(limits: Limits) -> Parameters {
 }
 
 /// The `fcfs` policy module this tree builds, and the package that names it: the source a caller
-/// installs through the real precopy and switchover.
+/// installs through the real preparation and switch.
 ///
 /// The package is [`packaged_revision`]`(capacity)`, so the limits it declares fit any fixture's
 /// build config and the mechanism's check of a policy's limits against the ceilings cannot refuse
@@ -68,7 +68,7 @@ pub fn packaged_module() -> Vec<u8> {
                 Err(_) => build_packaged_module(),
             };
             // Served precompiled for this host, as a deployment's store serves a policy: a
-            // precopy then loads the artifact instead of compiling the module again.
+            // preparation then loads the artifact instead of compiling the module again.
             scheduling::Engine::new()
                 .and_then(|engine| engine.precompile(&wasm))
                 .unwrap_or_else(|error| panic!("precompiling the fcfs policy module: {error}"))

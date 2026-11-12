@@ -14,7 +14,7 @@
 //! A previous epoch kept in host storage on trial (`KeepWeights` with
 //! `to_host`) has its weights moved there by the server's Transfer Server
 //! (`Request::Offload`). Every claim of an epoch returns that epoch's weights
-//! to the GPUs they left before it is responded (`Request::Restore`), after
+//! to the GPUs they left before it gets its response (`Request::Restore`), after
 //! the epochs it retires released their storage: an epoch started again at a
 //! rollback claims, and its workers then map its weights where they were.
 

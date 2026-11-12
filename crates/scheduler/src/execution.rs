@@ -1163,7 +1163,7 @@ impl Scheduler {
     }
 
     /// The report of a policy failure, for the control thread to hand up.
-    pub(super) fn take_policy_report(&mut self) -> Option<policy::PolicyReverted> {
+    pub(super) fn take_policy_report(&mut self) -> Option<policy::PolicyRolledBack> {
         self.policy_report.take()
     }
 

@@ -416,7 +416,7 @@ pub(crate) async fn end(
     // Only an epoch that still serves writes its files: a failed one's
     // workers keep what they committed (the files' write-ahead logs).
     if let Some(client) =
-        client.filter(|client| client.epoch() == epoch && client.state() == EngineState::Ready)
+        client.filter(|client| client.epoch() == epoch && client.state() == EngineState::Serving)
     {
         let payload = serde_json::json!({ "session": id, "reason": reason }).to_string();
         match tokio::time::timeout(STOP_TIMEOUT, client.hook("uniserve.profile_stop", &payload))

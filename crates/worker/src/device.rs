@@ -450,9 +450,8 @@ impl Worker {
         Ok(submission)
     }
 
-    /// Asks every runner to prepare `next` and returns the submission that finishes it (7.3 step
-    /// 2).
-    pub fn precopy(&self, next: Arc<Generation>) -> Result<Submission> {
+    /// Asks every runner to prepare `next` and returns the submission that finishes it.
+    pub fn prepare(&self, next: Arc<Generation>) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
         self.queue
@@ -460,8 +459,8 @@ impl Worker {
         Ok(submission)
     }
 
-    /// Switches the serving generation at the next batch boundary (7.3 step 3).
-    pub fn switchover(&self, generation: u64) -> Result<Submission> {
+    /// Switches the serving generation at the next batch boundary.
+    pub fn switch(&self, generation: u64) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
         self.queue
@@ -469,8 +468,8 @@ impl Worker {
         Ok(submission)
     }
 
-    /// Discards the update prepared for `generation` and keeps the serving one (7.3 step 4).
-    pub fn revert(&self, generation: u64) -> Result<Submission> {
+    /// Returns to `generation`, the one kept through the trial.
+    pub fn rollback(&self, generation: u64) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
         self.queue
@@ -478,8 +477,8 @@ impl Worker {
         Ok(submission)
     }
 
-    /// Releases the graphs that still reference a generation older than `generation` (7.3 step 6).
-    pub fn purge(&self, generation: u64) -> Result<Submission> {
+    /// Releases the graphs that still reference a generation older than `generation`.
+    pub fn release(&self, generation: u64) -> Result<Submission> {
         let id = SubmissionId(self.queue.next_submission());
         let (submission, _) = Submission::pending(id);
         self.queue

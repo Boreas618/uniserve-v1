@@ -1,5 +1,5 @@
 //! How much an epoch switch's transfers may slow the serving epoch down
-//! (`update_config.transfer_slowdown`, `specs/online-operations.md` §4.5.3).
+//! (`update_config.transfer_slowdown`).
 //!
 //! While a target prepares, the Transfer Servers of the deployment's
 //! nodes copy beside the serving epoch (weights, warmed pages), on copy
@@ -208,8 +208,8 @@ pub(crate) struct StepTime {
 /// Who passes a decision on to the nodes' Transfer Servers.
 pub(crate) trait Throttle: Send + Sync + 'static {
     /// Halves, or restores when not `halve`, the byte budgets of the links the
-    /// deployment's transfers use on every node, and answers the hosts that
-    /// took it. Blocks until every node's daemon answered.
+    /// deployment's transfers use on every node, and returns the hosts that
+    /// took it. Blocks until every node's daemon replied.
     fn throttle(&self, halve: bool) -> Result<Vec<String>, String>;
 }
 

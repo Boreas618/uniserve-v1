@@ -18,10 +18,10 @@
 //! their pidfds (`Supervisor::adopt`): the pipe stays open across it, so no
 //! process ends.
 //!
-//! A main process starts from a launch file, which the spawn carries
+//! An engine starts from a launch file, which the spawn carries
 //! (`Spawn::launch`): the daemon of the node it runs on states its own node's
 //! Build Server in it and writes it to its own runtime directory, so the
-//! leader starts a main process on any node of the deployment the same way.
+//! leader starts an engine on any node of the deployment the same way.
 //!
 //! A worker group's first rank serves the group's collective store. The
 //! daemon of that rank's node binds the store's socket when the engine
@@ -56,7 +56,7 @@ const SEGMENT_NOTE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub use proto::LIFELINE_ENV;
 
-/// A supervised process: the owner it is answered for, the connection that
+/// A supervised process: the owner it was started for, the connection that
 /// asked for it, its worker group, its rank and the generation of the group's
 /// launch. The connection is the launch's own: every client of the socket
 /// shares the deployment's owner, and two of them may name one group and rank,
@@ -155,26 +155,20 @@ pub(crate) struct Supervisor {
     children: HashMap<Key, Supervised>,
     reservations: HashMap<u64, Reservation>,
     next_reservation: u64,
-    /// This node's Build Server, which a main process started here resolves its modules from:
+    /// This node's Build Server, which an engine started here resolves its modules from:
     /// it is started on the first such spawn when it does not serve yet, and its socket is the one
     /// the launch file names. `None` keeps the socket the launch states.
     build_server: Option<build_server::command::Settings>,
 }
 
-/// The executable a main process started from `launch` runs as: the module of the engine
+/// The executable an engine started from `launch` runs as: the module of the engine
 /// package the launch's module set names, at the Build Server the launch names.
 ///
-/// The module was built when the epoch's modules were prepared, so this is a read of the store;
+/// The module was built when the epoch's module set was fixed, so this is a read of the store;
 /// a store that lost it builds it again first. A module of another version of the engine
 /// interface than this daemon speaks is refused here, before a process starts.
 pub(crate) fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, String> {
-    let modules = launch.modules.as_ref().ok_or_else(|| {
-        format!(
-            "the launch of engine {} names no module set, so no engine package to run",
-            launch.engine
-        )
-    })?;
-    let engine = &modules.engine;
+    let engine = &launch.modules.engine;
     let named = format!(
         "the engine package {} revision {}",
         engine.backend, engine.revision
@@ -266,7 +260,7 @@ impl Supervisor {
         })
     }
 
-    /// States this node's Build Server, which the main processes started here resolve their
+    /// States this node's Build Server, which the engines started here resolve their
     /// modules from.
     #[must_use]
     pub(crate) fn with_build_server(mut self, settings: build_server::command::Settings) -> Self {
@@ -274,7 +268,7 @@ impl Supervisor {
         self
     }
 
-    /// The executable of the main process `spawn` starts and the launch file written for it,
+    /// The executable of the engine `spawn` starts and the launch file written for it,
     /// with this node's facts stated in it.
     ///
     /// The executable is the engine package the launch's module set names, resolved at this
@@ -326,7 +320,7 @@ impl Supervisor {
             spawn.generation,
         );
 
-        // A main process runs as the engine package its launch names; any
+        // An engine runs as the engine package its launch names; any
         // other process as the executable the request states.
         let mut command = if spawn.launch.is_empty() {
             Command::new(&spawn.executable)
@@ -588,12 +582,12 @@ impl Supervisor {
 impl Supervisor {
     /// The processes this node supervises now, named as `hand_over` names
     /// them and without giving any of them up: what the daemon's process
-    /// table reports to the admin API (§2.3, §7.4).
-    pub(crate) fn live(&self) -> Vec<HandedProcess> {
+    /// table reports to the admin API.
+    pub(crate) fn live(&self) -> Vec<ProcessHandoff> {
         self.children
             .iter()
             .map(
-                |((engine, reporter, group, rank, generation), supervised)| HandedProcess {
+                |((engine, reporter, group, rank, generation), supervised)| ProcessHandoff {
                     engine: *engine,
                     reporter: *reporter,
                     group: group.clone(),
@@ -615,12 +609,12 @@ impl Supervisor {
     ///
     /// Fails when a process's pidfd cannot be opened; the supervisor keeps
     /// every process then.
-    pub(crate) fn hand_over(&mut self) -> std::io::Result<(HandedProcesses, Vec<OwnedFd>)> {
+    pub(crate) fn hand_over(&mut self) -> std::io::Result<(ProcessesHandoff, Vec<OwnedFd>)> {
         let mut processes = Vec::with_capacity(self.children.len());
         let mut descriptors = Vec::with_capacity(self.children.len() + self.reservations.len());
         for ((engine, reporter, group, rank, generation), supervised) in &self.children {
             descriptors.push(supervised.child.pidfd()?);
-            processes.push(HandedProcess {
+            processes.push(ProcessHandoff {
                 engine: *engine,
                 reporter: *reporter,
                 group: group.clone(),
@@ -631,7 +625,7 @@ impl Supervisor {
         }
         let mut reservations = Vec::with_capacity(self.reservations.len());
         for (id, reservation) in self.reservations.drain() {
-            reservations.push(HandedReservation {
+            reservations.push(ReservationHandoff {
                 id,
                 engine: reservation.engine,
                 group: reservation.group,
@@ -644,7 +638,7 @@ impl Supervisor {
         // handle neither kills nor waits for it.
         self.children.clear();
         Ok((
-            HandedProcesses {
+            ProcessesHandoff {
                 processes,
                 reservations,
                 next_reservation: self.next_reservation,
@@ -661,7 +655,7 @@ impl Supervisor {
     /// Fails when a descriptor is missing.
     pub(crate) fn adopt(
         host: String,
-        handed: HandedProcesses,
+        handoff: ProcessesHandoff,
         descriptors: Vec<OwnedFd>,
     ) -> std::io::Result<Self> {
         let mut descriptors = descriptors.into_iter();
@@ -669,12 +663,12 @@ impl Supervisor {
             descriptors.next().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "a handed-over process or reservation lacks its descriptor",
+                    "a process or reservation of the handoff lacks its descriptor",
                 )
             })
         };
         let mut supervisor = Self::new(host)?;
-        for process in handed.processes {
+        for process in handoff.processes {
             let mut child = Child::adopt(process.pid, next()?);
             let _ = child.note_nccl_segments();
             tracing::info!(group = %process.group, rank = process.rank, generation = process.generation, pid = process.pid, "adopted a process");
@@ -695,7 +689,7 @@ impl Supervisor {
                 },
             );
         }
-        for reservation in handed.reservations {
+        for reservation in handoff.reservations {
             supervisor.reservations.insert(
                 reservation.id,
                 Reservation {
@@ -718,7 +712,7 @@ impl Supervisor {
             "a supervisor adopted the processes the previous daemon supervised, with their \
              lifeline"
         );
-        supervisor.next_reservation = handed.next_reservation;
+        supervisor.next_reservation = handoff.next_reservation;
         Ok(supervisor)
     }
 }
@@ -732,18 +726,18 @@ impl Drop for Supervisor {
 
 /// The processes a daemon hands its successor (`Supervisor::hand_over`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HandedProcesses {
-    pub(crate) processes: Vec<HandedProcess>,
-    pub(crate) reservations: Vec<HandedReservation>,
+pub(crate) struct ProcessesHandoff {
+    pub(crate) processes: Vec<ProcessHandoff>,
+    pub(crate) reservations: Vec<ReservationHandoff>,
     pub(crate) next_reservation: u64,
 }
 
-/// One handed-over process: its key and process id.
+/// One process of the handoff: its key and process id.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HandedProcess {
+pub(crate) struct ProcessHandoff {
     pub(crate) engine: u64,
     /// The connection its exit report goes down. A predecessor that states
-    /// none leaves the report to the epoch layer alone.
+    /// none leaves the report to the updater alone.
     #[serde(default)]
     pub(crate) reporter: u64,
     pub(crate) group: String,
@@ -752,9 +746,9 @@ pub(crate) struct HandedProcess {
     pub(crate) pid: u32,
 }
 
-/// One handed-over reservation.
+/// One reservation of the handoff.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HandedReservation {
+pub(crate) struct ReservationHandoff {
     pub(crate) id: u64,
     pub(crate) engine: u64,
     pub(crate) group: String,
@@ -1287,7 +1281,7 @@ time.sleep(600)
     /// supervisor hands over: it reports none of them exited while they
     /// run, ends them as its own, and observes their exits.
     #[test]
-    fn a_handed_over_process_is_supervised_by_the_successor() {
+    fn the_successor_supervises_the_processes_of_a_handoff() {
         let mut first = Supervisor::new("host".to_owned()).unwrap();
         let spawn = Spawn {
             host: "host".to_owned(),
@@ -1311,12 +1305,12 @@ time.sleep(600)
                 None,
             )
             .unwrap();
-        let (handed, descriptors) = first.hand_over().unwrap();
+        let (handoff, descriptors) = first.hand_over().unwrap();
         // The first supervisor holds nothing more: dropping it ends nothing.
         drop(first);
         assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
 
-        let mut successor = Supervisor::adopt("host".to_owned(), handed, descriptors).unwrap();
+        let mut successor = Supervisor::adopt("host".to_owned(), handoff, descriptors).unwrap();
         assert!(successor.exits().is_empty());
         assert!(successor.reservations.contains_key(&reserved.reservation));
         successor.stop(7, "model", None);

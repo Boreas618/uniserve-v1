@@ -5,9 +5,20 @@
 //! `pause_generation`, `continue_generation`, `flush_cache`). A write
 //! operation runs on a task of its own, so it completes, or fails and says
 //! so in the event log, whether or not the client that asked for it stays
-//! connected; one runs at a time, and another answers `409`. An external
-//! manager attaches by reading `status` and `events` and detaches by
+//! connected; one runs at a time, and another is refused with `409`. An
+//! external manager attaches by reading `status` and `events` and detaches by
 //! stopping; the daemon keeps no state of it.
+//!
+//! The API is served apart from the client API, on two Unix sockets
+//! ([`serve`]), and access is their file permissions:
+//!
+//! - the operator's listener serves every route ([`router`]);
+//! - the harness's listener serves the verbs of an update ([`harness_router`]):
+//!   apply, for package selections and the options the operator lists
+//!   (`admin_config.harness_options`), commit, rollback, and reading the
+//!   status, the events and the update's report. The operator's operations
+//!   (weight update, sleep, wake, LoRA, rebalance, pause, flush, profiling,
+//!   shutdown, daemon restart) are not routes of it.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,9 +35,9 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::epoch::Phase;
 use crate::leader::{Leader, LeaderStatus, UpdateError};
 use crate::updates::change::{Applied, ApplyRequest, InFlight};
+use crate::updates::update::Phase;
 use frontend::openai::ApiError;
 
 /// Events the log keeps; older ones leave it.
@@ -79,7 +90,7 @@ pub(crate) struct Operation {
 /// The admin's event log and operations' record as a hot restart hands them
 /// to the successor.
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct HandedAdmin {
+pub(crate) struct AdminHandoff {
     events: Vec<AdminEvent>,
     next_event: u64,
     last: Option<Operation>,
@@ -101,9 +112,9 @@ pub(crate) struct Admin {
     retire: Arc<AtomicBool>,
     /// Set once a hot restart handed the deployment to a successor, which
     /// takes the operations from then on.
-    handed_over: AtomicBool,
+    handoff_sent: AtomicBool,
     /// The node's epoch records: the same instance the leader keeps, so the
-    /// admin reports and moves the records the epoch layer itself does (§7.2).
+    /// admin reports and moves the records the updater itself does.
     epochs: Arc<crate::epoch::Epochs>,
 }
 
@@ -127,8 +138,8 @@ impl Admin {
 
     /// An admin over `epochs`, the records the node's leader keeps: there is
     /// one `Epochs` per node and the admin holds the same instance, so
-    /// `GET /admin/config` and the update operations read what the epoch layer
-    /// itself moves (design §7.2).
+    /// `GET /admin/config` and the update operations read what the updater
+    /// itself moves.
     pub(crate) fn with_epochs(
         shutdown: CancellationToken,
         retire: Arc<AtomicBool>,
@@ -143,7 +154,7 @@ impl Admin {
             next_operation: AtomicU64::new(1),
             shutdown,
             retire,
-            handed_over: AtomicBool::new(false),
+            handoff_sent: AtomicBool::new(false),
             epochs,
         })
     }
@@ -154,19 +165,11 @@ impl Admin {
         &self.epochs
     }
 
-    /// The number of the operation that runs, which is the number an update it
-    /// starts carries; 0 when none runs.
-    fn running_number(&self) -> u64 {
-        locked(&self.running)
-            .as_ref()
-            .map_or(0, |operation| operation.id)
-    }
-
     /// The event log and the operations' record, for the successor of a hot
     /// restart to go on with ([`Admin::resume`]).
-    pub(crate) fn hand_over(&self) -> HandedAdmin {
-        self.handed_over.store(true, Ordering::Release);
-        HandedAdmin {
+    pub(crate) fn hand_over(&self) -> AdminHandoff {
+        self.handoff_sent.store(true, Ordering::Release);
+        AdminHandoff {
             events: locked(&self.events).iter().cloned().collect(),
             next_event: self.next_event.load(Ordering::Relaxed),
             last: locked(&self.last).clone(),
@@ -179,15 +182,17 @@ impl Admin {
     pub(crate) fn resume(
         shutdown: CancellationToken,
         retire: Arc<AtomicBool>,
-        handed: HandedAdmin,
+        handoff: AdminHandoff,
     ) -> Arc<Self> {
         let admin = Self::new(shutdown, retire);
-        *locked(&admin.events) = handed.events.into_iter().collect();
-        admin.next_event.store(handed.next_event, Ordering::Relaxed);
-        *locked(&admin.last) = handed.last;
+        *locked(&admin.events) = handoff.events.into_iter().collect();
+        admin
+            .next_event
+            .store(handoff.next_event, Ordering::Relaxed);
+        *locked(&admin.last) = handoff.last;
         admin
             .next_operation
-            .store(handed.next_operation, Ordering::Relaxed);
+            .store(handoff.next_operation, Ordering::Relaxed);
         admin
     }
 
@@ -208,23 +213,15 @@ impl Admin {
         self.appended.notify_waiters();
     }
 
-    /// Appends an update's phase event (§7.2, §7.3): a `deployment` event
-    /// whose `data` names the phase, the update and the epoch it moved,
-    /// beside whatever else the phase knows.
-    pub(crate) fn update_event(
-        &self,
-        update: u64,
-        phase: crate::epoch::Phase,
-        epoch: u64,
-        extra: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
-    ) {
-        let mut data = serde_json::Map::new();
-        data.insert("phase".to_owned(), serde_json::Value::from(phase.as_str()));
-        data.insert("update".to_owned(), serde_json::Value::from(update));
-        data.insert("epoch".to_owned(), serde_json::Value::from(epoch));
-        for (key, value) in extra {
-            data.insert(key.to_owned(), value);
-        }
+    /// Appends an update's phase event: a `deployment` event whose `data` is
+    /// the update as it stood when it entered the phase (its number, form,
+    /// phase, epoch and failure).
+    pub(crate) fn update_event(&self, transition: crate::updates::Transition) {
+        let phase = transition.phase.name();
+        let data = match transition.report {
+            serde_json::Value::Object(data) => data,
+            _ => serde_json::Map::new(),
+        };
         let mut events = locked(&self.events);
         if events.len() == EVENT_CAPACITY {
             events.pop_front();
@@ -233,7 +230,7 @@ impl Admin {
             seq: self.next_event.fetch_add(1, Ordering::Relaxed),
             time: now(),
             kind: "deployment".to_owned(),
-            message: format!("update {update}: {}", phase.as_str()),
+            message: format!("update {}: {phase}", transition.update),
             data,
         });
         drop(events);
@@ -273,7 +270,7 @@ impl Admin {
         if let Some(other) = running.as_ref() {
             return Err(Box::new(other.clone()));
         }
-        if self.handed_over.load(Ordering::Acquire) {
+        if self.handoff_sent.load(Ordering::Acquire) {
             return Err(Box::new(Operation {
                 id: 0,
                 kind: "restart".to_owned(),
@@ -299,15 +296,15 @@ impl Admin {
         Ok(operation)
     }
 
-    /// Ends `operation`, the running one, with `outcome`.
+    /// Ends `operation`, the running one, with `result`.
     fn end(
         &self,
         mut operation: Operation,
-        outcome: Result<serde_json::Value, String>,
+        result: Result<serde_json::Value, String>,
     ) -> Operation {
         *locked(&self.running) = None;
         operation.ended = Some(now());
-        match outcome {
+        match result {
             Ok(result) => {
                 operation.state = "succeeded".to_owned();
                 operation.result = Some(result);
@@ -329,9 +326,17 @@ impl Admin {
         operation
     }
 
-    /// Records the leader's changes of state, sampled every second, until
-    /// the server stops.
+    /// Records the leader's changes of state, sampled every second, and
+    /// every phase its updates enter, until the server stops.
     pub(crate) fn watch(self: &Arc<Self>, leader: &Arc<Leader>) {
+        if let Some(mut transitions) = leader.updates.transitions() {
+            let admin = Arc::clone(self);
+            tokio::spawn(async move {
+                while let Some(transition) = transitions.recv().await {
+                    admin.update_event(transition);
+                }
+            });
+        }
         let admin = Arc::clone(self);
         let leader = Arc::downgrade(leader);
         tokio::spawn(async move {
@@ -386,7 +391,70 @@ pub(crate) struct AdminState {
     pub restarter: Option<Arc<crate::restart::Restarter>>,
 }
 
-/// The admin routes; the caller adds the API key layer.
+/// The file mode of the operator's admin socket: its owner alone.
+const ADMIN_MODE: u32 = 0o600;
+
+/// The file mode of the harness socket: its owner and its group, which is
+/// how the operator grants a harness access.
+const HARNESS_MODE: u32 = 0o660;
+
+/// Serves the admin API of `state` on the operator's and the harness's Unix
+/// sockets (`config`) until `shutdown` is cancelled. The sockets are bound
+/// before this returns; the two servers run on tasks of their own.
+///
+/// # Errors
+///
+/// Fails when a socket cannot be bound at its path.
+pub(crate) fn serve(
+    config: &crate::options::AdminConfig,
+    state: AdminState,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    for (path, mode, routes, name) in [
+        (
+            config.admin_socket(),
+            ADMIN_MODE,
+            router(state.clone()),
+            "admin",
+        ),
+        (
+            config.harness_socket(),
+            HARNESS_MODE,
+            harness_router(state),
+            "harness",
+        ),
+    ] {
+        let listener = super::listener::Listener::bind_over(&path, mode)
+            .with_context(|| format!("binding the {name} socket {}", path.display()))?;
+        tracing::info!(socket = %path.display(), "serving the {name} API");
+        let stopped = shutdown.clone();
+        tokio::spawn(async move {
+            let served = axum::serve(listener, routes)
+                .with_graceful_shutdown(async move { stopped.cancelled().await })
+                .await;
+            if let Err(error) = served {
+                tracing::warn!(%error, "the {name} listener ended");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// The harness's routes: the verbs of an update and what it reads to decide
+/// one. Apply is checked against what a harness may set.
+pub(crate) fn harness_router(state: AdminState) -> Router {
+    Router::new()
+        .route("/admin/status", get(status))
+        .route("/admin/events", get(events))
+        .route("/admin/config", get(config).put(harness_apply_config))
+        .route("/admin/config/commit", post(commit))
+        .route("/admin/config/rollback", post(rollback))
+        .with_state(state)
+}
+
+/// The operator's routes: every admin route.
 pub(crate) fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/status", get(status))
@@ -453,7 +521,7 @@ fn yes() -> bool {
     true
 }
 
-/// Runs operation `kind` on a task of its own and answers with it: once it
+/// Runs operation `kind` on a task of its own and responds with it: once it
 /// ends when `wait`, else at once (`202`).
 async fn run<F>(admin: &Arc<Admin>, kind: &'static str, wait: bool, work: F) -> Response
 where
@@ -492,8 +560,8 @@ where
     }
 }
 
-/// The body of `PUT /admin/config`: an [`ApplyRequest`], and whether to
-/// answer once it ends.
+/// The body of `PUT /admin/config`: an [`ApplyRequest`], and whether the
+/// response waits for the change.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigBody {
@@ -511,6 +579,10 @@ struct ConfigBody {
     /// Apply a configuration a rollback marked unavailable.
     #[serde(default)]
     force: bool,
+    /// Seconds from now by which the update must be committed, or the
+    /// daemon rolls it back.
+    #[serde(default)]
+    deadline_s: Option<f64>,
     #[serde(default = "yes")]
     wait: bool,
 }
@@ -533,8 +605,12 @@ async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
 }
 
 /// `PUT /admin/config`: changes the deployment to a configuration
-/// (`Leader::apply`), in place, by a hot restart of the daemon, or in a new
-/// epoch on trial.
+/// (`Leader::apply`), in place, by a hot restart of the daemon, or as an
+/// update on trial.
+///
+/// The `config` operation ends once the change is applied or its update
+/// started, so a commit or a rollback can follow at once. With `wait`, the
+/// response comes when the update reached its trial or ended before it.
 async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let body = if body.is_empty() {
         ConfigBody {
@@ -547,73 +623,162 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
             Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
         }
     };
+    apply(&state, body, true).await
+}
+
+/// `PUT /admin/config` on the harness listener: as [`apply_config`], for the
+/// package selections and the options a harness may set.
+async fn harness_apply_config(
+    State(state): State<AdminState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let body = if body.is_empty() {
+        ConfigBody {
+            wait: true,
+            ..ConfigBody::default()
+        }
+    } else {
+        match serde_json::from_slice::<ConfigBody>(&body) {
+            Ok(body) => body,
+            Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
+        }
+    };
+    apply(&state, body, false).await
+}
+
+/// Applies `body` for a caller that may state every option (`operator`), or
+/// only the ones the operator lists for a harness.
+async fn apply(state: &AdminState, body: ConfigBody, operator: bool) -> Response {
     let leader = Arc::clone(&state.leader);
     let admin = Arc::clone(&state.admin);
     let jobs = Arc::clone(&state.jobs);
     let restarter = state.restarter.clone();
-    run(&state.admin, "config", body.wait, async move {
-        let request = ApplyRequest {
-            replica: body.replica,
-            config: body.config,
-            set: body.set,
-            in_flight: body.in_flight,
-            dry_run: body.dry_run,
-            force: body.force,
-        };
-        // The generation layer is tried first, and only on a target resolved
-        // against the serving configuration: a change that fills other
-        // modules moves the main processes in place, and the epoch path would
-        // answer `none` for it because its build config is unchanged (§7.2,
-        // §7.3).
-        if let Some(package) =
-            Box::pin(generation_update(&admin, &leader, &request, body.dry_run)).await?
-        {
-            return Ok(package);
+    let wait = body.wait;
+    let request = ApplyRequest {
+        replica: body.replica,
+        config: body.config,
+        set: body.set,
+        in_flight: body.in_flight,
+        dry_run: body.dry_run,
+        force: body.force,
+        deadline_s: body.deadline_s,
+    };
+    if !operator && let Err(refusal) = leader.harness_may_apply(&request) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": { "message": refusal, "type": "forbidden" } })),
+        )
+            .into_response();
+    }
+    let mut phases = leader.updates.watch();
+    let applying = Arc::clone(&leader);
+    let operation = admin.begin("config");
+    let operation = match operation {
+        Ok(operation) => operation,
+        Err(other) => {
+            return ApiError::conflict(format!(
+                "operation {} ({}) is running",
+                other.id, other.kind
+            ))
+            .into_response();
         }
-        // The change's future holds the model files it resolves.
-        match Box::pin(leader.apply(request)).await {
-            Ok(Applied::Daemon {
-                config,
-                executable,
-                then,
-            }) => {
-                let Some(restarter) = restarter else {
-                    return Err((
+    };
+    let number = operation.id;
+    let ended = tokio::spawn({
+        let admin = Arc::clone(&admin);
+        async move {
+            // The change's future holds the model files it resolves.
+            let applied = match Box::pin(applying.apply(request, number)).await {
+                Ok(Applied::Daemon {
+                    config,
+                    executable,
+                    then,
+                }) => match restarter {
+                    None => Err((
                         StatusCode::BAD_REQUEST,
                         "the change is of the daemon's own options, and this daemon does not \
                          restart in place"
                             .to_owned(),
-                    ));
-                };
-                let epoch = then.is_some();
-                restarter
-                    .restart(executable, Some(*config), then, &leader, &admin, &jobs)
-                    .await
-                    .map(|pid| {
-                        // The successor changes the epoch in an operation of
-                        // its own (`GET /admin/status`).
-                        json!({ "change": "daemon", "pid": pid, "then": epoch.then_some("epoch") })
-                    })
-                    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))
+                    )),
+                    Some(restarter) => {
+                        let update = then.is_some();
+                        restarter
+                            .restart(executable, Some(*config), then, &applying, &admin, &jobs)
+                            .await
+                            .map(|pid| {
+                                // The successor applies the rest of the change
+                                // in an operation of its own.
+                                json!({ "change": "daemon", "pid": pid, "then": update.then_some("update") })
+                            })
+                            .map_err(|error| {
+                                (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+                            })
+                    }
+                },
+                applied => applied_result(applied),
+            };
+            match applied {
+                Ok(result) => (StatusCode::OK, admin.end(operation, Ok(result))),
+                Err((status, error)) => (status, admin.end(operation, Err(error))),
             }
-            applied => applied_result(applied),
         }
-    })
-    .await
+    });
+    if !wait {
+        let running = locked(&admin.running).clone();
+        return (StatusCode::ACCEPTED, Json(running)).into_response();
+    }
+    let (status, mut operation) = match ended.await {
+        Ok(ended) => ended,
+        Err(error) => {
+            return ApiError::server_error(format!("the operation's task ended: {error}"))
+                .into_response();
+        }
+    };
+    let started = operation
+        .result
+        .as_ref()
+        .is_some_and(|result| result.get("update").is_some());
+    if !started {
+        return (status, Json(operation)).into_response();
+    }
+
+    // The update runs on by itself: the response states it as it stands when
+    // its trial begins or it ends before one.
+    loop {
+        phases.borrow_and_update();
+        let moving = matches!(
+            leader.updates.phase_of(number),
+            Some(Phase::Preparing | Phase::Switching)
+        );
+        if !moving || phases.changed().await.is_err() {
+            break;
+        }
+    }
+    let update = leader.updates.status().unwrap_or_default();
+    let status = if matches!(update["phase"].as_str(), Some("trial" | "committed")) {
+        StatusCode::OK
+    } else {
+        StatusCode::CONFLICT
+    };
+    // The operation is the one that started the update; its result states
+    // the update as it stands now.
+    if let Some(result) = operation.result.as_mut() {
+        result["update"] = update;
+    }
+    (status, Json(operation)).into_response()
 }
 
-/// What `PUT /admin/config` answers for a change that needs no hot restart
-/// of the daemon, or why it failed.
+/// What `PUT /admin/config` states for a change that needs no hot restart of
+/// the daemon, or why it failed.
 fn applied_result(
     applied: Result<Applied, UpdateError>,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     match applied {
         Ok(Applied::Unchanged) => Ok(json!({ "change": "none" })),
-        Ok(Applied::InPlace(plan)) => Ok(json!({ "change": "in_place", "plan": plan })),
-        Ok(Applied::Planned(plan)) => Ok(json!({ "change": "planned", "plan": plan })),
-        Ok(Applied::Epoch(report)) => Ok(json!({ "change": "epoch", "epoch": report })),
-        Ok(Applied::Generation(report)) => {
-            Ok(json!({ "change": "generation", "generation": report }))
+        Ok(Applied::InPlace(report)) => Ok(json!({ "change": "in_place", "in_place": report })),
+        Ok(Applied::DryRun(report)) => Ok(json!({ "change": "dry_run", "dry_run": report })),
+        Ok(Applied::Update(report)) => {
+            Ok(json!({ "change": report["change"].clone(), "update": report }))
         }
         Ok(Applied::Daemon { .. }) => Err((
             StatusCode::CONFLICT,
@@ -650,59 +815,17 @@ pub(crate) fn apply_after_restart(
     let admin = Arc::clone(admin);
     let leader = Arc::clone(leader);
     tokio::spawn(async move {
-        let applied = Box::pin(leader.apply(request)).await;
-        let outcome = applied_result(applied).map_err(|(_, error)| error);
-        admin.end(operation, outcome);
+        let applied = Box::pin(leader.apply(request, operation.id)).await;
+        let result = applied_result(applied).map_err(|(_, error)| error);
+        admin.end(operation, result);
     });
 }
 
-/// `POST /admin/config/commit`: ends the trial of the epoch that executes
+/// `POST /admin/config/commit`: commits the update in flight
 /// (`Leader::commit`).
 async fn commit(State(state): State<AdminState>) -> Response {
     let leader = Arc::clone(&state.leader);
-    let admin = Arc::clone(&state.admin);
     run(&state.admin, "commit", true, async move {
-        // A generation probation ends first: its commit and purge are the
-        // main processes', and the epoch keeps no previous generation
-        // afterwards (§7.3 steps 5-6). Only when no generation update is in
-        // flight does the configuration's own commit run.
-        // The update the probation belongs to is the one this operation ends,
-        // numbered when it was applied — not this operation's own number.
-        let epochs = Arc::clone(&leader.epochs());
-        let probation = epochs.generation_update();
-        if let Some(package) = probation {
-            let number = package.update.number;
-            match leader.commit_generation(number).await {
-                Ok(true) => {
-                    generation_phase(
-                        &admin,
-                        &epochs,
-                        Phase::Committed,
-                        package.epoch,
-                        &package.update,
-                    );
-                    generation_phase(
-                        &admin,
-                        &epochs,
-                        Phase::Purged,
-                        package.epoch,
-                        &package.update,
-                    );
-                    return Ok(json!({
-                        "change": "generation",
-                        "epoch": package.epoch,
-                        "state": "committed",
-                    }));
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    return Err((
-                        update_status(&error),
-                        format!("{:#}", anyhow::Error::from(error)),
-                    ));
-                }
-            }
-        }
         leader.commit().await.map_err(|error| {
             (
                 update_status(&error),
@@ -713,177 +836,17 @@ async fn commit(State(state): State<AdminState>) -> Response {
     .await
 }
 
-/// Applies a change at the generation layer, answering what it did, or `None`
-/// when the change moves nothing there and the epoch path decides it (§7.2).
-///
-/// The layer is decided on the target resolved against the serving
-/// configuration, and nothing is compared before the target's modules are
-/// prepared at every host's Build Server: a newly installed revision at an
-/// unchanged configuration is a generation change.
-async fn generation_update(
-    admin: &Arc<Admin>,
-    leader: &Arc<Leader>,
-    request: &ApplyRequest,
-    dry_run: bool,
-) -> Result<Option<serde_json::Value>, (StatusCode, String)> {
-    let Ok(current) = leader.serving_config() else {
-        // No replica serves: the epoch path answers that account itself.
-        return Ok(None);
-    };
-    let Ok((target, _, options)) = crate::updates::change::resolve(&current, request) else {
-        // The change itself is refused; the epoch path answers it the same way.
-        return Ok(None);
-    };
-    // A change the epoch or host layer outranks is not the generation layer's,
-    // and deciding that here keeps a host-layer change from needing a Build
-    // Server at all: only `None` and `PackageRevision` reach the prepare below, the
-    // first because a prepared package reveals what the config alone cannot.
-    let (Ok(previous), Ok(next)) = (
-        crate::epoch::Epoch::of(current.clone()),
-        crate::epoch::Epoch::of(target.clone()),
-    ) else {
-        // The configuration does not resolve; the epoch path refuses it with the reason.
-        return Ok(None);
-    };
-    if matches!(
-        crate::epoch::layer(&previous, &next),
-        crate::epoch::Layer::Epoch | crate::epoch::Layer::Host
-    ) {
-        return Ok(None);
-    }
-    let epochs = leader.epochs();
-    let number = admin.running_number();
-    let planned = match leader
-        .apply_generation(number, &target, &options, request.force, true)
-        .await
-    {
-        Ok(Some(planned)) => planned,
-        Ok(None) => return Ok(None),
-        Err(error) => return Err(refused_precopy(admin, &epochs, number, &error)),
-    };
-    if dry_run {
-        return Ok(Some(json!({
-            "change": "generation",
-            "plan": modules_report(&planned.target.modules),
-        })));
-    }
-    let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
-    generation_phase(admin, &epochs, Phase::Precopy, epoch, &planned);
-    match leader
-        .apply_generation(number, &target, &options, request.force, false)
-        .await
-    {
-        Ok(Some(update)) => {
-            // The main processes prepared, switched to and now serve the new
-            // generation; the probation decides it (§7.3 steps 2-4).
-            for phase in [
-                Phase::Precopied,
-                Phase::Switchover,
-                Phase::Switched,
-                Phase::Probation,
-            ] {
-                generation_phase(admin, &epochs, phase, epoch, &update);
-            }
-            Ok(Some(json!({
-                "change": "generation",
-                "epoch": epoch,
-                "state": "probation",
-                "update": update.number,
-            })))
-        }
-        Ok(None) => Err((
-            StatusCode::CONFLICT,
-            "the generation change moved nothing after it was planned: the \
-             deployment changed while this operation ran"
-                .to_owned(),
-        )),
-        Err(error) => Err(refused_precopy(admin, &epochs, number, &error)),
-    }
-}
-
-/// Reports a generation layer that could not take the target's modules and
-/// answers why: what serves is untouched (§7.3 step 2).
-fn refused_precopy(
-    admin: &Arc<Admin>,
-    epochs: &crate::epoch::Epochs,
-    number: u64,
-    error: &UpdateError,
-) -> (StatusCode, String) {
-    let reason = format!("{error:#}");
-    let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
-    admin.update_event(
-        number,
-        Phase::PrecopyFailed,
-        epoch,
-        [("change", json!("generation")), ("reason", json!(reason))],
-    );
-    (update_status(error), format!("precopy failed: {reason}"))
-}
-
-/// Reports one phase of a generation update on the event log: the phase,
-/// the update and the epoch it moves, the change it is, the generation that
-/// executes and the modules it carries (`data`).
-fn generation_phase(
-    admin: &Arc<Admin>,
-    epochs: &crate::epoch::Epochs,
-    phase: Phase,
-    epoch: u64,
-    update: &crate::epoch::Update,
-) {
-    let generation = epochs
-        .get(epoch)
-        .map(|record| record.generation)
-        .map_or(serde_json::Value::Null, serde_json::Value::from);
-    admin.update_event(
-        update.number,
-        phase,
-        epoch,
-        [
-            ("change", json!("generation")),
-            ("generation", generation),
-            ("modules", modules_report(&update.target.modules)),
-        ],
-    );
-}
-
-/// The modules an update carries, by operator and revision, as an event's
-/// `data.modules` names them (§7.3).
-fn modules_report(modules: &crate::epoch::ModuleSet) -> serde_json::Value {
-    let kernels = modules
-        .kernels
-        .iter()
-        .map(|(slot, package)| {
-            json!({
-                "op": slot.op,
-                "backend": package.backend,
-                "revision": package.revision,
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "engine": {
-            "backend": modules.engine.backend,
-            "revision": modules.engine.revision,
-        },
-        "kernels": kernels,
-        "policy": {
-            "backend": modules.policy.backend,
-            "revision": modules.policy.revision,
-        },
-    })
-}
-
 /// The body of `POST /admin/config/rollback`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RollbackBody {
-    /// Why the operator rolls back, which the unavailable mark records.
+    /// Why the update is rolled back, which the unavailable mark records.
     #[serde(default)]
     reason: Option<String>,
 }
 
-/// `POST /admin/config/rollback`: rolls the epoch on trial back to the
-/// previous epoch (`Leader::rollback`).
+/// `POST /admin/config/rollback`: rolls the update in flight back
+/// (`Leader::rollback`).
 async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let body = if body.is_empty() {
         RollbackBody::default()
@@ -894,51 +857,10 @@ async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> R
         }
     };
     let leader = Arc::clone(&state.leader);
-    let admin = Arc::clone(&state.admin);
     run(&state.admin, "rollback", true, async move {
         let reason = body
             .reason
-            .unwrap_or_else(|| "the operator rolled the trial back".to_owned());
-        // A generation probation returns to the generation before it first,
-        // with the reason the operator gave (§7.3 step 5); the configuration's
-        // own rollback runs only when no generation update is in flight.
-        // The update the probation belongs to is the one this operation ends,
-        // numbered when it was applied — not this operation's own number.
-        let epochs = leader.epochs();
-        let probation = epochs.generation_update();
-        if let Some(package) = probation {
-            let number = package.update.number;
-            match leader.rollback_generation(number, &reason).await {
-                Ok(true) => {
-                    generation_phase(
-                        &admin,
-                        &epochs,
-                        Phase::Reverted,
-                        package.epoch,
-                        &package.update,
-                    );
-                    generation_phase(
-                        &admin,
-                        &epochs,
-                        Phase::Purged,
-                        package.epoch,
-                        &package.update,
-                    );
-                    return Ok(json!({
-                        "change": "generation",
-                        "epoch": package.epoch,
-                        "state": "reverted",
-                    }));
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    return Err((
-                        update_status(&error),
-                        format!("{:#}", anyhow::Error::from(error)),
-                    ));
-                }
-            }
-        }
+            .unwrap_or_else(|| "the trial was rolled back by decision".to_owned());
         leader.rollback(reason).await.map_err(|error| {
             (
                 update_status(&error),
@@ -1160,7 +1082,7 @@ async fn unload_lora_adapter(State(state): State<AdminState>, body: axum::body::
 
 /// `POST /admin/profile`: starts a profiling session
 /// (`proto::profile::SessionRequest`) on every worker of the executing epoch
-/// at the engine's next step boundary (`crate::profiling`), and answers with
+/// at the engine's next step boundary (`crate::profiling`), and responds with
 /// it: its identity, each worker's file and collectors. One runs at a time:
 /// another is refused (`400`) until it ends.
 async fn start_profile(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
@@ -1188,7 +1110,7 @@ async fn profile_status(State(state): State<AdminState>) -> Json<serde_json::Val
 }
 
 /// `DELETE /admin/profile`: ends the running session at the engine's next
-/// step boundary, every worker writing its file, and answers with it.
+/// step boundary, every worker writing its file, and responds with it.
 async fn stop_profile(State(state): State<AdminState>) -> Response {
     let leader = Arc::clone(&state.leader);
     run(&state.admin, "profile", true, async move {
@@ -1216,7 +1138,7 @@ struct RestartBody {
 
 /// `POST /admin/restart`: hands the deployment to a successor daemon, which
 /// serves from then on while this one finishes the requests it took
-/// (`crate::restart`). Answers once the successor serves, with its process
+/// (`crate::restart`). Responds once the successor serves, with its process
 /// id.
 async fn restart(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let Some(restarter) = state.restarter.clone() else {
@@ -1260,7 +1182,7 @@ struct ShutdownBody {
 
 /// `POST /admin/shutdown`: brings the deployment down as SIGTERM does,
 /// finishing what is in flight within `server_config.shutdown_timeout`, and
-/// releases its storage unless `retire` is false. Answers at once (`202`).
+/// releases its storage unless `retire` is false. Responds at once (`202`).
 async fn shutdown(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let body = if body.is_empty() {
         ShutdownBody { retire: true }

@@ -109,8 +109,8 @@ fn text_request(id: u64, prompt: usize, max_tokens: usize) -> GenerationRequest 
 fn install(handle: &SchedulerHandle, serving: &FakeBatches) {
     let source: Arc<dyn PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    response(handle.precopy_policy(package(serving), source)).expect("the policy is precopied");
-    response(handle.stage(Stage::Switchover)).expect("the policy serves");
+    response(handle.prepare_policy(package(serving), source)).expect("the policy is precopied");
+    response(handle.stage(Stage::Switch)).expect("the policy serves");
 }
 
 /// The epoch's progress once it has taken at least `steps` steps.

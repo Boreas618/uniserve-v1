@@ -1,5 +1,5 @@
-//! The standby rules over a fake roster (§2.5): what the daemon does to a
-//! domain's children for each lifecycle event.
+//! The standby rules over fake standbys: what the daemon does to a
+//! domain's engines for each lifecycle event.
 
 use std::collections::BTreeMap;
 
@@ -7,10 +7,10 @@ use super::*;
 use crate::epoch::{Failure, Status};
 use proto::request::StandbyStorage;
 
-/// The serving generation the fake roster's processes are at.
+/// The serving generation the fake standbys's processes are at.
 const SERVING: u64 = 7;
 
-/// A process whose next child's generation the epoch layer took one after
+/// A process whose next engine's generation the caller took one after
 /// the serving one, as the counter gives it.
 fn process(host: &str, epoch: Option<u64>) -> MainProcess {
     MainProcess {
@@ -110,8 +110,8 @@ fn migrate(host: &str) -> Action {
 }
 
 /// Two domains: `a` alone, and `b` and `c` sharing cross-node epoch 3.
-fn roster() -> Roster {
-    Roster::new(vec![
+fn standbys() -> Standbys {
+    Standbys::new(vec![
         process("a", None),
         process("b", Some(3)),
         process("c", Some(3)),
@@ -119,8 +119,8 @@ fn roster() -> Roster {
 }
 
 /// Starts the standby of every domain.
-fn start(roster: &mut Roster) {
-    let actions = roster.serve(
+fn start(standbys: &mut Standbys) {
+    let actions = standbys.serve(
         Status::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
@@ -136,23 +136,23 @@ fn start(roster: &mut Roster) {
 }
 
 /// Reports every standby as prepared and parked.
-fn parked(roster: &mut Roster) {
+fn parked(standbys: &mut Standbys) {
     for host in ["a", "b", "c"] {
-        roster.parked(host, SERVING + 1);
+        standbys.parked(host, SERVING + 1);
     }
 }
 
-/// The generations the epoch layer takes for the next child of `hosts`, as
+/// The generations the caller takes for the next engine of `hosts`, as
 /// its counter gives them.
-fn allocated(roster: &mut Roster, hosts: &[&str], generation: u64) {
+fn allocated(standbys: &mut Standbys, hosts: &[&str], generation: u64) {
     for host in hosts {
-        roster.allocated(host, generation);
+        standbys.allocated(host, generation);
     }
 }
 
-/// The hosts of each domain, as the roster derives them.
-fn domains(roster: &Roster) -> Vec<Vec<String>> {
-    roster
+/// The hosts of each domain, as the standbys derives them.
+fn domains(standbys: &Standbys) -> Vec<Vec<String>> {
+    standbys
         .domains()
         .into_iter()
         .map(|domain| {
@@ -166,7 +166,7 @@ fn domains(roster: &Roster) -> Vec<Vec<String>> {
 
 #[test]
 fn the_domains_follow_the_cross_node_epochs() {
-    let roster = Roster::new(vec![
+    let standbys = Standbys::new(vec![
         process("a", None),
         process("b", Some(3)),
         process("c", Some(3)),
@@ -174,7 +174,7 @@ fn the_domains_follow_the_cross_node_epochs() {
         process("e", Some(5)),
     ]);
     assert_eq!(
-        domains(&roster),
+        domains(&standbys),
         vec![
             vec!["a".to_owned()],
             vec!["b".to_owned(), "c".to_owned()],
@@ -186,16 +186,16 @@ fn the_domains_follow_the_cross_node_epochs() {
 
 #[test]
 fn a_serving_epoch_starts_one_standby_a_generation_ahead_of_each_member() {
-    let mut roster = roster();
-    start(&mut roster);
+    let mut standbys = standbys();
+    start(&mut standbys);
     // The standbys exist: serving again starts none beside them.
-    let again = roster.serve(
+    let again = standbys.serve(
         Status::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
     );
     assert!(again.is_empty());
-    let phases: Vec<&str> = roster
+    let phases: Vec<&str> = standbys
         .state()
         .iter()
         .map(|domain| domain.phase.as_str())
@@ -205,7 +205,7 @@ fn a_serving_epoch_starts_one_standby_a_generation_ahead_of_each_member() {
 
 #[test]
 fn the_standby_generation_is_the_epoch_layers_number_and_is_never_computed() {
-    let mut roster = Roster::new(vec![
+    let mut standbys = Standbys::new(vec![
         MainProcess {
             standby_generation: 1000,
             ..process("a", None)
@@ -219,7 +219,7 @@ fn the_standby_generation_is_the_epoch_layers_number_and_is_never_computed() {
             ..process("c", Some(3))
         },
     ]);
-    let actions = roster.serve(
+    let actions = standbys.serve(
         Status::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
@@ -237,16 +237,16 @@ fn the_standby_generation_is_the_epoch_layers_number_and_is_never_computed() {
 
 #[test]
 fn an_epoch_that_does_not_serve_keeps_no_standby() {
-    let mut roster = roster();
-    for status in [Status::Precopy, Status::Probation, Status::Purged] {
-        let actions = roster.serve(
+    let mut standbys = standbys();
+    for status in [Status::Preparing, Status::Trial, Status::Released] {
+        let actions = standbys.serve(
             status,
             options(StandbyStorage::Auto),
             &roomy(&["a", "b", "c"]),
         );
         assert!(actions.is_empty(), "{status:?} keeps a standby");
     }
-    let disabled = roster.serve(
+    let disabled = standbys.serve(
         Status::Serving,
         StandbyOptions {
             enabled: false,
@@ -259,40 +259,40 @@ fn an_epoch_that_does_not_serve_keeps_no_standby() {
 
 #[test]
 fn a_parked_domain_is_promoted_on_a_sticky_fault_and_a_new_standby_follows() {
-    let mut roster = roster();
-    start(&mut roster);
-    parked(&mut roster);
-    let phases: Vec<&str> = roster
+    let mut standbys = standbys();
+    start(&mut standbys);
+    parked(&mut standbys);
+    let phases: Vec<&str> = standbys
         .state()
         .iter()
         .map(|domain| domain.phase.as_str())
         .collect();
     assert_eq!(phases, vec!["parked", "parked"]);
 
-    // One promotion per parked child of the failing domain, all in one step;
+    // One promotion per parked engine of the failing domain, all in one step;
     // the node in no cross-node group keeps its own standby.
-    let actions = roster.failed("b", &failure("sticky"));
+    let actions = standbys.failed("b", &failure("sticky"));
     assert_eq!(
         actions,
         vec![promote("b", SERVING + 1), promote("c", SERVING + 1)]
     );
 
     // A further fault in the same round changes nothing: the first wins.
-    assert!(roster.failed("c", &failure("sticky")).is_empty());
+    assert!(standbys.failed("c", &failure("sticky")).is_empty());
 
-    assert!(roster.promoted("b", SERVING + 1).is_empty());
-    // The last answer stops the old generation of the domain's members.
+    assert!(standbys.promoted("b", SERVING + 1).is_empty());
+    // The last acknowledgement stops the old generation of the domain's members.
     assert_eq!(
-        roster.promoted("c", SERVING + 1),
+        standbys.promoted("c", SERVING + 1),
         vec![stop("b", SERVING), stop("c", SERVING)]
     );
 
     // The promoted generation is `SERVING + 1`, the generation the epoch
-    // record now names; the epoch layer takes the next number from its
+    // record now names; the caller takes the next number from its
     // counter, so the domain's next standby is at `SERVING + 2`, never beside
     // the old generation.
-    allocated(&mut roster, &["b", "c"], SERVING + 2);
-    let actions = roster.serve(
+    allocated(&mut standbys, &["b", "c"], SERVING + 2);
+    let actions = standbys.serve(
         Status::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
@@ -308,16 +308,16 @@ fn a_parked_domain_is_promoted_on_a_sticky_fault_and_a_new_standby_follows() {
 
 #[test]
 fn a_request_level_failure_promotes_nothing() {
-    let mut roster = roster();
-    start(&mut roster);
-    parked(&mut roster);
+    let mut standbys = standbys();
+    start(&mut standbys);
+    parked(&mut standbys);
     for kind in ["non_finite_logits", "policy_reverted", "input_error"] {
         assert!(
-            roster.failed("b", &failure(kind)).is_empty(),
+            standbys.failed("b", &failure(kind)).is_empty(),
             "{kind} replaced the domain"
         );
     }
-    let phases: Vec<&str> = roster
+    let phases: Vec<&str> = standbys
         .state()
         .iter()
         .map(|domain| domain.phase.as_str())
@@ -325,20 +325,20 @@ fn a_request_level_failure_promotes_nothing() {
     assert_eq!(phases, vec!["parked", "parked"]);
     // The domain still promotes on a process-fatal fault.
     assert_eq!(
-        roster.failed("b", &failure("sticky")),
+        standbys.failed("b", &failure("sticky")),
         vec![promote("b", SERVING + 1), promote("c", SERVING + 1)]
     );
 }
 
 #[test]
 fn a_domain_with_a_member_that_has_no_parked_standby_relaunches_wholly() {
-    let mut roster = roster();
-    start(&mut roster);
+    let mut standbys = standbys();
+    start(&mut standbys);
     // `b` parked; `c` is still starting.
-    roster.parked("b", SERVING + 1);
-    // The epoch layer takes the next number for each member's replacement.
-    allocated(&mut roster, &["b", "c"], SERVING + 2);
-    let actions = roster.failed("b", &failure("illegal_address"));
+    standbys.parked("b", SERVING + 1);
+    // The caller takes the next number for each member's replacement.
+    allocated(&mut standbys, &["b", "c"], SERVING + 2);
+    let actions = standbys.failed("b", &failure("illegal_address"));
     assert_eq!(
         actions,
         vec![
@@ -351,10 +351,10 @@ fn a_domain_with_a_member_that_has_no_parked_standby_relaunches_wholly() {
         "a member without a parked standby relaunches its whole domain"
     );
 
-    roster.relaunched("b", SERVING + 2);
-    roster.relaunched("c", SERVING + 2);
-    allocated(&mut roster, &["b", "c"], SERVING + 3);
-    let actions = roster.serve(
+    standbys.relaunched("b", SERVING + 2);
+    standbys.relaunched("c", SERVING + 2);
+    allocated(&mut standbys, &["b", "c"], SERVING + 3);
+    let actions = standbys.serve(
         Status::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
@@ -370,39 +370,42 @@ fn a_domain_with_a_member_that_has_no_parked_standby_relaunches_wholly() {
 
 #[test]
 fn a_replacement_waits_for_the_epoch_layers_generation_numbers() {
-    let mut roster = roster();
-    start(&mut roster);
+    let mut standbys = standbys();
+    start(&mut standbys);
     // Both standbys are gone; their numbers were spent when they started.
-    roster.standby_lost("b");
-    assert_eq!(roster.standby_lost("c"), vec![]);
+    standbys.standby_lost("b");
+    assert_eq!(standbys.standby_lost("c"), vec![]);
     // The fault cannot start the replacement: the rules do not mint a number.
     assert_eq!(
-        roster.failed("b", &failure("sticky")),
+        standbys.failed("b", &failure("sticky")),
         vec![allocate("b"), allocate("c")]
     );
-    assert_eq!(roster.state()[1].phase.as_str(), "allocating");
+    assert_eq!(standbys.state()[1].phase.as_str(), "allocating");
     // The first number is not enough; the round starts with the last one.
-    assert!(roster.allocated("b", 41).is_empty());
-    // The failed node's child is gone, so it is not stopped; its sibling
+    assert!(standbys.allocated("b", 41).is_empty());
+    // The failed node's engine is gone, so it is not stopped; its sibling
     // still serves at the old generation and is stopped before its
     // replacement starts.
     assert_eq!(
-        roster.allocated("c", 42),
+        standbys.allocated("c", 42),
         vec![relaunch("b", 41), stop("c", SERVING), relaunch("c", 42)]
     );
-    assert_eq!(roster.state()[1].phase.as_str(), "relaunching");
+    assert_eq!(standbys.state()[1].phase.as_str(), "relaunching");
 }
 
 #[test]
 fn a_parked_standby_that_dies_leaves_the_domain_to_a_relaunch() {
-    let mut roster = roster();
-    start(&mut roster);
-    parked(&mut roster);
+    let mut standbys = standbys();
+    start(&mut standbys);
+    parked(&mut standbys);
     // A standby dies (its device faulted): the domain's standby epoch is
     // one, so the other members' standbys are dropped with it.
-    assert_eq!(roster.standby_lost("c"), vec![terminate("b", SERVING + 1)]);
-    allocated(&mut roster, &["b", "c"], SERVING + 2);
-    let actions = roster.failed("c", &failure("process_exit"));
+    assert_eq!(
+        standbys.standby_lost("c"),
+        vec![terminate("b", SERVING + 1)]
+    );
+    allocated(&mut standbys, &["b", "c"], SERVING + 2);
+    let actions = standbys.failed("c", &failure("process_exit"));
     assert!(
         actions
             .iter()
@@ -415,23 +418,26 @@ fn a_parked_standby_that_dies_leaves_the_domain_to_a_relaunch() {
 
 #[test]
 fn an_epoch_that_stops_serving_retires_its_standby_and_its_domain_goes_on_short() {
-    let mut roster = roster();
-    start(&mut roster);
-    parked(&mut roster);
-    // The epoch stops serving on `c`: the standby layer owns that child and
-    // stops it, so the epoch layer never needs its generation.
-    assert_eq!(roster.retired("c"), vec![terminate("c", SERVING + 1)]);
+    let mut standbys = standbys();
+    start(&mut standbys);
+    parked(&mut standbys);
+    // The epoch stops serving on `c`: the standby rules own that standby and
+    // stop it, so the caller never needs its generation.
+    assert_eq!(standbys.retired("c"), vec![terminate("c", SERVING + 1)]);
     // A fault of the retired node replaces nothing.
-    assert!(roster.failed("c", &failure("sticky")).is_empty());
+    assert!(standbys.failed("c", &failure("sticky")).is_empty());
     // The domain's remaining member is promoted alone.
     assert_eq!(
-        roster.failed("b", &failure("sticky")),
+        standbys.failed("b", &failure("sticky")),
         vec![promote("b", SERVING + 1)]
     );
-    assert_eq!(roster.promoted("b", SERVING + 1), vec![stop("b", SERVING)]);
+    assert_eq!(
+        standbys.promoted("b", SERVING + 1),
+        vec![stop("b", SERVING)]
+    );
     // Serving again starts no standby on the retired node.
-    allocated(&mut roster, &["b"], SERVING + 2);
-    let actions = roster.serve(
+    allocated(&mut standbys, &["b"], SERVING + 2);
+    let actions = standbys.serve(
         Status::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
@@ -441,13 +447,13 @@ fn an_epoch_that_stops_serving_retires_its_standby_and_its_domain_goes_on_short(
 
 #[test]
 fn a_device_that_needs_a_reset_takes_its_standby_and_migrates_the_node() {
-    let mut roster = roster();
-    start(&mut roster);
-    parked(&mut roster);
-    allocated(&mut roster, &["b"], SERVING + 2);
+    let mut standbys = standbys();
+    start(&mut standbys);
+    parked(&mut standbys);
+    allocated(&mut standbys, &["b"], SERVING + 2);
     // `c`'s GPU needs a reset: its standby is dead, the node cannot run
     // again, and the rest of its domain is started without it.
-    let actions = roster.unusable("c");
+    let actions = standbys.unusable("c");
     assert_eq!(
         actions,
         vec![
@@ -459,18 +465,18 @@ fn a_device_that_needs_a_reset_takes_its_standby_and_migrates_the_node() {
         ]
     );
     // The dead node's fault replaces nothing: it is already gone.
-    assert!(roster.failed("c", &failure("sticky")).is_empty());
+    assert!(standbys.failed("c", &failure("sticky")).is_empty());
 }
 
 #[test]
-fn every_member_is_asked_to_promote_before_any_answer_is_awaited() {
-    let mut roster = roster();
-    start(&mut roster);
-    parked(&mut roster);
+fn every_member_is_asked_to_promote_before_any_acknowledgement_is_awaited() {
+    let mut standbys = standbys();
+    start(&mut standbys);
+    parked(&mut standbys);
     // The whole round's promotions are returned in one call, so the caller
-    // issues them all before it awaits any answer (a suspended epoch
+    // issues them all before it awaits any acknowledgement (a suspended epoch
     // restores its communication together).
-    let actions = roster.failed("c", &failure("launch_failed"));
+    let actions = standbys.failed("c", &failure("launch_failed"));
     assert_eq!(
         actions,
         vec![promote("b", SERVING + 1), promote("c", SERVING + 1)]
@@ -479,14 +485,14 @@ fn every_member_is_asked_to_promote_before_any_answer_is_awaited() {
 
 #[test]
 fn a_promotion_that_fails_relaunches_the_domain() {
-    let mut roster = roster();
-    start(&mut roster);
-    parked(&mut roster);
-    roster.failed("b", &failure("sticky"));
-    roster.promoted("b", SERVING + 1);
-    allocated(&mut roster, &["b", "c"], SERVING + 2);
-    let actions = roster.promote_failed("c");
-    // The node whose promotion failed has no serving child to stop; every
+    let mut standbys = standbys();
+    start(&mut standbys);
+    parked(&mut standbys);
+    standbys.failed("b", &failure("sticky"));
+    standbys.promoted("b", SERVING + 1);
+    allocated(&mut standbys, &["b", "c"], SERVING + 2);
+    let actions = standbys.promote_failed("c");
+    // The node whose promotion failed has no serving engine to stop; every
     // other member of the domain is stopped and started again.
     assert_eq!(
         actions,
@@ -508,10 +514,10 @@ fn a_promotion_that_fails_relaunches_the_domain() {
 
 #[test]
 fn one_crowded_device_suspends_the_whole_domain() {
-    let mut roster = roster();
+    let mut standbys = standbys();
     let mut facts = roomy(&["a", "b", "c"]);
     facts.get_mut("b").expect("b's facts").crowded = true;
-    let actions = roster.serve(Status::Serving, options(StandbyStorage::Auto), &facts);
+    let actions = standbys.serve(Status::Serving, options(StandbyStorage::Auto), &facts);
     assert_eq!(
         actions,
         vec![
@@ -525,36 +531,36 @@ fn one_crowded_device_suspends_the_whole_domain() {
 
 #[test]
 fn a_standby_that_cannot_fit_even_suspended_is_not_kept() {
-    let mut roster = roster();
+    let mut standbys = standbys();
     let mut facts = roomy(&["a", "b", "c"]);
     let c = facts.get_mut("c").expect("c's facts");
     c.crowded = true;
     c.fits_suspended = false;
-    let actions = roster.serve(Status::Serving, options(StandbyStorage::Auto), &facts);
+    let actions = standbys.serve(Status::Serving, options(StandbyStorage::Auto), &facts);
     assert_eq!(
         actions,
         vec![spawn("a", SERVING + 1, Storage::Resident)],
         "the b/c domain keeps no standby when c cannot hold one"
     );
     // Without a standby the domain is replaced by a relaunch, with the
-    // numbers the epoch layer already took (nothing consumed them).
-    let actions = roster.failed("b", &failure("sticky"));
+    // numbers the caller already took (nothing consumed them).
+    let actions = standbys.failed("b", &failure("sticky"));
     assert!(actions.contains(&relaunch("b", SERVING + 1)));
     assert!(actions.contains(&relaunch("c", SERVING + 1)));
 }
 
 #[test]
 fn a_standby_that_fails_to_start_is_left_out() {
-    let mut roster = roster();
-    start(&mut roster);
-    assert!(roster.standby_lost("a").is_empty());
-    assert_eq!(roster.state()[0].phase.as_str(), "absent");
-    allocated(&mut roster, &["a"], SERVING + 2);
-    let actions = roster.failed("a", &failure("out_of_memory"));
+    let mut standbys = standbys();
+    start(&mut standbys);
+    assert!(standbys.standby_lost("a").is_empty());
+    assert_eq!(standbys.state()[0].phase.as_str(), "absent");
+    allocated(&mut standbys, &["a"], SERVING + 2);
+    let actions = standbys.failed("a", &failure("out_of_memory"));
     assert_eq!(actions, vec![relaunch("a", SERVING + 2)]);
-    roster.relaunched("a", SERVING + 2);
-    allocated(&mut roster, &["a"], SERVING + 3);
-    let actions = roster.serve(
+    standbys.relaunched("a", SERVING + 2);
+    allocated(&mut standbys, &["a"], SERVING + 3);
+    let actions = standbys.serve(
         Status::Serving,
         options(StandbyStorage::Auto),
         &roomy(&["a", "b", "c"]),
@@ -564,10 +570,10 @@ fn a_standby_that_fails_to_start_is_left_out() {
 
 #[test]
 fn a_standby_report_of_another_generation_does_not_park_it() {
-    let mut roster = roster();
-    start(&mut roster);
-    roster.parked("a", SERVING);
-    assert_eq!(roster.state()[0].phase.as_str(), "starting");
-    roster.parked("a", SERVING + 1);
-    assert_eq!(roster.state()[0].phase.as_str(), "parked");
+    let mut standbys = standbys();
+    start(&mut standbys);
+    standbys.parked("a", SERVING);
+    assert_eq!(standbys.state()[0].phase.as_str(), "starting");
+    standbys.parked("a", SERVING + 1);
+    assert_eq!(standbys.state()[0].phase.as_str(), "parked");
 }

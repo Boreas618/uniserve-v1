@@ -1,49 +1,37 @@
-//! The peer messages of a generation update.
+//! The commands of a generation update.
 //!
-//! The daemon receives `PUT /admin/config`, decides that the two configurations
-//! differ only in the packages they fill each operator with (§7.2), and prepares
-//! the target packages at each host's Build Server. The update itself then
-//! runs between the main processes of the epoch:
+//! The daemon receives `PUT /admin/config`, finds that the target differs from what serves only
+//! in the kernel and policy packages it selects, and moves every serving engine of the epoch:
 //!
-//! 1. the scheduler node's main process receives `Precopy` and fans it out to
-//!    every main process of the epoch over the existing ipc channel (§2.3), so
-//!    that all ranks install the same generation;
-//! 2. every main process returns `Precopied` or `PrecopyFailed` (step 2);
-//! 3. after all have responded, the daemon sends `Switchover` to each DP rank's
-//!    scheduler, which puts it in its batch sequence at a batch boundary and
-//!    tells its ranks (step 3);
-//! 4. during probation, `Commit` or `Revert` ends the update (step 5), and a
-//!    failure a main process finds is reported as [`crate::GenerationStatus::Failed`]
-//!    or [`crate::GenerationStatus::PolicyReverted`];
-//! 5. `Purge { generation }` releases the generation before the serving one once
-//!    its last batch has completed (step 6).
+//! 1. `Prepare` names the packages; the engine resolves and loads them beside the serving
+//!    generation and reports `Prepared`, or `PrepareFailed` with nothing changed;
+//! 2. `Switch` makes the prepared generation execute from one batch boundary, with the previous
+//!    one kept; the engine reports `Switched`;
+//! 3. the trial ends in `Commit` or `Rollback`, and the engine releases the generation that no
+//!    longer executes once its last batch has completed.
 //!
-//! The messages carry a package's names — its backend, its revision and its
-//! arguments — and never its content: content comes from the Build Server by
-//! `resolve` (§6.3). `PackageRevision`, `ModuleSlot`, `PhaseKind` and `Packages` are
-//! the module vocabulary of `proto::module` (design §5.1); this module gives
-//! them their form on the peer channel, exactly as the daemon's append-only
-//! Protobuf carries them across builds.
+//! The messages carry a package's names — its backend, its revision and its arguments — and never
+//! its content: content comes from the Build Server by `resolve`. `PackageRevision`,
+//! `ModuleSlot`, `PhaseKind` and `Packages` are the module vocabulary of `proto::module`; this
+//! module gives them their form on the peer channel, exactly as the daemon's Protobuf carries
+//! them across builds.
 
 use proto::module::Packages;
 use serde::{Deserialize, Serialize};
 
-/// A command of the generation update, as a main process receives it.
+/// A command of the generation update, as an engine receives it.
 ///
-/// The daemon-to-main-process form is the append-only Protobuf of `crates/proto`
-/// (§2.3); this is the same command between main processes of one epoch, which
-/// are one build and therefore exchange Rust types.
+/// The daemon-to-engine form is the Protobuf of `crates/proto`; this is the
+/// same command between the engines of one epoch, which are one build and
+/// therefore exchange Rust types.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenerationCommand {
-    /// §7.3 step 2: install `packages` as generation `generation` while serving
-    /// goes on.
-    Precopy {
-        /// The generation being installed: one update number, assigned by the
-        /// daemon and shared by every main process of the epoch.
+    /// Make `packages` ready as generation `generation` while serving goes on.
+    Prepare {
+        /// The generation being prepared: the number the engine gives it.
         generation: u64,
-        /// The operators' packages to install, and the packages they replace
-        /// (kept through probation, §7.3 step 4).
+        /// The operators' packages to install.
         packages: Box<Packages>,
         /// The scheduling policy the same update installs. It is not a slot of
         /// `packages`: a policy is one package per epoch, named by its own
@@ -51,34 +39,28 @@ pub enum GenerationCommand {
         /// (`crates/daemon/src/epoch.rs`).
         policy: proto::module::PackageRevision,
     },
-    /// §7.3 step 3: cut over at the batch boundary whose step is `step`.
-    Switchover {
-        /// The generation to serve.
+    /// Execute `generation` from the batch boundary whose step is `step`.
+    Switch {
+        /// The generation to execute.
         generation: u64,
-        /// The scheduler step the switchover runs at, agreed by an expert
+        /// The scheduler step the switch takes effect at, agreed by an expert
         /// group's schedulers so that both ends of an all-to-all switch
         /// together.
         ///
         /// `None` when the command came from the daemon, which does not choose
-        /// the boundary: the receiving main process's scheduler names the step
-        /// at its next batch boundary. `Some` between main processes of one
-        /// epoch, whose schedulers agreed on it.
+        /// the boundary: the receiving engine's scheduler names the step at
+        /// its next batch boundary. `Some` between the engines of one epoch,
+        /// whose schedulers agreed on it.
         step: Option<u64>,
     },
-    /// §7.3 step 5: probation ended in a commit.
+    /// The trial ended in a commit.
     Commit {
         /// The generation committed.
         generation: u64,
     },
-    /// §7.3 step 4: revert to the generation serving before the update.
-    Revert {
-        /// The generation reverted away from.
-        generation: u64,
-    },
-    /// §7.3 step 6: release generation `generation`, which is older than the one
-    /// serving.
-    Purge {
-        /// The generation to purge.
+    /// Return to the generation that executed before the update.
+    Rollback {
+        /// The generation left.
         generation: u64,
     },
 }
@@ -87,44 +69,41 @@ impl GenerationCommand {
     /// The generation this command is about.
     pub const fn generation(&self) -> u64 {
         match self {
-            Self::Precopy { generation, .. }
-            | Self::Switchover { generation, .. }
+            Self::Prepare { generation, .. }
+            | Self::Switch { generation, .. }
             | Self::Commit { generation }
-            | Self::Revert { generation }
-            | Self::Purge { generation } => *generation,
+            | Self::Rollback { generation } => *generation,
         }
     }
 
-    /// The stage's name, for tracing and for the status the command responds with.
+    /// The stage's name, for tracing.
     pub const fn stage(&self) -> &'static str {
         match self {
-            Self::Precopy { .. } => "precopy",
-            Self::Switchover { .. } => "switchover",
+            Self::Prepare { .. } => "prepare",
+            Self::Switch { .. } => "switch",
             Self::Commit { .. } => "commit",
-            Self::Revert { .. } => "revert",
-            Self::Purge { .. } => "purge",
+            Self::Rollback { .. } => "rollback",
         }
     }
 }
 
 /// These commands cross two wires with one shape: the daemon's Protobuf
-/// (`proto::process::Command`, §2.3) and the peer channel of one epoch's main
-/// processes, which are one build and exchange this Rust type. The mapping is
+/// (`proto::process::Command`) and the peer channel of one epoch's engines,
+/// which are one build and exchange this Rust type. The mapping is
 /// written once, here, so a field cannot be carried by one wire and dropped by
 /// the other without a reader seeing it.
 impl GenerationCommand {
     /// This command as the daemon's Protobuf `Command`.
     ///
-    /// The switchover's `step` is not part of the daemon's form: the boundary
-    /// is the main process's own decision (§7.3 step 3), and the daemon learns
-    /// it from `Report::Switched`.
+    /// The switch's `step` is not part of the daemon's form: the boundary is
+    /// the engine's own decision.
     pub fn to_command(&self) -> proto::process::Command {
         use proto::process::command::Kind;
 
         let kind = match self {
-            Self::Precopy {
+            Self::Prepare {
                 packages, policy, ..
-            } => Kind::Precopy(proto::process::Precopy {
+            } => Kind::Prepare(proto::process::Prepare {
                 kernels: packages
                     .iter()
                     .map(|(slot, package)| proto::process::KernelPackage {
@@ -136,28 +115,25 @@ impl GenerationCommand {
                     .collect(),
                 policy: Some(package_to_wire(policy)),
             }),
-            Self::Switchover { generation, .. } => Kind::Switchover(proto::process::Switchover {
+            Self::Switch { generation, .. } => Kind::Switch(proto::process::Switch {
                 generation: *generation,
             }),
             Self::Commit { .. } => Kind::Commit(proto::process::Commit {}),
-            Self::Revert { .. } => Kind::Revert(proto::process::Revert {
+            Self::Rollback { .. } => Kind::Rollback(proto::process::Rollback {
                 reason: String::new(),
-            }),
-            Self::Purge { generation } => Kind::Purge(proto::process::Purge {
-                generation: *generation,
             }),
         };
         proto::process::Command { kind: Some(kind) }
     }
 
-    /// The generation command `command` states, for a main process serving
+    /// The generation command `command` states, for an engine executing
     /// generation `current`.
     ///
-    /// `None` for the daemon's other commands (park, promote, drain, serve,
-    /// pause), which are the epoch layer's and not the generation layer's. The
-    /// daemon's commit and revert carry no generation - it is the one serving
-    /// when they arrive - so the state machine's number is `current` (for a
-    /// revert, the generation being reverted away from).
+    /// `None` for the daemon's other commands (drain, promote, pause, serve),
+    /// which move the engine's lifecycle and not its generation. The daemon's
+    /// commit and rollback carry no generation - it is the one executing when
+    /// they arrive - so the number is `current` (for a rollback, the generation
+    /// being left).
     pub fn from_command(
         command: proto::process::Command,
         current: u64,
@@ -168,12 +144,12 @@ impl GenerationCommand {
             return Err(command_error("a command states no kind"));
         };
         Ok(Some(match kind {
-            Kind::Precopy(precopy) => {
+            Kind::Prepare(prepare) => {
                 let mut packages = Packages::new();
-                for kernel in precopy.kernels {
+                for kernel in prepare.kernels {
                     let package = kernel
                         .package
-                        .ok_or_else(|| command_error("a precopy's kernel states no package"))?;
+                        .ok_or_else(|| command_error("a prepare's kernel states no package"))?;
                     let phase = kernel.phase.map(phase_from_wire).transpose()?.flatten();
                     let slot = proto::module::ModuleSlot {
                         op: kernel.op,
@@ -182,30 +158,27 @@ impl GenerationCommand {
                     };
                     packages.insert(slot, package_from_wire(package)?);
                 }
-                let policy = precopy
+                let policy = prepare
                     .policy
-                    .ok_or_else(|| command_error("a precopy states no policy"))?;
-                Self::Precopy {
-                    // The daemon's precopy states no number: the main process
-                    // numbers the generation it prepares (design 7.3 step 2),
-                    // and `Report::Precopied` echoes it back.
+                    .ok_or_else(|| command_error("a prepare states no policy"))?;
+                Self::Prepare {
+                    // The daemon's prepare states no number: the engine numbers
+                    // the generation it prepares, and `Report::Prepared` states
+                    // it.
                     generation: current + 1,
                     packages: Box::new(packages),
                     policy: package_from_wire(policy)?,
                 }
             }
-            Kind::Switchover(switchover) => Self::Switchover {
-                generation: switchover.generation,
+            Kind::Switch(switch) => Self::Switch {
+                generation: switch.generation,
                 step: None,
             },
             Kind::Commit(_) => Self::Commit {
                 generation: current,
             },
-            Kind::Revert(_) => Self::Revert {
+            Kind::Rollback(_) => Self::Rollback {
                 generation: current,
-            },
-            Kind::Purge(purge) => Self::Purge {
-                generation: purge.generation,
             },
             _ => return Ok(None),
         }))
@@ -213,7 +186,7 @@ impl GenerationCommand {
 }
 
 /// A package as the daemon's Protobuf carries it: its backend, its revision and
-/// its arguments, never the module's bytes (§6.3).
+/// its arguments, never the module's bytes.
 fn package_to_wire(package: &proto::module::PackageRevision) -> proto::process::PackageRevision {
     proto::process::PackageRevision {
         backend: package.backend.clone(),
@@ -283,16 +256,16 @@ mod tests {
 
     #[test]
     fn a_command_names_its_generation_and_stage() {
-        let command = GenerationCommand::Switchover {
+        let command = GenerationCommand::Switch {
             generation: 4,
             step: Some(17),
         };
         assert_eq!(command.generation(), 4);
-        assert_eq!(command.stage(), "switchover");
+        assert_eq!(command.stage(), "switch");
     }
 
     #[test]
-    fn a_precopy_carries_package_names_and_arguments_and_never_content() {
+    fn a_prepare_carries_package_names_and_arguments_and_never_content() {
         let mut packages = Packages::new();
         packages.insert(
             proto::module::ModuleSlot::all("decode_attention"),
@@ -310,7 +283,7 @@ mod tests {
                 arguments: toml::Table::new(),
             },
         );
-        let command = GenerationCommand::Precopy {
+        let command = GenerationCommand::Prepare {
             generation: 5,
             packages: Box::new(packages.clone()),
             policy: proto::module::PackageRevision {
@@ -322,24 +295,23 @@ mod tests {
             },
         };
 
-        let encoded = rmp_serde::to_vec(&command).expect("a precopy encodes");
-        // The module's bytes are not part of the command: a main process
-        // resolves them from its Build Server (§6.3), and the peer channel
-        // carries names only.
+        let encoded = rmp_serde::to_vec(&command).expect("a prepare encodes");
+        // The module's bytes are not part of the command: an engine resolves them from its
+        // Build Server, and the peer channel carries names only.
         assert!(
             encoded.len() < 1024,
-            "a precopy of two packages is {} bytes",
+            "a prepare of two packages is {} bytes",
             encoded.len()
         );
         let decoded: GenerationCommand = rmp_serde::from_slice(&encoded).expect("and decodes");
         assert_eq!(decoded, command);
-        let GenerationCommand::Precopy {
+        let GenerationCommand::Prepare {
             generation,
             packages,
             policy,
         } = decoded
         else {
-            panic!("a precopy decoded as {}", decoded.stage());
+            panic!("a prepare decoded as {}", decoded.stage());
         };
         assert_eq!(generation, 5);
         assert_eq!(
@@ -350,24 +322,23 @@ mod tests {
     }
 
     #[test]
-    fn the_commands_between_main_processes_survive_the_peer_encoding() {
+    fn the_commands_between_engines_survive_the_peer_encoding() {
         for command in [
-            GenerationCommand::Switchover {
+            GenerationCommand::Switch {
                 generation: 4,
                 step: Some(17),
             },
             GenerationCommand::Commit { generation: 4 },
-            GenerationCommand::Revert { generation: 4 },
-            GenerationCommand::Purge { generation: 4 },
+            GenerationCommand::Rollback { generation: 4 },
         ] {
-            let encoded = rmp_serde::to_vec(&command).expect("a package command encodes");
+            let encoded = rmp_serde::to_vec(&command).expect("a generation command encodes");
             let decoded: GenerationCommand = rmp_serde::from_slice(&encoded).expect("and decodes");
             assert_eq!(decoded, command);
         }
     }
 
     #[test]
-    fn a_precopy_survives_the_daemon_wire_with_its_policy_and_arguments() {
+    fn a_prepare_survives_the_daemon_wire_with_its_policy_and_arguments() {
         let mut packages = Packages::new();
         packages.insert(
             proto::module::ModuleSlot::phase("rms_norm", proto::module::PhaseKind::Prefill),
@@ -377,77 +348,62 @@ mod tests {
                 arguments: "block = 256".parse().expect("the package's arguments"),
             },
         );
-        let command = GenerationCommand::Precopy {
+        let policy = proto::module::PackageRevision {
+            backend: "fcfs".to_owned(),
+            revision: 4,
+            arguments: "chunked_prefill_size = 4096"
+                .parse()
+                .expect("the policy's arguments"),
+        };
+        let command = GenerationCommand::Prepare {
             generation: 9,
             packages: Box::new(packages.clone()),
-            policy: proto::module::PackageRevision {
-                backend: "fcfs".to_owned(),
-                revision: 4,
-                arguments: "chunked_prefill_size = 4096"
-                    .parse()
-                    .expect("the policy's arguments"),
-            },
+            policy: policy.clone(),
         };
 
         let wire = command.to_command();
         let back = GenerationCommand::from_command(wire.clone(), 3)
-            .expect("the wire form states a package command")
-            .expect("and it is the generation layer's");
-        // A daemon's precopy states no generation (`proto::process::Precopy`
-        // reserves the field, §7.3 step 2): the main process numbers the one it
-        // prepares, and `Report::Precopied` echoes the number back. What arrives
-        // is therefore the command for the generation after the one serving —
-        // the fixture's own number never crosses the wire.
-        let expected = GenerationCommand::Precopy {
+            .expect("the wire form states a generation command")
+            .expect("and it is a generation's");
+        // A daemon's prepare states no generation: the engine numbers the one it prepares, and
+        // `Report::Prepared` states the number. What arrives is therefore the command for the
+        // generation after the one that executes; the fixture's own number never crosses the wire.
+        let expected = GenerationCommand::Prepare {
             generation: 4,
-            packages: Box::new(packages.clone()),
-            policy: proto::module::PackageRevision {
-                backend: "fcfs".to_owned(),
-                revision: 4,
-                arguments: "chunked_prefill_size = 4096"
-                    .parse()
-                    .expect("the policy's arguments"),
-            },
+            packages: Box::new(packages),
+            policy,
         };
         assert_eq!(back, expected);
 
-        // The daemon's form carries no modules, only names, revisions and
-        // arguments (§6.3), and no step: the boundary is the main process's.
+        // The daemon's form carries no modules, only names, revisions and arguments, and no
+        // step: the boundary is the engine's.
         let bytes = prost::Message::encoded_len(&wire);
-        assert!(bytes < 512, "a precopy of one kernel is {bytes} bytes");
-        assert_eq!(
-            expected.to_command(),
-            GenerationCommand::from_command(wire, 3)
-                .expect("decodes")
-                .expect("is a package command")
-                .to_command()
-        );
+        assert!(bytes < 512, "a prepare of one kernel is {bytes} bytes");
     }
 
     #[test]
-    fn the_daemons_commit_and_revert_name_the_generation_the_process_serves() {
+    fn the_daemons_commit_and_rollback_name_the_generation_the_engine_executes() {
         use proto::process::command::Kind;
 
         for kind in [
             Kind::Commit(proto::process::Commit {}),
-            Kind::Revert(proto::process::Revert {
+            Kind::Rollback(proto::process::Rollback {
                 reason: String::new(),
             }),
         ] {
             let command =
                 GenerationCommand::from_command(proto::process::Command { kind: Some(kind) }, 7)
-                    .expect("the wire form states a package command")
-                    .expect("and it is the generation layer's");
+                    .expect("the wire form states a generation command")
+                    .expect("and it is a generation's");
             assert_eq!(command.generation(), 7);
         }
     }
 
     #[test]
-    fn a_command_outside_the_package_layer_is_none() {
+    fn a_lifecycle_command_is_no_generation_command() {
         use proto::process::command::Kind;
 
         for kind in [
-            Kind::Park(proto::process::Park {}),
             Kind::Promote(proto::process::Promote::default()),
             Kind::Drain(proto::process::Drain { epoch: 2 }),
             Kind::Pause(proto::process::Pause { paused: true }),

@@ -1,12 +1,12 @@
 //! The warming of an epoch switch: the
-//! requests in flight reach the target's cache before the switchover, so that
+//! requests in flight reach the target's cache before the switch, so that
 //! each computes at most a bounded tail again at the promotion.
 //!
 //! The pages reach a target through the host KV cache. A serving scheduler
 //! publishes every page of a request to the host as it completes, under a key
 //! of its tokens alone, and a request that migrates carries those tokens, so the
 //! target's admission finds them there and computes only the tokens past the
-//! last page the host holds. What warming adds is the wait: the switchover
+//! last page the host holds. What warming adds is the wait: the switch
 //! comes once every request's tail is within `update_config.cache_tail_tokens`.
 //!
 //! - **Rounds.** A round reads, from every scheduler, the tokens each request
@@ -24,7 +24,7 @@
 //!   ends after [`LIMIT`]: the requests past the limit compute their tail on the
 //!   target, which costs time and no correctness, and the report says so.
 //!
-//! A deployment without a host KV cache answers no request and warms nothing.
+//! A deployment without a host KV cache reports no request and warms nothing.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -62,7 +62,7 @@ pub(crate) struct Warming {
 ///
 /// # Errors
 ///
-/// Fails with the first answer a scheduler refused.
+/// Fails with the first read a scheduler refused.
 pub(crate) async fn warm<Ask, Asked>(
     mut ask: Ask,
     tail_tokens: Option<u32>,
@@ -146,7 +146,7 @@ mod tests {
         }
     }
 
-    /// One round of a source's reads, answered at once.
+    /// One round of a source's reads, ready at once.
     type Round = std::future::Ready<Result<Vec<Snapshot>, String>>;
 
     /// The prefill budgets a source was given, in the order it was given them.
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(warming.tail_tokens, 1000);
     }
 
-    /// A deployment without a host KV cache answers no request: nothing waits.
+    /// A deployment without a host KV cache reports no request: nothing waits.
     #[tokio::test]
     async fn no_request_warms_nothing() {
         let (ask, _) = source(vec![Vec::new()]);
