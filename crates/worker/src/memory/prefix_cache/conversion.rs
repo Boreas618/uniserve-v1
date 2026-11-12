@@ -301,10 +301,10 @@ impl Conversion {
             let slots =
                 (STAGING_BYTES / shape.page_bytes.max(1)).clamp(1, u64::from(width.max(1))) as u32;
             let bytes = u64::from(slots) * shape.page_bytes;
-            let got = retained.call("a converted-load staging tensor", |client| {
+            let (_, descriptors) = retained.call("a converted-load staging tensor", |client| {
                 client.allocate_host(key, format!("converted-load staging {index}"), bytes)
             })?;
-            let (_, descriptor) = got.storages.into_iter().next().ok_or_else(|| {
+            let descriptor = descriptors.into_iter().next().ok_or_else(|| {
                 Error::Interface("a staging tensor arrived without its storage".into())
             })?;
             let storage = Storage::map_host(descriptor, bytes as usize, device, true)?;

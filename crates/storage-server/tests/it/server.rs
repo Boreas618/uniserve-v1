@@ -215,7 +215,7 @@ fn a_published_read_only_tensor_is_shared_with_other_workers_and_retained_by_sco
 
     // Rank 1 maps the same bytes; one storage travels for both tensors.
     let mut second = worker(&server.socket, scope("text", 1), 1, claim);
-    let got = second
+    let (got, descriptors) = second
         .get(vec![key(1), key(2), key(3)], Mode::Read, Vec::new())
         .unwrap();
     assert_eq!(got.missing, vec![key(3)]);
@@ -227,7 +227,7 @@ fn a_published_read_only_tensor_is_shared_with_other_workers_and_retained_by_sco
             .collect::<Vec<_>>(),
         vec![("a", 0), ("b", 4)]
     );
-    let (_, descriptor) = got.storages.into_iter().next().unwrap();
+    let descriptor = descriptors.into_iter().next().unwrap();
     assert_eq!(contents(descriptor), b"abcdefgh");
 
     // The tensors live while some scope retains them.
@@ -343,6 +343,7 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
         first
             .get(vec![key(1), key(2)], Mode::Read, Vec::new())
             .unwrap()
+            .0
             .missing,
         vec![]
     );
@@ -352,11 +353,11 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
     first
         .rekey(vec![(key(1), key(11)), (key(2), key(12))], Vec::new())
         .unwrap();
-    let got = second
+    let (got, descriptors) = second
         .get(vec![key(1), key(11), key(12)], Mode::Read, Vec::new())
         .unwrap();
     assert_eq!(got.missing, vec![key(1)]);
-    let (_, descriptor) = got.storages.into_iter().next().unwrap();
+    let descriptor = descriptors.into_iter().next().unwrap();
     assert_eq!(contents(descriptor), b"abcdefgh");
     let listing = first.list().unwrap();
     let a = listing
@@ -407,7 +408,7 @@ fn write_access_to_an_exclusive_tensor_passes_on_by_release() {
     );
 
     writer.release(vec![key(9)]).unwrap();
-    let got = other.get(vec![key(9)], Mode::Write, Vec::new()).unwrap();
+    let (got, _) = other.get(vec![key(9)], Mode::Write, Vec::new()).unwrap();
     assert_eq!(got.tensors.len(), 1);
     let pid = std::process::id() as i32;
     let listing = other.list().unwrap();
@@ -531,7 +532,7 @@ fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
     // The next launch of the same scope takes the tensor: the server kills
     // the child, waits for it to exit and hands write access on.
     let mut relaunched = worker(&server.socket, scope("flow", 0), 2, claim);
-    let got = relaunched
+    let (got, descriptors) = relaunched
         .get(vec![key(5)], Mode::Write, Vec::new())
         .unwrap();
     assert_eq!(got.tensors.len(), 1);
@@ -540,7 +541,7 @@ fn a_relaunched_worker_takes_write_access_by_shooting_down_its_predecessor() {
         std::os::unix::process::ExitStatusExt::signal(&status),
         Some(libc::SIGKILL)
     );
-    let (_, descriptor) = got.storages.into_iter().next().unwrap();
+    let descriptor = descriptors.into_iter().next().unwrap();
     assert_eq!(contents(descriptor), [3; 4]);
 }
 
@@ -577,7 +578,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
         kv_head_count: 2,
         page_bytes: 16,
     };
-    let answer = worker
+    let (response, descriptors) = worker
         .call(
             &Request::Pool {
                 shape,
@@ -587,10 +588,10 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
             &[],
         )
         .unwrap();
-    let Response::Pool { pool, slots, .. } = answer.reply else {
-        panic!("a page pool request answered {:?}", answer.reply);
+    let Response::Pool { pool, slots, .. } = response else {
+        panic!("a page pool request answered {response:?}");
     };
-    assert_eq!((slots, answer.descriptors.len()), (4, 1));
+    assert_eq!((slots, descriptors.len()), (4, 1));
 
     // The head reaches the pool from another host.
     let mut remote = Client::connect_tcp(
@@ -601,7 +602,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
         },
     )
     .unwrap();
-    let mut ask = |request: Request| remote.call(&request, &[]).unwrap().reply;
+    let mut ask = |request: Request| remote.call(&request, &[]).unwrap().0;
     let Response::Reserved { slots } = ask(Request::Reserve {
         pool,
         writer: Some(scope("text", 0)),
@@ -698,7 +699,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the page pool was refused");
     };
@@ -733,7 +734,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the reservation was refused");
     };
@@ -765,7 +766,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         results: vec![true],
     };
     assert_eq!(
-        connector.call(&finished, &[]).unwrap().reply,
+        connector.call(&finished, &[]).unwrap().0,
         Response::Finished
     );
 
@@ -793,7 +794,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         )
         .unwrap();
     assert_eq!(
-        head.wait(lookup).unwrap().reply,
+        head.wait(lookup).unwrap().0,
         Response::Lookup {
             levels: vec![PageLevel::Host, PageLevel::Storage, PageLevel::Absent]
         }
@@ -806,10 +807,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
         keys: vec![key(1), key(2), key(3)],
         tag: 7,
     };
-    assert_eq!(
-        head.call(&prefetch, &[]).unwrap().reply,
-        Response::Prefetching
-    );
+    assert_eq!(head.call(&prefetch, &[]).unwrap().0, Response::Prefetching);
     let (Event::Download { task, pages, .. }, _) = next_event(&mut connector) else {
         panic!("the prefetch did not reach the connector");
     };
@@ -847,7 +845,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
     next_event(&mut connector);
     drop(connector);
     assert_eq!(
-        head.wait(lookup).unwrap().reply,
+        head.wait(lookup).unwrap().0,
         Response::Lookup {
             levels: vec![PageLevel::Host, PageLevel::Host, PageLevel::Absent]
         }
@@ -886,7 +884,7 @@ fn page_pool(worker: &mut Client, bytes: Option<u64>) -> Result<(u64, u64), Erro
         kv_head_count: 2,
         page_bytes: 16,
     };
-    let answer = worker.call(
+    let (response, _) = worker.call(
         &Request::Pool {
             shape,
             numa_node: None,
@@ -894,7 +892,7 @@ fn page_pool(worker: &mut Client, bytes: Option<u64>) -> Result<(u64, u64), Erro
         },
         &[],
     )?;
-    match answer.reply {
+    match response {
         Response::Pool { pool, slots, .. } => Ok((pool, slots)),
         reply => panic!("a page pool request answered {reply:?}"),
     }
@@ -928,7 +926,7 @@ fn page_pools_belong_to_their_deployment_and_leave_with_it() {
     let (other_pool, other_slots) = page_pool(&mut second, None).unwrap();
     assert_ne!(other_pool, pool);
     assert_eq!(other_slots, 4);
-    let lookup = other_head
+    let (lookup, _) = other_head
         .call(
             &Request::Lookup {
                 pool,
@@ -938,7 +936,7 @@ fn page_pools_belong_to_their_deployment_and_leave_with_it() {
         )
         .unwrap();
     assert!(matches!(
-        lookup.reply,
+        lookup,
         Response::Error {
             kind: ErrorKind::Invalid,
             ..
@@ -1044,7 +1042,7 @@ fn a_page_pool_the_hosts_storage_cannot_hold_is_refused() {
         kv_head_count: 2,
         page_bytes: 1 << 30,
     };
-    let refused = worker
+    let (refused, _) = worker
         .call(
             &Request::Pool {
                 shape,
@@ -1055,7 +1053,7 @@ fn a_page_pool_the_hosts_storage_cannot_hold_is_refused() {
         )
         .unwrap();
     assert!(matches!(
-        refused.reply,
+        refused,
         ::storage::protocol::Response::Error {
             kind: ErrorKind::Resource,
             ..
@@ -1127,9 +1125,9 @@ fn epochs_retain_their_own_storage_and_a_claim_retires_one() {
     let second_claim = head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
     assert_eq!(first_claim, second_claim);
     let mut second = epoch_worker(&server.socket, scope("text", 0), 2, second_claim);
-    let got = second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
+    let (got, _) = second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     assert_eq!(got.tensors.len(), 1);
-    let got = second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
+    let (got, _) = second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
     assert_eq!(got.tensors.len(), 1);
     let buffer = memfd(&[4; 4]);
     second
@@ -1208,7 +1206,7 @@ pub(crate) fn trial_pool(worker: &mut Client) -> u64 {
         kv_head_count: 2,
         page_bytes: 16,
     };
-    let answer = worker
+    let (response, _) = worker
         .call(
             &Request::Pool {
                 shape,
@@ -1218,8 +1216,8 @@ pub(crate) fn trial_pool(worker: &mut Client) -> u64 {
             &[],
         )
         .unwrap();
-    let Response::Pool { pool, .. } = answer.reply else {
-        panic!("the page pool was refused: {:?}", answer.reply);
+    let Response::Pool { pool, .. } = response else {
+        panic!("the page pool was refused: {response:?}");
     };
     pool
 }
@@ -1239,7 +1237,7 @@ pub(crate) fn publish(head: &mut Client, pool: u64, keys: &[Key]) {
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the reservation was refused");
     };
@@ -1273,7 +1271,7 @@ fn levels(head: &mut Client, pool: u64, keys: &[Key]) -> Vec<::storage::protocol
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the lookup was refused");
     };
@@ -1338,7 +1336,7 @@ fn a_epoch_on_trial_publishes_its_pages_to_itself_until_its_commit() {
     assert_eq!(keys, vec![key(2)]);
     finish(&mut connector, task, vec![false]);
     assert_eq!(
-        serving.wait(lookup).unwrap().reply,
+        serving.wait(lookup).unwrap().0,
         ::storage::protocol::Response::Lookup {
             levels: vec![PageLevel::Host, PageLevel::Absent]
         }
@@ -1354,7 +1352,7 @@ fn a_epoch_on_trial_publishes_its_pages_to_itself_until_its_commit() {
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the pin was refused");
     };
@@ -1483,7 +1481,7 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
         levels(&mut serving, pool, &[key(5)]),
         vec![PageLevel::Absent]
     );
-    let got = serving_worker
+    let (got, _) = serving_worker
         .get(vec![key(6), key(7)], Mode::Read, Vec::new())
         .unwrap();
     assert!(got.tensors.is_empty());
@@ -1497,10 +1495,10 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
             &[(host(4), serving_bytes.as_fd())],
         )
         .unwrap();
-    let mut got = trial_worker
+    let (_, mut descriptors) = trial_worker
         .get(vec![key(6)], Mode::Read, Vec::new())
         .unwrap();
-    assert_eq!(contents(got.storages.remove(0).1), b"good");
+    assert_eq!(contents(descriptors.remove(0)), b"good");
 
     // Epoch 2 reserves a page it commits only after the rollback.
     let ::storage::protocol::Response::Reserved { .. } = trial
@@ -1514,7 +1512,7 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the reservation was refused");
     };
@@ -1546,10 +1544,10 @@ fn a_rollback_discards_what_the_epoch_on_trial_published() {
     let listing = daemon.list().unwrap();
     assert_eq!(listing.page_pools[0].ready, 2, "{listing:?}");
     assert_eq!(retained_names(&mut daemon), vec!["weights"]);
-    let mut got = serving_worker
+    let (_, mut descriptors) = serving_worker
         .get(vec![key(6)], Mode::Read, Vec::new())
         .unwrap();
-    assert_eq!(contents(got.storages.remove(0).1), b"good");
+    assert_eq!(contents(descriptors.remove(0)), b"good");
 }
 
 /// What the serving epoch published stays the serving epoch's to read when
@@ -1576,7 +1574,7 @@ fn a_epoch_reads_what_it_published_that_only_a_epoch_on_trial_retains() {
     drop(serving);
 
     let mut restarted = epoch_worker(&server.socket, scope("text", 0), 1, claim);
-    let got = restarted
+    let (got, _) = restarted
         .get(vec![key(10)], Mode::Standby, Vec::new())
         .unwrap();
     assert_eq!(got.tensors.len(), 1, "{:?}", got.missing);
@@ -1595,7 +1593,7 @@ fn a_host_sizes_the_host_kv_cache_of_a_epoch_in_tokens() {
     daemon.publish(vec![1]).unwrap();
     let mut engine = engine_head(&server.socket, 1);
     let mut ask = |tokens: u64, host_bytes: Option<u64>| {
-        let answer = engine
+        let (response, _) = engine
             .call(
                 &Request::HostCache {
                     tokens,
@@ -1605,8 +1603,8 @@ fn a_host_sizes_the_host_kv_cache_of_a_epoch_in_tokens() {
                 &[],
             )
             .unwrap();
-        let Response::HostCache { tokens } = answer.reply else {
-            panic!("the host KV cache was not sized: {:?}", answer.reply);
+        let Response::HostCache { tokens } = response else {
+            panic!("the host KV cache was not sized: {response:?}");
         };
         tokens
     };
@@ -1631,9 +1629,9 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
             assert!(worker.list().unwrap().tensors.is_empty());
             continue;
         }
-        let got = result.unwrap();
+        let (got, descriptors) = result.unwrap();
         assert_eq!(got.tensors[0].shape, [4096]);
-        let (_, descriptor) = got.storages.into_iter().next().unwrap();
+        let descriptor = descriptors.into_iter().next().unwrap();
         let mut file = std::fs::File::from(descriptor);
         file.write_all(b"cache bytes").unwrap();
         file.seek(std::io::SeekFrom::Start(0)).unwrap();
@@ -1644,10 +1642,10 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
         drop(worker);
         assert_eq!(head.keep_weights(vec![1], vec![key(42)]).unwrap(), 0);
         let mut resumed = epoch_worker(&server.socket, scope("text", 0), 1, claim);
-        let got = resumed
+        let (_, descriptors) = resumed
             .get(vec![key(42)], Mode::Standby, Vec::new())
             .unwrap();
-        let (_, descriptor) = got.storages.into_iter().next().unwrap();
+        let descriptor = descriptors.into_iter().next().unwrap();
         let mut restored = std::fs::File::from(descriptor);
         restored.seek(std::io::SeekFrom::Start(0)).unwrap();
         restored.read_exact(&mut bytes).unwrap();
@@ -1675,7 +1673,7 @@ fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
     daemon.publish(vec![1]).unwrap();
     let mut engine = engine_head(&server.socket, 1);
     let mut ask = |tokens: u64, host_bytes: Option<u64>| {
-        let answer = engine
+        let (response, _) = engine
             .call(
                 &Request::HostCache {
                     tokens,
@@ -1685,8 +1683,8 @@ fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
                 &[],
             )
             .unwrap();
-        let Response::HostCache { tokens } = answer.reply else {
-            panic!("the host KV cache was not sized: {:?}", answer.reply);
+        let Response::HostCache { tokens } = response else {
+            panic!("the host KV cache was not sized: {response:?}");
         };
         tokens
     };
@@ -1705,7 +1703,7 @@ fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
             numa_node: None,
             bytes: Some(bytes),
         };
-        match worker.call(&request, &[]).unwrap().reply {
+        match worker.call(&request, &[]).unwrap().0 {
             Response::Pool { slots, .. } => Some(slots),
             Response::Error { .. } => None,
             reply => panic!("a page pool request answered {reply:?}"),
@@ -1732,7 +1730,7 @@ fn a_server_serves_its_own_protocol_only() {
     use ::storage::protocol::VERSION;
 
     let server = Running::start();
-    Client::connect_operator(&server.socket).unwrap();
+    Client::connect(&server.socket, Role::Operator).unwrap();
 
     let welcome = |version: u32| {
         let mut connection = ::storage::transport::Connection::new(
@@ -1801,18 +1799,19 @@ fn one_key_keeps_a_copy_at_each_location() {
         .unwrap();
 
     // A get selects the copy where the caller needs it, or every copy.
-    let got = second.get(vec![key(1)], Mode::Read, vec![far]).unwrap();
+    let (got, descriptors) = second.get(vec![key(1)], Mode::Read, vec![far]).unwrap();
     assert_eq!(got.storages.len(), 1);
-    let (record, descriptor) = got.storages.into_iter().next().unwrap();
+    let (record, descriptor) = got.storages.into_iter().zip(descriptors).next().unwrap();
     assert_eq!(record.location, far);
     assert_eq!(contents(descriptor), b"bbbb");
-    let every = second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
+    let (every, _) = second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     assert_eq!(every.storages.len(), 2);
     let elsewhere = Location::Host { numa_node: Some(2) };
     assert_eq!(
         second
             .get(vec![key(1)], Mode::Read, vec![elsewhere])
             .unwrap()
+            .0
             .missing,
         vec![key(1)]
     );
@@ -1825,19 +1824,19 @@ fn one_key_keeps_a_copy_at_each_location() {
             &[(on(far), storage.as_fd())],
         )
         .unwrap();
-    let got = first.get(vec![key(1)], Mode::Read, vec![far]).unwrap();
-    let (_, descriptor) = got.storages.into_iter().next().unwrap();
+    let (_, descriptors) = first.get(vec![key(1)], Mode::Read, vec![far]).unwrap();
+    let descriptor = descriptors.into_iter().next().unwrap();
     assert_eq!(contents(descriptor), b"bbbb");
 
     // Rekeying moves the selected copy only.
     first.rekey(vec![(key(1), key(2))], vec![near]).unwrap();
-    let got = first
+    let (got, _) = first
         .get(vec![key(1), key(2)], Mode::Read, Vec::new())
         .unwrap();
     let mut held: Vec<(Key, Location)> = got
         .tensors
         .iter()
-        .map(|tensor| (tensor.key, got.storages[tensor.storage as usize].0.location))
+        .map(|tensor| (tensor.key, got.storages[tensor.storage as usize].location))
         .collect();
     held.sort_by_key(|(key, _)| *key);
     assert_eq!(held, vec![(key(1), far), (key(2), near)]);
@@ -2072,7 +2071,7 @@ fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
     assert_eq!(reserved(&quota, Item::CacheSegment, &[2]), 50);
     assert_eq!(reserved(&quota, Item::Exclusive, &[1]), 0);
     // A worker is no head.
-    let refused = second
+    let (refused, _) = second
         .call(
             &::storage::protocol::Request::KeepWeights {
                 epochs: vec![1],
@@ -2083,14 +2082,14 @@ fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
         .unwrap();
     assert!(
         matches!(
-            refused.reply,
+            refused,
             ::storage::protocol::Response::Error {
                 kind: ErrorKind::Invalid,
                 ..
             }
         ),
         "{:?}",
-        refused.reply
+        refused
     );
 }
 
@@ -2120,28 +2119,25 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
         )
         .unwrap();
 
-    assert_eq!(
-        server_error(head.move_weights(1, true)),
-        ErrorKind::Unavailable
-    );
+    assert_eq!(server_error(head.offload(1)), ErrorKind::Unavailable);
     assert_eq!(reserved(&quota_of(&mut head), Item::Weights, &[1]), 200);
     // Epoch 2 retains nothing; epoch 1 has nothing in host storage.
-    assert_eq!(head.move_weights(2, true).unwrap(), (0, 0));
-    assert_eq!(head.move_weights(1, false).unwrap(), (0, 0));
+    assert_eq!(head.offload(2).unwrap(), (0, 0));
+    assert_eq!(head.restore(1).unwrap(), (0, 0));
     // A worker is no head.
-    let refused = first
+    let (refused, _) = first
         .call(&::storage::protocol::Request::Offload { epoch: 1 }, &[])
         .unwrap();
     assert!(
         matches!(
-            refused.reply,
+            refused,
             ::storage::protocol::Response::Error {
                 kind: ErrorKind::Invalid,
                 ..
             }
         ),
         "{:?}",
-        refused.reply
+        refused
     );
 }
 

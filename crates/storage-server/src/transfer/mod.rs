@@ -399,19 +399,19 @@ impl Served {
     /// holds, which changes nothing here.
     fn collect(&mut self, client: &mut Client) {
         self.answers.retain(|id, answer| match client.take(*id) {
-            Some(answered) => {
-                let outcome = match answered.reply {
+            Some((response, _)) => {
+                let result = match response {
                     Response::Error { message, .. } => Err(message),
                     _ => Ok(()),
                 };
-                let _ = answer.send(outcome);
+                let _ = answer.send(result);
                 false
             }
             None => true,
         });
         self.replies.retain(|id| match client.take(*id) {
-            Some(answer) => {
-                if let Response::Error { message, .. } = answer.reply {
+            Some((response, _)) => {
+                if let Response::Error { message, .. } = response {
                     tracing::warn!(message, "the storage server refused a report");
                 }
                 false

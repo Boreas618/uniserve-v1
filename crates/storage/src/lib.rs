@@ -33,7 +33,7 @@ pub mod manifest;
 pub mod protocol;
 pub mod transport;
 
-pub use client::{Answer, Client, Got};
+pub use client::{ClaimClient, ClaimHandoff, Client};
 pub use error::{Error, Result};
 
 /// The socket of this host's Storage Server for the calling user:

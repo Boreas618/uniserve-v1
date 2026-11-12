@@ -66,7 +66,7 @@ impl HostPages {
         bytes: Option<u64>,
         what: &'static str,
     ) -> Result<Self> {
-        let answer = retained.call(what, |client| {
+        let (response, descriptors) = retained.call(what, |client| {
             client.call(
                 &Request::Pool {
                     shape,
@@ -76,13 +76,12 @@ impl HostPages {
                 &[],
             )
         })?;
-        let Response::Pool { pool, slots } = answer.reply else {
+        let Response::Pool { pool, slots } = response else {
             return Err(Error::Interface(format!(
-                "the storage server answered {what} with {:?}",
-                answer.reply
+                "the storage server answered {what} with {response:?}"
             )));
         };
-        let descriptor = answer.descriptors.into_iter().next().ok_or_else(|| {
+        let descriptor = descriptors.into_iter().next().ok_or_else(|| {
             Error::Interface(format!("{what}: the pool arrived without its storage"))
         })?;
         let page_bytes = shape.page_bytes;

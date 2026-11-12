@@ -255,7 +255,7 @@ impl<S> Servers<S> {
         let connection = self.clients[client]
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("the storage server connection failed"))?;
-        Ok(connection.call(request, &[])?.reply)
+        Ok(connection.call(request, &[])?.0)
     }
 
     /// The connection to the Storage Server of the peer host at `endpoint`
@@ -567,14 +567,14 @@ impl<S> Servers<S> {
         }
         let ids: Vec<(usize, u64)> = self.pending.keys().copied().collect();
         for id in ids {
-            let Some(response) = self.clients[id.0]
+            let Some((response, _)) = self.clients[id.0]
                 .as_mut()
                 .and_then(|client| client.take(id.1))
             else {
                 continue;
             };
             if let Some(purpose) = self.pending.remove(&id) {
-                responses.push((purpose, response.reply));
+                responses.push((purpose, response));
             }
         }
         let mut own = Vec::with_capacity(responses.len());

@@ -246,7 +246,7 @@ fn a_transfer_copies_host_regions_and_ends_complete() {
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the page pool was refused");
     };
@@ -803,7 +803,7 @@ fn an_offload_the_host_cannot_hold_is_refused_and_moves_nothing() {
         )
         .unwrap();
 
-    match head.move_weights(1, true) {
+    match head.offload(1) {
         Err(::storage::Error::Server {
             kind: ErrorKind::Resource,
             message,
@@ -1328,12 +1328,12 @@ pub(crate) mod device {
             listed.unwrap().location
         };
 
-        assert_eq!(head.move_weights(1, true).unwrap(), (1, size));
+        assert_eq!(head.offload(1).unwrap(), (1, size));
         assert_eq!(weights_on(&mut head, gpu), [(vec![1, 2], size)]);
         assert!(matches!(location(&mut head), Location::Host { .. }));
         assert_eq!(own_weights(&mut successor), own_bytes);
 
-        assert_eq!(head.move_weights(1, false).unwrap(), (1, size));
+        assert_eq!(head.restore(1).unwrap(), (1, size));
         assert_eq!(
             weights_on(&mut head, gpu),
             [(vec![1], size), (vec![1, 2], size)]

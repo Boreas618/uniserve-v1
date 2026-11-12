@@ -243,7 +243,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         Command::Restart { socket, executable } => {
             let socket = socket.unwrap_or_else(storage::default_socket);
             // A server of an earlier protocol is restarted in its own.
-            storage::Client::connect_operator(&socket)
+            storage::Client::connect(&socket, ::storage::Role::Operator)
                 .and_then(|mut operator| operator.restart(executable))
                 .map(|pid| {
                     println!("the successor server {pid} takes over once nothing is in flight")

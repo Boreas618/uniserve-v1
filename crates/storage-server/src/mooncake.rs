@@ -223,8 +223,8 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
         // The server acknowledges each report; an error names a task it no
         // longer holds, which changes nothing here.
         reports.retain(|id| match client.take(*id) {
-            Some(answer) => {
-                if let Response::Error { message, .. } = answer.reply {
+            Some((response, _)) => {
+                if let Response::Error { message, .. } = response {
                     tracing::warn!(message, "the storage server refused a task's results");
                 }
                 false

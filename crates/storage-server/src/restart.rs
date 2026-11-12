@@ -862,7 +862,7 @@ mod tests {
 
         // The same connections go on: the worker finds its tensor, the head
         // still holds the claim, and a new client reaches the socket.
-        let got = worker
+        let (got, _) = worker
             .get(vec![Key([1; 32])], Mode::Read, Vec::new())
             .unwrap();
         assert!(got.missing.is_empty());
@@ -871,7 +871,7 @@ mod tests {
         let listing = operator.list().unwrap();
         assert_eq!(listing.tensors.len(), 3);
         assert_eq!(listing.deployments.len(), 1);
-        let got = worker
+        let (got, _) = worker
             .get(vec![Key([2; 32]), Key([3; 32])], Mode::Read, Vec::new())
             .unwrap();
         assert_eq!(got.missing, vec![Key([3; 32])]);
@@ -880,6 +880,7 @@ mod tests {
             worker
                 .get(vec![Key([3; 32])], Mode::Read, Vec::new())
                 .unwrap()
+                .0
                 .missing
                 .is_empty()
         );

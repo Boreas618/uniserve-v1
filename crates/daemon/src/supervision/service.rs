@@ -37,7 +37,7 @@ use proto::process::{
 };
 use proto::{Connection, Handed, Listener};
 
-use crate::supervision::claims::{ClaimHolder, HandedClaims};
+use crate::supervision::claims::{self, ClaimHolder};
 use crate::supervision::roster::Greeting;
 use crate::supervision::supervisor::{HandedProcesses, Supervisor};
 
@@ -90,7 +90,7 @@ impl Local {
     /// Hands the supervisor's processes and the claims over: their state,
     /// and their descriptors appended to `descriptors`.
     fn hand_over(&mut self, descriptors: &mut Vec<OwnedFd>) -> anyhow::Result<HandedLocal> {
-        let (claims, claim_descriptors) = self.claims.hand_over()?;
+        let (claims, claim_descriptors) = self.claims.handoff()?;
         let (processes, process_descriptors) = self.supervisor.hand_over()?;
         let handed = HandedLocal {
             claims,
@@ -1381,7 +1381,7 @@ pub(crate) struct HandedClient {
 /// The supervisor's processes and the node's claims, as handed over.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HandedLocal {
-    claims: HandedClaims,
+    claims: claims::Handoff,
     claim_descriptors: usize,
     processes: HandedProcesses,
     process_descriptors: usize,

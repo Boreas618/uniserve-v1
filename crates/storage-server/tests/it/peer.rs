@@ -118,7 +118,7 @@ fn a_peer_pins_only_the_pages_of_published_epochs() {
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the reservation was refused");
     };
@@ -165,7 +165,7 @@ fn a_peer_pins_only_the_pages_of_published_epochs() {
             &[],
         )
         .unwrap()
-        .reply;
+        .0;
     assert!(
         matches!(
             refused,
@@ -243,7 +243,7 @@ fn a_disconnected_heads_task_reservations_end_after_its_task() {
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the reservation was refused");
     };

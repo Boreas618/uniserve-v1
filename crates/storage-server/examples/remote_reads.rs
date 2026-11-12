@@ -528,7 +528,7 @@ fn hold(options: &Options) -> anyhow::Result<()> {
         Some(Ok(Some(ShareableHandle::Fabric(handle)))) => Some(handle),
         _ => None,
     };
-    let endpoint = match head.call(&Request::Endpoint, &[])?.reply {
+    let endpoint = match head.call(&Request::Endpoint, &[])?.0 {
         Response::Endpoint { tcp: Some(tcp) } => tcp,
         other => bail!("the server accepts no other host ({other:?}): start it with --tcp"),
     };

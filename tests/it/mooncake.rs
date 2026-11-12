@@ -110,7 +110,7 @@ fn claim_pool(socket: &Path, shape: PageShape) -> (Client, Client, u64, Mapping)
         },
     )
     .unwrap();
-    let answer = worker
+    let (response, descriptors) = worker
         .call(
             &Request::Pool {
                 shape,
@@ -120,10 +120,10 @@ fn claim_pool(socket: &Path, shape: PageShape) -> (Client, Client, u64, Mapping)
             &[],
         )
         .unwrap();
-    let Response::Pool { pool, slots, .. } = answer.reply else {
-        panic!("the page pool was refused: {:?}", answer.reply);
+    let Response::Pool { pool, slots, .. } = response else {
+        panic!("the page pool was refused: {response:?}");
     };
-    let storage = answer.descriptors.into_iter().next().unwrap();
+    let storage = descriptors.into_iter().next().unwrap();
     let mapping = Mapping::new(&storage, (slots * PAGE_BYTES) as usize);
     (head, worker, pool, mapping)
 }
@@ -170,7 +170,7 @@ impl Drop for Mapping {
 }
 
 fn reply(client: &mut Client, request: Request) -> Response {
-    client.call(&request, &[]).unwrap().reply
+    client.call(&request, &[]).unwrap().0
 }
 
 #[test]

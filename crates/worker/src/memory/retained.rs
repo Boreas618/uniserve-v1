@@ -536,7 +536,7 @@ impl Retained {
         if let Some(mapped) = state.weights.get(&(device.0, key)) {
             return Ok(Some(mapped.clone()));
         }
-        let got = state
+        let (got, descriptors) = state
             .client
             .get(vec![key], Mode::Read, Vec::new())
             .map_err(|error| storage_error("taking a retained weight", error))?;
@@ -548,6 +548,7 @@ impl Retained {
         let (record, descriptor) = got
             .storages
             .into_iter()
+            .zip(descriptors)
             .nth(index)
             .ok_or_else(|| Error::Interface("a retained weight names no storage".into()))?;
         // A weight is the Storage Server's retained storage, mapped read-only by its shareable
@@ -996,7 +997,7 @@ impl ExclusiveStorage for &Retained {
         // A standby maps what its predecessor holds, and creates nothing.
         let standby = state.standby.is_some();
         let mode = if standby { Mode::Standby } else { Mode::Write };
-        let got = state
+        let (got, descriptors) = state
             .client
             .get(keys, mode, Vec::new())
             .map_err(|error| storage_error("taking exclusive storages", error))?;
@@ -1054,8 +1055,12 @@ impl ExclusiveStorage for &Retained {
             let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
             retained.release_untaken(&mut state, &taking)?;
         }
-        let mut storages: Vec<Option<(StorageRecord, std::os::fd::OwnedFd)>> =
-            got.storages.into_iter().map(Some).collect();
+        let mut storages: Vec<Option<(StorageRecord, std::os::fd::OwnedFd)>> = got
+            .storages
+            .into_iter()
+            .zip(descriptors)
+            .map(Some)
+            .collect();
         let mut found = BTreeMap::new();
         for tensor in &got.tensors {
             let (record, descriptor) = storages
@@ -1514,7 +1519,7 @@ impl Retained {
                 continue;
             }
             let asked: Vec<Key> = indices.iter().map(|&index| keys[index]).collect();
-            let got = state
+            let (got, descriptors) = state
                 .client
                 .get(asked, mode, Vec::new())
                 .map_err(|error| storage_error("taking a segmented storage", error))?;
@@ -1546,8 +1551,12 @@ impl Retained {
                 let taking = got.tensors.iter().map(|tensor| tensor.key).collect();
                 self.release_untaken(&mut state, &taking)?;
             }
-            let mut storages: Vec<Option<(StorageRecord, std::os::fd::OwnedFd)>> =
-                got.storages.into_iter().map(Some).collect();
+            let mut storages: Vec<Option<(StorageRecord, std::os::fd::OwnedFd)>> = got
+                .storages
+                .into_iter()
+                .zip(descriptors)
+                .map(Some)
+                .collect();
             for tensor in &got.tensors {
                 let (record, descriptor) = storages
                     .get_mut(tensor.storage as usize)

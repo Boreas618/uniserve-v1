@@ -108,7 +108,7 @@ impl StorageServer {
             numa_node: None,
             bytes: Some(slots * page_bytes),
         };
-        let Response::Pool { pool, .. } = worker.call(&request, &[]).unwrap().reply else {
+        let Response::Pool { pool, .. } = worker.call(&request, &[]).unwrap().0 else {
             panic!("the latent pool was refused");
         };
         self._workers.push(worker);

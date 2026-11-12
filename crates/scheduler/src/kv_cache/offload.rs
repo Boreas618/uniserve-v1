@@ -2766,7 +2766,7 @@ mod tests {
                     numa_node: None,
                     bytes: None,
                 };
-                let Response::Pool { pool, .. } = worker.call(&request, &[]).unwrap().reply else {
+                let Response::Pool { pool, .. } = worker.call(&request, &[]).unwrap().0 else {
                     panic!("the page pool was refused");
                 };
                 pool
@@ -3022,7 +3022,7 @@ mod tests {
         };
         let Response::Pool {
             pool: peer_pool, ..
-        } = peer_worker.call(&request, &[]).unwrap().reply
+        } = peer_worker.call(&request, &[]).unwrap().0
         else {
             panic!("the page pool was refused");
         };
@@ -3191,7 +3191,7 @@ mod tests {
         };
         let Response::Pool {
             pool: peer_pool, ..
-        } = peer_worker.call(&request, &[]).unwrap().reply
+        } = peer_worker.call(&request, &[]).unwrap().0
         else {
             panic!("the page pool was refused");
         };

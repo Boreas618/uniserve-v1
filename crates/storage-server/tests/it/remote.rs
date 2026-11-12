@@ -52,7 +52,7 @@ fn rdma_host() -> Running {
 /// The endpoint other hosts reach the server on `socket` at.
 fn endpoint(socket: &Path) -> String {
     let mut operator = Client::connect(socket, Role::Operator).unwrap();
-    match operator.call(&Request::Endpoint, &[]).unwrap().reply {
+    match operator.call(&Request::Endpoint, &[]).unwrap().0 {
         Response::Endpoint { tcp: Some(tcp) } => tcp,
         other => panic!("the server names no endpoint: {other:?}"),
     }
@@ -220,7 +220,7 @@ fn page_pool(worker: &mut Client, page_bytes: u64, slots: u64) -> (u64, std::fs:
         kv_head_count: 2,
         page_bytes,
     };
-    let answer = worker
+    let (response, descriptors) = worker
         .call(
             &Request::Pool {
                 shape,
@@ -230,14 +230,10 @@ fn page_pool(worker: &mut Client, page_bytes: u64, slots: u64) -> (u64, std::fs:
             &[],
         )
         .unwrap();
-    let Response::Pool { pool, .. } = answer.reply else {
-        panic!("the page pool was refused: {:?}", answer.reply);
+    let Response::Pool { pool, .. } = response else {
+        panic!("the page pool was refused: {response:?}");
     };
-    let storage = answer
-        .descriptors
-        .into_iter()
-        .next()
-        .expect("the pool's storage");
+    let storage = descriptors.into_iter().next().expect("the pool's storage");
     (pool, std::fs::File::from(storage))
 }
 
@@ -260,7 +256,7 @@ fn reserve(
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the reservation was refused");
     };

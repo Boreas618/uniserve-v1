@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ::storage::Client;
 use ::storage::connector::Settings;
+use ::storage::{Client, Role};
 use anyhow::Context;
 
 use crate::transfer::storage_name;
@@ -139,7 +139,7 @@ pub fn run_transfer_server(
 ///
 /// Fails when the server cannot be reached or refuses the listing.
 pub fn list(socket: &Path) -> ::storage::Result<()> {
-    let mut client = Client::connect_operator(socket)?;
+    let mut client = Client::connect(socket, Role::Operator)?;
     let listing = client.list()?;
     for tensor in &listing.tensors {
         let scopes: Vec<String> = tensor.scopes.iter().map(ToString::to_string).collect();
@@ -232,7 +232,7 @@ pub fn list(socket: &Path) -> ::storage::Result<()> {
 /// Fails when the server cannot be reached, or refuses because the
 /// deployment's head is connected.
 pub fn retire(socket: &Path, deployment: &str) -> ::storage::Result<()> {
-    let mut client = Client::connect_operator(socket)?;
+    let mut client = Client::connect(socket, Role::Operator)?;
     let released = client.retire(deployment.to_owned())?;
     println!("released {released} tensors of {deployment}");
     Ok(())
