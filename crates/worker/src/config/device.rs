@@ -1,4 +1,4 @@
-//! Device names and tower layout, parsed without the numerical library.
+//! Device names, parsed without the numerical library.
 //!
 //! A rank names devices with torch's spelling (`cpu`, `cuda`, `cuda:N`); the
 //! worker accepts exactly that grammar. A bare `cuda` resolves to `cuda:0`
@@ -7,21 +7,29 @@
 
 use platform::DeviceId;
 
-use super::DescriptorError;
+use crate::{Error, Result};
 
-/// A device a rank computes on, parsed once from the launch descriptor.
+/// A device a rank computes on, parsed once from the engine's launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Device {
+    /// The host.
     Cpu,
     /// A CUDA device within the process's visible devices.
     Cuda(DeviceId),
 }
 
 impl Device {
-    /// Parse a torch device name. `option` names the launch setting in errors.
-    pub fn parse(value: &str, option: &str) -> Result<Self, DescriptorError> {
+    /// Parses a torch device name. `option` names the launch setting in the
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when `value` is not `cpu`, `cuda` or `cuda:N` with
+    /// a non-negative `N`.
+    pub fn parse(value: &str, option: &str) -> Result<Self> {
         let invalid =
-            || DescriptorError::new(format!("{option} must name a torch device, got {value:?}"));
+            || Error::Invalid(format!("{option} must name a torch device, got {value:?}"));
+
         match value.trim() {
             "cpu" => Ok(Self::Cpu),
             "cuda" => Ok(Self::Cuda(DeviceId(0))),
@@ -36,7 +44,8 @@ impl Device {
         }
     }
 
-    pub(crate) fn is_cuda(self) -> bool {
+    /// Whether the device is a CUDA device.
+    pub fn is_cuda(self) -> bool {
         matches!(self, Self::Cuda(_))
     }
 }

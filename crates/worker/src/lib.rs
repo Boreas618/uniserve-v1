@@ -23,6 +23,7 @@
 //! | --- | --- |
 //! | [`buckets`] | [`Bucket`](buckets::Bucket), the key that fixes a graph's shapes, and the bucket sets a runner captures |
 //! | [`completion`] | How an operation ended and the completion its waiters share, over the crate's error |
+//! | [`config`] | The devices a rank computes on, as an engine's launch names them |
 //! | [`error`] | The crate's one error and its classification for the engine |
 //! | [`graphs`] | [`Graphs`]: the profile run, capture, replay through the input buffer, and the switch of generations, for every runner |
 //! | [`runner`] | The [`Runner`] interface a stage's runner implements |
@@ -42,6 +43,7 @@
 
 pub mod buckets;
 pub mod completion;
+pub mod config;
 pub mod error;
 pub mod graphs;
 pub mod profiling;
