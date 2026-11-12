@@ -18,6 +18,7 @@ members = [
     "crates/manager",
     "crates/media",
     "crates/models/qwen3",
+    "crates/models/qwen4-exp",
     "crates/models/minimax-h3",
     "crates/nixl",
     "crates/nn",
@@ -95,6 +96,7 @@ media = { path = "crates/media" }
 nn = { path = "crates/nn" }
 ops = { path = "crates/ops" }
 qwen3 = { path = "crates/models/qwen3" }
+qwen4-exp = { path = "crates/models/qwen4-exp" }
 minimax-h3 = { path = "crates/models/minimax-h3" }
 nixl = { path = "crates/nixl" }
 processing = { path = "crates/processing" }
