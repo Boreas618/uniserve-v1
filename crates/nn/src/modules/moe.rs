@@ -32,7 +32,9 @@
 //!
 //! Over a tensor-parallel group ([`MoEConfig::split`]) a rank holds its block of every expert's
 //! intermediate width, so its output is a partial sum that [`MoE::forward`] reduces over the
-//! group. Over an expert group ([`MoEConfig::exchange`]) a rank holds a window of the slots and
+//! group. Packed experts are split the same way, each rank's block padded with zero rows and
+//! columns to whole row tiles of the grouped products ([`Nvfp4Share`]): the products then run
+//! at the padded width, and the zeros contribute nothing. Over an expert group ([`MoEConfig::exchange`]) a rank holds a window of the slots and
 //! the block runs through the group's exchange, whose rows execution lends
 //! ([`ExpertExchange`]): the routes travel to the ranks that hold their experts, and each
 //! token's sums come back.
@@ -50,9 +52,14 @@ use crate::functional::{
 };
 use crate::modules::linear::{Linear, LinearConfig, Parallel};
 use crate::modules::mlp::{Mlp, MlpConfig};
-use crate::quantization::{Nvfp4Names, Nvfp4Stack, Scheme, ValueLayout};
+use crate::quantization::{Nvfp4Names, Nvfp4Share, Nvfp4Stack, Scheme, ValueLayout};
 use crate::var_builder::VarBuilder;
 use crate::weights::{PartBlock, WeightLayout, WeightSource, extents};
+
+/// The intermediate columns a rank's block of packed experts is padded to: the gated product's
+/// `2 · intermediate` rows are whole 128-row tiles (vLLM pads the family's 160 to 192,
+/// `refs/qwen-kernel-challenge/packages/_common/nvfp4.py:98-126`).
+const PACKED_TILE: u32 = 64;
 
 /// The class the per-expert tables of a fused exchange are filed under: the producer of their
 /// retained keys. Its text is part of every stored key, so it does not follow the type's name.
@@ -231,18 +238,35 @@ impl MoE {
 
         let list = vb.pp(config.list);
         let packed = list.pp(window[0]).pp(config.up).scheme("weight") == Scheme::Nvfp4;
-        let stacks = if packed {
-            if split.size > 1 {
+        let (stacks, intermediate) = if packed {
+            // A rank's block of packed experts: whole bytes and block scales of every row,
+            // padded to whole row tiles of the products.
+            let padded = intermediate.next_multiple_of(PACKED_TILE);
+            let share = (split.size > 1).then_some((
+                u64::from(split.rank * intermediate),
+                u64::from(intermediate),
+                u64::from(padded),
+            ));
+            if share.is_some() && (exchange.size > 1 || !intermediate.is_multiple_of(16)) {
                 return Err(refuse(format!(
-                    "packed experts are whole on a rank, and a tensor group of {} splits their \
-                     width",
+                    "packed experts split over a tensor group of {} hold blocks of {intermediate} \
+                     columns: whole block scales of sixteen, and no expert group beside it",
                     split.size
                 )));
             }
-            Self::load_packed(config, &vb, window, exchange.size > 1)?
+
+            let width = if share.is_some() {
+                padded
+            } else {
+                intermediate
+            };
+            (
+                Self::load_packed(config, &vb, window, exchange.size > 1, share)?,
+                width,
+            )
         } else {
             let (up_gate, down) = Self::load_dense(config, &vb, window)?;
-            Experts::Dense { up_gate, down }
+            (Experts::Dense { up_gate, down }, intermediate)
         };
 
         Ok(Self {
@@ -371,12 +395,14 @@ impl MoE {
 
     /// The packed stacks of the experts `window` names: in the fused exchange's arrangement
     /// with its per-expert tables when the experts are `exchanged` over a group, and in the
-    /// routed products' otherwise.
+    /// routed products' otherwise. `share` is a tensor-parallel rank's block of every expert's
+    /// intermediate width, `(first, count, padded)` in columns, or `None` for whole experts.
     fn load_packed(
         config: &MoEConfig,
         vb: &VarBuilder<'_, '_>,
         window: &[u32],
         exchanged: bool,
+        share: Option<(u64, u64, u64)>,
     ) -> Result<Experts> {
         let loader = vb.loader();
         let list = vb.pp(config.list);
@@ -388,7 +414,19 @@ impl MoE {
 
         // The checkpoint's block scales are linear, and the published tables are built from
         // them once here.
-        let (up_gate, up_scales) = loader.nvfp4_stack(
+        // A gate or up projection is `[intermediate, hidden]`, so a rank's block is its rows;
+        // a down projection is `[hidden, intermediate]`, so a rank's block is its columns.
+        let rows = share.map(|(first, count, padded)| Nvfp4Share::Rows {
+            first,
+            count,
+            padded,
+        });
+        let columns = share.map(|(first, count, padded)| Nvfp4Share::Columns {
+            first,
+            count,
+            padded,
+        });
+        let (up_gate, up_scales) = loader.nvfp4_stack_share(
             &vb.name("experts.up_gate"),
             list.path(),
             &[config.up, config.gate],
@@ -397,8 +435,9 @@ impl MoE {
             Nvfp4Names::vllm(),
             (gated_layout, WEIGHT_SCALE_LAYOUT),
             true,
+            rows,
         )?;
-        let (down, down_scales) = loader.nvfp4_stack(
+        let (down, down_scales) = loader.nvfp4_stack_share(
             &vb.name("experts.down"),
             list.path(),
             &[config.down],
@@ -407,8 +446,12 @@ impl MoE {
             Nvfp4Names::vllm(),
             (down_layout, WEIGHT_SCALE_LAYOUT),
             true,
+            columns,
         )?;
-        Self::check_packed(config, vb, window.len(), &up_gate, &down)?;
+        let width = share.map_or(config.intermediate as usize, |(_, _, padded)| {
+            padded as usize
+        });
+        Self::check_packed(config, vb, window.len(), width, &up_gate, &down)?;
 
         if !exchanged {
             return Ok(Experts::Packed { up_gate, down });
@@ -451,17 +494,18 @@ impl MoE {
         })
     }
 
-    /// Checks that packed stacks of `held` experts are the extents and types the block's
-    /// config states and its products read.
+    /// Checks that packed stacks of `held` experts of `intermediate` columns are the extents
+    /// and types the block's config states and its products read.
     fn check_packed(
         config: &MoEConfig,
         vb: &VarBuilder<'_, '_>,
         held: usize,
+        intermediate: usize,
         up_gate: &Nvfp4Stack,
         down: &Nvfp4Stack,
     ) -> Result<()> {
         let refuse = |problem: String| Error::weight(vb.path(), problem);
-        let (hidden, intermediate) = (config.hidden as usize, config.intermediate as usize);
+        let hidden = config.hidden as usize;
 
         let up_gate_dims = [held, 2 * intermediate, hidden / 2];
         let down_dims = [held, hidden, intermediate / 2];

@@ -161,6 +161,7 @@ fn gated_rms_norm_normalizes_then_gates_by_the_silu() {
         &tensor(&gate, (2, 4), DType::F32),
         &tensor(&weight, 4, DType::F32),
         1e-6,
+        false,
     )
     .unwrap();
 
@@ -218,7 +219,7 @@ fn a_normalization_refuses_a_weight_of_another_width() {
     for refused in [
         functional::rms_norm(&x, &weight, 1e-6, false, DType::F32),
         functional::layer_norm(&x, &weight, None, 1e-6),
-        functional::gated_rms_norm(&x, &x, &weight, 1e-6),
+        functional::gated_rms_norm(&x, &x, &weight, 1e-6, false),
     ] {
         assert!(matches!(refused, Err(nn::Error::Shape { .. })));
     }
@@ -703,7 +704,7 @@ fn the_normalizations_state_their_kernels() {
         let narrowed =
             functional::rms_norm(&stream, &meta(8, DType::F32), 1e-6, false, DType::BF16)?;
         let (normalized, sum) = functional::add_rms_norm(&x, &plain, &weight, 1e-6, false)?;
-        let gated = functional::gated_rms_norm(&x, &centred, &weight, 1e-6)?;
+        let gated = functional::gated_rms_norm(&x, &centred, &weight, 1e-6, false)?;
         let layer = functional::layer_norm(&x, &weight, Some(&weight), 1e-5)?;
 
         Ok([plain, centred, narrowed, normalized, sum, gated, layer]

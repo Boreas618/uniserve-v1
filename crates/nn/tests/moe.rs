@@ -131,6 +131,46 @@ fn topk_softmax_keeps_the_most_probable_experts_and_renormalizes_them() {
     }
 }
 
+/// The widest served block routes each token to ten of 512 experts (Qwen3.8 Flash Next):
+/// the formula keeps the ten most probable, and the launch states their counts in its key.
+#[test]
+fn topk_softmax_routes_ten_of_five_hundred_and_twelve_experts() {
+    let (tokens, experts, top) = (3, 512, 10);
+    assert!(ops::moe::routing::MAX_EXPERTS >= experts as u32);
+    assert!(ops::moe::routing::MAX_TOP >= top as u32);
+
+    let scores = sequence(tokens * experts, 77);
+    let (expected_ids, expected_weights) = route_by_hand(&scores, experts, top);
+    let (ids, weights) = functional::topk_softmax(
+        &tensor(&scores, (tokens, experts), DType::F32),
+        top as u32,
+        true,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(entries(&ids), expected_ids);
+    assert_close(&values(&weights), &expected_weights, F32_TOLERANCE);
+
+    let (routed, launches) = recorded(|| {
+        functional::topk_softmax(
+            &meta((tokens, experts), DType::BF16),
+            top as u32,
+            true,
+            None,
+            None,
+        )
+    });
+    routed.unwrap();
+    assert_eq!(
+        launches,
+        [(
+            "topk_softmax",
+            "scores_bf16_experts_512_top_10_renormalize_true_scale_none".to_owned()
+        )]
+    );
+}
+
 #[test]
 fn topk_softmax_scales_by_the_expert_and_writes_each_route_s_slot() {
     let (tokens, experts, top) = (3, 5, 2);

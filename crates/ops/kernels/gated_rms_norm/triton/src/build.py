@@ -36,8 +36,10 @@ def spec(fields, parameters, target):
             "columns": "i32",
             "eps": "fp32",
             "BLOCK": "constexpr",
+            "SIGMOID": "constexpr",
         },
-        "constexprs": {"BLOCK": tile},
+        # A key without `gate` is the SiLU gate's.
+        "constexprs": {"BLOCK": tile, "SIGMOID": fields.get("gate", "silu") == "sigmoid"},
         "options": {"num_warps": warps_of(tile)},
     }
 

@@ -7,13 +7,22 @@
 //! qkv = in_proj_qkv(x)                       [q | k | v], key heads, key heads, value heads
 //! qkv = causal_conv1d(qkv)                   depthwise, SiLU, continuing from the slot's inputs
 //! o   = gated_delta_rule(q, k, v, a = in_proj_a(x), b = in_proj_b(x))
-//! o   = rms_norm(o) · weight · silu(in_proj_z(x))     per value head
+//! o   = rms_norm(o) · weight · act(in_proj_z(x))      per value head, act SiLU or sigmoid
 //! out = out_proj(o)
 //! ```
 //!
 //! Both recurrent stages read and advance the state the batch's request slots keep: field 0 of
 //! a layer's buffers is the convolution's last inputs, field 1 the delta rule's matrices
 //! ([`GatedDeltaNetConfig::state_fields`]).
+//!
+//! ## Tensor parallelism
+//!
+//! A rank of a tensor-parallel group holds a contiguous run of the key heads and the value
+//! heads they serve (vLLM's shards, `refs/vllm/vllm/models/qwen4_exp/nvidia/low_latency_gemm.py:27-65`):
+//! its rows of `in_proj_qkv` (three runs, one of each of `q`, `k` and `v`), of `in_proj_z`,
+//! `in_proj_b` and `in_proj_a`, its channels of the convolution, its entries of `A_log` and
+//! `dt_bias`, and its columns of `out_proj`, whose partial products the group sums. The state
+//! is the rank's heads' own.
 
 use uniserve_tensor::{DType, Tensor};
 
@@ -21,10 +30,11 @@ use crate::capability::{RecurrentState, TokenBatch};
 use crate::collective::Split;
 use crate::error::{Error, Result};
 use crate::family::StateField;
-use crate::functional;
+use crate::functional::{self, StateAxes, WeightOrder};
 use crate::modules::linear::{Linear, LinearConfig, Parallel};
 use crate::modules::norm::{GatedRmsNorm, GatedRmsNormConfig};
 use crate::var_builder::VarBuilder;
+use crate::weights::{PartBlock, WeightLayout, WeightSource, extents};
 
 /// The field of a layer's state that holds the convolution's last inputs.
 const CONV_FIELD: usize = 0;
@@ -49,37 +59,48 @@ pub struct GatedDeltaNetConfig {
     pub conv_width: u32,
     /// The output norm's variance floor.
     pub eps: f32,
-    /// The tensor-parallel split; a gated delta network is served on one rank.
+    /// Whether the output norm's gate passes through a sigmoid in place of the SiLU
+    /// (`output_gate_type: "sigmoid"`).
+    pub sigmoid_gate: bool,
+    /// The order of a stored state's matrix axes.
+    pub axes: StateAxes,
+    /// The tokens a step of the deployment drafts: the rows a slot's convolution window holds
+    /// beyond its history ([`crate::capability::VerifySlots`]); zero for a deployment whose
+    /// requests own one slot.
+    pub draft_tokens: u32,
+    /// The tensor-parallel split of the heads.
     pub split: Split,
 }
 
 impl GatedDeltaNetConfig {
-    /// Channels the short convolution mixes: the queries, the keys and the values.
+    /// Channels the short convolution mixes on this rank: its queries, keys and values.
     pub const fn conv_channels(&self) -> u32 {
-        2 * self.key_heads * self.key_dim + self.value_heads * self.value_dim
+        (2 * self.key_heads * self.key_dim + self.value_heads * self.value_dim) / self.split.size
     }
 
-    /// The state one layer keeps per request slot, in the order its buffers are lent to it:
-    /// the convolution's last inputs in the activations' type `dtype`, then the delta rule's
-    /// FP32 matrices.
+    /// The state one layer keeps per request slot on this rank, in the order its buffers are
+    /// lent to it: the convolution's window in the activations' type `dtype`, then the delta
+    /// rule's FP32 matrices in the order [`Self::axes`] states.
     pub fn state_fields(&self, dtype: DType) -> Vec<StateField> {
+        let heads = (self.value_heads / self.split.size) as usize;
+        let (key, value) = (self.key_dim as usize, self.value_dim as usize);
+
         vec![
             StateField {
                 name: "conv",
                 dtype,
                 dims: vec![
-                    self.conv_width.saturating_sub(1) as usize,
+                    (self.conv_width.saturating_sub(1) + self.draft_tokens) as usize,
                     self.conv_channels() as usize,
                 ],
             },
             StateField {
                 name: "recurrent",
                 dtype: DType::F32,
-                dims: vec![
-                    self.value_heads as usize,
-                    self.key_dim as usize,
-                    self.value_dim as usize,
-                ],
+                dims: match self.axes {
+                    StateAxes::KeyValue => vec![heads, key, value],
+                    StateAxes::ValueKey => vec![heads, value, key],
+                },
             },
         ]
     }
@@ -103,15 +124,14 @@ pub struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
-    /// The network the module at `vb` states: its four input projections, the depthwise
-    /// `conv1d.weight` of `[channels, 1, width]`, the per-head `A_log` and `dt_bias`, the
-    /// output `norm` and `out_proj`.
+    /// The network the module at `vb` states, at this rank's share of its heads: its four
+    /// input projections, the depthwise `conv1d.weight` of `[channels, 1, width]`, the
+    /// per-head `A_log` and `dt_bias`, the output `norm` and `out_proj`.
     ///
     /// # Errors
     ///
     /// A module the loader refuses, value heads the key heads do not group, head widths the
-    /// convolved row is not whole heads of, or a split of more than one rank: the
-    /// convolution's channels interleave three head windows, which no loaded layout shards.
+    /// convolved row is not whole heads of, or a split that does not divide the key heads.
     pub fn load(config: &GatedDeltaNetConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
         if config.key_heads == 0 || !config.value_heads.is_multiple_of(config.key_heads) {
             return Err(Error::weight(
@@ -123,72 +143,140 @@ impl GatedDeltaNet {
             ));
         }
 
+        let split = config.split;
+        if split.size == 0
+            || split.rank >= split.size
+            || !config.key_heads.is_multiple_of(split.size)
+        {
+            return Err(Error::weight(
+                vb.path(),
+                format!(
+                    "rank {} of a tensor group of {} does not hold a share of {} key heads",
+                    split.rank, split.size, config.key_heads
+                ),
+            ));
+        }
+
         // The delta rule reads the queries, keys and values as three runs of heads of one
         // convolved row, each a view of the row's own elements ([`heads_of_rows`]).
         let (key_width, value_width) = (
             config.key_heads * config.key_dim,
             config.value_heads * config.value_dim,
         );
+        let (local_key, local_value) = (key_width / split.size, value_width / split.size);
         if config.key_dim == 0
             || config.value_dim == 0
-            || !value_width.is_multiple_of(config.key_dim)
-            || !(2 * key_width).is_multiple_of(config.value_dim)
+            || !local_value.is_multiple_of(config.key_dim)
+            || !(2 * local_key).is_multiple_of(config.value_dim)
         {
             return Err(Error::weight(
                 vb.path(),
                 format!(
                     "heads of {} and {} elements do not both divide a convolved row of {} query \
-                     and key channels and {value_width} value channels",
+                     and key channels and {local_value} value channels",
                     config.key_dim,
                     config.value_dim,
-                    2 * key_width
-                ),
-            ));
-        }
-        if config.split.size != 1 {
-            return Err(Error::weight(
-                vb.path(),
-                format!(
-                    "a gated delta network is served on one tensor rank, not {}",
-                    config.split.size
+                    2 * local_key
                 ),
             ));
         }
 
-        let channels = config.conv_channels();
-        let projection = |module: &str, inputs: u32, outputs: u32| {
+        let parallel = |parallel: fn(Split) -> Parallel| {
+            if split.size == 1 {
+                Parallel::None
+            } else {
+                parallel(split)
+            }
+        };
+        let projection = |module: &str, inputs: u32, outputs: u32, parallel: Parallel| {
             Linear::load(
                 &LinearConfig {
                     inputs,
                     outputs,
                     bias: false,
-                    parallel: Parallel::None,
+                    parallel,
                 },
                 vb.pp(module),
             )
         };
 
-        let in_proj_qkv = projection("in_proj_qkv", config.hidden, channels)?;
-        let in_proj_z = projection("in_proj_z", config.hidden, value_width)?;
-        let in_proj_b = projection("in_proj_b", config.hidden, config.value_heads)?;
-        let in_proj_a = projection("in_proj_a", config.hidden, config.value_heads)?;
+        // This rank's runs of the `[q | k | v]` rows: `rows` elements a row, in a tensor whose
+        // rows are `row` elements apart.
+        let rank = u64::from(split.rank);
+        let (local_key, local_value) = (u64::from(local_key), u64::from(local_value));
+        let runs = |row: u64| -> Vec<PartBlock> {
+            [
+                (rank * local_key, local_key),
+                (u64::from(key_width) + rank * local_key, local_key),
+                (2 * u64::from(key_width) + rank * local_value, local_value),
+            ]
+            .into_iter()
+            .map(|(first, rows)| PartBlock {
+                start: first * row,
+                rows,
+                columns: row,
+                row_stride: row,
+            })
+            .collect()
+        };
+        let channels = u64::from(config.conv_channels());
+        let gathered = |module: &str, row: u64| -> Result<Tensor> {
+            let name = vb.pp(module).name("weight");
+            let parts = runs(row)
+                .into_iter()
+                .map(|block| (name.clone(), block))
+                .collect();
+            let shape = extents(&[channels, row]);
+
+            vb.load(
+                &name,
+                &WeightSource::Blocks {
+                    parts,
+                    shape: shape.clone(),
+                },
+                WeightLayout::ROW_MAJOR,
+                &shape,
+                false,
+            )
+        };
+
+        let hidden = u64::from(config.hidden);
+        let in_proj_qkv = if split.size == 1 {
+            projection(
+                "in_proj_qkv",
+                config.hidden,
+                2 * key_width + value_width,
+                Parallel::None,
+            )?
+        } else {
+            Linear::new(gathered("in_proj_qkv", hidden)?, None, WeightOrder::NxK)?
+        };
+        let column = parallel(Parallel::Column);
+        let in_proj_z = projection("in_proj_z", config.hidden, value_width, column)?;
+        let in_proj_b = projection("in_proj_b", config.hidden, config.value_heads, column)?;
+        let in_proj_a = projection("in_proj_a", config.hidden, config.value_heads, column)?;
 
         // PyTorch's depthwise `Conv1d` stores one input channel per group; the taps are its
         // rows.
-        let taps = (channels as usize, config.conv_width as usize);
-        let conv1d = vb
-            .pp("conv1d")
-            .get((taps.0, 1, taps.1), "weight")?
-            .reshape(taps)?;
+        let width = u64::from(config.conv_width);
+        let conv1d = if split.size == 1 {
+            vb.pp("conv1d")
+                .get((channels as usize, 1, width as usize), "weight")?
+                .reshape((channels as usize, width as usize))?
+        } else {
+            gathered("conv1d", width)?
+        };
 
-        let heads = config.value_heads as usize;
-        let a_log = vb.get(heads, "A_log")?;
-        let dt_bias = vb.get(heads, "dt_bias")?;
+        let heads = (config.value_heads / split.size) as usize;
+        let first = split.rank as usize * heads;
+        let a_log = vb.get_rows(heads, "A_log", first)?;
+        let dt_bias = vb.get_rows(heads, "dt_bias", first)?;
 
         let norm = GatedRmsNorm::load(
             &GatedRmsNormConfig {
                 width: config.value_dim,
                 eps: config.eps,
+                sigmoid: config.sigmoid_gate,
             },
             vb.pp("norm"),
         )?;
@@ -202,7 +290,12 @@ impl GatedDeltaNet {
             a_log,
             dt_bias,
             norm,
-            out_proj: projection("out_proj", value_width, config.hidden)?,
+            out_proj: projection(
+                "out_proj",
+                value_width,
+                config.hidden,
+                parallel(Parallel::Row),
+            )?,
             config: *config,
         })
     }
@@ -215,7 +308,7 @@ impl GatedDeltaNet {
 
     /// `hidden`, `[tokens, hidden]`, mixed through the network, reading and advancing
     /// recurrent layer `layer` of `state` in place: `[tokens, hidden]` in `hidden`'s element
-    /// type.
+    /// type, summed over the tensor-parallel group.
     ///
     /// `batch` is the batch the tokens are of: its phase decides how the delta rule advances
     /// its rows ([`functional::gated_delta_rule`]).
@@ -256,15 +349,28 @@ impl GatedDeltaNet {
         }
 
         let config = self.config;
-        let (key_heads, key_dim) = (config.key_heads as usize, config.key_dim as usize);
-        let (value_heads, value_dim) = (config.value_heads as usize, config.value_dim as usize);
+        let ranks = config.split.size;
+        let (key_heads, key_dim) = ((config.key_heads / ranks) as usize, config.key_dim as usize);
+        let (value_heads, value_dim) = (
+            (config.value_heads / ranks) as usize,
+            config.value_dim as usize,
+        );
 
         let qkv = self.in_proj_qkv.forward(hidden)?;
         let z = self.in_proj_z.forward(hidden)?;
         let b = self.in_proj_b.forward(hidden)?;
         let a = self.in_proj_a.forward(hidden)?;
 
-        let mixed = functional::causal_conv1d(&qkv, &self.conv1d, state, layer, CONV_FIELD)?;
+        let mixed = functional::causal_conv1d(
+            &qkv,
+            &self.conv1d,
+            1,
+            true,
+            batch,
+            state,
+            layer,
+            CONV_FIELD,
+        )?;
 
         // The convolved row is [q | k | v]: three runs of heads of one row.
         let key_width = key_heads * key_dim;
@@ -280,6 +386,7 @@ impl GatedDeltaNet {
             &b,
             &self.a_log,
             &self.dt_bias,
+            config.axes,
             batch,
             state,
             layer,

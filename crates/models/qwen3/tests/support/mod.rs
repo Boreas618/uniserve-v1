@@ -55,6 +55,7 @@ pub(crate) fn whole(drafter: bool) -> TextPlacement {
         tensor: nn::Split::WHOLE,
         experts: nn::Split::WHOLE,
         drafter,
+        draft_tokens: 0,
     }
 }
 
@@ -89,6 +90,8 @@ pub(crate) fn batch(
         draft_lens: None,
         rope_positions: None,
         live_tokens: None,
+        token_ids: None,
+        ngram_context: None,
     }
 }
 
@@ -121,6 +124,7 @@ pub(crate) fn cache(
                 value_initialized: tensor(flags.clone(), DType::U8),
                 key_scale: None,
                 value_scale: None,
+                index_keys: None,
             })
             .collect(),
         workspace: tensor(Shape::from(1 << 20), DType::U8),
@@ -165,5 +169,6 @@ pub(crate) fn state(
         live: live.to_vec(),
         checkpoint: checkpoint.to_vec(),
         trail: None,
+        verify: None,
     }
 }

@@ -9,7 +9,14 @@
 //! ```text
 //! replace: destination[indices[j]] = source[j]          (a copy)
 //! add:     destination[indices[j]] += source[j]         (one rounding into the output's dtype)
+//! place:   destination[indices[j]] = source[j]          for indices[j] ≥ 0; a negative index
+//!                                                       names no row and writes nothing
 //! ```
+//!
+//! `place` is the write of per-request state a batch's tokens leave (a ring of recent rows, the
+//! key of a group a token completes): a token that leaves none, or a padding token of a bucket
+//! wider than its batch, states a negative index, which is `u32::MAX`, the slot that addresses
+//! nothing, read as i32.
 //!
 //! `indices` is `[count]` i32 and may repeat: a repeated index is written, or added, more than once,
 //! in the order it appears, so the caller controls the sum order and repeated calls of one launch
@@ -55,6 +62,8 @@ pub enum Mode {
     Replace,
     /// The destination row gains the source row.
     Add,
+    /// The destination row becomes the source row, and a negative index writes nothing.
+    Place,
 }
 
 impl fmt::Display for Mode {
@@ -62,6 +71,7 @@ impl fmt::Display for Mode {
         formatter.write_str(match self {
             Self::Replace => "replace",
             Self::Add => "add",
+            Self::Place => "place",
         })
     }
 }
@@ -207,7 +217,7 @@ impl Op for Rows {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         match descriptor.mode {
             // A copy: the element arrives unchanged.
-            Mode::Replace => Tolerance::exact(),
+            Mode::Replace | Mode::Place => Tolerance::exact(),
             // One addition in the output's dtype: its own rounding, twice (the sum and the store).
             Mode::Add => Tolerance::exact()
                 .with_atol(2.0 * tolerance::unit_roundoff(descriptor.dtype) as f32),
@@ -238,6 +248,10 @@ mod tests {
         assert_eq!(
             descriptor(Mode::Add).to_string(),
             "dtype_bf16_mode_add_columns_5120_block_1024_pdl_false"
+        );
+        assert_eq!(
+            descriptor(Mode::Place).to_string(),
+            "dtype_bf16_mode_place_columns_5120_block_1024_pdl_false"
         );
     }
 

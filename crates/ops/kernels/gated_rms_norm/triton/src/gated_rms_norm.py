@@ -1,10 +1,12 @@
 """Gated RMS normalization: the Triton source of the ``gated_rms_norm`` operator.
 
 One program normalizes one contiguous row with FP32 statistics, scales it by the
-per-channel weight and by the SiLU of the same row of the gate, and rounds once
-when storing: the output norm of a gated delta network, normalized before it is
-gated (FLA's ``RMSNormGated`` with ``norm_before_gate``). The row tile is the
-descriptor's; the row count comes from the grid and ``columns`` from the launch.
+per-channel weight and by an activation of the same row of the gate, and rounds
+once when storing: the output norm of a gated delta network, normalized before it
+is gated (FLA's ``RMSNormGated`` with ``norm_before_gate``). The activation is the
+SiLU, or the sigmoid when the descriptor states ``gate_sigmoid``
+(``output_gate_type: "sigmoid"``). The row tile is the descriptor's; the row count
+comes from the grid and ``columns`` from the launch.
 
 The kernel body imports nothing but Triton: the operand checks and the launch
 stay with the operator's Rust side.
@@ -23,6 +25,7 @@ def _gated_rms_norm_kernel(
     columns,
     eps,
     BLOCK: tl.constexpr,  # noqa: N803
+    SIGMOID: tl.constexpr,  # noqa: N803
 ):
     """Normalize and gate one row per program.
 
@@ -40,5 +43,9 @@ def _gated_rms_norm_kernel(
 
     variance = tl.sum(x * x, axis=0) / columns
     normalized = x * tl.rsqrt(variance + eps) * w
-    y = normalized * (gate / (1.0 + tl.exp(-gate)))
+    opened = 1.0 / (1.0 + tl.exp(-gate))
+    if SIGMOID:
+        y = normalized * opened
+    else:
+        y = normalized * (gate * opened)
     tl.store(y_ptr + row_base + offsets, y, mask=mask)

@@ -332,6 +332,7 @@ impl TextModel for Qwen3ForCausalLm {
             // The load checked that the split divides the heads.
             kv_heads: text.num_key_value_heads / self.tensor.size,
             head_dim: text.head_dim,
+            index_keys: None,
         }
     }
 

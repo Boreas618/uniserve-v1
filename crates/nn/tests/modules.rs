@@ -921,13 +921,14 @@ fn the_normalizations_load_their_vectors_and_normalize() {
         &GatedRmsNormConfig {
             width: 6,
             eps: 1e-6,
+            sigmoid: false,
         },
         loader.root().pp("norm"),
     )
     .unwrap();
     assert_eq!(
         values(&gated.forward(&x, &residual).unwrap()),
-        values(&functional::gated_rms_norm(&x, &residual, &weight_tensor, 1e-6).unwrap())
+        values(&functional::gated_rms_norm(&x, &residual, &weight_tensor, 1e-6, false).unwrap())
     );
 
     // A weight of another width than the module states is the checkpoint's disagreement.

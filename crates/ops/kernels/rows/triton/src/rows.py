@@ -7,7 +7,11 @@ residual — so they are one operator with a compiled mode:
 ```text
 replace: destination[indices[j]] = source[j]        (a copy)
 add:     destination[indices[j]] += source[j]       (one rounding into the output's dtype)
+place:   destination[indices[j]] = source[j]        for indices[j] >= 0, nothing otherwise
 ```
+
+``place`` is ``replace`` with a row that may name no destination: a negative index stores nothing,
+so a batch's tokens that leave no row (and the padding tokens of a bucket) cost one masked store.
 
 A program is one (source row, block of columns), which is the grid the operator launches: a row's
 elements are never split across two blocks, so no two blocks write the same destination *element*
@@ -53,11 +57,12 @@ def _rows_kernel(
     REPLACE: tl.constexpr,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
+    SKIP: tl.constexpr,  # noqa: N803
 ):
     """Place one source row's block of columns at the row its index names.
 
-    ``COLUMNS`` is the row width, ``REPLACE`` the descriptor's mode and ``BLOCK`` the lanes one
-    program covers. ``count``, ``columns``, ``block`` and ``pdl`` are the launch's words: the grid
+    ``COLUMNS`` is the row width, ``REPLACE`` whether the row is copied and not added, ``SKIP``
+    whether a negative index stores nothing, and ``BLOCK`` the lanes one program covers. ``count``, ``columns``, ``block`` and ``pdl`` are the launch's words: the grid
     names the source row and the column slice.
     """
     _pdl_prologue(PDL)
@@ -67,6 +72,9 @@ def _rows_kernel(
     live = lanes < COLUMNS
 
     destination_row = tl.load(indices_ptr + row).to(tl.int64)
+    if SKIP:
+        # A negative index names no row: every lane of the row is masked out of its store.
+        live = live & (destination_row >= 0)
     source = tl.load(source_ptr + row * COLUMNS + lanes, mask=live, other=0.0)
     target = destination_ptr + destination_row * COLUMNS + lanes
 

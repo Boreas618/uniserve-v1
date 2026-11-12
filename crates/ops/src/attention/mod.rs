@@ -78,9 +78,14 @@
 //! keeps its multi-CTA reduction counters there across launches.
 
 pub mod dense;
+pub mod indexed;
 pub mod sparse;
 
 pub use dense::{DenseArgs, DenseAttention, DenseCall, DenseDescriptor};
+pub use indexed::{
+    IndexScores, IndexScoresArgs, IndexScoresDescriptor, IndexedAttention, IndexedAttentionArgs,
+    IndexedAttentionDescriptor,
+};
 pub use sparse::{SparseArgs, SparseAttention, SparseCall, SparseDescriptor};
 
 use std::ffi::c_void;

@@ -39,5 +39,10 @@ dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { p
 [[kernel.descriptors]]
 dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, pdl = ["true", "false"], centred = ["true"] }
 
+# A weight of several rows, row `i` of the input reading weight row `i mod groups` (the streams
+# of a hyper-connected residual); the operator names `groups` only above one.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], columns = { min = 1 }, tile = { power_of_two = true }, pdl = ["true", "false"], centred = ["true"], groups = { min = 2 } }
+
 [parameters]
 eps = 1e-06

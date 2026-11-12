@@ -300,6 +300,7 @@ fn cache(dtype: DType, table: &[u32], rows: usize) -> KvCache {
             value_initialized: per_page(DType::U8),
             key_scale: scale(),
             value_scale: scale(),
+            index_keys: None,
         }],
         workspace: Tensor::zeros(64, DType::U8, &Device::Cpu).unwrap(),
     }
@@ -321,6 +322,8 @@ fn batch(phase: PhaseKind, slots: &[u32], seq_lens: &[u32], offsets: &[u32]) -> 
         draft_lens: None,
         rope_positions: None,
         live_tokens: None,
+        token_ids: None,
+        ngram_context: None,
     }
 }
 
@@ -629,6 +632,8 @@ fn meta_batch(phase: PhaseKind, tokens: usize) -> TokenBatch {
         draft_lens: None,
         rope_positions: None,
         live_tokens: None,
+        token_ids: None,
+        ngram_context: None,
     }
 }
 
@@ -648,6 +653,7 @@ fn meta_cache(dtype: DType, kv_heads: usize, head_dim: usize) -> KvCache {
             value_initialized: meta((1, 1, 1, 1), DType::U8),
             key_scale: scale(),
             value_scale: scale(),
+            index_keys: None,
         }],
         workspace: meta(1 << 21, DType::U8),
     }

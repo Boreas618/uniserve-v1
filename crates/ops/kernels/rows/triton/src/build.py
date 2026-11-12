@@ -13,7 +13,7 @@ import rows as kernels
 from uniserve_build_server import triton as driver
 
 #: The element types the rows are stored in.
-DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
+DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32", "i32": "i32"}
 
 
 def warps_of(block):
@@ -39,12 +39,14 @@ def spec(fields, parameters, target):
             "REPLACE": "constexpr",
             "BLOCK": "constexpr",
             "PDL": "constexpr",
+            "SKIP": "constexpr",
         },
         "constexprs": {
             "COLUMNS": int(fields["columns"]),
-            "REPLACE": fields["mode"] == "replace",
+            "REPLACE": fields["mode"] != "add",
             "BLOCK": block,
             "PDL": pdl,
+            "SKIP": fields["mode"] == "place",
         },
         "options": {
             "num_warps": warps_of(block),

@@ -3524,6 +3524,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen4-exp"
+version = "2.0.0"
+dependencies = [
+ "backend",
+ "nn",
+ "processing",
+ "qwen3",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uniserve-tensor",
+]
+
+[[package]]
 name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

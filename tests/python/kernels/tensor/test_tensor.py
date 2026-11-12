@@ -39,3 +39,7 @@ def test_a_primitive_matches_its_reference_on_the_interpreter(check):
 @pytest.mark.parametrize("check", CHECKS)
 def test_a_primitive_matches_its_reference_on_the_device(check):
     on_device(FAMILY / check, "--device")
+
+
+def test_the_row_placement_matches_its_reference_on_the_interpreter():
+    interpreted(FAMILY / "rows_check.py")

@@ -144,13 +144,18 @@ impl<'l, 'a> VarBuilder<'l, 'a> {
     ) -> Result<Tensor> {
         let names = source_names(source);
 
-        // A weight-only NVFP4 matrix is read as the dense matrix it states, by every module.
-        if !names.is_empty()
-            && names
-                .iter()
-                .all(|tensor| self.loader.scheme(tensor) == Scheme::Nvfp4Weights)
-        {
-            return self.loader.load_decoded(name, source, layout, shape);
+        // A weight-only NVFP4 matrix and a block-scaled FP8 matrix are read as the dense matrix
+        // they state, by every module.
+        for scheme in [Scheme::Nvfp4Weights, Scheme::Fp8Blocks] {
+            if !names.is_empty()
+                && names
+                    .iter()
+                    .all(|tensor| self.loader.scheme(tensor) == scheme)
+            {
+                return self
+                    .loader
+                    .load_decoded(name, source, layout, shape, scheme);
+            }
         }
 
         self.refuse_packed(&names)?;

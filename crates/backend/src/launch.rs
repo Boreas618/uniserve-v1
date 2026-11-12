@@ -109,6 +109,7 @@ pub(crate) mod tests {
             tile: columns.next_power_of_two(),
             pdl: false,
             centred: false,
+            groups: 1,
         }
     }
 

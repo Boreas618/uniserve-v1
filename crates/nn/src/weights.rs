@@ -611,6 +611,25 @@ impl<'a> WeightLoader<'a> {
         VarBuilder::new(self)
     }
 
+    /// The names of the tensors the weights of a meta load are gathered or computed from, as
+    /// their keys state them: for a profile run's check that a load names every tensor a
+    /// checkpoint holds. A table a module computes is named by itself and is no checkpoint
+    /// tensor; a scalar a module reads beside a weight (a tensor scale) is not a weight and is
+    /// not named. `None` for a loader over retained storage, whose checkpoint records the
+    /// tensors it read ([`Checkpoint::reading`]).
+    pub fn named(&self) -> Option<std::collections::BTreeSet<String>> {
+        match &self.retention {
+            Retention::Store(_) => None,
+            Retention::Meta(tensors) => Some(
+                tensors
+                    .borrow()
+                    .keys()
+                    .flat_map(|key| key.tensors.iter().cloned())
+                    .collect(),
+            ),
+        }
+    }
+
     /// Whether this loader returns meta tensors instead of reading and publishing.
     pub(crate) fn is_meta(&self) -> bool {
         matches!(self.retention, Retention::Meta(_))
@@ -678,14 +697,15 @@ impl<'a> WeightLoader<'a> {
     }
 
     /// Loads the weight `name` whose tensors the checkpoint stores as weight-only NVFP4
-    /// ([`Scheme::Nvfp4Weights`]), as the BF16 matrix their codes and scales state.
+    /// ([`Scheme::Nvfp4Weights`]) or as block-scaled FP8 ([`Scheme::Fp8Blocks`]), `scheme`
+    /// saying which, as the BF16 matrix their fields state.
     ///
     /// `source` names the logical matrix, `[rows, columns]` of every tensor it reads, exactly as
     /// a dense read names it: a tensor-parallel block, a strided column block or a fused stack
-    /// of experts. Each tensor is decoded once for the read, `code · block_scale · tensor_scale`
-    /// in FP32 rounded once to BF16 (round to nearest even), and the source's region is gathered
-    /// from the decoded matrices. The product that reads the weight is then the 16-bit product
-    /// the declaration states.
+    /// of experts. Each tensor is decoded once for the read, in FP32 rounded once to BF16 (round
+    /// to nearest even): `code · block_scale · tensor_scale` for NVFP4 and
+    /// `e4m3(weight) · weight_scale_inv` for block-scaled FP8. The source's region is gathered
+    /// from the decoded matrices, and the product that reads the weight is a 16-bit product.
     ///
     /// # Errors
     ///
@@ -696,24 +716,30 @@ impl<'a> WeightLoader<'a> {
         source: &WeightSource,
         layout: WeightLayout,
         shape: &Shape,
+        scheme: Scheme,
     ) -> Result<Tensor> {
         let names = source_names(source);
         let mut logical = Vec::with_capacity(names.len());
+        let blocks = scheme == Scheme::Fp8Blocks;
 
         for tensor in &names {
             let packed = self.checkpoint.locate(tensor)?;
-            if packed.dtype != DType::U8 || packed.shape.rank() != 2 {
+            let stored = if blocks { DType::F8E4M3 } else { DType::U8 };
+            if packed.dtype != stored || packed.shape.rank() != 2 {
                 return Err(Error::weight(
                     tensor,
                     format!(
-                        "a weight-only NVFP4 weight is [rows, columns / 2] U8, not {} {:?}",
+                        "a weight decoded at load is a {} matrix, not {} {:?}",
+                        ops::abi::name(stored),
                         ops::abi::name(packed.dtype),
                         packed.shape.dims()
                     ),
                 ));
             }
 
-            let (rows, columns) = (dim(&packed.shape, 0), dim(&packed.shape, 1) * 2);
+            // An NVFP4 byte holds two elements of its row.
+            let per_byte = if blocks { 1 } else { 2 };
+            let (rows, columns) = (dim(&packed.shape, 0), dim(&packed.shape, 1) * per_byte);
             logical.push(TensorLocation {
                 file: packed.file,
                 tensor: tensor.clone(),
@@ -762,7 +788,11 @@ impl<'a> WeightLoader<'a> {
             for (location, range) in &spans {
                 let tensor = &location.tensor;
                 if !decoded.iter().any(|(decoded, _)| decoded == tensor) {
-                    let matrix = loader.decode_nvfp4(tensor, &location.shape)?;
+                    let matrix = if blocks {
+                        loader.decode_fp8_blocks(tensor, &location.shape)?
+                    } else {
+                        loader.decode_nvfp4(tensor, &location.shape)?
+                    };
                     decoded.push((tensor.clone(), matrix));
                 }
 
@@ -774,6 +804,63 @@ impl<'a> WeightLoader<'a> {
             }
             Ok(Cow::Owned(bytes))
         })
+    }
+
+    /// The BF16 bytes of the `[rows, columns]` matrix the block-scaled FP8 fields of `name`
+    /// state: each element `e4m3(weight) · weight_scale_inv` of its block, the product formed
+    /// in FP32 and rounded once to BF16.
+    fn decode_fp8_blocks(&self, name: &str, shape: &Shape) -> Result<Vec<u8>> {
+        let (rows, columns) = (dim(shape, 0) as usize, dim(shape, 1) as usize);
+        let scales_name = format!("{name}_scale_inv");
+        let scales = self.checkpoint.locate(&scales_name)?;
+
+        // The scale tensor's own extents state the blocks: whole blocks of rows and columns.
+        let (scale_rows, scale_columns) = match scales.shape.dims() {
+            &[scale_rows, scale_columns]
+                if scale_rows > 0
+                    && scale_columns > 0
+                    && rows.is_multiple_of(scale_rows)
+                    && columns.is_multiple_of(scale_columns)
+                    && scales.dtype.is_float() =>
+            {
+                (scale_rows, scale_columns)
+            }
+            _ => {
+                return Err(Error::weight(
+                    name,
+                    format!(
+                        "block scales of {} {:?} for a {rows} × {columns} matrix; one floating \
+                         scale per whole block of rows and columns expected",
+                        ops::abi::name(scales.dtype),
+                        scales.shape.dims()
+                    ),
+                ));
+            }
+        };
+        let (block_rows, block_columns) = (rows / scale_rows, columns / scale_columns);
+
+        let values = self.checkpoint.read(name)?;
+        let scales = convert(
+            scales.dtype,
+            DType::F32,
+            &self.checkpoint.read(&scales_name)?,
+            &scales_name,
+        )?;
+        let scale = |row: usize, column: usize| -> f32 {
+            let at = (row / block_rows * scale_columns + column / block_columns) * 4;
+            f32::from_le_bytes([scales[at], scales[at + 1], scales[at + 2], scales[at + 3]])
+        };
+
+        let mut out = Vec::with_capacity(rows * columns * 2);
+        for row in 0..rows {
+            for column in 0..columns {
+                let value = crate::quantization::e4m3(values[row * columns + column]);
+                out.extend_from_slice(
+                    &crate::quantization::bf16_bits(value * scale(row, column)).to_le_bytes(),
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// The BF16 bytes of the `[rows, columns]` matrix the NVFP4 fields of `name` state.

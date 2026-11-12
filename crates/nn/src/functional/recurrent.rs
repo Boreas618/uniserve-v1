@@ -30,20 +30,31 @@
 //! buffer, for the prefix cache. A batch that keeps a trail has each function write the state
 //! after **every** token as well, row `t` of the trail buffer for the batch's token `t`.
 //!
+//! ## Request slots
+//!
+//! A state that lends [`VerifySlots`] is a deployment's whose verifications copy no state: a
+//! request owns `Q` slots of the delta rule's field and one window of `Q − 1` rows more than
+//! the convolution's history, and a row starts from what its previous step left for the tokens
+//! that stand ([`VerifySlots`] states the rule; vLLM's `state_indices` and `num_accepted`). A
+//! decode-phase batch then leaves the state after each of a row's tokens for the next step to
+//! choose from, and every other batch the state after a row's last token in the row's first
+//! slot. Such a state keeps no trail.
+//!
 //! The buffers are execution's, lent for the forward and written in place; a function reads
 //! and writes one field of one recurrent layer of them.
 
 use std::ops::Range;
 
+pub use ops::recurrent::StateAxes;
 use ops::recurrent::{
     CausalConv1d, CausalConv1dArgs, CausalConv1dDescriptor, Form, GatedDeltaRule,
-    GatedDeltaRuleArgs, GatedDeltaRuleDescriptor, RowColumns, Trail,
+    GatedDeltaRuleArgs, GatedDeltaRuleDescriptor, RequestSlots, RowColumns, Trail,
 };
 use proto::module::PhaseKind;
 use uniserve_tensor::{D, DType, Device, Tensor};
 
 use super::{ACCUMULATE, on_cpu, vector};
-use crate::capability::{NO_SLOT, RecurrentState, TokenBatch};
+use crate::capability::{NO_SLOT, RecurrentState, TokenBatch, VerifySlots};
 use crate::error::{Error, Result};
 
 /// Channels one `causal_conv1d` kernel covers.
@@ -161,14 +172,80 @@ fn column(column: &Tensor) -> Result<Vec<u32>> {
     Ok(column.flatten_all()?.to_vec1::<u32>()?)
 }
 
-/// Runs `advance(tokens, slot, start, checkpoint)` over each state row of a CPU `state` that
-/// names a slot, in row order: `tokens` are the row's packed tokens, `start` the absolute
+/// The slots operand of a launch: the two columns of a state that lends request slots.
+fn slots_operand(verify: Option<&VerifySlots>) -> Result<Option<RequestSlots>> {
+    verify
+        .map(|verify| {
+            Ok(RequestSlots {
+                state_indices: backend::operand(&verify.state_indices)?,
+                num_accepted: backend::operand(&verify.num_accepted)?,
+            })
+        })
+        .transpose()
+}
+
+/// The slots a request owns under `verify`, checked against `rows` state rows.
+fn owned_slots(owner: &'static str, verify: &VerifySlots, rows: usize) -> Result<usize> {
+    let (indices, accepted) = (&verify.state_indices, &verify.num_accepted);
+
+    match indices.dims() {
+        &[stated, owned]
+            if stated == rows
+                && owned > 0
+                && indices.dtype() == DType::U32
+                && accepted.dims() == [rows]
+                && accepted.dtype() == DType::U32 =>
+        {
+            Ok(owned)
+        }
+        _ => Err(Error::shape(
+            owner,
+            format!(
+                "state_indices of {:?} and num_accepted of {:?} for {rows} state rows: \
+                 [{rows}, Q] and [{rows}] u32 expected",
+                indices.dims(),
+                accepted.dims()
+            ),
+        )),
+    }
+}
+
+/// The request slots of a CPU state on the host: each row's slots, and how many tokens of
+/// each row's previous step stand.
+type HostSlots = (Vec<Vec<u32>>, Vec<u32>);
+
+/// The request slots of a CPU state, read to the host.
+fn request_slots(owner: &'static str, verify: Option<&VerifySlots>) -> Result<Option<HostSlots>> {
+    let Some(verify) = verify else {
+        return Ok(None);
+    };
+
+    let accepted = column(&verify.num_accepted)?;
+    let indices = verify.state_indices.to_vec2::<u32>()?;
+    let owned = indices.first().map_or(0, Vec::len) as u32;
+    if let Some(row) = accepted
+        .iter()
+        .position(|count| *count == 0 || *count > owned)
+    {
+        return Err(Error::shape(
+            owner,
+            format!(
+                "state row {row} states {} standing tokens of a step of {owned}",
+                accepted[row]
+            ),
+        ));
+    }
+    Ok(Some((indices, accepted)))
+}
+
+/// Runs `advance(row, tokens, slot, start, checkpoint)` over each state row of a CPU `state`
+/// that names a slot, in row order: `tokens` are the row's packed tokens, `start` the absolute
 /// position of the first of them, and `checkpoint` the absolute token count the row keeps its
 /// state at, zero for none.
 fn for_each_row(
     owner: &'static str,
     state: &RecurrentState,
-    mut advance: impl FnMut(Range<usize>, usize, usize, usize) -> Result<()>,
+    mut advance: impl FnMut(usize, Range<usize>, usize, usize, usize) -> Result<()>,
 ) -> Result<()> {
     let offsets = column(&state.query_offsets)?;
     let seq_lens = column(&state.seq_lens)?;
@@ -206,6 +283,7 @@ fn for_each_row(
             )
         })?;
         advance(
+            row,
             tokens,
             slots[row] as usize,
             start,
@@ -215,23 +293,37 @@ fn for_each_row(
     Ok(())
 }
 
-/// The depthwise causal convolution of `x`, `[tokens, channels]`, with its SiLU, continuing
-/// each state row from its slot's last inputs: `[tokens, channels]` in `x`'s element type.
+/// The depthwise causal convolution of `x`, `[tokens, channels]`, continuing each state row
+/// from its slot's last inputs: `[tokens, channels]` in `x`'s element type.
 ///
-/// `weight` is `[channels, width]`, each channel's taps with the oldest input's first. The
-/// field `field` of recurrent layer `layer` of `state` holds each slot's last `width − 1`
-/// inputs, `[slots, width − 1, channels]` in `x`'s element type, oldest first; it is read for
-/// a row that continues and written in place with the row's last inputs, the checkpoint buffer
-/// with the inputs before a row's checkpoint, and the trail with the inputs up to and including
-/// each token (module documentation).
+/// `weight` is `[channels, width]`, each channel's taps with the oldest input's first; tap `j`
+/// reads the input `(width − 1 − j) · dilation` tokens back, so a token's history is
+/// `(width − 1) · dilation` inputs. With `activation` the FP32 sum passes through its SiLU
+/// before it rounds; without, the sum rounds once.
+///
+/// The field `field` of recurrent layer `layer` of `state` holds each slot's window,
+/// `[slots, window, channels]` in `x`'s element type, oldest first: the history, and one row
+/// more per slot a request owns beyond its first (module documentation, Request slots). It is
+/// read for a row that continues and written in place: with the row's last inputs from window
+/// row zero, or, for a decode-phase `batch` of a state that lends request slots, with the
+/// inputs after the first one read. The checkpoint buffer receives the inputs before a row's
+/// checkpoint from window row zero, and the trail the inputs up to and including each token.
 ///
 /// # Errors
 ///
 /// Taps that are not a matrix over `x`'s channels, a state that does not hold the field or
-/// holds another extent or element type, or the operator's refusal.
+/// holds another extent or element type, a window that is not the history and the request's
+/// further slots, a trail beside request slots, or the operator's refusal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the convolution's operands and the state execution lends it"
+)]
 pub fn causal_conv1d(
     x: &Tensor,
     weight: &Tensor,
+    dilation: u32,
+    activation: bool,
+    batch: &TokenBatch,
     state: &RecurrentState,
     layer: usize,
     field: usize,
@@ -266,16 +358,55 @@ pub fn causal_conv1d(
         Some(trail) => Some(buffer(OWNER, trail, layer, field)?),
         None => None,
     };
+
+    // The window is the history and a row per slot a request owns beyond its first.
+    let history = (width - 1) * dilation.max(1) as usize;
+    let owned = match &state.verify {
+        Some(verify) => owned_slots(OWNER, verify, state.seq_lens.elem_count())?,
+        None => 1,
+    };
+    let window = history + owned - 1;
+    if dilation == 0 || (state.verify.is_some() && trail.is_some()) {
+        return Err(Error::shape(
+            OWNER,
+            format!(
+                "taps {dilation} inputs apart{}",
+                if trail.is_some() {
+                    ", and a trail beside request slots"
+                } else {
+                    ""
+                }
+            ),
+        ));
+    }
     check_buffers(
         OWNER,
-        (live, checkpoint, trail),
+        (live, checkpoint, None),
         x.dtype(),
-        &[width - 1, channels],
+        &[window, channels],
         tokens,
     )?;
+    if let Some(trail) = trail
+        && rows_of(OWNER, "trail", trail, x.dtype(), &[history, channels])? < tokens
+    {
+        return Err(Error::shape(
+            OWNER,
+            format!("a trail of {} rows for {tokens} tokens", trail.dims()[0]),
+        ));
+    }
+
+    // A decode-phase batch of a state that lends request slots leaves its window for a step
+    // that chooses how many of a row's tokens stand.
+    let stepwise = state.verify.is_some() && batch.phase == PhaseKind::Decode;
 
     if on_cpu(x) {
-        return conv_formula(x, weight, state, (live, checkpoint, trail));
+        return conv_formula(
+            x,
+            weight,
+            (dilation as usize, activation, stepwise),
+            state,
+            (live, checkpoint, trail),
+        );
     }
 
     let out = backend::empty((tokens, channels), x.dtype())?;
@@ -285,6 +416,10 @@ pub fn causal_conv1d(
             channels: channels as u32,
             width: width as u32,
             block: CONV_BLOCK.min((channels as u32).next_power_of_two()),
+            dilation,
+            activation,
+            window: window as u32,
+            stepwise,
         },
         CausalConv1dArgs {
             x: backend::operand(x)?,
@@ -294,58 +429,97 @@ pub fn causal_conv1d(
             state: backend::operand(live)?,
             checkpoint: backend::operand(checkpoint)?,
             trail: trail_operand(trail)?,
+            slots: slots_operand(state.verify.as_ref())?,
         },
     )?;
     Ok(out)
 }
 
-/// [`causal_conv1d`] on CPU tensors: `buffers` are the field's live, checkpoint and trail
-/// buffers.
+/// [`causal_conv1d`] on CPU tensors: `form` is the taps' dilation, whether the sum is
+/// activated and whether the window is left for a step that chooses, and `buffers` are the
+/// field's live, checkpoint and trail buffers.
 fn conv_formula(
     x: &Tensor,
     weight: &Tensor,
+    (dilation, activation, stepwise): (usize, bool, bool),
     state: &RecurrentState,
     (live, checkpoint, trail): (&Tensor, &Tensor, Option<&Tensor>),
 ) -> Result<Tensor> {
+    const OWNER: &str = "causal_conv1d";
+
     let (tokens, channels) = x.dims2()?;
     let width = weight.dims()[1];
-    let kept = width - 1;
+    let history = (width - 1) * dilation;
+    let window = live.dims()[1];
     let taps = weight.to_dtype(ACCUMULATE)?;
     let out = Tensor::zeros((tokens, channels), x.dtype(), &Device::Cpu)?;
+    let slots = request_slots(OWNER, state.verify.as_ref())?;
 
-    for_each_row("causal_conv1d", state, |row, slot, start, keep| {
-        let count = row.len();
+    for_each_row(OWNER, state, |row, tokens, slot, start, keep| {
+        let count = tokens.len();
+
+        // The window row the row's history begins at: past the tokens of its previous step
+        // that do not stand.
+        let offset = match &slots {
+            Some((_, accepted)) => (accepted[row] as usize - 1).min(window - history),
+            None => 0,
+        };
+        if stepwise && count > window - history + 1 {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "a decode-phase row of {count} tokens against requests of {} slots",
+                    window - history + 1
+                ),
+            ));
+        }
 
         // The inputs the row's taps read: the slot's last inputs, or zeros for a row that
         // starts its sequence, then the row's own.
         let before = if start == 0 {
-            Tensor::zeros((kept, channels), x.dtype(), &Device::Cpu)?
+            Tensor::zeros((history, channels), x.dtype(), &Device::Cpu)?
         } else {
-            live.get(slot)?
+            live.get(slot)?.narrow(0, offset, history)?
         };
-        let window = Tensor::cat(&[before, x.narrow(0, row.start, count)?], 0)?;
-        let inputs = window.to_dtype(ACCUMULATE)?;
+        let inputs = Tensor::cat(&[before, x.narrow(0, tokens.start, count)?], 0)?;
+        let wide = inputs.to_dtype(ACCUMULATE)?;
 
         let mut sum = Tensor::zeros((count, channels), ACCUMULATE, &Device::Cpu)?;
         for tap in 0..width {
             let weights = taps.narrow(1, tap, 1)?.t()?;
-            sum = (sum + inputs.narrow(0, tap, count)?.broadcast_mul(&weights)?)?;
+            sum = (sum
+                + wide
+                    .narrow(0, tap * dilation, count)?
+                    .broadcast_mul(&weights)?)?;
         }
-        out.slice_set(&sum.silu()?.to_dtype(x.dtype())?, 0, row.start)?;
+        let sum = if activation { sum.silu()? } else { sum };
+        out.slice_set(&sum.to_dtype(x.dtype())?, 0, tokens.start)?;
 
-        // The window after `seen` of the row's tokens is the inputs a later token reads.
-        let after = |seen: usize| -> Result<Tensor> {
-            Ok(window.narrow(0, seen, kept)?.unsqueeze(0)?.contiguous()?)
+        // The inputs from input `first` on as a slot's window, zeros past the row's last.
+        let window_from = |first: usize| -> Result<Tensor> {
+            let held = (history + count - first).min(window);
+            let rows = inputs.narrow(0, first, held)?;
+
+            Ok(rows
+                .pad_with_zeros(0, 0, window - held)?
+                .unsqueeze(0)?
+                .contiguous()?)
         };
         if let Some(trail) = trail {
+            // A trail's rows are the history alone: the state after each token.
             for token in 0..count {
-                trail.slice_set(&after(token + 1)?, 0, row.start + token)?;
+                let after = inputs.narrow(0, token + 1, history)?.unsqueeze(0)?;
+                trail.slice_set(&after.contiguous()?, 0, tokens.start + token)?;
             }
         }
         if keep > start && keep <= start + count {
-            checkpoint.slice_set(&after(keep - start)?, 0, slot)?;
+            checkpoint.slice_set(&window_from(keep - start)?, 0, slot)?;
         }
-        live.slice_set(&after(count)?, 0, slot)?;
+
+        // A step that chooses reads the history before the row's token `t + 1` from window
+        // row `t`; any other step reads the history after the row from row zero.
+        let first = if stepwise { 1 } else { count };
+        live.slice_set(&window_from(first)?, 0, slot)?;
         Ok(())
     })?;
     Ok(out)
@@ -378,20 +552,23 @@ fn per_value_head(heads: &Tensor, group: usize) -> Result<Tensor> {
 /// `a_log` and `dt_bias`, `[value_heads]`, each head's log decay rate and time-step bias. A key
 /// head serves `value_heads / key_heads` consecutive value heads. The field `field` of
 /// recurrent layer `layer` of `state` holds each slot's FP32 state, `[slots, value_heads,
-/// key_dim, value_dim]`, read and written in place with its checkpoint and trail buffers
+/// key_dim, value_dim]`, or `[slots, value_heads, value_dim, key_dim]` under
+/// [`StateAxes::ValueKey`], read and written in place with its checkpoint and trail buffers
 /// (module documentation).
 ///
 /// A decode-phase batch (a decode, or a verification) advances its rows one token at a time
 /// and keeps the trail the state has; any other advances them in chunks of
 /// [`DELTA_RULE_CHUNK`] tokens at absolute positions, each solved at once, which keeps no trail
-/// and puts its checkpoints at chunk ends.
+/// and puts its checkpoints at chunk ends. Under a state that lends request slots a row starts
+/// from the slot of the tokens that stand, and a decode-phase batch leaves the state after its
+/// token `t` in the row's slot `t` (module documentation, Request slots).
 ///
 /// # Errors
 ///
 /// Heads of other token counts or widths, value heads the key heads do not group, gate inputs
 /// or parameters that are not one per value head, a state that does not hold the field or
-/// holds another extent, a trail kept by a batch that advances in chunks, a page that is not
-/// whole chunks, or the operator's refusal.
+/// holds another extent, a trail kept by a batch that advances in chunks or beside request
+/// slots, a page that is not whole chunks, or the operator's refusal.
 #[expect(
     clippy::too_many_arguments,
     reason = "the operands of the rule, as the reference's kernel takes them"
@@ -404,6 +581,7 @@ pub fn gated_delta_rule(
     b: &Tensor,
     a_log: &Tensor,
     dt_bias: &Tensor,
+    axes: StateAxes,
     batch: &TokenBatch,
     state: &RecurrentState,
     layer: usize,
@@ -462,13 +640,22 @@ pub fn gated_delta_rule(
         Some(trail) => Some(buffer(OWNER, trail, layer, field)?),
         None => None,
     };
-    check_buffers(
-        OWNER,
-        (live, checkpoint, trail),
-        DType::F32,
-        &[value_heads, key_dim, value_dim],
-        tokens,
-    )?;
+    let dims = match axes {
+        StateAxes::KeyValue => [value_heads, key_dim, value_dim],
+        StateAxes::ValueKey => [value_heads, value_dim, key_dim],
+    };
+    check_buffers(OWNER, (live, checkpoint, trail), DType::F32, &dims, tokens)?;
+
+    let owned = match &state.verify {
+        Some(verify) => owned_slots(OWNER, verify, state.seq_lens.elem_count())?,
+        None => 0,
+    };
+    if owned > 0 && trail.is_some() {
+        return Err(Error::shape(
+            OWNER,
+            "a state that lends request slots keeps no trail".to_owned(),
+        ));
+    }
 
     let (form, chunk) = match batch.phase {
         PhaseKind::Decode => (Form::Recurrent, 1),
@@ -500,6 +687,7 @@ pub fn gated_delta_rule(
             (query, key, value),
             (a, b),
             (a_log, dt_bias),
+            (axes, form == Form::Recurrent),
             state,
             (live, checkpoint, trail),
         );
@@ -516,6 +704,8 @@ pub fn gated_delta_rule(
             block: DELTA_RULE_BLOCK.min(value_dim as u32),
             form,
             chunk,
+            axes,
+            request_slots: owned as u32,
         },
         GatedDeltaRuleArgs {
             query: backend::operand(query)?,
@@ -530,6 +720,7 @@ pub fn gated_delta_rule(
             checkpoint: backend::operand(checkpoint)?,
             trail: trail_operand(trail)?,
             out: backend::operand(&out)?,
+            slots: slots_operand(state.verify.as_ref())?,
         },
     )?;
     Ok(out)
@@ -537,14 +728,20 @@ pub fn gated_delta_rule(
 
 /// [`gated_delta_rule`] on CPU tensors, as the recurrence of the module documentation:
 /// `heads` are the queries, keys and values, `gates` the inputs `a` and `b`, `parameters`
-/// `A_log` and `dt_bias`, and `buffers` the field's live, checkpoint and trail buffers.
+/// `A_log` and `dt_bias`, `form` the stored state's axis order and whether the batch advances
+/// token by token, and `buffers` the field's live, checkpoint and trail buffers.
+///
+/// The recurrence is computed on states of key rows, `[value_heads, key_dim, value_dim]`; a
+/// state stored in the other order is transposed as it is read and as it is written.
 fn rule_formula(
     (query, key, value): (&Tensor, &Tensor, &Tensor),
     (a, b): (&Tensor, &Tensor),
     (a_log, dt_bias): (&Tensor, &Tensor),
+    (axes, stepwise): (StateAxes, bool),
     state: &RecurrentState,
     (live, checkpoint, trail): (&Tensor, &Tensor, Option<&Tensor>),
 ) -> Result<Tensor> {
+    const OWNER: &str = "gated_delta_rule";
     let (tokens, key_heads, key_dim) = query.dims3()?;
     let (_, value_heads, value_dim) = value.dims3()?;
     let group = value_heads / key_heads;
@@ -569,15 +766,48 @@ fn rule_formula(
         &Device::Cpu,
     )?;
     let per_head = (value_heads, 1, 1);
+    let slots = request_slots(OWNER, state.verify.as_ref())?;
 
-    for_each_row("gated_delta_rule", state, |row, slot, start, keep| {
+    // A state as it is stored, `[1, …]`, and a stored state as the recurrence reads it.
+    let stored = |memory: &Tensor| -> Result<Tensor> {
+        Ok(match axes {
+            StateAxes::KeyValue => memory.unsqueeze(0)?,
+            StateAxes::ValueKey => memory.transpose(1, 2)?.contiguous()?.unsqueeze(0)?,
+        })
+    };
+    let read = |slot: usize| -> Result<Tensor> {
+        Ok(match axes {
+            StateAxes::KeyValue => live.get(slot)?.copy()?,
+            StateAxes::ValueKey => live.get(slot)?.transpose(1, 2)?.contiguous()?,
+        })
+    };
+
+    for_each_row(OWNER, state, |row, tokens, slot, start, keep| {
+        // A row starts from the state its previous step left for the tokens that stand, read
+        // before any of the row's slots is written.
+        let owned = slots.as_ref().map(|(indices, _)| indices[row].as_slice());
+        let source = match &slots {
+            Some((indices, accepted)) => indices[row][accepted[row] as usize - 1] as usize,
+            None => slot,
+        };
+        if stepwise && owned.is_some_and(|owned| tokens.len() > owned.len()) {
+            return Err(Error::shape(
+                OWNER,
+                format!(
+                    "a decode-phase row of {} tokens against requests of {} slots",
+                    tokens.len(),
+                    owned.map_or(0, <[u32]>::len)
+                ),
+            ));
+        }
+
         let mut memory = if start == 0 {
             Tensor::zeros((value_heads, key_dim, value_dim), ACCUMULATE, &Device::Cpu)?
         } else {
-            live.get(slot)?.copy()?
+            read(source)?
         };
 
-        for (seen, token) in row.clone().enumerate() {
+        for (seen, token) in tokens.clone().enumerate() {
             let key = keys.get(token)?;
 
             // Decay, then the delta-rule step toward the token's value along its key.
@@ -596,15 +826,22 @@ fn rule_formula(
                 token,
             )?;
 
-            let after = memory.unsqueeze(0)?;
+            let after = stored(&memory)?;
             if let Some(trail) = trail {
                 trail.slice_set(&after, 0, token)?;
             }
             if start + seen + 1 == keep {
                 checkpoint.slice_set(&after, 0, slot)?;
             }
+
+            // A step that chooses keeps the state after every token, in the row's slot of it.
+            if let (true, Some(owned)) = (stepwise, owned) {
+                live.slice_set(&after, 0, owned[seen] as usize)?;
+            }
         }
-        live.slice_set(&memory.unsqueeze(0)?, 0, slot)?;
+        if !(stepwise && owned.is_some()) {
+            live.slice_set(&stored(&memory)?, 0, slot)?;
+        }
         Ok(())
     })?;
     Ok(out)

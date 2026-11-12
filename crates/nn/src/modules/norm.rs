@@ -103,14 +103,17 @@ pub struct GatedRmsNormConfig {
     pub width: u32,
     /// The variance floor.
     pub eps: f32,
+    /// Whether the gate passes through a sigmoid in place of the SiLU.
+    pub sigmoid: bool,
 }
 
-/// RMS normalization gated by the SiLU of a second input:
-/// `x · rsqrt(mean(x²) + eps) · weight · silu(gate)`, the output norm of a gated delta network
+/// RMS normalization gated by an activation of a second input:
+/// `x · rsqrt(mean(x²) + eps) · weight · act(gate)`, the output norm of a gated delta network
 /// ([`functional::gated_rms_norm`]).
 pub struct GatedRmsNorm {
     weight: Tensor,
     eps: f32,
+    sigmoid: bool,
 }
 
 impl GatedRmsNorm {
@@ -123,6 +126,7 @@ impl GatedRmsNorm {
         Ok(Self {
             weight: vb.get(config.width as usize, "weight")?,
             eps: config.eps,
+            sigmoid: config.sigmoid,
         })
     }
 
@@ -133,7 +137,7 @@ impl GatedRmsNorm {
     ///
     /// What the operator refuses.
     pub fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
-        functional::gated_rms_norm(x, gate, &self.weight, self.eps)
+        functional::gated_rms_norm(x, gate, &self.weight, self.eps, self.sigmoid)
     }
 }
 
