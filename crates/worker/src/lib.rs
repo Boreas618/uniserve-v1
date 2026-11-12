@@ -47,9 +47,9 @@ pub mod completion;
 pub mod config;
 pub mod error;
 pub mod graphs;
+pub mod parallel;
 pub mod profiling;
 pub mod runner;
-pub mod parallel;
 pub mod stream;
 pub mod thread_pool;
 
