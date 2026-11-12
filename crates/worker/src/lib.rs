@@ -25,6 +25,7 @@
 //! | [`completion`] | How an operation ended and the completion its waiters share, over the crate's error |
 //! | [`config`] | The devices a rank computes on, as an engine's launch names them |
 //! | [`error`] | The crate's one error and its classification for the engine |
+//! | [`executor`] | [`Executor`]: the one thread per device that performs the device's jobs in submission order; its queue, the route of a batch to a node's executors and peers, the watchdog, and the control thread's and the peers' channels |
 //! | [`graphs`] | [`Graphs`]: the profile run, capture, replay through the input buffer, and the switch of generations, for every runner |
 //! | [`runner`] | The [`Runner`] interface a stage's runner implements |
 //! | [`profiling`] | The range markers that time a model's modules, the engine's `backend::Profiler`; CUPTI's always-on counters; profiling sessions and their collectors and files |
@@ -48,6 +49,7 @@ pub mod buckets;
 pub mod completion;
 pub mod config;
 pub mod error;
+pub mod executor;
 pub mod graphs;
 pub mod memory;
 pub mod parallel;
@@ -58,6 +60,7 @@ pub mod stream;
 pub mod thread_pool;
 
 pub use error::{Error, Failure, Result};
+pub use executor::Executor;
 pub use graphs::Graphs;
 pub use runner::{Runner, RunnerId};
 
