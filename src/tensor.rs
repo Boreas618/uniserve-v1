@@ -465,6 +465,7 @@ impl Tensor {
     unary_op!(erf, Erf);
     unary_op!(relu, Relu);
     unary_op!(silu, Silu);
+    unary_op!(sigmoid, Sigmoid);
     unary_op!(ceil, Ceil);
     unary_op!(floor, Floor);
     unary_op!(round, Round);

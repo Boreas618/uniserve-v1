@@ -1819,8 +1819,44 @@ fn zero_dim(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn sigmoid(device: &Device) -> Result<()> {
+    let data = [-3f32, 0., 1., 4.];
+    let tensor = Tensor::new(&data, device)?;
+    assert_eq!(
+        test_utils::to_vec1_round(&tensor.sigmoid()?, 4)?,
+        [0.0474, 0.5, 0.7311, 0.982]
+    );
+
+    // A 16-bit float is evaluated in F32 and rounded once into its element type.
+    let logistic = |x: f32| 1. / (1. + (-x).exp());
+    let half = tensor.to_dtype(DType::BF16)?.sigmoid()?;
+    assert_eq!(half.dtype(), DType::BF16);
+    assert_eq!(
+        half.to_vec1::<half::bf16>()?,
+        data.map(|x| half::bf16::from_f32(logistic(x)))
+    );
+    let half = tensor.to_dtype(DType::F16)?.sigmoid()?;
+    assert_eq!(
+        half.to_vec1::<half::f16>()?,
+        data.map(|x| half::f16::from_f32(logistic(x)))
+    );
+
+    // The same on a strided input.
+    let strided = tensor.reshape((2, 2))?.t()?.sigmoid()?.flatten_all()?;
+    assert_eq!(
+        test_utils::to_vec1_round(&strided, 4)?,
+        [0.0474, 0.7311, 0.5, 0.982]
+    );
+
+    // The logistic function of an integer is no integer.
+    let counts = Tensor::new(&[1i64, 2], device)?;
+    assert!(counts.sigmoid().is_err());
+    Ok(())
+}
+
 test_device!(zeros);
 test_device!(ones);
+test_device!(sigmoid);
 test_device!(full);
 test_device!(const_set);
 test_device!(arange);

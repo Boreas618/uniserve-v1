@@ -77,6 +77,7 @@ pub enum UnaryOp {
     Erf,
     Relu,
     Silu,
+    Sigmoid,
     Tanh,
     Floor,
     Ceil,
@@ -101,6 +102,7 @@ impl UnaryOp {
             Self::Erf => Erf::NAME,
             Self::Relu => Relu::NAME,
             Self::Silu => Silu::NAME,
+            Self::Sigmoid => Sigmoid::NAME,
             Self::Tanh => Tanh::NAME,
             Self::Floor => Floor::NAME,
             Self::Ceil => Ceil::NAME,
@@ -297,6 +299,7 @@ pub struct GeluErf;
 pub struct Erf;
 pub struct Relu;
 pub struct Silu;
+pub struct Sigmoid;
 pub struct Tanh;
 pub struct Floor;
 pub struct Ceil;
@@ -597,6 +600,54 @@ impl UnaryOpT for Silu {
     #[inline(always)]
     fn f8e4m3(v: f8e4m3) -> f8e4m3 {
         v / (f8e4m3::ONE + (-v).exp())
+    }
+}
+
+/// The logistic function `1 / (1 + exp(-x))`.
+///
+/// A 16-bit or an 8-bit float is widened to F32, where the function is evaluated, and rounded
+/// once into its element type.
+impl UnaryOpT for Sigmoid {
+    const NAME: &'static str = "sigmoid";
+    #[inline(always)]
+    fn bf16(v: bf16) -> bf16 {
+        bf16::from_f32(Self::f32(v.to_f32()))
+    }
+    #[inline(always)]
+    fn f16(v: f16) -> f16 {
+        f16::from_f32(Self::f32(v.to_f32()))
+    }
+    #[inline(always)]
+    fn f32(v: f32) -> f32 {
+        1.0 / (1.0 + (-v).exp())
+    }
+    #[inline(always)]
+    fn f64(v: f64) -> f64 {
+        1.0 / (1.0 + (-v).exp())
+    }
+    #[inline(always)]
+    fn u8(_: u8) -> u8 {
+        0
+    }
+    #[inline(always)]
+    fn u32(_: u32) -> u32 {
+        0
+    }
+    #[inline(always)]
+    fn i16(_: i16) -> i16 {
+        0
+    }
+    #[inline(always)]
+    fn i32(_: i32) -> i32 {
+        0
+    }
+    #[inline(always)]
+    fn i64(_: i64) -> i64 {
+        0
+    }
+    #[inline(always)]
+    fn f8e4m3(v: f8e4m3) -> f8e4m3 {
+        f8e4m3::from_f32(Self::f32(v.to_f32()))
     }
 }
 

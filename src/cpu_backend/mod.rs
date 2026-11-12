@@ -2362,6 +2362,11 @@ impl CpuStorage {
     }
 
     pub fn unary(&self, op: UnaryOp, layout: &Layout) -> Result<Self> {
+        // The logistic function of an integer is no integer.
+        if op == UnaryOp::Sigmoid && self.dtype().is_int() {
+            return Err(Error::UnsupportedDTypeForOp(self.dtype(), op.name()).bt());
+        }
+
         match op {
             UnaryOp::Exp => self.unary_impl::<op::Exp>(layout),
             UnaryOp::Log => self.unary_impl::<op::Log>(layout),
@@ -2377,6 +2382,7 @@ impl CpuStorage {
             UnaryOp::Erf => self.unary_impl::<op::Erf>(layout),
             UnaryOp::Relu => self.unary_impl::<op::Relu>(layout),
             UnaryOp::Silu => self.unary_impl::<op::Silu>(layout),
+            UnaryOp::Sigmoid => self.unary_impl::<op::Sigmoid>(layout),
             UnaryOp::Tanh => self.unary_impl::<op::Tanh>(layout),
             UnaryOp::Floor => self.unary_impl::<op::Floor>(layout),
             UnaryOp::Ceil => self.unary_impl::<op::Ceil>(layout),
