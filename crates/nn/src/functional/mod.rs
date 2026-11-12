@@ -35,6 +35,7 @@
 //! every launch site of an operator states the same key.
 
 mod activation;
+mod conv;
 mod embedding;
 mod linear;
 mod logits;
@@ -47,6 +48,7 @@ use crate::error::{Error, Result};
 pub use activation::{
     Activation, Rounding, act_and_mul, gelu, gelu_tanh, silu, snake, swiglu, value_first_swiglu,
 };
+pub use conv::{Padding, causal_pad, conv_transpose1d, conv1d, conv3d};
 pub use embedding::{embedding, vocabulary_shard};
 pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
 pub use linear::{ENCODE_CHUNK, WeightOrder, encode_block, linear, linear_fp8, linear_nvfp4};
