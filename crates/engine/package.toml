@@ -12,7 +12,8 @@
 op = "engine"
 backend = "uniserve"
 # The engine interface: its messages with the daemon, the Storage Server and
-# the Build Server (`proto::ENGINE_INTERFACE_VERSION`).
+# the Build Server (`proto::ENGINE_INTERFACE_VERSION`, which carries the
+# storage protocol's version).
 interface_version = 1
 
 [toolchain]

@@ -21,8 +21,8 @@ import "request.proto";
 
 // The first message on a connection, from the connecting side.
 message Hello {
-  // `ENGINE_INTERFACE_VERSION` of the sender's build; the peers refuse each other on a
-  // difference.
+  // `ENGINE_INTERFACE_VERSION` of the sender's build, which carries the storage protocol's
+  // version; the peers refuse each other on a difference.
   uint32 major = 1;
   // The sender's build: package version and source digest.
   string build = 3;
