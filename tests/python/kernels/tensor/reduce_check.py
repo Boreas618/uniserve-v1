@@ -13,6 +13,10 @@ What is covered:
 
 - **every function on every element type**, over a reduction shorter than a tile, where one program
   folds several outputs, and one of several tiles with a masked tail, where it folds one;
+- **a block of 1024 elements**, the one the backend launches a primitive with, where one program
+  folds several hundred outputs and each of its threads several of them: every function over two
+  and three elements per output, with the outputs adjacent in memory and with the reduced elements
+  adjacent;
 - **every choice of axes** of a rank-4 input: the last, the first, a middle one that splits the kept
   axes in two, two that are not adjacent, and all of them; an index along each single axis;
 - **every layout** of `operands.views` — rank 1 to 6, windows, steps, permutations, zero-stride
@@ -66,8 +70,13 @@ def expected_of(function, x, axes):
     return np.expand_dims(found, axis)
 
 
-def check(function, name, x, axes):
-    """One launch held to numpy and the operator's bound."""
+#: The block of the cases that fold several hundred outputs in one program: the backend's
+#: (`BLOCK` of `crates/backend/src/primitives.rs`).
+WIDE_BLOCK = 1024
+
+
+def check(function, name, x, axes, block=operands.BLOCK):
+    """One launch of a module of `block` elements, held to numpy and the operator's bound."""
     dtype = NAMES[x.dtype]
     kept_axes = [axis for axis in range(x.dim()) if axis not in axes]
     reduced_axes = [axis for axis in range(x.dim()) if axis in axes]
@@ -90,15 +99,15 @@ def check(function, name, x, axes):
     )
 
     # `Descriptor`'s `Display`: the tile is the class, capped at the block.
-    tile = min(reduction_class(length), operands.BLOCK)
+    tile = min(reduction_class(length), block)
     key = (
         f"function_{function}_dtype_{dtype}_kept_{len(kept)}_reduced_{len(reduced)}"
-        f"_tile_{tile}_block_{operands.BLOCK}_pdl_false"
+        f"_tile_{tile}_block_{block}_pdl_false"
     )
     operands.launch(
         "reduce",
         key,
-        operands.grid(outputs, operands.BLOCK // tile),
+        operands.grid(outputs, block // tile),
         x,
         out,
         outputs,
@@ -133,6 +142,17 @@ def main():
             )
             checked += check(function, "shorter than a tile", short, [1])
             checked += check(function, "several tiles", long, [1])
+
+    # A program of several hundred outputs, each thread of it folding several: the outputs
+    # adjacent in memory and the reduced elements a row apart, then the reduced elements adjacent.
+    for dtype in ("f32", "f64", "bf16", "i32"):
+        for seed, function in enumerate(FUNCTIONS):
+            apart = operands.values(dtype, (2, 300), seed + 40)
+            adjacent = operands.values(dtype, (300, 3), seed + 50)
+            checked += check(function, "a wide block", apart, [0], WIDE_BLOCK)
+            checked += check(
+                function, "a wide block", adjacent, [1], WIDE_BLOCK
+            )
 
     # Every choice of axes of a rank-4 input.
     choices = (
@@ -220,6 +240,7 @@ def main():
 
     print(
         f"ok: {checked} outputs over {len(FUNCTIONS)} functions on {len(DTYPES)} element types, "
+        f"blocks of {operands.BLOCK} and {WIDE_BLOCK} elements, "
         f"{len(choices)} choices of axes, {layouts} strided launches of rank 1 to 6, ties and empty "
         f"axes, on {operands.where()}: floating sums within dot(class), the rest exact"
     )

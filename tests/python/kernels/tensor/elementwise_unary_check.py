@@ -21,11 +21,12 @@ What is covered:
   permutation, a zero-stride broadcast, an input of several programs with a masked tail and a single
   element.
 
-`tanh` and `powf` call libdevice, which the interpreter cannot evaluate. Numpy's `tanh` and `power`
-stand in for those two calls there, so the interpreter run holds which values reach them, in which
-order, and where the results are stored; the two functions' own last place is libdevice's, and
-`--device` is the run that holds it to the bound. A BF16 output is rounded to nearest on a device
-and truncated by the interpreter, which `operands.compare` allows for.
+`tanh`, `powf` and every exponential (`exp`, and the one inside `gelu`, `silu`, `sigmoid` and `elu`)
+call libdevice, which the interpreter cannot evaluate. Numpy's `tanh`, `power` and `exp` stand in
+for those calls there, so the interpreter run holds which values reach them, in which order, and
+where the results are stored; the calls' own last place is libdevice's, and `--device` is the run
+that holds it to the bound. A BF16 output is rounded to nearest on a device and truncated by the
+interpreter, which `operands.compare` allows for.
 """
 
 import sys
@@ -70,7 +71,7 @@ INTEGRAL = (
 
 
 class Libdevice:
-    """Numpy in the place of the two libdevice calls the kernel makes."""
+    """Numpy in the place of the libdevice calls the kernel makes."""
 
     @staticmethod
     def _applied(function, *arguments):
@@ -79,6 +80,12 @@ class Libdevice:
         return tl.tensor(
             interpreter.TensorHandle(data, first.dtype.scalar), first.type
         )
+
+    @staticmethod
+    def exp(value):
+        # An exponential past the type's largest value is an infinity, as on a device.
+        with np.errstate(over="ignore"):
+            return Libdevice._applied(np.exp, value)
 
     @staticmethod
     def tanh(value):
@@ -314,7 +321,7 @@ def main():
         + (
             ""
             if operands.DEVICE
-            else " (numpy stands in for libdevice's tanh and pow)"
+            else " (numpy stands in for libdevice's exp, tanh and pow)"
         )
     )
     return 0
