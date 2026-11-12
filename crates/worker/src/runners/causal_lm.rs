@@ -35,12 +35,12 @@
 //! [`Runner::execute`] serves one batch:
 //!
 //! 1. the batch is checked and the smallest captured bucket that holds it is chosen;
-//! 2. the batch's columns are padded to the bucket and written into the input block
-//!    ([`columns`]), with the host values the forward computes;
+//! 2. the batch's columns are padded to the bucket ([`columns`]);
 //! 3. the slots the batch starts a request on are started, and its ban masks copied
 //!    ([`slots`]);
 //! 4. the batch's page work that precedes the forward is issued ([`PageWork::BeforeReplay`]);
-//! 5. the bucket's graph is replayed;
+//! 5. the padded columns are written into the input block, with the host values the forward
+//!    computes, and the bucket's graph is replayed;
 //! 6. the page work that follows the forward is issued ([`PageWork::AfterReplay`]);
 //! 7. the stream event behind the replay is waited for, the outputs are read and one
 //!    `CallOutput` per call is assembled.
@@ -913,6 +913,8 @@ impl Runner for CausalLmRunner {
     }
 
     fn prepare_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+        // Outside a step, a member of an expert union prepares the smallest capacity class of
+        // the bucket: the class a step runs follows from its agreement (`execute`).
         let bucket = self.choose(batch)?;
 
         self.fill(batch, &bucket, None)?;

@@ -28,7 +28,7 @@
 //! | [`executor`] | [`Executor`]: the one thread per device that performs the device's jobs in submission order; its queue, the route of a batch to a node's executors and peers, the watchdog, and the control thread's and the peers' channels |
 //! | [`graphs`] | [`Graphs`]: the profile run, capture, replay through the input buffer, and the switch of generations, for every runner |
 //! | [`runner`] | The [`Runner`] interface a stage's runner implements |
-//! | [`runners`] | [`CausalLmRunner`], the runner of every causal language model: its input tensors, the request slots' device state, the forward of each bucket and the completion of a step |
+//! | [`runners`] | [`CausalLmRunner`], the runner of every causal language model: its input tensors, the request slots' device state, the forward of each bucket, the completion of a step, paired forwards over the scratch page set, and its membership of an expert union |
 //! | [`profiling`] | The range markers that time a model's modules, the engine's `backend::Profiler`; CUPTI's always-on counters; profiling sessions and their collectors and files |
 //! | [`parallel`] | [`HostGroup`](parallel::host::HostGroup), the host collectives of a rank group over a TCP full mesh |
 //! | [`stream`] | [`EventPool`](stream::EventPool), the event leases storage owners defer their releases behind |
