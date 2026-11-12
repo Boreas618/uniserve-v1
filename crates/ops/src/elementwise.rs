@@ -7,6 +7,10 @@
 //! elementwise_where    out[i] = condition[i] ≠ 0 ? on_true[i] : on_false[i]
 //! ```
 //!
+//! A selection converts nothing, so its values are any element a primitive moves
+//! ([`crate::strided::MOVED`]), an FP8 (`f8e4m3`) element included; the other two operators
+//! compute, on the element types of [`crate::strided`]'s `ELEMENTS`.
+//!
 //! `i` ranges over one shape that every operand of a call has. An input is read through its
 //! strides, so a permuted view needs no copy and a broadcast operand is one whose stride is zero
 //! along the axes it repeats; the output is contiguous. The shape and the strides are launch
@@ -673,7 +677,7 @@ impl Op for ElementwiseWhere {
     type Args<'a> = WhereArgs;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::ELEMENTS)?;
+        strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::MOVED)?;
         strided::require_element(
             Self::NAME,
             "condition",
@@ -1140,6 +1144,41 @@ mod tests {
         );
         ElementwiseWhere::check(&descriptor, &args).unwrap();
         assert_eq!(ElementwiseWhere::tolerance(&descriptor), Tolerance::exact());
+    }
+
+    #[test]
+    fn a_selection_moves_fp8_values_as_their_bytes() {
+        let args = selection(
+            contiguous(DType::U8, &[4, 8]),
+            operand(DType::F8E4M3, &[4, 8], &[0, 1]),
+        );
+        let descriptor = WhereDescriptor::of(&args, BLOCK, false);
+        assert_eq!(
+            descriptor.to_string(),
+            "dtype_f8e4m3_condition_u8_rank_2_block_1024_pdl_false"
+        );
+        ElementwiseWhere::check(&descriptor, &args).unwrap();
+        assert_eq!(ElementwiseWhere::tolerance(&descriptor), Tolerance::exact());
+
+        // Two NVFP4 elements share a byte: there is no element to select.
+        let packed = selection(
+            contiguous(DType::U8, &[4, 8]),
+            contiguous(DType::F4, &[4, 8]),
+        );
+        let message = refusal(ElementwiseWhere::check(
+            &WhereDescriptor::of(&packed, BLOCK, false),
+            &packed,
+        ));
+        assert!(message.contains("dtype is f4e2m1"), "{message}");
+
+        // Arithmetic on an FP8 element is no primitive's.
+        let lhs = contiguous(DType::F8E4M3, &[4, 8]);
+        let sum = binary(lhs, lhs, BinaryFunction::Add);
+        let message = refusal(ElementwiseBinary::check(
+            &BinaryDescriptor::of(BinaryFunction::Add, &sum, BLOCK, false),
+            &sum,
+        ));
+        assert!(message.contains("dtype is f8e4m3"), "{message}");
     }
 
     #[test]

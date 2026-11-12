@@ -13,7 +13,8 @@ surely as one left unset inside it.
 What is covered:
 
 - **every element type**, with the patterns a conversion would lose: zero, a negative zero, a NaN
-  with a payload, an infinity, the largest and the smallest integer, and all bits set;
+  with a payload, an infinity, the largest and the smallest integer, and all bits set. An FP8
+  (`f8e4m3`) element is stored as the byte it is;
 - **a whole tensor** (`zeros`, a constant) of several programs and a masked tail;
 - **a block of a larger tensor** (`const_set` on a slice) of rank 1 to 5, whose strides the
   destination keeps, and **a stepped run**, which sets every other element and leaves the rest.
@@ -25,10 +26,7 @@ import sys
 import operands
 import torch
 
-DTYPES = operands.FLOATS + operands.INTEGERS
-
-#: The name `ops::DType` prints for each torch element type.
-NAMES = {element: name for name, element in operands.ELEMENTS.items()}
+DTYPES = operands.FLOATS + operands.INTEGERS + tuple(operands.MOVED)
 
 #: Bit patterns to store, by the element's width: zero, the sign bit alone (a negative zero, or the
 #: smallest signed integer), all bits set (a NaN with a payload, or minus one), a pattern with no
@@ -43,7 +41,7 @@ PATTERNS = {
 
 def element_of(dtype, pattern):
     """The one-element tensor whose bits are `pattern`."""
-    element = operands.ELEMENTS[dtype]
+    element = operands.element(dtype)
     width = torch.empty((), dtype=element).element_size() * 8
     signed = {
         8: torch.uint8,
@@ -100,7 +98,7 @@ def main():
     patterns = 0
     for seed, dtype in enumerate(DTYPES):
         width = (
-            torch.empty((), dtype=operands.ELEMENTS[dtype]).element_size() * 8
+            torch.empty((), dtype=operands.element(dtype)).element_size() * 8
         )
         for pattern in PATTERNS[width]:
             buffer = operands.values(dtype, (2 * operands.BLOCK + 9,), seed)
@@ -120,9 +118,9 @@ def main():
         "a block of rank 5": ((3, 4, 5, 3, 4), (slice(0, 2), slice(1, 3), slice(2, 5), slice(1, 3), slice(2, 4))),
         "one element": ((3, 4), (slice(1, 2), slice(2, 3))),
     }  # fmt: skip
-    for seed, dtype in enumerate(("bf16", "f32", "i64", "u8", "f64")):
+    for seed, dtype in enumerate(("bf16", "f32", "i64", "u8", "f64", "f8e4m3")):
         width = (
-            torch.empty((), dtype=operands.ELEMENTS[dtype]).element_size() * 8
+            torch.empty((), dtype=operands.element(dtype)).element_size() * 8
         )
         for name, (shape, block) in blocks.items():
             buffer = operands.values(dtype, shape, seed + 50)

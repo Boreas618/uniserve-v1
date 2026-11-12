@@ -6,7 +6,8 @@
 #
 # `destination[i] = value` over a row-major window: a contiguous tensor, or a
 # block of a larger one. The value travels as the element's bits and is stored
-# as those bits, so the operator's tolerance is `exact()`. The element type and
+# as those bits, so the operator's tolerance is `exact()`. An FP8 (`f8e4m3`)
+# element is stored as the byte it is. The element type and
 # the number of axes the call traverses are compiled in; the shape, the strides
 # and the bits are launch words. The key is the one `Descriptor`'s `Display`
 # prints, e.g. `dtype_f32_rank_1_block_1024_pdl_false`.
@@ -38,6 +39,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
+dimensions = { dtype = ["u8", "u32", "i16", "i32", "i64", "f16", "bf16", "f32", "f64", "f8e4m3"], rank = { min = 1, max = 6 }, block = { power_of_two = true }, pdl = ["false", "true"] }
 
 [parameters]

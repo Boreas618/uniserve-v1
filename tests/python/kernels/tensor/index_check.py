@@ -22,7 +22,9 @@ What is covered, by the backend primitive:
   a scatter skips it;
 - **every element type and every index type**, along the first, a middle and the last axis of
   operands of rank 1 to 5, with a permuted or stepped source, permuted indices, columns that span
-  several programs, and a destination that stays as it was wherever no index names it.
+  several programs, and a destination that stays as it was wherever no index names it;
+- **an FP8 (`f8e4m3`) tensor** gathered and set as the bytes its elements are, over the same
+  shapes; an addition computes, so the package has no `scatter_add` module for it.
 
 A BF16 sum is rounded to nearest on a device and truncated by the interpreter; the reference makes
 the store the run makes (`stored`), so the comparison stays exact in both.
@@ -59,8 +61,11 @@ def chosen_of(indices):
     return chosen, chosen != ABSENT[NAMES[indices.dtype]]
 
 
-def launch_gather(source, indices, destination, axis):
-    """One gather launch, with the words `Index::launch` packs for it."""
+def launch_gather(source, indices, destination, axis, dtype=None):
+    """One gather launch, with the words `Index::launch` packs for it.
+
+    `dtype` names the element type where the tensors hold its bytes.
+    """
     # The source row that index zero selects, repeated along the axis.
     row = list(source.stride())
     step = row[axis]
@@ -73,7 +78,7 @@ def launch_gather(source, indices, destination, axis):
 
     # `Descriptor`'s `Display`.
     key = (
-        f"function_gather_dtype_{NAMES[source.dtype]}_indices_{NAMES[indices.dtype]}"
+        f"function_gather_dtype_{dtype or NAMES[source.dtype]}_indices_{NAMES[indices.dtype]}"
         f"_rank_{len(extents)}_block_{operands.BLOCK}_pdl_false"
     )
     operands.launch(
@@ -92,8 +97,11 @@ def launch_gather(source, indices, destination, axis):
     )
 
 
-def launch_scatter(function, source, indices, destination, axis):
-    """One scatter launch, with the words `Index::launch` packs for it."""
+def launch_scatter(function, source, indices, destination, axis, dtype=None):
+    """One scatter launch, with the words `Index::launch` packs for it.
+
+    `dtype` names the element type where the tensors hold its bytes.
+    """
     off_axis = [other for other in range(source.dim()) if other != axis]
     extents, (source_strides, index_strides, destination_strides) = (
         operands.merge(
@@ -108,7 +116,7 @@ def launch_scatter(function, source, indices, destination, axis):
 
     # `Descriptor`'s `Display`.
     key = (
-        f"function_{function}_dtype_{NAMES[source.dtype]}_indices_{NAMES[indices.dtype]}"
+        f"function_{function}_dtype_{dtype or NAMES[source.dtype]}_indices_{NAMES[indices.dtype]}"
         f"_rank_{len(extents)}_block_{operands.BLOCK}_pdl_false"
     )
     operands.launch(
@@ -131,17 +139,20 @@ def launch_scatter(function, source, indices, destination, axis):
     )
 
 
-def check_gather(name, source, indices, axis):
+def check_gather(name, source, indices, axis, dtype=None):
     """A gather held to torch's, with zero wherever the index names no element."""
     destination = operands.empty(indices.shape, source.dtype)
-    launch_gather(source, indices, destination, axis)
+    launch_gather(source, indices, destination, axis, dtype)
 
     chosen, present = chosen_of(indices)
     moved = torch.gather(
         operands.bits(source), axis, torch.where(present, chosen, 0)
     )
     expected = torch.where(present, moved, 0).view(source.dtype)
-    label = f"gather {NAMES[source.dtype]} by {NAMES[indices.dtype]} {name} axis {axis} {tuple(indices.shape)}"
+    label = (
+        f"gather {dtype or NAMES[source.dtype]} by {NAMES[indices.dtype]} {name} axis {axis} "
+        f"{tuple(indices.shape)}"
+    )
     return operands.same(label, destination, expected)
 
 
@@ -166,7 +177,9 @@ def added(held, value):
     return (held.to(torch.int64) + value.to(torch.int64)).to(element)
 
 
-def check_scatter(function, name, source, indices, destination, axis):
+def check_scatter(
+    function, name, source, indices, destination, axis, dtype=None
+):
     """A scatter held to the operator's statement, traversed along the axis in order."""
     expected = destination.clone()
     pattern = operands.bits(expected)
@@ -186,9 +199,9 @@ def check_scatter(function, name, source, indices, destination, axis):
             axis, target, torch.where(named, operands.bits(value), held)
         )
 
-    launch_scatter(function, source, indices, destination, axis)
+    launch_scatter(function, source, indices, destination, axis, dtype)
     label = (
-        f"{function} {NAMES[source.dtype]} by {NAMES[indices.dtype]} {name} axis {axis} "
+        f"{function} {dtype or NAMES[source.dtype]} by {NAMES[indices.dtype]} {name} axis {axis} "
         f"{tuple(source.shape)} into {tuple(destination.shape)}"
     )
     return operands.same(label, destination, expected)
@@ -282,6 +295,62 @@ def main():
             )
             cases += 5
 
+    # An FP8 tensor is gathered and set as the bytes its elements are, over the same shapes.
+    for seed, (shape, axis, other) in enumerate(SHAPES):
+        traversed = list(shape)
+        traversed[axis] = other
+
+        for dtype in operands.MOVED:
+            index_dtype = INDICES[seed % len(INDICES)]
+            source = operands.values(dtype, shape, 500 + 10 * seed)
+
+            indices = positions(
+                index_dtype, traversed, 501 + 10 * seed, shape[axis]
+            )
+            checked += check_gather("contiguous", source, indices, axis, dtype)
+
+            vector = positions(
+                index_dtype, (other,), 502 + 10 * seed, shape[axis]
+            )
+            checked += check_gather(
+                "an index vector",
+                source,
+                repeated(vector, traversed, axis),
+                axis,
+                dtype,
+            )
+
+            reversed_source = permuted(dtype, shape, 503 + 10 * seed)
+            checked += check_gather(
+                "reversed in memory", reversed_source, indices, axis, dtype
+            )
+
+            destination = operands.values(dtype, traversed, 504 + 10 * seed)
+            indices = positions(index_dtype, shape, 505 + 10 * seed, other)
+            checked += check_scatter(
+                "scatter_set",
+                "contiguous",
+                source,
+                indices,
+                destination,
+                axis,
+                dtype,
+            )
+            cases += 4
+
+    # An addition computes, and no primitive computes with an element that only moves.
+    for dtype in operands.MOVED:
+        key = f"function_scatter_add_dtype_{dtype}_indices_u32_rank_1_block_{operands.BLOCK}_pdl_false"
+        try:
+            operands.described("index", key)
+        except SystemExit as stated:
+            if "move as their bytes" not in str(stated):
+                raise
+        else:
+            raise SystemExit(
+                f"{key}: the package states a module that adds {dtype} elements"
+            )
+
     # Strided operands: a source and indices whose axes lie reversed in memory, and a stepped one.
     for seed, (shape, axis, other) in enumerate(SHAPES[1:6]):
         traversed = list(shape)
@@ -336,7 +405,8 @@ def main():
     print(
         f"ok: {checked} elements bit for bit over {cases} launches: gather, index_select, "
         f"scatter_set, scatter_add_set and index_add on {len(DTYPES)} element types and "
-        f"{len(INDICES)} index types, along every kind of axis of rank 1 to 5, on {operands.where()}"
+        f"{len(INDICES)} index types, gather and scatter_set on {len(operands.MOVED)} that only "
+        f"moves, along every kind of axis of rank 1 to 5, on {operands.where()}"
     )
     return 0
 
