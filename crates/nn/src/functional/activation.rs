@@ -85,7 +85,7 @@ fn activate(x: &Tensor, activation: Activation) -> Result<Tensor> {
         Activation::Silu => x.silu()?,
         Activation::Gelu => x.gelu_erf()?,
         Activation::GeluTanh => x.gelu()?,
-        Activation::Sigmoid => (x.neg()?.exp()? + 1.0)?.recip()?,
+        Activation::Sigmoid => x.sigmoid()?,
     })
 }
 
