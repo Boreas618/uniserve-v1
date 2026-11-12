@@ -40,8 +40,8 @@
 pub mod buckets;
 pub mod error;
 pub mod graphs;
-pub mod runner;
 pub mod profiling;
+pub mod runner;
 
 pub use error::{Error, Failure, Result};
 pub use graphs::Graphs;

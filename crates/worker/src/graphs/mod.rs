@@ -328,13 +328,6 @@ impl Graphs {
         }
     }
 
-    /// What launches the range markers of the modules a captured or eager forward enters.
-    pub fn set_profiler(&self, profiler: Option<Arc<dyn backend::Profiler>>) {
-        if let Some(cuda) = &self.device {
-            cuda.launching.set_profiler(profiler);
-        }
-    }
-
     // ---- The profile run ----
 
     /// Runs the forward of every bucket `runner` states under the meta context and keeps each
@@ -1100,8 +1093,16 @@ impl Graphs {
 
         let captured = {
             let _guard = cuda.launching.enter();
-            Executable::capture(&cuda.stream, || runner.forward(bucket))
+            Executable::capture(&cuda.stream, || {
+                // A captured forward carries the range markers of the modules it enters, which
+                // every replay then runs; the process's markers are a profiler only while the
+                // stream captures.
+                cuda.launching
+                    .set_profiler(crate::profiling::markers::profiler(&cuda.stream));
+                runner.forward(bucket)
+            })
         };
+        cuda.launching.set_profiler(None);
 
         let table = cuda.launching.take_launches();
         let copies = cuda.launching.take_input_copies();
