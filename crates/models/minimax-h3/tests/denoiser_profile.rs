@@ -290,11 +290,15 @@ fn a_rank_of_a_sequence_split_profiles_under_each_projection() {
     }
 }
 
-/// The NVFP4 export's profile. Its load is refused by name until the loading boundary reads
-/// the export's packed projections and the activation scales of its manifest; this run is that
-/// reader's acceptance.
+/// The NVFP4 export's profile: the network's feed-forward projections are packed, so a step
+/// encodes their activations and multiplies the packed weights (`nvfp4_quantize`,
+/// `nvfp4_gemm`), block by block above the packed product's largest row class. The text
+/// encoder, which the export's manifest does not calibrate, loads dense beside it.
 #[test]
 #[ignore = "requires /workspace/models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-NVFP4"]
 fn the_nvfp4_export_profiles_a_small_and_a_large_layout() {
     profile(FAST_4_STEP_NVFP4, Stage::Transformer, SequenceSplit::WHOLE);
+
+    let encoder = load(FAST_4_STEP_NVFP4, Stage::TextEncoder, SequenceSplit::WHOLE).unwrap();
+    assert!(encoder.text_encoder().is_some());
 }

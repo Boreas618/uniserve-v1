@@ -7,6 +7,10 @@
 //! `fastvideo_inference.json`, or the release it was extracted from, states). Every module's
 //! `load` consumes the typed struct of its own submodule and reparses nothing.
 //!
+//! A packed ModelOpt export states its calibration in a manifest at its root; it is read here
+//! into the quantization each stage's configuration declares ([`modelopt`]), which the stage's
+//! loader is given before any of its weights is read.
+//!
 //! The request-level values the family's request rules are parameterized by (the frame rule,
 //! the resolution rule, the durations and the audio clock) are request processing's
 //! ([`processing::minimax_h3`]); this configuration checks that the checkpoint agrees with
@@ -14,6 +18,7 @@
 
 mod audio_vae;
 mod denoiser;
+mod modelopt;
 mod text;
 mod video_vae;
 
@@ -22,6 +27,7 @@ use std::collections::BTreeMap;
 use nn::PixelNorm;
 use nn::config::Fields;
 use nn::family::Stage;
+use nn::quantization::ModeloptManifest;
 use processing::qwen_vl::ProcessorConfig;
 use serde_json::Value;
 
@@ -50,6 +56,9 @@ pub const UNIFORM_GRID_POINTS: u32 = 50;
 
 /// The networks a release may hold, of which a deployment places one.
 pub const NETWORKS: [Stage; 2] = [Stage::Transformer, Stage::TransformerRef];
+
+/// The directory of the video VAE, which holds the decoder's weights and the encoder's.
+pub const VIDEO_VAE: &str = "vae";
 
 /// The rungs a fused FastH3 adapter's student was distilled with: the four DMD rungs of the
 /// `t2av` network at the base release's shifts
@@ -132,7 +141,17 @@ impl Config {
             })
         };
 
-        let text_encoder = text::text_encoder(&require("text_encoder/config.json")?)?;
+        // A packed export's calibration, which every stage's declaration is read from.
+        let manifest = sidecar(ModeloptManifest::FILE)?
+            .map(|manifest| ModeloptManifest::parse(&manifest))
+            .transpose()?;
+        if let Some(manifest) = &manifest {
+            modelopt::check(manifest)?;
+        }
+        let declared = |directory: &str| modelopt::declaration(manifest.as_ref(), directory);
+
+        let mut text_encoder = text::text_encoder(&require("text_encoder/config.json")?)?;
+        text_encoder.quantization = declared(Stage::TextEncoder.name())?;
         let image_processor = require("processor/preprocessor_config.json")?;
         let pixels = qwen3::config::pixel_norm(&Fields::of(
             "processor/preprocessor_config.json",
@@ -143,7 +162,8 @@ impl Config {
             .transpose()
             .map_err(|error| Error::config(format!("the checkpoint's processor: {error}")))?;
 
-        let video_vae = VideoVaeConfig::parse(&require("vae/config.json")?)?;
+        let mut video_vae = VideoVaeConfig::parse(&require(&format!("{VIDEO_VAE}/config.json"))?)?;
+        video_vae.quantization = declared(VIDEO_VAE)?;
         let audio_vae = AudioVaeConfig::parse(&require("audio_vae/config.json")?)?;
         let shifts = (
             shift(&require("scheduler/scheduler_config.json")?, "scheduler")?,
@@ -193,10 +213,9 @@ impl Config {
                 .into_iter()
                 .filter(|task| network(*task) == stage)
                 .collect();
-            denoisers.insert(
-                stage,
-                DenoiserConfig::new(transformer, schedule, vsa, tasks)?,
-            );
+            let mut denoiser = DenoiserConfig::new(transformer, schedule, vsa, tasks)?;
+            denoiser.quantization = declared(stage.name())?;
+            denoisers.insert(stage, denoiser);
         }
 
         let config = Self {
@@ -882,5 +901,93 @@ mod tests {
             json(r#"{"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.0, 0.5]}"#),
         );
         assert!(read(&unscaled, None).is_err());
+    }
+
+    /// The released four-step export's manifest, trimmed to the first block of each calibrated
+    /// stage: the fixture the manifest's reader is tested on.
+    fn manifest() -> Value {
+        json(include_str!(
+            "../../../../nn/tests/fixtures/modelopt_manifest.json"
+        ))
+    }
+
+    /// A packed export's manifest becomes each stage's declaration: the network's feed-forward
+    /// projections and the video decoder's attention and feed-forward projections are
+    /// calibrated under the names their stages store them by, and the text encoder, which the
+    /// manifest lists and does not calibrate, is dense.
+    #[test]
+    fn a_packed_export_declares_the_projections_each_stage_stores_packed() {
+        let mut files = dmd_export(release(), "VIDEO_SPARSE_ATTN_H3");
+        files.insert(ModeloptManifest::FILE.to_owned(), manifest());
+        let config = read(&files, None).unwrap();
+
+        // An activation's tensor scale is its calibrated magnitude over 6 · 448.
+        let scale = |amax: f64| Some((amax / 2688.0) as f32);
+        let network = &config.denoisers[&Stage::Transformer].quantization;
+        assert!(network.is_encoded());
+        for (module, amax) in [
+            ("ff.net.0.proj", 485.011_444_091_796_9),
+            ("ff.net.2", 602.315_246_582_031_2),
+        ] {
+            assert_eq!(
+                network
+                    .activation_scale(&format!("transformer_blocks.0.{module}"))
+                    .unwrap(),
+                scale(amax),
+                "{module}"
+            );
+        }
+
+        let decoder = &config.video_vae.quantization;
+        for (module, amax) in [
+            ("attn.to_q", 5_855.696_289_062_5),
+            ("attn.to_k", 5_855.696_289_062_5),
+            ("attn.to_v", 5_855.696_289_062_5),
+            ("attn.to_out.0", 4_231.270_019_531_25),
+            ("ff.net.0.proj", 3_796.949_218_75),
+            ("ff.net.2", 540.490_356_445_312_5),
+        ] {
+            assert_eq!(
+                decoder
+                    .activation_scale(&format!("decoder.transformer_blocks.0.{module}"))
+                    .unwrap(),
+                scale(amax),
+                "{module}"
+            );
+        }
+
+        assert_eq!(
+            config.text_encoder.quantization,
+            nn::quantization::Declaration::dense()
+        );
+    }
+
+    /// A calibration this crate has no stored projection for is refused by the path the
+    /// manifest lists, and a manifest the reader refuses is refused as the reader names it.
+    #[test]
+    fn a_manifest_this_family_cannot_place_is_refused_by_the_listed_path() {
+        let mut files = dmd_export(release(), "VIDEO_SPARSE_ATTN_H3");
+        let listed = "text_encoder.network.layers.0.mlp.down";
+
+        let mut unplaced = manifest();
+        unplaced["components"]["text_encoder"] = serde_json::json!({
+            "enabled": true,
+            "modules": {listed: {"activation_amax": 12.5}},
+        });
+        files.insert(ModeloptManifest::FILE.to_owned(), unplaced);
+        let error = read(&files, None).unwrap_err();
+        assert!(
+            matches!(error, Error::Config(ref problem) if problem.contains(listed)),
+            "{error}"
+        );
+
+        let mut inconsistent = manifest();
+        inconsistent["components"]["video_vae"]["enabled"] = serde_json::json!(false);
+        files.insert(ModeloptManifest::FILE.to_owned(), inconsistent);
+        let error = read(&files, None).unwrap_err();
+        assert!(
+            matches!(error, Error::Nn(nn::Error::Config { ref field, .. }) if field == "modules"),
+            "{error}"
+        );
     }
 }

@@ -8,6 +8,7 @@
 
 use nn::config::Fields;
 use nn::functional::Padding;
+use nn::quantization::Declaration;
 use serde_json::Value;
 
 use super::statistics;
@@ -60,10 +61,14 @@ pub struct VideoVaeConfig {
     pub latents_mean: Vec<f32>,
     /// Per-channel standard deviation of the latent space.
     pub latents_std: Vec<f32>,
+    /// How the stage stores its weights: dense, or the packed decoder projections a ModelOpt
+    /// export's manifest calibrates.
+    pub quantization: Declaration,
 }
 
 impl VideoVaeConfig {
-    /// Read `vae/config.json`.
+    /// Read `vae/config.json`, the stage's weights dense until the checkpoint's reader states a
+    /// calibration.
     pub fn parse(values: &Value) -> Result<Self> {
         let values = Fields::of("vae/config.json", values)?;
         let latent_channels = values.count("latent_channels")?;
@@ -103,6 +108,7 @@ impl VideoVaeConfig {
             token_drop: values.index("token_drop")?,
             latents_mean: statistics(&values, "latents_mean", latent_channels)?,
             latents_std: statistics(&values, "latents_std", latent_channels)?,
+            quantization: Declaration::dense(),
         };
 
         config.validate()?;

@@ -27,6 +27,7 @@
 use nn::Step;
 use nn::config::Fields;
 use nn::diffusion::{ladder_sigmas, linspace, steps, uniform_sigmas};
+use nn::quantization::Declaration;
 
 use crate::{Error, Result, VideoTask};
 
@@ -501,10 +502,14 @@ pub struct DenoiserConfig {
     pub vsa: Option<VsaConfig>,
     /// The tasks it serves, in canonical order.
     pub tasks: Vec<VideoTask>,
+    /// How the network's stage stores its weights: dense, or the packed projections a ModelOpt
+    /// export's manifest calibrates.
+    pub quantization: Declaration,
 }
 
 impl DenoiserConfig {
-    /// One network with the schedule and attention the checkpoint states for it.
+    /// One network with the schedule and attention the checkpoint states for it, its weights
+    /// dense until the checkpoint's reader states a calibration.
     ///
     /// # Errors
     ///
@@ -546,6 +551,7 @@ impl DenoiserConfig {
             schedule,
             vsa,
             tasks,
+            quantization: Declaration::dense(),
         })
     }
 
