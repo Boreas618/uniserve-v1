@@ -120,6 +120,11 @@ impl Runner for LoggingRunner {
         Ok(bucket)
     }
 
+    fn prepare_shadow_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+        // The runner's forward writes no state, so a paired forward's inputs are a step's.
+        self.prepare_inputs(batch)
+    }
+
     fn execute(&mut self, batch: &Batch) -> Result<BatchOutput> {
         if let Some((held, entered, released)) = &self.held
             && held.contains(&batch.id.0)

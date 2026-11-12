@@ -710,6 +710,8 @@ impl Thread {
         }
         self.renew()?;
 
+        // The step's range markers are launched by the graphs, around the forward itself.
+        self.runners[index].graphs().mark_step(step, stage);
         let mut output = self.runners[index].execute(batch)?;
 
         if self
@@ -748,25 +750,18 @@ impl Thread {
     /// were compared in earlier turns. Returns whether an operator is left for a later turn.
     fn shadow(&mut self, batch: &Batch, compared: usize) -> Result<bool> {
         let index = self.runner_of(batch.phase)?;
-        let next = self.kernels.get(&batch.generation).ok_or_else(|| {
-            Error::Invariant(format!(
+        if !self.kernels.contains_key(&batch.generation) {
+            return Err(Error::Invariant(format!(
                 "shadow batch {} names generation {}, which this executor is not preparing",
                 batch.id.0, batch.generation
-            ))
-        })?;
-
+            )));
+        }
         let runner = &mut self.runners[index];
-        let serving = runner.graphs().generation();
-        let serving = self.kernels.get(&serving).ok_or_else(|| {
-            Error::Invariant(format!(
-                "generation {serving} serves and the executor holds no kernels of it"
-            ))
-        })?;
 
-        // The inputs are prepared again for each paired forward, which issues them.
-        let bucket = runner.prepare_inputs(batch)?;
-        let table = runner.graphs().launch_table(&bucket).unwrap_or_default();
-        let operators = replaced_operators(&table, serving, next);
+        // The inputs are prepared again for each paired forward, which issues them; a paired
+        // forward writes scratch memory only, which the runner's shadow inputs state.
+        let bucket = runner.prepare_shadow_inputs(batch)?;
+        let operators = runner.graphs().replaced(&bucket);
         let Some(operator) = operators.get(compared).copied() else {
             return Ok(false);
         };
@@ -980,13 +975,8 @@ impl Thread {
     /// Waits for the device to pass the last forward of every runner's graphs: what a job that
     /// needs nothing in flight on the device starts with.
     fn settle(&self) -> Result<()> {
-        let meta = backend::meta();
-
         for runner in &self.runners {
-            let graphs = runner.graphs();
-            if !graphs.device().same_device(&meta) {
-                graphs.wait()?;
-            }
+            runner.graphs().wait()?;
         }
         Ok(())
     }
@@ -1049,29 +1039,6 @@ impl Thread {
                 ))
             })
     }
-}
-
-/// The operators of the launch table `table` that `next` launches with another kernel than
-/// `serving` under the same key, in launch order: what a paired forward compares. A key only
-/// one of the two holds has no pair, because a kernel is compared with the one it replaces and
-/// never with another compilation.
-fn replaced_operators(
-    table: &[(&'static str, String, String)],
-    serving: &Generation,
-    next: &Generation,
-) -> Vec<&'static str> {
-    let mut operators = Vec::new();
-
-    for (operator, key, _) in table {
-        let replaced = matches!(
-            (serving.kernel(operator, key), next.kernel(operator, key)),
-            (Ok(held), Ok(new)) if !Arc::ptr_eq(held, new)
-        );
-        if replaced && !operators.contains(operator) {
-            operators.push(*operator);
-        }
-    }
-    operators
 }
 
 /// The kernels `next` holds under keys `serving` has none for, each as a statement of what the

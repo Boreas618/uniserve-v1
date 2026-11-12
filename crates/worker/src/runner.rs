@@ -65,6 +65,20 @@ pub trait Runner: Send {
     /// A batch no bucket holds, or columns the runner refuses.
     fn prepare_inputs(&mut self, batch: &Batch) -> Result<Bucket>;
 
+    /// As [`Runner::prepare_inputs`], for a shadow batch of the generation being prepared: the
+    /// inputs of a paired forward ([`Graphs::shadow`]), which must write no state a serving
+    /// request reads, so the runner redirects what the forward writes to scratch memory.
+    ///
+    /// # Errors
+    ///
+    /// The default refuses: a runner that states no scratch memory shadows nothing.
+    fn prepare_shadow_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+        let _ = batch;
+        Err(crate::Error::Unsupported(
+            "this runner prepares no inputs for a paired forward".to_owned(),
+        ))
+    }
+
     /// One step: prepare the inputs, run the bucket's graph, read the outputs.
     ///
     /// # Errors

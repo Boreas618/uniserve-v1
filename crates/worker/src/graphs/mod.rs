@@ -133,6 +133,9 @@ struct State {
     /// The bucket whose inputs are prepared and the slot that holds them, until the replay or
     /// the eager forward that issues them.
     prepared: Option<(Bucket, usize)>,
+    /// The step the next replay or eager forward is, when the executor stated one
+    /// ([`Graphs::mark_step`]): its number and its stage.
+    step: Option<(u64, &'static str)>,
     /// What paired forwards are compared with, once the device's scratch pool gave its region.
     shadow: Option<Shadow>,
     /// The pairs the paired forwards of the generation being prepared could not compare, each
@@ -292,13 +295,49 @@ impl Graphs {
         Ok(self.cuda()?.launching.enter())
     }
 
-    /// Waits for the device to pass the last replay or eager forward these graphs issued.
+    /// Waits for the device to pass everything these graphs issued: the last replay, eager
+    /// forward, paired forward or capture. Graphs that hold no device have nothing in flight.
     ///
     /// # Errors
     ///
-    /// For graphs that hold no device, or when the event cannot be waited for.
+    /// When the event cannot be waited for.
     pub fn wait(&self) -> Result<()> {
-        Ok(self.cuda()?.done.synchronize()?)
+        self.settle()
+    }
+
+    /// States the step the next replay or eager forward of these graphs is: its number and its
+    /// stage (the call kind of its batch). The forward is then issued between the step's two
+    /// range markers, the end marker right behind its last launch, so the time between them is
+    /// the device's and holds nothing of the host's read of the outputs. Without range markers
+    /// in the process nothing is launched.
+    pub fn mark_step(&self, step: u64, stage: &'static str) {
+        self.state.borrow_mut().step = Some((step, stage));
+    }
+
+    /// The operators the generation being prepared launches with another kernel than the
+    /// serving one under the same key in `bucket`'s graph, in launch order, each once: what a
+    /// paired forward of the bucket compares ([`Graphs::shadow`]). A key only one of the two
+    /// generations holds has no pair. Empty when no generation is being prepared.
+    pub fn replaced(&self, bucket: &Bucket) -> Vec<&'static str> {
+        let state = self.state.borrow();
+        let Update::Prepared { next, .. } = &state.update else {
+            return Vec::new();
+        };
+        let Some((_, graph)) = state.served(bucket) else {
+            return Vec::new();
+        };
+
+        let mut operators = Vec::new();
+        for (operator, key, _) in &graph.table {
+            let replaced = matches!(
+                (state.serving.kernel(operator, key), next.kernel(operator, key)),
+                (Ok(held), Ok(new)) if !Arc::ptr_eq(held, new)
+            );
+            if replaced && !operators.contains(operator) {
+                operators.push(*operator);
+            }
+        }
+        operators
     }
 
     /// The group of the runner's partitioned forwards: this rank is member `rank` of `ranks`,
@@ -363,6 +402,16 @@ impl Graphs {
     pub fn peak(&self) -> u64 {
         // One alignment unit covers a region whose first address is not aligned.
         ALIGNMENT + self.inputs.next_multiple_of(ALIGNMENT) + self.profile.peak()
+    }
+
+    /// A bound on the bytes of the shadow region a paired forward of a profiled bucket needs
+    /// for the outputs its operators allocate: the new kernel's shadow outputs and the copies of
+    /// the serving kernel's real outputs, each at most everything the forward allocates. An
+    /// operator that writes execution-owned memory in place (a cache page, a state row) is
+    /// shadowed over the scratch memory its runner redirects it to, whose bytes its owner
+    /// states beside this figure.
+    pub fn shadow_peak(&self) -> u64 {
+        2 * self.profile.allocated_peak()
     }
 
     /// The bytes of host values the largest profiled forward copies to the device: the values
@@ -492,7 +541,12 @@ impl Graphs {
 
         let mut state = self.state.borrow_mut();
         let serving = state.serving.number();
-        let State { graphs, buffer, .. } = &mut *state;
+        let State {
+            graphs,
+            buffer,
+            step,
+            ..
+        } = &mut *state;
         let (_, graph) = served(graphs, serving, bucket).ok_or_else(|| {
             Error::Invariant(format!("bucket {bucket} has no captured graph to replay"))
         })?;
@@ -502,7 +556,11 @@ impl Graphs {
 
         buffer.issue(slot, &cuda.stream, cuda.inputs, self.inputs, &graph.copies)?;
         buffer.release(slot, &cuda.stream)?;
+
+        let step = step.take();
+        begin_step(&cuda.stream, step)?;
         executable.launch(&cuda.stream)?;
+        end_step(&cuda.stream, step)?;
         cuda.done.record(&cuda.stream)?;
 
         Ok(graph.outputs.clone())
@@ -524,11 +582,14 @@ impl Graphs {
         self.with_buffer(|buffer| buffer.issue(slot, &cuda.stream, cuda.inputs, self.inputs, &[]))?;
         self.lend_values(&cuda.launching, slot)?;
 
+        let step = self.state.borrow_mut().step.take();
+        begin_step(&cuda.stream, step)?;
         cuda.launching.reset();
         let outputs = {
             let _guard = cuda.launching.enter();
             runner.forward(bucket)
         };
+        end_step(&cuda.stream, step)?;
 
         // The forward's own copies read the slot, so the slot is free only behind them.
         self.with_buffer(|buffer| buffer.release(slot, &cuda.stream))?;
@@ -1109,6 +1170,7 @@ impl Graphs {
 
         // The slot is free once the stream has passed the copy of the idle inputs.
         self.with_buffer(|buffer| buffer.release(slot, &cuda.stream))?;
+        cuda.done.record(&cuda.stream)?;
         let (executable, outputs) = captured?;
 
         Ok(Graph {
@@ -1190,6 +1252,7 @@ impl State {
             graphs: HashMap::new(),
             buffer,
             prepared: None,
+            step: None,
             shadow: None,
             uncompared: Vec::new(),
         }
@@ -1199,6 +1262,23 @@ impl State {
     /// captured or rebound for.
     fn served(&self, bucket: &Bucket) -> Option<(u64, &Graph)> {
         served(&self.graphs, self.serving.number(), bucket)
+    }
+}
+
+/// Launches the begin marker of `step` on `stream`, when the executor stated a step and the
+/// process holds range markers.
+fn begin_step(stream: &Stream, step: Option<(u64, &'static str)>) -> Result<()> {
+    match (step, crate::profiling::markers::Markers::installed()) {
+        (Some((step, stage)), Some(markers)) => markers.begin_step(stream, step, stage),
+        _ => Ok(()),
+    }
+}
+
+/// Launches the end marker of `step` on `stream`, right behind the step's last launch.
+fn end_step(stream: &Stream, step: Option<(u64, &'static str)>) -> Result<()> {
+    match (step, crate::profiling::markers::Markers::installed()) {
+        (Some((step, _)), Some(markers)) => markers.end_step(stream, step),
+        _ => Ok(()),
     }
 }
 
