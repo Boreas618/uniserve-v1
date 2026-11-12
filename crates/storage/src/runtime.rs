@@ -20,6 +20,8 @@
 //! [`VERSION`] is stated when a session is opened; a session keeps its version
 //! for its life, and a new request or completion is a new version.
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Error, Key, Result};
 
 /// The version of this interface.
@@ -35,12 +37,14 @@ pub struct RequestId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OwnerId(pub u64);
 
-/// A worker group of the session's engine epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// A worker group of the session's engine epoch. The engine numbers the
+/// groups of its session, so a group is one scheduler's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GroupId(pub u8);
 
 /// Where a copy of a block lies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Tier {
     Device,
     Host,
@@ -68,6 +72,101 @@ pub enum Cause {
     /// The request itself: its number was taken before, or its record is
     /// not one of this version's.
     Request,
+}
+
+/// What an engine epoch states to open its session with the buffer pool of
+/// its deployment: its layout. It travels on the Storage Server's socket;
+/// the answer is [`Opened`], with one queue pair's descriptor per scheduler.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Open {
+    /// The version of this interface the engine speaks: [`VERSION`].
+    pub version: u32,
+    /// The engine epoch, and whether its update is on trial.
+    pub epoch: u64,
+    pub trial: bool,
+    /// The regions of the layout. A region another session of the
+    /// deployment stated under the same name is that region.
+    pub regions: Vec<Region>,
+    /// The classes; a request names a class by its index here.
+    pub classes: Vec<Class>,
+    /// The class of stored trajectories.
+    pub trajectory: u8,
+    pub groups: Vec<Group>,
+    /// Per scheduler, its groups. Each scheduler gets a queue pair whose
+    /// registers hold the `completed` word of each of its groups and the
+    /// capacity words of each region its groups and their classes name.
+    pub schedulers: Vec<Vec<GroupId>>,
+}
+
+/// The memory blocks are taken from, on one tier and in one layout.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Region {
+    pub name: String,
+    pub tier: Tier,
+    /// The memory space: the unit axis of one physical layout. Regions that
+    /// state one space are cut from the same allocations at the same
+    /// positions.
+    pub space: String,
+    /// The bytes of a unit, summed over the ranks that hold a part of it.
+    pub unit_bytes: u64,
+    /// The units before this one are never allocated: unit 0 and the
+    /// executor's scratch units of a cache, row 0 of the slot rows.
+    pub reserved: u32,
+    /// The units the engine asks to have in the region, and the limit of
+    /// the region's numbering.
+    pub units: u32,
+    pub limit: u32,
+}
+
+/// A kind of block.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Class {
+    /// The units of one block; 0 when each request states the size.
+    pub units: u32,
+    /// The host region of the class's host copies, as an index into
+    /// [`Open::regions`], and the units of one host copy; 0 units when a
+    /// host copy takes the units that hold the block's bytes.
+    pub host: Option<(u8, u32)>,
+    /// Whether the class's live state is in the slot, which a clone cannot copy.
+    pub state_in_slot: bool,
+}
+
+/// One worker group of the epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Group {
+    pub id: GroupId,
+    /// The device memory the group's ranks address. Groups of two sessions
+    /// that state one name read and write the same memory.
+    pub memory: String,
+    /// The region of its slot rows, and per class the device regions its
+    /// owners' blocks are taken from: one, or one per backing rank of a
+    /// product, none for a class the group lacks. Indices into
+    /// [`Open::regions`].
+    pub slots: u8,
+    pub regions: Vec<Vec<u8>>,
+}
+
+/// The answer to [`Open`]. The descriptors of the queue pairs travel with
+/// it, one per scheduler in the order of [`Open::schedulers`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Opened {
+    /// Per region of [`Open::regions`]: the number completions name it by,
+    /// and the units in it.
+    pub regions: Vec<(u8, u32)>,
+    /// Per scheduler, where its queue pair's registers lie.
+    pub registers: Vec<Registers>,
+}
+
+/// The registers of one scheduler's queue pair.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Registers {
+    /// Per group of the scheduler, in the order it listed them: the index
+    /// of the group's `completed` word, which the group's executor writes.
+    pub completed: Vec<u32>,
+    /// Per region the scheduler uses, by its number: the index of the first
+    /// of its three capacity words (`available`, `retiring`, `evictable`),
+    /// which the buffer pool writes.
+    pub capacity: Vec<(u8, u32)>,
 }
 
 /// The stamps of a request: per stamping group, the sequence of the last
