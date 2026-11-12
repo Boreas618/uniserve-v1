@@ -11,6 +11,8 @@
 //! - [`protocol`]: the messages, versioned independently of the build.
 //! - [`transport`]: framed messages with file descriptors over a Unix
 //!   socket.
+//! - [`queue`]: the queue pair in shared memory between a scheduler and the
+//!   buffer pool.
 //! - [`Client`]: one connection, used synchronously by workers and
 //!   asynchronously by the head.
 //! - [`connector`]: the settings of the Mooncake connector a server runs,
@@ -31,10 +33,12 @@ mod error;
 pub mod key;
 pub mod manifest;
 pub mod protocol;
+pub mod queue;
 pub mod transport;
 
 pub use client::{ClaimClient, ClaimHandoff, Client};
 pub use error::{Error, Result};
+pub use queue::QueuePair;
 
 /// The socket of this host's Storage Server for the calling user:
 /// `storage-server.sock` in the user's service directory
