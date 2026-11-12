@@ -35,6 +35,7 @@
 //! every launch site of an operator states the same key.
 
 mod activation;
+mod activation1d;
 mod conv;
 mod embedding;
 mod frame;
@@ -54,6 +55,7 @@ use crate::error::{Error, Result};
 pub use activation::{
     Activation, Rounding, act_and_mul, gelu, gelu_tanh, silu, snake, swiglu, value_first_swiglu,
 };
+pub use activation1d::activation1d;
 pub use conv::{Padding, causal_pad, conv_transpose1d, conv1d, conv3d};
 pub use embedding::{embedding, vocabulary_shard};
 pub use frame::frame_norm_pad;

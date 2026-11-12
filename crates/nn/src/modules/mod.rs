@@ -9,6 +9,7 @@
 //! composes with `Tensor::apply`.
 
 mod adaln;
+mod codec;
 mod conv;
 mod embedding;
 mod frame;
@@ -18,9 +19,11 @@ mod mlp;
 mod norm;
 mod timestep;
 mod ulysses;
+mod vocoder;
 mod vsa;
 
 pub use adaln::{AdaLnBlock, AdaLnBlockConfig, AdaLnOut, AdaLnOutConfig};
+pub use codec::{DacEncoder, DacEncoderConfig};
 pub use conv::{Conv1d, Conv3d, ConvConfig, ConvTranspose1d};
 pub use embedding::{Embedding, EmbeddingConfig};
 pub use frame::{FrameNorm, FrameNormConfig, ResnetBlock3d, ResnetBlock3dConfig};
@@ -34,4 +37,7 @@ pub use timestep::{
     TimestepEmbedding, TimestepEmbeddingConfig, TimestepTable, TimestepTableConfig,
 };
 pub use ulysses::{UlyssesAttention, UlyssesAttentionConfig};
+pub use vocoder::{
+    Activation1d, Activation1dConfig, AmpBlock, AmpBlockConfig, BigVgan, BigVganConfig,
+};
 pub use vsa::{VsaAttention, VsaAttentionConfig};

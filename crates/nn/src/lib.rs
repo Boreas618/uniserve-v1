@@ -60,6 +60,7 @@
 //! | [`modules`] | `Linear`, `Embedding`, `LmHead`, `RmsNorm`, `LayerNorm`, `Mlp` and their parallel forms |
 //! | [`capability`] | The traits execution calls and the input values of their methods |
 //! | [`diffusion`] | Flow-matching schedules, the solver formulas and the sinusoidal time embedding |
+//! | [`vae`] | The tiles of a raster, their blend and stitch, the tiled encode and the temporal clips |
 //! | [`family`] | The family traits, the registry and the shapes execution sizes a model by |
 //! | [`collective`], [`profiler`] | The model-facing forms of the backend's collectives and profiler ranges |
 
@@ -75,6 +76,7 @@ pub mod functional;
 pub mod modules;
 pub mod profiler;
 pub mod quantization;
+pub mod vae;
 pub mod var_builder;
 pub mod weights;
 
