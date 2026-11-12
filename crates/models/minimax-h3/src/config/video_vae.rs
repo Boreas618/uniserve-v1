@@ -1,10 +1,10 @@
-//! The video VAE's configuration: its encoder stages, the latent reconstruction geometry, and the
-//! channel statistics that turn a latent into a raster.
+//! The video VAE's configuration, as the checkpoint's `vae/config.json` states it: the stages of
+//! the convolutional encoder, the transformer of the decoder, the clips a video is encoded in
+//! and the per-channel statistics of the latent space.
 //!
-//! The decoder is the piece H3 serves: it inflates a latent of one temporal step and a
-//! `spatial_compression x spatial_compression` pixel patch back into frames, in clips of
-//! `clip_length` frames. The encoder is the piece `ref2va` uses to encode condition media. Both
-//! share one configuration, which the checkpoint's `vae/config.json` states.
+//! The decoder serves every task: one latent voxel becomes `temporal_compression` frames of
+//! `spatial_compression × spatial_compression` pixels. The encoder serves the conditioned
+//! tasks, which encode a request's keyframes and reference media. Both read this one config.
 
 use nn::config::Fields;
 use nn::functional::Padding;
@@ -13,7 +13,7 @@ use serde_json::Value;
 use super::statistics;
 use crate::{Error, Result};
 
-/// The video VAE's network and reconstruction geometry.
+/// What `vae/config.json` states of the video VAE (diffusers' `AutoencoderKLMiniMaxH3`).
 #[derive(Clone, PartialEq, Debug)]
 pub struct VideoVaeConfig {
     /// Raster channels the encoder reads.
@@ -36,13 +36,13 @@ pub struct VideoVaeConfig {
     pub norm_eps: f32,
     /// How the causal convolutions fill the rows and columns beyond a frame's edge.
     pub spatial_padding_mode: Padding,
-    /// Transformer layers of the decoder's latent stage.
+    /// Transformer layers of the decoder.
     pub decoder_num_layers: u32,
     /// Attention heads of those layers.
     pub decoder_num_attention_heads: u32,
     /// Width of one head.
     pub decoder_attention_head_dim: u32,
-    /// Learned register tokens the decoder's latent stage carries.
+    /// Learned register tokens that trail each sequence of the decoder.
     pub decoder_num_register_tokens: u32,
     /// The feed-forward width multiplier of those layers.
     pub decoder_ffn_mult: u32,
@@ -52,9 +52,9 @@ pub struct VideoVaeConfig {
     pub decoder_rope_dim_ratio: f32,
     /// The epsilon of those layers' normalizations.
     pub decoder_norm_eps: f32,
-    /// Frames of one clip: the VAE's temporal footprint.
+    /// Frames of one clip the encoder reads at a time.
     pub clip_length: u32,
-    /// Latent frames the final clip drops, which the next clip's overlap repeats.
+    /// Latent frames the final clip of a video drops.
     pub token_drop: u32,
     /// Per-channel mean of the latent space.
     pub latents_mean: Vec<f32>,
@@ -67,6 +67,7 @@ impl VideoVaeConfig {
     pub fn parse(values: &Value) -> Result<Self> {
         let values = Fields::of("vae/config.json", values)?;
         let latent_channels = values.count("latent_channels")?;
+
         let spatial_padding_mode = match values.text("spatial_padding_mode")? {
             "reflect" => Padding::Reflect,
             "replicate" => Padding::Replicate,
@@ -78,6 +79,7 @@ impl VideoVaeConfig {
                 )));
             }
         };
+
         let config = Self {
             in_channels: values.count("in_channels")?,
             out_channels: values.count("out_channels")?,
@@ -102,6 +104,7 @@ impl VideoVaeConfig {
             latents_mean: statistics(&values, "latents_mean", latent_channels)?,
             latents_std: statistics(&values, "latents_std", latent_channels)?,
         };
+
         config.validate()?;
         Ok(config)
     }
@@ -110,6 +113,7 @@ impl VideoVaeConfig {
     /// other.
     fn validate(&self) -> Result<()> {
         let owner = "H3 video_vae";
+
         if self.block_out_channels.len() != self.spatial_downsample_factors.len()
             || self.block_out_channels.len() != self.temporal_downsample_factors.len()
         {
@@ -132,6 +136,7 @@ impl VideoVaeConfig {
                 "{owner}.latents_std must be positive"
             )));
         }
+
         // The rotary width splits evenly across the three axes (time, height, width), and each
         // axis rotates an even number of channels.
         let rotary_width =
@@ -148,7 +153,7 @@ impl VideoVaeConfig {
         Ok(())
     }
 
-    /// The spatial compression: latent columns become this many pixels.
+    /// The spatial compression: one latent row or column is this many pixels.
     pub fn spatial_compression(&self) -> u32 {
         self.spatial_downsample_factors.iter().product()
     }
@@ -158,15 +163,14 @@ impl VideoVaeConfig {
         self.temporal_downsample_factors.iter().product()
     }
 
-    /// Latent frames one clip encodes to.
-    ///
-    /// The causal strides map `clip_length` frames to this many latent frames; the final clip
-    /// keeps all but `token_drop` of them.
+    /// Latent frames one clip encodes to: the causal strides map `clip_length` frames to
+    /// `ceil(clip_length / temporal_compression)`, and the final clip keeps all but `token_drop`
+    /// of them.
     pub fn clip_latents(&self) -> u32 {
         self.clip_length.div_ceil(self.temporal_compression())
     }
 
-    /// The latent frames of the final clip: what a generated clip's latent actually holds.
+    /// The latent frames the final clip of a video keeps.
     pub fn final_clip_latents(&self) -> u32 {
         self.clip_latents() - self.token_drop
     }

@@ -1,8 +1,9 @@
-//! The audio VAE's configuration: the BigVGAN decoder that turns an audio latent into stereo PCM,
-//! the latent space's channel statistics, and the sample clock.
+//! The audio VAE's configuration, as the checkpoint's `audio_vae/config.json` states it: the DAC
+//! encoder, the BigVGAN decoder that turns an audio latent into a waveform, the per-channel
+//! statistics of the latent space and the sample clock.
 //!
-//! The product of `encoder_rates` is the samples one latent frame stands for - the encoder's input
-//! hop and the decoder's output rate - and H3's timeline counts audio latents in those hops
+//! The product of `encoder_rates` is the samples one latent frame covers (the encoder's hop,
+//! which the decoder's rates invert), and a video's timeline counts audio latents in those hops
 //! (`docs/minimax_h3/minimax_h3.md`).
 
 use nn::config::Fields;
@@ -11,16 +12,16 @@ use serde_json::Value;
 use super::statistics;
 use crate::{Error, Result};
 
-/// The audio VAE's network geometry and latent statistics.
+/// What `audio_vae/config.json` states of the audio VAE.
 #[derive(Clone, PartialEq, Debug)]
 pub struct AudioVaeConfig {
     /// Width of the encoder's first stage.
     pub encoder_dim: u32,
     /// Each encoder stage's stride.
     pub encoder_rates: Vec<u32>,
-    /// Width of one latent frame.
+    /// Width of the features the encoder writes and the decoder's vocoder reads.
     pub latent_dim: u32,
-    /// Latent channels: the generated audio stream's.
+    /// Channels of the latent space.
     pub latent_channels: u32,
     /// Width of the decoder's first stage.
     pub decoder_dim: u32,
@@ -28,7 +29,7 @@ pub struct AudioVaeConfig {
     pub decoder_rates: Vec<u32>,
     /// Each decoder stage's transposed convolution kernel.
     pub decoder_kernel_sizes: Vec<u32>,
-    /// Attention heads of the latent stage.
+    /// Attention heads of the encoder's projection to the latent channels.
     pub num_attention_heads: u32,
     /// Each residual stack's kernel sizes.
     pub resblock_kernel_sizes: Vec<u32>,
@@ -47,6 +48,7 @@ impl AudioVaeConfig {
     pub fn parse(values: &Value) -> Result<Self> {
         let values = Fields::of("audio_vae/config.json", values)?;
         let latent_channels = values.count("latent_channels")?;
+
         let config = Self {
             encoder_dim: values.count("encoder_dim")?,
             encoder_rates: values.counts("encoder_rates")?,
@@ -62,6 +64,7 @@ impl AudioVaeConfig {
             latents_mean: statistics(&values, "latents_mean", latent_channels)?,
             latents_std: statistics(&values, "latents_std", latent_channels)?,
         };
+
         config.validate()?;
         Ok(config)
     }
@@ -69,6 +72,7 @@ impl AudioVaeConfig {
     /// Check the stages, the residual stacks and the latent width against each other.
     fn validate(&self) -> Result<()> {
         let owner = "H3 audio_vae";
+
         if self.decoder_rates.len() != self.decoder_kernel_sizes.len() {
             return Err(Error::config(format!(
                 "{owner}: {} decoder stages and {} kernels",
@@ -97,12 +101,12 @@ impl AudioVaeConfig {
         Ok(())
     }
 
-    /// Samples one latent frame covers: the encoder's hop and the decoder's output rate.
+    /// Samples one latent frame covers as the encoder reads them: the product of its rates.
     pub fn hop(&self) -> u32 {
         self.encoder_rates.iter().product()
     }
 
-    /// Samples one latent frame of the decoder's output covers.
+    /// Samples one latent frame decodes to: the product of the decoder's rates.
     pub fn decoder_hop(&self) -> u32 {
         self.decoder_rates.iter().product()
     }
