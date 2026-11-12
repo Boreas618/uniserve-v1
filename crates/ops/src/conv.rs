@@ -22,6 +22,7 @@ use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
 use crate::platform::{self, Stream};
+use crate::strided;
 use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
@@ -149,7 +150,11 @@ pub struct Args {
     pub out: Operand,
 }
 
-/// The two layout obligations a convolution's arguments carry.
+/// The layout obligations a convolution's arguments carry.
+///
+/// The entry receives an address and a shape for each operand and derives the strides itself,
+/// so an operand laid out any other way is read at the wrong offsets while the numbers still
+/// look like a convolution.
 ///
 /// **The filter is not an operand a channels-last memory format reorders.** A checkpoint stores
 /// every module's weight packed in `[out, in, kd, kh, kw]` — the KCRS form the filter descriptor
@@ -160,6 +165,13 @@ pub struct Args {
 /// **The activations and the output are.** With `channels_last` set the entry derives
 /// channels-last strides for both, so a buffer allocated in the other order is misread for the same
 /// reason. A unit channel axis has no order to disagree about and is exempt.
+///
+/// **Channels-first activations and output are contiguous.** Without `channels_last` the entry
+/// derives row-major strides for both, so a permuted, stepped or broadcast view, and a block of
+/// a larger tensor, are refused: the caller makes such an operand contiguous first. An axis of
+/// one element carries any stride.
+///
+/// **The bias is contiguous**: the entry reads its elements one after the other.
 fn check_layouts(operator: &'static str, descriptor: &Descriptor, args: Args) -> Result<()> {
     if args.weight.strides != Strides::row_major(args.weight.shape) {
         return Err(Error::argument(
@@ -186,6 +198,12 @@ fn check_layouts(operator: &'static str, descriptor: &Descriptor, args: Args) ->
                 ));
             }
         }
+    } else {
+        strided::require_contiguous(operator, "input", &args.input)?;
+        strided::require_contiguous(operator, "out", &args.out)?;
+    }
+    if let Some(bias) = &args.bias {
+        strided::require_contiguous(operator, "bias", bias)?;
     }
     Ok(())
 }
@@ -572,5 +590,114 @@ mod tests {
             error.to_string().contains("not packed row-major"),
             "{error}"
         );
+    }
+
+    /// `[n, c, l]` operands of a one-dimensional convolution of four channels into eight.
+    fn one_dimensional(input: Operand, out: Operand) -> (Descriptor, Args) {
+        let descriptor = Descriptor {
+            kernel: [3, 1, 1],
+            padding: [1, 0, 0],
+            rank: 1,
+            ..descriptor(false)
+        };
+        let args = Args {
+            input,
+            weight: view(&[8, 4, 3], &[12, 3, 1]),
+            bias: None,
+            out,
+        };
+        (descriptor, args)
+    }
+
+    /// The entry derives row-major strides for channels-first operands, so any other view of
+    /// the input or the output is refused by every convolution operator.
+    #[test]
+    fn a_channels_first_convolution_refuses_an_input_or_an_output_that_is_not_contiguous() {
+        let input = view(&[2, 4, 16], &[64, 16, 1]);
+        let out = view(&[2, 8, 16], &[128, 16, 1]);
+
+        let (descriptor, args) = one_dimensional(input, out);
+        Conv1d::check(&descriptor, &args).unwrap();
+
+        // `[n, l, c]` storage read as `[n, c, l]`: the channels are innermost in memory.
+        let permuted = view(&[2, 4, 16], &[64, 1, 4]);
+        // Every other sample of a longer signal.
+        let stepped = view(&[2, 4, 16], &[128, 32, 2]);
+        // One sample repeated over the batch.
+        let broadcast = view(&[2, 4, 16], &[0, 16, 1]);
+        // Sixteen samples of rows that are twenty long.
+        let window = view(&[2, 4, 16], &[80, 20, 1]);
+
+        for strided_input in [permuted, stepped, broadcast, window] {
+            let (descriptor, args) = one_dimensional(strided_input, out);
+            let message = Conv1d::check(&descriptor, &args).unwrap_err().to_string();
+            assert!(message.contains("input must be contiguous"), "{message}");
+        }
+
+        let (descriptor, args) = one_dimensional(input, view(&[2, 8, 16], &[160, 20, 1]));
+        let message = Conv1d::check(&descriptor, &args).unwrap_err().to_string();
+        assert!(message.contains("out must be contiguous"), "{message}");
+
+        // The transposed operator reads its operands the same way: `[in, out, taps]`.
+        let transposed = Descriptor {
+            transposed: true,
+            padding: [1, 0, 0],
+            ..descriptor
+        };
+        let args = Args {
+            input: permuted,
+            weight: view(&[4, 8, 3], &[24, 3, 1]),
+            bias: None,
+            out,
+        };
+        let message = ConvTranspose1d::check(&transposed, &args)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("input must be contiguous"), "{message}");
+
+        // An axis of one element is never stepped along, whatever stride it carries.
+        let single = view(&[1, 4, 16], &[7, 16, 1]);
+        let (descriptor, args) = one_dimensional(single, view(&[1, 8, 16], &[0, 16, 1]));
+        Conv1d::check(&descriptor, &args).unwrap();
+    }
+
+    #[test]
+    fn a_three_dimensional_convolution_refuses_a_strided_volume_and_a_strided_bias() {
+        let shape = [1, 4, 2, 2, 2];
+        let args = Args {
+            input: view(&shape, &[32, 8, 4, 2, 1]),
+            weight: view(&[8, 4, 3, 3, 3], &[108, 27, 9, 3, 1]),
+            bias: None,
+            out: view(&[1, 8, 2, 2, 2], &[64, 8, 4, 2, 1]),
+        };
+        Conv3d::check(&descriptor(false), &args).unwrap();
+
+        // Depth and height exchanged.
+        let permuted = Args {
+            input: view(&shape, &[32, 8, 2, 4, 1]),
+            ..args
+        };
+        let message = Conv3d::check(&descriptor(false), &permuted)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("input must be contiguous"), "{message}");
+
+        // Every other element of a longer bias.
+        let biased = Descriptor {
+            bias: true,
+            ..descriptor(false)
+        };
+        let stepped = Args {
+            bias: Some(view(&[8], &[2])),
+            ..args
+        };
+        let message = Conv3d::check(&biased, &stepped).unwrap_err().to_string();
+        assert!(message.contains("bias must be contiguous"), "{message}");
+
+        let packed = Args {
+            bias: Some(view(&[8], &[1])),
+            ..args
+        };
+        Conv3d::check(&biased, &packed).unwrap();
     }
 }

@@ -10,6 +10,11 @@
 //! out    [m, n]        row-major
 //! ```
 //!
+//! Each operand is a matrix of rows: its last axis is contiguous, its rows are one fixed stride
+//! apart, and that stride is no shorter than a row. The library reads the row stride as a
+//! leading dimension, so a window of a wider tensor is read in place, while a transposed, a
+//! stepped and a broadcast view are refused; their caller makes them contiguous first.
+//!
 //! The weight order is a descriptor value because it is the checkpoint's layout, not this call's.
 //! The contraction length `k` is a descriptor value too: a module's tile and split choices are made
 //! for one `k`, so a launch whose input disagrees with the descriptor is a launch of the wrong
@@ -284,6 +289,19 @@ impl Op for Gemm {
                 WeightOrder::NxK => Shape::new(&[n, k]),
             },
         )?;
+        if args.weight.strides.last() != 1 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected a unit stride on the weight's last axis, found {}: a transposed \
+                     weight is the other weight order over the stored matrix",
+                    args.weight.strides.last()
+                ),
+            ));
+        }
+        require_rows("input", &args.input)?;
+        require_rows("weight", &args.weight)?;
+        require_rows("out", &args.out)?;
 
         match (descriptor.epilogue, args.bias) {
             (Epilogue::Bias, Some(bias)) => {
@@ -376,6 +394,52 @@ impl Op for Gemm {
     }
 }
 
+/// Check that the rows of the operand `name` are what the entry reads: runs of its last axis,
+/// one fixed stride apart, the stride no shorter than a run.
+///
+/// The entry receives a row count, a row length and one row stride, which its library takes as
+/// a leading dimension. Rows closer than their length overlap, and a row repeated by a zero
+/// stride is one address stated many times: neither is a matrix the library accepts. The axes
+/// before the row axis only multiply the row count, so each of them steps over the rows inside
+/// it.
+fn require_rows(name: &str, operand: &Operand) -> Result<()> {
+    let (stride, length) = (row_stride(&operand.strides), operand.last());
+    if stride < length {
+        return Err(Error::argument(
+            Gemm::NAME,
+            format!(
+                "the {name}'s rows are {stride} elements apart and {length} long: a row stride \
+                 is a leading dimension, which is no shorter than a row, in the view {:?} with \
+                 strides {:?}",
+                operand.shape, operand.strides
+            ),
+        ));
+    }
+
+    let rank = operand.shape.rank();
+    for axis in 0..rank.saturating_sub(2) {
+        let inside = operand
+            .shape
+            .dim(axis + 1)
+            .saturating_mul(operand.strides.get(axis + 1));
+
+        if operand.shape.dim(axis) > 1 && operand.strides.get(axis) != inside {
+            return Err(Error::argument(
+                Gemm::NAME,
+                format!(
+                    "axis {axis} of the {name} advances by {} elements where the rows inside it \
+                     span {inside}: its rows are not one stride apart, in the view {:?} with \
+                     strides {:?}",
+                    operand.strides.get(axis),
+                    operand.shape,
+                    operand.strides
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The elements between consecutive rows of a view.
 fn row_stride(strides: &Strides) -> u64 {
     if strides.rank() >= 2 {
@@ -421,6 +485,168 @@ mod tests {
         assert!(
             Gemm::operands(&descriptor(DType::BF16, DType::BF16)).is_ok(),
             "a pair of one type is the cell the operator declares"
+        );
+    }
+
+    fn matrix(shape: &[u64], strides: &[u64]) -> Operand {
+        Operand::with_strides(
+            DevicePtr::new(0x1000),
+            DType::BF16,
+            Shape::new(shape),
+            Strides::new(strides),
+        )
+    }
+
+    /// Four rows of eight against a weight stored `[n, k]` with five outputs.
+    fn product() -> (Descriptor, Args) {
+        let descriptor = Descriptor {
+            k: 8,
+            ..descriptor(DType::BF16, DType::BF16)
+        };
+        let args = Args {
+            input: matrix(&[4, 8], &[8, 1]),
+            weight: matrix(&[5, 8], &[8, 1]),
+            bias: None,
+            out: matrix(&[4, 5], &[5, 1]),
+            alpha: 1.0,
+        };
+        (descriptor, args)
+    }
+
+    fn refusal(descriptor: &Descriptor, args: &Args) -> String {
+        Gemm::check(descriptor, args).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn rows_a_stride_apart_are_read_in_place() {
+        let (descriptor, args) = product();
+        Gemm::check(&descriptor, &args).unwrap();
+
+        // Each operand as a window of a wider tensor: its rows keep the wider tensor's stride.
+        let windows = Args {
+            input: matrix(&[4, 8], &[12, 1]),
+            weight: matrix(&[5, 8], &[16, 1]),
+            out: matrix(&[4, 5], &[9, 1]),
+            ..args
+        };
+        Gemm::check(&descriptor, &windows).unwrap();
+
+        // A batch folded into the rows: two members of two rows each, contiguous.
+        let folded = Args {
+            input: matrix(&[2, 2, 8], &[16, 8, 1]),
+            ..args
+        };
+        Gemm::check(&descriptor, &folded).unwrap();
+
+        // The weight in the other order, `[k, n]`.
+        let stored = Descriptor {
+            order: WeightOrder::KxN,
+            ..descriptor
+        };
+        let args = Args {
+            weight: matrix(&[8, 5], &[5, 1]),
+            ..args
+        };
+        Gemm::check(&stored, &args).unwrap();
+    }
+
+    #[test]
+    fn a_weight_whose_last_axis_is_not_contiguous_is_refused() {
+        let (descriptor, args) = product();
+
+        // `[k, n]` storage read as `[n, k]`: its transpose.
+        let transposed = Args {
+            weight: matrix(&[5, 8], &[1, 5]),
+            ..args
+        };
+        let message = refusal(&descriptor, &transposed);
+        assert!(
+            message.contains("expected a unit stride on the weight's last axis, found 5"),
+            "{message}"
+        );
+
+        // Every other column of a wider weight.
+        let stepped = Args {
+            weight: matrix(&[5, 8], &[16, 2]),
+            ..args
+        };
+        let message = refusal(&descriptor, &stepped);
+        assert!(message.contains("found 2"), "{message}");
+    }
+
+    #[test]
+    fn a_row_stride_shorter_than_a_row_is_refused_for_every_operand() {
+        let (descriptor, args) = product();
+
+        // One row repeated over the batch: a broadcast.
+        let broadcast = Args {
+            input: matrix(&[4, 8], &[0, 1]),
+            ..args
+        };
+        let message = refusal(&descriptor, &broadcast);
+        assert!(
+            message.contains("the input's rows are 0 elements apart and 8 long"),
+            "{message}"
+        );
+
+        // Rows that overlap.
+        let overlapping = Args {
+            weight: matrix(&[5, 8], &[4, 1]),
+            ..args
+        };
+        let message = refusal(&descriptor, &overlapping);
+        assert!(
+            message.contains("the weight's rows are 4 elements apart and 8 long"),
+            "{message}"
+        );
+
+        let out = Args {
+            out: matrix(&[4, 5], &[0, 1]),
+            ..args
+        };
+        let message = refusal(&descriptor, &out);
+        assert!(
+            message.contains("the out's rows are 0 elements apart and 5 long"),
+            "{message}"
+        );
+
+        // A vector has no row axis to state a stride.
+        let vector = Args {
+            input: matrix(&[8], &[1]),
+            out: matrix(&[1, 5], &[5, 1]),
+            ..args
+        };
+        let message = refusal(&descriptor, &vector);
+        assert!(
+            message.contains("the input's rows are 0 elements apart"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_batch_whose_members_are_not_a_row_stride_apart_is_refused() {
+        let (descriptor, args) = product();
+
+        // Two members of two rows, the members three rows apart.
+        let spaced = Args {
+            input: matrix(&[2, 2, 8], &[24, 8, 1]),
+            ..args
+        };
+        let message = refusal(&descriptor, &spaced);
+        assert!(
+            message.contains("axis 0 of the input advances by 24 elements"),
+            "{message}"
+        );
+
+        // One member repeated.
+        let repeated = Args {
+            input: matrix(&[2, 2, 8], &[0, 8, 1]),
+            ..args
+        };
+        let message = refusal(&descriptor, &repeated);
+        assert!(
+            message.contains("axis 0 of the input advances by 0"),
+            "{message}"
         );
     }
 }
