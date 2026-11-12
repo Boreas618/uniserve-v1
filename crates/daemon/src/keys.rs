@@ -16,8 +16,8 @@ use std::process::{Command, Stdio};
 use anyhow::Context as _;
 use proto::config::EngineArgs;
 
-use crate::engine::control::{Interfaces, ensure_build_server, place, select_engine};
-use crate::leader::{Leader, replica_configs};
+use crate::engine::control::{BuildServer, Interfaces, ensure_build_server, place};
+use crate::leader::{Leader, fix_modules, named_modules, replica_configs};
 use crate::options::{ServerArgs, Stated};
 
 /// The launch of every main process the deployment `config` starts on this node, in replica
@@ -35,6 +35,9 @@ pub async fn launches(
     stated: &Stated,
 ) -> anyhow::Result<Vec<EngineArgs>> {
     let prepared = Leader::prepare(families, config, stated).await?;
+    // The module set is fixed when the keys are recorded (`record`): a launch built here names
+    // the packages the configuration names.
+    let named = named_modules(config, prepared.model_config.video().is_some());
     replica_configs(&prepared.engine)?
         .into_iter()
         .zip(1..)
@@ -42,7 +45,7 @@ pub async fn launches(
             // A serving daemon numbers its main processes from one as it starts them; the number
             // keys nothing a recorded start reads.
             place(
-                EngineArgs::new(replica),
+                EngineArgs::new(replica, named.clone()),
                 engine,
                 &Interfaces {
                     requests: "",
@@ -57,13 +60,13 @@ pub async fn launches(
 /// The kernel keys the deployment `config` launches, by operator: what every main process of it
 /// records in its profile runs, each key once.
 ///
-/// The engine package the deployment selects is fixed and built at this host's Build Server,
-/// which is started when none serves, and each launch is run by its executable with `--keys`.
+/// The deployment's module set is fixed and built at this host's Build Server, which is started
+/// when none serves, and each launch is run by the engine's executable with `--keys`.
 /// No weight is read, and no daemon, Storage Server or communicator is started.
 ///
 /// # Errors
 ///
-/// Fails as [`launches`] does, when the engine package cannot be selected or resolved, and when
+/// Fails as [`launches`] does, when the module set cannot be fixed or the engine resolved, and when
 /// a recording process fails or prints a line that is no `operator<TAB>key`.
 pub async fn record(
     families: &processing::Registry,
@@ -71,17 +74,29 @@ pub async fn record(
     stated: &Stated,
 ) -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
     let launches = launches(families, config, stated).await?;
-    let config = config.clone();
+    let socket = {
+        let settings = config.build_config.clone();
+        tokio::task::spawn_blocking(move || ensure_build_server(&settings))
+            .await
+            .context("starting the Build Server did not complete")??
+    };
+    let Some(named) = launches.first().map(|launch| launch.modules.clone()) else {
+        return Ok(BTreeMap::new());
+    };
+    let servers = vec![BuildServer {
+        host: config.host_identity.clone(),
+        socket: socket.clone(),
+        targets: Vec::new(),
+    }];
+    let modules = fix_modules(servers, config.host_identity.clone(), named)
+        .await
+        .map_err(anyhow::Error::from)?;
     tokio::task::spawn_blocking(move || {
-        let socket = ensure_build_server(&config.build_config)?;
-        let mut modules = crate::epoch::modules_of(&config);
-        modules.engine = select_engine(&socket, &modules.engine)?;
-
         let directory = tempfile::tempdir().context("creating the launch files' directory")?;
         let mut recorded: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for mut launch in launches {
             launch.build_server = socket.display().to_string();
-            launch.modules = Some(modules.clone());
+            launch.modules = modules.clone();
             let executable =
                 crate::supervision::engine_executable(&launch).map_err(anyhow::Error::msg)?;
             let file = crate::engine::launch::write(directory.path(), launch.engine, &launch)

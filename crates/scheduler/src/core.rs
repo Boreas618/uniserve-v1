@@ -685,18 +685,18 @@ impl SchedulerHandle {
     /// §7.3 step 2: prepares `package`'s policy on this scheduler's state,
     /// without putting it in; the response arrives when the blocking thread that
     /// loaded it is done.
-    pub fn precopy_policy(
+    pub fn prepare_policy(
         &self,
         package: crate::PolicyPackage,
         source: std::sync::Arc<dyn crate::PolicySource + Send + Sync>,
     ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.precopy_policy(package, source)
+        self.commands.prepare_policy(package, source)
     }
 
     /// §7.3 step 3: the prepared policy responds from this scheduler's next
     /// batch boundary.
-    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.switchover_policy()
+    pub fn switch_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.switch_policy()
     }
 
     /// §7.3 step 5: probation ended; the replaced policy stays until the next
@@ -707,8 +707,8 @@ impl SchedulerHandle {
 
     /// §7.3 step 4: the previous policy responds again, on the state this
     /// scheduler holds when the stage applies.
-    pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.revert_policy()
+    pub fn rollback_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.rollback_policy()
     }
 
     /// The step this scheduler reached and §12's cost counters for its policy,
@@ -723,7 +723,9 @@ impl SchedulerHandle {
     /// The response is polled, not waited for: the caller of the stats tick is
     /// the engine's control thread, and a scheduler that does not respond must
     /// not hold it.
-    pub fn take_policy_report(&self) -> crossbeam_channel::Receiver<Option<crate::PolicyReverted>> {
+    pub fn take_policy_report(
+        &self,
+    ) -> crossbeam_channel::Receiver<Option<crate::PolicyRolledBack>> {
         self.commands.take_policy_report()
     }
 

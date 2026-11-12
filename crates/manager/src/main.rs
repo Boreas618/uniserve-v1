@@ -3,7 +3,9 @@
 //!
 //! The manager is a client of each node's admin API (`/admin`) and nothing
 //! else: no daemon, engine, worker or Storage Server waits for it or keeps
-//! state of it. It attaches to a node by reading its status and its event
+//! state of it. A node's admin API listens on a Unix socket whose file
+//! permissions are its access (`unix:<path>`); an `http://` address names an
+//! admin socket forwarded from another host. It attaches to a node by reading its status and its event
 //! log and detaches by stopping; a write it sends is carried out by the
 //! node whether the manager stays or not. Every command acts on the nodes
 //! `--node` names, in the order given:
@@ -44,8 +46,9 @@ mod updates;
     about = "Manage UniServe deployments through their nodes' admin API"
 )]
 struct Cli {
-    /// A node's base URL, such as `http://10.0.0.2:8000`; repeated for
-    /// several, before the command.
+    /// A node's admin API: its Unix socket (`unix:/run/user/1000/admin-8000.sock`),
+    /// or the base URL the socket is forwarded at; repeated for several,
+    /// before the command.
     #[arg(long = "node", required = true)]
     nodes: Vec<String>,
     /// The nodes' API key.
@@ -128,22 +131,40 @@ enum Command {
 /// One node's admin API.
 #[derive(Clone)]
 struct Node {
+    /// The node's address as the operator stated it, which names it in every
+    /// line the manager prints.
     base: String,
+    /// The URL prefix of its routes: the address itself, or a placeholder
+    /// host for a Unix socket, which the client connects by path.
+    url: String,
     http: reqwest::Client,
     api_key: Option<String>,
 }
 
 impl Node {
-    fn new(base: &str, http: &reqwest::Client, api_key: Option<&str>) -> Self {
-        Self {
-            base: base.trim_end_matches('/').to_owned(),
-            http: http.clone(),
+    /// The node at `address`: `unix:<path>` for its admin socket, else a base
+    /// URL.
+    fn new(address: &str, api_key: Option<&str>) -> Result<Self> {
+        let (http, url) = match address.strip_prefix("unix:") {
+            Some(path) => (
+                reqwest::Client::builder().unix_socket(path),
+                "http://admin".to_owned(),
+            ),
+            None => (
+                reqwest::Client::builder(),
+                address.trim_end_matches('/').to_owned(),
+            ),
+        };
+        Ok(Self {
+            base: address.trim_end_matches('/').to_owned(),
+            url,
+            http: http.build().context("building the HTTP client")?,
             api_key: api_key.map(str::to_owned),
-        }
+        })
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let request = self.http.request(method, format!("{}{path}", self.base));
+        let request = self.http.request(method, format!("{}{path}", self.url));
         match &self.api_key {
             Some(key) => request.bearer_auth(key),
             None => request,
@@ -205,14 +226,11 @@ impl Node {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let http = reqwest::Client::builder()
-        .build()
-        .context("building the HTTP client")?;
     let nodes: Vec<Node> = cli
         .nodes
         .iter()
-        .map(|base| Node::new(base, &http, cli.api_key.as_deref()))
-        .collect();
+        .map(|address| Node::new(address, cli.api_key.as_deref()))
+        .collect::<Result<_>>()?;
     match cli.command {
         Command::Status => status(&nodes).await,
         Command::Watch { from_start } => watch(nodes, from_start).await,

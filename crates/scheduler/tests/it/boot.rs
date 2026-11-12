@@ -109,8 +109,8 @@ fn policy_package(pool: &FakeBatches) -> scheduler::PolicyPackage {
 fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    response(handle.precopy_policy(policy_package(pool), source)).expect("the policy is precopied");
-    response(handle.stage(Stage::Switchover)).expect("the policy serves");
+    response(handle.prepare_policy(policy_package(pool), source)).expect("the policy is precopied");
+    response(handle.stage(Stage::Switch)).expect("the policy serves");
 }
 
 #[test]

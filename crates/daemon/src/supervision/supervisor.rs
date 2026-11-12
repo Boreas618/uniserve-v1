@@ -164,17 +164,11 @@ pub(crate) struct Supervisor {
 /// The executable a main process started from `launch` runs as: the module of the engine
 /// package the launch's module set names, at the Build Server the launch names.
 ///
-/// The module was built when the epoch's modules were prepared, so this is a read of the store;
+/// The module was built when the epoch's module set was fixed, so this is a read of the store;
 /// a store that lost it builds it again first. A module of another version of the engine
 /// interface than this daemon speaks is refused here, before a process starts.
 pub(crate) fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, String> {
-    let modules = launch.modules.as_ref().ok_or_else(|| {
-        format!(
-            "the launch of engine {} names no module set, so no engine package to run",
-            launch.engine
-        )
-    })?;
-    let engine = &modules.engine;
+    let engine = &launch.modules.engine;
     let named = format!(
         "the engine package {} revision {}",
         engine.backend, engine.revision

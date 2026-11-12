@@ -72,10 +72,10 @@ impl Needs {
         let mut needs = Self::default();
         let held = status["gpus"].as_array().into_iter().flatten();
         needs.gpus.extend(held.filter_map(gpu));
-        if planned["change"] != "planned" {
+        if planned["change"] != "dry_run" {
             return needs;
         }
-        let plan = &planned["plan"];
+        let plan = &planned["dry_run"];
         let plans: Vec<&Value> = match plan["replicas"].as_array() {
             Some(replicas) => replicas.iter().collect(),
             None => vec![plan],
@@ -427,46 +427,33 @@ async fn update(node: &Node, options: &Options) -> Result<Ended> {
         .with_context(|| format!("{} did not change", node.base))?;
     let mut result = answer["result"].clone();
     println!("{}: {result}", node.base);
-    if result["change"] == "daemon" && result["then"] == "epoch" {
-        // The hot restart's successor changes the epoch in an operation of
-        // its own, after the one that answered.
+    if result["change"] == "daemon" && result["then"] == "update" {
+        // The hot restart's successor applies the rest of the change in an
+        // operation of its own, after this one.
         let after = answer["id"].as_u64().unwrap_or(0);
         result = operation_after(node, after, options.poll).await?;
         println!("{}: {result}", node.base);
     }
-    if result["change"] != "epoch" {
+    // An update, in either form, serves on trial once the apply responded.
+    let update = result["update"].clone();
+    if update["phase"] != "trial" {
         return Ok(Ended::Done);
     }
     let Some(trial_window) = options.commit_after else {
         return Ok(Ended::OnTrial);
     };
-    let mut trial = result["epoch"].clone();
-    loop {
-        tokio::time::sleep(trial_window).await;
-        let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
-        let epochs = if trial["epochs"].is_array() {
-            "epochs"
-        } else {
-            "epoch"
-        };
-        if status["trial"].is_null() || status["trial"][epochs] != trial[epochs] {
-            bail!(
-                "{}: the trial rolled back before its commit ({})",
-                node.base,
-                status["last"]
-            );
-        }
-        let committed = node.post("/admin/config/commit", &json!({})).await?;
-        let result = &committed["result"];
-        println!("{}: committed {result}", node.base);
-        if let Some(error) = result.get("rollout_error") {
-            bail!("{}: {error}", node.base);
-        }
-        let Some(next) = result.get("next_trial") else {
-            break;
-        };
-        trial = next.clone();
+    tokio::time::sleep(trial_window).await;
+    let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
+    let standing = &status["update"];
+    if standing["update"] != update["update"] || standing["phase"] != "trial" {
+        bail!(
+            "{}: the trial rolled back before its commit ({})",
+            node.base,
+            standing["failure"]
+        );
     }
+    let committed = node.post("/admin/config/commit", &json!({})).await?;
+    println!("{}: committed {}", node.base, committed["result"]);
     Ok(Ended::Done)
 }
 
@@ -558,15 +545,18 @@ mod tests {
             .iter()
             .map(|(host, gpu)| json!({ "host": host, "gpu": gpu, "used": 1 }))
             .collect();
-        Json(json!({
-            "gpus": gpus,
-            "trial": trial.map(|epoch| json!({ "epoch": epoch })),
-            "last": if daemon.rolls_back {
-                json!({ "rolled_back": 2, "reason": "epoch 2 failed" })
-            } else {
-                Value::Null
-            },
-        }))
+        // The update as the daemon reports it: on trial, or rolled back with
+        // its failure.
+        let update = match trial {
+            Some(number) => json!({ "update": number, "phase": "trial" }),
+            None if daemon.rolls_back => json!({
+                "update": 2,
+                "phase": "rolled_back",
+                "failure": { "kind": "sticky", "reason": "epoch 2 failed" },
+            }),
+            None => Value::Null,
+        };
+        Json(json!({ "gpus": gpus, "update": update }))
     }
 
     async fn change(State(daemon): State<Arc<Daemon>>, Json(body): Json<Value>) -> Json<Value> {
@@ -575,14 +565,17 @@ mod tests {
             let plan = (daemon.plan)(&daemon.log);
             return Json(json!({
                 "id": 1, "kind": "config", "state": "succeeded",
-                "result": { "change": "planned", "plan": plan },
+                "result": { "change": "dry_run", "dry_run": plan },
             }));
         }
         daemon.log.record(format!("{}:apply", daemon.name));
         *daemon.trial.lock().unwrap() = Some(2);
         Json(json!({
             "id": 2, "kind": "config", "state": "succeeded",
-            "result": { "change": "epoch", "epoch": { "epoch": 2, "previous_epoch": 1 } },
+            "result": {
+                "change": "epoch",
+                "update": { "update": 2, "phase": "trial", "epoch": 2 },
+            },
         }))
     }
 
@@ -611,7 +604,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        Node::new(&format!("http://{address}"), &reqwest::Client::new(), None)
+        Node::new(&format!("http://{address}"), None).unwrap()
     }
 
     /// The plan of a new epoch beside the serving one on `gpus`, requiring
@@ -838,8 +831,8 @@ mod tests {
             })
         };
         let planned = json!({
-            "change": "planned",
-            "plan": { "replicas": [
+            "change": "dry_run",
+            "dry_run": { "replicas": [
                 replica("GPU-0", "GPU-8", 100, true),
                 replica("GPU-1", "GPU-9", 300, false),
             ] },
@@ -872,8 +865,8 @@ mod tests {
         // A change in place starts no epoch, and one that changes nothing
         // needs nothing.
         let in_place = json!({
-            "change": "planned",
-            "plan": { "epoch": true, "daemon": false, "steps": null },
+            "change": "dry_run",
+            "dry_run": { "epoch": true, "daemon": false, "steps": null },
         });
         let needs = Needs::of(&status, &in_place);
         assert!(needs.changes && !needs.epoch);

@@ -165,7 +165,7 @@ struct ReplicaHandoff {
     paused: bool,
     asleep: bool,
     sleep_paused: bool,
-    unavailable: Vec<crate::updates::epoch::Unavailable>,
+    unavailable: Vec<crate::updates::Unavailable>,
 }
 
 /// What `POST /admin/restart` needs of the daemon it restarts.
@@ -813,19 +813,14 @@ async fn prepared_successor(
     )
     .context("resuming the node's daemon service")?;
     let epoch_records = Arc::new(crate::epoch::Epochs::new());
-    // Every later update commands the same main processes through this daemon's
-    // channel, as the first daemon's did after its start.
-    if let Some(commands) = daemon.commands() {
-        epoch_records.supervise(commands);
-    }
     let (updates, awake) = daemon
-        .updates(
+        .updater(
             Arc::clone(&epoch_records),
             config.served_model_name().to_owned(),
         )
-        .context("the leader's daemon serves no epoch layer")?;
-    Daemon::advance_epochs(Arc::clone(&updates), awake)
-        .context("starting the epoch layer's thread")?;
+        .context("the leader's daemon commands no engine")?;
+    Daemon::advance_updates(Arc::clone(&updates), awake)
+        .context("starting the updater's thread")?;
     let control = Arc::new(control);
     let adopting = Arc::clone(&control);
     let daemon_options = config.clone();
@@ -889,12 +884,9 @@ async fn prepared_successor(
     let first = Arc::clone(&leader.replicas()[0]);
     *crate::leader::locked(&first.config) = options;
     first.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
-    first.adopt_unavailable(handed.unavailable);
-    // §2.5 continues across the handoff: the successor adopts the engines and
-    // then keeps a standby of its own, or the deployment would serve without one
-    // until the next restart. The epoch's modules serve already, so it prepares
-    // from them as soon as it parks.
-    first.prepare_standby();
+    leader.updates.adopt_unavailable(handed.unavailable);
+    // The successor adopts the engines and then keeps a standby of its own,
+    // or the deployment would serve without one until the next restart.
     first.start_standby();
     for (index, (handed, options, served, observer, client)) in adopted.enumerate() {
         let replica = crate::leader::Replica::new(
@@ -909,10 +901,8 @@ async fn prepared_successor(
         let _ = replica.control.set(Arc::clone(&control));
         *crate::leader::locked(&replica.served) = Some(served);
         replica.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
-        replica.adopt_unavailable(handed.unavailable);
+        leader.updates.adopt_unavailable(handed.unavailable);
         replica.monitor();
-        replica.prepare_standby();
-        replica.start_standby();
         leader
             .replicas
             .serving

@@ -29,7 +29,7 @@
 //!
 //! This module holds the rules only: the caller applies the [`Action`]s it
 //! returns to the real children and reports the lifecycle back through
-//! [`Roster::parked`], [`Roster::failed`], [`Roster::promoted`] and the
+//! [`Standbys::parked`], [`Standbys::failed`], [`Standbys::promoted`] and the
 //! rest.
 
 use std::collections::BTreeMap;
@@ -54,7 +54,7 @@ pub struct MainProcess {
     /// rank when taken; these rules never mint a generation number. `0` means
     /// none was taken: the rules then return [`Action::Allocate`] and change
     /// nothing, and the caller takes a number, records it with
-    /// [`Roster::allocated`] and asks again.
+    /// [`Standbys::allocated`] and asks again.
     pub standby_generation: u64,
     /// The cross-node epoch the node's process joins; `None` when the node
     /// is in no cross-node group and is therefore a failure domain alone.
@@ -128,7 +128,7 @@ pub enum Action {
     Terminate { host: String, generation: u64 },
     /// The node needs a generation for its next child, and only the epoch
     /// layer's counter can give one: take a number from the group and rank's
-    /// counter and record it with [`Roster::allocated`].
+    /// counter and record it with [`Standbys::allocated`].
     Allocate {
         host: String,
         group: String,
@@ -172,7 +172,7 @@ pub enum Phase {
     /// serving.
     Relaunching { awaiting: usize },
     /// A replacement round waits for the epoch layer's generation numbers:
-    /// the caller takes one per node, records it with [`Roster::allocated`],
+    /// the caller takes one per node, records it with [`Standbys::allocated`],
     /// and the round's actions follow the last one.
     Allocating,
 }
@@ -197,7 +197,7 @@ struct Node {
 
 /// The epoch's main processes and the standby rules over them.
 #[derive(Debug, Clone)]
-pub struct Roster {
+pub struct Standbys {
     nodes: Vec<Node>,
     /// The nodes replaced together, by node index.
     domains: Vec<Vec<usize>>,
@@ -209,8 +209,8 @@ pub struct Roster {
     deferred: Vec<Option<String>>,
 }
 
-impl Roster {
-    /// The roster of the epoch's main processes, one per node; the failure
+impl Standbys {
+    /// The standbys of the epoch's main processes, one per node; the failure
     /// domains are derived from the cross-node epochs they join.
     pub fn new(processes: Vec<MainProcess>) -> Self {
         let mut domains: Vec<Vec<usize>> = Vec::new();
@@ -372,7 +372,7 @@ impl Roster {
     /// standby (the child mapped the epoch's weights and cache read-only,
     /// captured its graphs on warmup scratch and parked). A child whose
     /// preparation failed reports that failure instead, which the caller
-    /// feeds to [`Roster::standby_lost`]: a standby epoch is kept whole or not
+    /// feeds to [`Standbys::standby_lost`]: a standby epoch is kept whole or not
     /// at all.
     pub fn parked(&mut self, host: &str, generation: u64) {
         let Some(domain) = self.domain_of(host) else {
@@ -427,8 +427,8 @@ impl Roster {
     /// member is started again. A request-level failure replaces nothing.
     ///
     /// The caller applies whatever actions come back and reports their
-    /// outcome through [`Roster::promoted`], [`Roster::promote_failed`] and
-    /// [`Roster::relaunched`]; it does not assume that a fault yields a
+    /// outcome through [`Standbys::promoted`], [`Standbys::promote_failed`] and
+    /// [`Standbys::relaunched`]; it does not assume that a fault yields a
     /// promotion, because whether one is possible is the domain's state, not
     /// the failure's.
     pub fn failed(&mut self, host: &str, failure: &Failure) -> Vec<Action> {
@@ -713,7 +713,7 @@ impl Roster {
     }
     /// The node's epoch stopped serving there: its main process was drained,
     /// purged or switched away, so its standby is terminated and none starts
-    /// until [`Roster::serve`] is called again.
+    /// until [`Standbys::serve`] is called again.
     ///
     /// The standby layer owns the standby child, so it stops it: the epoch
     /// layer does not need to know its generation. A replacement round in
@@ -758,7 +758,7 @@ impl Roster {
 /// A domain's standby, as the daemon reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainState<'a> {
-    /// The domain's nodes, in roster order.
+    /// The domain's nodes, in standbys order.
     pub hosts: Vec<&'a str>,
     /// Where its standby stands: `absent`, `starting`, `parked`,
     /// `promoting` or `relaunching`.

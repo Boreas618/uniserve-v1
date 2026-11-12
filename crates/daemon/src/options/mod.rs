@@ -380,10 +380,10 @@ impl Default for ServerArgs {
     }
 }
 
-/// The daemon's HTTP server (`admin_config`): the address this node's admin
-/// API listens on (design §7.7). The application's own server is
-/// `server_config`'s; the two are separate options so the management API and
-/// the application API can listen at different addresses.
+/// The daemon's listeners (`admin_config`): the address its HTTP server
+/// serves the client API on, and the two Unix sockets that serve the admin
+/// API apart from it, one for the operator and one for a harness. Access to
+/// the admin API is those sockets' file permissions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
@@ -394,6 +394,36 @@ pub struct AdminConfig {
     /// Unix domain socket to listen on instead of TCP; a stale socket file
     /// is replaced and the socket file is removed at shutdown.
     pub uds: Option<String>,
+    /// The Unix socket the operator's admin API listens on, created with
+    /// mode `0600`; unset places it in the daemon's runtime directory
+    /// (`admin-<port>.sock`).
+    pub admin_uds: Option<String>,
+    /// The Unix socket the harness's subset of the admin API listens on,
+    /// created with mode `0660`, so that the operator grants a harness
+    /// access through the socket's group; unset places it in the daemon's
+    /// runtime directory (`harness-<port>.sock`).
+    pub harness_uds: Option<String>,
+    /// The option paths a harness may set through `PUT /admin/config` on the
+    /// harness listener, beside the package selections it may always set.
+    pub harness_options: Vec<String>,
+}
+
+impl AdminConfig {
+    /// The Unix socket the operator's admin API listens on.
+    pub fn admin_socket(&self) -> PathBuf {
+        self.admin_uds.as_ref().map_or_else(
+            || runtime_directory().join(format!("admin-{}.sock", self.port)),
+            PathBuf::from,
+        )
+    }
+
+    /// The Unix socket the harness's subset of the admin API listens on.
+    pub fn harness_socket(&self) -> PathBuf {
+        self.harness_uds.as_ref().map_or_else(
+            || runtime_directory().join(format!("harness-{}.sock", self.port)),
+            PathBuf::from,
+        )
+    }
 }
 
 impl Default for AdminConfig {
@@ -402,6 +432,9 @@ impl Default for AdminConfig {
             host: "127.0.0.1".to_owned(),
             port: 8000,
             uds: None,
+            admin_uds: None,
+            harness_uds: None,
+            harness_options: Vec::new(),
         }
     }
 }
@@ -812,6 +845,19 @@ impl ServerArgs {
                 "`admin_config.host` must not be empty"
             ),
         }
+        for (name, path) in [
+            ("admin_uds", &admin.admin_uds),
+            ("harness_uds", &admin.harness_uds),
+        ] {
+            anyhow::ensure!(
+                path.as_ref().is_none_or(|path| !path.trim().is_empty()),
+                "`admin_config.{name}` must not be empty"
+            );
+        }
+        anyhow::ensure!(
+            admin.admin_socket() != admin.harness_socket(),
+            "`admin_config.admin_uds` and `admin_config.harness_uds` name one socket"
+        );
         // The model holds the capacity to its own bounds when its processor
         // is bound; a duration that is no positive number admits nothing.
         anyhow::ensure!(

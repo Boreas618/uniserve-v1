@@ -13,11 +13,14 @@
 //! - [`text`]: where a fake's text ends, and the control tokens a scheduler over it names.
 //! - [`policy`]: the `fcfs` module this tree builds, and the package a test epoch installs it
 //!   under.
+//! - [`service`]: a fake engine at the request interface, over production schedulers.
+//! - [`process`]: a fake engine at the process interface, and a fake node daemon behind it.
 
 pub mod batches;
 pub mod media;
 pub mod policy;
 pub mod pools;
+pub mod process;
 pub mod service;
 pub mod text;
 
@@ -28,5 +31,5 @@ pub use batches::{
 pub use media::Media;
 pub use policy::{packaged_module, packaged_policy, packaged_revision};
 pub use pools::{args, limits, pool, rank};
-pub use service::{EpochPolicy, serve_requests};
+pub use service::{EpochPolicy, ProcessLink, serve_engine, serve_requests};
 pub use text::{EOS, EndOfText, special_tokens};

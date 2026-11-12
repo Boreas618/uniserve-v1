@@ -39,7 +39,7 @@ use crate::options::RollbackConfig;
 /// How often a trial reads its thresholds and its switch's end: a report
 /// arrives once a second, and a revert waits for the hold to name the epoch
 /// that serves next, so this is part of the pause a revert costs.
-pub(crate) const POLL: Duration = Duration::from_millis(100);
+pub(crate) const INTERVAL: Duration = Duration::from_millis(100);
 
 /// One replica's reports a trial reads: the epoch the update serves it from,
 /// and what serving reported before the promotion.
@@ -194,26 +194,6 @@ impl Trial {
     }
 }
 
-/// Reads `trial` for as long as `standing` says its update is on probation, and
-/// hands the first threshold it passes to `revert`, which ends the watch.
-pub(crate) async fn watch<Revert, Reverted>(
-    trial: &Trial,
-    outcomes: impl Fn() -> (u64, u64),
-    standing: impl Fn() -> bool,
-    revert: Revert,
-) where
-    Revert: FnOnce(Failure) -> Reverted,
-    Reverted: std::future::Future<Output = ()>,
-{
-    while standing() {
-        if let Some(failure) = trial.breach(outcomes()) {
-            revert(failure).await;
-            return;
-        }
-        tokio::time::sleep(POLL).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use proto::report::SchedulerStats;
@@ -329,42 +309,6 @@ mod tests {
         let failure = trial.breach((104, 52)).expect("half is past it");
         assert_eq!(failure.kind, "failure_rate");
         assert!(failure.reason.contains("2 of the 4"), "{failure:?}");
-    }
-
-    /// A generation update's watch hands the passed threshold over once, and
-    /// a watch whose update ended reverts nothing.
-    #[tokio::test]
-    async fn the_watch_reverts_once_and_ends_with_its_update() {
-        let observer = Arc::new(Observer::default());
-        let thresholds = RollbackConfig {
-            failure_rate: Some(0.5),
-            ..Default::default()
-        };
-        let trial = Trial::begin(
-            thresholds,
-            vec![Observed::new(observer, 2, 1, None, Instant::now())],
-            (0, 0),
-        );
-        let reverted = std::sync::Mutex::new(Vec::new());
-        watch(
-            &trial,
-            || (2, 2),
-            || true,
-            |failure| {
-                reverted.lock().expect("the list").push(failure.kind);
-                std::future::ready(())
-            },
-        )
-        .await;
-        assert_eq!(*reverted.lock().expect("the list"), ["failure_rate"]);
-
-        watch(
-            &trial,
-            || (2, 2),
-            || false,
-            |_| async { panic!("an update that ended reverts nothing") },
-        )
-        .await;
     }
 
     /// A window that has not passed decides nothing, however slow the target.

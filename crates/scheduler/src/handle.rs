@@ -633,7 +633,7 @@ pub enum Command {
     /// §7.3 step 2: prepares `package`'s policy on this scheduler's state,
     /// without putting it in. The load and the instantiation run on a blocking
     /// thread; the response says whether a candidate was prepared.
-    PrecopyPolicy {
+    PreparePolicy {
         package: crate::PolicyPackage,
         source: std::sync::Arc<dyn crate::PolicySource + Send + Sync>,
         response: crossbeam_channel::Sender<Result<(), String>>,
@@ -685,7 +685,7 @@ pub enum Command {
     },
     /// Hands the control thread a policy failure this scheduler recorded: it
     /// reverted to the previous policy and serves on (§7.3).
-    TakePolicyReport(crossbeam_channel::Sender<Option<crate::PolicyReverted>>),
+    TakePolicyReport(crossbeam_channel::Sender<Option<crate::PolicyRolledBack>>),
     CacheWarm {
         operation: storage::manifest::cache::Operation,
         together: Arc<HookBarrier>,
@@ -1097,7 +1097,7 @@ impl CommandSender {
 
     /// Prepares `package`'s policy on this scheduler's state without putting it
     /// in (§7.3 step 2); the response arrives when the blocking thread is done.
-    pub fn precopy_policy(
+    pub fn prepare_policy(
         &self,
         package: crate::PolicyPackage,
         source: std::sync::Arc<dyn crate::PolicySource + Send + Sync>,
@@ -1105,7 +1105,7 @@ impl CommandSender {
         let (response, done) = crossbeam_channel::bounded(1);
         self.refuse_into(
             &response,
-            self.send(Command::PrecopyPolicy {
+            self.send(Command::PreparePolicy {
                 package,
                 source,
                 response: response.clone(),
@@ -1152,8 +1152,8 @@ impl CommandSender {
 
     /// Puts the prepared policy in from the scheduler's next boundary (§7.3
     /// step 3).
-    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.stage_applied(crate::Stage::Switchover)
+    pub fn switch_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.stage_applied(crate::Stage::Switch)
     }
 
     /// Ends the probation: the replaced policy stays until the next precopy
@@ -1164,14 +1164,14 @@ impl CommandSender {
 
     /// Serves the previous policy again, on the scheduler's current state
     /// (§7.3 step 4).
-    pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.stage_applied(crate::Stage::Revert)
+    pub fn rollback_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.stage_applied(crate::Stage::Rollback)
     }
 
     /// Drops the module a revert could have returned to, once no batch uses it
     /// (§7.3 step 6).
-    pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.stage_applied(crate::Stage::Purge)
+    pub fn release_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.stage_applied(crate::Stage::Release)
     }
 
     /// One command of the generation update, responded when this scheduler
@@ -1267,7 +1267,9 @@ impl CommandSender {
 
     /// Takes the policy failure this scheduler recorded since the last call,
     /// if it recorded one: the control thread forwards it to the daemons.
-    pub fn take_policy_report(&self) -> crossbeam_channel::Receiver<Option<crate::PolicyReverted>> {
+    pub fn take_policy_report(
+        &self,
+    ) -> crossbeam_channel::Receiver<Option<crate::PolicyRolledBack>> {
         let (response, report) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::TakePolicyReport(response));
         report

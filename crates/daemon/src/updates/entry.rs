@@ -1,46 +1,39 @@
-//! The update entry: one change of the deployment's configuration, decided
-//! by the layer that owns it (`PUT /admin/config`).
+//! The update entry: one change of the deployment's configuration, applied
+//! as the least it needs (`PUT /admin/config`).
 //!
-//! A change is one of three kinds. What the main processes are built from —
-//! their executable, the parallel ranks, the deployment file, the model's
-//! files, the rank layout, the KV cache's options — is `proto::config::EngineConfig`'s, and
-//! the epoch layer switches to a new epoch (§7.4, [`crate::updates::switch`]).
-//! What they execute — the modules — is the generation layer's, prepared
-//! against every host's Build Server before the processes switch to them
-//! (§7.2). Everything else is this daemon's own: its options change in a hot
-//! restart (§7.5), and the scheduling limits change in place at the engine's
-//! next step boundary, within the batch its workers were started for.
+//! A change moves one of four things, decided by comparing what it moves
+//! ([`crate::epoch::change`]) once the target's module set is fixed at the
+//! Build Servers:
 //!
-//! `Leader::apply` decides in that order and answers what it applied;
-//! `Leader::commit` and `Leader::rollback` are the switch's. A change that
-//! fits no layer is refused by name: the mechanism that moved a deployment
-//! to a successor epoch, with its trial and its rollback, is gone, and
-//! nothing here starts a second engine beside the one that serves.
+//! - the daemon's own options: a hot restart of the daemon, whose successor
+//!   applies what else the change states;
+//! - the engine package, the build configuration or the checkpoint: an update
+//!   in its epoch form, target engines started beside the serving ones;
+//! - kernel or policy packages, the policy's parameters included: an update
+//!   in its generation form, inside the serving engines;
+//! - nothing an engine executes: in place, or nothing at all.
+//!
+//! `Leader::apply` decides in that order and starts the update;
+//! `Leader::commit` and `Leader::rollback` decide it. The update itself is
+//! `crate::updates::update::Update`, advanced by the engines'
+//! acknowledgements; what the daemon does beside it for a replica (moving
+//! requests to the engine that serves, reading the trial's thresholds,
+//! enforcing the deadline) is [`Replica::follow`].
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use proto::config::EngineConfig;
 use tracing::info;
 
 use crate::engine::client::EngineState;
 use crate::engine::hold::HoldState;
+use crate::epoch::{Change, Epoch, Failure};
 use crate::leader::{Leader, Replica, UpdateError, locked};
 use crate::options::ServerArgs;
-use crate::updates::change::{Applied, ApplyRequest, resolve};
-use crate::updates::epoch::Unavailable;
-
-/// The deployment's epochs as the leader tracks them.
-#[derive(Default)]
-pub(crate) struct EpochState {
-    /// The epoch the executing engine runs.
-    pub(crate) executing: u64,
-    pub(crate) unavailable: BTreeMap<String, Unavailable>,
-    /// What the last epoch change, commit or rollback reported.
-    pub(crate) last: Option<serde_json::Value>,
-}
+use crate::updates::change::{Applied, ApplyRequest, InFlight, resolve};
+use crate::updates::update::{EpochSwitch, Node, Update};
 
 /// The GPUs the deployment's epochs hold storage on, from every node's
 /// storage report (`nodes`): each one's host and name (`GPU-…`, as
@@ -69,8 +62,8 @@ fn deployment_gpus(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> {
     gpus
 }
 
-/// The digest of a configuration, which names it in the status and the
-/// unavailable marks: of its printed TOML.
+/// The digest of a configuration, which names it in the status: of its
+/// printed TOML.
 pub(crate) fn digest(config: &ServerArgs) -> anyhow::Result<String> {
     use sha2::Digest as _;
     let printed = crate::options::printed(config)?;
@@ -80,17 +73,14 @@ pub(crate) fn digest(config: &ServerArgs) -> anyhow::Result<String> {
         .collect())
 }
 
-/// How long the closed engine of an epoch takes to exit.
-const CLOSED_EXIT: Duration = Duration::from_secs(60);
-
 /// How long the status waits for the storage ledgers, which each node's
 /// daemon reads from its Storage Server.
 const LEDGER_READ: Duration = Duration::from_secs(10);
 
-/// Whether `target` differs from `served` in the fence probes' switch
+/// Whether `target` differs from `served` in the profiler ranges' switch
 /// alone, which the workers change in place. Every other part of the
 /// profiling configuration shapes the CUDA graphs an epoch captures at its
-/// start, the probed components and whether PC sampling was enabled before
+/// start, the modules it times and whether PC sampling was enabled before
 /// the capture (`profiling_config.graph_pc_sampling`), and takes a new
 /// epoch.
 fn switches_probes_only(served: &EngineConfig, target: &EngineConfig) -> bool {
@@ -103,10 +93,10 @@ fn switches_probes_only(served: &EngineConfig, target: &EngineConfig) -> bool {
     switched == comparable(target)
 }
 
-/// The parts of `config` a replica compares: all of it but what the generation
-/// layer owns (§7.7), the package backends, the scheduling policy, the expert
-/// exchange and the speculative cost figures. A change reaches a replica only
-/// once the generation layer has answered for those.
+/// The parts of `config` a replica compares in place: all of it but what a
+/// module selection owns (the package backends, the scheduling policy, the
+/// expert exchange and the speculative cost figures). A change reaches a
+/// replica only once the module set has answered for those.
 fn comparable(config: &EngineConfig) -> EngineConfig {
     let mut comparable = config.clone();
     comparable.attention_backend = String::new();
@@ -138,8 +128,21 @@ fn retain_devices(served: &EngineConfig, target: &mut EngineConfig) {
     }
 }
 
-/// Changes outside a successor's current process-control contract. Rank
-/// resources and numerical layouts are planned by the target epoch.
+/// The options that select a deployment's packages: the engine package, the
+/// scheduling policy and each operator's implementation. A harness may set
+/// them without the operator listing them.
+pub(crate) const MODULE_OPTIONS: [&str; 8] = [
+    "worker_config.engine",
+    "worker_config.engine_revision",
+    "scheduler_config.policy",
+    "attention_backend",
+    "prefill_attention_backend",
+    "decode_attention_backend",
+    "moe_runner_backend",
+    "moe_config.exchange",
+];
+
+/// The parts of a change no form of update moves.
 fn differing(served: &EngineConfig, target: &EngineConfig) -> Vec<&'static str> {
     let mut parts = Vec::new();
     if served.deployment != target.deployment {
@@ -149,84 +152,133 @@ fn differing(served: &EngineConfig, target: &EngineConfig) -> Vec<&'static str> 
 }
 
 impl Leader {
-    /// Applies a configuration through the replica that owns its epochs.
-    pub async fn apply(&self, request: ApplyRequest) -> Result<Applied, UpdateError> {
+    /// Applies a configuration change as operation `number`, as the module
+    /// describes: the least the change needs.
+    ///
+    /// An update it starts runs on after this returns: its phases end on the
+    /// engines' acknowledgements, and `GET /admin/status`, the events and
+    /// `GET /admin/config` report it.
+    ///
+    /// # Errors
+    ///
+    /// `UpdateError::InProgress` while another change or update runs;
+    /// `UpdateError::Refused` for a configuration that does not parse or
+    /// validate, one a rollback marked unavailable unless `force`, a module
+    /// set the Build Servers cannot select, or a change no form moves.
+    pub async fn apply(&self, request: ApplyRequest, number: u64) -> Result<Applied, UpdateError> {
         let _replacing = self
             .replicas
             .replacing
             .try_lock()
             .map_err(|_| UpdateError::InProgress)?;
         let replicas = self.replicas();
-        // A switch that ended still hands the replica to the epoch that serves, and the serving
-        // client is the one this change would be built from.
-        if !request.dry_run && replicas.iter().any(|replica| replica.follows_a_switch()) {
+        if !request.dry_run && self.updates.in_flight().is_some() {
             return Err(UpdateError::InProgress);
         }
         let current = locked(&replicas[0].config).clone();
-        let (target, _stated, update) = resolve(&current, &request)?;
-        // A target that reverted with a failure is unavailable until it is
-        // applied with `force` (§7.2, §7.3 step 4), whichever layer would
-        // apply it: the epoch layer's switch and the generation layer both end
-        // by recording the update here.
-        let resolved_target = crate::leader::deployment(&target)?;
+        let (target, _stated, options) = resolve(&current, &request)?;
+
+        let named_previous = crate::leader::deployment(&current)?;
+        let named_next = crate::leader::deployment(&target)?;
+        let named = crate::epoch::change(&named_previous, &named_next);
+        if named == Change::Host {
+            return self.apply_in_place(request).await;
+        }
+
+        // The one selection of an apply: every interface's revision is fixed
+        // at the Build Servers before anything is compared, so a revision
+        // installed since the serving epoch was applied is a change. A dry
+        // run of an epoch change starts nothing and selects nothing.
+        let mut next = named_next;
+        if !(request.dry_run && named == Change::Epoch) {
+            next.modules = self.fix_modules(&target).await?;
+        }
+        let Some((serving, record)) = self.updates.epochs().serving() else {
+            return self.apply_in_place(request).await;
+        };
+        let change = if named == Change::Epoch || record.engine != next.modules.engine {
+            Change::Epoch
+        } else if record.kernels != next.modules.kernels || record.policy != next.modules.policy {
+            Change::Generation
+        } else {
+            Change::None
+        };
+        if change == Change::None {
+            return self.apply_in_place(request).await;
+        }
         if !request.force
-            && let Some(failure) = self.updates.epochs().unavailable(&resolved_target)
+            && let Some(mark) = self.updates.unavailable(&next)
         {
             return Err(UpdateError::Refused(format!(
-                "the configuration reverted with a failure ({}); apply it again with force",
-                failure.reason
+                "the configuration was rolled back from epoch {} ({}); apply it again with force",
+                mark.epoch, mark.reason
             )));
         }
-        // The same mark carried across a handover: a predecessor daemon that
-        // adopted it kept it in the replica's state, not in an update record.
-        if !request.force {
-            replicas[0].available(&target, request.force)?;
+        let deadline = request
+            .deadline_s
+            .map(|seconds| Instant::now() + Duration::from_secs_f64(seconds));
+
+        match change {
+            Change::Epoch => {
+                Box::pin(self.epoch_update(
+                    number, &current, &target, next, serving, &options, &request, deadline,
+                ))
+                .await
+            }
+            _ => {
+                self.generation_update(number, next, serving, &options, &request, deadline)
+                    .await
+            }
         }
-        // One update at a time (§7.2, §7.4), whichever layer the change is
-        // the other's: while a switch runs or a generation update is on
-        // probation, the `served` spec and the records this entry would read
-        // belong to that update. A dry run answers without touching them.
-        if !request.dry_run
-            && let Some(update) = crate::updates::in_flight(
-                self.updates.running(),
-                self.epochs().generation_update().is_some(),
-            )
-        {
-            return Err(UpdateError::Refused(format!(
-                "another update is in flight: {update}"
-            )));
+    }
+
+    /// Whether a harness may apply `request`: it selects packages
+    /// ([`MODULE_OPTIONS`]) and sets only the options the operator lists for
+    /// it (`admin_config.harness_options`), by assignment. A whole
+    /// configuration, one replica of the deployment and `force` are the
+    /// operator's.
+    ///
+    /// # Errors
+    ///
+    /// The refusal, naming what the harness may not state.
+    pub(crate) fn harness_may_apply(&self, request: &ApplyRequest) -> Result<(), String> {
+        if request.config.is_some() {
+            return Err(
+                "a harness states assignments (`set`), not a whole configuration".to_owned(),
+            );
         }
-        // A change of what the main processes build is the epoch layer's
-        // (§7.4): one switch for the deployment, decided before either of the
-        // other two layers looks at the change.
-        // The epoch switch's future holds the configurations it compares.
-        if let Some(applied) =
-            Box::pin(self.apply_epoch(&current, &target, &update, request.dry_run)).await?
-        {
-            return Ok(applied);
+        if request.force {
+            return Err("applying a configuration a rollback marked unavailable (`force`) is the operator's".to_owned());
         }
-        // The generation layer (§7.2): only what the serving epoch's processes
-        // execute differs, and the modules are prepared against every host's
-        // Build Server before the processes switch to them. A generation
-        // update is named by the epoch it executes in; the generation layer
-        // answers `None` when the modules a configuration selects do not
-        // differ, and what remains is the daemon's own options and the
-        // scheduling limits.
-        let epoch = self
-            .updates
-            .epochs()
-            .serving()
-            .map_or(0, |(epoch, _)| epoch);
-        if let Some(update) = self
-            .apply_generation(epoch, &target, &update, request.force, request.dry_run)
-            .await?
-        {
-            return Ok(Applied::Generation(serde_json::json!({
-                "change": "generation",
-                "epoch": epoch,
-                "update": update.number,
-            })));
+        if request.replica.is_some() {
+            return Err("a harness applies to the deployment, not to one replica".to_owned());
         }
+        let allowed = locked(&self.replicas()[0].config)
+            .admin_config
+            .harness_options
+            .clone();
+        for assignment in &request.set {
+            let path = assignment
+                .split_once('=')
+                .map_or(assignment.as_str(), |(path, _)| path)
+                .trim();
+            let permitted =
+                MODULE_OPTIONS.contains(&path) || allowed.iter().any(|option| option == path);
+            if !permitted {
+                return Err(format!(
+                    "a harness may not set `{path}`: it is neither a package selection nor an \
+                     option the operator lists in `admin_config.harness_options`"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The per-replica path of a change that starts no update: the daemon's
+    /// own options (a hot restart), the options the workers switch in place,
+    /// or nothing.
+    async fn apply_in_place(&self, request: ApplyRequest) -> Result<Applied, UpdateError> {
+        let replicas = self.replicas();
         let indices: Vec<_> = match request.replica {
             Some(index) => vec![index],
             None => (0..replicas.len()).collect(),
@@ -245,8 +297,8 @@ impl Leader {
                     }
                     return Ok(applied);
                 }
-                Applied::Planned(report) | Applied::InPlace(report) => reports.push(report),
-                applied @ (Applied::Epoch(_) | Applied::Generation(_)) => return Ok(applied),
+                Applied::DryRun(report) | Applied::InPlace(report) => reports.push(report),
+                applied @ Applied::Update(_) => return Ok(applied),
                 Applied::Unchanged => {}
             }
         }
@@ -259,121 +311,190 @@ impl Leader {
             serde_json::json!({ "replicas": reports })
         };
         Ok(if request.dry_run {
-            Applied::Planned(report)
+            Applied::DryRun(report)
         } else {
             Applied::InPlace(report)
         })
     }
 
-    /// The epoch layer's arm of [`Leader::apply`]: a change that starts main
-    /// processes which differ in what they build is a switch between epochs,
-    /// and the two deployments alone decide it. It
-    /// answers `Ok(None)` when the change is another layer's — the host path,
-    /// the modules, or nothing.
-    ///
-    /// The change this builds is the switch's whole input: the serving epoch
-    /// and its launch generation, the epoch the target becomes, one spawn
-    /// generation for the deployment (above every rank's standby, §2.5), the
-    /// target's executable and the arguments every engine process of this
-    /// daemon starts with.
-    async fn apply_epoch(
+    /// Fixes the module set `target` runs: every interface's revision, as the
+    /// Build Servers' `cover` selects it, with every module built on every
+    /// host before anything starts from it.
+    async fn fix_modules(
         &self,
+        target: &ServerArgs,
+    ) -> Result<crate::epoch::ModuleSet, UpdateError> {
+        let named = self.named_modules(target);
+        let servers = self.build_servers(target);
+        // A daemon that starts no engine of its own has no Build Server to
+        // select at, and no engine to move.
+        if servers.is_empty() {
+            return Err(UpdateError::NoEngine);
+        }
+        let leader = self.build_leader_host(target, &servers);
+        crate::leader::fix_modules(servers, leader, named).await
+    }
+
+    /// Starts an update in its generation form: the serving engines prepare
+    /// `next`'s kernel and policy modules and switch to them.
+    async fn generation_update(
+        &self,
+        number: u64,
+        next: Epoch,
+        serving: u64,
+        options: &crate::options::UpdateConfig,
+        request: &ApplyRequest,
+        deadline: Option<Instant>,
+    ) -> Result<Applied, UpdateError> {
+        if request.dry_run {
+            return Ok(Applied::DryRun(serde_json::json!({
+                "change": "generation",
+                "epoch": serving,
+                "modules": crate::updates::change::modules_report(&next.modules),
+            })));
+        }
+        let nodes = self.serving_nodes();
+        if nodes.is_empty() {
+            return Err(UpdateError::NoEngine);
+        }
+        let update = Update::generation(
+            number,
+            next.clone(),
+            Arc::clone(self.updates.epochs()),
+            serving,
+            crate::engine::control::ENGINE_GROUP.to_owned(),
+            nodes,
+            deadline,
+        );
+        let report = self.updates.apply(update)?;
+        for replica in self.replicas() {
+            replica.follow(
+                Arc::clone(&self.updates),
+                number,
+                options.clone(),
+                deadline,
+                crate::leader::Following::Generation {
+                    config: Box::new(next.config.clone()),
+                    modules: next.modules.clone(),
+                },
+            );
+        }
+        Ok(Applied::Update(report))
+    }
+
+    /// The serving engines, one node each: the processes a generation update
+    /// commands, by the launch generation their reports state.
+    fn serving_nodes(&self) -> Vec<Node> {
+        let mut nodes: Vec<Node> = Vec::new();
+        for replica in self.replicas() {
+            let Some(client) = replica.hold().client() else {
+                continue;
+            };
+            let ranks = locked(&replica.config)
+                .engine_config()
+                .ok()
+                .and_then(|config| crate::engine::control::world_hosts(&config).ok())
+                .unwrap_or_default();
+            for process in client.processes() {
+                let rank = ranks
+                    .iter()
+                    .find(|ranks| ranks.host == process.host)
+                    .map_or(0, |ranks| ranks.first);
+                nodes.push(Node::new(process.host, rank, process.engine));
+            }
+        }
+        nodes
+    }
+
+    /// Starts an update in its epoch form: `next`'s engines start beside the
+    /// serving ones as parked engines of the target epoch, and service moves
+    /// to them.
+    ///
+    /// The launch file every target starts from states the epoch's whole
+    /// module set, the storage the serving engine holds now (which the target
+    /// maps read-only until it is promoted) and one launch generation for the
+    /// deployment, above every rank's standby.
+    #[allow(clippy::too_many_arguments)]
+    async fn epoch_update(
+        &self,
+        number: u64,
         current: &ServerArgs,
         target: &ServerArgs,
-        update: &crate::options::UpdateConfig,
-        dry_run: bool,
-    ) -> Result<Option<Applied>, UpdateError> {
-        let previous = crate::leader::deployment(current)?;
-        let mut next = crate::leader::deployment(target)?;
-        if crate::epoch::layer(&previous, &next) != crate::epoch::Layer::Epoch {
-            return Ok(None);
-        }
-        // One main process per node and one launch file per process: the file
-        // names its peers' request addresses, which this daemon does not know
-        // for a node it does not run on, so it can state a world of one only.
-        // A world of more is refused by name instead of silently writing
-        // `world_size = 1` for two processes (exec's rule: the epoch is its
-        // peers and itself).
-        // One main process, not only one node: a data-parallel deployment runs
-        // one replica per main process, and this daemon writes one launch file
-        // and starts one child per node. The count is the target's, decided
-        // from the same expression the replica rollout uses.
-        let processes = if target.moe_config.expert_parallel {
+        next: Epoch,
+        serving: u64,
+        options: &crate::options::UpdateConfig,
+        request: &ApplyRequest,
+        deadline: Option<Instant>,
+    ) -> Result<Applied, UpdateError> {
+        // One engine per node and one launch file per engine: the file names
+        // its peers' request addresses, which this daemon does not know for
+        // a node it does not run on, so it states a world of one only.
+        let engines = if target.moe_config.expert_parallel {
             1
         } else {
             target.data_parallel_size.get()
         };
-        if processes != 1 {
+        if engines != 1 {
             return Err(UpdateError::Refused(format!(
-                "the target epoch runs {processes} data-parallel replicas, and the epoch layer \
-                 starts one main process per node: a replica's launch needs the contents carried \
-                 in `process::Spawn` or an epoch that states every replica's addresses"
+                "the target epoch runs {engines} data-parallel replicas, and an epoch update \
+                 starts one engine per node from one launch file"
             )));
         }
         if target.nnodes.get() != 1 {
             return Err(UpdateError::Refused(format!(
-                "the target epoch runs {} nodes, and a launch file written here names no peer: a \
-                 multi-node epoch needs the launch contents carried in `process::Spawn` or a \
-                 epoch that states its peers' request addresses",
+                "the target epoch runs {} nodes, and a launch file written here names no peer: \
+                 every node's daemon has to state its own engine's launch",
                 target.nnodes.get()
             )));
         }
-        // Whether this daemon has an engine process of its own is asked first:
-        // a daemon that has none runs no epoch change at all, and the missing
-        // means — not the state of its epochs — is what its caller has to fix,
-        // so the answer is "no engine process here" (§7.2: the service cannot
-        // apply the change) rather than a refusal of a valid one.
-        //
-        // The deployment's argv comes from its leader node's control: the
-        // arguments an engine process of this daemon starts with are the
-        // same for every host (the daemon's sockets travel with them).
         let replicas = self.replicas();
         let control = replicas[0].control.get().ok_or(UpdateError::NoEngine)?;
         let serving_client = replicas[0].hold().client().ok_or(UpdateError::NoEngine)?;
         let epochs = self.updates.epochs();
-        let (previous_epoch, _) = epochs.serving().ok_or_else(|| {
-            UpdateError::Refused("no epoch serves: there is nothing to switch from".to_owned())
-        })?;
-        // The previous epoch's processes are addressed by their LAUNCH
-        // generation — `Drain`, `Stop` and `Purge` take it — never by the
-        // record's `generation`, which is the model generation the main process
-        // numbers for its modules (`EpochRecord`, `ManagedProcess`). The
-        // authority for that number is the client itself: it is the engine this
-        // daemon started or adopted, so it is the process those commands must
-        // reach. The process table is no substitute — it holds no row for the
-        // epoch the daemon started with (that child is `EngineControl`'s, not
-        // the roster's) and can hold a lingering replacement above the one that
-        // serves.
-        let previous_generation = serving_client.engine().ok_or_else(|| {
+        // The serving engine is addressed by its launch generation, which is
+        // the number the client states: the engine this daemon started or
+        // adopted.
+        let serving_generation = serving_client.engine().ok_or_else(|| {
             UpdateError::Refused(format!(
-                "the main process serving epoch {} has no launch generation: this daemon neither \
-                 started nor adopted it",
-                previous_epoch
+                "the engine serving epoch {serving} has no launch generation: this daemon \
+                 neither started nor adopted it"
             ))
         })?;
         // One number for the whole deployment: every rank's counter is
-        // advanced, and the highest is the generation each child of the epoch
-        // is spawned at, so none collides with a rank's standby (§2.5). A dry
-        // run advances the counters too and reports the number the switch
-        // would use; the counters are monotone, not a promise.
+        // advanced, and the highest is the generation each target is started
+        // at, so none collides with a rank's standby.
         let group = crate::engine::control::ENGINE_GROUP;
         let spawn_generation = (0..u64::from(target.nnodes.get()))
             .map(|rank| epochs.next_generation(group, rank))
             .max()
             .unwrap_or(0);
-        // The target's number is above every epoch the daemon knows: an epoch a revert retired
-        // keeps its number, and an epoch's storage ends with the epoch it was claimed for.
+        // The target's number is above every epoch the daemon knows: an epoch
+        // a rollback retired keeps its number.
         let target_epoch = epochs
             .records()
             .keys()
             .copied()
             .max()
-            .unwrap_or(previous_epoch)
-            .max(previous_epoch)
+            .unwrap_or(serving)
+            .max(serving)
             + 1;
-        // The target's engine configuration is resolved as a deployment's start resolves it: the
-        // options state the scheduler and the rank layout, and the model's files complete what they
-        // determine. Its launch file carries it whole (§2.3).
+        if request.dry_run {
+            return Ok(Applied::DryRun(serde_json::json!({
+                "change": "epoch",
+                "epoch": target_epoch,
+                "engine": {
+                    "backend": next.modules.engine.backend,
+                    "revision": next.modules.engine.revision,
+                },
+                "launch_generation": spawn_generation,
+                "nodes": [target.host_identity],
+                "pause": "from the previous epoch's Drain to the target's Serving",
+            })));
+        }
+
+        // The target's engine configuration is resolved as a deployment's
+        // start resolves it: the options state the scheduler and the rank
+        // layout, and the model's files complete what they determine.
         let engine = Leader::prepare(
             &self.families,
             target,
@@ -382,8 +503,8 @@ impl Leader {
         .await
         .map_err(|error| UpdateError::Refused(format!("{error:#}")))?
         .engine;
-        // Other model files serve the deployment's requests only when they are processed as the
-        // serving ones are: the same tokenizer, templates, generation defaults and model facts.
+        // Other model files serve the deployment's requests only when they
+        // are processed as the serving ones are.
         if current.model() != target.model() {
             crate::leader::same_processing(current.model(), target.model())
                 .await
@@ -399,96 +520,94 @@ impl Leader {
                 )));
             }
         }
-        // The target's main processes are started from its engine package,
-        // so its revision is fixed here, before the first of them starts; a
-        // dry run starts none and reports the package as the target names it.
-        if !dry_run {
-            let socket = control.build_server().to_path_buf();
-            let named = next.modules.engine.clone();
-            next.modules.engine = tokio::task::spawn_blocking(move || {
-                crate::engine::control::select_engine(&socket, &named)
-            })
-            .await
-            .map_err(|error| UpdateError::Failed(anyhow::anyhow!(error)))?
-            .map_err(|error| {
-                UpdateError::Refused(format!("selecting the target's engine package: {error:#}"))
-            })?;
-        }
-        let mut args = proto::config::EngineArgs::new(engine);
+
+        let mut args = proto::config::EngineArgs::new(engine, next.modules.clone());
         args.epoch = target_epoch;
-        args.modules = Some(next.modules.clone());
-        // §7.4 step 1: the target's main processes start as the serving
-        // process's standby — they map the predecessor's cache read-only and
-        // park — so the storage of an epoch has one writer while both run.
-        // The predecessor's segments are the ones it holds now, which only its
-        // engine can state; without them the child would map nothing and the
-        // launch would be a serving process's, claiming the same scopes
-        // writably. The engine states as well the epoch that created them, which
-        // is what they are keyed by, and not the target's own `args.epoch`: the
-        // successor reads one epoch while it serves the next, an epoch that took
-        // storage over keys it as its creator did, and one relaunched created
-        // its own.
+        // The target starts parked: it maps the cache segments the serving
+        // engine holds now read-only, so the storage has one writer while
+        // both run. Only the serving engine can state them, and the epoch
+        // that created them, which is what they are keyed by.
         args.predecessor = Some(serving_client.describe_cache().await.map_err(|reason| {
             UpdateError::Refused(format!(
-                "the serving epoch named no cache segments for its standby: {reason}"
+                "the serving epoch named no cache segments for its successor: {reason}"
             ))
         })?);
-        let joining = (!dry_run).then(|| args.clone());
-        let change = crate::updates::epoch::EpochChange {
-            previous: previous_epoch,
-            target: target_epoch,
-            // The update's number is the epoch it creates: epochs only grow.
-            update: crate::epoch::Update::new(target_epoch, next.clone()),
-            group: group.to_owned(),
-            start: control
-                .epoch_start(&args, spawn_generation)
-                .map_err(UpdateError::Failed)?,
-            previous_epoch,
-            previous_generation,
-            spawn_generation,
-            keeps: update.previous_epoch,
-        };
-        let modules = next.modules.clone();
-        let servers = self.build_servers(target);
-        let leader = self.build_leader_host(target, &servers);
-        // A session does not cross epochs (`docs/profiling.md`): its ranks write their files while
-        // the epoch still executes, before the switch parks it.
-        if !dry_run {
-            self.end_profiles("epoch change").await;
-        }
-        let applied = self.updates.apply(&previous, &next, change, dry_run);
-        if let (Ok(_), Some(args)) = (&applied, joining) {
-            self.updates.await_modules(&target.host_identity);
-            replicas[0].follow_switch(
-                Arc::clone(control),
-                Arc::clone(&self.updates),
-                crate::leader::SwitchTarget {
-                    args,
-                    config: target.clone(),
-                    modules,
-                    servers,
-                    leader,
-                    engine: spawn_generation,
-                    epoch: target_epoch,
-                    update: update.clone(),
-                },
-            );
-        }
-        applied
+        let (launch, environment) = control
+            .target_launch(&args, spawn_generation)
+            .map_err(UpdateError::Failed)?;
+
+        let serving_record = epochs.get(serving).ok_or_else(|| {
+            UpdateError::Refused(format!(
+                "epoch {serving} has no record: the serving epoch cannot be drained or promoted \
+                 again"
+            ))
+        })?;
+        let mut record = serving_record;
+        record.config = next.engine.clone();
+        record.engine = next.modules.engine.clone();
+        record.kernels = next.modules.kernels.clone();
+        record.policy = next.modules.policy.clone();
+        record.previous_kernels.clear();
+        record.previous_policy = None;
+        // The target's generation is set only by its own engine's report.
+        record.generation = None;
+
+        let nodes = vec![Node::new(
+            target.host_identity.clone(),
+            0,
+            serving_generation,
+        )];
+        let mut update = Update::epoch(
+            number,
+            next.clone(),
+            Arc::clone(epochs),
+            serving,
+            group.to_owned(),
+            nodes,
+            EpochSwitch {
+                epoch: target_epoch,
+                record,
+                launch,
+                environment,
+                spawn_generation,
+                requests: target.request_socket().to_string_lossy().into_owned(),
+                keeps: options.previous_epoch,
+                recompute: request.in_flight == InFlight::Recompute,
+                retire: self.updates.take_retire(),
+            },
+            deadline,
+        );
+        // A profiling session does not cross epochs: its ranks write their
+        // files while the epoch still executes, before the switch drains it.
+        self.end_profiles("epoch change").await;
+        // The requests in flight warm the host KV tier once the target
+        // parked, before the switch.
+        update.await_warming(&target.host_identity);
+        let report = self.updates.apply(update)?;
+        args.predecessor = None;
+        replicas[0].follow(
+            Arc::clone(&self.updates),
+            number,
+            options.clone(),
+            deadline,
+            crate::leader::Following::Epoch {
+                control: Arc::clone(control),
+                args: Box::new(args),
+                config: Box::new(target.clone()),
+                launch_generation: spawn_generation,
+                epoch: target_epoch,
+            },
+        );
+        Ok(Applied::Update(report))
     }
 
-    /// Commits the update in flight: the switch's, whose commit is a command
-    /// to the target's processes, recorded when every one of them
-    /// acknowledges (§7.4).
+    /// Commits the update in flight: the decision is recorded before the kept
+    /// side is released.
     pub async fn commit(&self) -> Result<serde_json::Value, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
-        if self.updates.running() && self.updates.commit() {
-            return Ok(self
-                .updates
-                .report()
-                .unwrap_or_else(|| serde_json::json!({})));
-        }
-        Ok(serde_json::json!({ "commit": "no update in flight" }))
+        self.updates.commit().ok_or_else(|| {
+            UpdateError::Refused("no update is in flight: there is nothing to commit".to_owned())
+        })
     }
 
     /// Ends every replica's running profiling session, because its epoch stops executing.
@@ -499,23 +618,26 @@ impl Leader {
         }
     }
 
-    /// Restores the previous epoch of the update in flight.
+    /// Rolls the update in flight back, with `reason` as the operator's or
+    /// the submitter's own account.
     pub async fn rollback(&self, reason: String) -> Result<serde_json::Value, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
-        if self.updates.running() {
+        if self.updates.in_flight().is_some() {
             self.end_profiles("rollback").await;
-            if self.updates.rollback(&reason) {
-                return Ok(self
-                    .updates
-                    .report()
-                    .unwrap_or_else(|| serde_json::json!({})));
-            }
         }
-        Err(UpdateError::Refused(
-            "no update is in flight: the deployment already serves the configuration \
-             the file states"
-                .into(),
-        ))
+        self.updates
+            .rollback(Failure {
+                kind: "rollback".to_owned(),
+                reason,
+                device: None,
+            })
+            .ok_or_else(|| {
+                UpdateError::Refused(
+                    "no update is in flight: the deployment already serves the configuration \
+                     the file states"
+                        .into(),
+                )
+            })
     }
 
     /// Reports the configuration and resource ownership of the replicas.
@@ -524,9 +646,9 @@ impl Leader {
         let client = replicas
             .iter()
             .filter_map(|replica| replica.hold().client())
-            .find(|client| matches!(client.state(), EngineState::Ready | EngineState::Parked));
+            .find(|client| matches!(client.state(), EngineState::Serving | EngineState::Parked));
         // Each node's daemon reads its ledgers over its claim; an engine this daemon did not launch
-        // (a simulated one) answers for itself.
+        // (a simulated one) reads them itself.
         let control = replicas
             .iter()
             .find_map(|replica| replica.control.get().cloned());
@@ -566,8 +688,8 @@ impl Leader {
             .into_iter()
             .map(|replica| replica.config_status())
             .collect();
-        // An object even when no replica answers, so the fields below are
-        // written into it rather than into a null.
+        // An object even when the deployment has no replica, so the fields
+        // below are written into it rather than into a null.
         let mut status = statuses
             .first()
             .cloned()
@@ -579,99 +701,62 @@ impl Leader {
         status["ledgers"] = ledgers;
         // The update in flight, or the one that ended last, with its trial.
         status["update"] = self.updates.status().unwrap_or_default();
-        // A revert's mark lives with the epoch layer's last update; the
-        // replicas' own marks are the ones a handover carried in.
-        if let Some(update) = self.updates.epochs().update()
-            && let Some(failure) = update.unavailable()
-        {
-            let mut marks = status["unavailable"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            if !marks.iter().any(|mark| mark["reason"] == failure.reason) {
-                marks.push(serde_json::json!({
-                    "digest": digest(&update.target.config).unwrap_or_default(),
-                    "update": update.number,
-                    "reason": failure.reason,
-                }));
-            }
-            status["unavailable"] = marks.into();
-        }
+        status["unavailable"] =
+            serde_json::to_value(self.updates.unavailable_marks()).unwrap_or_default();
         status
     }
 }
 
-/// Completes a recorded decision. Publication progress survives both an
-/// error response and daemon handoff; node and engine operations are
-/// idempotent when a response was lost after the operation took effect.
 impl Replica {
     /// Reports what the replica executes and what its configuration is: the
-    /// engine that takes requests with its state, the digest of the
-    /// configuration, and the configurations a rollback marked unavailable.
+    /// engine that takes requests with its state, and the digest of the
+    /// configuration.
     pub(crate) fn config_status(&self) -> serde_json::Value {
         let config = locked(&self.config).clone();
         let printed = crate::options::printed(&config).unwrap_or_default();
         let digest = digest(&config).unwrap_or_default();
-        let epochs = locked(&self.epochs);
         let hold = self.hold();
         let slot = |epoch: u64, state: &str| serde_json::json!({ "epoch": epoch, "state": state });
         let unavailable = |epoch: u64, reason: &str| serde_json::json!({ "epoch": epoch, "state": "unavailable", "reason": reason });
+        // The epoch a replica without an engine last executed is the one its
+        // served arguments name.
+        let served_epoch = locked(&self.served).as_ref().map_or(0, |args| args.epoch);
         let executing = match hold.client() {
             Some(client) => {
                 let epoch = client.epoch();
                 match client.state() {
-                    EngineState::Standby => slot(epoch, "preparing"),
-                    EngineState::Ready => slot(epoch, "executing"),
+                    EngineState::Starting => slot(epoch, "starting"),
                     EngineState::Parked => slot(epoch, "parked"),
+                    EngineState::Serving => slot(epoch, "serving"),
+                    EngineState::Draining => slot(epoch, "draining"),
                     EngineState::Failed(reason) => unavailable(epoch, &reason),
-                    EngineState::Closed => unavailable(epoch, "its engine process ended"),
+                    EngineState::Stopped => unavailable(epoch, "its engine process ended"),
                 }
             }
             // A hold that closed names why it closed, and it names it to the
             // requests it fails: the status states the same reason rather
             // than that requests merely wait for an engine that will not come.
             None => match hold.state() {
-                HoldState::Closed(reason) => unavailable(epochs.executing, &reason),
-                _ => unavailable(epochs.executing, "requests wait for its engine"),
+                HoldState::Closed(reason) => unavailable(served_epoch, &reason),
+                _ => unavailable(served_epoch, "requests wait for its engine"),
             },
         };
         serde_json::json!({
             "config": printed,
             "digest": digest,
             "executing": executing,
-            "unavailable": epochs.unavailable.values().collect::<Vec<_>>(),
-            "last": epochs.last,
         })
     }
 
-    /// The digest of `target`, which names it, unless a rollback marked it
-    /// unavailable and the update does not `force` it.
-    fn available(&self, target: &ServerArgs, force: bool) -> Result<String, UpdateError> {
-        let target_digest =
-            digest(target).map_err(|error| UpdateError::Failed(error.context("digest")))?;
-        if !force && let Some(unavailable) = locked(&self.epochs).unavailable.get(&target_digest) {
-            return Err(UpdateError::Refused(format!(
-                "the configuration {target_digest} was rolled back from epoch {} ({}); \
-                 apply it again with force",
-                unavailable.epoch, unavailable.reason
-            )));
-        }
-        Ok(target_digest)
-    }
-
-    /// Changes the deployment to the configuration `request` states, as
-    /// the module describes, choosing the least the change needs: nothing
-    /// for the current configuration; the schedulers' next step for their
-    /// limits alone; a hot restart of the daemon for its own options; and a
-    /// new epoch for anything an epoch executes.
+    /// Applies what of `request` no update moves: nothing for the current
+    /// configuration; the workers' own switch for the profiler ranges; the
+    /// record of scheduling limits the policy package already took; and a
+    /// hot restart of the daemon for its own options.
     ///
     /// # Errors
     ///
-    /// Refuses another change in progress or an epoch on trial (`409`), a
-    /// configuration that does not parse or validate, one a rollback marked
-    /// unavailable unless `force`, and a change the successor cannot map;
-    /// fails when the successor does not start (the serving epoch serves
-    /// on) or its promotion fails (the serving epoch resumes).
+    /// Refuses another change in progress (`409`), a configuration that does
+    /// not parse or validate, and a change no form of update moves.
     pub(crate) async fn apply(
         self: &Arc<Self>,
         request: ApplyRequest,
@@ -687,9 +772,6 @@ impl Replica {
         }
         let current = locked(&self.config).clone();
         let (target, stated, _) = resolve(&current, &request)?;
-        // A configuration a rollback marked unavailable stays refused unless
-        // the change is forced.
-        self.available(&target, request.force)?;
         if target == current && target.worker_groups.is_none() {
             return Ok(Applied::Unchanged);
         }
@@ -740,10 +822,10 @@ impl Replica {
                 )));
             }
         }
-        // A dry run answers what the change would do and changes nothing: no
+        // A dry run states what the change would do and changes nothing: no
         // handover, no engine command, no configuration written back.
         if request.dry_run {
-            return Ok(Applied::Planned(serde_json::json!({
+            return Ok(Applied::DryRun(serde_json::json!({
                 "daemon": daemon_changes,
                 "scheduling": in_place,
                 "fence_probes": switches_probes_only(&served.engine_config, &target_engine),
@@ -787,9 +869,9 @@ impl Replica {
                 serde_json::json!({ "in_place": ["the fence probes"] }),
             ));
         }
-        // A scheduling limit is a parameter of the policy package, so the generation layer above has
-        // moved the schedulers to it (§7.7) or found they run it already. What is left is the
-        // record of it here: the arguments the next apply compares with.
+        // A scheduling limit is a parameter of the policy package, so a generation update has
+        // moved the schedulers to it or they run it already. What is left is the record of it
+        // here: the arguments the next apply compares with.
         if in_place {
             let mut args = served;
             args.engine_config = target_engine;
@@ -799,18 +881,11 @@ impl Replica {
                 serde_json::json!({ "in_place": ["the scheduling limits"] }),
             ));
         }
-        // The layers above decide every change that reaches here: the epoch
-        // layer owns what the main processes are built from (the executable,
-        // the parallel ranks, the deployment file, the model's files, the
-        // rank layout and the KV cache's options, all of them `proto::config::EngineConfig`),
-        // the generation layer what they execute, and this one the daemon's own
-        // options and the scheduling limits, in place. A change that fits
-        // none of them would have needed a successor epoch, which this
-        // daemon no longer runs: it is refused by name here rather than
-        // half served.
+        // Every change an update moves was decided before this path: what
+        // reaches here changed nothing an epoch is built from and no module,
+        // and is none of the options changed in place either.
         Err(UpdateError::Refused(format!(
-            "the change fits no layer: it would have needed a successor engine ({}) and the \
-             epoch layer starts one main process from the build config",
+            "no form of update moves the change ({}): deploy the configuration instead",
             differing(&served.engine_config, &target_engine).join(", ")
         )))
     }
@@ -867,10 +942,10 @@ mod tests {
     }
 
     /// A change of the scheduling limits alone, within the batch the workers were started for, is
-    /// in place, and a value the generation layer owns does not stand in its way: the generation layer
-    /// answered for it before the change reached the replica.
+    /// in place, and a value a module selection owns does not stand in its way: the module set was
+    /// compared before the change reached the replica.
     #[test]
-    fn a_scheduling_change_is_in_place_beside_what_the_package_layer_owns() {
+    fn a_scheduling_change_is_in_place_beside_what_a_module_selection_owns() {
         let mut served = config();
         served.scheduler.max_batch = std::num::NonZeroUsize::new(8).unwrap();
         served.max_running_requests = std::num::NonZeroUsize::new(8).unwrap();
@@ -928,7 +1003,7 @@ mod tests {
         }
     }
 
-    /// A node's storage report as its daemon answers it, with what the
+    /// A node's storage report as its daemon states it, with what the
     /// deployment's transfers copied there by priority.
     fn node(host: &str, totals: &[(storage::protocol::Priority, u64, u64)]) -> String {
         let transfers: Vec<_> = totals
@@ -958,7 +1033,7 @@ mod tests {
         let status = leader.config_status().await;
         assert_eq!(
             status["executing"],
-            serde_json::json!({ "epoch": epoch, "state": "executing" })
+            serde_json::json!({ "epoch": epoch, "state": "serving" })
         );
         // The engine refuses the ledger read, so the status states no GPUs.
         assert_eq!(status["gpus"], serde_json::Value::Null);

@@ -97,8 +97,8 @@ fn policy_package(pool: &testkit::FakeBatches) -> scheduler::PolicyPackage {
 fn install(handle: &SchedulerHandle, pool: &testkit::FakeBatches) {
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    response(handle.precopy_policy(policy_package(pool), source)).expect("the policy is precopied");
-    response(handle.stage(Stage::Switchover)).expect("the policy serves");
+    response(handle.prepare_policy(policy_package(pool), source)).expect("the policy is precopied");
+    response(handle.stage(Stage::Switch)).expect("the policy serves");
 }
 
 #[test]
@@ -282,9 +282,9 @@ fn a_policy_stage_applies_after_a_request_ended() {
     // switchover asks for a boundary with nothing in flight.
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(crate::support::policy_module()));
-    response(handle.precopy_policy(policy_package(&serving), source))
+    response(handle.prepare_policy(policy_package(&serving), source))
         .expect("the next policy is precopied");
-    response(handle.stage(Stage::Switchover)).expect("the next policy serves");
+    response(handle.stage(Stage::Switch)).expect("the next policy serves");
     handle.shutdown();
 }
 

@@ -1,14 +1,14 @@
-//! An in-place weight update: plan the checkpoint's load, quiesce the schedulers, publish the new
-//! weights beside the serving ones, apply them at a batch boundary, and resume. Each stage is
-//! ended by a serve pass ([`WeightStage`]).
+//! The weight update in place: resolve the checkpoint's load, quiesce the schedulers, publish
+//! the new weights beside the serving ones, apply them at a batch boundary, and resume. Each
+//! stage's completion wakes the control thread, which starts the next ([`WeightStage`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::MainProcess;
-use super::operations::{DataAnswer, collect};
+use super::operations::{Completion, collect};
 
-/// A weight update in progress: one stage at a time, each ended by a pass.
+/// A weight update in progress: one stage at a time, each ended by its completion.
 pub(super) struct WeightUpdate {
     id: u64,
     front: usize,
@@ -28,22 +28,22 @@ pub(super) struct WeightUpdate {
 
 /// Where a weight update stands.
 enum WeightStage {
-    /// The pass moving it from one stage to the next.
+    /// The control thread is moving it from one stage to the next.
     Between,
-    /// The checkpoint's load is walked, moving no byte.
-    Planning(crossbeam_channel::Receiver<worker::Result<crate::data_plane::Planned>>),
+    /// The checkpoint's load is resolved, moving no byte.
+    Resolving(crossbeam_channel::Receiver<worker::Result<crate::data_plane::Planned>>),
     /// The schedulers quiesce: for `recompute` and `abort` they sleep, so the cache's storage holds
     /// the new checkpoint, and for a `keep` the free storage does not hold, they stop forming
     /// batches. The load waits.
-    Quiescing(Vec<DataAnswer>, Option<crate::data_plane::Planned>),
+    Quiescing(Vec<Completion>, Option<crate::data_plane::Planned>),
     /// The new weights are published, beside the weights that serve.
     Loading(crossbeam_channel::Receiver<worker::Result<crate::data_plane::Planned>>),
     /// The schedulers put the new weights in place at a boundary.
-    Applying(Vec<DataAnswer>),
+    Applying(Vec<Completion>),
     /// The graph storage a `keep` load took comes back.
     Restoring(crossbeam_channel::Receiver<worker::Result<()>>),
     /// The schedulers wake, or form batches again.
-    Resuming(Vec<DataAnswer>),
+    Resuming(Vec<Completion>),
 }
 
 impl MainProcess {
@@ -83,13 +83,15 @@ impl MainProcess {
         );
         let mut target = self.data.target();
         target.checkpoint = PathBuf::from(&update.model_path);
-        let (answer, answered) = crossbeam_channel::bounded(1);
+        let (complete, completion) = crossbeam_channel::bounded(1);
         let data = Arc::clone(&self.data);
+        let wake = self.wake.clone();
         let spawned = std::thread::Builder::new()
-            .name("weight-plan".into())
+            .name("weight-resolve".into())
             .spawn(move || {
                 let _ =
-                    answer.send(data.plan(target, worker::memory::reload::Matching::SameTensors));
+                    complete.send(data.plan(target, worker::memory::reload::Matching::SameTensors));
+                wake.wake();
             });
         if spawned.is_err() {
             self.refuse(
@@ -104,7 +106,7 @@ impl MainProcess {
             front,
             path: update.model_path,
             in_flight,
-            stage: WeightStage::Planning(answered),
+            stage: WeightStage::Resolving(completion),
             slept: false,
             suspended: false,
             results: Vec::new(),
@@ -112,17 +114,18 @@ impl MainProcess {
         });
     }
 
-    /// Moves a weight update to its next stage, when the one it is in ended.
-    pub(super) fn advance_weights(&mut self) {
+    /// Moves the weight update to its next stage, when the one it is in completed.
+    pub(super) fn continue_weights(&mut self) {
         let Some(mut update) = self.weights.take() else {
             return;
         };
         update.stage = match std::mem::replace(&mut update.stage, WeightStage::Between) {
             WeightStage::Between => WeightStage::Between,
-            WeightStage::Planning(answer) => match answer.try_recv() {
-                Err(crossbeam_channel::TryRecvError::Empty) => WeightStage::Planning(answer),
+            WeightStage::Resolving(completion) => match completion.try_recv() {
+                Err(crossbeam_channel::TryRecvError::Empty) => WeightStage::Resolving(completion),
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    update.failure = Some("the weight update's plan ended unanswered".to_owned());
+                    update.failure =
+                        Some("resolving the weight update's load ended incomplete".to_owned());
                     return self.finish_weights(update);
                 }
                 Ok(Err(error)) => {
@@ -130,8 +133,8 @@ impl MainProcess {
                     return self.finish_weights(update);
                 }
                 Ok(Ok(planned)) => match self.quiesce(&mut update, &planned) {
-                    Ok(answers) if answers.is_empty() => self.load_weights(planned, false),
-                    Ok(answers) => WeightStage::Quiescing(answers, Some(planned)),
+                    Ok(completions) if completions.is_empty() => self.load_weights(planned, false),
+                    Ok(completions) => WeightStage::Quiescing(completions, Some(planned)),
                     Err(refusal) => {
                         update.failure = Some(refusal);
                         self.data.discard(planned);
@@ -139,9 +142,9 @@ impl MainProcess {
                     }
                 },
             },
-            WeightStage::Quiescing(mut answers, planned) => {
-                if !collect(&mut answers, &mut Vec::new(), &mut update.failure) {
-                    WeightStage::Quiescing(answers, planned)
+            WeightStage::Quiescing(mut completions, planned) => {
+                if !collect(&mut completions, &mut Vec::new(), &mut update.failure) {
+                    WeightStage::Quiescing(completions, planned)
                 } else {
                     let Some(planned) = planned else {
                         return self.finish_weights(update);
@@ -154,10 +157,10 @@ impl MainProcess {
                     self.load_weights(planned, update.suspended)
                 }
             }
-            WeightStage::Loading(answer) => match answer.try_recv() {
-                Err(crossbeam_channel::TryRecvError::Empty) => WeightStage::Loading(answer),
+            WeightStage::Loading(completion) => match completion.try_recv() {
+                Err(crossbeam_channel::TryRecvError::Empty) => WeightStage::Loading(completion),
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    update.failure = Some("the weight load ended unanswered".to_owned());
+                    update.failure = Some("the weight load ended incomplete".to_owned());
                     self.resume_after(update);
                     return;
                 }
@@ -178,19 +181,19 @@ impl MainProcess {
                     )
                 }
             },
-            WeightStage::Applying(mut answers) => {
+            WeightStage::Applying(mut completions) => {
                 let mut results = std::mem::take(&mut update.results);
-                let finished = collect(&mut answers, &mut results, &mut update.failure);
+                let finished = collect(&mut completions, &mut results, &mut update.failure);
                 update.results = results;
                 if finished {
                     self.data.discard_staged();
                     self.resume_after(update);
                     return;
                 }
-                WeightStage::Applying(answers)
+                WeightStage::Applying(completions)
             }
-            WeightStage::Restoring(answer) => match answer.try_recv() {
-                Err(crossbeam_channel::TryRecvError::Empty) => WeightStage::Restoring(answer),
+            WeightStage::Restoring(completion) => match completion.try_recv() {
+                Err(crossbeam_channel::TryRecvError::Empty) => WeightStage::Restoring(completion),
                 result => {
                     if let Ok(Err(error)) = result {
                         update.failure.get_or_insert(error.to_string());
@@ -199,11 +202,11 @@ impl MainProcess {
                     return;
                 }
             },
-            WeightStage::Resuming(mut answers) => {
-                if collect(&mut answers, &mut Vec::new(), &mut update.failure) {
+            WeightStage::Resuming(mut completions) => {
+                if collect(&mut completions, &mut Vec::new(), &mut update.failure) {
                     return self.finish_weights(update);
                 }
-                WeightStage::Resuming(answers)
+                WeightStage::Resuming(completions)
             }
         };
         self.weights = Some(update);
@@ -220,7 +223,7 @@ impl MainProcess {
         &mut self,
         update: &mut WeightUpdate,
         planned: &crate::data_plane::Planned,
-    ) -> std::result::Result<Vec<DataAnswer>, String> {
+    ) -> std::result::Result<Vec<Completion>, String> {
         if self.asleep {
             return Ok(Vec::new());
         }
@@ -269,8 +272,9 @@ impl MainProcess {
     /// up to them when `suspend` says so. A thread of its own: the load reads a checkpoint for
     /// minutes, and neither a scheduler nor this thread may wait for it.
     fn load_weights(&mut self, planned: crate::data_plane::Planned, suspend: bool) -> WeightStage {
-        let (answer, answered) = crossbeam_channel::bounded(1);
+        let (complete, completion) = crossbeam_channel::bounded(1);
         let data = Arc::clone(&self.data);
+        let wake = self.wake.clone();
         let spawned = std::thread::Builder::new()
             .name("weight-load".into())
             .spawn(move || {
@@ -281,30 +285,33 @@ impl MainProcess {
                     }
                     _ => data.load(planned),
                 };
-                let _ = answer.send(loaded);
+                let _ = complete.send(loaded);
+                wake.wake();
             });
         if let Err(error) = spawned {
             tracing::error!(%error, "the weight load's thread did not start");
         }
-        WeightStage::Loading(answered)
+        WeightStage::Loading(completion)
     }
 
-    /// Puts back what the update stilled, and answers once it is.
+    /// Puts back what the update stilled, and acknowledges once it is.
     fn resume_after(&mut self, mut update: WeightUpdate) {
         if !update.suspended {
             return self.release_schedulers(update);
         }
-        let (answer, answered) = crossbeam_channel::bounded(1);
+        let (complete, completion) = crossbeam_channel::bounded(1);
         let data = Arc::clone(&self.data);
+        let wake = self.wake.clone();
         let spawned = std::thread::Builder::new()
             .name("graph-restore".into())
             .spawn(move || {
-                let _ = answer.send(data.restore_graphs());
+                let _ = complete.send(data.restore_graphs());
+                wake.wake();
             });
         if let Err(error) = spawned {
             update.failure.get_or_insert(error.to_string());
         }
-        update.stage = WeightStage::Restoring(answered);
+        update.stage = WeightStage::Restoring(completion);
         self.weights = Some(update);
     }
 
@@ -326,7 +333,7 @@ impl MainProcess {
         self.weights = Some(update);
     }
 
-    /// Answers the update.
+    /// Acknowledges the update to the daemon front that asked.
     fn finish_weights(&mut self, update: WeightUpdate) {
         self.refresh_announced();
         let WeightUpdate {

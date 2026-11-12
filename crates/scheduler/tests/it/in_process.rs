@@ -68,7 +68,7 @@ fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
     assert_eq!(progress.step, 0, "no step ran: no policy serves yet");
     // Nothing serves yet: a switchover has no prepared policy to put in, and
     // the refusal says so rather than applying nothing silently.
-    let refused = response(handle.stage(scheduler::Stage::Switchover))
+    let refused = response(handle.stage(scheduler::Stage::Switch))
         .expect_err("no policy is prepared before the epoch's first precopy");
     assert!(refused.contains("without a policy prepared"), "{refused}");
 

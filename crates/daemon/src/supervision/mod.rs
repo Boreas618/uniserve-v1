@@ -18,10 +18,8 @@
 
 mod claims;
 
-pub(crate) mod roster;
+pub(crate) mod processes;
 mod service;
-#[cfg(test)]
-pub(crate) mod stand_in;
 mod supervisor;
 
 pub(crate) use service::HandedService;
@@ -88,33 +86,20 @@ pub struct DaemonOptions {
 /// devices could not be read; the daemon answers the asking engine with it.
 pub type DeviceProbe = fn() -> Result<Vec<u32>, String>;
 
-/// The daemon's downward path to the main processes its service supervises,
-/// and the reports they send up (§2.3, §7.3): the daemon commands a main
-/// process and reads its `Report`s without holding its connection, which the
-/// service owns.
+/// The daemon's downward path to the engines its service supervises, and the
+/// reports they send up: the daemon commands an engine and reads its `Report`s
+/// without holding its connection, which the service owns.
 ///
-/// A clone of this shares the same ends: one reporter’s queue, so one
-/// consumer at a time. A caller that waits for the answers to commands it sent
-/// holds an [`Awaiting`] while it waits, and the epoch layer, which otherwise
-/// drains the queue, leaves the reports to it meanwhile.
+/// A clone of this shares the same ends. The reports have one consumer, the
+/// updater's [`processes::Processes`], so that every acknowledgement and every
+/// failure an engine states reaches the update in flight.
 #[derive(Clone)]
 pub struct ProcessCommands {
-    /// Commands, by the engine whose main process is to execute them.
-    commands: std::sync::mpsc::Sender<(u64, proto::process::Command)>,
-    /// Every report a main process sent, by the engine that sent it.
-    reports: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<(u64, proto::process::Report)>>>,
-    /// How many callers wait for answers to the commands they sent.
-    awaiting: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-/// A caller's wait for the answers to its commands, which keeps the reports
-/// for it until it ends ([`ProcessCommands::awaiting`]).
-pub struct Awaiting(Arc<std::sync::atomic::AtomicUsize>);
-
-impl Drop for Awaiting {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
+    /// Commands, by the engine that is to execute them.
+    pub(crate) commands: std::sync::mpsc::Sender<(u64, proto::process::Command)>,
+    /// Every report an engine sent, by the engine that sent it.
+    pub(crate) reports:
+        Arc<std::sync::Mutex<std::sync::mpsc::Receiver<(u64, proto::process::Report)>>>,
 }
 
 impl std::fmt::Debug for ProcessCommands {
@@ -124,42 +109,7 @@ impl std::fmt::Debug for ProcessCommands {
 }
 
 impl ProcessCommands {
-    /// The two ends of the daemon's command channel: the daemon's, and the
-    /// service's — the commands it drains each round, and the reports it
-    /// fills.
-    #[allow(clippy::type_complexity)]
-    #[cfg(test)]
-    pub(crate) fn channel() -> (
-        Self,
-        std::sync::mpsc::Receiver<(u64, proto::process::Command)>,
-        std::sync::mpsc::Sender<(u64, proto::process::Report)>,
-    ) {
-        let (commands, commands_rx) = std::sync::mpsc::channel();
-        let (reports, reports_rx) = std::sync::mpsc::channel();
-        (
-            Self {
-                commands,
-                reports: Arc::new(std::sync::Mutex::new(reports_rx)),
-                awaiting: Arc::default(),
-            },
-            commands_rx,
-            reports,
-        )
-    }
-
-    /// Marks a wait for the answers to commands the caller sent: until the
-    /// guard drops, the reports are the caller's to read.
-    pub fn awaiting(&self) -> Awaiting {
-        self.awaiting.fetch_add(1, Ordering::AcqRel);
-        Awaiting(Arc::clone(&self.awaiting))
-    }
-
-    /// Whether a caller waits for the answers to its commands.
-    pub fn awaited(&self) -> bool {
-        self.awaiting.load(Ordering::Acquire) > 0
-    }
-
-    /// Sends `command` to engine `engine`'s main process.
+    /// Sends `command` to engine `engine`.
     ///
     /// # Errors
     ///
@@ -170,7 +120,7 @@ impl ProcessCommands {
             .map_err(|_| anyhow::anyhow!("the daemon's service stopped"))
     }
 
-    /// The next report a main process sent, with the engine that sent it,
+    /// The next report an engine sent, with the engine that sent it,
     /// waiting at most `timeout` for one.
     pub fn report(&self, timeout: Duration) -> Option<(u64, proto::process::Report)> {
         let deadline = Instant::now() + timeout;
@@ -178,9 +128,8 @@ impl ProcessCommands {
             .reports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Every answer ends the wait: a report, the deadline, or a service that
-        // stopped sending. `recv_timeout` already waits the whole `timeout`, so
-        // there is nothing to loop over.
+        // A report, the deadline, or a service that stopped sending each end
+        // the wait.
         match reports.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(report) => Some(report),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
@@ -192,29 +141,30 @@ impl ProcessCommands {
 /// A running daemon. Dropping it stops its service and ends every process
 /// it supervises.
 pub struct Daemon {
-    /// The command channel to the main processes this node's daemon
-    /// supervises; `None` on a member daemon, which supervises none.
+    /// The command channel to the engines this node's daemon supervises;
+    /// `None` on a member daemon, which supervises none.
     commands: Option<ProcessCommands>,
-    /// The epoch layer's ends of the service on the leader: its requests
-    /// down, and the peers and exits up. `None` on a member. Taken once, by
-    /// the adapter; behind a lock because a `Daemon` is shared between the
-    /// HTTP threads and the channel ends are not themselves `Sync`.
-    link: std::sync::Mutex<Option<roster::EpochLink>>,
+    /// The updater's ends of the service on the leader: its requests down,
+    /// and the peers and exits up. `None` on a member. Taken once, by the
+    /// updater's [`processes::Processes`]; behind a lock because a `Daemon` is
+    /// shared between the HTTP threads and the channel ends are not
+    /// themselves `Sync`.
+    link: std::sync::Mutex<Option<processes::ProcessLink>>,
     /// A clone of the requests channel inside `link`, kept for the processes
     /// this daemon starts itself: the frontend is spawned and commanded
-    /// through the node's service too, and its channel must not be the epoch
-    /// layer's to take (§2.1, §2.3).
+    /// through the node's service too, and its channel must not be the
+    /// updater's to take.
     _requests: Option<
         std::sync::mpsc::Sender<(
             proto::process::Request,
             std::sync::mpsc::Sender<proto::process::Reply>,
         )>,
     >,
-    /// The processes this node supervises, which the service keeps current
-    /// (§2.3): the epoch layer and `GET /admin/config` read them.
+    /// The processes this node supervises, which the service keeps current:
+    /// the updater and `GET /admin/config` read them.
     table: Option<service::ProcessTable>,
-    /// One token per thing the epoch layer has to read, so the thread that
-    /// advances the switch waits instead of polling.
+    /// One token per thing the updater has to read, so the thread that
+    /// advances the update waits instead of polling.
     awake: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// The process socket engines connect to, on the leader.
     address: Option<String>,
@@ -319,9 +269,8 @@ impl Daemon {
             let commands = ProcessCommands {
                 commands,
                 reports: Arc::new(std::sync::Mutex::new(reports_rx)),
-                awaiting: Arc::default(),
             };
-            let link = Some(roster::EpochLink {
+            let link = Some(processes::ProcessLink {
                 requests: requests.clone(),
                 greetings: greetings_rx,
                 exits: exits_rx,
@@ -417,10 +366,9 @@ impl Daemon {
         let commands = leader.then_some(ProcessCommands {
             commands,
             reports: Arc::new(std::sync::Mutex::new(reports_rx)),
-            awaiting: Arc::default(),
         });
         let link = match (&commands, leader) {
-            (Some(commands), true) => Some(roster::EpochLink {
+            (Some(commands), true) => Some(processes::ProcessLink {
                 requests: requests.clone(),
                 greetings: greetings_rx,
                 exits: exits_rx,
@@ -475,64 +423,58 @@ impl Daemon {
         self.commands.clone()
     }
 
-    /// The epoch layer's ends of this node's service: `None` on a member
-    /// daemon, and once taken, `None` again — one adapter owns them.
-    pub(crate) fn epoch_link(&self) -> Option<roster::EpochLink> {
+    /// The updater's ends of this node's service: `None` on a member daemon,
+    /// and once taken, `None` again: one owner reads them.
+    pub(crate) fn process_link(&self) -> Option<processes::ProcessLink> {
         self.link
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
 
-    /// The epoch layer of `deployment`: the driver the update entry and the
-    /// adapter share, over `epochs` and this node's service (§7.4, §2.5).
-    /// `None` on a member daemon, which commands no deployment's processes.
-    pub(crate) fn updates(
+    /// The updater of `deployment` over `epochs` and this node's service,
+    /// with the tokens that wake the thread advancing it. `None` on a member
+    /// daemon, which commands no deployment's engines.
+    pub(crate) fn updater(
         &self,
         epochs: Arc<crate::epoch::Epochs>,
         deployment: String,
-    ) -> Option<(
-        Arc<crate::updates::driver::Driver>,
-        std::sync::mpsc::Receiver<()>,
-    )> {
-        let link = self.epoch_link()?;
+    ) -> Option<(Arc<crate::updates::Updater>, std::sync::mpsc::Receiver<()>)> {
+        let link = self.process_link()?;
         let awake = self
             .awake
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()?;
         // The epoch records report the node's processes: the service writes
-        // them into this table as they start and end, and the epoch layer's
-        // roster adds what each launch is (§2.3, §7.4).
+        // them into this table as they start and end, and the updater's
+        // `Processes` adds what each launch is.
         if let Some(table) = &self.table {
             epochs.attach_processes(Arc::clone(table));
         }
-        let roster = roster::ProcessRoster::new(Arc::clone(&epochs), deployment, Vec::new(), link);
+        let processes =
+            processes::Processes::new(Arc::clone(&epochs), deployment, Vec::new(), link);
         Some((
-            Arc::new(crate::updates::driver::Driver::new(
-                epochs,
-                Box::new(roster),
-            )),
+            Arc::new(crate::updates::Updater::new(epochs, processes)),
             awake,
         ))
     }
 
-    /// Advances the epoch layer whenever the service reports something, until
-    /// the service ends: a switch ends on acknowledgements, so the thread
-    /// that owns the epoch layer must be woken by the reports, never by a
-    /// clock.
-    pub(crate) fn advance_epochs(
-        updates: Arc<crate::updates::driver::Driver>,
+    /// Advances the update in flight whenever the service reports something,
+    /// until the service ends: a phase ends on acknowledgements, so the
+    /// thread that advances it is woken by the reports, never by a clock.
+    pub(crate) fn advance_updates(
+        updater: Arc<crate::updates::Updater>,
         awake: std::sync::mpsc::Receiver<()>,
     ) -> anyhow::Result<()> {
         std::thread::Builder::new()
-            .name("epoch".into())
+            .name("updates".into())
             .spawn(move || {
                 while awake.recv().is_ok() {
-                    updates.advance();
+                    updater.advance();
                 }
             })
-            .context("starting the epoch layer's thread")?;
+            .context("starting the updater's thread")?;
         Ok(())
     }
 
@@ -839,101 +781,5 @@ mod tests {
         unsafe { libc::waitpid(spawned.pid as libc::pid_t, &mut status, 0) };
         assert!(libc::WIFSIGNALED(status));
         successor.stop().unwrap();
-    }
-}
-
-/// The commands the adapter sends down to a peer, by engine number.
-#[cfg(test)]
-type CommandsDown = std::sync::mpsc::Receiver<(u64, proto::process::Command)>;
-
-/// The way a test plays a peer's reports up, by engine number.
-#[cfg(test)]
-type ReportsUp = std::sync::mpsc::Sender<(u64, proto::process::Report)>;
-
-#[cfg(test)]
-impl ProcessCommands {
-    /// The ends an epoch-layer test needs: the commands the adapter sends
-    /// down to a peer, and the way a test plays a peer's reports up.
-    pub(crate) fn pair() -> (Self, CommandsDown, ReportsUp) {
-        let (commands, sent) = std::sync::mpsc::channel();
-        let (reports, received) = std::sync::mpsc::channel();
-        (
-            Self {
-                commands,
-                reports: Arc::new(std::sync::Mutex::new(received)),
-                awaiting: Arc::default(),
-            },
-            sent,
-            reports,
-        )
-    }
-}
-
-#[cfg(test)]
-mod command_tests {
-    use super::*;
-    use proto::process::{Report, report};
-
-    /// The daemon's channel carries a command down to the service's end and
-    /// a main process's report up to the daemon's: the one downward path a
-    /// command has (§2.3), and the one upward path a report has.
-    #[test]
-    fn a_command_goes_down_to_the_service_and_a_report_comes_up() {
-        let (commands, commands_rx) = std::sync::mpsc::channel();
-        let (reports, reports_rx) = std::sync::mpsc::channel();
-        let processes = ProcessCommands {
-            commands,
-            reports: Arc::new(std::sync::Mutex::new(reports_rx)),
-            awaiting: Arc::default(),
-        };
-
-        let command = proto::process::Command {
-            kind: Some(proto::process::command::Kind::Commit(
-                proto::process::Commit {},
-            )),
-        };
-        processes.send(7, command).expect("the service runs");
-
-        // The service's end reads the command with the engine it is for.
-        let (engine, command) = commands_rx.recv().unwrap();
-        assert_eq!(engine, 7);
-        assert!(matches!(
-            command.kind,
-            Some(proto::process::command::Kind::Commit(_))
-        ));
-
-        // The report a main process sent reaches the daemon with its engine.
-        reports
-            .send((
-                7,
-                Report {
-                    kind: Some(report::Kind::Committed(proto::process::Committed {})),
-                },
-            ))
-            .unwrap();
-        let (engine, report) = processes
-            .report(Duration::from_secs(1))
-            .expect("the report arrives");
-        assert_eq!(engine, 7);
-        assert!(matches!(report.kind, Some(report::Kind::Committed(_))));
-
-        // A service that stopped fails the command instead of dropping it,
-        // and no report waits forever.
-        drop(commands_rx);
-        assert!(
-            processes
-                .send(
-                    7,
-                    proto::process::Command {
-                        kind: Some(proto::process::command::Kind::Commit(
-                            proto::process::Commit {}
-                        )),
-                    }
-                )
-                .is_err(),
-            "a stopped service cannot carry a command"
-        );
-        drop(reports);
-        assert!(processes.report(Duration::from_millis(10)).is_none());
     }
 }

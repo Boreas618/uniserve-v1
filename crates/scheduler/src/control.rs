@@ -16,10 +16,10 @@ use crate::request::Request;
 /// The name a stage's refusal uses.
 fn stage_name(stage: Stage) -> &'static str {
     match stage {
-        Stage::Switchover => "switchover",
+        Stage::Switch => "switch",
         Stage::Commit => "commit",
-        Stage::Revert => "revert",
-        Stage::Purge => "purge",
+        Stage::Rollback => "rollback",
+        Stage::Release => "release",
     }
 }
 
@@ -28,17 +28,14 @@ fn stage_name(stage: Stage) -> &'static str {
 fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
     use proto::process::command::Kind;
     match kind {
-        Kind::Park(_) => "park",
-        Kind::Promote(_) => "promote",
-        Kind::Precopy(_) => "precopy",
-        Kind::Switchover(_) => "switchover",
+        Kind::Prepare(_) => "prepare",
+        Kind::Switch(_) => "switch",
         Kind::Commit(_) => "commit",
-        Kind::Revert(_) => "revert",
-        Kind::Purge(_) => "purge",
+        Kind::Rollback(_) => "rollback",
         Kind::Drain(_) => "drain",
-        Kind::Serve(_) => "serve",
+        Kind::Promote(_) => "promote",
         Kind::Pause(_) => "pause",
-        Kind::Inherit(_) => "inherit",
+        Kind::Serve(_) => "serve",
     }
 }
 
@@ -225,11 +222,11 @@ impl Scheduler {
                 }
                 let _ = response.send(committed);
             }
-            Command::PrecopyPolicy {
+            Command::PreparePolicy {
                 package,
                 source,
                 response,
-            } => self.precopy_policy(package, source, response),
+            } => self.prepare_policy(package, source, response),
             Command::StagePolicy { stage, response } => {
                 self.request_stage(stage, Some(response), None);
             }
@@ -279,7 +276,7 @@ impl Scheduler {
     /// and the trial of each decision run on a blocking thread, so the serving
     /// thread is never held by them. The response arrives when that thread is
     /// done; [`Self::take_prepared_policy`] takes the candidate.
-    fn precopy_policy(
+    fn prepare_policy(
         &mut self,
         package: PolicyPackage,
         source: Arc<dyn PolicySource + Send + Sync>,
@@ -301,8 +298,11 @@ impl Scheduler {
         let ceilings = ceilings_of(BatchCapacity::of(&self.info));
         let engine = policy::process_engine().cloned();
         let (prepared, candidate) = crossbeam_channel::bounded(1);
+        // The response is sent from the blocking thread, so that thread wakes the control
+        // thread that waits for it.
+        let progress = self.progress.clone();
         let spawned = std::thread::Builder::new()
-            .name("policy-precopy".to_owned())
+            .name("policy-prepare".to_owned())
             .spawn(move || {
                 let room = state.room.clone();
                 let built = engine.and_then(|engine| {
@@ -322,11 +322,12 @@ impl Scheduler {
                     Some(error) => response_moved.send(Err(error)),
                     None => response_moved.send(Ok(())),
                 };
+                progress.wake();
             });
         match spawned {
-            Ok(_) => self.policy_precopy = Some(candidate),
+            Ok(_) => self.policy_prepare = Some(candidate),
             Err(error) => {
-                let _ = self.policy_precopy.take();
+                let _ = self.policy_prepare.take();
                 let _ = response.send(Err(format!("the precopy thread did not start: {error}")));
             }
         }
@@ -337,13 +338,13 @@ impl Scheduler {
     /// The scheduler that is about to switch reads it; a candidate that failed
     /// is dropped, and its failure is the response the precopy already gave.
     pub(super) fn take_prepared_policy(&mut self) {
-        let Some(precopy) = self.policy_precopy.as_ref() else {
+        let Some(precopy) = self.policy_prepare.as_ref() else {
             return;
         };
         let Ok(built) = precopy.try_recv() else {
             return;
         };
-        self.policy_precopy = None;
+        self.policy_prepare = None;
         match built {
             Ok(candidate) => self.policy_prepared = Some(candidate),
             Err(error) => tracing::warn!(%error, "a policy precopy failed"),
@@ -471,7 +472,7 @@ impl Scheduler {
     /// serving one. A `Precopy` arrives with the operator packages, which are
     /// the generation layer's, and the scheduling policy, whose module comes from
     /// the Build Server: the process that holds that source resolves it once
-    /// and precopies each scheduler (`SchedulerHandle::precopy_policy`), so the
+    /// and precopies each scheduler (`SchedulerHandle::prepare_policy`), so the
     /// command itself gets its response with that rather than half applied here.
     fn generation_command(
         &mut self,
@@ -479,14 +480,13 @@ impl Scheduler {
         response: crossbeam_channel::Sender<Result<(), String>>,
     ) {
         let (stage, at) = match command {
-            ipc::GenerationCommand::Switchover { step, .. } => (Stage::Switchover, step),
+            ipc::GenerationCommand::Switch { step, .. } => (Stage::Switch, step),
             ipc::GenerationCommand::Commit { .. } => (Stage::Commit, None),
-            ipc::GenerationCommand::Revert { .. } => (Stage::Revert, None),
-            ipc::GenerationCommand::Purge { .. } => (Stage::Purge, None),
-            ipc::GenerationCommand::Precopy { .. } => {
+            ipc::GenerationCommand::Rollback { .. } => (Stage::Rollback, None),
+            ipc::GenerationCommand::Prepare { .. } => {
                 let _ = response.send(Err(
-                    "a precopy's policy is resolved through the Build Server by the process \
-                     that holds its client, which then precopies each scheduler's policy"
+                    "a prepare's policy is resolved through the Build Server by the process \
+                     that holds its client, which then prepares each scheduler's policy"
                         .to_owned(),
                 ));
                 return;
@@ -512,14 +512,13 @@ impl Scheduler {
         use proto::process::command::Kind;
 
         let stage = match command.kind {
-            Some(Kind::Switchover(_)) => Stage::Switchover,
+            Some(Kind::Switch(_)) => Stage::Switch,
             Some(Kind::Commit(_)) => Stage::Commit,
-            Some(Kind::Revert(_)) => Stage::Revert,
-            Some(Kind::Purge(_)) => Stage::Purge,
-            Some(Kind::Precopy(_)) => {
+            Some(Kind::Rollback(_)) => Stage::Rollback,
+            Some(Kind::Prepare(_)) => {
                 let _ = response.send(Err(
-                    "a precopy is resolved once per epoch by the process that holds the Build \
-                     Server, which then precopies each scheduler's policy"
+                    "a prepare is resolved once per epoch by the process that holds the Build \
+                     Server, which then prepares each scheduler's policy"
                         .to_owned(),
                 ));
                 return;
@@ -569,7 +568,7 @@ impl Scheduler {
             }
             return;
         }
-        if stage == Stage::Switchover {
+        if stage == Stage::Switch {
             self.take_prepared_policy();
             if self.policy_prepared.is_none() {
                 if let Some(response) = response {
@@ -656,7 +655,7 @@ impl Scheduler {
             Err(reason) => {
                 let package = self.policy.as_ref().map(|policy| policy.package().clone());
                 if let Some(package) = package {
-                    self.policy_report = Some(policy::PolicyReverted {
+                    self.policy_report = Some(policy::PolicyRolledBack {
                         scheduler: None,
                         package,
                         reason: reason.clone(),
@@ -678,14 +677,14 @@ impl Scheduler {
         &mut self,
         stage: Stage,
         state: &TrialState,
-    ) -> Result<Option<policy::PolicyReverted>, String> {
+    ) -> Result<Option<policy::PolicyRolledBack>, String> {
         let Some(policy) = self.policy.as_mut() else {
             // An epoch's first switchover: no policy served before, so the
             // candidate's precopy prepared the only instance this policy has.
             // A commit or a purge with no policy changes nothing; a switchover
             // or a revert that would leave the scheduler with no policy fails,
             // since a scheduler with no policy forms no batch.
-            if matches!(stage, Stage::Commit | Stage::Purge) {
+            if matches!(stage, Stage::Commit | Stage::Release) {
                 return Ok(None);
             }
             let Some(candidate) = self.policy_prepared.take() else {
@@ -694,7 +693,7 @@ impl Scheduler {
                     stage_name(stage)
                 ));
             };
-            if stage == Stage::Revert {
+            if stage == Stage::Rollback {
                 // A revert before any policy served has nothing to go back to.
                 return Err("a revert found no serving policy to revert".to_owned());
             }
@@ -705,7 +704,7 @@ impl Scheduler {
             self.adopt(PolicySlot::from_candidate(engine, ceilings, candidate));
             return Ok(None);
         };
-        if stage == Stage::Switchover {
+        if stage == Stage::Switch {
             let Some(candidate) = self.policy_prepared.take() else {
                 return Err("a switchover arrived without a prepared policy".to_owned());
             };
@@ -713,7 +712,7 @@ impl Scheduler {
         }
         policy.request(stage);
         let applied = policy.boundary(state).map_err(|error| error.to_string());
-        if applied.is_ok() && matches!(stage, Stage::Switchover | Stage::Revert) {
+        if applied.is_ok() && matches!(stage, Stage::Switch | Stage::Rollback) {
             self.seed_from_policy();
         }
         applied

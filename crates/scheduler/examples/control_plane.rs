@@ -69,11 +69,11 @@ fn main() -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("the scheduler stopped"))?
             .map_err(|error| anyhow::anyhow!("the fcfs policy is installed: {error}"))
     };
-    responded(handle.precopy_policy(
+    responded(handle.prepare_policy(
         program,
         std::sync::Arc::new(scheduler::PolicyBytes::new(module)),
     ))?;
-    responded(handle.switchover_policy())?;
+    responded(handle.switch_policy())?;
 
     let mut rxs: HashMap<RequestId, (String, scheduler::EventRx)> = HashMap::new();
     let mut next_id = 1u64;

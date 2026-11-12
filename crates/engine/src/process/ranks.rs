@@ -245,10 +245,8 @@ fn load_rank(
                 .collect(),
             held: cache.held,
         });
-    let model_runner = model_runner.sharing_cache_of(
-        epoch.predecessor_epoch.filter(|_| launch.standby()),
-        adopted,
-    );
+    let model_runner =
+        model_runner.sharing_cache_of(epoch.predecessor_epoch.filter(|_| launch.parked()), adopted);
     let host = HostGroup::connect(rendezvous, member, members, STARTUP_TIMEOUT)
         .context("joining this process's ranks")?;
     // The rank's Storage Server and its claim are the node's, which the daemon answered for; the

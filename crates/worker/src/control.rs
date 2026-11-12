@@ -474,7 +474,7 @@ mod tests {
 
         let front = control.attach(
             &successor,
-            proto::request::wire::EngineState::Ready as i32,
+            proto::request::wire::EngineState::Serving as i32,
             None,
         )?;
         assert_eq!(
@@ -506,7 +506,7 @@ mod tests {
         );
         assert_eq!(
             state.state,
-            proto::request::wire::EngineState::Ready as i32,
+            proto::request::wire::EngineState::Serving as i32,
             "the state that makes the successor count this engine as serving"
         );
         assert!(message.kind.is_some());
@@ -526,7 +526,7 @@ mod tests {
 
         let refused = control.attach(
             &successor,
-            proto::request::wire::EngineState::Ready as i32,
+            proto::request::wire::EngineState::Serving as i32,
             None,
         );
         assert!(refused.is_err(), "a refused attach must not be a front");

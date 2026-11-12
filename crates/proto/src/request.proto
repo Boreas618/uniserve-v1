@@ -49,7 +49,6 @@ message FromEngine {
     Stats stats = 4;
     Hooked hooked = 5;
     Configured configured = 6;
-    Parked parked = 7;
     CacheDescribed cache_described = 8;
     RequestsDescribed requests_described = 9;
     // TCP artifact bytes, sent contiguously before their Artifact event.
@@ -125,22 +124,24 @@ message State {
   string error = 3;
 }
 
+// Where an engine is in its life, as it announces it on every request link.
 enum EngineState {
   ENGINE_STATE_UNSPECIFIED = 0;
-  // Starting its workers.
+  // Loading its ranks, resolving its modules and capturing its graphs.
   ENGINE_STATE_STARTING = 1;
-  // Serving requests.
-  ENGINE_STATE_READY = 2;
-  // Its start failed or its workers are lost; it serves nothing more.
-  ENGINE_STATE_FAILED = 3;
-  // Prepared: an engine that succeeds a serving one loaded its workers,
-  // mapped what it shares with its predecessor read-only, warmed up and
-  // captured its graphs; it executes nothing until promoted.
-  ENGINE_STATE_STANDBY = 5;
-  // Parked: it preempted every request at a step boundary and executes
-  // nothing; it keeps its workers, storage and prefix cache index until it
-  // resumes or shuts down.
-  ENGINE_STATE_PARKED = 6;
+  // Executes nothing and admits nothing, with its storage mapped and its
+  // graphs captured: an engine started beside the serving one (a switch's
+  // target, a standby), or one that drained. `Promote` makes it serve.
+  ENGINE_STATE_PARKED = 2;
+  // Admits and executes requests.
+  ENGINE_STATE_SERVING = 3;
+  // Admits nothing more; its requests in flight end as migratable at their
+  // step boundaries. Parked once the last one ended.
+  ENGINE_STATE_DRAINING = 4;
+  // Closed its ranks on a shutdown and exits.
+  ENGINE_STATE_STOPPED = 5;
+  // Its start failed or its ranks are lost; it serves nothing more.
+  ENGINE_STATE_FAILED = 6;
 }
 
 // What a ready engine serves.
@@ -286,9 +287,6 @@ message EngineCommand {
   oneof kind {
     // Finish every request as aborted, close the workers and exit.
     Shutdown shutdown = 1;
-    // A prepared engine imports its predecessor's prefix cache index and
-    // serves.
-    Promote promote = 3;
     // Revoke every cached prefix page; requests in flight keep theirs.
     FlushCache flush_cache = 4;
     // Run a named operation of the data plane; answered with `Hooked`.
@@ -307,18 +305,9 @@ message EngineCommand {
     // Rewrite the weights in place from another checkpoint of the same
     // model, once no request runs; answered with `Hooked`.
     UpdateWeights update_weights = 9;
-    // Preempt every request at the next step boundary and execute nothing
-    // more; answered with `Parked`.
-    Park park = 10;
-    // A parked engine executes and admits again; answered with `Hooked`.
-    Resume resume = 11;
     // Report the KV cache segments every worker group holds now; answered
     // with `CacheDescribed`.
     DescribeCache describe_cache = 13;
-    // The trial of a promoted engine ended: its predecessor is gone, so its
-    // workers take the predecessor's storage they mapped read-only, and a
-    // lost worker group is relaunched from then on; answered with `Hooked`.
-    Commit commit = 12;
     // Read the storage ledgers every node's Storage Server keeps for the
     // deployment, each node's daemon over its claim, without asking a
     // worker; answered with `Hooked`, one JSON result per node.
@@ -330,8 +319,6 @@ message EngineCommand {
     // Install completed expert copies at the common drained step boundary.
     CommitExperts commit_experts = 18;
   }
-  reserved 15;
-  reserved "throttle_transfers";
 }
 
 message CacheWarm {
@@ -494,64 +481,6 @@ message Attach {
 message Shutdown {}
 message FlushCache {}
 
-// The promotion of a prepared engine.
-message Promote {
-  // The prefix cache index of the parked predecessor, by worker group,
-  // whose pages the promoted engine reads from the predecessor's segments
-  // it maps read-only; empty for an engine without a predecessor.
-  repeated GroupIndex index = 1;
-  // Whether the requests the predecessor hands over compute their state
-  // again from their tokens: the promoted engine computes other numerics,
-  // and the change recomputes them (`in_flight = recompute`).
-  bool recompute = 2;
-  // Whether the predecessor's storage frees once the engine is promoted
-  // (its processes exit), so that the cache grows into it at once and the
-  // requests it hands over wait for that rather than for a commit.
-  bool grows = 3;
-}
-
-// A request to park the engine.
-message Park {
-  // Matches the `Parked` answer.
-  uint64 id = 1;
-  // Whether the epoch that succeeds the engine maps its KV cache: each
-  // scheduler then lends it the segments no request in flight continues
-  // from (`GroupIndex.lent`), forgets their pages and allocates none of
-  // their units until a `Resume` retires that epoch.
-  bool lend = 2;
-}
-
-// The answer to a `Park`: every request ended as migratable, or why the
-// engine did not park.
-message Parked {
-  uint64 id = 1;
-  // Empty when the engine parked.
-  string error = 2;
-  // The pages the engine's prefix cache index publishes, by worker group,
-  // which its successor reads from the segments it maps.
-  repeated GroupIndex index = 3;
-}
-
-// A request to resume a parked engine.
-message Resume {
-  // Matches the `Hooked` answer.
-  uint64 id = 1;
-  // Epochs whose storage ends on every node of the engine: the one a
-  // rollback discarded. An epoch named here writes none of the engine's
-  // storage any more (its processes are gone, or it was never promoted),
-  // so the engine takes back the cache units it lent it.
-  repeated uint64 retire = 2;
-}
-
-// The end of a promoted engine's trial.
-message Commit {
-  // Matches the `Hooked` answer.
-  uint64 id = 1;
-  // Epochs whose storage ends on every node of the engine: the predecessor,
-  // whose processes are gone.
-  repeated uint64 retire = 2;
-}
-
 // A request for the engine's KV cache segments.
 message DescribeCache {
   // Matches the `CacheDescribed` answer.
@@ -583,8 +512,8 @@ message GroupIndex {
   // reserves whole again: it computes their context anew.
   uint32 reserved_units = 5;
   uint32 reserving = 6;
-  // The units of the segments the scheduler lent its successor at the park
-  // (`Park.lend`): the successor maps them writable and allocates them on
+  // The units of the segments the scheduler lent its successor at its drain:
+  // the successor maps them writable and allocates them on
   // trial.
   repeated UnitRange lent = 7;
 }

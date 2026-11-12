@@ -117,7 +117,7 @@ mod tests {
             processes: "unix:/run/uniserve/processes.sock".to_owned(),
             engine: 7,
             build_server: "/run/uniserve/modules.sock".to_owned(),
-            modules: None,
+            modules: crate::epoch::modules_of(&crate::options::ServerArgs::default()),
             devices: vec![0, 1],
             group: "engine".to_owned(),
             rank: 0,
@@ -125,7 +125,6 @@ mod tests {
             world: None,
             standby_storage: crate::options::StandbyStorage::Resident,
             watchdog_timeout_s: None,
-            rollback_s: None,
             queue_depth: 4,
             world_size: 1,
         }
@@ -178,7 +177,6 @@ mod tests {
             "world",
             "standby_storage",
             "watchdog_timeout_s",
-            "rollback_s",
             "queue_depth",
             "world_size",
         ]

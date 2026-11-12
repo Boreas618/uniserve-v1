@@ -1,6 +1,6 @@
-//! The kernel installs of a precopy: the Build Server's selection of the generation's packages
-//! for every key the devices launch, then one install per device admitted on the module-load lane
-//! with every selected slot and exactly its keys.
+//! The kernel installs of a preparation: the Build Server's selection of the generation's
+//! packages for every key the devices launch, then one install per device admitted on the
+//! module-load lane with every selected slot and exactly its keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -16,12 +16,12 @@ use crate::modules::select::Routes;
 
 impl MainProcess {
     /// Every descriptor key this node's generation launches, by operator: the union of the local
-    /// workers' recorded walks, and of what the serving generation holds.
+    /// workers' profile runs, and of what the serving generation holds.
     ///
-    /// The recorded walk (`worker::runners::recording`) states every key a device's forwards
-    /// launch before anything is installed, so the epoch's first generation is installed from it in
-    /// one admission. An update changes implementations and never the set of descriptors, and the
-    /// serving generation's own keys are the same set as the walk's.
+    /// A profile run (`worker::runners::recording`) states every key a device's forwards launch
+    /// before anything is installed, so the engine's first generation is installed from it in one
+    /// admission. An update changes implementations and never the set of descriptors, and the
+    /// serving generation's own keys are the same set as the profile run's.
     pub(super) fn generation_keys(&self) -> BTreeMap<String, BTreeSet<String>> {
         let mut keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for worker in &self.workers {
@@ -31,7 +31,7 @@ impl MainProcess {
                     .extend(recorded.iter().cloned());
             }
         }
-        if let Some(serving) = self.update.generations.first() {
+        if let Some(serving) = self.state.generations.serving.first() {
             for (operator, key, _) in serving.iter() {
                 keys.entry(operator.to_owned())
                     .or_default()
@@ -50,7 +50,7 @@ impl MainProcess {
     ) -> std::result::Result<Arc<HostTask<ModuleWork>>, UpdateFailure> {
         for operator in keys.keys() {
             if proto::module::operator::named(operator).is_none() {
-                return Err(UpdateFailure::Precopy {
+                return Err(UpdateFailure::Prepare {
                     reason: format!("operator {operator} has no implementation in this build"),
                 });
             }
@@ -63,7 +63,7 @@ impl MainProcess {
         };
         self.modules
             .admit(ModuleWork::Select(select))
-            .map_err(|error| UpdateFailure::Precopy {
+            .map_err(|error| UpdateFailure::Prepare {
                 reason: format!("admitting the selection of the generation's packages: {error}"),
             })
     }
@@ -75,7 +75,7 @@ impl MainProcess {
         packages: &Packages,
         routes: &Routes,
     ) -> std::result::Result<Vec<Arc<HostTask<ModuleWork>>>, UpdateFailure> {
-        let invalid = |reason: String| UpdateFailure::Precopy { reason };
+        let invalid = |reason: String| UpdateFailure::Prepare { reason };
         let mut entries = Vec::with_capacity(packages.len());
         let mut descriptors = Vec::with_capacity(packages.len());
         for (slot, package) in packages {

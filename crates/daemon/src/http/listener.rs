@@ -146,6 +146,40 @@ impl Listener {
         })
     }
 
+    /// Binds a Unix-domain listener at `path` with file mode `mode`, taking
+    /// the path over from whoever holds it: the socket is bound beside the
+    /// path and renamed onto it, so the path always names a listening socket.
+    ///
+    /// The admin listeners bind so: their access is the socket file's
+    /// permissions, which are set before the path names the socket, and a hot
+    /// restart's successor takes them over while its predecessor finishes the
+    /// requests it accepted on its own, now unnamed, socket. The predecessor's
+    /// drop leaves the file alone, because the path no longer names the
+    /// socket it bound.
+    pub(crate) fn bind_over(path: &Path, mode: u32) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let beside = path.with_extension(format!("{}.binding", std::process::id()));
+        let _ = std::fs::remove_file(&beside);
+        let listener = std::os::unix::net::UnixListener::bind(&beside)?;
+        listener.set_nonblocking(true)?;
+        let placed = std::fs::set_permissions(&beside, std::fs::Permissions::from_mode(mode))
+            .and_then(|()| std::fs::rename(&beside, path));
+        if let Err(error) = placed {
+            let _ = std::fs::remove_file(&beside);
+            return Err(error);
+        }
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok(Self::Unix {
+            listener: UnixListener::from_std(listener)?,
+            socket_file: Some(SocketFile {
+                path: path.to_owned(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+        })
+    }
+
     /// A duplicate of the listening socket and what the successor of a hot
     /// restart needs beside it ([`Listener::resume`]); the successor owns a
     /// Unix socket's file from then on.

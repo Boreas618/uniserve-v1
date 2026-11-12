@@ -1,38 +1,35 @@
 //! The vocabulary of a generation update.
 //!
-//! A generation update moves through precopy, switchover, probation and
-//! commit or revert, and ends with a purge. The daemon drives it and every main
-//! process of the epoch takes part, so the names below travel: the daemon and
-//! the main processes of one epoch are one build and exchange them over the ipc
-//! channel (§2.3); the daemon's own process interface carries the same names in
-//! its append-only Protobuf (`crates/proto`) so that a later build of the daemon
-//! keeps serving the main processes of this one.
+//! A generation update moves a serving engine from the kernel and policy modules it executes to
+//! others: it is prepared beside the serving generation, switched to at one batch boundary, served
+//! on trial with the previous generation kept, and committed or rolled back. The daemon drives it
+//! through its process interface (`crates/proto`), whose reports acknowledge each step; the
+//! failures an engine observes meanwhile are named below.
 //!
 //! Only the vocabulary lives here. The commands that carry packages are in
-//! [`crate::generation`], because a `Precopy` names the [`PackageRevision`] set to install,
-//! and a package is defined by the Build Server (§5.1).
+//! [`crate::generation`], because a `Prepare` names the [`PackageRevision`] set to install,
+//! and a package is defined by the Build Server.
 
 use crate::{RequestKey, Stall};
 
-/// The first error of a failed update, as §7.3 step 4 lists the conditions that
-/// end probation in a revert, and §7.3 step 2 the failure that discards a new
-/// generation.
+/// The first error of a failed update: what ends a trial in a rollback, or drops a
+/// generation that was being prepared.
 ///
 /// The daemon marks the update unavailable with the first of these until it is
-/// applied again by force; a main process only reports its own.
+/// applied again by force; an engine only reports its own.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateFailure {
-    /// Precopy failed: the new generation was discarded and serving goes on
-    /// with the old one (§7.3 step 2). This one does not revert anything,
-    /// because nothing was switched over.
-    Precopy {
+    /// Preparing failed: the new generation was discarded and serving goes on
+    /// with the one that executes. Nothing is rolled back, because nothing was
+    /// switched.
+    Prepare {
         /// What failed: a module that did not resolve, a shadow batch outside
         /// its tolerance, a graph that did not recapture.
         reason: String,
     },
     /// A device error that leaves its context unusable, such as an illegal
-    /// address: the epoch's service cannot go on (§2.5).
+    /// address: the engine cannot go on serving.
     Device {
         /// The device, by ordinal.
         device: u32,
@@ -41,25 +38,25 @@ pub enum UpdateFailure {
         /// The batch that was in flight on it, if any.
         batch: Option<u64>,
     },
-    /// A job stayed inside one worker past half the watchdog timeout (§2.4).
+    /// A job stayed inside one worker past half the watchdog timeout.
     Stalled {
         /// The job's batch and how long it has run.
         stall: Stall,
     },
-    /// A batch produced non-finite logits (§7.3 step 4).
+    /// A batch produced non-finite logits.
     NonFiniteLogits {
         /// The request whose logits were not finite.
         request: RequestKey,
     },
     /// The scheduling policy failed: a trap, fuel, a limit outside the build
-    /// config, a decision the mechanism rejected, or a starved request (§4.4).
+    /// config, a decision the mechanism rejected, or a starved request.
     Policy {
         /// The mechanism's error.
         error: String,
     },
-    /// The update's rollback threshold of `update_config.rollback` was
-    /// exceeded (§7.3 step 4). The daemon decides this one; a main process
-    /// reports what the threshold is measured on.
+    /// The daemon ended the trial: a threshold of `update_config.rollback`, the
+    /// deadline of the apply, or the operator's decision. The daemon decides
+    /// this one; an engine reports what the thresholds are measured on.
     Threshold {
         /// What crossed the threshold.
         reason: String,
@@ -67,16 +64,16 @@ pub enum UpdateFailure {
 }
 
 impl UpdateFailure {
-    /// Whether this failure reverts an update on probation. A precopy failure
-    /// does not: it discards the new generation before any switchover.
-    pub const fn reverts(&self) -> bool {
-        !matches!(self, Self::Precopy { .. })
+    /// Whether this failure rolls back an update on trial. A failure of the
+    /// preparation does not: it discards the new generation before any switch.
+    pub const fn rolls_back(&self) -> bool {
+        !matches!(self, Self::Prepare { .. })
     }
 
     /// The failure as the one-line reason a record or a log keeps.
     pub fn reason(&self) -> String {
         match self {
-            Self::Precopy { reason }
+            Self::Prepare { reason }
             | Self::Policy { error: reason }
             | Self::Threshold { reason } => reason.clone(),
             Self::Device { device, error, .. } => format!("device {device}: {error}"),
@@ -94,116 +91,27 @@ impl UpdateFailure {
     }
 }
 
-/// What a main process reports of a generation update to the daemon and to
-/// the scheduler of its epoch (§7.3).
-///
-/// Every status names the generation it is about. A `Failed` and a
-/// `PolicyReverted` are sent unasked, like a stall report; the others response the
-/// command that caused them.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GenerationStatus {
-    /// Precopy finished: the new generation is loaded, rebound or recaptured,
-    /// and its shadow batches are within tolerance. Serving is unchanged.
-    Precopied {
-        /// The generation being installed.
-        generation: u64,
-        /// The operators this update could not compare, each with its reason
-        /// (7.3 step 2). Empty states every replaced operator was compared; a
-        /// pass with nothing to compile against lists every operator that has
-        /// no shadow evidence.
-        #[serde(default)]
-        uncompared: Vec<String>,
-    },
-    /// Precopy failed: the new generation was discarded and serving goes on.
-    PrecopyFailed {
-        /// The generation that was being installed.
-        generation: u64,
-        /// The first error.
-        failure: UpdateFailure,
-    },
-    /// The update switched over at a batch boundary; the old generation is
-    /// kept for probation.
-    Switched {
-        /// The generation now serving.
-        generation: u64,
-    },
-    /// A switchover's warmup moved on to another capture on a device: the
-    /// generation is still warming, and `Switched` follows once every device
-    /// finished it.
-    Warming {
-        /// The generation being warmed.
-        generation: u64,
-        /// The step a device took up, as its worker names it.
-        step: String,
-    },
-    /// Probation ended in a commit; the old generation is purged next.
-    Committed {
-        /// The generation committed.
-        generation: u64,
-    },
-    /// The update was reverted and the old generation serves again.
-    Reverted {
-        /// The generation that was reverted away from.
-        generation: u64,
-        /// Why it was reverted: a failure on probation, the rollback threshold,
-        /// or the operator's command.
-        reason: String,
-    },
-    /// The generation was purged: the last batch of the generation before it
-    /// completed and its graphs and kernels are released (§7.3 step 6).
-    Purged {
-        /// The generation purged.
-        generation: u64,
-    },
-    /// An update on probation failed and was reverted automatically; this
-    /// carries the first error (§7.3 step 4).
-    Failed {
-        /// The generation that failed.
-        generation: u64,
-        /// The first error.
-        failure: UpdateFailure,
-    },
-    /// The scheduling policy failed and the mechanism instantiated the previous
-    /// policy on the state it holds (§4.4, §7.3). After a commit the epoch keeps
-    /// serving and the daemon records the previous policy again; before one the
-    /// update reverts, and `fatal` says the policy cannot be recovered at all.
-    PolicyReverted {
-        /// The scheduler whose policy failed.
-        scheduler: u32,
-        /// The backend the failed policy came from.
-        backend: String,
-        /// That backend's revision.
-        revision: u32,
-        /// The policy's error.
-        reason: String,
-        /// Whether the mechanism can no longer serve: no previous policy exists
-        /// to instantiate, or the policy failed outside an update.
-        fatal: bool,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_precopy_failure_does_not_revert_an_update() {
-        let failure = UpdateFailure::Precopy {
+    fn a_failed_preparation_rolls_back_nothing() {
+        let failure = UpdateFailure::Prepare {
             reason: "a module did not resolve".into(),
         };
-        assert!(!failure.reverts());
+        assert!(!failure.rolls_back());
         assert_eq!(failure.reason(), "a module did not resolve");
     }
 
     #[test]
-    fn a_device_failure_reverts_and_names_its_device() {
+    fn a_device_failure_rolls_back_and_names_its_device() {
         let failure = UpdateFailure::Device {
             device: 3,
             error: "an illegal address was encountered".into(),
             batch: Some(41),
         };
-        assert!(failure.reverts());
+        assert!(failure.rolls_back());
         assert_eq!(
             failure.reason(),
             "device 3: an illegal address was encountered"

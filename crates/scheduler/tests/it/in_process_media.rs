@@ -46,12 +46,12 @@ fn install(handle: &SchedulerHandle, pool: &FakeBatches) {
     let source: Arc<dyn scheduler::PolicySource + Send + Sync> =
         Arc::new(scheduler::PolicyBytes::new(support::policy_module()));
     let installed = handle
-        .precopy_policy(package, source)
+        .prepare_policy(package, source)
         .recv_timeout(RESPONSE)
         .expect("the scheduler responds to a precopy");
     installed.expect("the policy is precopied");
     let switched = handle
-        .stage(Stage::Switchover)
+        .stage(Stage::Switch)
         .recv_timeout(RESPONSE)
         .expect("the scheduler responds to a switchover");
     switched.expect("the policy serves");

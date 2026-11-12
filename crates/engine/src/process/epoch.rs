@@ -1,71 +1,66 @@
-//! The epoch layer's commands to this process: a drain that parks every scheduler at its boundary,
-//! the `Serve` that resumes it, a standby's promotion, and admission, which opens only once the
-//! epoch's first switchover and its warmup have run.
+//! The lifecycle's work between epochs: a drain that parks every scheduler at its boundary and
+//! hands the prefix index over, the promotion that makes a parked engine serve, and admission.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use ipc::UpdateFailure;
 
 use super::MainProcess;
-use super::device_command;
 
 /// A drain whose schedulers have not all parked yet.
 pub(super) struct Draining {
     /// The epoch `Drained` names.
     epoch: u64,
-    /// The schedulers still to answer, in order.
-    answers: Vec<crossbeam_channel::Receiver<std::result::Result<scheduler::ParkedCache, String>>>,
-    /// What the ones that answered parked with, in the schedulers' order.
+    /// The schedulers still to respond, in order.
+    responses:
+        Vec<crossbeam_channel::Receiver<std::result::Result<scheduler::ParkedCache, String>>>,
+    /// What the ones that responded parked with, in the schedulers' order.
     parked: Vec<scheduler::ParkedCache>,
-    /// When the drain began, which the stall bound is measured from.
+    /// When the drain began, which its bound is measured from.
     since: Instant,
 }
 
-/// Why a promotion this process cannot serve is refused, or `None` when it can serve.
-///
-/// A standby is promoted to serve the generation the epoch prepared in it, and nothing in
-/// `Promote` states that generation - the message is empty and `Promoted` answers with the launch
-/// number the epoch layer promotes by - so this process cannot tell a generation the epoch still
-/// holds from one it has reverted. What it *can* tell is whether it holds a generation at all: a
-/// promotion with nothing prepared is a process that would open admission with no kernel and no
-/// graph, and answer `Promoted` to a daemon that then moves the frontend onto it.
-/// The longest a promoted epoch holds the requests that continue from its predecessor's pages for
-/// that epoch's index: the drain that sends it ends at the predecessor's next step boundary, once
-/// its requests left, so the bound only matters when the index never comes; the requests then
-/// compute what the pages held.
-const INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
-fn promote_refusal(standby: bool, prepared: usize) -> Option<String> {
-    (standby && prepared == 0).then(|| {
-        "this standby holds no prepared generation: its precopy was discarded or never ran, so          promoting it would serve a generation this process does not hold"
-            .to_owned()
-    })
+impl Draining {
+    /// The instant a scheduler that has not parked fails the drain.
+    pub(super) fn bound(&self, stall: Duration) -> Instant {
+        self.since + stall
+    }
 }
 
+/// The longest a promoted engine's schedulers hold the requests that continue from the drained
+/// engine's pages while its index is adopted: the index is adopted in the same command, so the
+/// bound only matters when a scheduler never responds; the requests then compute what the pages
+/// held.
+const INDEX_WAIT: Duration = Duration::from_secs(30);
+
 impl MainProcess {
-    /// The epoch drains at the boundary its schedulers reach, and the process
-    /// goes on living.
+    /// Begins the drain of `epoch`: every scheduler parks at the boundary it reaches, and the
+    /// process goes on living.
     ///
-    /// Every scheduler parks: its migratable requests end with their facts kept, the others finish,
-    /// and it executes nothing more. What it parks with is kept, so the `Serve` that names the epoch
-    /// again resumes it in place instead of reading its pages back. Weights and storage stay mapped
-    /// and the threads stay up - a drain is not an exit, and the daemon's `Serve` is what ends it.
-    pub(super) fn drain(&mut self, epoch: u64) -> Result<()> {
-        // An update cannot cross the drain: its switchover takes effect at a batch boundary and a
-        // drained epoch reaches none, so what the precopy built is given back now rather than left
-        // prepared for a boundary that cannot come.
-        self.drop_prepared("the epoch drained before its switchover")?;
+    /// A scheduler parks once its migratable requests ended with their state kept and the others
+    /// finished, and executes nothing more. What it parks with is kept, so a promotion that makes
+    /// this engine serve again resumes it in place. Weights and storage stay mapped and the
+    /// threads stay up: a drain is not an exit.
+    pub(super) fn drain(&mut self, epoch: u64, discarded: Option<u64>) -> Result<()> {
+        // An update cannot cross the drain: what a preparation built is given back now rather
+        // than left for a boundary that cannot come, and the daemon is told.
+        if let Some(generation) = discarded {
+            self.discard_generation(generation);
+            let report = self
+                .state
+                .rolled_back("the engine drained before the generation was switched to".to_owned());
+            self.send_report(report);
+        }
         // The daemon's client reads this before the first request ends migratable, on the same
-        // connection, so a request that moves never finds this epoch ready: it waits for the epoch
-        // the frontend serves next rather than being submitted to a process that admits nothing.
-        self.announce(proto::request::wire::EngineState::Parked)?;
-        // A scheduler parks once its requests have ended, and a request ends only when the daemon
-        // acknowledges it through this thread, so the answers are polled from the serve pass:
+        // connection, so a request that moves never finds this engine serving: it waits for the
+        // engine that serves next rather than being submitted to one that admits nothing.
+        self.announce(false)?;
+        // A scheduler parks once its requests have ended, and a request ends only when the
+        // daemon acknowledges it through this thread, so the responses are read as they wake it:
         // waiting here would hold the acknowledgement the park is waiting for.
         self.draining = Some(Draining {
             epoch,
-            answers: self
+            responses: self
                 .schedulers
                 .iter()
                 .map(|scheduler| scheduler.park(false))
@@ -73,37 +68,38 @@ impl MainProcess {
             parked: Vec::with_capacity(self.schedulers.len()),
             since: Instant::now(),
         });
-        self.advance_drain()
+        self.continue_drain()
     }
 
-    /// Takes the answers of a drain in progress, and states `Drained` when every scheduler parked.
-    pub(super) fn advance_drain(&mut self) -> Result<()> {
+    /// Takes the responses of the drain in flight, and acknowledges it once every scheduler
+    /// parked.
+    pub(super) fn continue_drain(&mut self) -> Result<()> {
         let bound = self.watchdog.stall_bound();
         let Some(mut draining) = self.draining.take() else {
             return Ok(());
         };
-        while let Some(answer) = draining.answers.first() {
-            match answer.try_recv() {
+        while let Some(response) = draining.responses.first() {
+            match response.try_recv() {
                 Ok(Ok(cache)) => {
                     draining.parked.push(cache);
-                    draining.answers.remove(0);
+                    draining.responses.remove(0);
                 }
-                Ok(Err(reason)) => bail!("draining the epoch: a scheduler did not park: {reason}"),
+                Ok(Err(reason)) => bail!("draining the engine: a scheduler did not park: {reason}"),
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     if draining.since.elapsed() > bound {
-                        bail!("draining the epoch: a scheduler did not park within {bound:?}");
+                        bail!("draining the engine: a scheduler did not park within {bound:?}");
                     }
                     self.draining = Some(draining);
                     return Ok(());
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    bail!("draining the epoch: a scheduler is gone");
+                    bail!("draining the engine: a scheduler is gone");
                 }
             }
         }
-        // The index each scheduler parked with goes with the report: the epoch that maps this
-        // one's cache segments reads the pages it names (`Inherit`). The parked index is kept as
-        // well, for a `Serve` that resumes this epoch.
+        // The index each scheduler parked with goes with the acknowledgement: the engine that
+        // maps this one's cache segments reads the pages it names. The parked caches are kept
+        // as well, for a promotion that makes this engine serve again.
         let index = self
             .schedulers
             .iter()
@@ -111,126 +107,81 @@ impl MainProcess {
             .flat_map(|(scheduler, parked)| parked.clone().into_indexes(&scheduler.cache_workers()))
             .collect();
         self.parked = Some(draining.parked);
-        self.serving = false;
-        // A drain ends the epoch this process was serving, so admission owed to a warmup of it is
-        // owed to nothing: the `Serve` that names the epoch again opens the next one.
-        self.admission_owed = false;
-        self.send_report(proto::process::Report {
-            kind: Some(proto::process::report::Kind::Drained(
-                proto::process::Drained {
-                    epoch: draining.epoch,
-                    index,
-                },
-            )),
-        });
-        // A revert that overtook the drain serves this epoch again, now that it can.
-        if let Some(serve) = self.serve_after_drain.take() {
-            self.resume(serve)?;
+        let (report, serves_again) = self.state.drained(draining.epoch, index);
+        self.send_report(report);
+        self.announce(false)?;
+        // A promotion that overtook the drain serves this engine again, now that it can.
+        if serves_again {
+            self.promote(None)?;
         }
         Ok(())
     }
 
-    /// Gives back what an in-flight update prepared, by name.
+    /// The promotion: this parked engine serves.
     ///
-    /// A precopy still running is abandoned through its own path, which discards the captures on
-    /// every device, reinstates the serving policy and answers the daemon.
-    /// A generation already prepared is discarded the same way: the device queue orders the discard
-    /// after the walk that captured it, and the generation that serves keeps its plans.
-    fn drop_prepared(&mut self, reason: &str) -> Result<()> {
-        if let Some(precopy) = self.precopy.take() {
-            let generation = precopy.generation;
-            self.precopy = Some(precopy);
-            return self.abandon_precopy(
-                generation,
-                UpdateFailure::Precopy {
-                    reason: reason.to_owned(),
-                },
+    /// An engine that parked at its start holds no request and no index: with a `handoff` its
+    /// schedulers adopt the index of the engine that drained - whose pages lie in the cache
+    /// segments this one maps - before they admit, and the requests that migrate continue from
+    /// those pages; without one it is a standby promoted after its failure domain was lost, and
+    /// it computes what it is asked. An engine that parked by draining resumes the schedulers it
+    /// parked with what they parked with, and forgets the pages its index names: another epoch
+    /// ran on its cache's storage while it stood drained.
+    pub(super) fn promote(&mut self, handoff: Option<proto::process::Handoff>) -> Result<()> {
+        let drained = self.parked.is_some();
+        let adopts = handoff.as_ref().filter(|_| !drained);
+        if let Some(handoff) = adopts {
+            // The scheduler's own promotion takes `recompute` and `grows` only with segments its
+            // predecessor lent, and a drain lends none: the index below is what is adopted.
+            tracing::info!(
+                groups = handoff.index.len(),
+                recompute = handoff.recompute,
+                grows = handoff.grows,
+                "the promoted engine adopts the drained engine's index"
             );
-        }
-        let Some(generation) = self.update.prepared.first().map(|built| built.number()) else {
-            return Ok(());
-        };
-        self.discard_policy();
-        for worker in &self.workers {
-            match worker.discard(generation) {
-                Ok(submission) => {
-                    if let Err(error) =
-                        device_command(&self.watchdog, worker.device(), "discard", submission)
-                    {
-                        // The generation never serves: a discard that did not finish holds storage
-                        // until the purge, and the epoch that drained is not made to fail for it.
-                        tracing::warn!(%error, generation, "discarding a prepared generation failed");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, generation, "queueing a prepared generation's discard failed");
-                }
+            for scheduler in &self.schedulers {
+                scheduler.await_index(INDEX_WAIT);
             }
         }
-        self.update.prepared.clear();
-        self.update.prepared_packages.clear();
-        Ok(())
-    }
-
-    /// Epoch `serve.epoch` serves from now on, at this process.
-    ///
-    /// A process that drained resumes the schedulers it parked, with the cache it parked with; one
-    /// that never drained already serves and has nothing to resume. The request address in the
-    /// command is the one this process bound at launch: the daemon names it so that the frontend
-    /// submits to the right place, not so that a process moves its socket.
-    pub(super) fn resume(&mut self, serve: proto::process::Serve) -> Result<()> {
-        if !self.boundary {
-            // The daemon has said the epoch serves; the process cannot admit until its first
-            // generation is filled and warmed. The request waits in the frontend, which retries the
-            // submission it was refused.
-            self.pending_serve = true;
-            return Ok(());
+        // An engine that parked with its graph pools' storage given back takes it again, at the
+        // addresses the graphs hold, before anything is admitted.
+        if std::mem::take(&mut self.graphs_suspended) {
+            self.data
+                .restore_graphs()
+                .context("restoring the promoted engine's graph pools")?;
+            tracing::info!("the promoted engine restored its graph storage");
         }
-        if self.draining.is_some() {
-            self.serve_after_drain = Some(serve);
-            return Ok(());
-        }
-        let drained = self.parked.is_some();
-        // A `Serve` that arrives while the warmup still has to capture this generation's buckets is
-        // owed rather than refused: admission opens when the last submission finishes, the same way
-        // it does at a switchover.
+        // The generation the schedulers stamp this engine's batches with: the one it holds.
+        self.record_generation(self.state.generations.current());
         self.open_admission()
-            .with_context(|| format!("resuming epoch {}", serve.epoch))?;
+            .context("promoting this engine in place")?;
         if drained {
-            // A target ran on this cache's storage while this epoch stood drained, so what its
-            // index names holds the target's pages now. The frontend moves only after the report
-            // below, so every request comes after this command.
+            // The daemon moves requests only after the acknowledgement below, so every request
+            // comes after this command.
             for scheduler in &self.schedulers {
                 scheduler.flush_cache();
             }
-            // The daemon returns a drained epoch to serving and moves the frontend once
-            // every host says so, as a promotion's answer says it of a target.
-            self.send_report(proto::process::Report {
-                kind: Some(proto::process::report::Kind::Promoted(
-                    proto::process::Promoted {
-                        generation: self.control.engine(),
-                        module_generation: self.served_generation(),
-                    },
-                )),
-            });
-            self.announce(proto::request::wire::EngineState::Ready)?;
         }
-        Ok(())
+        if let Some(handoff) = adopts {
+            self.adopt_index(&handoff.index)?;
+        }
+        let report = self.state.promoted();
+        self.send_report(report);
+        // The request link says so too: the daemon's client waits on it to move its requests.
+        self.announce(true)
     }
 
-    /// Adopts the index the drained predecessor epoch parked with, each worker group's in the
-    /// schedulers of that group: its pages lie in the cache segments this process maps, and the
-    /// requests the predecessor handed over continue from them. A scheduler whose group the index
-    /// names nothing of adopts none, and admits the requests it held for it.
+    /// Adopts the index the drained engine parked with, each worker group's in the schedulers of
+    /// that group. A scheduler whose group the index names nothing of adopts none, and admits
+    /// the requests it held for it.
     ///
     /// Each adoption is bounded by the watchdog's stall bound, as a park is.
-    pub(super) fn inherit(&mut self, index: Vec<proto::request::GroupIndex>) -> Result<()> {
+    fn adopt_index(&mut self, index: &[proto::request::GroupIndex]) -> Result<()> {
         let bound = self.watchdog.stall_bound();
-        let answers: Vec<_> = self
+        let responses: Vec<_> = self
             .schedulers
             .iter()
             .map(|scheduler| {
-                // Each of the scheduler's groups adopts the pages its predecessor group's planes
+                // Each of the scheduler's groups adopts the pages the drained engine's group
                 // held: a prefill/decode scheduler's groups are two.
                 let parked = scheduler
                     .cache_workers()
@@ -243,214 +194,67 @@ impl MainProcess {
                 scheduler.inherit(parked)
             })
             .collect();
-        for answer in answers {
-            match answer.recv_timeout(bound) {
+        for response in responses {
+            match response.recv_timeout(bound) {
                 Ok(Ok(())) => {}
                 // A page the scheduler does not adopt is computed again: the requests go on.
                 Ok(Err(reason)) => {
-                    tracing::warn!(%reason, "a scheduler did not adopt its predecessor's index");
+                    tracing::warn!(%reason, "a scheduler did not adopt the drained engine's index");
                 }
                 Err(error) => {
-                    bail!("adopting the predecessor's index: no answer within {bound:?}: {error}")
+                    bail!(
+                        "adopting the drained engine's index: no response within {bound:?}: {error}"
+                    )
                 }
             }
         }
         Ok(())
     }
 
-    /// Promotes this standby in place. When it `inherits`, the predecessor's index follows once
-    /// that epoch drained ([`Self::inherit`]), and the schedulers hold the requests that continue
-    /// from its pages until it arrives, for at most [`INDEX_WAIT`].
-    pub(super) fn promote_in_place(&mut self, inherits: bool) -> Result<()> {
-        // A standby is promoted to serve the generation the epoch prepared in it.
-        // A promotion that finds nothing prepared - the precopy was discarded, or the
-        // epoch moved on before it ran - is a promotion of a process that cannot serve,
-        // and it is refused here, by name, before admission opens: `Promoted` followed
-        // by a first request that finds no graph would tell the daemon the promotion
-        // succeeded and move the frontend onto a process with no kernels.
-        // A standby that took the epoch's packages serves them already: its precopy, switchover
-        // and commit ran when the daemon handed them over, so its generation is the serving one.
-        let held = self.update.prepared.len()
-            + self
-                .update
-                .generations
-                .iter()
-                .filter(|generation| !generation.is_empty())
-                .count();
-        if let Some(reason) = promote_refusal(self.standby, held) {
-            tracing::warn!(%reason, "a promotion this process cannot serve is refused");
-            self.send_report(proto::process::Report {
-                kind: Some(proto::process::report::Kind::Fault(proto::process::Fault {
-                    kind: "promote".to_owned(),
-                    reason: reason.clone(),
-                    device: 0,
-                })),
-            });
-            bail!("{reason}");
-        }
-        self.promoted = true;
-        if inherits {
-            for scheduler in &self.schedulers {
-                scheduler.await_index(INDEX_WAIT);
-            }
-        }
-        // A suspended standby takes its graph pools' storage back, at the addresses the graphs
-        // hold, before anything is admitted.
-        if self.standby_storage == proto::request::StandbyStorage::Suspended {
-            self.data
-                .restore_graphs()
-                .context("restoring the promoted standby's graph pools")?;
-            tracing::info!("the promoted standby worker restored its graph storage");
-        }
-        // The generation the schedulers must stamp this process's batches with: the one it
-        // holds. A promotion is the one cut-over that reaches no `switchover` of this
-        // process's own, so nothing else records it, and a promoted standby whose batches
-        // were stamped 0 would find no graph - the same defect the switchover had.
-        self.record_generation(self.served_generation());
-        // A promoted standby admits on the same rule as any other process: once the
-        // generation it will serve has been warmed.
-        self.open_admission()
-            .context("promoting this process in place")?;
-        if !self.boundary {
-            // A promoted standby serves only once the switchover that fills its
-            // generation has happened, the same rule a fresh process follows.
-            self.serving = false;
-            self.pending_serve = true;
-        }
-        // The two numbers answer different questions and both are needed: the launch
-        // generation is what the epoch layer promotes a child by, and the package
-        // generation is the one this process holds - the fact the daemon compares with
-        // its own before it moves the frontend, so a promotion of a generation the
-        // epoch has reverted is refused there instead of served here.
-        self.send_report(proto::process::Report {
-            kind: Some(proto::process::report::Kind::Promoted(
-                proto::process::Promoted {
-                    generation: self.control.engine(),
-                    module_generation: self.served_generation(),
-                },
-            )),
-        });
-        // The request link says so too: the daemon's client waits on it to move its frontend.
-        self.announce(proto::request::wire::EngineState::Ready)?;
-        Ok(())
-    }
-
-    /// Opens admission, or owes it to the warmup.
+    /// Opens admission: what the ranks hold to serve is recorded in their devices' usage, the
+    /// schedulers resume, and the serving path warms up.
     ///
-    /// A bucket is served only after its capture has run: a replay reads the captures of the
-    /// generation serving, and a bucket captured by no one is an invariant error at the first batch
-    /// rather than a capture that is slow. `warmup` queues one capture of every bucket per device
-    /// and returns at once - it runs one bucket per queue turn behind serving, which for a model
-    /// with many buckets is minutes - so the switchover answers the daemon and leaves the opening
-    /// here. A `Drain` clears what was owed, because the epoch it was owed to is no longer serving.
+    /// Every bucket a batch can be formed into is captured by now: a start ends, and a
+    /// promotion happens, only after the captures of the generation that executes.
     pub(super) fn open_admission(&mut self) -> Result<()> {
-        if !self.warming.is_empty() {
-            tracing::info!(
-                warming = self.warming.len(),
-                "admission is owed to the warmup, which has not finished"
-            );
-            self.admission_owed = true;
-            return Ok(());
-        }
-        tracing::info!(
-            boundary = self.boundary,
-            pending_serve = self.pending_serve,
-            "opening admission"
-        );
-        self.admission_owed = false;
-        // An early `Serve` is honoured here rather than at its arrival: this is the pass that
-        // admits, so the request waiting in the frontend is exactly what it was waiting for.
-        self.pending_serve = false;
-        // What the ranks hold to serve is warm by now, so the ledger hears of it before any request
-        // can ask for more. A rank past its quota does not serve.
+        tracing::info!("opening admission");
+        // A rank past its quota does not serve.
         self.data
             .book_serving()
-            .context("booking what the ranks hold in their devices' ledgers")?;
+            .context("recording what the ranks hold in their devices' usage")?;
         self.resume_schedulers()?;
-        // The serving path's warm-up submits ordinary requests straight to each scheduler, so it
-        // obeys the rule above too: it starts here, where every bucket its batches replay is
-        // captured, and not at the switchover that installed the policy. Only an epoch's first
-        // opening starts it; a reopening after a drain finds it started.
+        // The serving path's warm-up submits ordinary requests straight to each scheduler, so
+        // it starts here, where every bucket its batches replay is captured. Only an engine's
+        // first opening starts it; a reopening after a drain finds it started.
         for scheduler in &self.schedulers {
             scheduler.warm_serving_path();
         }
         Ok(())
     }
 
-    /// Parks every scheduler, keeping what each parks with for the resume.
-    ///
-    /// Each park is bounded by the watchdog's stall bound, the same rule the scheduler stage calls
-    /// follow: a scheduler that cannot park is a stall the epoch has to name rather than a
-    /// control thread that waits forever.
-    pub(super) fn park_schedulers(&mut self, what: &str) -> Result<()> {
-        let bound = self.watchdog.stall_bound();
-        let mut parked = Vec::with_capacity(self.schedulers.len());
-        for scheduler in &self.schedulers {
-            match scheduler.park(false).recv_timeout(bound) {
-                Ok(Ok(cache)) => parked.push(cache),
-                Ok(Err(reason)) => bail!("{what}: a scheduler did not park: {reason}"),
-                Err(error) => bail!("{what}: a scheduler did not park within {bound:?}: {error}"),
-            }
-        }
-        self.parked = Some(parked);
-        self.serving = false;
-        // A drain ends the epoch this process was serving, so admission owed to a warmup of it is
-        // owed to nothing: the `Serve` that names the epoch again opens the next one.
-        self.admission_owed = false;
-        Ok(())
-    }
-
-    /// Resumes every scheduler with the cache it parked with: the pages it still holds are reused
-    /// and the facts the drain kept are resubmitted by the frontend.
-    pub(super) fn resume_schedulers(&mut self) -> Result<()> {
+    /// Resumes every scheduler a drain parked, with the cache it parked with: the pages it still
+    /// holds are reused and the requests the drain ended are resubmitted by the daemon. A
+    /// scheduler that never parked has nothing to resume.
+    fn resume_schedulers(&mut self) -> Result<()> {
         let Some(parked) = self.parked.take() else {
-            self.serving = true;
             return Ok(());
         };
         let bound = self.watchdog.stall_bound();
         for (scheduler, cache) in self.schedulers.iter().zip(parked) {
-            // A resumed epoch recomputes from the tokens the frontend resubmits rather than lending
-            // from a predecessor: it is the same epoch, and the requests it ended at the drain are
-            // new requests to it.
+            // A resumed engine recomputes from the tokens the daemon resubmits rather than
+            // lending from a predecessor: it is the same engine, and the requests it ended at
+            // the drain are new requests to it.
             scheduler
                 .promote(cache, true, false)
                 .context("resuming a scheduler")?;
-            // The promotion states the cache; it is the resume that ends the park. A scheduler left
-            // parked takes requests into its queue and admits none of them.
+            // The promotion states the cache; it is the resume that ends the park. A scheduler
+            // left parked takes requests into its queue and admits none of them.
             match scheduler.resume(true).recv_timeout(bound) {
                 Ok(Ok(())) => {}
                 Ok(Err(reason)) => bail!("resuming a scheduler: {reason}"),
-                Err(error) => bail!("resuming a scheduler: no answer within {bound:?}: {error}"),
+                Err(error) => bail!("resuming a scheduler: no response within {bound:?}: {error}"),
             }
         }
-        self.serving = true;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A promotion with nothing prepared is refused, and one with a generation is not: the engine
-    /// cannot see the epoch's current generation (`Promote` states none), so what it can refuse is
-    /// a process that holds none at all.
-    #[test]
-    fn a_promotion_with_nothing_prepared_is_refused_and_one_with_a_generation_is_not() {
-        assert!(
-            promote_refusal(true, 0).is_some(),
-            "a standby with nothing prepared would have been promoted into an empty generation"
-        );
-        assert!(
-            promote_refusal(true, 1).is_none(),
-            "a standby holding its prepared generation was refused"
-        );
-        assert!(
-            promote_refusal(false, 0).is_none(),
-            "an initial process, which is never promoted, was refused"
-        );
-        let reason = promote_refusal(true, 0).unwrap_or_default();
-        assert!(reason.contains("no prepared generation"), "{reason}");
-        assert!(reason.contains("discarded"), "{reason}");
     }
 }

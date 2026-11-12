@@ -1,11 +1,16 @@
-//! Starting and closing a main process: the control thread's connections, the ranks' load, the
-//! device workers, the schedulers, and a standby's park; and the orderly close that ends them.
+//! Starting and closing an engine process: the control thread's connections, the ranks' load,
+//! the device workers, the schedulers, and the first generation, which the launch file's module
+//! set names; and the orderly close that ends them.
+//!
+//! A start is not an update. The process is built `Starting`, begins preparing the module set
+//! as its first generation, and then runs its ordinary loop: when the preparation completes the
+//! generation is installed with nothing kept, and when its captures complete the start ends -
+//! parked for an engine launched beside a serving one, serving otherwise.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::update::HotUpdate;
 use anyhow::{Context as _, Result, bail};
 use build_server::Client;
 use proto::config::EngineArgs;
@@ -16,10 +21,11 @@ use worker::watchdog::Watchdog;
 
 use super::claim::claim;
 use super::device_command;
+use super::generation::Generations;
 use super::launch::{Epoch, ProcessInterface, handshake};
+use super::lifecycle::State;
 use super::ranks::{Backing, LoadedRank, Meeting, load_ranks};
 use super::reports::{announce, state_failure};
-use super::serve::Wait;
 use super::{MainProcess, Peers};
 use crate::modules::load::ModuleWork;
 use crate::rank::ModelRunner;
@@ -43,7 +49,7 @@ impl MainProcess {
             launch.engine,
         )?;
         // The request interface's handshake: this process says who it is, and the
-        // daemon answers with the epoch this node serves.
+        // daemon replies with the epoch this node serves.
         // The epoch this rank belongs to is the daemon's, and it decides the storage this process
         // claims. A zero epoch names no epoch, and a world whose processes do not divide its ranks
         // between them is another deployment's: each is refused here, by name, rather than at the
@@ -66,11 +72,9 @@ impl MainProcess {
             bail!("a main process that holds every rank of its group holds its schedulers too");
         }
         let epoch = handshake(&mut control, launch)?;
-        // The daemon's launch path blocks until this process states what it is, and it
-        // sends the epoch's first generation command only once it has. `Starting` goes out
-        // before the model load, which is minutes long, so the daemon's log and the caller's show a
-        // process that is alive rather than one that vanished after the storage claim; the
-        // `Ready`/`Standby` at the end of `start` is what lets the epoch begin.
+        // The daemon's launch path waits for the state this start ends in. `STARTING` goes out
+        // before the model load, which is minutes long, so the daemon's log and the caller's show
+        // a process that is alive rather than one that vanished after the storage claim.
         announce(
             &mut control,
             proto::request::wire::EngineState::Starting,
@@ -100,17 +104,17 @@ impl MainProcess {
             .context("a main process starts on the connection it opened")?;
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
-        // the generation reports, and every command of the generation layer - travels on this one.
+        // its reports, and every command - travels on this one.
         let mut process = ProcessInterface::connect(
             &launch.processes,
             &launch.engine_config.deployment,
             launch.engine,
         )?;
-        // Every command of the generation layer arrives on this socket, and a stage waits for the
-        // command before it: the control thread sleeps on it as it does on the request socket.
+        // Every command arrives on this socket: the control thread blocks on it as it does on
+        // the request socket.
         connected.watch_process(Some(process.connection.descriptor()));
 
-        // The rank's Storage Server and its claim are the node's, which the daemon answers for;
+        // The rank's Storage Server and its claim are the node's, which the daemon holds for it;
         // the retained weights outlive the epoch, so the store is built once, before the model
         // loads, and keeps what it maps for the process's life.
         // A host tier is the build config's, and it needs prefix caching to have pages to keep.
@@ -140,10 +144,10 @@ impl MainProcess {
         )?;
 
         // The resident owners are opened before any thread that borrows them, and
-        // released in reverse order by `close`. The weights are mapped before the capacity plan
-        // measures, so the plan sees a device with the model already in it - the figure it computes
-        // is what is left, not what was there before the load. Pools sized first and weights after
-        // would over-commit the device by exactly the model's size.
+        // released in reverse order by `close`. The weights are mapped before the pools are
+        // sized, so the sizing sees a device with the model already in it - the figure it
+        // computes is what is left, not what was there before the load. Pools sized first and
+        // weights after would over-commit the device by exactly the model's size.
         let blocking = ThreadPool::new(model_runner.blocking_limits());
         let modules = blocking.lane::<ModuleWork>(BlockingKind::ModuleLoad)?;
         let packages = Arc::new(Mutex::new(Client::connect(model_runner.build_server())?));
@@ -156,17 +160,16 @@ impl MainProcess {
                 .watchdog_timeout()
                 .unwrap_or_else(|| model_runner.watchdog_timeout()),
         )?;
-        let mut update = HotUpdate::new(epoch.generation);
 
         let mut workers = Vec::with_capacity(model_runner.devices().len());
         let mut generations = Vec::with_capacity(model_runner.devices().len());
         // A rank with no device serves nothing, and saying it here names the deployment's fault
-        // rather than leaving the pool's figure to a plan that never sized one.
+        // rather than leaving the pool's figure to a sizing that never ran.
         if model_runner.devices().is_empty() {
             bail!("this rank serves no device");
         }
-        // Every capture of this process carries the probes the deployment names, and the graphs
-        // keep them for good: only their switch changes while the process serves.
+        // Every capture of this process carries the range markers the deployment names, and the
+        // graphs keep them for good: only their switch changes while the process serves.
         if !epoch.profiling.fence_components.is_empty() {
             worker::profiling::fences::Fences::install(
                 model_runner.devices(),
@@ -174,7 +177,7 @@ impl MainProcess {
                 epoch.profiling.fence_probes,
                 &epoch.profiling.fence_probes_off,
             )
-            .context("installing the fence probes")?;
+            .context("installing the range markers")?;
         }
         // CUPTI attributes a graph kernel's PC samples only when sampling was enabled before the
         // graph was captured.
@@ -195,7 +198,7 @@ impl MainProcess {
             .map(|rank| rank.model_runner.scheduled())
             .context("this process serves no rank")?;
         // Each rank of an expert union is a scheduler's own; the ranks of a media group are one
-        // pool, which the first rank's plan describes.
+        // pool, which the first rank describes.
         let union = first_plan.union().map(|(union, _)| Arc::clone(union));
         let mut scheduled = Vec::with_capacity(ranks.len());
         // The group's products, which every rank's runners reach through their own view of them.
@@ -229,16 +232,13 @@ impl MainProcess {
             } = rank;
             let client = client.context("a serving rank holds its Storage Server client")?;
             for (device, worker, generation) in spawned {
-                // The precopy shadows a replaced operator beside the serving one, so the region it
-                // runs in is mapped before any batch: the worker books it from the scratch pool
-                // the graph storage sized. Nothing is serving yet, so the control thread waits here;
-                // `serve` never does.
+                // A preparation shadows a replaced operator beside the serving one, so the region
+                // it runs in is mapped before any batch: the worker reserves it from the scratch
+                // pool the graph storage sized. Nothing is serving yet, so the control thread
+                // waits here; `serve` never does.
                 //
-                // The warmup is not here: the epoch's first generation holds no kernel until the
-                // daemon's precopy fills it - and a precopy that names no kernel (the startup
-                // switch) fills it from the store's built packages - so there is no bucket to warm
-                // yet. It runs at the first switchover, which is the boundary the first request is
-                // served at.
+                // The captures are not here: the generation the worker starts with holds no
+                // kernel, and the first one with kernels is prepared once this process is built.
                 let shadow = worker.set_shadow()?;
                 device_command(&watchdog, device, "shadow region", shadow)
                     .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
@@ -315,7 +315,7 @@ impl MainProcess {
             Links::Registered(channel) => {
                 let liveness = worker::peers::Liveness::new(connected.wake());
                 let ranks = Arc::new(worker::batch::Workers::shared(placed.clone())?);
-                // The scheduler node plans a group whose first rank is this process's against
+                // The scheduler node sizes a group whose first rank is this process's from
                 // that rank's report.
                 let report =
                     super::ranks::stated_report(&inventories[0], &memories[0], &data, false)?;
@@ -419,7 +419,6 @@ impl MainProcess {
         let stats_reporters = (0..schedulers.len())
             .map(|_| scheduler::SchedulerStatsReporter::default())
             .collect();
-        update.generations = generations;
         // The route instance is held to the ceilings of the batch the schedulers were built for,
         // as theirs are.
         let router = scheduler::Router::new(
@@ -428,10 +427,12 @@ impl MainProcess {
                 .map(|handle| scheduler::ceilings_of(scheduler::BatchCapacity::of(handle.info())))
                 .unwrap_or_default(),
         );
+        let control = control
+            .take()
+            .context("an engine process starts on the connection it opened")?;
         let mut process = Self {
-            control: control
-                .take()
-                .context("a main process starts on the connection it opened")?,
+            wake: control.wake(),
+            control,
             peers,
             schedulers,
             union,
@@ -443,95 +444,82 @@ impl MainProcess {
             storage: clients,
             blocking,
             modules,
-            update,
+            state: State::new(launch.engine, Generations::new(generations)),
+            starts_parked: launch.parked(),
             watchdog,
             packages,
-            precopy: None,
-            warming: Vec::new(),
-            announced_at: None,
-            reported_state: proto::request::wire::EngineState::Starting as i32,
+            preparing: None,
+            switching: None,
+            draining: None,
             daemon_closed: false,
             announced: None,
             noted_process_closed: false,
-            commands_seen: 0,
-            command_wait: Wait::default(),
-            warmup_wait: Wait::default(),
-            pending_switch: None,
-            warming_since: None,
-            warming_steps: Vec::new(),
-            policy_answers: Vec::new(),
             router,
             route_prepared: None,
             targets: model_runner.targets().to_vec(),
             build_server: model_runner.build_server().to_path_buf(),
             process,
-            stopping: false,
             streams: Vec::new(),
-            // Nothing is admitted until the epoch's first switchover, which is the boundary the
-            // first batch is served at: before it the generation holds no kernel and no capture, so
-            // a batch would find no graph. A standby parks itself here as well, and the `Promote`
-            // that follows does not lift the boundary either.
-            serving: false,
-            boundary: false,
-            pending_serve: false,
-            serve_after_drain: None,
-            admission_owed: false,
             max_running_requests: u32::try_from(build.max_running_requests.get())
                 .unwrap_or(u32::MAX),
-            catalogue: model_runner.prefill_catalogue(),
-            standby: launch.standby(),
-            promoted: false,
+            prefill_bound: model_runner.prefill_catalogue(),
             standby_storage: launch.standby_storage,
+            graphs_suspended: false,
             parked: None,
-            draining: None,
             paused: false,
-            rollback: launch.rollback_s.map(Duration::from_secs),
-            released: std::collections::BTreeSet::new(),
             data,
-            owed: Vec::new(),
+            operations: Vec::new(),
             weights: None,
             asleep: false,
         };
-        if launch.standby() {
-            process.park_standby()?;
+        // The engine's first generation: the kernel and policy packages the launch file's
+        // module set names, for every key this node's devices launch. Nothing serves and nothing
+        // is admitted until it executes and its graphs are captured.
+        let generation = process.state.generations.next();
+        let modules = &launch.modules;
+        if let Some(failure) =
+            process.start_prepare(generation, &modules.kernels, &modules.policy)?
+        {
+            bail!(
+                "the engine's first generation could not be prepared: {}",
+                failure.reason()
+            );
         }
-        // What the daemon waits for before the epoch's first `Precopy`: a process started beside a
-        // serving one is `Standby`, and one launched to serve is `Ready`. Waiting to be ready until
-        // this process had a policy would be waiting for the command that waits for it.
-        let state = if launch.standby() {
-            proto::request::wire::EngineState::Standby
-        } else {
-            proto::request::wire::EngineState::Ready
-        };
-        process.announce(state)?;
         Ok(process)
     }
 
-    /// A standby that has prepared announces itself and executes nothing until promoted.
-    ///
-    /// Its schedulers hold no request and have served no epoch, so parking them would ask for a
-    /// cache handover that belongs to a drained epoch; what makes this a park is that nothing is
-    /// admitted. `Promote` is the command that ends it.
-    ///
-    /// The report means exactly "prepared and admitted nothing", which is what the daemon gates
-    /// its promotion on: it is sent after `start` has mapped the weights, opened the memory and
-    /// started the runners, and *before* the epoch's first generation has been warmed - a warmup
-    /// belongs to the first switchover, and a standby's own generation reaches it when the daemon
-    /// sends the epoch's packages.
-    fn park_standby(&mut self) -> Result<()> {
-        self.serving = false;
-        // The launch generation, which is what `Parked` states: the daemon files a report by it
-        // (`supervision/roster.rs:236-244` reads `launch_of(engine, parked.generation)`), and the
-        // module generation is zero here - a standby parks before any `Precopy` names one - so a
-        // report stating that would name a launch that does not exist and be dropped. The `Park`
-        // command states the same number for the same reason.
-        self.send_report(proto::process::Report {
-            kind: Some(proto::process::report::Kind::Parked(
-                proto::process::Parked {
-                    generation: self.control.engine(),
-                },
-            )),
-        });
+    /// Ends the start: the first generation executes on every device, its captures finished and
+    /// every scheduler decides by its policy. An engine launched beside a serving one parks, with
+    /// its graph pools kept as its launch states; any other serves.
+    pub(super) fn finish_start(&mut self) -> Result<()> {
+        // The first generation has nothing before it, so its policy is the serving one at once.
+        self.commit_policy();
+        if self.starts_parked {
+            self.park_graph_storage()?;
+        } else {
+            self.open_admission()
+                .context("opening admission at the end of the start")?;
+        }
+        let report = self.state.started(self.starts_parked);
+        self.send_report(report);
+        self.announce(true)
+    }
+
+    /// Keeps a parked engine's graph pools as its launch states (`standby_storage`): resident,
+    /// or suspended to host storage at unchanged addresses until the promotion restores them.
+    fn park_graph_storage(&mut self) -> Result<()> {
+        match self.standby_storage {
+            proto::request::StandbyStorage::Suspended => {
+                self.data
+                    .suspend_graphs()
+                    .context("suspending the parked engine's graph pools")?;
+                self.graphs_suspended = true;
+                tracing::info!("the parked engine suspended its graph storage");
+            }
+            proto::request::StandbyStorage::Resident | proto::request::StandbyStorage::Auto => {
+                tracing::info!("the parked engine keeps its graph storage resident");
+            }
+        }
         Ok(())
     }
 
@@ -562,8 +550,8 @@ impl MainProcess {
         if let Some(union) = &self.union {
             union.end();
         }
-        // The peer links close first: a scheduler waiting for a peer's answer is answered by the
-        // close, and the peers read it as this process's end. The schedulers go next: their
+        // The peer links close first: a scheduler waiting for a peer's response is released by
+        // the close, and the peers read it as this process's end. The schedulers go next: their
         // `Batches` holds a clone of every worker, and a device thread cannot be joined while a
         // scheduler could still submit to it.
         self.peers.close();
@@ -583,7 +571,7 @@ impl MainProcess {
         for error in self.blocking.close() {
             tracing::warn!(%error, "closing a blocking lane failed");
         }
-        // The caches a park handed back name segments of the pools below: they go before the
+        // The caches a drain kept name segments of the pools below: they go before the
         // resident owners close, so nothing the memory releases is still described as parked.
         self.parked = None;
         for memory in std::mem::take(&mut self.memory) {
@@ -610,7 +598,7 @@ enum Links {
 }
 
 /// Meets the epoch's other main processes the launch names: the scheduler node accepts every
-/// peer's registration on the listener it inherited, and a peer dials it and registers. Answers
+/// peer's registration on the listener it inherited, and a peer dials it and registers. Returns
 /// where the group's ranks form their host group, and the channels.
 ///
 /// # Errors

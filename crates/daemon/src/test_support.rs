@@ -56,12 +56,46 @@ pub(crate) fn router_with(engine: impl Into<Arc<Leader>>, server: &ServerConfig)
         Arc::new(jobs),
         server,
         crate::http::BODY_LIMIT,
-        crate::http::admin::Admin::new(
-            CancellationToken::new(),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        ),
         None,
     )
+}
+
+/// The state of the admin routes over `engine`, with a new event log.
+fn admin_state(engine: impl Into<Arc<Leader>>) -> crate::http::admin::AdminState {
+    let leader = engine.into();
+    let admin = crate::http::admin::Admin::new(
+        CancellationToken::new(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    admin.watch(&leader);
+    crate::http::admin::AdminState {
+        leader,
+        admin,
+        jobs: Arc::new(VideoJobs::new(
+            VideoJobConfig::default(),
+            CancellationToken::new(),
+        )),
+        restarter: None,
+    }
+}
+
+/// The operator's admin routes over `engine`, as the admin listener serves
+/// them.
+pub(crate) fn admin_router(engine: impl Into<Arc<Leader>>) -> Router {
+    crate::http::admin::router(admin_state(engine))
+}
+
+/// The client API and the operator's admin routes over one `engine`, for a
+/// test that needs both: a daemon serves them on two listeners.
+pub(crate) fn daemon_routers(engine: impl Into<Arc<Leader>>) -> Router {
+    let engine = engine.into();
+    router(Arc::clone(&engine)).merge(admin_router(engine))
+}
+
+/// The harness's admin routes over `engine`, as the harness listener serves
+/// them.
+pub(crate) fn harness_router(engine: impl Into<Arc<Leader>>) -> Router {
+    crate::http::admin::harness_router(admin_state(engine))
 }
 
 /// Builds an engine for a model of `family` over one default fake
@@ -147,14 +181,14 @@ pub(crate) fn policy_on(core: &SchedulerHandle) {
     let (package, module) = packaged_policy(capacity);
     let source: std::sync::Arc<dyn scheduler::PolicySource + Send + Sync> =
         std::sync::Arc::new(scheduler::PolicyBytes::new(module));
-    core.precopy_policy(package, source)
+    core.prepare_policy(package, source)
         .recv_timeout(POLICY_ANSWER)
-        .expect("the policy precopy is answered within the bound")
+        .expect("the policy's preparation responds within the bound")
         .expect("the packaged policy's limits fit the scheduler's capacity");
-    core.switchover_policy()
+    core.switch_policy()
         .recv_timeout(POLICY_ANSWER)
-        .expect("the switchover is answered within the bound")
-        .expect("the switchover applies at the next batch boundary");
+        .expect("the switch responds within the bound")
+        .expect("the switch applies at the next batch boundary");
     // A scheduler that fatal-stops leaves its handle dead, and a dead handle is what
     // an engine reports as "no live scheduler answered the state the route policy is
     // instantiated on" - a sentence about the wrong subject. Its own reason is here,
@@ -208,10 +242,29 @@ pub(crate) fn engine_of(family: processing::Family, cores: Vec<SchedulerHandle>)
 /// this process over a socket pair, labelling their statistics with their
 /// model.
 pub(crate) fn fake_client(cores: Vec<SchedulerHandle>) -> EngineClient {
+    fake_engine(cores).0
+}
+
+/// [`fake_client`], with the fake engine's process link: the commands a test
+/// sends it as its daemon (`Drain`, `Promote`), and the reports it sends
+/// back.
+pub(crate) fn fake_engine(
+    cores: Vec<SchedulerHandle>,
+) -> (
+    EngineClient,
+    std::sync::mpsc::Sender<proto::process::Command>,
+    std::sync::mpsc::Receiver<proto::process::Report>,
+) {
     let state = if cores.iter().any(SchedulerHandle::starts_on_trial) {
-        crate::engine::client::EngineState::Standby
+        crate::engine::client::EngineState::Parked
     } else {
-        crate::engine::client::EngineState::Ready
+        crate::engine::client::EngineState::Serving
+    };
+    let (commands, commanded) = std::sync::mpsc::channel();
+    let (reports, reported) = std::sync::mpsc::channel();
+    let link = testkit::ProcessLink {
+        commands: commanded,
+        reports,
     };
     let first = &cores[0];
     let info = EngineInfo {
@@ -247,7 +300,7 @@ pub(crate) fn fake_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     std::thread::Builder::new()
         .name("fake-engine".into())
         .spawn(move || {
-            if let Err(error) = testkit::serve_requests(engine, cores, Some(policy)) {
+            if let Err(error) = testkit::serve_engine(engine, cores, Some(policy), link) {
                 // An engine stand-in that ends is the whole of a test's failure and
                 // otherwise leaves no line: the client reports only that its process
                 // ended, and the reason - a frame the engine refused, a scheduler that
@@ -257,7 +310,7 @@ pub(crate) fn fake_client(cores: Vec<SchedulerHandle>) -> EngineClient {
             }
         })
         .expect("start the engine stand-in");
-    EngineClient::new(
+    let client = EngineClient::new(
         proto::Connection::from_unix(daemon.try_clone().expect("clone the request socket"))
             .expect("a reader"),
         proto::Connection::from_unix(daemon).expect("a writer"),
@@ -266,7 +319,8 @@ pub(crate) fn fake_client(cores: Vec<SchedulerHandle>) -> EngineClient {
         crate::leader::stats_sink(model_name, std::sync::Arc::default(), 0),
         None,
     )
-    .expect("a client")
+    .expect("a client");
+    (client, commands, reported)
 }
 
 /// The test model's facts.
@@ -334,7 +388,7 @@ pub(crate) fn leader_over(
         processor,
         images,
         &options,
-        test_updates(),
+        test_updater(),
     )
 }
 
@@ -427,18 +481,270 @@ pub(crate) fn post_json(path: &str, body: &serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
-/// A driver over fresh epoch records and the real roster over stand-in
-/// nodes: the leaders the crate's tests build never run a switch, and
-/// `updates::tests` drives one.
-pub(crate) fn test_updates() -> std::sync::Arc<crate::updates::driver::Driver> {
-    use crate::supervision::stand_in;
+/// The connection number of the engine of launch generation `generation`
+/// that the fake nodes start: another number than the generation, so that a
+/// test shows the daemon binds a connection by the launch generation its
+/// reports state.
+pub(crate) fn connection(generation: u64) -> u64 {
+    1000 + generation
+}
 
+/// The engines' and the node daemons' ends of a process link, played by
+/// `testkit::process`: every request the leader makes of a node is answered
+/// as a node answers it, every engine the leader spawns is a fake engine that
+/// reports as the process interface states, and a test reads what each was
+/// sent.
+pub(crate) struct Engines {
+    /// Every request the leader made of the nodes, in arrival order.
+    requests: Arc<std::sync::Mutex<Vec<proto::process::request::Kind>>>,
+    /// The commands the daemon sent, by engine connection.
+    commands: std::sync::mpsc::Receiver<(u64, proto::process::Command)>,
+    /// The reports the engines send up, by engine connection.
+    reports: std::sync::mpsc::Sender<(u64, proto::process::Report)>,
+    exits: std::sync::mpsc::Sender<proto::process::Exit>,
+    greetings: std::sync::mpsc::Sender<(u64, crate::supervision::processes::Greeting)>,
+    /// The fake engines by connection number.
+    engines: std::collections::BTreeMap<u64, testkit::process::Engine>,
+    /// How many of the recorded spawns were started as engines.
+    started: usize,
+}
+
+impl Engines {
+    /// The fakes behind a new process link, whose nodes refuse what
+    /// `refusals` names.
+    pub(crate) fn link(
+        refusals: testkit::process::Refusals,
+    ) -> (Self, crate::supervision::processes::ProcessLink) {
+        type Asked = (
+            proto::process::Request,
+            std::sync::mpsc::Sender<proto::process::Reply>,
+        );
+        let (requests, asked) = std::sync::mpsc::channel::<Asked>();
+        let (exits, exited) = std::sync::mpsc::channel();
+        let (greetings, greeted) = std::sync::mpsc::channel();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&log);
+        // The leader waits for each reply, so a request is recorded before the
+        // call that made it returns.
+        std::thread::spawn(move || {
+            while let Ok((request, reply)) = asked.recv() {
+                if let Some(kind) = &request.kind {
+                    recorded.lock().unwrap().push(kind.clone());
+                }
+                let _ = reply.send(testkit::process::node_reply(&request, &refusals));
+            }
+        });
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (reports, reported) = std::sync::mpsc::channel();
+        let link = crate::supervision::processes::ProcessLink {
+            requests,
+            greetings: greeted,
+            exits: exited,
+            commands: crate::supervision::ProcessCommands {
+                commands,
+                reports: Arc::new(std::sync::Mutex::new(reported)),
+            },
+        };
+        let engines = Self {
+            requests: log,
+            commands: sent,
+            reports,
+            exits,
+            greetings,
+            engines: std::collections::BTreeMap::new(),
+            started: 0,
+        };
+        (engines, link)
+    }
+
+    /// Adds the serving engine of launch generation `generation`, which the
+    /// daemon's engine control started: it states its launch generation as
+    /// its connection number.
+    pub(crate) fn serve(&mut self, generation: u64) {
+        self.engines
+            .insert(generation, testkit::process::Engine::serving(generation));
+    }
+
+    /// Starts every engine the leader spawned since the last call: each
+    /// connects, greets with `build` and reports that it parked, or that it
+    /// serves, as its launch file states. Returns whether one started.
+    pub(crate) fn start_spawned(&mut self, build: &str) -> bool {
+        let spawns = self.spawns();
+        let new = &spawns[self.started.min(spawns.len())..];
+        for spawn in new {
+            let launch: proto::config::EngineArgs =
+                serde_json::from_slice(&spawn.launch).expect("a launch file");
+            let engine = if launch.parked() {
+                testkit::process::Engine::parked(spawn.generation)
+            } else {
+                testkit::process::Engine::serving(spawn.generation)
+            };
+            let peer = connection(spawn.generation);
+            let _ = self.greetings.send((
+                peer,
+                crate::supervision::processes::Greeting {
+                    build: build.to_owned(),
+                    frontend: false,
+                },
+            ));
+            let _ = self.reports.send((peer, engine.started()));
+            self.engines.insert(peer, engine);
+        }
+        let started = !new.is_empty();
+        self.started = spawns.len();
+        started
+    }
+
+    /// Delivers every command the daemon sent to the engine it names, and
+    /// sends the engines' reports up. Returns whether one was delivered.
+    pub(crate) fn deliver(&mut self) -> bool {
+        let mut delivered = false;
+        while let Ok((peer, command)) = self.commands.try_recv() {
+            delivered = true;
+            let Some(engine) = self.engines.get_mut(&peer) else {
+                continue;
+            };
+            for report in engine.command(command) {
+                let _ = self.reports.send((peer, report));
+            }
+        }
+        delivered
+    }
+
+    /// Runs the update of `updater` as far as the fakes take it: the daemon
+    /// reads the engines' reports, the engines the daemon's commands, until
+    /// neither has anything left.
+    pub(crate) fn run(&mut self, updater: &crate::updates::Updater, build: &str) {
+        loop {
+            updater.advance();
+            let started = self.start_spawned(build);
+            if !(self.deliver() || started) {
+                return;
+            }
+        }
+    }
+
+    /// The fake engine of launch generation `generation`.
+    pub(crate) fn engine(&mut self, generation: u64) -> &mut testkit::process::Engine {
+        let peer = self.peer(generation);
+        self.engines
+            .get_mut(&peer)
+            .expect("an engine of that generation")
+    }
+
+    /// The connection number of the engine of launch generation `generation`.
+    fn peer(&self, generation: u64) -> u64 {
+        self.engines
+            .iter()
+            .find(|(_, engine)| engine.launch_generation() == generation)
+            .map(|(peer, _)| *peer)
+            .expect("an engine of that generation")
+    }
+
+    /// The commands the engine of launch generation `generation` was sent.
+    pub(crate) fn received(&mut self, generation: u64) -> Vec<proto::process::command::Kind> {
+        self.engine(generation).received().to_vec()
+    }
+
+    /// Sends `report` up as the engine of launch generation `generation`.
+    pub(crate) fn report(&self, generation: u64, report: proto::process::Report) {
+        let _ = self.reports.send((self.peer(generation), report));
+    }
+
+    /// The node `host` reports that the engine of launch generation
+    /// `generation` exited with `status`.
+    pub(crate) fn exit(&self, host: &str, generation: u64, status: &str) {
+        let _ = self.exits.send(proto::process::Exit {
+            host: host.to_owned(),
+            group: crate::engine::control::ENGINE_GROUP.to_owned(),
+            rank: 0,
+            generation,
+            status: status.to_owned(),
+            last_line: String::new(),
+        });
+    }
+
+    /// A frontend process greets on connection `peer`.
+    pub(crate) fn greet_frontend(&self, peer: u64) {
+        let _ = self.greetings.send((
+            peer,
+            crate::supervision::processes::Greeting {
+                build: String::new(),
+                frontend: true,
+            },
+        ));
+    }
+
+    /// The commands the daemon sent that no engine took, by connection: a
+    /// frontend's, in the tests that greet one.
+    pub(crate) fn undelivered(&self) -> Vec<(u64, proto::process::command::Kind)> {
+        self.commands
+            .try_iter()
+            .filter_map(|(peer, command)| Some((peer, command.kind?)))
+            .collect()
+    }
+
+    /// Every request the leader made of the nodes, in arrival order.
+    pub(crate) fn requests(&self) -> Vec<proto::process::request::Kind> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// The spawns among them.
+    pub(crate) fn spawns(&self) -> Vec<proto::process::Spawn> {
+        self.requests()
+            .into_iter()
+            .filter_map(|kind| match kind {
+                proto::process::request::Kind::Spawn(spawn) => Some(spawn),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The claims among them.
+    pub(crate) fn claims(&self) -> Vec<proto::process::Claim> {
+        self.requests()
+            .into_iter()
+            .filter_map(|kind| match kind {
+                proto::process::request::Kind::Claim(claim) => Some(claim),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The launch generations the leader stopped, in order.
+    pub(crate) fn stops(&self) -> Vec<Option<u64>> {
+        self.requests()
+            .into_iter()
+            .filter_map(|kind| match kind {
+                proto::process::request::Kind::Stop(stop) => Some(stop.generation),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The weight retentions among them.
+    pub(crate) fn retentions(&self) -> Vec<proto::process::KeepWeights> {
+        self.requests()
+            .into_iter()
+            .filter_map(|kind| match kind {
+                proto::process::request::Kind::KeepWeights(keep) => Some(keep),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// An updater over fresh epoch records whose engines and nodes are fakes
+/// nobody plays: the leaders the crate's tests build start no update, and
+/// `updates::tests` drives one.
+pub(crate) fn test_updater() -> std::sync::Arc<crate::updates::Updater> {
     let epochs = std::sync::Arc::new(crate::epoch::Epochs::new());
-    // The main processes' ends are dropped: nothing is commanded and nothing
-    // reports, while the nodes still answer what the roster asks.
-    let (_processes, roster) = stand_in::roster(&epochs, stand_in::Refusals::default());
-    std::sync::Arc::new(crate::updates::driver::Driver::new(
-        epochs,
-        Box::new(roster),
-    ))
+    let (_engines, link) = Engines::link(testkit::process::Refusals::default());
+    let processes = crate::supervision::processes::Processes::new(
+        Arc::clone(&epochs),
+        "deployment".to_owned(),
+        Vec::new(),
+        link,
+    );
+    std::sync::Arc::new(crate::updates::Updater::new(epochs, processes))
 }

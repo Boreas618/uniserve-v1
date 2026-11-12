@@ -86,21 +86,26 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// What an engine is, as its client knows it.
+/// Where an engine is in its life, as its client knows it: the lifecycle
+/// the engine announces on its request link, and `Stopped` once its
+/// connection closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineState {
-    /// It succeeds the serving engine and is prepared beside it: its
-    /// workers are loaded and captured, and it serves once promoted.
-    Standby,
-    /// It serves requests.
-    Ready,
-    /// It preempted every request and executes nothing, keeping its storage
-    /// and prefix cache index until it resumes or shuts down.
+    /// It loads its ranks, resolves its modules and captures its graphs.
+    Starting,
+    /// It executes and admits nothing, with its storage mapped and its
+    /// graphs captured: an update's target or a standby before its
+    /// promotion, or an engine that drained.
     Parked,
-    /// It serves nothing more: its workers failed.
+    /// It admits and executes requests.
+    Serving,
+    /// It admits nothing more; its requests end as migratable at their step
+    /// boundaries.
+    Draining,
+    /// It shut down, or its connection closed.
+    Stopped,
+    /// It serves nothing more: its start failed or its ranks are lost.
     Failed(String),
-    /// Its connection closed.
-    Closed,
 }
 
 pub use frontend::input::SubmitError;
@@ -137,22 +142,20 @@ struct Shared {
     /// The hooks and configure commands awaiting their answer, by
     /// identity: a hook's answer is each worker's result, a configure's
     /// none.
-    answers: Mutex<HashMap<u64, Answer>>,
+    responses: Mutex<HashMap<u64, Responder>>,
     /// The epoch the engine executes, which its statistics are recorded
     /// under; 0 for an engine this daemon did not start.
     epoch: AtomicU64,
 }
 
-/// Where an engine command's answer goes: each worker's result, or why the
+/// Where an engine command's response goes: each worker's result, or why the
 /// command failed.
-type Answer = oneshot::Sender<Result<Answered, String>>;
+type Responder = oneshot::Sender<Result<Response, String>>;
 
-/// What the engine answered a command with.
-enum Answered {
+/// What the engine responded to a command with.
+enum Response {
     /// Each worker's JSON result (`Hooked`), or nothing (`Configured`).
     Results(Vec<String>),
-    /// Each worker group's prefix cache index (`Parked`).
-    Index(Vec<wire::GroupIndex>),
     /// What a successor maps of the engine (`CacheDescribed`).
     Cache(wire::Predecessor),
     /// The engine described the requests it was asked about (`RequestsDescribed`).
@@ -234,7 +237,7 @@ impl EngineClient {
             requests: Mutex::default(),
             state,
             next_id: AtomicU64::new(1),
-            answers: Mutex::default(),
+            responses: Mutex::default(),
             epoch: AtomicU64::new(0),
         });
         let thread = {
@@ -341,7 +344,7 @@ impl EngineClient {
         if let EngineState::Failed(reason) = self.state() {
             return Err(SubmitError::Unavailable(reason));
         }
-        if self.state() == EngineState::Closed {
+        if self.state() == EngineState::Stopped {
             return Err(SubmitError::Unavailable("its process ended".to_owned()));
         }
         let id = RequestId(self.shared.next_id.fetch_add(1, Ordering::Relaxed));
@@ -419,7 +422,7 @@ impl EngineClient {
         if let EngineState::Failed(reason) = self.state() {
             return Err(SubmitError::Unavailable(reason));
         }
-        if self.state() == EngineState::Closed {
+        if self.state() == EngineState::Stopped {
             return Err(SubmitError::Unavailable("its process ended".to_owned()));
         }
         let (events, receiver) = mpsc::unbounded_channel();
@@ -451,65 +454,29 @@ impl EngineClient {
         Ok(stream)
     }
 
-    /// Promotes a prepared engine, which succeeds a parked one: its workers
-    /// adopt the predecessor's cache flags, and it imports `index`, the
-    /// predecessor's prefix cache index, and serves the requests the
-    /// predecessor hands over, which `recompute` their state from their
-    /// tokens or not, and for which its cache `grows` into the
-    /// predecessor's storage at once or only at its commit. Waits until the
-    /// engine reports that it serves; an engine that serves already is left
-    /// as it is.
+    /// Waits until this parked engine, and every peer of its world, serves:
+    /// its promotion travels on its process link, and it announces here that
+    /// it took effect.
     ///
     /// # Errors
     ///
-    /// Fails when the engine reports that its promotion failed, as when its
-    /// cache cannot hold those requests, or its connection closes first.
-    pub async fn promote(
-        &self,
-        index: Vec<wire::GroupIndex>,
-        recompute: bool,
-        grows: bool,
-    ) -> Result<(), SubmitError> {
-        // The peers are promoted with the scheduler node's process, every promotion issued before
-        // any is awaited: each process takes its storage over once its predecessor is out, and the
-        // ranks' collectives resume together.
+    /// Fails when an engine reports that it failed, as when its cache cannot
+    /// hold the requests handed to it, or its connection closes first.
+    pub async fn await_serving(&self) -> Result<(), SubmitError> {
         for peer in &self.peers {
-            peer.send_promote(Vec::new(), recompute, grows);
+            Box::pin(peer.await_serving()).await?;
         }
-        self.send_promote(index, recompute, grows);
-        for peer in &self.peers {
-            peer.await_promoted().await?;
-        }
-        self.await_promoted().await
-    }
-
-    /// Sends the engine its promotion while it stands by.
-    fn send_promote(&self, index: Vec<wire::GroupIndex>, recompute: bool, grows: bool) {
-        if *self.states().borrow() == EngineState::Standby {
-            self.shared
-                .send(to_engine::Kind::Engine(wire::EngineCommand {
-                    kind: Some(wire::engine_command::Kind::Promote(wire::Promote {
-                        index,
-                        recompute,
-                        grows,
-                    })),
-                }));
-        }
-    }
-
-    /// Waits until the promoted engine serves.
-    async fn await_promoted(&self) -> Result<(), SubmitError> {
         let mut states = self.states();
         loop {
             match states.borrow_and_update().clone() {
-                EngineState::Ready => return Ok(()),
+                EngineState::Serving => return Ok(()),
                 EngineState::Failed(reason) => return Err(SubmitError::Unavailable(reason)),
-                EngineState::Closed | EngineState::Parked => {
+                EngineState::Stopped | EngineState::Draining => {
                     return Err(SubmitError::Unavailable(
                         "the engine ended before it served".to_owned(),
                     ));
                 }
-                EngineState::Standby => {}
+                EngineState::Starting | EngineState::Parked => {}
             }
             if states.changed().await.is_err() {
                 return Err(SubmitError::Unavailable(
@@ -558,51 +525,28 @@ impl EngineClient {
         lock(&self.shared.requests).len()
     }
 
-    /// Sends `command`, built with the identity its answer matches, and
-    /// awaits the answer.
+    /// Sends `command`, built with the identity its response matches, and
+    /// awaits the response.
     async fn ask(
         &self,
         command: impl FnOnce(u64) -> wire::engine_command::Kind,
-    ) -> Result<Answered, String> {
+    ) -> Result<Response, String> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (answer, answered) = oneshot::channel();
-        lock(&self.shared.answers).insert(id, answer);
+        let (responder, response) = oneshot::channel();
+        lock(&self.shared.responses).insert(id, responder);
         self.shared
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(command(id)),
             }));
-        // The reader marks the engine closed before it drops the answers it holds, so an answer
+        // The reader marks the engine closed before it drops the responses it holds, so an answer
         // registered after that finds the mark here and no reader ever drops it.
-        if matches!(self.state(), EngineState::Closed | EngineState::Failed(_)) {
-            lock(&self.shared.answers).remove(&id);
-            return Err("the engine ended before it answered".to_owned());
+        if matches!(self.state(), EngineState::Stopped | EngineState::Failed(_)) {
+            lock(&self.shared.responses).remove(&id);
+            return Err("the engine ended before it responded".to_owned());
         }
-        answered
+        response
             .await
-            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
-    }
-
-    /// Parks the engine: at its next step boundary it ends every token
-    /// request that resumes from its generated tokens as migratable, lets
-    /// the others finish, and executes nothing more, keeping its storage and
-    /// prefix cache index. When it `lend`s, the epoch that succeeds it maps
-    /// its KV cache: it lends that epoch the segments no request in flight
-    /// continues from, forgetting their pages, and allocates none of their
-    /// units until a resume retires that epoch. Returns its index once it
-    /// parked.
-    ///
-    /// # Errors
-    ///
-    /// Fails with the reason a scheduler did not park, or when the engine
-    /// ends first.
-    pub async fn park(&self, lend: bool) -> Result<Vec<wire::GroupIndex>, String> {
-        match self
-            .ask(|id| wire::engine_command::Kind::Park(wire::Park { id, lend }))
-            .await?
-        {
-            Answered::Index(index) => Ok(index),
-            _ => Err("the engine answered a park with something else".to_owned()),
-        }
+            .unwrap_or_else(|_| Err("the engine ended before it responded".to_owned()))
     }
 
     /// Each worker group's KV cache segments as the engine holds them now,
@@ -617,8 +561,8 @@ impl EngineClient {
             .ask(|id| wire::engine_command::Kind::DescribeCache(wire::DescribeCache { id }))
             .await?
         {
-            Answered::Cache(predecessor) => Ok(predecessor),
-            _ => Err("the engine answered a cache description with something else".to_owned()),
+            Response::Cache(predecessor) => Ok(predecessor),
+            _ => Err("the engine responded to a cache description with something else".to_owned()),
         }
     }
 
@@ -649,7 +593,7 @@ impl EngineClient {
     pub async fn describe_storage(&self) -> Result<Vec<String>, String> {
         self.ask(|id| wire::engine_command::Kind::DescribeStorage(wire::DescribeStorage { id }))
             .await
-            .map(Answered::results)
+            .map(Response::results)
     }
 
     /// Runs the data plane's operation `name` with the JSON `payload`, and
@@ -660,8 +604,8 @@ impl EngineClient {
     /// Fails with the reason a worker gave, or when the engine ends first.
     pub async fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>, String> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (answer, answered) = oneshot::channel();
-        lock(&self.shared.answers).insert(id, answer);
+        let (responder, response) = oneshot::channel();
+        lock(&self.shared.responses).insert(id, responder);
         self.shared
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(wire::engine_command::Kind::Hook(wire::Hook {
@@ -670,10 +614,10 @@ impl EngineClient {
                     payload: payload.to_owned(),
                 })),
             }));
-        answered
+        response
             .await
-            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
-            .map(Answered::results)
+            .unwrap_or_else(|_| Err("the engine ended before it responded".to_owned()))
+            .map(Response::results)
     }
 
     /// Commit completed expert copies and record the order in worker launches.
@@ -682,18 +626,18 @@ impl EngineClient {
         order: std::collections::HashMap<String, wire::ExpertOrder>,
     ) -> Result<Vec<String>, String> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (answer, answered) = oneshot::channel();
-        lock(&self.shared.answers).insert(id, answer);
+        let (responder, response) = oneshot::channel();
+        lock(&self.shared.responses).insert(id, responder);
         self.shared
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(wire::engine_command::Kind::CommitExperts(
                     wire::CommitExperts { id, order },
                 )),
             }));
-        answered
+        response
             .await
-            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
-            .map(Answered::results)
+            .unwrap_or_else(|_| Err("the engine ended before it responded".to_owned()))
+            .map(Response::results)
     }
 
     /// Gives back or restores the device storage of the engine's KV cache
@@ -712,7 +656,7 @@ impl EngineClient {
             })
         })
         .await
-        .map(Answered::results)
+        .map(Response::results)
     }
 
     /// Gives back the tail of the engine's KV cache until each device's
@@ -748,7 +692,7 @@ impl EngineClient {
             })
         })
         .await
-        .map(Answered::results)
+        .map(Response::results)
     }
 
     /// Has every worker rewrite its weights in place from the checkpoint at
@@ -765,8 +709,8 @@ impl EngineClient {
         in_flight: crate::leader::WeightsInFlight,
     ) -> Result<Vec<String>, String> {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (answer, answered) = oneshot::channel();
-        lock(&self.shared.answers).insert(id, answer);
+        let (responder, response) = oneshot::channel();
+        lock(&self.shared.responses).insert(id, responder);
         self.shared
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(wire::engine_command::Kind::UpdateWeights(
@@ -783,10 +727,10 @@ impl EngineClient {
                     },
                 )),
             }));
-        answered
+        response
             .await
-            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
-            .map(Answered::results)
+            .unwrap_or_else(|_| Err("the engine ended before it responded".to_owned()))
+            .map(Response::results)
     }
 
     /// Commands the engine to revoke every cached prefix page; requests in
@@ -905,12 +849,12 @@ impl Drop for EngineClient {
     }
 }
 
-impl Answered {
-    /// The results a `Hooked` answer carries; none for any other answer.
+impl Response {
+    /// The results a `Hooked` response carries; none for any other response.
     fn results(self) -> Vec<String> {
         match self {
             Self::Results(results) => results,
-            Self::Index(_) | Self::Cache(_) | Self::Prefixes => Vec::new(),
+            Self::Cache(_) | Self::Prefixes => Vec::new(),
         }
     }
 }
@@ -986,11 +930,11 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             }
             Some(from_engine::Kind::Accepted(accepted)) => {
                 let mut requests = lock(&shared.requests);
-                if let Some(answer) = requests
+                if let Some(responder) = requests
                     .get_mut(&RequestId(accepted.request))
                     .and_then(|pending| pending.accepted.take())
                 {
-                    let _ = answer.send(Some(accepted.scheduler));
+                    let _ = responder.send(Some(accepted.scheduler));
                 }
             }
             Some(from_engine::Kind::Metrics(metrics)) => {
@@ -1016,66 +960,53 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                     Err(error) => tracing::debug!(%error, "the engine sent unreadable statistics"),
                 }
             }
-            Some(from_engine::Kind::State(state))
-                if state.state == wire::EngineState::Failed as i32 =>
-            {
-                tracing::error!(error = %state.error, "the engine failed");
-                shared.state.send_replace(EngineState::Failed(state.error));
-            }
-            Some(from_engine::Kind::State(state))
-                if state.state == wire::EngineState::Ready as i32 =>
-            {
-                // A prepared engine was promoted, or a parked one resumed.
-                shared.state.send_if_modified(|current| {
-                    let changes = matches!(*current, EngineState::Standby | EngineState::Parked);
-                    if changes {
-                        *current = EngineState::Ready;
+            Some(from_engine::Kind::State(state)) => {
+                // The engine announces its lifecycle; the client keeps what
+                // it last announced.
+                let announced = match wire::EngineState::try_from(state.state) {
+                    Ok(wire::EngineState::Starting) => Some(EngineState::Starting),
+                    Ok(wire::EngineState::Parked) => Some(EngineState::Parked),
+                    Ok(wire::EngineState::Serving) => Some(EngineState::Serving),
+                    Ok(wire::EngineState::Draining) => Some(EngineState::Draining),
+                    Ok(wire::EngineState::Stopped) => Some(EngineState::Stopped),
+                    Ok(wire::EngineState::Failed) => {
+                        tracing::error!(error = %state.error, "the engine failed");
+                        Some(EngineState::Failed(state.error))
                     }
-                    changes
-                });
-            }
-            Some(from_engine::Kind::State(state))
-                if state.state == wire::EngineState::Parked as i32 =>
-            {
-                shared.state.send_if_modified(|current| {
-                    let ready = *current == EngineState::Ready;
-                    if ready {
-                        *current = EngineState::Parked;
-                    }
-                    ready
-                });
+                    Ok(wire::EngineState::Unspecified) | Err(_) => None,
+                };
+                if let Some(announced) = announced {
+                    shared.state.send_if_modified(|current| {
+                        let changes = *current != announced;
+                        if changes {
+                            *current = announced;
+                        }
+                        changes
+                    });
+                }
             }
             Some(from_engine::Kind::Hooked(hooked)) => {
-                if let Some(answer) = lock(&shared.answers).remove(&hooked.id) {
-                    let _ = answer.send(if hooked.error.is_empty() {
-                        Ok(Answered::Results(hooked.results))
+                if let Some(responder) = lock(&shared.responses).remove(&hooked.id) {
+                    let _ = responder.send(if hooked.error.is_empty() {
+                        Ok(Response::Results(hooked.results))
                     } else {
                         Err(hooked.error)
                     });
                 }
             }
             Some(from_engine::Kind::Configured(configured)) => {
-                if let Some(answer) = lock(&shared.answers).remove(&configured.id) {
-                    let _ = answer.send(if configured.error.is_empty() {
-                        Ok(Answered::Results(Vec::new()))
+                if let Some(responder) = lock(&shared.responses).remove(&configured.id) {
+                    let _ = responder.send(if configured.error.is_empty() {
+                        Ok(Response::Results(Vec::new()))
                     } else {
                         Err(configured.error)
                     });
                 }
             }
-            Some(from_engine::Kind::Parked(parked)) => {
-                if let Some(answer) = lock(&shared.answers).remove(&parked.id) {
-                    let _ = answer.send(if parked.error.is_empty() {
-                        Ok(Answered::Index(parked.index))
-                    } else {
-                        Err(parked.error)
-                    });
-                }
-            }
             Some(from_engine::Kind::CacheDescribed(described)) => {
-                if let Some(answer) = lock(&shared.answers).remove(&described.id) {
-                    let _ = answer.send(if described.error.is_empty() {
-                        Ok(Answered::Cache(wire::Predecessor {
+                if let Some(responder) = lock(&shared.responses).remove(&described.id) {
+                    let _ = responder.send(if described.error.is_empty() {
+                        Ok(Response::Cache(wire::Predecessor {
                             epoch: described.storage_epoch,
                             segments: described.segments,
                         }))
@@ -1085,30 +1016,30 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                 }
             }
             Some(from_engine::Kind::RequestsDescribed(described)) => {
-                if let Some(answer) = lock(&shared.answers).remove(&described.id) {
-                    let _ = answer.send(if described.error.is_empty() {
-                        Ok(Answered::Prefixes)
+                if let Some(responder) = lock(&shared.responses).remove(&described.id) {
+                    let _ = responder.send(if described.error.is_empty() {
+                        Ok(Response::Prefixes)
                     } else {
                         Err(described.error)
                     });
                 }
             }
-            Some(from_engine::Kind::State(_)) | None => {}
+            None => {}
         }
     }
     if !matches!(*shared.state.borrow(), EngineState::Failed(_)) {
-        shared.state.send_replace(EngineState::Closed);
+        shared.state.send_replace(EngineState::Stopped);
     }
-    // A hook or configure the lost engine did not answer fails.
-    lock(&shared.answers).clear();
+    // A hook or configure the lost engine did not respond to fails.
+    lock(&shared.responses).clear();
     // Every request still in flight leaves with the lost engine as
     // migratable: the daemon submits one that resumes from its generated
     // tokens, or a video request, to the engine that serves next, and fails
     // any other. No trajectory was stored anywhere new.
     let pending: Vec<(RequestId, Pending)> = lock(&shared.requests).drain().collect();
     for (_, mut request) in pending {
-        if let Some(answer) = request.accepted.take() {
-            let _ = answer.send(None);
+        if let Some(responder) = request.accepted.take() {
+            let _ = responder.send(None);
         }
         let _ = request.events.send(Event::Migratable {
             cause: proto::request::MigrationCause::Loss,
@@ -1128,8 +1059,8 @@ fn file(shared: &Shared, id: RequestId, event: Event) {
     };
     // The engine accepts a request before any of its scheduler's events; an
     // event before the acceptance ended the request at submission.
-    if let Some(answer) = pending.accepted.take() {
-        let _ = answer.send(None);
+    if let Some(responder) = pending.accepted.take() {
+        let _ = responder.send(None);
     }
     let _ = pending.events.send(event);
     if terminal {

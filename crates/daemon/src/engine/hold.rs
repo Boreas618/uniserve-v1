@@ -165,7 +165,7 @@ impl RequestHold {
         !self.is_paused()
             && matches!(
                 &*self.serving.borrow(),
-                Serving::Engine(client) if client.state() == EngineState::Ready
+                Serving::Engine(client) if client.state() == EngineState::Serving
             )
     }
 
@@ -250,7 +250,7 @@ impl RequestHold {
             let held = *paused.borrow_and_update();
             let current = serving.borrow_and_update().clone();
             match current {
-                Serving::Engine(client) if !held && client.state() == EngineState::Ready => {
+                Serving::Engine(client) if !held && client.state() == EngineState::Serving => {
                     return Ok((
                         Destination::Engine(client),
                         previous_epoch.and_then(|epoch| self.kept(epoch)),
@@ -385,7 +385,7 @@ mod tests {
         assert!(!hold.pause(), "the hold was not paused before");
         assert!(hold.pause(), "a second pause finds it paused");
         assert!(!hold.is_serving());
-        assert_eq!(hold.state(), HoldState::Engine(EngineState::Ready));
+        assert_eq!(hold.state(), HoldState::Engine(EngineState::Serving));
 
         let submission = tokio::spawn({
             let hold = Arc::clone(&hold);

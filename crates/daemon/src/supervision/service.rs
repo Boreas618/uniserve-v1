@@ -37,7 +37,7 @@ use proto::process::{
 use proto::{Connection, Handed, Listener};
 
 use crate::supervision::claims::{ClaimHolder, HandedClaims};
-use crate::supervision::roster::Greeting;
+use crate::supervision::processes::Greeting;
 use crate::supervision::supervisor::{HandedProcesses, Supervisor};
 
 /// How often children are polled for exits while nothing else happens.

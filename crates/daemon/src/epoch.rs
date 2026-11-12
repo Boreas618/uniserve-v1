@@ -1,25 +1,19 @@
-//! Epochs: what a deployment executes, what fills it, and how the daemon
-//! moves it.
+//! Epochs: what a deployment executes and which modules it runs.
 //!
-//! An epoch is one configuration executed: its main processes on every node,
-//! their communicators, graphs and the storage they create
-//! The leader's daemon keeps one [`EpochRecord`] per
-//! epoch: the [`proto::config::EngineConfig`] it was built from, the modules that fill its
-//! operators and its scheduling interface, the modules a probation keeps as
-//! the previous generation, and its [`Status`].
+//! An epoch is one engine build with its build configuration, executed: its
+//! engines on every node, their graphs and the storage they create. The
+//! leader's daemon keeps one [`EpochRecord`] per epoch: the
+//! [`proto::config::EngineConfig`] it was built from, the module set it runs,
+//! the modules a trial keeps as the previous generation, and its [`Status`].
 //!
-//! A configuration change is routed mechanically by comparing the records
-//! (§7.2): with the build config unchanged and only the filled modules
-//! different, the modules move inside the serving main process (§7.3); with
-//! a different build config, a new epoch is built (§7.4); a change of the
-//! daemon's or the frontend's own options, or of their executables, is a
-//! hot restart (§7.5). Nothing about a change is declared by the change
-//! itself.
-//!
-//! The values are the daemon's own, not the wire's: [`PackageRevision`] is
-//! `crates/build-server`'s type, which the modules swarm defines, and the
-//! daemon records the wire form ([`crate::proto`]'s `process::PackageRevision`)
-//! until that crate lands.
+//! A configuration change is routed by comparing what it moves ([`change`]):
+//! with the build configuration unchanged and only the kernel or policy
+//! modules different, the serving engines take them as a generation; with a
+//! different build configuration or engine package, a new epoch is started
+//! beside the serving one; a change of the daemon's own options is a hot
+//! restart. Nothing about a change is declared by the change itself. The
+//! update that moves the deployment is `crate::updates::update::Update`; this
+//! module holds the records it writes.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -56,7 +50,7 @@ pub fn package_to_wire(package: &PackageRevision) -> proto::process::PackageRevi
     }
 }
 
-/// One operator's package as the `Precopy` command states it (§7.3 step 2).
+/// One operator's package as the `Prepare` command states it.
 pub fn kernel_to_wire(
     slot: &KernelKey,
     package: &PackageRevision,
@@ -77,21 +71,31 @@ pub fn kernel_to_wire(
     }
 }
 
-/// Where an epoch is in its life (§7.3, §7.4).
+/// Where an epoch is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// Its main processes prepare the next generation of modules while the
-    /// serving epoch runs (the generation layer's precopy), or they start as
-    /// standbys that map storage read-only and park (the epoch layer's
-    /// precopy).
-    Precopy,
-    /// Its main processes serve requests.
+    /// Its engines start beside the serving epoch's, map external state
+    /// read-only and park.
+    Preparing,
+    /// Its engines serve requests.
     Serving,
-    /// Its main processes serve while the previous generation is kept for a
-    /// rollback.
-    Probation,
-    /// Its main processes exited and its storage was retired.
-    Purged,
+    /// Its engines serve while what they replaced is kept for a rollback:
+    /// the previous epoch, or the previous generation of this one.
+    Trial,
+    /// Its engines exited and its storage was retired.
+    Released,
+}
+
+impl Status {
+    /// The status as `GET /admin/config` names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Serving => "serving",
+            Self::Trial => "trial",
+            Self::Released => "released",
+        }
+    }
 }
 
 /// What the leader's daemon records of one epoch.
@@ -107,19 +111,18 @@ pub struct EpochRecord {
     pub kernels: BTreeMap<KernelKey, PackageRevision>,
     /// The scheduling policy package.
     pub policy: PackageRevision,
-    /// The modules a probation keeps as the previous generation: a revert
-    /// and a restart during the probation use them, and a commit empties
-    /// them (§7.3).
+    /// The modules a generation's trial keeps as the previous generation: a
+    /// rollback returns to them, and a commit empties them.
     pub previous_kernels: BTreeMap<KernelKey, PackageRevision>,
     /// The previous scheduling policy package, kept until the next commit.
     pub previous_policy: Option<PackageRevision>,
     /// Where the epoch is in its life.
     pub status: Status,
-    /// The MODEL generation: the number the epoch's own main processes gave
-    /// the modules they execute, read from their `Parked`, `Promoted` or
-    /// launch report and never invented here (§2.5, §7.4). It is not a
-    /// process's identity: that is [`ManagedProcess::generation`], the
-    /// launch generation, allocated by [`Epochs::next_generation`].
+    /// The generation: the number the epoch's own engines gave the modules
+    /// they execute, read from their `Parked` or `Serving` report and never
+    /// invented here. It is not a process's identity: that is
+    /// [`ManagedProcess::generation`], the launch generation, allocated by
+    /// [`Epochs::next_generation`].
     pub generation: Option<u64>,
 }
 
@@ -164,56 +167,27 @@ pub struct ManagedProcess {
     pub state: ProcessState,
 }
 
-/// One configuration change in flight or just applied: one operation with
-/// one number, one probation and one commit or revert (§7.2).
-///
-/// The first failure reported while the update runs is kept, not the last
-/// (§7.3 step 4): if the update reverts, it is marked unavailable with that
-/// first error, and applying the same configuration again takes `force`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Update {
-    /// The update's number, from the daemon's sequence of operations.
-    pub number: u64,
-    /// What the update moves the deployment to.
-    pub target: Epoch,
-    /// Where the update is.
-    pub state: UpdateState,
-    /// The first failure reported while the update ran.
-    pub first_failure: Option<Failure>,
-}
-
-/// Where an update is (§7.2, §7.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateState {
-    /// The new generation serves while the previous one is kept: the
-    /// probation, from which a commit or a revert follows (§7.3 step 4).
-    Probation,
-    /// The probation ended in favour of the new generation.
-    Committed,
-    /// The probation ended by returning to the previous generation.
-    Reverted,
-}
-
-/// One failure that failed an update: a fault the main process observed, a
-/// stalled job, non-finite logits, or a scheduling policy that had to be
-/// reverted (§7.3 step 4).
+/// Why an update did not stand: a fault an engine observed, a stalled job,
+/// non-finite logits, a scheduling policy the engine had to roll back, a
+/// threshold, the deadline or the operator's decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
     /// A stable short name: `sticky`, `illegal_address`, `launch_failed`,
     /// `out_of_memory`, `process_exit`, `stalled`, `non_finite_logits`,
-    /// `policy_reverted` or `invalid_config`.
+    /// `policy_rolled_back`, `prepare_failed`, `deadline`, `rollback` or a
+    /// threshold's name.
     pub kind: String,
-    /// The account the main process gave, for the daemon's record.
+    /// The account given with it, for the daemon's record.
     pub reason: String,
     /// The CUDA ordinal the failure names, when it names one.
     pub device: Option<u32>,
 }
 
 impl Failure {
-    /// The failure a main process's report states, or `None` for a report
-    /// that states none: an acknowledgement (`Precopied`, `Switched`,
-    /// `Committed`, `Reverted`, `Purged`) or a failed precopy, which drops
-    /// the new generation and leaves the serving one alone (§7.3 step 2).
+    /// The failure an engine's report states, or `None` for a report that
+    /// states none: an acknowledgement, a lifecycle state, or a failed
+    /// preparation, which drops the new generation and leaves the serving
+    /// one alone.
     pub fn of_report(report: &proto::process::Report) -> Option<Self> {
         use proto::process::report::Kind;
         let kind = report.kind.as_ref()?;
@@ -240,182 +214,55 @@ impl Failure {
                 reason: format!("non-finite logits for request {}", logits.request),
                 device: None,
             }),
-            Kind::PolicyReverted(reverted) => Some(Self {
-                kind: "policy_reverted".to_owned(),
+            Kind::PolicyRolledBack(policy) => Some(Self {
+                kind: "policy_rolled_back".to_owned(),
                 reason: {
-                    // Presence is the contract (§4.4): absent is the route
-                    // instance the engine's control thread runs, a value one
-                    // scheduler thread's policy.
-                    let instance = match reverted.scheduler {
+                    // Absent is the route instance the engine's control
+                    // thread runs, a value one scheduler thread's policy.
+                    let instance = match policy.scheduler {
                         Some(scheduler) => format!("scheduler {scheduler}"),
                         None => "the engine's control thread".to_owned(),
                     };
-                    let fatal = if reverted.fatal {
+                    let fatal = if policy.fatal {
                         ", and no previous policy module is left"
                     } else {
                         ""
                     };
                     format!(
                         "the policy of {instance} (backend {} revision {}) failed: {}{fatal}",
-                        reverted.backend, reverted.revision, reverted.reason
+                        policy.backend, policy.revision, policy.reason
                     )
                 },
                 device: None,
             }),
             Kind::Parked(_)
-            | Kind::Promoted(_)
-            | Kind::Precopied(_)
+            | Kind::Serving(_)
+            | Kind::Prepared(_)
             | Kind::Switched(_)
             | Kind::Warming(_)
             | Kind::Committed(_)
-            | Kind::Reverted(_)
-            | Kind::Purged(_)
+            | Kind::RolledBack(_)
             | Kind::Drained(_)
-            | Kind::PrecopyFailed(_) => None,
+            | Kind::PrepareFailed(_) => None,
         }
     }
-}
-
-impl Update {
-    /// The update `number` that moves a deployment to `target`; its
-    /// probation has not ended.
-    pub fn new(number: u64, target: Epoch) -> Self {
-        Self {
-            number,
-            target,
-            state: UpdateState::Probation,
-            first_failure: None,
-        }
-    }
-
-    /// Records `failure` unless a failure was recorded already: the first
-    /// error an update meets is the one it is marked unavailable with.
-    pub fn fail(&mut self, failure: Failure) {
-        if self.first_failure.is_none() {
-            self.first_failure = Some(failure);
-        }
-    }
-
-    /// Ends the probation in favour of the new generation (§7.3 step 5).
-    pub fn commit(&mut self) {
-        self.state = UpdateState::Committed;
-    }
-
-    /// Ends the probation by returning to the previous deployment (§7.3
-    /// step 5): the update stays unavailable with its first failure, and
-    /// applying it again takes `force`.
-    ///
-    /// A deliberate rollback is not a failure: it states none, so the update
-    /// it ends stays available and applying it again needs no `force`.
-    /// Only a revert after a failure is marked with one.
-    pub fn revert(&mut self) {
-        self.state = UpdateState::Reverted;
-    }
-
-    /// Why this update may not be applied again without `force`, when it
-    /// reverted after a failure (§7.3 step 4).
-    pub fn unavailable(&self) -> Option<&Failure> {
-        match self.state {
-            UpdateState::Reverted => self.first_failure.as_ref(),
-            UpdateState::Probation | UpdateState::Committed => None,
-        }
-    }
-}
-
-/// One phase of an update, as the daemon's event log names it (§7.2, §7.3):
-/// the generation layer's steps and the probation's end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
-    /// The new generation's modules are being prepared in the serving main
-    /// processes (§7.3 step 2).
-    Precopy,
-    /// Every main process prepared them.
-    Precopied,
-    /// The switchover to the new generation is under way (§7.3 step 3).
-    Switchover,
-    /// Every main process executes the new generation.
-    Switched,
-    /// The new generation serves while the previous one is kept (§7.3
-    /// step 4).
-    Probation,
-    /// The probation ended in favour of the new generation (§7.3 step 5).
-    Committed,
-    /// The probation ended by returning to the previous generation, with
-    /// the reason it did.
-    Reverted,
-    /// The generation the probation kept is gone (§7.3 step 6).
-    Purged,
-    /// A main process could not prepare the new generation's modules; the
-    /// serving one is untouched (§7.3 step 2).
-    PrecopyFailed,
-    /// A scheduling policy failed and the main process reinstantiated the
-    /// previous one (§4.4).
-    PolicyReverted,
-}
-
-impl Phase {
-    /// The name the event log and the update's readers use.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Precopy => "precopy",
-            Self::Precopied => "precopied",
-            Self::Switchover => "switchover",
-            Self::Switched => "switched",
-            Self::Probation => "probation",
-            Self::Committed => "committed",
-            Self::Reverted => "reverted",
-            Self::Purged => "purged",
-            Self::PrecopyFailed => "precopy_failed",
-            Self::PolicyReverted => "policy_reverted",
-        }
-    }
-}
-
-/// A generation update in flight, as the daemon keeps it between the
-/// request that started it and the one that ends its probation (§7.3 steps
-/// 2-6): the update, the epoch it moves, and every main process with the
-/// generation it prepared.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GenerationUpdate {
-    /// The update, in its probation.
-    pub update: Update,
-    /// The epoch whose modules it moves.
-    pub epoch: u64,
-    /// The main processes that prepared a generation: the node they run on,
-    /// the engine number their reports carry, and the generation each of
-    /// them numbered.
-    pub prepared: Vec<PreparedProcess>,
-}
-
-/// One main process that prepared a generation of a generation update.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedProcess {
-    pub host: String,
-    pub engine: u64,
-    pub generation: u64,
 }
 
 /// The epochs a deployment's daemon keeps and the processes it manages on
 /// its node: the state `GET /admin/config` reports and a change is routed
-/// by (§7.2).
+/// by.
 #[derive(Debug, Default)]
 pub struct Epochs {
     records: Mutex<BTreeMap<u64, EpochRecord>>,
     processes: Mutex<Vec<ManagedProcess>>,
     /// The daemon's process table, once the daemon that supervises this
     /// node's processes attached it: the processes are the supervisor's to
-    /// report, and this record keeps what each of them is (§2.3).
+    /// report, and this record keeps what each of them is.
     supervised: std::sync::OnceLock<std::sync::Arc<Mutex<Vec<ManagedProcess>>>>,
-    update: Mutex<Option<Update>>,
     /// The last launch generation allocated per worker group and rank.
     generations: Mutex<BTreeMap<(String, u64), u64>>,
-    /// The daemon's command channel to its main processes (`supervision::
-    /// ProcessCommands`), which the generation layer commands through.
-    commands: Mutex<Option<crate::supervision::ProcessCommands>>,
-    /// The generation update in flight: its probation's record (§7.3).
-    package: Mutex<Option<GenerationUpdate>>,
-    /// The epoch the frontend was last told to serve (§7.4): a daemon that holds its frontend in
-    /// this process follows it by moving its hold onto the target's engine.
+    /// The epoch requests were last moved to: the request path of this daemon follows it by
+    /// moving its hold onto that epoch's engine.
     served: tokio::sync::watch::Sender<u64>,
 }
 
@@ -425,12 +272,12 @@ impl Epochs {
         Self::default()
     }
 
-    /// States that the frontend serves `epoch` from now on (§7.4).
+    /// States that `epoch` serves requests from now on.
     pub fn announce_serve(&self, epoch: u64) {
         self.served.send_replace(epoch);
     }
 
-    /// The epoch the frontend was last told to serve, as it changes.
+    /// The epoch that was last stated to serve, as it changes.
     pub fn served(&self) -> tokio::sync::watch::Receiver<u64> {
         self.served.subscribe()
     }
@@ -480,73 +327,36 @@ impl Epochs {
         next
     }
 
-    /// Records `update` as the deployment's update: the one in flight, or
-    /// the last one that ended.
-    pub fn set_update(&self, update: Update) {
-        *locked(&self.update) = Some(update);
-    }
-
-    /// The deployment's update: the one in flight, or the last one that
-    /// ended.
-    pub fn update(&self) -> Option<Update> {
-        locked(&self.update).clone()
-    }
-
-    /// Why `target` may not be applied without `force` (§7.2, §7.3 step 4):
-    /// the last update reverted from the same modules and the same build
-    /// after a failure.
-    ///
-    /// The comparison is the modules', revisions included, because those
-    /// are what a reverted generation update was: applying the same
-    /// configuration again selects the same revisions, so the refusal is
-    /// about the change and not about how it was asked for. The build is what
-    /// a reverted epoch update was, whose modules most often did not change,
-    /// so another build is another change.
-    pub fn unavailable(&self, target: &Epoch) -> Option<Failure> {
-        let update = locked(&self.update);
-        let update = update.as_ref()?;
-        let failure = update.unavailable()?;
-        (update.target.modules == target.modules
-            && update.target.engine.build_hash() == target.engine.build_hash())
-        .then(|| failure.clone())
-    }
-
-    /// Records that epoch `epoch` now executes `modules`, keeping what it
-    /// executed before as the probation's previous generation (§7.3 steps
-    /// 2-4). The record's status stays what it was: the modules are in the
-    /// main process, the probation is the update's.
-    pub fn precopied(&self, epoch: u64, modules: ModuleSet) {
+    /// Records that epoch `epoch` switched to `modules` on trial, keeping
+    /// what it executed before as the previous generation.
+    pub fn switched(&self, epoch: u64, modules: ModuleSet) {
         let mut records = locked(&self.records);
         let Some(record) = records.get_mut(&epoch) else {
-            // The modules are already in the main process, so an epoch with no
-            // record serves them under a record that says nothing about them: the
-            // probation would read as a serving epoch that kept no previous
-            // generation, which is the same sentence an actual revert fault makes.
+            // The modules already execute, so an epoch with no record serves
+            // them under a record that says nothing about them.
             tracing::error!(
                 epoch,
-                "a pre copy finished for an epoch with no record: the modules serve and the \
-                 record does not name the generation they replaced"
+                "a switch finished for an epoch with no record: the modules serve and no record \
+                 names the generation they replaced"
             );
             return;
         };
         record.previous_kernels = std::mem::replace(&mut record.kernels, modules.kernels);
         record.previous_policy = Some(std::mem::replace(&mut record.policy, modules.policy));
-        // The new modules serve while the previous generation is kept as
-        // the last resort (§7.3 step 4).
         if record.status == Status::Serving {
-            record.status = Status::Probation;
+            record.status = Status::Trial;
         }
     }
 
     /// Records that epoch `epoch`'s new modules are what serves and the
-    /// previous generation is no longer kept (§7.3 step 5).
+    /// previous generation is no longer kept.
     pub fn committed(&self, epoch: u64) {
         let mut records = locked(&self.records);
         let Some(record) = records.get_mut(&epoch) else {
             tracing::error!(
                 epoch,
-                "a commit finished for an epoch with no record: the generation it replaced is \
-                 still the record's, and nothing says it was dropped"
+                "a commit finished for an epoch with no record: nothing says the generation it \
+                 replaced was dropped"
             );
             return;
         };
@@ -555,47 +365,39 @@ impl Epochs {
         record.status = Status::Serving;
     }
 
-    /// Ends a probation by putting the previous generation back: what the
-    /// epoch executed before the update is what it executes again (§7.3
-    /// step 5), and the generation the update prepared is dropped with it.
-    pub fn reverted(&self, epoch: u64) {
+    /// Ends a generation's trial by putting the previous generation back:
+    /// what the epoch executed before the update is what it executes again.
+    pub fn rolled_back(&self, epoch: u64) {
         let mut records = locked(&self.records);
         let Some(record) = records.get_mut(&epoch) else {
             tracing::error!(
                 epoch,
-                "a revert finished for an epoch with no record: the generation it went back from \
-                 is not named anywhere"
+                "a rollback finished for an epoch with no record: the generation it went back \
+                 from is named nowhere"
             );
             return;
         };
-        if record.previous_kernels.is_empty() && record.previous_policy.is_none() {
-            // A revert with nothing kept is the state this record's reader reports
-            // as "the epoch on probation kept no previous kernel packages to
-            // revert to"; it is the daemon's own inconsistency, never a no-op.
-            tracing::error!(
-                epoch,
-                "a revert found no previous generation kept: the epoch serves what it served, \
-                 and the record cannot say what the update had prepared"
-            );
-        }
         if !record.previous_kernels.is_empty() || record.previous_policy.is_some() {
             record.kernels = std::mem::take(&mut record.previous_kernels);
             record.policy = record
                 .previous_policy
                 .take()
                 .unwrap_or_else(|| record.policy.clone());
+        } else {
+            // The daemon's own inconsistency, never a no-op: the epoch serves
+            // what it served, and the record cannot say what was dropped.
+            tracing::error!(epoch, "a rollback found no previous generation kept");
         }
         record.status = Status::Serving;
     }
 
-    /// Records epoch `epoch` as serving the `deployment` this node installed
-    /// at startup: its build config and modules and the generation its main
-    /// processes numbered (§7.4). The epoch is recorded under the number its launch gave it,
-    /// as a switch's target and an adopted epoch are numbered. The daemon
-    /// records nothing it did not install, so this is called with what the
-    /// main processes answered, not with what the configuration asked for.
+    /// Records epoch `epoch` as serving the `deployment` this node started:
+    /// its build configuration, the module set its launch files stated and
+    /// the generation its engines numbered for it. The epoch is recorded
+    /// under the number its launch gave it, as an update's target and an
+    /// adopted epoch are.
     ///
-    /// Answers the epoch's number.
+    /// Returns the epoch's number.
     pub fn install(&self, epoch: u64, deployment: &Epoch, generations: &[u64]) -> u64 {
         self.record(
             epoch,
@@ -613,348 +415,6 @@ impl Epochs {
         epoch
     }
 
-    /// Gives the epochs the daemon's command channel to its main processes,
-    /// once, when the daemon starts (§2.3): the generation layer commands
-    /// through it and reads its reports.
-    pub fn supervise(&self, commands: crate::supervision::ProcessCommands) {
-        *locked(&self.commands) = Some(commands);
-    }
-
-    /// Hands the serving epoch's modules to a main process that joined it
-    /// after the epoch was installed — the process a relaunch starts — and
-    /// switches it to them (§2.5, §7.5).
-    ///
-    /// A main process starts with no modules: it resolves no kernel itself,
-    /// and its first request fails every operator it was never given. The
-    /// first start installs them through the same switch (`Leader::install_modules`);
-    /// a relaunched process has to be given the very modules its predecessor
-    /// ran, because the epoch they belong to is already serving and nothing
-    /// else sends them.
-    ///
-    /// # Errors
-    ///
-    /// Fails when no epoch serves, when the daemon has no channel to its main
-    /// processes, and when a process refuses the modules or does not answer.
-    pub fn hand_to(
-        &self,
-        processes: Vec<crate::engine::control::EpochProcess>,
-        config: &crate::options::ServerArgs,
-    ) -> Result<(), Failure> {
-        let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
-            kind: "no_command_channel".to_owned(),
-            reason: "the daemon has no channel to its main processes".to_owned(),
-            device: None,
-        })?;
-        let (_, record) = self.serving().ok_or_else(|| Failure {
-            kind: "no_epoch".to_owned(),
-            reason: "the daemon executes no epoch".to_owned(),
-            device: None,
-        })?;
-        let modules = ModuleSet {
-            engine: record.engine.clone(),
-            kernels: record.kernels.clone(),
-            policy: record.policy.clone(),
-        };
-        self.hand_modules(processes, config, &modules, commands)
-    }
-
-    /// Gives an epoch switch's target `modules`, as [`Self::hand_to`] gives a joining process the
-    /// serving epoch's: the target parks before any `Precopy` names a generation, and a promotion
-    /// refuses a process that holds none.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the daemon has no channel to its main processes, and when the process refuses
-    /// the modules or does not answer.
-    pub fn hand_target(
-        &self,
-        host: &str,
-        engine: u64,
-        config: &crate::options::ServerArgs,
-        modules: &ModuleSet,
-    ) -> Result<(), Failure> {
-        let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
-            kind: "no_command_channel".to_owned(),
-            reason: "the daemon has no channel to its main processes".to_owned(),
-            device: None,
-        })?;
-        let process = crate::engine::control::EpochProcess {
-            host: host.to_owned(),
-            engine,
-        };
-        self.hand_modules(vec![process], config, modules, commands)
-    }
-
-    /// Switches `processes`, every main process of one engine, to `modules` together: the ranks
-    /// of a worker group that spans hosts warm up their collectives together.
-    fn hand_modules(
-        &self,
-        processes: Vec<crate::engine::control::EpochProcess>,
-        config: &crate::options::ServerArgs,
-        modules: &ModuleSet,
-        commands: crate::supervision::ProcessCommands,
-    ) -> Result<(), Failure> {
-        let record = modules.clone();
-        let deployment =
-            Epoch::with_modules(config.clone(), modules.clone()).map_err(|error| Failure {
-                kind: "invalid_config".to_owned(),
-                reason: format!("{error:#}"),
-                device: None,
-            })?;
-        let engines: Vec<u64> = processes.iter().map(|process| process.engine).collect();
-        let mut switch = crate::engine::control::GenerationSwitch::new(
-            &commands,
-            processes,
-            Update::new(0, deployment),
-        );
-        switch.precopy(&record.kernels, &record.policy)?;
-        switch.switchover()?;
-        switch.commit()?;
-        tracing::info!(
-            engines = ?engines,
-            kernels = record.kernels.len(),
-            policy = %record.policy.backend,
-            "the joining main process took the epoch's modules"
-        );
-        Ok(())
-    }
-
-    /// The generation update in flight, if there is one.
-    pub fn generation_update(&self) -> Option<GenerationUpdate> {
-        locked(&self.package).clone()
-    }
-
-    /// Whether a generation update is on probation: the main processes
-    /// execute its generation, and the epoch keeps the generation that served
-    /// before it as the last resort until it is committed or reverted (§7.3
-    /// step 4).
-    pub fn generation_in_flight(&self) -> bool {
-        self.generation_update()
-            .is_some_and(|package| package.update.state == UpdateState::Probation)
-    }
-
-    /// Applies `update`, a generation change a routing decision prepared,
-    /// to the main processes `processes`: their modules are prepared
-    /// (`Precopy`), they switch to the generation each numbered, and the
-    /// epoch's record takes the new modules as the probation's (§7.3 steps
-    /// 2-4). The probation lasts until [`Self::commit_generation`] or
-    /// [`Self::revert_generation`].
-    ///
-    /// Refuses an update a revert marked unavailable unless `force` asks for
-    /// it anyway (§7.2).
-    ///
-    /// # Errors
-    ///
-    /// Fails with the first failure and leaves what serves untouched: a
-    /// refused precopy changes nothing, and a fault, a stalled job,
-    /// non-finite logits or a policy revert fails the update with its own
-    /// account.
-    pub fn apply_generation(
-        &self,
-        update: Update,
-        processes: Vec<crate::engine::control::EpochProcess>,
-        force: bool,
-    ) -> Result<(), Failure> {
-        // §7.2: one update is one operation with one probation, committed or
-        // reverted as a whole. A second change applied now would replace the
-        // epoch's last resort with the generation the first update has not
-        // proven yet, so it waits for the commit or the revert.
-        if self.generation_in_flight() {
-            return Err(Failure {
-                kind: "in_flight".to_owned(),
-                reason: "a generation update is on probation: it is committed or reverted \
-                         before another change is applied"
-                    .to_owned(),
-                device: None,
-            });
-        }
-        let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
-            kind: "no_command_channel".to_owned(),
-            reason: "the daemon has no channel to its main processes".to_owned(),
-            device: None,
-        })?;
-        let (epoch, _) = self.serving().ok_or_else(|| Failure {
-            kind: "no_epoch".to_owned(),
-            reason: "the daemon executes no epoch".to_owned(),
-            device: None,
-        })?;
-        // §7.2: an update that a revert marked unavailable is refused until
-        // it is applied with `force`, whatever it says about itself.
-        if !force && let Some(failure) = self.unavailable(&update.target) {
-            return Err(Failure {
-                kind: "unavailable".to_owned(),
-                reason: format!(
-                    "this update was reverted and is unavailable after a {} failure: {}",
-                    failure.kind, failure.reason
-                ),
-                device: failure.device,
-            });
-        }
-        let modules = update.target.modules.clone();
-        let mut switch =
-            crate::engine::control::GenerationSwitch::new(&commands, processes, update.clone());
-        switch.precopy(&modules.kernels, &modules.policy)?;
-        switch.switchover()?;
-        // The generation the main processes execute is the epoch's now; the
-        // probation keeps what it executed before as its last resort.
-        self.precopied(epoch, modules);
-        let prepared = switch
-            .processes()
-            .iter()
-            .zip(switch.generations().iter().copied())
-            .map(|(process, generation)| PreparedProcess {
-                host: process.host.clone(),
-                engine: process.engine,
-                generation,
-            })
-            .collect();
-        let mut update = switch.update().clone();
-        update.state = UpdateState::Probation;
-        *locked(&self.package) = Some(GenerationUpdate {
-            update: update.clone(),
-            epoch,
-            prepared,
-        });
-        *locked(&self.update) = Some(update);
-        Ok(())
-    }
-
-    /// Ends the generation probation in favour of the generation that
-    /// executes: every main process commits it and purges what it no longer
-    /// runs (§7.3 steps 5-6), and the epoch's record keeps no previous
-    /// generation.
-    ///
-    /// Answers `Ok(false)` when the update in flight is not a generation
-    /// one, so a caller that also has epoch-layer updates asks and falls
-    /// through.
-    ///
-    /// # Errors
-    ///
-    /// Fails with the first failure of the commit, leaving the probation
-    /// standing for [`Self::revert_generation`].
-    pub fn commit_generation(&self) -> anyhow::Result<bool> {
-        let Some(package) = self.generation_update() else {
-            return Ok(false);
-        };
-        let commands = locked(&self.commands)
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("the daemon has no channel to its main processes"))?;
-        let processes: Vec<_> = package
-            .prepared
-            .iter()
-            .map(|prepared| crate::engine::control::EpochProcess {
-                host: prepared.host.clone(),
-                engine: prepared.engine,
-            })
-            .collect();
-        let generations: Vec<u64> = package
-            .prepared
-            .iter()
-            .map(|prepared| prepared.generation)
-            .collect();
-        let mut switch = crate::engine::control::GenerationSwitch::resuming(
-            &commands,
-            processes,
-            package.update.clone(),
-            generations,
-        );
-        if let Err(failure) = switch.commit().and_then(|()| switch.purge()) {
-            anyhow::bail!("committing the generation update: {}", failure.reason);
-        }
-        // The epoch keeps serving: what the commit purges is the previous
-        // *generation* of modules in every main process, not the epoch.
-        self.committed(package.epoch);
-        *locked(&self.update) = Some(switch.update().clone());
-        *locked(&self.package) = None;
-        Ok(true)
-    }
-
-    /// Returns every main process to the generation it served before the
-    /// generation update, with `reason` (§7.3 step 5), so the update is
-    /// unavailable with its first failure until it is applied with `force`
-    /// (§7.2).
-    ///
-    /// Answers `Ok(false)` when the update in flight is not a generation
-    /// one.
-    ///
-    /// # Errors
-    ///
-    /// Fails when a main process does not answer the revert. The epochs'
-    /// records are the previous generation's either way.
-    pub fn revert_generation(&self, reason: &str) -> anyhow::Result<bool> {
-        self.revert_generation_because(reason, None)
-    }
-
-    /// Reverts the generation update on probation because a main process
-    /// failed, and records that failure as the update's first one (§7.3
-    /// step 4): a main process that exits, a worker it can no longer use, a
-    /// stuck job, a non-finite logit or a policy error all end the probation in
-    /// favour of the generation that served before it, and the update stays
-    /// unavailable with this failure until it is applied with `force` (§7.2).
-    ///
-    /// Answers whether an update was on probation to revert. A process that
-    /// cannot be told is logged, not returned: what serves is the previous
-    /// generation either way, and the report moves nothing.
-    pub fn generation_failure(&self, failure: Failure) -> bool {
-        if !self.generation_in_flight() {
-            return false;
-        }
-        let reason = format!("{}: {}", failure.kind, failure.reason);
-        if let Err(error) = self.revert_generation_because(&reason, Some(failure)) {
-            tracing::warn!(%error, "reverting the generation update after a failure");
-        }
-        true
-    }
-
-    /// [`Self::revert_generation`], with the failure that caused an automatic
-    /// revert recorded as the update's first one when the processes did not
-    /// produce one themselves.
-    fn revert_generation_because(
-        &self,
-        reason: &str,
-        cause: Option<Failure>,
-    ) -> anyhow::Result<bool> {
-        let Some(package) = self.generation_update() else {
-            return Ok(false);
-        };
-        let commands = locked(&self.commands)
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("the daemon has no channel to its main processes"))?;
-        let processes: Vec<_> = package
-            .prepared
-            .iter()
-            .map(|prepared| crate::engine::control::EpochProcess {
-                host: prepared.host.clone(),
-                engine: prepared.engine,
-            })
-            .collect();
-        let generations: Vec<u64> = package
-            .prepared
-            .iter()
-            .map(|prepared| prepared.generation)
-            .collect();
-        let mut switch = crate::engine::control::GenerationSwitch::resuming(
-            &commands,
-            processes,
-            package.update.clone(),
-            generations,
-        );
-        let outcome = switch.revert(reason);
-        self.reverted(package.epoch);
-        let mut update = switch.update().clone();
-        // The failure that made the revert automatic is the update's first one
-        // unless a process reported one of its own while it was being told.
-        if let Some(cause) = cause {
-            update.fail(cause);
-        }
-        *locked(&self.update) = Some(update);
-        *locked(&self.package) = None;
-        if let Err(failure) = outcome {
-            anyhow::bail!("reverting the generation update: {}", failure.reason);
-        }
-        Ok(true)
-    }
-
     /// Epoch `epoch`'s record, if the daemon keeps one.
     pub fn get(&self, epoch: u64) -> Option<EpochRecord> {
         locked(&self.records).get(&epoch).cloned()
@@ -966,12 +426,12 @@ impl Epochs {
     }
 
     /// The epoch that serves requests: the highest numbered one that is
-    /// serving or on probation.
+    /// serving or on trial.
     pub fn serving(&self) -> Option<(u64, EpochRecord)> {
         locked(&self.records)
             .iter()
             .rev()
-            .find(|(_, record)| matches!(record.status, Status::Serving | Status::Probation))
+            .find(|(_, record)| matches!(record.status, Status::Serving | Status::Trial))
             .map(|(epoch, record)| (*epoch, record.clone()))
     }
 
@@ -1055,12 +515,7 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
         "previous_kernels": previous,
         "previous_policy": record.previous_policy.as_ref().map(package_report),
         "generation": record.generation,
-        "status": match record.status {
-            Status::Precopy => "precopy",
-            Status::Serving => "serving",
-            Status::Probation => "probation",
-            Status::Purged => "purged",
-        },
+        "status": record.status.name(),
     })
 }
 
@@ -1308,19 +763,19 @@ fn word<T: Serialize>(value: &T) -> String {
     }
 }
 
-/// What a configuration change moves (§7.2).
+/// What a configuration change moves, and so the least it needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Layer {
-    /// Nothing changed: the update does nothing.
+pub enum Change {
+    /// Nothing an engine executes changed.
     None,
-    /// Only the filled modules changed: they move inside the serving main
-    /// process (§7.3).
+    /// Only kernel or policy modules changed: the serving engines take them
+    /// as a generation.
     Generation,
-    /// The build config changed: a new epoch is built (§7.4).
+    /// The build configuration or the engine package changed: a new epoch
+    /// starts beside the serving one.
     Epoch,
-    /// The daemon's or the frontend's own options changed, or their
-    /// executables: the process is handed over to a successor (§7.5), whose
-    /// own routing applies what else the change states.
+    /// The daemon's own options changed: the daemon is handed over to a
+    /// successor, whose own routing applies what else the change states.
     Host,
 }
 
@@ -1366,34 +821,32 @@ impl Epoch {
     }
 }
 
-/// Which layer `next` moves `previous` on (§7.2), mechanically: the
-/// host layer when the options the daemon or the frontend read alone
-/// differ, the epoch layer when the build config differs, the generation layer
-/// when only the filled modules differ, and nothing otherwise. Nothing
-/// about a change is declared by the change itself.
-pub fn layer(previous: &Epoch, next: &Epoch) -> Layer {
-    if host_layer_differ(&previous.config, &next.config) {
-        Layer::Host
+/// What `next` changes of `previous`, mechanically: the daemon's own options
+/// first, then the build configuration or the engine package, then the
+/// kernel and policy modules. Nothing about a change is declared by the
+/// change itself.
+pub fn change(previous: &Epoch, next: &Epoch) -> Change {
+    if host_options_differ(&previous.config, &next.config) {
+        Change::Host
     } else if previous.engine.build_hash() != next.engine.build_hash()
         || previous.modules.engine != next.modules.engine
     {
         // Another engine package, or another revision of it, is another
-        // executable: its main processes are started beside the serving ones.
-        Layer::Epoch
+        // executable: its engines are started beside the serving ones.
+        Change::Epoch
     } else if previous.modules != next.modules {
-        Layer::Generation
+        Change::Generation
     } else {
-        Layer::None
+        Change::None
     }
 }
 
-/// Whether `current` and `target` differ in the options assigned to the host
-/// layer (§7.7): the ones the frontend reads alone (its HTTP server, the
-/// request and output processing, the media and video jobs, migration and
-/// the model's processor options) and the ones the daemon reads alone
-/// (logging, the update's own policy and the admin API's address). A change
-/// of them is a hot restart of the process that reads them (§7.5).
-pub fn host_layer_differ(current: &ServerArgs, target: &ServerArgs) -> bool {
+/// Whether `current` and `target` differ in the options the daemon reads
+/// alone: its HTTP server, the request and output processing, the media and
+/// video jobs, migration, the model's processor options, logging, the
+/// update's own options and the admin listeners. A change of them is a hot
+/// restart of the daemon.
+pub fn host_options_differ(current: &ServerArgs, target: &ServerArgs) -> bool {
     crate::options::daemon_options_differ(current, target)
         || current.update_config != target.update_config
 }
@@ -1403,7 +856,6 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroUsize};
 
     use super::*;
-    use crate::engine::stand_in::Seen;
     use crate::options::SchedulerConfig;
 
     /// A package of backend `backend` at revision 1 with no parameters.
@@ -1430,70 +882,6 @@ mod tests {
         }
     }
 
-    /// A main process that joins the serving epoch after it was installed — the
-    /// process a relaunch starts — is handed the epoch's own modules and
-    /// switched to them. A process that starts with none waits for a
-    /// generation command nothing sends, and answers 503 to every request,
-    /// so the epoch layer is what gives it them (§2.5, §7.5).
-    #[test]
-    fn a_joining_main_process_takes_the_epochs_own_modules() {
-        use crate::engine::stand_in::{Answer, Seen, main_processes_recording};
-
-        let (commands, seen, carried) = main_processes_recording(vec![(9, Answer::Serves(12))]);
-        let epochs = Epochs::new();
-        let config = ServerArgs::default();
-        epochs.record(0, record());
-        epochs.supervise(commands);
-
-        epochs
-            .hand_to(
-                vec![crate::engine::control::EpochProcess {
-                    host: "node-0".to_owned(),
-                    engine: 9,
-                }],
-                &config,
-            )
-            .expect("the epoch's modules reached the joining process");
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![
-                (9, Seen::Precopy),
-                (9, Seen::Switchover(12)),
-                (9, Seen::Commit)
-            ],
-            "the joining process prepares, switches to and commits the epoch's modules"
-        );
-        let carried = carried.lock().unwrap();
-        assert_eq!(carried.len(), 1);
-        assert_eq!(
-            carried[0].1.kernels, 1,
-            "the very operator the epoch's record names, not an empty set"
-        );
-        assert_eq!(
-            carried[0].1.revisions,
-            vec![("rms_norm".to_owned(), 1)],
-            "the revision the epoch installed, not the zero a package carries before a \
-             Build Server selects one: a name at revision zero is one the store never built"
-        );
-        assert_eq!(carried[0].1.policy, "fcfs");
-
-        // A daemon that executes no epoch has nothing to hand over, and says so
-        // rather than leaving the process waiting.
-        let (commands, _seen, _carried) = main_processes_recording(vec![(9, Answer::Serves(12))]);
-        let empty = Epochs::new();
-        empty.supervise(commands);
-        let failure = empty
-            .hand_to(
-                vec![crate::engine::control::EpochProcess {
-                    host: "node-0".to_owned(),
-                    engine: 9,
-                }],
-                &config,
-            )
-            .expect_err("a daemon with no epoch hands nothing over");
-        assert_eq!(failure.kind, "no_epoch");
-    }
-
     /// Another checkpoint's weights are other keys, so only a new epoch reads them: a change of
     /// the model's files that fell to the generation layer would answer an update that moved nothing.
     #[test]
@@ -1504,374 +892,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            layer(
+            change(
                 &serving,
                 &Epoch::of(other).expect("the configuration resolves")
             ),
-            Layer::Epoch
+            Change::Epoch
         );
-    }
-
-    /// A generation update in flight is the epoch's probation: the record
-    /// names the modules the main processes took, the previous generation is
-    /// kept, and a commit ends the probation without the epoch stopping
-    /// (§7.3 steps 4-6).
-    #[test]
-    fn a_package_update_serves_from_the_generation_it_switched_to_until_it_is_committed() {
-        use crate::engine::stand_in::{Answer, Seen, main_processes, process};
-
-        let (commands, seen) =
-            main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
-        let epochs = Epochs::new();
-        let config = ServerArgs::default();
-        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
-        epochs.install(3, &serving, &[10]);
-        epochs.supervise(commands);
-
-        // A change that moves only the modules: one operator's backend.
-        let mut target = serving.clone();
-        let mut modules = crate::epoch::modules_of(&config);
-        modules
-            .policy
-            .arguments
-            .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        target.modules = modules.clone();
-        let update = Update::new(1, target);
-        epochs
-            .apply_generation(
-                update,
-                vec![process("rank-0", 7), process("rank-1", 8)],
-                false,
-            )
-            .expect("both main processes took the modules");
-
-        // The epoch is on probation from the generation the update switched
-        // to, and the record names what executes.
-        let package = epochs.generation_update().expect("the update is in flight");
-        assert_eq!(package.update.number, 1);
-        assert_eq!(package.update.state, UpdateState::Probation);
-        assert_eq!(package.epoch, 3);
-        let prepared: Vec<u64> = package.prepared.iter().map(|p| p.generation).collect();
-        assert_eq!(prepared, vec![11, 12]);
-        let serving_epoch = epochs.get(3).expect("the epoch is recorded");
-        assert_eq!(serving_epoch.status, Status::Probation);
-        assert_eq!(serving_epoch.policy, modules.policy);
-        assert!(serving_epoch.previous_policy.is_some());
-
-        assert!(
-            epochs
-                .commit_generation()
-                .expect("both main processes committed"),
-            "a generation update is committed here"
-        );
-        let serving_epoch = epochs.get(3).expect("the epoch is recorded");
-        assert_eq!(serving_epoch.status, Status::Serving);
-        assert!(serving_epoch.previous_policy.is_none());
-        assert!(
-            serving_epoch.previous_kernels.is_empty(),
-            "a commit keeps no previous generation"
-        );
-        assert!(epochs.generation_update().is_none());
-
-        // Each process was commanded in the protocol's order, and the
-        // generation each switched to is the one it numbered itself.
-        let seen = seen.lock().unwrap().clone();
-        assert_eq!(
-            seen,
-            vec![
-                (7, Seen::Precopy),
-                (8, Seen::Precopy),
-                (7, Seen::Switchover(11)),
-                (8, Seen::Switchover(12)),
-                (7, Seen::Commit),
-                (8, Seen::Commit),
-                (7, Seen::Purge(11)),
-                (8, Seen::Purge(12)),
-            ]
-        );
-    }
-
-    /// A main process that fails during the probation ends it in favour of the
-    /// generation that served before, and the update stays unavailable with the
-    /// failure that caused it until it is applied with `force` (§7.2, §7.3
-    /// step 4).
-    #[test]
-    fn a_main_process_failure_during_probation_reverts_the_package_update() {
-        use crate::engine::stand_in::{Answer, Seen, main_processes, process};
-
-        let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
-        let epochs = Epochs::new();
-        let config = ServerArgs::default();
-        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
-        epochs.install(3, &serving, &[10]);
-        epochs.supervise(commands);
-
-        let mut target = serving.clone();
-        let mut modules = crate::epoch::modules_of(&config);
-        modules
-            .policy
-            .arguments
-            .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        target.modules = modules.clone();
-        epochs
-            .apply_generation(
-                Update::new(1, target.clone()),
-                vec![process("rank-0", 7)],
-                false,
-            )
-            .expect("the update switches over");
-        assert!(epochs.generation_in_flight());
-
-        let failure = Failure {
-            kind: "illegal_address".to_owned(),
-            reason: "the worker can no longer run".to_owned(),
-            device: Some(0),
-        };
-        assert!(
-            epochs.generation_failure(failure.clone()),
-            "a failure during probation reverts the update"
-        );
-
-        // The previous generation serves again, nothing is in flight, and the
-        // update is unavailable for the failure that caused the revert.
-        let record = epochs.get(3).expect("the epoch is recorded");
-        assert_eq!(record.status, Status::Serving);
-        assert_eq!(record.policy, serving.modules.policy);
-        assert!(record.previous_policy.is_none());
-        assert!(epochs.generation_update().is_none());
-        assert_eq!(
-            epochs
-                .update()
-                .expect("the update is recorded")
-                .first_failure,
-            Some(failure.clone())
-        );
-        assert_eq!(epochs.unavailable(&target), Some(failure));
-        assert!(
-            !epochs.generation_failure(Failure {
-                kind: "policy_error".to_owned(),
-                reason: "no probation to end".to_owned(),
-                device: None,
-            }),
-            "a failure after the revert moves nothing"
-        );
-
-        let seen = seen.lock().unwrap().clone();
-        assert!(
-            matches!(seen.last(), Some((7, Seen::Revert(_)))),
-            "the main process was told to revert: {seen:?}"
-        );
-    }
-
-    /// One update is one operation with one probation (§7.2): a second
-    /// generation change waits for the first to be committed or reverted,
-    /// so the epoch's last resort stays the generation that served before the
-    /// first began (§7.3 steps 4 and 5).
-    #[test]
-    fn a_second_package_update_waits_for_the_first_ones_probation() {
-        use crate::engine::stand_in::{Answer, main_processes, process};
-
-        let (commands, _seen) = main_processes(vec![(7, Answer::Serves(11))]);
-        let epochs = Epochs::new();
-        let config = ServerArgs::default();
-        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
-        epochs.install(3, &serving, &[10]);
-        epochs.supervise(commands);
-
-        let mut first = serving.clone();
-        let mut modules = crate::epoch::modules_of(&config);
-        modules
-            .policy
-            .arguments
-            .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        first.modules = modules;
-        epochs
-            .apply_generation(Update::new(1, first), vec![process("rank-0", 7)], false)
-            .expect("the first update switches over");
-        let last_resort = epochs
-            .get(3)
-            .expect("the epoch is recorded")
-            .previous_policy
-            .clone();
-        assert!(
-            last_resort.is_some(),
-            "the first update keeps the policy it replaced"
-        );
-
-        let mut second = serving.clone();
-        let mut modules = crate::epoch::modules_of(&config);
-        modules
-            .policy
-            .arguments
-            .insert("max_batch".to_owned(), toml::Value::Integer(4));
-        second.modules = modules;
-        let failure = epochs
-            .apply_generation(Update::new(2, second), vec![process("rank-0", 7)], false)
-            .expect_err("an update on probation is not replaced");
-        assert_eq!(failure.kind, "in_flight");
-
-        // Nothing moved: the first update is still the one in flight, and the
-        // last resort is still the generation that served before it.
-        assert_eq!(
-            epochs
-                .generation_update()
-                .expect("the first update is in flight")
-                .update
-                .number,
-            1
-        );
-        assert_eq!(
-            epochs
-                .get(3)
-                .expect("the epoch is recorded")
-                .previous_policy,
-            last_resort
-        );
-    }
-
-    /// A revert puts the previous generation back in every main process and
-    /// in the epoch's record, and the update stays unavailable with its first
-    /// failure until it is applied with `force` (§7.2, §7.3 step 5).
-    #[test]
-    fn a_reverted_package_update_leaves_the_previous_modules_serving() {
-        use crate::engine::stand_in::{Answer, main_processes, process};
-
-        let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
-        let epochs = Epochs::new();
-        let config = ServerArgs::default();
-        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
-        epochs.install(3, &serving, &[10]);
-        epochs.supervise(commands);
-
-        let mut target = serving.clone();
-        let mut modules = crate::epoch::modules_of(&config);
-        modules
-            .policy
-            .arguments
-            .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        target.modules = modules;
-        epochs
-            .apply_generation(Update::new(2, target), vec![process("rank-0", 7)], false)
-            .expect("the main process took the modules");
-        assert!(
-            epochs
-                .revert_generation("a trial refused it")
-                .expect("the revert was answered")
-        );
-
-        let serving_epoch = epochs.get(3).expect("the epoch is recorded");
-        assert_eq!(serving_epoch.status, Status::Serving);
-        assert_eq!(
-            serving_epoch.policy, serving.modules.policy,
-            "the previous modules serve again"
-        );
-        let reverted = seen.lock().unwrap().clone();
-        assert!(
-            reverted.iter().any(|(engine, what)| *engine == 7
-                && *what == Seen::Revert("a trial refused it".to_owned())),
-            "{reverted:?}"
-        );
-        let update = epochs.update().expect("the update is recorded");
-        assert_eq!(update.state, UpdateState::Reverted);
-    }
-
-    /// An update a revert marked unavailable is refused until it is applied
-    /// with `force`, which is the whole of §7.2's refusal: the same target,
-    /// applied again, is not taken twice by accident.
-    #[test]
-    fn a_reverted_update_is_refused_until_it_is_forced() {
-        use crate::engine::stand_in::{Answer, main_processes, process};
-
-        let (commands, _) = main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
-        let epochs = Epochs::new();
-        let config = ServerArgs::default();
-        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
-        epochs.install(3, &serving, &[10]);
-        epochs.supervise(commands);
-
-        let mut target = serving.clone();
-        let mut modules = crate::epoch::modules_of(&config);
-        modules
-            .policy
-            .arguments
-            .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        target.modules = modules;
-
-        let processes = || vec![process("rank-0", 7), process("rank-1", 8)];
-        epochs
-            .apply_generation(Update::new(1, target.clone()), processes(), false)
-            .expect("the first application is taken");
-        // The revert a failure causes, which is the one §7.2 makes the update
-        // unavailable with (§7.3 step 4): the failure is recorded as the
-        // update's first one, and the reason the refusal quotes is its
-        // account.
-        assert!(
-            epochs.generation_failure(Failure {
-                kind: "policy_reverted".to_owned(),
-                reason: "the policy refused a decision".to_owned(),
-                device: None,
-            }),
-            "the update on probation is reverted"
-        );
-
-        let refused = epochs
-            .apply_generation(Update::new(1, target.clone()), processes(), false)
-            .expect_err("a reverted update is unavailable");
-        assert_eq!(refused.kind, "unavailable");
-        assert!(
-            refused.reason.contains("the policy refused a decision"),
-            "{}",
-            refused.reason
-        );
-        assert!(epochs.generation_update().is_none());
-        let mut another_checkpoint = target.config.clone();
-        another_checkpoint.model = Some("another checkpoint".to_owned());
-        let another_build = Epoch::with_modules(another_checkpoint, target.modules.clone())
-            .expect("the configuration resolves");
-        assert!(
-            epochs.unavailable(&another_build).is_none(),
-            "the same modules on another build are another change"
-        );
-
-        epochs
-            .apply_generation(Update::new(1, target), processes(), true)
-            .expect("force applies it anyway");
-        assert!(epochs.generation_update().is_some());
-    }
-
-    /// A refused precopy changes nothing that serves, and an update in flight
-    /// is what a commit finds: with none, a commit answers that it is not a
-    /// generation update, so a caller falls through to the epoch path.
-    #[test]
-    fn a_refused_precopy_records_no_probation_and_a_commit_falls_through() {
-        use crate::engine::stand_in::{Answer, main_processes, process};
-
-        let (commands, _) = main_processes(vec![(
-            7,
-            Answer::Refuses("the policy module did not build".to_owned()),
-        )]);
-        let epochs = Epochs::new();
-        let config = ServerArgs::default();
-        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
-        epochs.install(3, &serving, &[10]);
-        epochs.supervise(commands);
-        assert!(!epochs.commit_generation().expect("nothing to commit"));
-
-        let mut target = serving.clone();
-        let mut modules = crate::epoch::modules_of(&config);
-        modules
-            .policy
-            .arguments
-            .insert("max_batch".to_owned(), toml::Value::Integer(8));
-        target.modules = modules;
-        let failure = epochs
-            .apply_generation(Update::new(3, target), vec![process("rank-0", 7)], false)
-            .expect_err("a refused precopy fails the update");
-        assert_eq!(failure.kind, "precopy_failed");
-        assert!(epochs.generation_update().is_none());
-        let serving_epoch = epochs.get(3).expect("the epoch is recorded");
-        assert_eq!(serving_epoch.status, Status::Serving);
-        assert_eq!(serving_epoch.policy, serving.modules.policy);
     }
 
     /// The process table reports what the daemon attached: every process it
@@ -2139,29 +1165,29 @@ mod tests {
         ];
 
         let base = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
-        assert_eq!(layer(&base, &base), Layer::None, "no change");
+        assert_eq!(change(&base, &base), Change::None, "no change");
 
-        for (what, change) in host_frontend.iter().chain(host_daemon.iter()) {
-            let next = Epoch::of(set(*change)).expect("the configuration resolves");
+        for (what, edit) in host_frontend.iter().chain(host_daemon.iter()) {
+            let next = Epoch::of(set(*edit)).expect("the configuration resolves");
             assert_eq!(
-                layer(&base, &next),
-                Layer::Host,
-                "{what} reads the host layer"
+                change(&base, &next),
+                Change::Host,
+                "{what} is the daemon's own option"
             );
         }
-        for (what, change) in &epoch {
-            let next = Epoch::of(set(*change)).expect("the configuration resolves");
+        for (what, edit) in &epoch {
+            let next = Epoch::of(set(*edit)).expect("the configuration resolves");
             assert_eq!(
-                layer(&base, &next),
-                Layer::Epoch,
+                change(&base, &next),
+                Change::Epoch,
                 "{what} builds a new epoch"
             );
         }
-        for (what, change) in &package {
-            let next = Epoch::of(set(*change)).expect("the configuration resolves");
+        for (what, edit) in &package {
+            let next = Epoch::of(set(*edit)).expect("the configuration resolves");
             assert_eq!(
-                layer(&base, &next),
-                Layer::Generation,
+                change(&base, &next),
+                Change::Generation,
                 "{what} moves the modules"
             );
         }
@@ -2178,7 +1204,7 @@ mod tests {
             config.flashinfer_config.workspace_size = 1 << 30;
         }))
         .expect("the configuration resolves");
-        assert_eq!(layer(&named_base, &workspace), Layer::Generation);
+        assert_eq!(change(&named_base, &workspace), Change::Generation);
 
         // The exchange is a package only where experts are spread over ranks:
         // a single-rank deployment's MoE block takes its local arm and launches
@@ -2190,11 +1216,11 @@ mod tests {
             config.moe_config.exchange = proto::request::ExpertExchange::DeepEp
         });
         assert_eq!(
-            layer(
+            change(
                 &base,
                 &Epoch::of(exchange_only.clone()).expect("the configuration resolves")
             ),
-            Layer::None,
+            Change::None,
             "at one rank the exchange setting moves nothing"
         );
         let mut spread = ServerArgs::default();
@@ -2202,11 +1228,11 @@ mod tests {
         let mut spread_exchanged = spread.clone();
         spread_exchanged.moe_config.exchange = proto::request::ExpertExchange::DeepEp;
         assert_eq!(
-            layer(
+            change(
                 &Epoch::of(spread).expect("the configuration resolves"),
                 &Epoch::of(spread_exchanged).expect("the configuration resolves")
             ),
-            Layer::Generation,
+            Change::Generation,
             "in an expert-parallel deployment the exchange moves the modules"
         );
 
@@ -2245,8 +1271,8 @@ mod tests {
             package.revision = 3;
         }
         assert_eq!(
-            layer(&named_base, &installed),
-            Layer::Generation,
+            change(&named_base, &installed),
+            Change::Generation,
             "a new revision"
         );
     }
@@ -2424,46 +1450,6 @@ mod tests {
         );
     }
 
-    /// The update keeps the first failure it meets, not the last, and a
-    /// revert marks it unavailable with that first error (§7.3 step 4): the
-    /// daemon reports the reason with the update and refuses it without
-    /// `force` afterwards.
-    #[test]
-    fn an_update_keeps_the_first_failure_and_is_unavailable_with_it() {
-        let mut update = Update::new(
-            1,
-            Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
-        );
-        update.commit();
-        assert_eq!(
-            update.unavailable(),
-            None,
-            "a committed update is available"
-        );
-
-        let mut update = Update::new(
-            2,
-            Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
-        );
-        let first = Failure {
-            kind: "illegal_address".to_owned(),
-            reason: "an illegal memory access was encountered".to_owned(),
-            device: Some(3),
-        };
-        update.fail(first.clone());
-        update.fail(Failure {
-            kind: "stalled".to_owned(),
-            reason: "the forward job of batch 7 ran 400 ms".to_owned(),
-            device: None,
-        });
-        assert_eq!(update.first_failure.as_ref(), Some(&first));
-        assert_eq!(update.unavailable(), None, "the probation has not ended");
-
-        update.revert();
-        assert_eq!(update.state, UpdateState::Reverted);
-        assert_eq!(update.unavailable(), Some(&first));
-    }
-
     /// The reports that fail an update become its failure, with the kind
     /// the main process named; the acknowledgements do not.
     #[test]
@@ -2500,9 +1486,9 @@ mod tests {
         );
 
         // The policy's failure names the instance, the backend and the
-        // revision, and whether no previous module is left (§4.4).
-        let reverted = proto::process::Report {
-            kind: Some(Kind::PolicyReverted(proto::process::PolicyReverted {
+        // revision, and whether no previous module is left.
+        let rolled_back = proto::process::Report {
+            kind: Some(Kind::PolicyRolledBack(proto::process::PolicyRolledBack {
                 scheduler: Some(2),
                 backend: "trtllm".to_owned(),
                 revision: 7,
@@ -2510,8 +1496,8 @@ mod tests {
                 fatal: false,
             })),
         };
-        let failure = Failure::of_report(&reverted).expect("a policy revert fails the update");
-        assert_eq!(failure.kind, "policy_reverted");
+        let failure = Failure::of_report(&rolled_back).expect("a policy rollback fails the update");
+        assert_eq!(failure.kind, "policy_rolled_back");
         assert!(failure.reason.contains("scheduler 2"), "{}", failure.reason);
         assert!(failure.reason.contains("trtllm"), "{}", failure.reason);
         assert!(failure.reason.contains("revision 7"), "{}", failure.reason);
@@ -2521,7 +1507,7 @@ mod tests {
             failure.reason
         );
         let route = proto::process::Report {
-            kind: Some(Kind::PolicyReverted(proto::process::PolicyReverted {
+            kind: Some(Kind::PolicyRolledBack(proto::process::PolicyRolledBack {
                 scheduler: None,
                 backend: "fcfs".to_owned(),
                 revision: 1,
@@ -2529,7 +1515,7 @@ mod tests {
                 fatal: true,
             })),
         };
-        let failure = Failure::of_report(&route).expect("a fatal policy revert fails the update");
+        let failure = Failure::of_report(&route).expect("a fatal policy rollback fails the update");
         assert!(
             failure.reason.contains("the engine's control thread"),
             "{}",
@@ -2543,7 +1529,7 @@ mod tests {
 
         for acknowledged in [
             proto::process::Report {
-                kind: Some(Kind::Precopied(proto::process::Precopied {
+                kind: Some(Kind::Prepared(proto::process::Prepared {
                     generation: 4,
                     uncompared: Vec::new(),
                 })),
@@ -2555,12 +1541,12 @@ mod tests {
                 kind: Some(Kind::Committed(proto::process::Committed {})),
             },
             proto::process::Report {
-                kind: Some(Kind::Purged(proto::process::Purged { generation: 4 })),
+                kind: Some(Kind::RolledBack(proto::process::RolledBack::default())),
             },
-            // A failed precopy drops the new generation and leaves the
-            // serving one alone: it fails no update (§7.3 step 2).
+            // A failed preparation drops the new generation and leaves the
+            // serving one alone: the update is abandoned by its own report.
             proto::process::Report {
-                kind: Some(Kind::PrecopyFailed(proto::process::PrecopyFailed {
+                kind: Some(Kind::PrepareFailed(proto::process::PrepareFailed {
                     reason: "the package has no module for this descriptor".to_owned(),
                 })),
             },
@@ -2571,15 +1557,15 @@ mod tests {
 
     /// Modules are recorded per operator and, where the configuration fills
     /// one per phase, per phase; the epoch that serves is the one of the
-    /// highest number that is serving or on probation.
+    /// highest number that is serving or on trial.
     #[test]
     fn epochs_are_reported_by_operator_phase_and_status() {
         let epochs = Epochs::new();
         let mut first = record();
-        first.status = Status::Probation;
+        first.status = Status::Trial;
         epochs.record(1, first);
         let mut second = record();
-        second.status = Status::Precopy;
+        second.status = Status::Preparing;
         second.kernels.insert(
             KernelKey::phase(operator::PAGED_ATTENTION, PhaseKind::Decode),
             package("trtllm"),
@@ -2589,7 +1575,7 @@ mod tests {
             epochs
                 .serving()
                 .map(|(epoch, record)| (epoch, record.status)),
-            Some((1, Status::Probation))
+            Some((1, Status::Trial))
         );
 
         // The epochs are one array, ascending, each naming its number.
@@ -2602,8 +1588,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(1), Some(2)]
         );
-        assert_eq!(entries[0]["status"], Value::from("probation"));
-        assert_eq!(entries[1]["status"], Value::from("precopy"));
+        assert_eq!(entries[0]["status"], Value::from("trial"));
+        assert_eq!(entries[1]["status"], Value::from("preparing"));
         assert_eq!(entries[1]["kernels"][0]["phase"], Value::from("decode"));
         assert_eq!(
             entries[1]["kernels"][0]["package"]["backend"],
