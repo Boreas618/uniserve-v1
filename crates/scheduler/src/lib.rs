@@ -109,7 +109,7 @@ pub use epoch::{GroupCache, ParkedCache};
 use ipc::ForwardMode;
 pub use policy::{
     Arrival, BatchCapacity, Candidate, Limits, ModuleSource, PREFETCH_FLOOR_TOKENS, Parameters,
-    PolicyBytes, PolicyPackage, PolicyReverted, PolicySlot, PolicySource, PolicyUsage, Progress,
+    PolicyBytes, PolicyPackage, PolicyRolledBack, PolicySlot, PolicySource, PolicyUsage, Progress,
     RouteRefusal, RouteTrial, Router, Stage, TrialState, Validators, arrival_view, ceilings_of,
 };
 pub use proto::config::{
@@ -343,7 +343,7 @@ pub struct Scheduler {
     policy: Option<policy::PolicySlot>,
     /// The report of a policy failure the mechanism did not take from `fail`'s
     /// response, for the control thread.
-    policy_report: Option<policy::PolicyReverted>,
+    policy_report: Option<policy::PolicyRolledBack>,
     /// §7.3 step 2's paired pass: an update asked that the following step's
     /// batches also run in shadow for an epoch generation, and the response waits
     /// for the step that shadows them.
@@ -351,7 +351,7 @@ pub struct Scheduler {
     /// The candidate a precopy is preparing on a blocking thread, while it runs
     /// (§7.3 step 2): loading and instantiating a policy must not hold the
     /// serving thread.
-    policy_precopy:
+    policy_prepare:
         Option<crossbeam_channel::Receiver<Result<policy::Candidate, scheduling::PolicyError>>>,
     /// The candidate a precopy prepared at this boundary, until the switchover
     /// puts it in.

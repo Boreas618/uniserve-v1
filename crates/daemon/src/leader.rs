@@ -31,6 +31,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use crate::updates::update::Phase;
+
 use crate::metrics::{EngineLabels, METRICS};
 use anyhow::Context as _;
 use futures::StreamExt as _;
@@ -56,32 +58,6 @@ use frontend::model::ModelConfig;
 use frontend::output::RequestOutputStream;
 use frontend::protocol::VideoGenerationRequest;
 
-/// How long the epoch's Build Servers may take to select its modules.
-///
-/// A Build Server that selects a package compiles it when it has no module:
-/// a cold store builds every kernel of the epoch, which minutes of compiler
-/// work per kernel makes long. The budget is the engine's own for the precopy
-/// (§7.3), and it is a backstop rather than the signal a reader follows: the
-/// line the install prints before it waits, and the Build Server's own
-/// module progress, say whether the selection is working or stopped.
-const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
-
-/// How often a wait on the epoch's modules says it is still waiting.
-///
-/// The budgets below are longer than a run, on purpose: a cold store's modules
-/// are minutes of compiler work, and an experiment that lasts fifteen minutes
-/// would otherwise end without a single line saying where the daemon was. The
-/// heartbeat turns a wait that outlives the run into a trail of lines that name
-/// the step the daemon is in and how long it has been in it.
-const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How long the main processes may take to take the epoch's modules.
-///
-/// A backstop beyond the engine's own budget for the steps (§7.3: the precopy
-/// waits up to 20 minutes, a switch, commit, revert or purge 2), which fire
-/// first and name the process that did not answer.
-const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 * 60);
-
 /// One model served over its engine process.
 ///
 /// Construction spawns Tokio tasks, so every constructor must be called
@@ -98,10 +74,10 @@ pub struct Leader {
     /// Independent replica epochs behind the public request entry point.
     pub(crate) replicas: Arc<Replicas>,
     images: MediaConnector,
-    /// The epoch layer: the epoch records, the switch in flight and the
-    /// adapter that commands the deployment's main processes (§7.4). It
-    /// shares the records with the admin's `GET /admin/config`.
-    pub(crate) updates: Arc<crate::updates::driver::Driver>,
+    /// The updater: the epoch records, the update in flight and the engine
+    /// processes it commands. It shares the records with the admin's
+    /// `GET /admin/config`.
+    pub(crate) updates: Arc<crate::updates::Updater>,
     /// Whether every request logs a summary line when it ends.
     log_requests: bool,
     /// Periodic throughput logging, stopped with the engine.
@@ -115,9 +91,9 @@ pub(crate) struct Replicas {
     pub(crate) serving: watch::Sender<Vec<Arc<Replica>>>,
     pub(crate) replacing: tokio::sync::Mutex<()>,
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
-    /// The update layer, so a replica that loses its engine asks whether an
-    /// update in flight owns that decision (§7.2, §7.4).
-    pub(crate) updates: std::sync::Weak<crate::updates::driver::Driver>,
+    /// The updater, so a replica that loses its engine asks whether an
+    /// update in flight owns that decision.
+    pub(crate) updates: std::sync::Weak<crate::updates::Updater>,
     /// The new requests that wait for a replica to accept them: while
     /// generation is paused, the engine sleeps, or no engine is ready
     /// (`LeaderStatus::held`).
@@ -159,23 +135,30 @@ pub enum Task {
     VideoGeneration,
 }
 
-/// What a replica needs to follow an epoch switch onto its target (§7.4).
-pub(crate) struct SwitchTarget {
-    /// The arguments the target's process started with.
-    pub(crate) args: proto::config::EngineArgs,
-    /// The configuration the target serves.
-    pub(crate) config: ServerArgs,
-    /// The modules the target takes before it is promoted.
-    pub(crate) modules: crate::epoch::ModuleSet,
-    /// The Build Servers that select those modules' revisions, and the host that leads them.
-    pub(crate) servers: Vec<crate::engine::control::BuildServer>,
-    pub(crate) leader: String,
-    /// The target's launch generation, the number its links state.
-    pub(crate) engine: u64,
-    /// The epoch the target serves.
-    pub(crate) epoch: u64,
-    /// The options that govern this update (`update_config`, with what its own `set` stated).
-    pub(crate) update: crate::options::UpdateConfig,
+/// What a replica does beside an update in flight, by the update's form.
+pub(crate) enum Following {
+    /// The serving engine moves to other kernel or policy modules in place:
+    /// a commit makes `config` and `modules` what a relaunch and a standby
+    /// start from.
+    Generation {
+        config: Box<ServerArgs>,
+        modules: crate::epoch::ModuleSet,
+    },
+    /// A target engine of another epoch serves this replica once the update
+    /// switched.
+    Epoch {
+        /// What starts and joins the replica's engines.
+        control: Arc<EngineControl>,
+        /// The arguments the target serves with, once it is no longer the
+        /// engine that succeeds another.
+        args: Box<proto::config::EngineArgs>,
+        /// The configuration the target serves.
+        config: Box<ServerArgs>,
+        /// The target's launch generation, the number its links state.
+        launch_generation: u64,
+        /// The epoch the target serves.
+        epoch: u64,
+    },
 }
 
 /// Records each scheduler's statistics under `model_name`, and with
@@ -197,12 +180,90 @@ pub(crate) fn stats_sink(
 }
 
 /// How many requests ended since the daemon started, and how many failed.
-pub(crate) fn outcomes() -> (u64, u64) {
-    let outcomes = &metrics::OUTCOMES;
+pub(crate) fn request_counts() -> (u64, u64) {
+    let counts = &metrics::OUTCOMES;
     (
-        outcomes.ended.load(Ordering::Relaxed),
-        outcomes.failed.load(Ordering::Relaxed),
+        counts.ended.load(Ordering::Relaxed),
+        counts.failed.load(Ordering::Relaxed),
     )
+}
+
+/// How long the Build Servers may take to fix and build a module set: a cold
+/// store builds every module the set names.
+const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// How often a wait on the Build Servers says it still waits.
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Fixes the module set `named` states: every interface's revision as the
+/// leader host's Build Server selects it through `cover`
+/// ([`crate::engine::control::with_store_modules`]), then every module built
+/// at every host's Build Server ([`crate::engine::control::prepare_epoch`]),
+/// so an engine started from the set finds each module it resolves.
+///
+/// This is the one place a deployment's packages are selected: when a
+/// configuration is applied, at startup and at every later apply. The set it
+/// returns is part of the epoch's record and of every launch file made from
+/// it.
+///
+/// # Errors
+///
+/// `UpdateError::Refused` when a Build Server holds no package, or not the
+/// revision, the deployment names, or cannot build a module;
+/// `UpdateError::Failed` when no Build Server responds in time.
+pub(crate) async fn fix_modules(
+    servers: Vec<crate::engine::control::BuildServer>,
+    leader: String,
+    named: crate::epoch::ModuleSet,
+) -> Result<crate::epoch::ModuleSet, UpdateError> {
+    // The client's waits have no deadline of their own, so the blocking task
+    // records which one it is in and the deadline here names it.
+    let steps = crate::engine::control::PrepareSteps::new();
+    let recorded = steps.clone();
+    let mut fixing = tokio::task::spawn_blocking(move || {
+        let complete = crate::engine::control::with_store_modules(&servers, &leader, &named)?;
+        crate::engine::control::prepare_epoch(&servers, &leader, &complete, &[], &recorded)
+    });
+    let started = tokio::time::Instant::now();
+    let deadline = started + PREPARE_TIMEOUT;
+    let fixed = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left.min(HEARTBEAT), &mut fixing).await {
+            Ok(joined) => {
+                break joined.map_err(|error| {
+                    UpdateError::Failed(anyhow::anyhow!("fixing the module set: {error}"))
+                })?;
+            }
+            Err(_) if left <= HEARTBEAT => {
+                return Err(UpdateError::Failed(anyhow::anyhow!(
+                    "fixing the module set: no Build Server responded within {} s: the daemon \
+                     was {}",
+                    PREPARE_TIMEOUT.as_secs(),
+                    steps.describe()
+                )));
+            }
+            Err(_) => tracing::info!(
+                waited_s = started.elapsed().as_secs(),
+                step = %steps.describe(),
+                "still fixing the module set at the Build Servers"
+            ),
+        }
+    };
+    fixed.map_err(|error| UpdateError::Refused(format!("fixing the module set: {error:#}")))
+}
+
+/// The modules `config` names for a deployment that serves video or not.
+///
+/// The configuration selects a backend for attention and for the grouped
+/// experts, which are a causal language model's operators. A video deployment
+/// launches neither, so a slot filled for them would fix a package no call
+/// reaches: every operator it runs is selected from the store.
+pub(crate) fn named_modules(config: &ServerArgs, video: bool) -> crate::epoch::ModuleSet {
+    let mut named = crate::epoch::modules_of(config);
+    if video {
+        named.kernels.clear();
+    }
+    named
 }
 
 /// The engine configuration of each data-parallel replica of `config`: independent replicas each
@@ -238,7 +299,7 @@ pub(crate) fn replica_configs(
 /// What a leader prepares before it has an engine (`Leader::prepare`).
 pub(crate) struct Prepared {
     families: processing::Registry,
-    model_config: ModelConfig,
+    pub(crate) model_config: ModelConfig,
     tokenizer: frontend::tokenizer::DynTokenizer,
     renderer: LoadedRenderer,
     /// The deployment's engine configuration, with the facts the model's files determine.
@@ -288,7 +349,7 @@ impl Leader {
         }
     }
 
-    /// Ends every replica's parked standby (§2.5).
+    /// Ends every replica's parked standby.
     ///
     /// A daemon that hands the deployment to a successor calls this before the
     /// handoff: the successor numbers and starts its own standbys, and a parked
@@ -330,15 +391,14 @@ impl Leader {
 
     pub(crate) fn engine_handoff(&self) -> anyhow::Result<Vec<EngineHandoff>> {
         // A handover passes the serving engine, its epoch and the
-        // configuration to the successor, not the update in progress: an
-        // epoch switch's children and phases or a package trial's record do
-        // not cross it, so the handover waits for the update to end
-        // (one update at a time).
-        if let Some(update) = crate::updates::in_flight(
-            self.updates.running(),
-            self.epochs().generation_update().is_some(),
-        ) {
-            anyhow::bail!("{update}: a daemon handover waits until the update ends");
+        // configuration to the successor, not the update in flight: an
+        // update does not cross a daemon handover, so the handover waits for
+        // it to end.
+        if let Some((number, phase)) = self.updates.in_flight() {
+            anyhow::bail!(
+                "update {number} is {}: a daemon handover waits until the update ends",
+                phase.name()
+            );
         }
         self.replicas()
             .iter()
@@ -351,10 +411,17 @@ impl Leader {
         let replicas = self.replicas();
         let states: Vec<_> = replicas.iter().map(|replica| replica.status()).collect();
         let mut state = states[0].clone();
-        if states.iter().any(|state| state.engine == "ready") {
-            state.engine = "ready".to_owned();
+        if states.iter().any(|state| state.engine == "serving") {
+            state.engine = "serving".to_owned();
             state.reason = None;
         }
+        state.update = self
+            .updates
+            .in_flight()
+            .map(|(number, phase)| UpdateStatus {
+                number,
+                phase: phase.name().to_owned(),
+            });
         state.paused = states.iter().all(|state| state.paused);
         state.asleep = states.iter().all(|state| state.asleep);
         state.replacing = self.replicas.replacing.try_lock().is_err()
@@ -576,8 +643,7 @@ impl Leader {
         config: &ServerArgs,
         stated: &Stated,
         daemon: String,
-        commands: Option<&crate::supervision::ProcessCommands>,
-        updates: Arc<crate::updates::driver::Driver>,
+        updates: Arc<crate::updates::Updater>,
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(families, config, stated).await?;
         info!(parallel = ?prepared.engine.parallel, "starting the engine process");
@@ -588,26 +654,34 @@ impl Leader {
             config.served_model_name().to_owned(),
             crate::engine::control::ensure_build_server(&config.build_config)?,
         )?);
-        // The module set the launches name: the engine package is fixed here,
-        // because a main process is started from it, and the policy and the
-        // kernels as the configuration names them until the epoch's own
-        // selection fixes theirs (`install_modules`).
-        let mut modules = crate::epoch::modules_of(config);
-        modules.engine = {
-            let socket = control.build_server().to_path_buf();
-            let named = modules.engine.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::engine::control::select_engine(&socket, &named)
-            })
+
+        // The epoch's whole module set is fixed before any engine starts: the
+        // engine, policy and kernel revisions the Build Server's `cover`
+        // selects, each module built. Every launch file states it, so an
+        // engine resolves what its profile runs name and serves, and a
+        // relaunch and a standby run exactly what their epoch runs.
+        let servers = vec![crate::engine::control::BuildServer {
+            host: control.host().to_owned(),
+            socket: config.build_config.socket(),
+            targets: Vec::new(),
+        }];
+        let leader_host = config
+            .engine_host
+            .clone()
+            .unwrap_or_else(|| control.host().to_owned());
+        let named = named_modules(config, prepared.model_config.video().is_some());
+        let modules = fix_modules(servers, leader_host, named)
             .await
-            .context("the engine's selection did not complete")?
-            .context("selecting the deployment's engine package")?
-        };
+            .map_err(anyhow::Error::from)
+            .context("fixing the deployment's module set")?;
         info!(
             engine = %modules.engine.backend,
             revision = modules.engine.revision,
-            "the engine package is selected"
+            kernels = modules.kernels.len(),
+            policy = %modules.policy.backend,
+            "the epoch's module set is fixed"
         );
+
         let replicas = replica_configs(&prepared.engine)?;
         let clients =
             futures::future::join_all(replicas.into_iter().enumerate().map(|(index, replica)| {
@@ -617,8 +691,7 @@ impl Leader {
                 tokio::task::spawn_blocking(move || {
                     let observer = Arc::new(crate::observe::Observer::default());
                     let sink = stats_sink(model, Arc::clone(&observer), index);
-                    let mut args = proto::config::EngineArgs::new(replica);
-                    args.modules = Some(modules);
+                    let mut args = proto::config::EngineArgs::new(replica, modules);
                     let client = starting.start(args.clone(), sink)?;
                     args.epoch = client.epoch();
                     Ok::<_, anyhow::Error>((client, args, observer))
@@ -629,12 +702,6 @@ impl Leader {
             .map(|started| started.context("the engine startup task did not complete")?)
             .collect::<anyhow::Result<Vec<_>>>()
             .context("failed to start the UniServe engine")?;
-        // The main processes this node started, by the engine number their
-        // reports carry, for the epoch's first package switch.
-        let engines: Vec<crate::engine::control::EpochProcess> = clients
-            .iter()
-            .flat_map(|(client, _, _)| client.processes())
-            .collect();
         let epoch = clients.first().map_or(0, |(client, _, _)| client.epoch());
         let mut clients = clients.into_iter();
         let (client, served, observer) = clients
@@ -667,210 +734,16 @@ impl Leader {
                 .serving
                 .send_modify(|replicas| replicas.push(replica));
         }
-        if let Some(commands) = commands {
-            // The epoch's record commands the same main processes the
-            // daemon's channel reaches, for every later generation
-            // update (§2.3, §7.3).
-            leader.epochs().supervise(commands.clone());
-            leader
-                .install_modules(commands, config, engines, epoch, modules.engine)
-                .await
-                .context("installing the epoch's modules in its main processes")?;
-            // A committed epoch's tensors are what the next epoch starts from: until it is
-            // published its storage is private to it, and a target of another epoch finds nothing.
-            let publishing = Arc::clone(&control);
-            tokio::task::spawn_blocking(move || publishing.publish_epochs(&[epoch], &mut None))
-                .await
-                .context("publishing the first epoch")?
-                .context("publishing the first epoch")?;
-            // The epoch's modules serve, which is what the standbys were waiting to prepare from.
-            for replica in leader.replicas() {
-                replica.prepare_standby();
-            }
-        }
-        Ok(leader)
-    }
 
-    /// The modules `config` names for what this deployment launches.
-    ///
-    /// The configuration selects a backend for attention and for the grouped experts, which are a
-    /// causal language model's operators. A video deployment launches neither, so a slot filled for
-    /// them would pin a package no call reaches: every operator it runs is filled from the store.
-    fn named_modules(&self, config: &ServerArgs) -> crate::epoch::ModuleSet {
-        let mut filled = crate::epoch::modules_of(config);
-        if self.video_service().is_some() {
-            filled.kernels.clear();
-        }
-        filled
-    }
-
-    /// Prepares the epoch's modules and switches this node's main processes
-    /// to them (§7.3 steps 2-3, §3): a main process reports ready without
-    /// waiting for warmup and serves only once the switchover has installed
-    /// the epoch's modules, the scheduling policy among them, so the daemon
-    /// switches every main process once before it accepts a request.
-    ///
-    /// The generation is each main process's own, as its `Precopied` names
-    /// it, and the first epoch is committed at once: it has no previous
-    /// generation to keep as a last resort, so there is nothing to purge.
-    ///
-    /// # Errors
-    ///
-    /// Refuses when a Build Server cannot select the epoch's modules, and
-    /// fails with the first main process that refuses or does not answer.
-    async fn install_modules(
-        &self,
-        commands: &crate::supervision::ProcessCommands,
-        config: &ServerArgs,
-        engines: Vec<crate::engine::control::EpochProcess>,
-        epoch: u64,
-        engine: proto::module::PackageRevision,
-    ) -> anyhow::Result<()> {
-        let mut filled = self.named_modules(config);
-        // The engine package the main processes were started from, at the
-        // revision fixed before they started.
-        filled.engine = engine;
-        // The startup switch installs the epoch's modules as its record names
-        // them: the scheduling policy *and* the kernel of every operator the
-        // deployment selects. A main process resolves no kernel itself — its
-        // backends are the installed modules, and a kernel it was never given
-        // fails the first request that needs it — so an epoch that prepared the
-        // policy alone serves its first token with nothing to run.
-        //
-        // A Build Server without a package for one of those operators refuses
-        // the epoch by name here, before it serves, which is the correct
-        // refusal: the deployment selects a backend whose package is not
-        // installed.
-        let servers = self.build_servers(config);
-        let leader_host = self.build_leader_host(config, &servers);
-        // Each step of the install says so before it waits: a deployment that
-        // hangs here is otherwise silent for as long as the run lasts, and the
-        // last line printed is the only thing that names where it waited.
-        tracing::info!(
-            epoch,
-            engines = ?engines,
-            kernels = filled.kernels.len(),
-            policy = %filled.policy.backend,
-            leader = %leader_host,
-            servers = ?servers
-                .iter()
-                .map(|server| format!("{} at {}", server.host, server.socket.display()))
-                .collect::<Vec<_>>(),
-            "preparing the epoch's modules at its Build Servers"
-        );
-        let prepared = {
-            let servers = servers.clone();
-            let leader_host = leader_host.clone();
-            let filled = filled.clone();
-            // The deadline below names the wait, so the blocking task records
-            // which of the client's two unbounded waits it is in.
-            let steps = crate::engine::control::PrepareSteps::new();
-            let recorded = steps.clone();
-            let preparing = tokio::task::spawn_blocking(move || {
-                // The record holds the generation's full module set: the named modules and
-                // the packages the store holds for every other operator, so a later revision of
-                // one of those is a change `route` sees.
-                let complete =
-                    crate::engine::control::with_store_modules(&servers, &leader_host, &filled)?;
-                crate::engine::control::prepare_epoch(
-                    &servers,
-                    &leader_host,
-                    &complete,
-                    &[],
-                    &recorded,
-                )
-            });
-            let started = tokio::time::Instant::now();
-            let deadline = started + PREPARE_TIMEOUT;
-            let mut preparing = preparing;
-            loop {
-                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                match tokio::time::timeout(left.min(HEARTBEAT), &mut preparing).await {
-                    Ok(joined) => break joined.context("the epoch's modules")?,
-                    Err(_) if left <= HEARTBEAT => anyhow::bail!(
-                        "the epoch's Build Servers selected nothing within {} s: \
-                         the daemon was {}",
-                        PREPARE_TIMEOUT.as_secs(),
-                        steps.describe()
-                    ),
-                    Err(_) => tracing::info!(
-                        waited_s = started.elapsed().as_secs(),
-                        step = %steps.describe(),
-                        "still preparing the epoch's modules"
-                    ),
-                }
-            }
-            .context("preparing the epoch's modules")?
-        };
-        tracing::info!(
-            epoch,
-            kernels = prepared.kernels.len(),
-            policy = %prepared.policy.backend,
-            "the epoch's modules are resolved; sending them to the main processes"
-        );
-        // The record states the modules the main processes took, revisions
-        // included — the ones `prepare_epoch` selected — and not the ones the
-        // configuration asked for: a filled package's revision is zero until a
-        // Build Server selects one, so recording the request would leave
-        // `GET /admin/config` naming numbers no package has and a later
-        // handover to a joining process (`Epochs::hand_to`) sending a revision
-        // the store never built.
-        let deployment = crate::epoch::Epoch::with_modules(config.clone(), prepared.clone())?;
-        // The epoch's module set is fixed: a relaunch and a standby are
-        // started from the launch each replica keeps, so it names this set and
-        // no later selection.
-        for replica in self.replicas() {
-            if let Some(served) = locked(&replica.served).as_mut() {
-                served.modules = Some(prepared.clone());
-            }
-        }
-        // Every main process of every engine, each on its own host: a worker group that spans
-        // hosts switches every one of its processes together.
-        let processes = engines;
-        let commands = commands.clone();
-        let installed = deployment.clone();
-        let switching = tokio::task::spawn_blocking(move || {
-            let mut switch = crate::engine::control::GenerationSwitch::new(
-                &commands,
-                processes,
-                crate::epoch::Update::new(0, installed),
-            );
-            // The epoch's modules, kernels and policy alike: the main
-            // processes serve their first request with them.
-            switch.precopy(&prepared.kernels, &prepared.policy)?;
-            switch.switchover()?;
-            switch.commit()?;
-            Ok::<_, crate::epoch::Failure>(switch.generations().to_vec())
-        });
-        let generations = match tokio::time::timeout(SWITCH_TIMEOUT, switching).await {
-            Ok(joined) => joined.context("switching the main processes to the epoch's modules")?,
-            Err(_) => anyhow::bail!(
-                "the main processes took the epoch's modules in neither Precopy, \
-                 Switchover nor Commit within {} s (the last step logged above is \
-                 where the daemon waited)",
-                SWITCH_TIMEOUT.as_secs()
-            ),
-        }
-        .map_err(|failure| {
-            anyhow::anyhow!(
-                "the main processes did not take the epoch's modules ({}): {}",
-                failure.kind,
-                failure.reason
-            )
-        })?;
-        // The daemon's record of what executes: the epoch's build config and
-        // the modules its main processes took, with the number they gave
-        // them (`EpochRecord::generation`), which `GET /admin/config`
-        // reports and a later update is routed against (§7.2, §7.4).
-        // The epoch is recorded under the number its launch gave it, as every later epoch is
-        // (§7.4).
-        self.epochs().install(epoch, &deployment, &generations);
-        // The process table names every main process this daemon manages, and
-        // the serving one is the first (§7.4): a switch addresses the process it
-        // replaces by this generation, `GET /admin/config` lists it, and without
-        // the row a deployment started here looks like one with no main process
-        // at all — which is what an epoch switch refuses for.
-        if let Some(engine) = self
+        // The daemon's record of what executes: the epoch's build
+        // configuration and the module set its launch files stated, which
+        // `GET /admin/config` reports and a later change is compared with.
+        let deployment = crate::epoch::Epoch::with_modules(config.clone(), modules)?;
+        leader.epochs().install(epoch, &deployment, &[]);
+        // The process table names every engine this daemon manages, and the
+        // serving one is the first: an update addresses the engine it drains
+        // by this launch generation, and `GET /admin/config` lists it.
+        if let Some(engine) = leader
             .replicas
             .serving
             .borrow()
@@ -878,7 +751,7 @@ impl Leader {
             .and_then(|replica| replica.hold().client())
             .and_then(|client| client.engine())
         {
-            let mut processes = self.epochs().processes();
+            let mut processes = leader.epochs().processes();
             processes.retain(|process| process.generation != engine);
             processes.push(crate::epoch::ManagedProcess {
                 group: crate::engine::control::ENGINE_GROUP.to_owned(),
@@ -889,15 +762,23 @@ impl Leader {
                 generation: engine,
                 state: crate::epoch::ProcessState::Serving,
             });
-            self.epochs().set_processes(processes);
+            leader.epochs().set_processes(processes);
         }
-        tracing::info!(
-            epoch,
-            epoch,
-            generations = ?generations,
-            "the main processes serve the epoch's modules"
-        );
-        Ok(())
+        // A serving epoch's tensors are what the next epoch starts from:
+        // until it is published its storage is private to it, and a target
+        // of another epoch finds nothing.
+        let publishing = Arc::clone(&control);
+        tokio::task::spawn_blocking(move || publishing.publish_epochs(&[epoch], &mut None))
+            .await
+            .context("publishing the first epoch")?
+            .context("publishing the first epoch")?;
+        info!(epoch, "the engines serve the epoch's module set");
+        Ok(leader)
+    }
+
+    /// The modules `config` names for what this deployment launches.
+    pub(crate) fn named_modules(&self, config: &ServerArgs) -> crate::epoch::ModuleSet {
+        named_modules(config, self.video_service().is_some())
     }
 
     /// What a leader prepares before it has an engine: the model's files
@@ -975,7 +856,7 @@ impl Leader {
         client: EngineClient,
         served: proto::config::EngineArgs,
         observer: Arc<crate::observe::Observer>,
-        updates: Arc<crate::updates::driver::Driver>,
+        updates: Arc<crate::updates::Updater>,
     ) -> anyhow::Result<Self> {
         let Prepared {
             families,
@@ -988,7 +869,7 @@ impl Leader {
         let info = client.info().clone();
 
         // A video checkpoint serves what its placed denoiser declares in the
-        // worker handshake, planned against the conditioner's vision
+        // worker handshake, prepared against the conditioner's vision
         // processor.
         // A chat family that takes images lowers them through its bound processor.
         let mut images = None;
@@ -1070,7 +951,7 @@ impl Leader {
         processor: Processor,
         images: MediaConnector,
         options: &ServerArgs,
-        updates: Arc<crate::updates::driver::Driver>,
+        updates: Arc<crate::updates::Updater>,
     ) -> Self {
         Self::observed(
             processing::Registry::default(),
@@ -1100,7 +981,7 @@ impl Leader {
         images: MediaConnector,
         options: &ServerArgs,
         observer: Arc<crate::observe::Observer>,
-        updates: Arc<crate::updates::driver::Driver>,
+        updates: Arc<crate::updates::Updater>,
     ) -> Self {
         let logging = &options.logging_config;
         let mut info = clients[0].info().clone();
@@ -1269,8 +1150,8 @@ impl Leader {
         Ok((Box::new(events), output))
     }
 
-    /// The model's tokenizer, which a successor builds a handed-over body's
-    /// decoder from.
+    /// The model's tokenizer, which a successor builds the decoder of a
+    /// handoff's body from.
     pub(crate) fn tokenizer(&self) -> frontend::tokenizer::DynTokenizer {
         self.processor.tokenizer()
     }
@@ -1292,10 +1173,10 @@ impl Leader {
     }
 
     /// Takes one request's engine event stream over from the process that
-    /// consumed it, going on after the position it reached (design §7.5.1
-    /// step 4): the request keeps generating in the engine that serves it,
-    /// and is neither cancelled nor submitted again. Both handed kinds of
-    /// response call it, with the replica and identity their state carries.
+    /// consumed it, going on after the position it reached:
+    /// the request keeps generating in the engine that serves it,
+    /// and is neither cancelled nor submitted again. Both kinds of response
+    /// in a handoff call it, with the replica and identity their state carries.
     ///
     /// # Errors
     ///
@@ -1311,21 +1192,21 @@ impl Leader {
             .replicas()
             .get(engine_replica as usize)
             .cloned()
-            .with_context(|| format!("the handed response names replica {engine_replica}"))?;
+            .with_context(|| format!("the response's handoff names replica {engine_replica}"))?;
         let client = replica
             .hold
             .client()
-            .context("the handed response's replica has no engine connection")?;
+            .context("the replica of the response's handoff has no engine connection")?;
         let id = proto::request::RequestId(
             engine_request_id
                 .parse()
-                .context("the handed response's engine identity")?,
+                .context("the engine identity of the response's handoff")?,
         );
         let stream = client.take_over(id, consumed)?;
         Ok(RequestEvents::taken_over(stream, consumed))
     }
 
-    /// Fetches, probes and plans a video request's media, presents its
+    /// Fetches, probes and prepares a video request's media, presents its
     /// prompt, and streams its output.
     ///
     /// Also returns what the request generates: its duration, frames and
@@ -1409,387 +1290,16 @@ impl Leader {
 }
 
 impl Leader {
-    /// The epochs this node keeps: the record the admin API reports and a
-    /// generation update lives in (§7.2, §7.3).
+    /// The epochs this node keeps: the records the admin API reports and an
+    /// update writes.
     pub(crate) fn epochs(&self) -> Arc<crate::epoch::Epochs> {
-        // One record for the daemon: the epoch layer's driver owns it, the
-        // generation layer and the admin API read it (§7.2, §7.3, §7.4).
         Arc::clone(self.updates.epochs())
     }
 
-    /// The configuration the deployment serves now: what a change is
-    /// resolved against before it is routed (§7.2).
-    ///
-    /// # Errors
-    ///
-    /// `UpdateError::Failed` when no replica serves — the same answer
-    /// [`Self::apply_generation`] gives, so a caller may ask either first.
-    pub(crate) fn serving_config(&self) -> Result<ServerArgs, UpdateError> {
-        self.replicas()
-            .first()
-            .map(|replica| locked(&replica.config).clone())
-            .ok_or_else(|| UpdateError::Failed(anyhow::anyhow!("no replica serves")))
-    }
-
-    /// This node's main processes, by the engine number their reports carry
-    /// and the node they run on: the processes a generation update
-    /// commands (§7.3).
-    pub(crate) fn main_processes(&self) -> Vec<crate::engine::control::EpochProcess> {
-        self.replicas()
-            .iter()
-            .filter_map(|replica| {
-                let engine = replica.hold.client()?.engine()?;
-                let host = locked(&replica.config).host_identity.clone();
-                Some(crate::engine::control::EpochProcess { host, engine })
-            })
-            .collect()
-    }
-
-    /// Routes `target` and applies its generation change to this node's
-    /// main processes: the target's modules are prepared at every host's
-    /// Build Server, precopied into each main process, switched to, and
-    /// recorded as the epoch's probation (§7.3 steps 2-4).
-    ///
-    /// Answers the update that is on probation. `Ok(None)` when the change
-    /// moves nothing at the generation layer — it belongs to the host layer or
-    /// the epoch layer, or fills the modules the epoch already executes —
-    /// which is where a caller falls through to the epoch path.
-    ///
-    /// With `dry_run`, the routing decision alone is made and nothing is
-    /// applied, so a caller can answer what a change would move. `force`
-    /// applies an update a revert marked unavailable (§7.2).
-    ///
-    /// # Errors
-    ///
-    /// `UpdateError::Refused` when a Build Server cannot select the
-    /// target's modules; `UpdateError::Failed` when a main process refuses
-    /// the precopy or the switchover, or does not answer. What serves is
-    /// untouched either way.
-    pub(crate) async fn apply_generation(
-        &self,
-        number: u64,
-        target: &ServerArgs,
-        options: &crate::options::UpdateConfig,
-        force: bool,
-        dry_run: bool,
-    ) -> Result<Option<crate::epoch::Update>, UpdateError> {
-        let current = self.serving_config()?;
-        // One update at a time (§7.2, §7.4): an epoch switch and a generation
-        // update are each the deployment's one update, and the generation
-        // layer's callers reach this method directly as well as through the
-        // entry, so the check lives here. A dry run answers without touching
-        // the processes or the records the update in flight owns, which is
-        // what the entry does for the layers above (§7.2).
-        if !dry_run
-            && let Some(update) = crate::updates::in_flight(
-                self.updates.running(),
-                self.epochs().generation_update().is_some(),
-            )
-        {
-            return Err(UpdateError::Refused(format!(
-                "another update is in flight: {update}"
-            )));
-        }
-        // A target that reverted with a failure is unavailable until it is
-        // applied with `force` (§7.2, §7.3 step 4), the generation layer's as
-        // much as the epoch layer's.
-        let resolved_target = deployment(target)?;
-        if !force && let Some(failure) = self.epochs().unavailable(&resolved_target) {
-            return Err(UpdateError::Refused(format!(
-                "the configuration reverted with a failure ({}); apply it again with force",
-                failure.reason
-            )));
-        }
-        let Some(update) = self.route(&current, target, false).await? else {
-            return Ok(None);
-        };
-        if dry_run {
-            return Ok(Some(update));
-        }
-        let mut update = update;
-        update.number = number;
-        let epochs = Arc::clone(&self.epochs());
-        let processes = self.main_processes();
-        let recorded = update.clone();
-        let promotion = std::time::Instant::now();
-        tokio::task::spawn_blocking(move || epochs.apply_generation(update, processes, force))
-            .await
-            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("applying the update: {error}")))?
-            .map_err(|failure| {
-                UpdateError::Failed(anyhow::anyhow!(
-                    "the main processes did not take the modules ({}): {}",
-                    failure.kind,
-                    failure.reason
-                ))
-            })?;
-        // The modules moved in place; a parked standby prepared from the old
-        // ones is replaced (§2.5).
-        for replica in self.replicas.serving.borrow().iter() {
-            replica.restart_standby();
-        }
-        self.watch_generation_trial(number, options, promotion);
-        Ok(Some(recorded))
-    }
-
-    /// Reads update `number`'s thresholds for as long as it stands on probation in the serving
-    /// epoch (§7.3 step 4), and reverts it through the path a main process's failure takes once
-    /// one is passed. Serving and the update share an epoch, so the baseline ends at `promotion`,
-    /// when the update began to switch, and the trial's reports begin after the switch.
-    fn watch_generation_trial(
-        &self,
-        number: u64,
-        options: &crate::options::UpdateConfig,
-        promotion: std::time::Instant,
-    ) {
-        let window = options.rollback.window;
-        let observed = self
-            .replicas()
-            .iter()
-            .filter_map(|replica| {
-                let epoch = replica.hold.client()?.epoch();
-                Some(crate::updates::trial::Observed::new(
-                    Arc::clone(&replica.observer),
-                    epoch,
-                    epoch,
-                    window,
-                    promotion,
-                ))
-            })
-            .collect();
-        let trial = Arc::new(crate::updates::trial::Trial::begin(
-            options.rollback.clone(),
-            observed,
-            outcomes(),
-        ));
-        self.updates.begin_trial(Arc::clone(&trial));
-        let updates = Arc::clone(&self.updates);
-        let epochs = Arc::clone(&self.epochs());
-        tokio::spawn(async move {
-            let standing = Arc::clone(&epochs);
-            let reverting = Arc::clone(&epochs);
-            crate::updates::trial::watch(
-                &trial,
-                outcomes,
-                move || {
-                    standing
-                        .generation_update()
-                        .is_some_and(|package| package.update.number == number)
-                },
-                move |failure| async move {
-                    warn!(
-                        number,
-                        kind = %failure.kind,
-                        reason = %failure.reason,
-                        "the update on trial passed a rollback threshold; it reverts"
-                    );
-                    let _ =
-                        tokio::task::spawn_blocking(move || reverting.generation_failure(failure))
-                            .await;
-                },
-            )
-            .await;
-            updates.end_trial(serde_json::json!({
-                "change": "generation",
-                "update": number,
-                "failure": epochs.update().and_then(|update| update.unavailable().map(|failure| {
-                    serde_json::json!({ "kind": failure.kind, "reason": failure.reason })
-                })),
-            }));
-        });
-    }
-
-    /// Ends update `number`'s generation probation: every main process
-    /// commits the generation it executes and purges the one it no longer
-    /// runs, and the epoch's record keeps no previous generation (§7.3 steps
-    /// 5-6).
-    ///
-    /// Answers `Ok(false)` when update `number` is not a generation one,
-    /// which is where a caller falls through to the epoch path.
-    ///
-    /// # Errors
-    ///
-    /// Fails when `number` names no update, when it is not the update on
-    /// probation, or when a main process does not answer the commit.
-    pub(crate) async fn commit_generation(&self, number: u64) -> Result<bool, UpdateError> {
-        let package = self
-            .epochs()
-            .generation_update()
-            .filter(|package| package.update.number == number);
-        let Some(package) = package else {
-            return Ok(false);
-        };
-        let epochs = Arc::clone(&self.epochs());
-        let committed = tokio::task::spawn_blocking(move || epochs.commit_generation())
-            .await
-            .map_err(|error| {
-                UpdateError::Failed(anyhow::anyhow!("committing the update: {error}"))
-            })?
-            .map_err(UpdateError::Failed)?;
-        // The configuration is what the next apply starts from and what a successor takes over:
-        // one that kept the values before this update would undo it at the next change.
-        if committed {
-            for replica in self.replicas() {
-                *locked(&replica.config) = package.update.target.config.clone();
-            }
-        }
-        Ok(committed)
-    }
-
-    /// Returns every main process to the generation it served before update
-    /// `number`, with `reason`, and records the update as reverted: it is
-    /// unavailable until it is applied with `force` (§7.2, §7.3 step 5).
-    ///
-    /// Answers `Ok(false)` when update `number` is not a generation one.
-    ///
-    /// # Errors
-    ///
-    /// Fails when a main process does not answer the revert. What serves is
-    /// the previous generation either way.
-    pub(crate) async fn rollback_generation(
-        &self,
-        number: u64,
-        reason: &str,
-    ) -> Result<bool, UpdateError> {
-        let package = self
-            .epochs()
-            .generation_update()
-            .filter(|package| package.update.number == number);
-        if package.is_none() {
-            return Ok(false);
-        }
-        let epochs = Arc::clone(&self.epochs());
-        let reason = reason.to_owned();
-        tokio::task::spawn_blocking(move || epochs.revert_generation(&reason))
-            .await
-            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("reverting the update: {error}")))?
-            .map_err(UpdateError::Failed)
-    }
-}
-
-/// The layer a configuration change moves on, and the update a generation
-/// change starts.
-///
-/// A change is routed by what it moves and never by what it says (§7.2): the
-/// daemon's and the frontend's own options are the host layer, which a hot
-/// restart applies (§7.5); a different build config is the epoch layer,
-/// whose modules are prepared when the epoch is built (§7.4); and a change
-/// whose build config is the same moves only the modules, which the serving
-/// main processes take in place (§7.3).
-///
-/// The target's modules are prepared at every host's Build Server before
-/// anything is compared, so a newly installed revision at an unchanged
-/// configuration is a generation change: the comparison sees the
-/// revisions the Build Servers select, not the ones the serving epoch
-/// pinned. `prepare` is blocking I/O, so it runs off the async runtime.
-///
-/// # Errors
-///
-/// Refuses a target whose modules a Build Server cannot select or build.
-impl Leader {
-    pub(crate) async fn route(
-        &self,
-        current: &ServerArgs,
-        target: &ServerArgs,
-        force: bool,
-    ) -> Result<Option<crate::epoch::Update>, UpdateError> {
-        if crate::epoch::host_layer_differ(current, target) {
-            return Ok(None);
-        }
-        let engine = resolved(target)?;
-        if resolved(current)?.build_hash() != engine.build_hash() {
-            return Ok(None);
-        }
-        // From here only the modules can differ. The descriptors a
-        // `prepare` builds modules for come from the epoch's engine configuration,
-        // which this decision does not resolve: the main process resolves
-        // the modules it needs when it loads them (`resolve`), so the
-        // selection and the revisions are what this call is for.
-        let filled = self.named_modules(target);
-        let servers = self.build_servers(target);
-        let leader_host = self.build_leader_host(target, &servers);
-        // Bounded like the epoch install's: the client's two waits have no
-        // deadline, so an unanswering Build Server would otherwise hold the
-        // update without saying anything at all.
-        let steps = crate::engine::control::PrepareSteps::new();
-        let recorded = steps.clone();
-        let prepared = {
-            let servers = servers.clone();
-            let leader_host = leader_host.clone();
-            let filled = filled.clone();
-            let preparing = tokio::task::spawn_blocking(move || {
-                let complete =
-                    crate::engine::control::with_store_modules(&servers, &leader_host, &filled)?;
-                crate::engine::control::prepare_epoch(
-                    &servers,
-                    &leader_host,
-                    &complete,
-                    &[],
-                    &recorded,
-                )
-            });
-            let started = tokio::time::Instant::now();
-            let deadline = started + PREPARE_TIMEOUT;
-            let mut preparing = preparing;
-            let prepared = loop {
-                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                match tokio::time::timeout(left.min(HEARTBEAT), &mut preparing).await {
-                    Ok(joined) => {
-                        break joined.map_err(|error| {
-                            UpdateError::Failed(anyhow::anyhow!(
-                                "preparing the target's modules: {error}"
-                            ))
-                        })?;
-                    }
-                    // Not a refusal: the deployment asked for nothing the
-                    // Build Server turned down — the server did not answer
-                    // at all. The change may be legitimate, so this is the
-                    // deployment's failure (500), not the request's (400).
-                    Err(_) if left <= HEARTBEAT => {
-                        return Err(UpdateError::Failed(anyhow::anyhow!(
-                            "preparing the target's modules: no Build Server answered \
-                             within {} s: the daemon was {}",
-                            PREPARE_TIMEOUT.as_secs(),
-                            steps.describe()
-                        )));
-                    }
-                    Err(_) => tracing::info!(
-                        waited_s = started.elapsed().as_secs(),
-                        step = %steps.describe(),
-                        "still preparing the target's modules"
-                    ),
-                }
-            };
-            prepared.map_err(|error| {
-                UpdateError::Refused(format!("preparing the target's modules: {error:#}"))
-            })?
-        };
-        let next = crate::epoch::Epoch {
-            config: target.clone(),
-            engine,
-            modules: prepared,
-        };
-        // The epoch's record and the target's resolution both hold the generation's full module
-        // set - the named modules and the store's packages of every other operator, revisions
-        // included - so they are compared whole: a target that resolves to what the epoch runs
-        // changes nothing, and a newly installed revision of any operator's package, named or
-        // not, is a package change.
-        if self.epochs().serving().is_some_and(|(_, record)| {
-            record.policy == next.modules.policy && record.kernels == next.modules.kernels
-        }) {
-            return Ok(None);
-        }
-        // The reverted-update refusal is the daemon's record's, checked when
-        // the update executes (`Epochs::unavailable`): this decision holds no
-        // record of its own.
-        let _ = force;
-        Ok(Some(crate::epoch::Update::new(0, next)))
-    }
-
-    /// Where each host of the deployment prepares an epoch's modules: the
-    /// Build Server socket the configuration names, or the Build
-    /// Server's default socket on that host (§5.1, §6.3). The targets are the
-    /// Build Server's own: the daemon does not query the devices of another
-    /// host to name them.
+    /// Where each host of the deployment builds an epoch's modules: the
+    /// Build Server socket the configuration names, or the Build Server's
+    /// default socket on that host. The targets are the Build Server's own:
+    /// the daemon does not query the devices of another host to name them.
     pub(crate) fn build_servers(
         &self,
         config: &ServerArgs,
@@ -1854,7 +1364,7 @@ pub(crate) struct EngineHandoff {
     pub(crate) asleep: bool,
     pub(crate) sleep_paused: bool,
     /// The configurations a rollback marked unavailable.
-    pub(crate) unavailable: Vec<crate::updates::epoch::Unavailable>,
+    pub(crate) unavailable: Vec<crate::updates::Unavailable>,
 }
 
 /// What the leader serves, for `GET /admin/status`.
@@ -1864,9 +1374,9 @@ pub struct LeaderStatus {
     pub deployment: String,
     /// The model the deployment serves.
     pub model: String,
-    /// `ready`, `standby`, `draining`, `failed` or `closed` for the engine
-    /// that serves; `holding` while an engine is being replaced; `stopped`
-    /// once none will serve.
+    /// The lifecycle state of the engine requests go to: `starting`,
+    /// `parked`, `serving`, `draining`, `stopped` or `failed`; `holding`
+    /// while an engine is being replaced; `closed` once none will serve.
     pub engine: String,
     /// Why the engine failed or no engine will serve.
     pub reason: Option<String>,
@@ -1882,26 +1392,28 @@ pub struct LeaderStatus {
     /// The new requests the daemon holds before any engine takes them: while
     /// generation is paused, the engine sleeps, or no engine is ready.
     pub held: usize,
-    /// The launch generation of the main process that serves (the scheduler
+    /// The launch generation of the engine that serves (the scheduler
     /// node's, for a worker group over several hosts); `None` while none
     /// serves, or for an engine this daemon did not start. It names that
     /// process's row in `GET /admin/config`'s `processes`.
     pub generation: Option<u64>,
-    /// The parked standby beside the serving engine (`worker_config.standby`),
-    /// `None` while there is none.
-    pub standby: Option<StandbyStatus>,
+    /// The launch generation of each engine of the parked standby beside
+    /// the serving engine (`worker_config.standby`), one per host in the
+    /// world's order: the serving `generation` a promotion leaves is its
+    /// first. Empty while there is none.
+    pub standby: Vec<u64>,
+    /// The update in flight; `None` when none is.
+    pub update: Option<UpdateStatus>,
 }
 
-/// The parked standby of [`LeaderStatus::standby`].
+/// The update in flight, for `GET /admin/status`: `GET /admin/config` holds
+/// its whole report.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct StandbyStatus {
-    /// The launch generation of each of its main processes, one per host in
-    /// the world's order: the serving `generation` a promotion leaves is its
-    /// first.
-    pub generations: Vec<u64>,
-    /// Whether it holds the epoch's modules and captured its graphs, so that
-    /// a promotion has nothing left to build.
-    pub prepared: bool,
+pub struct UpdateStatus {
+    /// The admin operation that applied it.
+    pub number: u64,
+    /// `preparing`, `switching` or `trial`.
+    pub phase: String,
 }
 
 /// How the requests in flight continue through an in-place weight update
@@ -1920,15 +1432,8 @@ pub enum WeightsInFlight {
     Abort,
 }
 
-/// The engine configuration `config` resolves into, refused as a request when it does not:
-/// its deployment file does not read or does not place.
-pub(crate) fn resolved(config: &ServerArgs) -> Result<proto::config::EngineConfig, UpdateError> {
-    config.engine_config().map_err(|error| {
-        UpdateError::Refused(format!("the configuration does not resolve: {error:#}"))
-    })
-}
-
-/// The deployment `config` describes, refused as [`resolved`] refuses.
+/// The deployment `config` describes, refused as a request when it does not resolve: its
+/// deployment file does not read or does not place.
 pub(crate) fn deployment(config: &ServerArgs) -> Result<crate::epoch::Epoch, UpdateError> {
     crate::epoch::Epoch::of(config.clone()).map_err(|error| {
         UpdateError::Refused(format!("the configuration does not resolve: {error:#}"))
@@ -2051,13 +1556,13 @@ pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// The index a diffusers checkpoint states its components in.
+/// The index a diffusers checkpoint states its parts in.
 const MODULAR_INDEX: &str = "modular_model_index.json";
 
-/// The components of a diffusers checkpoint that decide how a request is processed.
-const PROCESSING_COMPONENTS: [&str; 4] = ["tokenizer", "processor", "scheduler", "audio_scheduler"];
+/// The parts of a diffusers checkpoint that decide how a request is processed.
+const PROCESSING_PARTS: [&str; 4] = ["tokenizer", "processor", "scheduler", "audio_scheduler"];
 
-/// [`same_processing`] for a diffusers checkpoint: the same index, and every file of the components
+/// [`same_processing`] for a diffusers checkpoint: the same index, and every file of the parts
 /// that process a request the same.
 fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(), String> {
     let read = |file: &std::path::Path| {
@@ -2065,12 +1570,12 @@ fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(),
     };
     if read(&served.join(MODULAR_INDEX))? != read(&path.join(MODULAR_INDEX))? {
         return Err(format!(
-            "the checkpoint at {} states other components than the served model: deploy it instead",
+            "the checkpoint at {} states other parts than the served model: deploy it instead",
             path.display()
         ));
     }
-    for component in PROCESSING_COMPONENTS {
-        let directory = served.join(component);
+    for part in PROCESSING_PARTS {
+        let directory = served.join(part);
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2079,9 +1584,9 @@ fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(),
         for entry in entries {
             let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
             let name = entry.file_name();
-            if read(&entry.path())? != read(&path.join(component).join(&name))? {
+            if read(&entry.path())? != read(&path.join(part).join(&name))? {
                 return Err(format!(
-                    "the checkpoint at {} has another {component}/{} than the served model, \
+                    "the checkpoint at {} has another {part}/{} than the served model, \
                      which changes how requests are processed: deploy it instead",
                     path.display(),
                     name.to_string_lossy()
@@ -2099,8 +1604,8 @@ pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// One independent replica's engine lifecycle and its
-/// epochs (`crate::updates::entry`).
+/// One independent replica: the engine its requests go to, the arguments
+/// that engine serves with, and its standby.
 pub(crate) struct Replica {
     /// The model families the executable serves, which an update of this replica resolves its
     /// target checkpoint with.
@@ -2132,37 +1637,31 @@ pub(crate) struct Replica {
     sleep_paused: AtomicBool,
     /// The LoRA adapters the workers hold, by name (`Leader::load_adapter`).
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
-    /// The engine that executes, and the configurations a rollback marked
-    /// unavailable.
-    pub(crate) epochs: std::sync::Mutex<crate::updates::entry::EpochState>,
     /// Every engine's scheduler statistics, which the status reads.
     pub(crate) observer: Arc<crate::observe::Observer>,
     /// The profiling session that runs, or the last that ended
     /// (`crate::profiling`).
     pub(crate) profiles: crate::profiling::Profiles,
-    /// The parked standby standing beside the serving engine (§2.5), if one is
+    /// The parked standby standing beside the serving engine, if one is
     /// live. Started by [`Replica::keep_standby`], taken by
     /// [`Replica::promote_standby`].
     pub(crate) standby: std::sync::Mutex<Option<Standby>>,
-    /// The failure-domain rules over the serving engine's main processes
-    /// (`crate::standby::Roster`), which decide whether its standby starts, is
-    /// promoted or is ended; built for the engine that serves, and anew when
-    /// another serves.
-    domain: std::sync::Mutex<Option<crate::standby::Roster>>,
+    /// The failure-domain rules over the serving engine's processes
+    /// (`crate::standby::Standbys`), which decide whether its standby starts,
+    /// is promoted or is ended; built for the engine that serves, and anew
+    /// when another serves.
+    domain: std::sync::Mutex<Option<crate::standby::Standbys>>,
     /// Serializes starting a standby: two callers that both saw none must not
     /// both start a process, since a second engine of the same scope is a
     /// whole copy of its device storage.
     standby_starting: tokio::sync::Mutex<()>,
-    /// Whether the epoch's modules serve here, which is what a standby is
-    /// prepared from.
-    modules_serve: std::sync::atomic::AtomicBool,
-    /// Whether this daemon handed the engine to a successor (§7.5.1): the
+    /// Whether this daemon handed the engine to a successor: the
     /// successor owns its life then, and a watch that sees its client go away
     /// must not relaunch it.
-    pub(crate) handed_over: AtomicBool,
-    /// Whether an epoch switch owns this replica's engines: from the moment its target serves
-    /// until the switch settled and the hold names the epoch that serves on. An engine lost
-    /// meanwhile is the switch's to judge, not the watcher's to relaunch.
+    pub(crate) handoff_sent: AtomicBool,
+    /// Whether an epoch update owns this replica's engines: from the moment its target serves
+    /// until the update ended and the hold names the epoch that serves on. An engine lost
+    /// meanwhile is the update's to judge, not the watcher's to relaunch.
     following: AtomicBool,
 }
 
@@ -2192,17 +1691,12 @@ impl Replica {
             asleep: AtomicBool::new(false),
             sleep_paused: AtomicBool::new(false),
             adapters,
-            epochs: std::sync::Mutex::new(crate::updates::entry::EpochState {
-                executing: client.epoch(),
-                ..Default::default()
-            }),
             observer,
             profiles: crate::profiling::Profiles::default(),
             standby: std::sync::Mutex::new(None),
             domain: std::sync::Mutex::new(None),
             standby_starting: tokio::sync::Mutex::new(()),
-            modules_serve: std::sync::atomic::AtomicBool::new(false),
-            handed_over: AtomicBool::new(false),
+            handoff_sent: AtomicBool::new(false),
             following: AtomicBool::new(false),
         });
         hold.serve(client);
@@ -2228,395 +1722,494 @@ impl Replica {
         &self.hold
     }
 
-    /// Moves this replica onto an epoch switch's target when the switch serves it (§7.4).
+    /// Follows update `number` for this replica until it ends: what the
+    /// daemon does beside the update's own phase machine.
     ///
-    /// The target's child dials this daemon's request socket as it starts, and the switch commands
-    /// it on its process link from then on. The frontend of this process moves when the record says
-    /// the target serves: the responses the drained epoch ends then migrate to the client the hold
-    /// serves, and a switch that fails never moves it.
-    pub(crate) fn follow_switch(
+    /// For both forms it reads the trial's thresholds (`options.rollback`)
+    /// and rolls the update back at its `deadline`. For the generation form
+    /// it keeps the committed configuration and module set, and replaces the
+    /// standby with one of them. For the epoch form it joins the
+    /// target engine, warms the host KV tier before the switch, moves this
+    /// replica's requests onto the target once it serves, and returns them to
+    /// the previous epoch when the update rolls back.
+    ///
+    /// The task wakes on the update's own progress
+    /// ([`crate::updates::Updater::watch`]), on the deadline and, during the
+    /// trial, on the interval the thresholds are read at.
+    pub(crate) fn follow(
         self: &Arc<Self>,
-        control: Arc<EngineControl>,
-        updates: Arc<crate::updates::driver::Driver>,
-        target: SwitchTarget,
+        updater: Arc<crate::updates::Updater>,
+        number: u64,
+        options: crate::options::UpdateConfig,
+        deadline: Option<Instant>,
+        following: Following,
     ) {
         let replica = Arc::clone(self);
-        let SwitchTarget {
-            mut args,
-            config,
-            modules,
-            servers,
-            leader,
-            engine,
-            epoch,
-            update,
-        } = target;
-        let mut served = updates.epochs().served();
-        let serving_config = config.clone();
-        let publishing = Arc::clone(&control);
         tokio::spawn(async move {
-            // While the target prepares, its transfers yield to the serving epoch's steps
-            // (`update_config.transfer_slowdown`); the guard ends that however the preparation ends.
-            let preparing = tokio_util::sync::CancellationToken::new();
-            let preparation = preparing.clone().drop_guard();
-            if let Some(serving) = replica.hold.client() {
-                let steps = Arc::new(std::sync::Mutex::new(
-                    crate::interference::StepTime::default(),
-                ));
-                updates.watch_transfers(Arc::clone(&steps));
-                let throttling = crate::interference::Throttling::new(
-                    &replica.observer,
-                    serving.epoch(),
-                    update.transfer_slowdown,
-                    std::time::Instant::now(),
-                );
-                tokio::spawn(crate::interference::control(
-                    Arc::clone(&publishing) as Arc<dyn crate::interference::Throttle>,
-                    vec![(Arc::clone(&replica.observer), throttling)],
-                    crate::interference::INTERVAL,
-                    preparing,
-                    steps,
-                ));
-            }
-            let sink = stats_sink(
-                replica.model_name.clone(),
-                Arc::clone(&replica.observer),
-                replica.ordinal,
-            );
-            let joined =
-                tokio::task::spawn_blocking(move || control.join_target(engine, epoch, sink)).await;
-            let client = match joined {
-                Ok(Ok(client)) => Arc::new(client),
-                Ok(Err(error)) => {
-                    warn!(engine, "the switch's target did not join: {error:#}");
-                    return;
+            match following {
+                Following::Generation { config, modules } => {
+                    replica
+                        .follow_generation(&updater, number, &options, deadline, *config, modules)
+                        .await;
                 }
-                Err(error) => {
-                    warn!(engine, "joining the switch's target ended: {error}");
-                    return;
-                }
-            };
-            // The target parks with no modules: it takes them here, and the switch promotes it
-            // once it holds them.
-            let host = config.host_identity.clone();
-            let handing = Arc::clone(updates.epochs());
-            let pinning = Arc::clone(&updates);
-            let target_page = args
-                .engine_config
-                .kv_cache
-                .block_size
-                .map_or(0, std::num::NonZeroU32::get);
-            let mut source;
-            let handed = tokio::task::spawn_blocking(move || {
-                // The update names backends, and a revision is the Build Server's to select.
-                let steps = crate::engine::control::PrepareSteps::new();
-                let pinned =
-                    crate::engine::control::prepare_epoch(&servers, &leader, &modules, &[], &steps)
-                        .map_err(|error| crate::epoch::Failure {
-                            kind: "prepare_failed".to_owned(),
-                            reason: format!("{error:#}"),
-                            device: None,
-                        })?;
-                pinning.pin(&pinned);
-                handing.hand_target(&config.host_identity, engine, &config, &pinned)
-            })
-            .await;
-            match handed {
-                Ok(Ok(())) => {
-                    source = replica.warm_target(&updates, &update, target_page).await;
-                    updates.handed(&host);
-                }
-                Ok(Err(failure)) => {
-                    warn!(
-                        engine,
-                        "the switch's target took no modules: {}", failure.reason
-                    );
-                    updates.rollback(&failure.reason);
-                    return;
-                }
-                Err(error) => {
-                    warn!(
-                        engine,
-                        "handing the switch's target its modules ended: {error}"
-                    );
-                    updates.rollback(&error.to_string());
-                    return;
-                }
-            }
-            let settled = async {
-                while !updates.settled() {
-                    tokio::time::sleep(crate::updates::trial::POLL).await;
-                }
-            };
-            let promoted = async {
-                while *served.borrow_and_update() < epoch {
-                    if served.changed().await.is_err() {
-                        return false;
-                    }
-                }
-                true
-            };
-            let served_target = tokio::select! {
-                promoted = promoted => promoted,
-                () = settled => false,
-            };
-            if !served_target {
-                // The target fell before the frontend moved: the serving epoch serves on, at the
-                // prefill budget it was configured with.
-                if let Some(source) = source.take() {
-                    restore_prefill(source).await;
-                }
-                return;
-            }
-            drop(preparation);
-            // From here the switch owns both epochs' engines: the previous one is stopped when
-            // the trial begins, which may come before the hold names the target.
-            replica.following.store(true, Ordering::SeqCst);
-            // The promotion restores the prefill budget the warming limited.
-            if let Some(source) = source.take() {
-                restore_prefill(source).await;
-            }
-            // The target maps the serving epoch's cache storage, and two epochs must not write it
-            // at once: a request reaches the target only once the epoch that serves stopped
-            // stepping. The drained epoch's state says the requests that move wait meanwhile.
-            while updates.phase() == Some(crate::updates::switch::Phase::Serving) {
-                tokio::time::sleep(DRAIN_POLL).await;
-            }
-            args.predecessor = None;
-            let before = locked(&replica.served).replace(args);
-            // The configuration is the one the target serves from here, as its arguments are, and a
-            // revert puts both back: the next apply starts from it, and the operator reads it.
-            let config_before = std::mem::replace(&mut *locked(&replica.config), serving_config);
-            // The previous client stays until the switch settles: it is what keeps the previous
-            // epoch's process, which the switch drains next and serves again on a revert.
-            let previous = replica.hold.client();
-            replica.hold.serve(Arc::clone(&client));
-            tokio::spawn(watch_engine(Arc::clone(&replica), Arc::downgrade(&client)));
-            info!(engine, epoch, "the switch's target serves this replica");
-            // The trial (§7.3 step 4, §7.4 step 3): the steps the previous epoch served before the
-            // promotion are what the target's are read against, until the switch settles.
-            let promoted = updates
-                .promotion()
-                .map_or_else(std::time::Instant::now, |(promoted, _)| promoted);
-            let previous_epoch = previous.as_ref().map_or(0, |client| client.epoch());
-            let trial = Arc::new(crate::updates::trial::Trial::begin(
-                update.rollback.clone(),
-                vec![crate::updates::trial::Observed::new(
-                    Arc::clone(&replica.observer),
+                Following::Epoch {
+                    control,
+                    args,
+                    config,
+                    launch_generation,
                     epoch,
-                    previous_epoch,
-                    update.rollback.window,
-                    promoted,
-                )],
-                outcomes(),
-            ));
-            updates.begin_trial(Arc::clone(&trial));
-            let mut relaunched = None;
-            let host = locked(&replica.config).host_identity.clone();
-            let mut keeps = update.previous_epoch != crate::options::PreviousEpoch::Parked;
-            while !updates.settled() {
-                // The trial stopped the previous epoch's process: once it ended its node keeps
-                // the weights alone.
-                if keeps
-                    && previous
-                        .as_ref()
-                        .is_some_and(|client| client.state() == EngineState::Closed)
-                {
-                    keeps = false;
-                    updates.previous_ended(&host);
-                }
-                if let Some(failure) = trial.breach(outcomes())
-                    && updates.fail_trial(failure.clone())
-                {
-                    warn!(
+                } => {
+                    // The epoch form's follower holds both epochs' launch
+                    // arguments and configurations across its whole wait.
+                    Box::pin(replica.follow_epoch(
+                        &updater,
+                        number,
+                        &options,
+                        deadline,
+                        control,
+                        *args,
+                        *config,
+                        launch_generation,
                         epoch,
-                        kind = %failure.kind,
-                        reason = %failure.reason,
-                        "the epoch on trial passed a rollback threshold; it reverts"
-                    );
+                    ))
+                    .await;
                 }
-                // A revert of an epoch whose processes the trial stopped starts them again on
-                // the weights they kept. The switch asks once the target stopped.
-                if relaunched.is_none() && !updates.relaunch_due().is_empty() {
-                    relaunched = Some(
-                        replica
-                            .relaunch_previous(
-                                &publishing,
-                                &updates,
-                                before.clone(),
-                                &config_before,
-                            )
-                            .await,
-                    );
-                }
-                tokio::time::sleep(crate::updates::trial::POLL).await;
-            }
-            let committed = updates
-                .epochs()
-                .serving()
-                .is_some_and(|(serving, _)| serving == epoch);
-            if !committed {
-                *locked(&replica.served) = before;
-                *locked(&replica.config) = config_before;
-                match relaunched {
-                    Some(Ok(started)) => {
-                        replica.hold.serve(Arc::clone(&started));
-                        tokio::spawn(watch_engine(Arc::clone(&replica), Arc::downgrade(&started)));
-                    }
-                    Some(Err(error)) => {
-                        let reason = format!("the previous epoch did not start again: {error:#}");
-                        tracing::error!(%reason, "no engine serves requests");
-                        replica.hold.close(reason);
-                    }
-                    None => {
-                        if let Some(previous) = previous {
-                            replica.hold.serve(previous);
-                        }
-                    }
-                }
-                warn!(
-                    engine,
-                    epoch, "the switch returned this replica to the previous epoch"
-                );
-                replica.start_standby();
-            }
-            replica.following.store(false, Ordering::SeqCst);
-            if committed {
-                // The committed target is what the next switch starts from.
-                let published = tokio::task::spawn_blocking(move || {
-                    publishing.publish_epochs(&[epoch], &mut None)
-                })
-                .await;
-                if !matches!(published, Ok(Ok(()))) {
-                    warn!(
-                        epoch,
-                        "publishing the committed epoch failed: {published:?}"
-                    );
-                }
-                // The standby of the epoch before ended with it (`worker_config.standby`).
-                replica.start_standby();
             }
         });
     }
 
-    /// Runs the switch's warming once its target parked (§7.4 step 1), and answers the serving
-    /// client whose prefill budget it limited, for the caller to restore. A warming that fails
-    /// costs the requests in flight the tail they compute on the target and nothing else, so it
-    /// neither fails the switch nor delays it further.
-    async fn warm_target(
+    /// Waits for the next thing an update's follower acts on: the update's
+    /// progress, its `deadline` (which rolls it back, once), or the next
+    /// reading of `trial`'s thresholds (a threshold passed rolls it back).
+    /// Returns update `number`'s phase afterwards; `None` once another
+    /// update, or none, is what the updater states.
+    async fn next_phase(
+        updater: &crate::updates::Updater,
+        number: u64,
+        phases: &mut watch::Receiver<Option<(u64, Phase)>>,
+        deadline: &mut Option<Instant>,
+        trial: Option<&crate::updates::trial::Trial>,
+    ) -> Option<Phase> {
+        let expiry = async {
+            match *deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => std::future::pending().await,
+            }
+        };
+        let reading = async {
+            match trial {
+                Some(_) => tokio::time::sleep(crate::updates::trial::INTERVAL).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            changed = phases.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+            }
+            () = expiry => {
+                *deadline = None;
+                updater.expire(number);
+            }
+            () = reading => {
+                if let Some(failure) = trial.and_then(|trial| trial.breach(request_counts()))
+                    && updater.fail_trial(failure.clone())
+                {
+                    warn!(
+                        number,
+                        kind = %failure.kind,
+                        reason = %failure.reason,
+                        "the update on trial passed a rollback threshold; it rolls back"
+                    );
+                }
+            }
+        }
+        // The watch only wakes: the phase is the update's own, which the
+        // updater keeps after the update ended and another began.
+        phases.borrow_and_update();
+        updater.phase_of(number)
+    }
+
+    /// [`Self::follow`] for the generation form.
+    async fn follow_generation(
         self: &Arc<Self>,
-        updates: &Arc<crate::updates::driver::Driver>,
-        update: &crate::options::UpdateConfig,
-        target_page: u32,
-    ) -> Option<Arc<EngineClient>> {
-        let source = self.hold.client()?;
+        updater: &Arc<crate::updates::Updater>,
+        number: u64,
+        options: &crate::options::UpdateConfig,
+        mut deadline: Option<Instant>,
+        config: ServerArgs,
+        modules: crate::epoch::ModuleSet,
+    ) {
+        let mut phases = updater.watch();
+        let mut trial: Option<Arc<crate::updates::trial::Trial>> = None;
+        let mut phase = updater.phase_of(number);
         loop {
-            match updates.parked() {
-                Some(true) => break,
-                Some(false) => tokio::time::sleep(crate::updates::trial::POLL).await,
-                None => return None,
+            match phase {
+                Some(Phase::Trial) if trial.is_none() => {
+                    // Serving and the update share an epoch, so the baseline
+                    // ends where the switch began.
+                    let began = updater.switch_began().unwrap_or_else(Instant::now);
+                    let observed = self.hold.client().map(|client| {
+                        crate::updates::trial::Baseline::new(
+                            Arc::clone(&self.observer),
+                            client.epoch(),
+                            client.epoch(),
+                            options.rollback.window,
+                            began,
+                        )
+                    });
+                    let began = Arc::new(crate::updates::trial::Trial::begin(
+                        options.rollback.clone(),
+                        observed.into_iter().collect(),
+                        request_counts(),
+                    ));
+                    updater.begin_trial(Arc::clone(&began));
+                    trial = Some(began);
+                }
+                Some(Phase::Committed) => {
+                    // The configuration and the module set are what the next
+                    // apply compares with, what a relaunch and a standby
+                    // start from and what a successor daemon takes over.
+                    *locked(&self.config) = config;
+                    if let Some(args) = locked(&self.served).as_mut() {
+                        args.modules = modules;
+                    }
+                    // The parked standby holds the generation the commit
+                    // released: it is replaced by one of the committed set.
+                    self.restart_standby();
+                    return;
+                }
+                // Through the trial the launch arguments and the standby keep
+                // the previous module set, which is what serves again.
+                Some(Phase::RolledBack | Phase::Abandoned) | None => return,
+                Some(Phase::Preparing | Phase::Switching | Phase::Trial) => {}
             }
-        }
-        let asking = Arc::clone(&source);
-        let warmed = crate::updates::warming::warm(
-            |operation| {
-                let asking = Arc::clone(&asking);
-                async move { asking.cache_warm(operation).await }
-            },
-            update.cache_tail_tokens.map(std::num::NonZeroU32::get),
-            update.cache_prefill_tokens.map(std::num::NonZeroU32::get),
-            target_page,
-            crate::updates::warming::LIMIT,
-        )
-        .await;
-        match warmed {
-            Ok(warming) => {
-                info!(?warming, "the requests in flight warmed the target's cache");
-                updates.warmed(serde_json::to_value(&warming).unwrap_or_default());
-            }
-            Err(error) => {
-                warn!(%error, "the warming ended: the requests compute their tails on the target");
-                updates.warmed(serde_json::json!({ "error": error }));
-            }
-        }
-        Some(source)
-    }
-
-    /// Starts the previous epoch again for a revert (§7.4): its processes exited for the trial
-    /// (`update_config.previous_epoch`), the target stopped, and the epoch binds the weights it
-    /// kept. The switch waits for this process exactly as it waits for one that drained.
-    ///
-    /// A start that fails leaves no engine: the switch ends all the same, since nothing it commands
-    /// can serve the epoch, and the caller closes the hold with the reason.
-    async fn relaunch_previous(
-        self: &Arc<Self>,
-        control: &Arc<EngineControl>,
-        updates: &Arc<crate::updates::driver::Driver>,
-        args: Option<proto::config::EngineArgs>,
-        config: &ServerArgs,
-    ) -> anyhow::Result<Arc<EngineClient>> {
-        let host = config.host_identity.clone();
-        let generation = updates
-            .epochs()
-            .next_generation(crate::engine::control::ENGINE_GROUP, 0);
-        let started = self
-            .start_previous(control, updates, args, config, generation)
+            phase = Self::next_phase(
+                updater,
+                number,
+                &mut phases,
+                &mut deadline,
+                trial.as_deref(),
+            )
             .await;
-        // Whether or not it serves, the switch has nothing left to wait for.
-        updates.relaunched(&host, generation);
-        started
+        }
     }
 
-    /// The process of [`Self::relaunch_previous`], holding the epoch's modules.
-    async fn start_previous(
+    /// [`Self::follow`] for the epoch form.
+    #[allow(clippy::too_many_arguments)]
+    async fn follow_epoch(
         self: &Arc<Self>,
-        control: &Arc<EngineControl>,
-        updates: &Arc<crate::updates::driver::Driver>,
-        args: Option<proto::config::EngineArgs>,
-        config: &ServerArgs,
-        generation: u64,
-    ) -> anyhow::Result<Arc<EngineClient>> {
-        let args = args.context("the replica has no served arguments")?;
+        updater: &Arc<crate::updates::Updater>,
+        number: u64,
+        options: &crate::options::UpdateConfig,
+        mut deadline: Option<Instant>,
+        control: Arc<EngineControl>,
+        args: proto::config::EngineArgs,
+        config: ServerArgs,
+        launch_generation: u64,
+        epoch: u64,
+    ) {
+        let host = config.host_identity.clone();
+        let mut phases = updater.watch();
+
+        // While the target prepares, its transfers yield to the serving
+        // epoch's steps (`update_config.transfer_slowdown`); the guard ends
+        // that however the preparation ends.
+        let preparing = tokio_util::sync::CancellationToken::new();
+        let preparation = preparing.clone().drop_guard();
+        if let Some(serving) = self.hold.client() {
+            let steps = Arc::new(std::sync::Mutex::new(
+                crate::interference::StepTime::default(),
+            ));
+            updater.watch_transfers(Arc::clone(&steps));
+            let throttling = crate::interference::Throttling::new(
+                &self.observer,
+                serving.epoch(),
+                options.transfer_slowdown,
+                Instant::now(),
+            );
+            tokio::spawn(crate::interference::control(
+                Arc::clone(&control) as Arc<dyn crate::interference::Throttle>,
+                vec![(Arc::clone(&self.observer), throttling)],
+                crate::interference::INTERVAL,
+                preparing,
+                steps,
+            ));
+        }
+
+        // The target dials this daemon's request socket as it starts, and
+        // states that it parked once it resolved its modules and captured its
+        // graphs.
         let sink = stats_sink(
             self.model_name.clone(),
             Arc::clone(&self.observer),
             self.ordinal,
         );
-        let starting = Arc::clone(control);
-        let client = Arc::new(
-            tokio::task::spawn_blocking(move || starting.start_at(args, generation, sink))
-                .await??,
-        );
-        reload_adapters(self, &client).await;
-        let handing = Arc::clone(updates.epochs());
-        let config = config.clone();
-        let processes = client.processes();
-        let handed = tokio::task::spawn_blocking(move || handing.hand_to(processes, &config));
-        match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
-            Ok(joined) => joined
-                .context("handing the epoch's modules to the started engine")?
-                .map_err(|failure| {
-                    anyhow::anyhow!(
-                        "the started engine did not take the epoch's modules ({}): {}",
-                        failure.kind,
-                        failure.reason
-                    )
-                })?,
-            Err(_) => anyhow::bail!(
-                "the started engine took the epoch's modules in neither Precopy, Switchover nor \
-                 Commit within {} s",
-                SWITCH_TIMEOUT.as_secs()
-            ),
+        let joining = Arc::clone(&control);
+        let joined = tokio::task::spawn_blocking(move || {
+            joining.join_target(launch_generation, epoch, sink)
+        })
+        .await;
+        let client = match joined {
+            Ok(Ok(client)) => Arc::new(client),
+            failed => {
+                let reason = match failed {
+                    Ok(Err(error)) => format!("the update's target did not join: {error:#}"),
+                    Err(error) => format!("joining the update's target ended: {error}"),
+                    Ok(Ok(_)) => String::new(),
+                };
+                warn!(launch_generation, "{reason}");
+                // Before the switch a rollback abandons the update; nothing
+                // that serves changed.
+                updater.rollback(crate::epoch::Failure {
+                    kind: "prepare_failed".to_owned(),
+                    reason,
+                    device: None,
+                });
+                updater.warmed(&host, None);
+                return;
+            }
+        };
+
+        // The requests in flight warm the host KV tier, so the target finds
+        // their pages; the switch begins once this ended. A warming that
+        // fails costs those requests the tail they compute on the target and
+        // nothing else, so it neither fails the update nor delays it further.
+        let target_page = args
+            .engine_config
+            .kv_cache
+            .block_size
+            .map_or(0, std::num::NonZeroU32::get);
+        let mut source = self.hold.client();
+        let warming = match &source {
+            Some(source) => {
+                let reading = Arc::clone(source);
+                let warmed = crate::updates::warming::warm(
+                    |operation| {
+                        let reading = Arc::clone(&reading);
+                        async move { reading.cache_warm(operation).await }
+                    },
+                    options.cache_tail_tokens.map(std::num::NonZeroU32::get),
+                    options.cache_prefill_tokens.map(std::num::NonZeroU32::get),
+                    target_page,
+                    crate::updates::warming::LIMIT,
+                )
+                .await;
+                Some(match warmed {
+                    Ok(warming) => {
+                        info!(?warming, "the requests in flight warmed the target's cache");
+                        serde_json::to_value(&warming).unwrap_or_default()
+                    }
+                    Err(error) => {
+                        warn!(%error, "the warming ended: the requests compute their tails on the target");
+                        serde_json::json!({ "error": error })
+                    }
+                })
+            }
+            None => None,
+        };
+        updater.warmed(&host, warming);
+
+        // Until the target serves, this replica's requests are the previous
+        // epoch's: they end as migratable at its drain and wait in the hold.
+        let mut served = updater.epochs().served();
+        let mut phase = updater.phase_of(number);
+        loop {
+            if *served.borrow_and_update() >= epoch {
+                break;
+            }
+            if phase.is_none_or(Phase::ended) {
+                // The update ended before any request moved: the serving
+                // epoch serves on, at the prefill budget it was configured
+                // with.
+                if let Some(source) = source.take() {
+                    restore_prefill(source).await;
+                }
+                return;
+            }
+            tokio::select! {
+                changed = served.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                next = Self::next_phase(updater, number, &mut phases, &mut deadline, None) => {
+                    phase = next;
+                }
+            }
         }
+        drop(preparation);
+        // From here the update owns both epochs' engines: an engine lost is
+        // the update's to judge, not the watcher's to relaunch.
+        self.following.store(true, Ordering::SeqCst);
+        if let Some(source) = source.take() {
+            restore_prefill(source).await;
+        }
+        let before = locked(&self.served).replace(args);
+        // The configuration is the one the target serves from here, as its
+        // arguments are, and a rollback puts both back.
+        let config_before = std::mem::replace(&mut *locked(&self.config), config);
+        // The previous client stays until the update ends: it is what keeps
+        // the previous epoch's engine, which serves again on a rollback.
+        let previous = self.hold.client();
+        self.hold.serve(Arc::clone(&client));
+        tokio::spawn(watch_engine(Arc::clone(self), Arc::downgrade(&client)));
         info!(
-            generation,
-            "the previous epoch started again on the weights it kept"
+            launch_generation,
+            epoch, "the update's target serves this replica"
         );
-        Ok(client)
+
+        // The trial: the steps the previous epoch served before the switch
+        // are what the target's are read against.
+        let began = updater.switch_began().unwrap_or_else(Instant::now);
+        let previous_epoch = previous.as_ref().map_or(0, |client| client.epoch());
+        let trial = Arc::new(crate::updates::trial::Trial::begin(
+            options.rollback.clone(),
+            vec![crate::updates::trial::Baseline::new(
+                Arc::clone(&self.observer),
+                epoch,
+                previous_epoch,
+                options.rollback.window,
+                began,
+            )],
+            request_counts(),
+        ));
+        updater.begin_trial(Arc::clone(&trial));
+
+        // The previous engine's end, when the trial stops it: its node then
+        // keeps the weights alone.
+        let mut previous_states = (options.previous_epoch != crate::options::PreviousEpoch::Parked)
+            .then(|| previous.as_ref().map(|client| client.states()))
+            .flatten();
+        let mut relaunched = None;
+        let mut phase = updater.phase_of(number);
+        while phase.is_some_and(|phase| !phase.ended()) {
+            // A rollback of an epoch whose engines the trial stopped starts
+            // them again on the weights they kept, once the target stopped.
+            if relaunched.is_none() && !updater.relaunch_due().is_empty() {
+                relaunched = Some(
+                    self.relaunch_previous(&control, updater, before.clone(), &config_before)
+                        .await,
+                );
+                phase = updater.phase_of(number);
+                continue;
+            }
+            let ended = async {
+                match previous_states.as_mut() {
+                    Some(states) => {
+                        while *states.borrow_and_update() != EngineState::Stopped {
+                            if states.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                () = ended => {
+                    previous_states = None;
+                    updater.previous_ended(&host);
+                }
+                next = Self::next_phase(
+                    updater,
+                    number,
+                    &mut phases,
+                    &mut deadline,
+                    Some(trial.as_ref()),
+                ) => phase = next,
+            }
+        }
+
+        if phase == Some(Phase::Committed) {
+            // The committed target is what the next update starts from.
+            let publishing = Arc::clone(&control);
+            let published =
+                tokio::task::spawn_blocking(move || publishing.publish_epochs(&[epoch], &mut None))
+                    .await;
+            if !matches!(published, Ok(Ok(()))) {
+                warn!(
+                    epoch,
+                    "publishing the committed epoch failed: {published:?}"
+                );
+            }
+        } else {
+            *locked(&self.served) = before;
+            *locked(&self.config) = config_before;
+            match relaunched {
+                Some(Ok(started)) => {
+                    self.hold.serve(Arc::clone(&started));
+                    tokio::spawn(watch_engine(Arc::clone(self), Arc::downgrade(&started)));
+                }
+                Some(Err(error)) => {
+                    let reason = format!("the previous epoch did not start again: {error:#}");
+                    tracing::error!(%reason, "no engine serves requests");
+                    self.hold.close(reason);
+                }
+                None => {
+                    if let Some(previous) = previous {
+                        self.hold.serve(previous);
+                    }
+                }
+            }
+            warn!(
+                launch_generation,
+                epoch, "the update returned this replica to the previous epoch"
+            );
+        }
+        self.following.store(false, Ordering::SeqCst);
+        // The standby of the epoch that no longer serves ended with it
+        // (`worker_config.standby`).
+        self.start_standby();
+    }
+
+    /// Starts the previous epoch again for a rollback: its engines exited for
+    /// the trial (`update_config.previous_epoch`), the target stopped, and
+    /// the engine binds the weights its node kept. The update waits for this
+    /// engine exactly as it waits for one that was promoted again.
+    ///
+    /// A start that fails leaves no engine: the update ends all the same,
+    /// since nothing it commands can serve the epoch, and the caller closes
+    /// the hold with the reason.
+    async fn relaunch_previous(
+        self: &Arc<Self>,
+        control: &Arc<EngineControl>,
+        updater: &Arc<crate::updates::Updater>,
+        args: Option<proto::config::EngineArgs>,
+        config: &ServerArgs,
+    ) -> anyhow::Result<Arc<EngineClient>> {
+        let generation = updater
+            .epochs()
+            .next_generation(crate::engine::control::ENGINE_GROUP, 0);
+        let started = async {
+            let args = args.context("the replica has no served arguments")?;
+            let sink = stats_sink(
+                self.model_name.clone(),
+                Arc::clone(&self.observer),
+                self.ordinal,
+            );
+            let starting = Arc::clone(control);
+            let client = Arc::new(
+                tokio::task::spawn_blocking(move || starting.start_at(args, generation, sink))
+                    .await??,
+            );
+            reload_adapters(self, &client).await;
+            info!(
+                generation,
+                "the previous epoch started again on the weights it kept"
+            );
+            anyhow::Ok(client)
+        }
+        .await;
+        // Whether or not it serves, the update has nothing left to wait for.
+        updater.relaunched(&config.host_identity, generation);
+        started
     }
 
     /// Restarts the committed epoch while the caller owns its replacement
-    /// lock. A pending commit must finish publication before calling this.
+    /// lock: the engine starts from the arguments this replica keeps, whose
+    /// launch file states the epoch's module set.
     pub(crate) async fn recover(self: &Arc<Self>) -> anyhow::Result<Arc<EngineClient>> {
         let control = Arc::clone(
             self.control
@@ -2635,51 +2228,12 @@ impl Replica {
         let client =
             Arc::new(tokio::task::spawn_blocking(move || control.start(args, sink)).await??);
         reload_adapters(self, &client).await;
-        // The epoch's modules, before this process serves: a relaunched main
-        // process starts with none, and the epoch they belong to was installed
-        // for its predecessor, so nothing else sends them. Without this the
-        // process waits on a generation command that never comes and
-        // answers 503 to every request (§2.5, §7.5).
-        if let Some(epochs) = self
-            .registry
-            .upgrade()
-            .and_then(|registry| registry.updates.upgrade())
-            .map(|driver| Arc::clone(driver.epochs()))
-        {
-            let config = locked(&self.config).clone();
-            let processes = client.processes();
-            anyhow::ensure!(
-                !processes.is_empty(),
-                "the relaunched engine states no number"
-            );
-            let handing = Arc::clone(&epochs);
-            let handed = tokio::task::spawn_blocking(move || handing.hand_to(processes, &config));
-            match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
-                Ok(joined) => joined
-                    .context("handing the epoch's modules to the relaunched engine")?
-                    .map_err(|failure| {
-                        anyhow::anyhow!(
-                            "the relaunched engine did not take the epoch's modules ({}): {}",
-                            failure.kind,
-                            failure.reason
-                        )
-                    })?,
-                Err(_) => anyhow::bail!(
-                    "the relaunched engine took the epoch's modules in neither Precopy, \
-                     Switchover nor Commit within {} s",
-                    SWITCH_TIMEOUT.as_secs()
-                ),
-            }
-        }
         self.hold.serve(Arc::clone(&client));
         info!("the relaunched engine serves");
         self.start_standby();
         Ok(client)
     }
 }
-
-/// How often a switch reads whether the serving epoch drained: part of its pause.
-const DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Gives `source` back the prefill budget a warming limited.
 async fn restore_prefill(source: Arc<EngineClient>) {
@@ -2691,26 +2245,26 @@ async fn restore_prefill(source: Arc<EngineClient>) {
     }
 }
 
-/// Whether a replica keeps a standby (§2.5): the deployment reserved room for
-/// one (`worker_config.standby`), the replica's engine serves rather than being
-/// parked, draining or failing, and its epoch is the one the deployment serves. A standby anywhere else is a second engine of a scope
-/// nothing routes to, or a copy of the device storage the serving engine needs.
+/// Whether a replica keeps a standby: the deployment reserved room for one
+/// (`worker_config.standby`), the replica's engine serves rather than being
+/// parked, draining or failing, and its epoch is the one the deployment
+/// serves. A standby anywhere else is a second engine of a scope nothing
+/// routes to, or a copy of the device storage the serving engine needs.
 fn keeps_standby(wanted: bool, serving: EngineState, epoch_serves: bool) -> bool {
-    wanted && epoch_serves && serving == EngineState::Ready
+    wanted && epoch_serves && serving == EngineState::Serving
 }
 
-/// The standby world started beside this replica's serving engine (§2.5): a second process of the
-/// serving epoch on every host its worker group spans, each parked with its scope's storage
-/// claimed read-only, promoted in place together when the serving engine is lost.
+/// The standby started beside this replica's serving engine: a parked engine of the serving
+/// epoch on every host its worker group spans, started as an epoch update's target is (its launch
+/// file states the epoch's module set and the engine it succeeds, so it resolves its modules,
+/// captures its graphs and parks by itself), promoted in place together when the serving engine
+/// is lost.
 pub(crate) struct Standby {
     /// The standby world's scheduler node client, which holds its peers'.
     pub(crate) client: Arc<EngineClient>,
-    /// Each host's standby process and the launch generation it was started under, from the epoch
-    /// layer's one allocator, in the world's order.
+    /// Each host's standby engine and the launch generation it was started under, from the
+    /// deployment's one allocator, in the world's order.
     pub(crate) generations: Vec<(String, u64)>,
-    /// Whether it holds the epoch's modules and has captured its graphs, so a
-    /// promotion is the promotion alone (§2.5).
-    prepared: bool,
 }
 
 impl Standby {
@@ -2722,8 +2276,8 @@ impl Standby {
     }
 }
 
-/// The failure-domain rules' view of the serving engine: one main process per host of its worker
-/// group, which form one domain when there are several (`crate::standby::Roster`).
+/// The failure-domain rules' view of the serving engine: one engine process per host of its worker
+/// group, which form one domain when there are several (`crate::standby::Standbys`).
 fn domain_processes(
     serving: &EngineClient,
     config: &proto::config::EngineConfig,
@@ -2748,86 +2302,6 @@ fn domain_processes(
 }
 
 impl Replica {
-    /// Prepares the parked standby in the background, once the epoch's modules
-    /// serve: the caller is what makes them serve.
-    pub(crate) fn prepare_standby(self: &Arc<Self>) {
-        self.modules_serve.store(true, Ordering::SeqCst);
-        let replica = Arc::clone(self);
-        tokio::spawn(async move {
-            let _starting = replica.standby_starting.lock().await;
-            replica.prepare_parked_standby().await;
-        });
-    }
-
-    /// Hands the parked standby the epoch's modules (§2.5): it captures its
-    /// graphs on its own warmup scratch, and the graphs wait at their addresses
-    /// for a promotion that then has nothing left to build.
-    ///
-    /// A standby the epoch's modules have not reached is kept: the promotion
-    /// hands them over itself, later than it should, and still serves. The
-    /// caller holds `standby_starting`, so a promotion never meets a handover
-    /// half done.
-    async fn prepare_parked_standby(self: &Arc<Self>) {
-        if !self.modules_serve.load(Ordering::SeqCst) {
-            return;
-        }
-        let parked = locked(&self.standby)
-            .as_ref()
-            .filter(|standby| !standby.prepared)
-            .map(|standby| (Arc::clone(&standby.client), standby.generation()));
-        let Some((client, generation)) = parked else {
-            return;
-        };
-        match self.hand_modules(&client).await {
-            Ok(()) => {
-                if let Some(standby) = locked(&self.standby)
-                    .as_mut()
-                    .filter(|standby| standby.generation() == generation)
-                {
-                    standby.prepared = true;
-                }
-                info!(generation, "the standby captured its graphs and stands by");
-            }
-            Err(reason) => warn!(
-                generation,
-                "the standby did not take the epoch's modules while parked: {reason}; a \
-                 promotion hands them over itself"
-            ),
-        }
-    }
-
-    /// Gives every main process of `client`'s engine the modules the epoch serves.
-    async fn hand_modules(self: &Arc<Self>, client: &Arc<EngineClient>) -> Result<(), String> {
-        let Some(epochs) = self
-            .registry
-            .upgrade()
-            .and_then(|registry| registry.updates.upgrade())
-            .map(|driver| Arc::clone(driver.epochs()))
-        else {
-            return Ok(());
-        };
-        let config = locked(&self.config).clone();
-        let processes = client.processes();
-        if processes.is_empty() {
-            return Err("the standby states no engine number".to_owned());
-        }
-        let handed = tokio::task::spawn_blocking(move || epochs.hand_to(processes, &config));
-        match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(failure))) => Err(format!("{}: {}", failure.kind, failure.reason)),
-            Ok(Err(error)) => Err(format!("the handover did not complete: {error}")),
-            Err(_) => Err(format!(
-                "it answered nothing within {} s",
-                SWITCH_TIMEOUT.as_secs()
-            )),
-        }
-    }
-
-    /// Whether a switch still decides which engine serves this replica.
-    pub(crate) fn follows_a_switch(&self) -> bool {
-        self.following.load(Ordering::SeqCst)
-    }
-
     /// Starts the standby in the background, if this replica serves and has
     /// none. Errors are logged: a replica without a standby still serves, and a
     /// loss then relaunches ([`Replica::recover`]) instead of promoting.
@@ -2847,16 +2321,16 @@ impl Replica {
     /// deployment serves. A switch moves service to its target through the
     /// frontend, and the replica's own engine is then the drained previous
     /// epoch's: it keeps no standby and is not promoted, because nothing routes
-    /// to it and a promoted process would be a second engine of a purged epoch.
+    /// to it and a promoted process would be a second engine of a released epoch.
     fn serves_serving_epoch(&self) -> bool {
-        let Some(driver) = self
+        let Some(updater) = self
             .registry
             .upgrade()
             .and_then(|registry| registry.updates.upgrade())
         else {
             return true;
         };
-        let Some((epoch, _)) = driver.epochs().serving() else {
+        let Some((epoch, _)) = updater.epochs().serving() else {
             return true;
         };
         let Some(served) = locked(&self.served).as_ref().map(|args| args.epoch) else {
@@ -2865,17 +2339,17 @@ impl Replica {
         epoch == served
     }
 
-    /// The failure-domain rules over `serving`'s main processes: the rules this replica keeps, or
+    /// The failure-domain rules over `serving`'s engines: the rules this replica keeps, or
     /// new ones when `serving` is another engine than theirs (a promotion or a relaunch replaced
     /// it).
     fn domain_of(
         &self,
         serving: &EngineClient,
-    ) -> std::sync::MutexGuard<'_, Option<crate::standby::Roster>> {
+    ) -> std::sync::MutexGuard<'_, Option<crate::standby::Standbys>> {
         let config = locked(&self.config).engine_config().ok();
         let mut domain = locked(&self.domain);
-        let current = domain.as_ref().is_some_and(|roster| {
-            let members: Vec<u64> = roster
+        let current = domain.as_ref().is_some_and(|standbys| {
+            let members: Vec<u64> = standbys
                 .domains()
                 .iter()
                 .flatten()
@@ -2889,7 +2363,7 @@ impl Replica {
             members == serving
         });
         if !current && let Some(config) = config {
-            *domain = Some(crate::standby::Roster::new(domain_processes(
+            *domain = Some(crate::standby::Standbys::new(domain_processes(
                 serving, &config,
             )));
         }
@@ -2921,8 +2395,8 @@ impl Replica {
             let mut domain = locked(&self.domain);
             let hosts: Vec<String> = domain
                 .as_ref()
-                .map(|roster| {
-                    roster
+                .map(|standbys| {
+                    standbys
                         .domains()
                         .iter()
                         .flatten()
@@ -2932,7 +2406,12 @@ impl Replica {
                 .unwrap_or_default();
             domain
                 .as_mut()
-                .map(|roster| hosts.iter().flat_map(|host| roster.retired(host)).collect())
+                .map(|standbys| {
+                    hosts
+                        .iter()
+                        .flat_map(|host| standbys.retired(host))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         self.end_standby_world(&retired);
@@ -2953,14 +2432,14 @@ impl Replica {
     pub(crate) fn restart_standby(self: &Arc<Self>) {
         let lost: Vec<crate::standby::Action> = {
             let mut domain = locked(&self.domain);
-            let host = domain.as_ref().and_then(|roster| {
-                roster
+            let host = domain.as_ref().and_then(|standbys| {
+                standbys
                     .domains()
                     .first()
                     .and_then(|members| members.first().map(|process| process.host.clone()))
             });
             match (domain.as_mut(), host) {
-                (Some(roster), Some(host)) => roster.standby_lost(&host),
+                (Some(standbys), Some(host)) => standbys.standby_lost(&host),
                 _ => Vec::new(),
             }
         };
@@ -2995,13 +2474,13 @@ impl Replica {
     }
 
     /// Starts the standby that stands beside this replica's serving engine, if
-    /// one is wanted and none is live (§2.5).
+    /// one is wanted and none is live.
     ///
-    /// The failure-domain rules decide (`crate::standby::Roster::serve`): the serving engine's
-    /// main processes are one domain, one per host its worker group spans, and the domain keeps a
+    /// The failure-domain rules decide (`crate::standby::Standbys::serve`): the serving epoch's
+    /// engines are one domain, one per host its worker group spans, and the domain keeps a
     /// standby of every member or of none, all resident or all suspended (the deployment's
     /// `worker_config.standby_storage`, its `auto` decided by what each host's devices can keep).
-    /// The standby world is started under numbers from the epoch layer's one allocator, claims
+    /// The standby world is started under numbers from the epoch records' one allocator, claims
     /// each scope's storage read-only (the launch file states the role and the storage mode), and
     /// parks once it is prepared. A replica whose engine is itself parked, draining or failing has
     /// no standby: there is nothing to stand beside.
@@ -3011,8 +2490,8 @@ impl Replica {
     /// Fails when the processes cannot be started or do not report that they
     /// stand by. The caller decides whether to retry.
     pub(crate) async fn keep_standby(self: &Arc<Self>) -> anyhow::Result<()> {
-        // `worker_config.standby` decides whether a standby exists at all
-        // (§2.5): each standby rank holds a CUDA context, graph pools and
+        // `worker_config.standby` decides whether a standby exists at all:
+        // each standby rank holds a CUDA context, graph pools and
         // workspaces of its own, and a deployment that has not reserved them
         // cannot hold a second engine of the same scope.
         let (wanted, storage) = {
@@ -3039,7 +2518,7 @@ impl Replica {
             let mut slot = locked(&self.standby);
             match slot.as_ref().map(|standby| standby.client.state()) {
                 // A parked standby is the one this replica wants.
-                Some(EngineState::Standby) => return Ok(()),
+                Some(EngineState::Parked) => return Ok(()),
                 // A standby that failed or ended is replaced: dropping the
                 // client closes its control connections, and its processes end.
                 Some(_) => *slot = None,
@@ -3049,15 +2528,15 @@ impl Replica {
         let Some(mut args) = locked(&self.served).clone() else {
             return Ok(());
         };
-        let Some(driver) = self
+        let Some(updater) = self
             .registry
             .upgrade()
             .and_then(|registry| registry.updates.upgrade())
         else {
             return Ok(());
         };
-        let epochs = Arc::clone(driver.epochs());
-        // The engine control numbered every main process it started, those of other hosts
+        let epochs = Arc::clone(updater.epochs());
+        // The engine control numbered every engine it started, those of other hosts
         // included: the standby's numbers come after them.
         epochs.launched_up_to(
             crate::engine::control::ENGINE_GROUP,
@@ -3071,19 +2550,19 @@ impl Replica {
         };
 
         // The rules' round: every member's next number from the one counter, then the spawns. One
-        // counter numbers every main process of the deployment, so the members' numbers differ.
+        // counter numbers every engine of the deployment, so the members' numbers differ.
         let (spawns, members) = {
             let mut domain = self.domain_of(&serving);
-            let Some(roster) = domain.as_mut() else {
+            let Some(standbys) = domain.as_mut() else {
                 return Ok(());
             };
-            let members = roster
+            let members = standbys
                 .domains()
                 .into_iter()
                 .flatten()
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut actions = roster.serve(crate::epoch::Status::Serving, options, &rooms);
+            let mut actions = standbys.serve(crate::epoch::Status::Serving, options, &rooms);
             if actions
                 .iter()
                 .any(|action| matches!(action, crate::standby::Action::Allocate { .. }))
@@ -3091,10 +2570,10 @@ impl Replica {
                 for action in &actions {
                     if let crate::standby::Action::Allocate { host, group, .. } = action {
                         let generation = epochs.next_generation(group, 0);
-                        roster.allocated(host, generation);
+                        standbys.allocated(host, generation);
                     }
                 }
-                actions = roster.serve(crate::epoch::Status::Serving, options, &rooms);
+                actions = standbys.serve(crate::epoch::Status::Serving, options, &rooms);
             }
             let spawns: Vec<(String, u64, crate::standby::Storage)> = actions
                 .into_iter()
@@ -3132,7 +2611,7 @@ impl Replica {
 
         // The standby executes the serving engine's epoch: it maps that epoch's
         // weights and its KV cache read-only, ready to be promoted into the same
-        // scope (§2.5). What a successor maps is the cache the serving engine
+        // scope. What a successor maps is the cache the serving engine
         // holds **now**, not the segments it started with: a cache that grew or
         // was resized since the launch would hand the standby units that are
         // shorter than the ones it will be promoted into, and the failure would
@@ -3174,9 +2653,9 @@ impl Replica {
                 return Err(error);
             }
         };
-        if let Some(roster) = locked(&self.domain).as_mut() {
+        if let Some(standbys) = locked(&self.domain).as_mut() {
             for (host, generation) in &generations {
-                roster.parked(host, *generation);
+                standbys.parked(host, *generation);
             }
         }
         info!(
@@ -3187,9 +2666,7 @@ impl Replica {
         *locked(&self.standby) = Some(Standby {
             client,
             generations,
-            prepared: false,
         });
-        self.prepare_parked_standby().await;
         Ok(())
     }
 
@@ -3197,21 +2674,21 @@ impl Replica {
     /// loss relaunches it.
     fn lose_standby(&self, generations: &[(String, u64)]) {
         let actions: Vec<crate::standby::Action> = match locked(&self.domain).as_mut() {
-            Some(roster) => generations
+            Some(standbys) => generations
                 .iter()
-                .flat_map(|(host, _)| roster.standby_lost(host))
+                .flat_map(|(host, _)| standbys.standby_lost(host))
                 .collect(),
             None => Vec::new(),
         };
         self.end_standby_world(&actions);
     }
 
-    /// Promotes the parked standby in place if this replica has one (§2.5), and
-    /// answers the client that now serves.
+    /// Promotes the parked standby in place if this replica has one, and
+    /// returns the client that now serves.
     ///
-    /// The failure-domain rules decide (`crate::standby::Roster::failed`): the domain's parked
+    /// The failure-domain rules decide (`crate::standby::Standbys::failed`): the domain's parked
     /// standbys are promoted together, every promotion issued before any is awaited, or, when a
-    /// member has none, the domain is relaunched instead and this answers `None`. The promoted
+    /// member has none, the domain is relaunched instead and this returns `None`. The promoted
     /// processes are the same processes, with their graphs at their addresses: each takes the
     /// storage its scope claimed read-only and serves under the serving engine's epoch.
     pub(crate) async fn promote_standby(self: &Arc<Self>) -> Option<Arc<EngineClient>> {
@@ -3220,17 +2697,17 @@ impl Replica {
         let starting = self.standby_starting.lock().await;
         let failure = crate::epoch::Failure {
             kind: "process_exit".to_owned(),
-            reason: "the serving engine's main process ended".to_owned(),
+            reason: "the serving engine ended".to_owned(),
             device: None,
         };
         let promotions: Vec<(String, u64)> = {
             let mut domain = locked(&self.domain);
-            let roster = domain.as_mut()?;
-            let host = roster
+            let standbys = domain.as_mut()?;
+            let host = standbys
                 .domains()
                 .first()
                 .and_then(|members| members.first().map(|process| process.host.clone()))?;
-            roster
+            standbys
                 .failed(&host, &failure)
                 .into_iter()
                 .filter_map(|action| match action {
@@ -3250,27 +2727,37 @@ impl Replica {
         }
         let standby = locked(&self.standby).take()?;
         self.hold.hold();
-        // A standby prepares while it parks (`prepare_parked_standby`), and one that is lost to
-        // before its modules reached it takes them here. A promotion that named it serving with
-        // no modules would answer 503 to every request, so the daemon hands them over before it
-        // moves the frontend, and the engine's own refusal of a promotion that holds no generation is a guard
-        // rather than the only defence.
-        if !standby.prepared
-            && let Err(reason) = self.hand_modules(&standby.client).await
-        {
-            warn!(
-                generation = standby.generation(),
-                "the standby did not take the epoch's modules: {reason}; the engine is relaunched"
-            );
-            *locked(&self.domain) = None;
-            return None;
-        }
         drop(starting);
-        match standby.client.promote(Vec::new(), false, true).await {
+        // The promotion travels on each engine's process link, as an epoch
+        // update's does; no state is handed over, because the engine that
+        // held it is gone. Every promotion is issued before any is awaited:
+        // the ranks' collectives resume together.
+        let updater = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())?;
+        let ranks = locked(&self.config)
+            .engine_config()
+            .ok()
+            .and_then(|config| crate::engine::control::world_hosts(&config).ok())
+            .unwrap_or_default();
+        for (host, generation) in &promotions {
+            let rank = ranks
+                .iter()
+                .find(|ranks| ranks.host == *host)
+                .map_or(0, |ranks| ranks.first);
+            updater.promote(
+                host,
+                crate::engine::control::ENGINE_GROUP,
+                rank,
+                *generation,
+            );
+        }
+        match standby.client.await_serving().await {
             Ok(()) => {
-                if let Some(roster) = locked(&self.domain).as_mut() {
+                if let Some(standbys) = locked(&self.domain).as_mut() {
                     for (host, generation) in &promotions {
-                        roster.promoted(host, *generation);
+                        standbys.promoted(host, *generation);
                     }
                 }
                 // The promoted world is the engine that serves; the rules over it start anew.
@@ -3284,9 +2771,9 @@ impl Replica {
                 Some(standby.client)
             }
             Err(error) => {
-                if let Some(roster) = locked(&self.domain).as_mut() {
+                if let Some(standbys) = locked(&self.domain).as_mut() {
                     for (host, _) in &promotions {
-                        roster.promote_failed(host);
+                        standbys.promote_failed(host);
                     }
                 }
                 *locked(&self.domain) = None;
@@ -3307,7 +2794,7 @@ impl Replica {
     ///
     /// # Errors
     ///
-    /// Ends the parked standby this replica keeps, if it has one (§2.5).
+    /// Ends the parked standby this replica keeps, if it has one.
     ///
     /// A standby is a process of its own: ending it here means nothing of this
     /// replica's stays on the device after the daemon is gone, and a successor
@@ -3389,17 +2876,13 @@ impl Replica {
             paused: self.hold().is_paused(),
             asleep: self.asleep.load(Ordering::Acquire),
             sleep_paused: self.sleep_paused.load(Ordering::Acquire),
-            unavailable: locked(&self.epochs).unavailable.values().cloned().collect(),
+            unavailable: self
+                .registry
+                .upgrade()
+                .and_then(|registry| registry.updates.upgrade())
+                .map(|updater| updater.unavailable_marks())
+                .unwrap_or_default(),
         })
-    }
-
-    /// Takes over the configurations a rollback marked unavailable on the
-    /// leader a hot restart replaced.
-    pub(crate) fn adopt_unavailable(&self, unavailable: Vec<crate::updates::epoch::Unavailable>) {
-        let mut epochs = locked(&self.epochs);
-        for mark in unavailable {
-            epochs.unavailable.insert(mark.digest.clone(), mark);
-        }
     }
 
     /// Takes over the pause and sleep of the leader a hot
@@ -3418,14 +2901,15 @@ impl Replica {
         let hold = self.hold();
         let (engine, reason) = match hold.state() {
             HoldState::Engine(state) => match state {
-                EngineState::Ready => ("ready", None),
-                EngineState::Standby => ("standby", None),
+                EngineState::Starting => ("starting", None),
                 EngineState::Parked => ("parked", None),
+                EngineState::Serving => ("serving", None),
+                EngineState::Draining => ("draining", None),
+                EngineState::Stopped => ("stopped", None),
                 EngineState::Failed(reason) => ("failed", Some(reason)),
-                EngineState::Closed => ("closed", None),
             },
             HoldState::Holding => ("holding", None),
-            HoldState::Closed(reason) => ("stopped", Some(reason)),
+            HoldState::Closed(reason) => ("closed", Some(reason)),
         };
         LeaderStatus {
             deployment: self.served_model_name.clone(),
@@ -3439,14 +2923,18 @@ impl Replica {
             // The leader's status counts the deployment's held requests.
             held: 0,
             generation: hold.client().and_then(|client| client.engine()),
-            standby: locked(&self.standby).as_ref().map(|standby| StandbyStatus {
-                generations: standby
-                    .generations
-                    .iter()
-                    .map(|(_, generation)| *generation)
-                    .collect(),
-                prepared: standby.prepared,
-            }),
+            standby: locked(&self.standby)
+                .as_ref()
+                .map(|standby| {
+                    standby
+                        .generations
+                        .iter()
+                        .map(|(_, generation)| *generation)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // The leader's status states the deployment's update.
+            update: None,
         }
     }
 
@@ -3615,7 +3103,7 @@ impl Replica {
         }
         *locked(&self.config) = config;
         // A parked standby mapped the weights this update replaced, and a promotion would serve
-        // them: it starts again on the new ones (§2.5).
+        // them: it starts again on the new ones.
         self.restart_standby();
         info!(
             model = model_path,
@@ -3704,7 +3192,7 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
         // relaunch here would start a second engine for a deployment another daemon
         // serves.
         if replica
-            .handed_over
+            .handoff_sent
             .load(std::sync::atomic::Ordering::Acquire)
         {
             tracing::info!(
@@ -3721,37 +3209,19 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
             return;
         }
         drop(lost_client);
-        // Once the switch's target serves, the engine this replica lost is
-        // the target's: the switch judges its death itself and reverts to the
-        // previous epoch, and a relaunch from here would start the target
-        // again from a `served` spec the switch is in the middle of reverting.
-        // Before the switchover the lost engine is the previous epoch's, which
-        // a relaunch restores as any loss does.
+        // Once an epoch update's target serves, the engine this replica lost
+        // is the target's: the update judges its death itself and rolls back
+        // to the previous epoch, and a relaunch from here would start the
+        // target again from arguments the update is putting back. Before the
+        // switch the lost engine is the previous epoch's, which a relaunch
+        // restores as any loss does.
         if replica.following.load(Ordering::SeqCst) {
-            tracing::info!(%reason, "the engine ended under an epoch switch, which owns it");
+            tracing::info!(%reason, "the engine ended under an epoch update, which owns it");
             return;
         }
-        if let Some(registry) = replica.registry.upgrade()
-            && let Some(updates) = registry.updates.upgrade()
-            && updates.phase().is_some_and(|phase| {
-                matches!(
-                    phase,
-                    crate::updates::switch::Phase::Serving
-                        | crate::updates::switch::Phase::Probation
-                        | crate::updates::switch::Phase::Committing
-                        | crate::updates::switch::Phase::Reverting
-                )
-            })
-        {
-            tracing::error!(
-                %reason,
-                "the engine was lost while the switch's target served; the switch reverts"
-            );
-            return;
-        }
-        // An epoch the deployment no longer serves is relaunched, not promoted:
-        // the frontend serves another epoch, and a revert to this one has to
-        // find its engine alive.
+        // An epoch the deployment no longer serves is relaunched, not
+        // promoted: requests go to another epoch, and a rollback to this one
+        // has to find its engine alive.
         if replica.serves_serving_epoch()
             && let Some(promoted) = replica.promote_standby().await
         {
@@ -3775,22 +3245,22 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
     }
 }
 
-/// Waits until the engine whose states `states` observes stops serving,
-/// and returns why. A draining or standing-by engine is no loss — but an epoch
-/// the deployment stops serving keeps no standby, and a parked engine is the
-/// first moment the watcher learns the switch drained it: the standby's
-/// read-only claim on that epoch would outlive the purge that frees it.
+/// Waits until the engine whose states `states` observes is lost, and
+/// returns why. A draining or parked engine is no loss, but an epoch the
+/// deployment stops serving keeps no standby, and a parked engine is the
+/// first moment the watcher learns an update drained it: the standby's
+/// read-only claim on that epoch would outlive the release that frees it.
 async fn lost(mut states: watch::Receiver<EngineState>, replica: &Replica) -> String {
     loop {
         match states.borrow_and_update().clone() {
-            EngineState::Parked | EngineState::Standby => {
+            EngineState::Parked | EngineState::Draining => {
                 if !replica.serves_serving_epoch() {
                     replica.drop_standby();
                 }
             }
-            EngineState::Ready => {}
+            EngineState::Starting | EngineState::Serving => {}
             EngineState::Failed(error) => return format!("the engine failed: {error}"),
-            EngineState::Closed => return "the engine process ended".to_owned(),
+            EngineState::Stopped => return "the engine process ended".to_owned(),
         }
         if states.changed().await.is_err() {
             return "the engine process ended".to_owned();
@@ -3906,7 +3376,7 @@ mod tests {
         })
     }
 
-    /// Answers `body` through the chat route of `engine`'s router.
+    /// Sends `body` through the chat route of `engine`'s router.
     async fn chat(
         router: &axum::Router,
         body: &serde_json::Value,
@@ -3992,7 +3462,7 @@ mod tests {
     async fn concurrent_requests_spread_over_engine_cores() {
         // Every wait in this test is bounded and named: an unbounded wait here
         // reads as a suite that hung, with no line saying which of the seven
-        // answers the leader never gave.
+        // responses the leader never gave.
         let mut clients = Vec::new();
         for _ in 0..2 {
             let core = serving_core("sim-model");
@@ -4068,8 +3538,8 @@ mod tests {
             .expect("shutdown replica");
     }
 
-    /// Awaits `future`, failing by name when it does not answer within
-    /// `seconds`: a test whose unbounded wait hangs says which answer it never
+    /// Awaits `future`, failing by name when it does not respond within
+    /// `seconds`: a test whose unbounded wait hangs says which response it never
     /// got instead of outliving the suite's bound in silence.
     async fn within<T>(
         seconds: u64,
@@ -4078,13 +3548,13 @@ mod tests {
     ) -> T {
         match tokio::time::timeout(Duration::from_secs(seconds), future).await {
             Ok(value) => value,
-            Err(_) => panic!("{what} did not answer within {seconds} s"),
+            Err(_) => panic!("{what} did not respond within {seconds} s"),
         }
     }
 
     /// A chat prompt that exceeds the total capacity of a two-unit prefix
     /// cache is submitted and then rejected by engine admission. The
-    /// non-streamed response holds its head for the outcome, so it answers
+    /// non-streamed response holds its head for the result, so it reports
     /// that rejection as HTTP 400.
     #[tokio::test]
     async fn chat_admission_rejection_remains_a_bad_request() {
@@ -4388,26 +3858,26 @@ mod tests {
     }
 
     /// A standby exists only where the deployment reserved room for one and the
-    /// replica's epoch is the epoch the deployment serves (§2.5). Each of the
+    /// replica's epoch is the epoch the deployment serves. Each of the
     /// three conditions is a whole engine's device storage when it is wrong.
     #[test]
     fn a_standby_exists_only_where_the_deployment_reserved_one_and_the_epoch_serves() {
-        assert!(keeps_standby(true, EngineState::Ready, true));
+        assert!(keeps_standby(true, EngineState::Serving, true));
         // Nothing reserved: a second engine would take the serving engine's
         // memory, so the deployment asks for none.
-        assert!(!keeps_standby(false, EngineState::Ready, true));
+        assert!(!keeps_standby(false, EngineState::Serving, true));
         // A parked, standing-by, failed or closed engine has nothing to stand
         // beside, and a standby of a standby is a third copy.
         assert!(!keeps_standby(true, EngineState::Parked, true));
-        assert!(!keeps_standby(true, EngineState::Standby, true));
+        assert!(!keeps_standby(true, EngineState::Parked, true));
         assert!(!keeps_standby(
             true,
             EngineState::Failed("a fatal fault".into()),
             true
         ));
-        assert!(!keeps_standby(true, EngineState::Closed, true));
+        assert!(!keeps_standby(true, EngineState::Stopped, true));
         // An epoch a switch replaced keeps no standby: nothing routes to it, and
-        // its read-only claim would outlive the purge.
-        assert!(!keeps_standby(true, EngineState::Ready, false));
+        // its read-only claim would outlive the release.
+        assert!(!keeps_standby(true, EngineState::Serving, false));
     }
 }

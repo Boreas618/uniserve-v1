@@ -1,98 +1,30 @@
-//! The serve loop of the control thread: one pass reads the daemon, the peers and the schedulers,
-//! advances every update in flight by at most one stage, forwards the requests' events and
-//! watches the workers. Nothing here waits for a job: every wait is bounded by the watchdog's
-//! stall bound, and a wait that outlasts it is reported by name ([`Wait`]).
+//! The control thread's loop: it blocks until the daemon, a peer, a scheduler or a completion of
+//! its own work has something for it, or a timer is due, and then serves what arrived - the
+//! daemon's messages, the requests' events, the continuation of every piece of work whose
+//! completion woke it, and the watchdog's rules.
 
 use std::time::{Duration, Instant};
 
-use super::update::Action;
 use anyhow::{Result, bail};
-use ipc::{GenerationStatus, UpdateFailure};
+use ipc::UpdateFailure;
 use worker::control::Ready;
 use worker::device::Probe;
 use worker::watchdog::Running;
 
 use super::MainProcess;
+use super::generation::Action;
+use super::lifecycle::Lifecycle;
 
 /// How often the engine reports its counters.
 const METRICS_EVERY: Duration = Duration::from_secs(1);
 
-/// How closely an update's probation is watched while one is pending: the phase machine states an
-/// expiry, and the control thread asks it at least this often. A rollback window is stated in whole
-/// seconds, so the poll costs a wake per tenth of a second for the length of the window.
-const PROBATION_POLL: Duration = Duration::from_millis(100);
-
-/// How long a serve pass sleeps while a precopy, a warmup or a drain is in flight.
-const TRANSITION_POLL: Duration = Duration::from_millis(1);
-
-/// The window a daemon gives one generation command before it gives up on it, as this process
-/// must assume it (`crates/daemon/src/engine/control.rs`'s `COMMAND_TIMEOUT`): the engine does not
-/// know that constant, it knows that its own reports must arrive inside the window or a run says
-/// nothing but a timeout.
-const DAEMON_COMMAND_WINDOW: Duration = Duration::from_secs(120);
-
-/// A wait of the control path: when it began and when it was last reported.
-///
-/// Every step of the generation update is polled rather than blocked on, so a step that never
-/// advances is a run that hangs without a line. Each such wait reports itself by name, generation
-/// and elapsed time once per stall bound, and never ends the epoch: the command's own failure path
-/// decides, and a deadline that killed would be a second failure beside the one being chased.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Wait {
-    since: Option<Instant>,
-    reported_at: Option<Instant>,
-}
-
-impl Wait {
-    /// Notes whether the wait is on: it begins on the first pass that finds it waiting, and the
-    /// next pass that finds it over clears it.
-    fn note(&mut self, waiting: bool, now: Instant) {
-        if waiting {
-            self.since.get_or_insert(now);
-        } else {
-            self.since = None;
-            self.reported_at = None;
-        }
-    }
-
-    /// Reports the wait when it has stood a stall bound since it began, and again once per bound
-    /// after each report. Returns whether this pass reported it.
-    fn report(
-        &mut self,
-        name: &'static str,
-        generation: u64,
-        bound: Duration,
-        now: Instant,
-    ) -> bool {
-        let Some(since) = self.since else {
-            return false;
-        };
-        if now.duration_since(since) < bound {
-            return false;
-        }
-        if self
-            .reported_at
-            .is_some_and(|at| now.duration_since(at) < bound)
-        {
-            return false;
-        }
-        self.reported_at = Some(now);
-        tracing::warn!(
-            generation,
-            wait = name,
-            waited_s = now.duration_since(since).as_secs(),
-            "the control path is still waiting on this step and nothing has answered it yet"
-        );
-        true
-    }
-}
-
 impl MainProcess {
-    /// Serves until the daemon closes the process or a failure ends it.
+    /// Serves until the daemon shuts the process down or a failure ends it.
     ///
-    /// The control thread waits on its channels, never later than the watchdog's
-    /// deadline; each pass runs the watchdog over the workers and handles what
-    /// arrived.
+    /// Nothing here polls: every piece of work this thread starts wakes it when it ends (a
+    /// device submission, a host task, a scheduler's response, a work thread), so the wait's
+    /// deadline is the next timer alone - the watchdog's stall bound, the metrics report, or the
+    /// bound of a stage in flight.
     pub(super) fn serve(&mut self) -> Result<Option<UpdateFailure>> {
         let mut running = Vec::new();
         let mut reported = Instant::now();
@@ -105,47 +37,31 @@ impl MainProcess {
             // process is gone. It is read first: the rest of a pass may wait on a scheduler whose
             // batch waits for the lost ranks.
             if let Some(reason) = self.peers.lost() {
-                bail!("a main process of this epoch was lost: {reason}");
+                bail!("an engine process of this epoch was lost: {reason}");
             }
-            if self.stopping {
+            if self.state.lifecycle() == Lifecycle::Stopped {
                 // The report is stated once more on the way out: an epoch's counters are additive
-                // and a frontend that only saw the passes would lose the last second of them.
+                // and a daemon that only saw the passes would lose the last second of them.
                 self.send_metrics();
+                if let Err(error) = self.announce(false) {
+                    tracing::debug!(%error, "no daemon was told that this engine stopped");
+                }
                 return Ok(None);
             }
-            // Two obligations the control thread has that no event announces: the counters' report,
-            // and a probation running out. An idle epoch has no events at all, so a deadline naming
-            // only the stall rule would leave both to whatever traffic arrived - the dashboard would
-            // see nothing of a server nobody is asking, and a generation nobody accepted would sit
-            // on probation past the window that reverts it. Only a pending probation
-            // adds its poll, so an idle epoch without one keeps waking for its counters alone.
-            let stall = self.watchdog.deadline(oldest(&running));
-            let mut due = reported + METRICS_EVERY;
-            if self.rollback.is_some()
-                && matches!(self.update.phase(), super::update::Phase::Probation { .. })
-            {
-                due = due.min(Instant::now() + PROBATION_POLL);
+            let mut deadline = reported + METRICS_EVERY;
+            if let Some(stall) = self.watchdog.deadline(oldest(&running)) {
+                deadline = deadline.min(stall);
             }
-            // A transition moves one stage a pass, and what ends a stage is a device, a Build
-            // Server or a scheduler rather than a socket. Passes run back to back while one is in
-            // flight, so each stage costs what its work costs: a recovery is made of these stages,
-            // and a client's stream stands still for all of them.
-            if self.precopy.is_some()
-                || !self.warming.is_empty()
-                || self.draining.is_some()
-                || !self.owed.is_empty()
-                || self.weights.is_some()
-            {
-                due = due.min(Instant::now() + TRANSITION_POLL);
+            if let Some(bound) = self.stage_bound() {
+                deadline = deadline.min(bound);
             }
-            let deadline = Some(stall.map_or(due, |stall| stall.min(due)));
             // One metrics report a second, and a final one on the way out
             // (the daemon exports the engine's counters as metrics).
             if reported.elapsed() >= METRICS_EVERY {
                 self.send_metrics();
                 reported = Instant::now();
             }
-            for event in self.control.wait(deadline)? {
+            for event in self.control.wait(Some(deadline))? {
                 match event {
                     // Every front reads the same way: a frame from an attached daemon is served
                     // exactly as one from the daemon that launched this process, and the front it
@@ -155,28 +71,26 @@ impl MainProcess {
                             return Ok(Some(failure));
                         }
                     }
-                    // What these announce is read by the pass below, whatever woke it.
+                    // What these announce is read below, whatever woke the thread.
                     Ready::Process | Ready::Woken | Ready::Idle => {}
                 }
             }
 
             if let Some(reason) = self.peers.lost() {
-                bail!("a main process of this epoch was lost: {reason}");
+                bail!("an engine process of this epoch was lost: {reason}");
             }
 
-            // What the admitted requests produced since the last pass.
+            // What the admitted requests produced since the thread last ran.
             self.forward_events();
 
-            // The daemon's commands for this epoch: the generation layer's stages, the epoch layer's
-            // park and serve, and the shutdown. They arrive on the process interface, so a pass
-            // that did not look for them would never see an update.
+            // The daemon's commands for this engine arrive on the process interface.
             while let Some(command) = self.process.take_command()? {
                 if let Some(failure) = self.process_command(command)? {
                     return Ok(Some(failure));
                 }
             }
             // A daemon owns this process's life: an interface it closed is the end of the epoch,
-            // not a failure to report to it, so the pass stops by name and the process exits
+            // not a failure to report to it, so the loop stops by name and the process exits
             // cleanly. At a hot restart the interface that closes is the predecessor's, and the
             // successor holds the deployment: this process is still serving it, and ending here
             // would leave the successor with a front into nothing.
@@ -184,7 +98,7 @@ impl MainProcess {
                 self.control.watch_process(None);
                 let serving = self.control.live_attached();
                 if serving == 0 {
-                    self.stopping = true;
+                    self.state.stop();
                 } else if !self.noted_process_closed {
                     self.noted_process_closed = true;
                     tracing::warn!(
@@ -195,18 +109,12 @@ impl MainProcess {
                 }
             }
 
-            // A precopy in flight advances one stage per pass, never waiting on
-            // its builds or its devices.
-            self.note_waits();
-            self.advance_precopy()?;
-            self.advance_drain()?;
-            self.advance_owed();
-            self.advance_weights();
+            // The work whose completion woke the thread goes on.
+            if let Some(failure) = self.continue_work()? {
+                return Ok(Some(failure));
+            }
             if let Some(reason) = self.data.poisoned() {
                 bail!("a change of this rank's weights failed part of the way: {reason}");
-            }
-            if let Some(failure) = self.advance_warmup()? {
-                return Ok(Some(failure));
             }
 
             running = self.read_workers();
@@ -216,22 +124,50 @@ impl MainProcess {
             if let Some(failure) = self.watch_schedulers()? {
                 return Ok(Some(failure));
             }
-            if let Some(failure) = self.read_policy_answers()? {
-                return Ok(Some(failure));
-            }
-            if let Some(failure) = self.watch_probation()? {
-                return Ok(Some(failure));
-            }
             // A pass that took seconds was blocked somewhere inside it, and a process that is
-            // blocked reads as one that never answered: a handover's attach waits on exactly
+            // blocked reads as one that never responded: a handover's attach waits on exactly
             // that difference.
             if pass.elapsed() > Duration::from_secs(5) {
                 tracing::warn!(
                     millis = pass.elapsed().as_millis(),
-                    "a serve pass took longer than five seconds"
+                    "a pass of the control thread took longer than five seconds"
                 );
             }
         }
+    }
+
+    /// Continues every piece of work in flight whose completion arrived: the preparation, the
+    /// switch's captures, the drain, the operator's operations and the weight update. A piece
+    /// whose completion has not arrived is left as it is; its completion wakes this thread.
+    fn continue_work(&mut self) -> Result<Option<UpdateFailure>> {
+        if let Some(failure) = self.continue_prepare()? {
+            return Ok(Some(failure));
+        }
+        if let Some(failure) = self.continue_switch()? {
+            return Ok(Some(failure));
+        }
+        self.continue_drain()?;
+        self.continue_operations();
+        self.continue_weights();
+        Ok(None)
+    }
+
+    /// The earliest instant a stage in flight is failed by name for standing still: a timer, so
+    /// a stage whose completion never arrives is still read when its bound passes.
+    fn stage_bound(&self) -> Option<Instant> {
+        let bound = self.watchdog.stall_bound();
+        [
+            self.preparing
+                .as_ref()
+                .and_then(|prepare| prepare.bound(bound)),
+            self.switching
+                .as_ref()
+                .map(|switching| switching.bound(bound)),
+            self.draining.as_ref().map(|draining| draining.bound(bound)),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// The oldest unfinished command of each worker, in rank order, as the watchdog
@@ -246,8 +182,8 @@ impl MainProcess {
 
     /// The watchdog's rules: a job past half the watchdog timeout is reported with its
     /// batch, and while a job has run for a second the devices' contexts are
-    /// probed once a second for a sticky error. Both are failures of the epoch,
-    /// and of an update on probation.
+    /// probed once a second for a sticky error. Both are failures of the engine,
+    /// and of an update on trial.
     fn watch(&mut self, running: &[Running]) -> Result<Option<UpdateFailure>> {
         let now = Instant::now();
         for (_, stall) in self.watchdog.stalls(now, running) {
@@ -258,7 +194,7 @@ impl MainProcess {
 
         if self.watchdog.probe_due(now, oldest(running)) {
             self.watchdog.probed(now);
-            // The probe leaves an answered error latched in the device rather than failing, so a
+            // The probe leaves an error latched in the device rather than failing, so a
             // device that errored and one that is healthy are read in one pass, and only then is
             // the update's decision table applied to what was found.
             let mut sticky = Vec::new();
@@ -285,58 +221,45 @@ impl MainProcess {
         Ok(None)
     }
 
-    /// Applies the generation update's decision table to `failure`: a precopy failure discards
-    /// the new generation and serving goes on; a failure on probation reverts
-    /// the update; anything else ends the epoch's service. Returns the failure
-    /// that ends service, if any.
+    /// Applies the decision table to `failure`: a failed preparation is abandoned and serving
+    /// goes on; a failure on trial rolls the update back; anything else fails the engine.
+    /// Returns the failure that ends service, if any.
     pub(super) fn failure(&mut self, failure: UpdateFailure) -> Result<Option<UpdateFailure>> {
-        match self.update.action(&failure) {
-            Action::Discard => {
-                let generation = self.update.phase().generation().unwrap_or_default();
-                if let Err(error) = self.update.precopy_failed(generation, failure.clone()) {
-                    // The precopy this failure belongs to is no longer the one in flight - a revert
-                    // or a later precopy took its place. The failure is still reported, and a
-                    // serving process is not ended over bookkeeping that moved on.
-                    tracing::warn!(generation, %error, "a precopy failure arrived for no precopy");
-                }
-                self.report(GenerationStatus::PrecopyFailed {
-                    generation,
-                    failure,
-                });
+        match self.state.failure(&failure) {
+            Action::Abandon => {
+                self.abandon_prepare(failure.reason());
                 Ok(None)
             }
-            Action::Revert => {
-                let generation = self.update.phase().generation().unwrap_or_default();
+            Action::Rollback => {
                 let reason = failure.reason();
-                let status = self.revert(generation, failure)?;
-                // The answer goes out from here: a revert this process started - a warmup that
-                // failed, a device that could not continue - has no command to answer, and the
-                // daemon waiting on the switchover learns it from this report or not at all. Two
-                // minutes of silence and then a timeout is what its absence looks like.
-                self.report(status);
-                tracing::info!(generation, %reason, "an update on probation was reverted");
+                let (left, executed) = self.state.rollback_on_failure()?;
+                // The acknowledgement goes out from here: a rollback this engine started - a
+                // capture that failed, a device that could not continue - has no command to
+                // acknowledge, and the daemon learns of it from this report or not at all.
+                self.roll_back(left, executed)?;
+                let report = self.state.rolled_back(reason.clone());
+                self.send_report(report);
+                tracing::info!(generation = left, %reason, "an update on trial was rolled back");
                 Ok(None)
             }
-            Action::Epoch => {
-                // The three failures that end the epoch's service are said before it ends: the
-                // daemon replaces a stalled rank on the report, and a report that never arrives
-                // leaves it reading a process that exited for no stated reason.
-                self.report_ending(&failure);
+            Action::Fail => {
+                // The failure is said before the engine ends: the daemon replaces a failed
+                // engine on the report, and one that never arrives leaves it reading a process
+                // that exited for no stated reason.
+                self.report_failure(&failure);
                 Ok(Some(failure))
             }
         }
     }
 
-    /// States the failure that ends this epoch's service to the daemon.
-    ///
-    /// A failure with no report of its own is left unsaid rather than given a shape it does not
-    /// have; the process's exit still reaches the daemon.
-    fn report_ending(&mut self, failure: &UpdateFailure) {
+    /// States the failure that ends this engine's service to the daemon, on both links.
+    fn report_failure(&mut self, failure: &UpdateFailure) {
         use proto::process::report::Kind;
 
+        super::reports::state_failure(&mut self.control, &failure.reason());
         let kind = match failure {
             UpdateFailure::Stalled { stall } => Kind::Stalled(proto::process::Stalled {
-                generation: self.update.current(),
+                generation: self.state.generations.current(),
                 batch: stall
                     .batch_id
                     .map_or_else(String::new, |batch| batch.to_string()),
@@ -349,11 +272,7 @@ impl MainProcess {
                     .unwrap_or_default(),
                 elapsed_ms: stall.running_ms,
             }),
-            UpdateFailure::Device {
-                device,
-                error,
-                batch: _,
-            } => Kind::Fault(proto::process::Fault {
+            UpdateFailure::Device { device, error, .. } => Kind::Fault(proto::process::Fault {
                 kind: "sticky".to_owned(),
                 reason: error.clone(),
                 device: *device,
@@ -363,57 +282,31 @@ impl MainProcess {
                     request: format!("{request:?}"),
                 })
             }
-            _ => return,
+            // A start whose first generation could not be prepared, and a policy no previous
+            // module can replace: neither names a device.
+            UpdateFailure::Prepare { reason } | UpdateFailure::Threshold { reason } => {
+                Kind::Fault(proto::process::Fault {
+                    kind: "start".to_owned(),
+                    reason: reason.clone(),
+                    device: 0,
+                })
+            }
+            UpdateFailure::Policy { error } => Kind::Fault(proto::process::Fault {
+                kind: "policy".to_owned(),
+                reason: error.clone(),
+                device: 0,
+            }),
         };
         self.send_report(proto::process::Report { kind: Some(kind) });
     }
 
-    /// Reports the two waits of the epoch's start when they outlast a stall bound: the daemon's
-    /// first generation command, and this node's warmup. Neither fails anything - the failures
-    /// they precede state themselves - but a run that hangs here now says what it was waiting for.
-    fn note_waits(&mut self) {
-        let now = Instant::now();
-        let bound = self.watchdog.stall_bound();
-        self.command_wait
-            .note(self.announced_at.is_some() && self.commands_seen == 0, now);
-        self.command_wait
-            .report("the daemon's first generation command", 0, bound, now);
-        // The report is due inside the daemon's own window for the switchover this warmup answers: a
-        // wait reported later is a wait nobody reads, because the daemon gives up first and the log
-        // says only that something timed out.
-        let warmup_bound = bound.min(DAEMON_COMMAND_WINDOW / 2);
-        self.warmup_wait.note(!self.warming.is_empty(), now);
-        let generation = self
-            .warming
-            .first()
-            .map_or(0, |(_, _, generation)| *generation);
-        if self
-            .warmup_wait
-            .report("this node's warmup", generation, warmup_bound, now)
-        {
-            // The thread that is stuck cannot say what it is stuck in, so each device states the job
-            // it performs: a bucket's capture and a launch look identical from outside and are
-            // different defects.
-            for worker in &self.workers {
-                tracing::warn!(
-                    device = worker.device().0,
-                    performing = worker
-                        .performing()
-                        .unwrap_or_else(|| "between commands".to_owned()),
-                    captures = worker.capturing(),
-                    "a device that has not finished its warmup"
-                );
-            }
-        }
-    }
-
-    /// A scheduler thread that stopped ends the epoch's service, and the epoch says so.
+    /// A scheduler thread that stopped ends the engine's service, and the engine says so.
     ///
     /// With no scheduler no batch is formed, so no job runs and no job can stall: the stall rule
-    /// reports nothing and every request waits for a batch that will never be planned. The reason
+    /// reports nothing and every request waits for a batch that will never be formed. The reason
     /// the thread stopped is its own (a policy that trapped or ran out of fuel is the usual one),
-    /// and the update's decision table decides whether that ends the epoch or reverts the update
-    /// on probation.
+    /// and the decision table decides whether that fails the engine or rolls back the update on
+    /// trial.
     fn watch_schedulers(&mut self) -> Result<Option<UpdateFailure>> {
         for (rank, scheduler) in self.schedulers.iter().enumerate() {
             if !scheduler.is_dead() {

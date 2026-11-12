@@ -224,7 +224,7 @@ impl Scheduler {
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             step_generation: 0,
             starvation_judged: scheduling::guest::Nanos(0),
-            policy_precopy: None,
+            policy_prepare: None,
             policy_prepared: None,
             progress: crate::CommandWaker::noop(),
             policy_stage: None,
@@ -811,6 +811,10 @@ impl Scheduler {
             // step has not finished.
             self.settle_shadow();
             if !self.failed() && !progressed {
+                // The control thread blocks until something wakes it, and what this pass
+                // responded to it (a park, a policy stage, a shadow pass) may have been sent
+                // after the step's own wake: it reads those before this thread blocks.
+                self.progress.wake();
                 self.wait(None);
             }
             if self.failed() {
@@ -823,6 +827,8 @@ impl Scheduler {
                     self.hand_back_requests();
                 }
                 self.abort_all_requests();
+                // The control thread learns of the stop from the handle, when it next runs.
+                self.progress.wake();
                 return true;
             }
         }

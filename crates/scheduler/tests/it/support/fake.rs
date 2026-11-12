@@ -96,11 +96,8 @@ impl Serving {
         // from then on, as a stopped engine's are.
         let (stopped, stop) = crossbeam_channel::bounded::<()>(0);
         let forwarder = std::thread::spawn(move || {
-            super::applied(installer.precopy_policy(program, source), "a precopy");
-            super::applied(
-                installer.stage(scheduler::Stage::Switchover),
-                "a switchover",
-            );
+            super::applied(installer.prepare_policy(program, source), "a precopy");
+            super::applied(installer.stage(scheduler::Stage::Switch), "a switchover");
             loop {
                 crossbeam_channel::select! {
                     recv(commands) -> command => {

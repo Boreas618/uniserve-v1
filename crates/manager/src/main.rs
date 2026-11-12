@@ -3,7 +3,9 @@
 //!
 //! The manager is a client of each node's admin API (`/admin`) and nothing
 //! else: no daemon, engine, worker or Storage Server waits for it or keeps
-//! state of it. It attaches to a node by reading its status and its event
+//! state of it. A node's admin API listens on a Unix socket whose file
+//! permissions are its access (`unix:<path>`); an `http://` address names an
+//! admin socket forwarded from another host. It attaches to a node by reading its status and its event
 //! log and detaches by stopping; a write it sends is carried out by the
 //! node whether the manager stays or not. Every command acts on the nodes
 //! `--node` names, in the order given:
@@ -17,7 +19,7 @@
 //!   up, a serving one changes it in place or in a new epoch on trial,
 //!   which `--commit-after` commits once it served that long. Each node is
 //!   one service's leader: the manager decides the order of their updates
-//!   from the GPUs and hosts they share and the storage their plans
+//!   from the GPUs and hosts they share and the storage their dry runs
 //!   require ([`updates`]), so that two services that share a GPU never
 //!   prepare at once.
 //! - `commit`, `rollback`: end each node's trial.
@@ -44,8 +46,9 @@ mod updates;
     about = "Manage UniServe deployments through their nodes' admin API"
 )]
 struct Cli {
-    /// A node's base URL, such as `http://10.0.0.2:8000`; repeated for
-    /// several, before the command.
+    /// A node's admin API: its Unix socket (`unix:/run/user/1000/admin-8000.sock`),
+    /// or the base URL the socket is forwarded at; repeated for several,
+    /// before the command.
     #[arg(long = "node", required = true)]
     nodes: Vec<String>,
     /// The nodes' API key.
@@ -70,7 +73,7 @@ enum Command {
     /// Change each node's configuration: an idle node brings the
     /// deployment up, a serving one changes it in place or in a new epoch
     /// on trial. Nodes whose services share a GPU update one after another,
-    /// each once its plan fits; a failure stops the nodes not started.
+    /// each once its dry run fits; a failure stops the nodes not started.
     Apply {
         /// The whole TOML configuration, as `uniserve serve --config` reads
         /// it; each node's current one when unset.
@@ -83,7 +86,7 @@ enum Command {
         /// they reached (`keep`) or compute it again (`recompute`).
         #[arg(long, default_value = "keep")]
         in_flight: String,
-        /// Report each node's plan and the order the manager decides, and
+        /// Report each node's dry run and the order the manager decides, and
         /// change nothing.
         #[arg(long)]
         dry_run: bool,
@@ -128,29 +131,47 @@ enum Command {
 /// One node's admin API.
 #[derive(Clone)]
 struct Node {
+    /// The node's address as the operator stated it, which names it in every
+    /// line the manager prints.
     base: String,
+    /// The URL prefix of its routes: the address itself, or a placeholder
+    /// host for a Unix socket, which the client connects by path.
+    url: String,
     http: reqwest::Client,
     api_key: Option<String>,
 }
 
 impl Node {
-    fn new(base: &str, http: &reqwest::Client, api_key: Option<&str>) -> Self {
-        Self {
-            base: base.trim_end_matches('/').to_owned(),
-            http: http.clone(),
+    /// The node at `address`: `unix:<path>` for its admin socket, else a base
+    /// URL.
+    fn new(address: &str, api_key: Option<&str>) -> Result<Self> {
+        let (http, url) = match address.strip_prefix("unix:") {
+            Some(path) => (
+                reqwest::Client::builder().unix_socket(path),
+                "http://admin".to_owned(),
+            ),
+            None => (
+                reqwest::Client::builder(),
+                address.trim_end_matches('/').to_owned(),
+            ),
+        };
+        Ok(Self {
+            base: address.trim_end_matches('/').to_owned(),
+            url,
+            http: http.build().context("building the HTTP client")?,
             api_key: api_key.map(str::to_owned),
-        }
+        })
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let request = self.http.request(method, format!("{}{path}", self.base));
+        let request = self.http.request(method, format!("{}{path}", self.url));
         match &self.api_key {
             Some(key) => request.bearer_auth(key),
             None => request,
         }
     }
 
-    /// `GET path` as JSON; `None` when the node answers 404 or 503.
+    /// `GET path` as JSON; `None` when the node responds 404 or 503.
     async fn get(&self, path: &str) -> Result<Option<Value>> {
         let response = self
             .request(reqwest::Method::GET, path)
@@ -168,17 +189,17 @@ impl Node {
             .await
             .with_context(|| format!("reading {}{path}", self.base))?;
         if !status.is_success() {
-            bail!("{}{path} answered {status}: {body}", self.base);
+            bail!("{}{path} responded {status}: {body}", self.base);
         }
         Ok(Some(body))
     }
 
-    /// `POST path` with a JSON body; the answer, which must succeed.
+    /// `POST path` with a JSON body; the response, which must succeed.
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         self.send(reqwest::Method::POST, path, body).await
     }
 
-    /// `PUT path` with a JSON body; the answer, which must succeed.
+    /// `PUT path` with a JSON body; the response, which must succeed.
     async fn put(&self, path: &str, body: &Value) -> Result<Value> {
         self.send(reqwest::Method::PUT, path, body).await
     }
@@ -196,7 +217,7 @@ impl Node {
             .await
             .with_context(|| format!("reading {}{path}", self.base))?;
         if !status.is_success() {
-            bail!("{}{path} answered {status}: {body}", self.base);
+            bail!("{}{path} responded {status}: {body}", self.base);
         }
         Ok(body)
     }
@@ -205,14 +226,11 @@ impl Node {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let http = reqwest::Client::builder()
-        .build()
-        .context("building the HTTP client")?;
     let nodes: Vec<Node> = cli
         .nodes
         .iter()
-        .map(|base| Node::new(base, &http, cli.api_key.as_deref()))
-        .collect();
+        .map(|address| Node::new(address, cli.api_key.as_deref()))
+        .collect::<Result<_>>()?;
     match cli.command {
         Command::Status => status(&nodes).await,
         Command::Watch { from_start } => watch(nodes, from_start).await,
@@ -263,22 +281,22 @@ async fn main() -> Result<()> {
                 poll: Duration::from_secs(1),
             };
             if dry_run {
-                updates::plan(&nodes, &options).await
+                updates::dry_run(&nodes, &options).await
             } else {
                 updates::apply(&nodes, &options).await
             }
         }
         Command::Commit => {
             for node in &nodes {
-                let answer = node.post("/admin/config/commit", &json!({})).await?;
-                println!("{}: {}", node.base, answer["result"]);
+                let response = node.post("/admin/config/commit", &json!({})).await?;
+                println!("{}: {}", node.base, response["result"]);
             }
             Ok(())
         }
         Command::Rollback => {
             for node in &nodes {
-                let answer = node.post("/admin/config/rollback", &json!({})).await?;
-                println!("{}: {}", node.base, answer["result"]);
+                let response = node.post("/admin/config/rollback", &json!({})).await?;
+                println!("{}: {}", node.base, response["result"]);
             }
             Ok(())
         }
@@ -293,7 +311,7 @@ async fn main() -> Result<()> {
         Command::Restart { executable } => {
             for node in &nodes {
                 println!("{}: restarting", node.base);
-                let answer = node
+                let response = node
                     .post(
                         "/admin/restart",
                         &json!({ "executable": executable, "wait": true }),
@@ -304,7 +322,7 @@ async fn main() -> Result<()> {
                     })?;
                 println!(
                     "{}: the daemon {} serves",
-                    node.base, answer["result"]["pid"]
+                    node.base, response["result"]["pid"]
                 );
             }
             Ok(())
@@ -318,8 +336,8 @@ async fn main() -> Result<()> {
 /// Posts `path` to every node.
 async fn each(nodes: &[Node], path: &str) -> Result<()> {
     for node in nodes {
-        let answer = node.post(path, &json!({})).await?;
-        println!("{}: {} {}", node.base, answer["kind"], answer["state"]);
+        let response = node.post(path, &json!({})).await?;
+        println!("{}: {} {}", node.base, response["kind"], response["state"]);
     }
     Ok(())
 }

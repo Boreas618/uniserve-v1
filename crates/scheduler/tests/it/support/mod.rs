@@ -228,6 +228,6 @@ pub(crate) fn install_policy_on(
     capacity: scheduler::BatchCapacity,
 ) {
     let program = fcfs(capacity, Parameters::default());
-    applied(handle.precopy_policy(program, policy_source()), "a precopy");
-    applied(handle.stage(scheduler::Stage::Switchover), "a switchover");
+    applied(handle.prepare_policy(program, policy_source()), "a precopy");
+    applied(handle.stage(scheduler::Stage::Switch), "a switchover");
 }

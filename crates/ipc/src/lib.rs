@@ -108,7 +108,7 @@ pub mod phase;
 pub mod product;
 mod request;
 mod tensor;
-/// The vocabulary of a generation update (§7.3).
+/// The vocabulary of a generation update.
 pub mod update;
 
 pub use batch::*;
@@ -132,4 +132,4 @@ pub use proto::request::{
 };
 pub use request::*;
 pub use tensor::*;
-pub use update::{GenerationStatus, UpdateFailure};
+pub use update::UpdateFailure;

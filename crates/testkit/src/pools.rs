@@ -85,7 +85,18 @@ fn launch(model: impl Into<String>) -> EngineArgs {
         2,
         proto::config::WorkerGroupConfig::single_component(proto::config::DEFAULT_BLOCK, 1),
     );
-    let mut args = EngineArgs::new(proto::config::EngineConfig {
+    // A fake runs no module: the set names the packages a launch file states.
+    let package = |backend: &str| proto::module::PackageRevision {
+        backend: backend.to_owned(),
+        revision: 1,
+        arguments: Default::default(),
+    };
+    let modules = proto::module::ModuleSet {
+        engine: package("uniserve"),
+        policy: package("fcfs"),
+        kernels: Default::default(),
+    };
+    let config = proto::config::EngineConfig {
         executable: proto::BUILD.to_owned(),
         model: proto::config::ModelConfig {
             model: model.into(),
@@ -136,7 +147,8 @@ fn launch(model: impl Into<String>) -> EngineArgs {
         speculative: Default::default(),
         video: Default::default(),
         profiling: Default::default(),
-    });
+    };
+    let mut args = EngineArgs::new(config, modules);
     // A fake keeps no host tier: it has no Storage Server to keep one in.
     args.engine_config.kv_cache.host_tier = false;
     args.host = "localhost".to_owned();

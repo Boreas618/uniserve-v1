@@ -284,7 +284,7 @@ impl DataPlane {
     /// Reserves `bytes` of device storage a session's collectors hold on `rank`'s device with the
     /// rank's process. Answers the quota's refusal; a process that reserves nothing yet, a standby,
     /// has nothing to reserve it beside.
-    fn book_profiling(&self, index: usize, bytes: u64) -> Result<Option<String>> {
+    fn reserve_profiling(&self, index: usize, bytes: u64) -> Result<Option<String>> {
         let mut reservations = lock(&self.reservations);
         let Some(reservation) = reservations.get_mut(index) else {
             return Ok(None);
@@ -324,7 +324,7 @@ impl DataPlane {
                 (rank.rank, rank.worker()?)
             };
             let held = worker::profiling::session::device_storage(&start.request, number);
-            if let Some(refusal) = self.book_profiling(index, held)? {
+            if let Some(refusal) = self.reserve_profiling(index, held)? {
                 answers.push(
                     serde_json::json!({
                         "rank": number,
@@ -358,7 +358,7 @@ impl DataPlane {
     /// reservation in the quota, which only overstates the rank's storage, so it is logged rather than
     /// failing the session's end.
     fn release_profiling(&self, index: usize) {
-        let failure = match self.book_profiling(index, 0) {
+        let failure = match self.reserve_profiling(index, 0) {
             Ok(None) => return,
             Ok(Some(refusal)) => refusal,
             Err(error) => error.to_string(),

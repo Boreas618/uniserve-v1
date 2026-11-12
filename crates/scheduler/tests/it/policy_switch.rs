@@ -101,17 +101,17 @@ impl Epoch {
             stated: Default::default(),
         };
         let source: Arc<dyn PolicySource + Send + Sync> = Arc::new(PolicyBytes::new(wasm));
-        response(self.handle.precopy_policy(package, source))
+        response(self.handle.prepare_policy(package, source))
     }
 
     /// The switchover's response: the step it applied at.
     fn switch_over(&self) -> Result<StageApplied, String> {
-        response(self.handle.stage(Stage::Switchover))
+        response(self.handle.stage(Stage::Switch))
     }
 
     /// The revert's response, as the caller that does not use the step reads it.
-    fn revert(&self) -> Result<(), String> {
-        response(self.handle.revert_policy())
+    fn rollback(&self) -> Result<(), String> {
+        response(self.handle.rollback_policy())
     }
 
     /// The step the scheduler reached, as it reports it.
@@ -219,7 +219,7 @@ fn the_package_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     // A precopy's policy module belongs to the process holding the Build
     // Server's client, which resolves it once and precopies each scheduler; the
     // command gets its response with that rather than half applied.
-    let precopy = ipc::GenerationCommand::Precopy {
+    let precopy = ipc::GenerationCommand::Prepare {
         generation: 1,
         packages: Box::default(),
         policy: proto::module::PackageRevision {
@@ -243,7 +243,7 @@ fn the_package_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     response(
         epoch
             .handle
-            .generation_command(ipc::GenerationCommand::Switchover {
+            .generation_command(ipc::GenerationCommand::Switch {
                 generation: 1,
                 step: Some(ahead),
             }),
@@ -262,12 +262,14 @@ fn the_package_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     epoch
         .precopy("fcfs", 3, toy())
         .expect("a candidate the boundary check can leave prepared");
-    let refused_step = response(epoch.handle.generation_command(
-        ipc::GenerationCommand::Switchover {
-            generation: 1,
-            step: Some(ahead - 1),
-        },
-    ))
+    let refused_step = response(
+        epoch
+            .handle
+            .generation_command(ipc::GenerationCommand::Switch {
+                generation: 1,
+                step: Some(ahead - 1),
+            }),
+    )
     .expect_err("a step the scheduler passed cannot be applied at");
     assert!(
         refused_step.contains("passed"),
@@ -280,7 +282,7 @@ fn the_package_layers_commands_reach_one_scheduler_and_name_what_they_need() {
         .expect("the second precopy");
     let waiting = epoch
         .handle
-        .generation_command(ipc::GenerationCommand::Switchover {
+        .generation_command(ipc::GenerationCommand::Switch {
             generation: 2,
             step: Some(epoch.step() + 1000),
         });
@@ -294,7 +296,7 @@ fn the_package_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     let refused = response(epoch.handle.commit_policy())
         .expect_err("a stage waits for the boundary already taken");
     assert!(
-        refused.contains("switchover"),
+        refused.contains("switch"),
         "the refusal names the stage that owns the boundary: {refused}"
     );
 }
@@ -364,7 +366,9 @@ fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_
     // A commit keeps the replaced policy until the next precopy (§7.3 step 5),
     // so a revert still finds it and brings it back.
     response(epoch.handle.commit_policy()).expect("the commit applies at a boundary");
-    epoch.revert().expect("the commit kept the previous policy");
+    epoch
+        .rollback()
+        .expect("the commit kept the previous policy");
     assert_eq!(
         named(packages(&epoch).running),
         Some(("fcfs".to_owned(), 3)),
@@ -373,7 +377,7 @@ fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_
 
     // The revert consumed it: there is nothing older to revert to.
     assert!(
-        epoch.revert().is_err(),
+        epoch.rollback().is_err(),
         "a second revert has no previous policy"
     );
 }
@@ -392,9 +396,9 @@ fn a_purge_drops_the_policy_a_revert_would_return_to() {
 
     // §7.3 step 6: the generation before the serving one is released once no
     // batch uses it, so the policy a revert would return to is gone.
-    response(epoch.handle.purge_policy()).expect("the purge applies at a boundary");
+    response(epoch.handle.release_policy()).expect("the purge applies at a boundary");
     assert!(
-        epoch.revert().is_err(),
+        epoch.rollback().is_err(),
         "a purged generation cannot be reverted to"
     );
 }
@@ -406,8 +410,8 @@ fn the_engines_commands_reach_a_scheduler_and_name_what_is_not_its_own() {
 
     // A stage of §7.3 is a scheduler's: it applies at the next boundary.
     let switchover = proto::process::Command {
-        kind: Some(proto::process::command::Kind::Switchover(
-            proto::process::Switchover { generation: 1 },
+        kind: Some(proto::process::command::Kind::Switch(
+            proto::process::Switch { generation: 1 },
         )),
     };
     response(epoch.handle.engine_command(switchover))
@@ -416,8 +420,8 @@ fn the_engines_commands_reach_a_scheduler_and_name_what_is_not_its_own() {
     // A precopy's module comes from the Build Server, whose client the
     // process holding it resolves: the command gets its response with that.
     let precopy = proto::process::Command {
-        kind: Some(proto::process::command::Kind::Precopy(
-            proto::process::Precopy {
+        kind: Some(proto::process::command::Kind::Prepare(
+            proto::process::Prepare {
                 kernels: Vec::new(),
                 policy: None,
             },
@@ -575,14 +579,12 @@ fn the_router_routes_switches_reverts_and_refuses_a_rank_it_was_not_offered() {
         router.route(&arrival, &ranks).is_err(),
         "no policy routes yet"
     );
-    assert!(router.switchover(&ranks).is_err(), "nothing was prepared");
+    assert!(router.switch(&ranks).is_err(), "nothing was prepared");
 
     let prepared = Router::prepare(&routing(1), program("a", 1), &ranks, &ceilings)
         .expect("the candidate prepares");
     router.adopt(prepared);
-    router
-        .switchover(&ranks)
-        .expect("the switchover installs it");
+    router.switch(&ranks).expect("the switchover installs it");
     assert_eq!(router.route(&arrival, &ranks).expect("a rank"), 1);
 
     // A program that names a rank it was not offered fails, and the
@@ -590,9 +592,7 @@ fn the_router_routes_switches_reverts_and_refuses_a_rank_it_was_not_offered() {
     let prepared = Router::prepare(&routing(5), program("b", 2), &ranks, &ceilings)
         .expect("the candidate prepares");
     router.adopt(prepared);
-    router
-        .switchover(&ranks)
-        .expect("the switchover installs it");
+    router.switch(&ranks).expect("the switchover installs it");
     assert_eq!(
         router
             .route(&arrival, &ranks)

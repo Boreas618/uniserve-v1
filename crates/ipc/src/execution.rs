@@ -1709,7 +1709,7 @@ pub trait Batches: Send + Sync {
     /// operators against the serving generation's kernels, compared by each operator's tolerance.
     ///
     /// A shadow batch never writes running memory and never serves a request; its failure is the
-    /// update's, which the main process reports as `PrecopyFailed`.
+    /// update's, which the main process reports as `PrepareFailed`.
     fn shadow(&self, batch: Batch) -> Result<Submission, Box<Fault>>;
 
     /// The bucket this worker would serve `computation` in, or `None` when it serves no such
@@ -1826,9 +1826,9 @@ pub enum EpochOperation {
     UpdateWeights(crate::memory::UpdateWeights),
     /// Takes over the KV cache units a predecessor epoch lent.
     AdoptCache(crate::memory::AdoptCache),
-    /// Publishes a precopy's claimed pages, which the ranks then serve as cached prefixes.
+    /// Publishes a cache warming's claimed pages, which the ranks then serve as cached prefixes.
     PublishCache(crate::memory::PublishCache),
-    /// Describes where the ranks hold a precopy's pages, for a successor's cache manifest.
+    /// Describes where the ranks hold a cache warming's pages, for a successor's cache manifest.
     CacheManifest(crate::memory::CacheManifest),
 }
 

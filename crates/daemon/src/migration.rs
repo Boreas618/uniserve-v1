@@ -659,7 +659,7 @@ mod tests {
 
     use super::*;
     use crate::engine::client::EngineClient;
-    use crate::test_support::{SERVED_MODEL, fake_client, fake_core, letter_fake};
+    use crate::test_support::{SERVED_MODEL, fake_core, letter_fake};
 
     /// A text request of a four-token prompt that generates `max_tokens`
     /// tokens.
@@ -683,9 +683,20 @@ mod tests {
     /// A client of one scheduler over a fake whose text never ends, so a
     /// request generates until its limit.
     fn client() -> Arc<EngineClient> {
+        engine().0
+    }
+
+    /// [`client`], with the engine's process link, on which its daemon
+    /// drains it.
+    fn engine() -> (
+        Arc<EngineClient>,
+        std::sync::mpsc::Sender<proto::process::Command>,
+    ) {
         let args = testkit::args(SERVED_MODEL);
         let fake = Arc::new(letter_fake(&args));
-        Arc::new(fake_client(vec![fake_core(args, fake)]))
+        let (client, commands, _reports) =
+            crate::test_support::fake_engine(vec![fake_core(args, fake)]);
+        (Arc::new(client), commands)
     }
 
     /// Receives the next event within ten seconds.
@@ -699,9 +710,9 @@ mod tests {
     /// its consumer reads every token it generates, one scheduling event,
     /// and a finish that charges its whole usage.
     #[tokio::test]
-    async fn a_parked_engines_request_continues_on_the_next_engine() {
+    async fn a_drained_engines_request_continues_on_the_next_engine() {
         let hold = Arc::new(RequestHold::new());
-        let first = client();
+        let (first, process) = engine();
         hold.serve(Arc::clone(&first));
         let migrator = Migrator::new(Arc::clone(&hold), 0);
         let (mut events, _) = migrator
@@ -715,11 +726,19 @@ mod tests {
                 Some(Event::TextToken { .. }) => tokens += 1,
                 Some(Event::Scheduled { .. }) => scheduled += 1,
                 Some(_) => {}
-                None => panic!("the request ended before its engine parked"),
+                None => panic!("the request ended before its engine drained"),
             }
         }
         hold.serve(client());
-        first.park(false).await.unwrap();
+        process
+            .send(proto::process::Command {
+                kind: Some(proto::process::command::Kind::Drain(
+                    proto::process::Drain {
+                        epoch: first.epoch(),
+                    },
+                )),
+            })
+            .unwrap();
 
         let finished = loop {
             match next(&mut events).await {

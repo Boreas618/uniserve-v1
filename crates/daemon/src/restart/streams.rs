@@ -11,7 +11,7 @@
 //! each response over: it takes the request's engine event stream over from
 //! the consumed position ([`crate::engine::client::EngineClient::take_over`],
 //! `uniserve.request.Command.Takeover`) so the request keeps generating and no
-//! token is computed twice, resumes the session from the handed state, writes
+//! token is computed twice, resumes the session from the handoff's state, writes
 //! the bytes the predecessor did not write, and goes on producing frames on the
 //! same socket.
 //!
@@ -35,7 +35,7 @@
 //! # Limits
 //!
 //! Only the responses item 1 covers are handed over: a chat completion
-//! streamed as server-sent events and one answered as a single JSON body, each
+//! streamed as server-sent events and one written as a single JSON body, each
 //! with a state a successor continues from. A covered response whose state
 //! cannot be frozen ends at the boundary instead of being kept here — the
 //! process that hands the deployment over does not wait for a response to end.
@@ -97,7 +97,7 @@ pub(crate) struct Adopted {
     ///
     /// This is the moment the engine serves the request to the successor, which
     /// is what the predecessor's `pause_ms` in `Paused::decide` runs to. It is
-    /// not §7.5.1's pause, which ends when the successor writes the response's
+    /// not the pause a client sees, which ends when the successor writes the response's
     /// next event: the successor's own `handoff adopted` record carries that,
     /// and [`adopted`] writes it from the serving path.
     pub(crate) at_ns: u64,
@@ -113,24 +113,23 @@ pub(crate) struct Adopted {
     pub(crate) descriptor: OwnedFd,
 }
 
-/// The responses a predecessor hands over, with the pause records that answer
-/// them.
+/// The responses a predecessor hands over, with the registrations it decides.
 pub(crate) struct Paused {
     /// The states the successor takes over.
     pub(crate) records: Vec<StreamHandoff>,
     /// The sockets they travel with, in the records' order.
     pub(crate) descriptors: Vec<OwnedFd>,
-    /// The registrations this process answers, in the same order.
+    /// The registrations this process decides, in the same order.
     frozen: Vec<FrozenStream>,
     /// The handoff this pause closed, for the path that gives it back.
     handoff: Option<Arc<crate::http::handoff::Handoff>>,
-    /// Whether the responses were answered: a pause that ends any other way
+    /// Whether the responses were decided: a pause that ends any other way
     /// gives the deployment back to this daemon.
     decided: bool,
 }
 
-/// A pause that ends without answering its responses — the successor gave up,
-/// or the takeover failed before it answered — gives the deployment back: the
+/// A pause that ends without deciding its responses — the successor gave up,
+/// or the takeover failed before it responded — gives the deployment back: the
 /// responses resume here (their decision's sender dies with this struct) and
 /// the daemon admits new requests again, instead of closing every connection
 /// for a handover that never happened.
@@ -157,7 +156,7 @@ impl Paused {
         }
     }
 
-    /// Answers every frozen response: the ones the successor `adopted` go to
+    /// Decides every frozen response: the ones the successor `adopted` go to
     /// it, and the rest resume here.
     ///
     /// Also writes the predecessor's handoff records — one `handoff stream`
@@ -166,7 +165,7 @@ impl Paused {
     /// of the response's engine stream ([`Adopted::at_ns`]), and one
     /// `handoff streams adopted` line after the last of them — which the
     /// deployment's restart test parses. This is the shorter of the two views:
-    /// §7.5.1's pause, which ends when the successor writes the response's next
+    /// the pause a client sees, which ends when the successor writes the response's next
     /// event, is the successor's [`adopted`] record.
     pub(crate) fn decide(mut self, adopted: &[Taken], successor_pid: u32) {
         self.decided = true;
@@ -188,7 +187,7 @@ impl Paused {
                     "pause_ms": pause_ms,
                     "frozen_at_ns": frozen.frozen_at_ns,
                     // When the engine moved this response's stream to the
-                    // successor (design §7.5.1 step 4). The ownership window
+                    // successor. The ownership window
                     // runs from here to the successor's first new frame, which
                     // its own `handoff adopted` record carries; it is null
                     // when the successor took nothing over. This is where the
@@ -227,7 +226,7 @@ impl Paused {
 impl super::Restarter {
     /// Stops every response in flight at its next engine event boundary and
     /// returns what the successor takes over: each response's state with a
-    /// descriptor of its socket, and the registrations this process answers.
+    /// descriptor of its socket, and the registrations this process decides.
     ///
     /// A response whose socket cannot be duplicated stays here and resumes
     /// when the successor names the responses it took.
@@ -254,10 +253,10 @@ impl super::Restarter {
         // Two counts, because they differ exactly when a response cannot be
         // handed over: every registration paused, and the ones whose socket
         // travelled. A paused response with no descriptor resumes here, and
-        // the deployment's restart test counts the handed ones.
+        // the deployment's restart test counts the ones in the handoff.
         info!(
             paused = frozen.len(),
-            handed = records.len(),
+            handoff = records.len(),
             "the responses in flight are paused"
         );
         Paused {
@@ -288,7 +287,7 @@ pub(crate) fn take_adopted() -> Vec<Adopted> {
     std::mem::take(&mut crate::leader::locked(&ADOPTED))
 }
 
-/// One response a successor took over, as it answers the predecessor.
+/// One response a successor took over, as it reports it to the predecessor.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Taken {
     /// The request's identity, as the deployment named it.
@@ -331,7 +330,7 @@ pub(crate) fn adopt(
                 warn!(
                     request_id = %record.request_id,
                     error = %error,
-                    "a handed-over response cannot be taken over; it stays with the predecessor"
+                    "a response of the handoff cannot be taken over; it stays with the predecessor"
                 );
             }
         }
@@ -340,7 +339,7 @@ pub(crate) fn adopt(
     Adoption { streams }
 }
 
-/// Takes one handed-over response over: its engine stream first, then its body
+/// Takes one response of the handoff over: its engine stream first, then its body
 /// from the state, then its connection.
 fn take_over(
     leader: &Arc<Leader>,
@@ -350,15 +349,15 @@ fn take_over(
 ) -> anyhow::Result<Adopted> {
     let at_ns = crate::http::handoff::now_ns();
     let state = handoff::Stream::decode(record.state.as_slice())
-        .context("reading a handed-over response's state")?;
+        .context("reading the state of a response of the handoff")?;
     let http = state
         .http
         .clone()
-        .context("a handed-over response states no HTTP framing")?;
+        .context("a response of the handoff states no HTTP framing")?;
     let application = state
         .application
         .clone()
-        .context("a handed-over response states no application")?;
+        .context("a response of the handoff states no application")?;
     let descriptor = next()?;
     let body = match application {
         handoff::stream::Application::ChatStream(chat) => {
@@ -410,7 +409,7 @@ fn take_over(
             // that is not here is one whose media did not come over.
             let media = jobs.content(&content.job_id).with_context(|| {
                 format!(
-                    "the retained media of the handed-over job {} is not here",
+                    "the retained media of the handoff's job {} is not here",
                     content.job_id
                 )
             })?;
@@ -427,7 +426,7 @@ fn take_over(
     info!(
         request_id = %record.request_id,
         frozen_at_ns = record.frozen_at_ns,
-        "a handed-over response is taken over"
+        "a response of the handoff is taken over"
     );
     Ok(Adopted {
         request_id: record.request_id.clone(),
@@ -439,21 +438,21 @@ fn take_over(
     })
 }
 
-/// Records that this process is serving one handed-over response, at the moment
+/// Records that this process is serving one response of the handoff, at the moment
 /// it has written the predecessor's bytes and is about to write the response's
 /// first event of its own.
 ///
 /// The record is one log line whose message is `handoff adopted ` and one JSON
 /// object, which the deployment's restart test parses. Exactly one is written
-/// per handed-over response, by the process that serves it, so `at_ns` is
-/// §7.5.1 step 4's moment and `pause_ms` is the response's pause as §7.5.1
-/// defines it. The predecessor's `pause_ms` is its own, shorter view
+/// per response of the handoff, by the process that serves it, so `at_ns` is
+/// the moment the response goes on and `pause_ms` is the pause its client
+/// sees. The predecessor's `pause_ms` is its own, shorter view
 /// ([`Adopted::at_ns`]) and the artifact does not read it.
 pub(crate) fn adopted(request_id: &str, frozen_at_ns: u64) {
     let at_ns = crate::http::handoff::now_ns();
     info!(
         request_id,
-        frozen_at_ns, at_ns, "a handed-over response is served here"
+        frozen_at_ns, at_ns, "a response of the handoff is served here"
     );
     info!(
         "handoff adopted {}",
@@ -493,8 +492,8 @@ mod tests {
         configured_tokenizer, fake_client, leader_over, serving_core, test_model,
     };
 
-    /// A pause that ends without answering its responses — the successor gave
-    /// up, or the takeover failed before it answered — gives the deployment
+    /// A pause that ends without deciding its responses — the successor gave
+    /// up, or the takeover failed before it responded — gives the deployment
     /// back: the daemon admits requests again rather than closing every
     /// connection for a handover that did not happen, and no round is left
     /// running for a response that registers later. A decided pause does not:
@@ -521,7 +520,7 @@ mod tests {
         );
         assert!(!handoff.pausing(), "no round is left running");
 
-        // The successor's answer was given: this process finishes its
+        // The successor's response was given: this process finishes its
         // responses and leaves the deployment's new requests to the successor.
         assert!(handoff.pause().await.is_empty());
         let decided = Paused {
@@ -564,7 +563,7 @@ mod tests {
         let record = StreamHandoff {
             request_id: "refused-handoff-request".to_owned(),
             frozen_at_ns: 1,
-            state: b"not a handed-over stream".to_vec(),
+            state: b"not a stream's handoff".to_vec(),
         };
         let mut socket_taken = false;
         let adoption = adopt(&leader, vec![record], &jobs, &mut || {
@@ -625,7 +624,7 @@ mod tests {
         assert!(!socket_taken, "a response without framing does not move");
     }
 
-    /// §7.5.1's ownership rule, which no run reaches: the responses the
+    /// The ownership rule, which no run reaches: the responses the
     /// successor reported taking are adopted — it writes the rest of them —
     /// and the ones it did not report resume here, so a response the successor
     /// could not take over is the predecessor's again from the boundary it
@@ -638,7 +637,7 @@ mod tests {
             // client); the test's pauses are microseconds and the socket is
             // never written, so dropping it here changes nothing.
             drop(theirs);
-            let (decision, answer) = tokio::sync::oneshot::channel();
+            let (decision, decided) = tokio::sync::oneshot::channel();
             let frozen = FrozenStream {
                 request_id: request_id.to_owned(),
                 frozen_at_ns: 1_000,
@@ -646,10 +645,10 @@ mod tests {
                 descriptor: std::os::fd::OwnedFd::from(ours),
                 decision,
             };
-            (frozen, answer)
+            (frozen, decided)
         };
-        let (taken, mut taken_answer) = socket("taken");
-        let (resumed, mut resumed_answer) = socket("resumed");
+        let (taken, mut taken_decided) = socket("taken");
+        let (resumed, mut resumed_decided) = socket("resumed");
         let paused = Paused {
             records: Vec::new(),
             descriptors: Vec::new(),
@@ -667,15 +666,15 @@ mod tests {
         );
 
         assert_eq!(
-            taken_answer
+            taken_decided
                 .try_recv()
-                .expect("the taken response is answered"),
+                .expect("the taken response is decided"),
             Decision::Adopt
         );
         assert_eq!(
-            resumed_answer
+            resumed_decided
                 .try_recv()
-                .expect("the untaken response is answered"),
+                .expect("the untaken response is decided"),
             Decision::Resume
         );
     }

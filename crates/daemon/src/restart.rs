@@ -6,7 +6,7 @@
 //! FD`) with one end of a socket pair at that descriptor. They talk over it:
 //!
 //! 1. The daemon sends its options (`Prepare`). The successor loads the
-//!    model's files and binds a request socket of its own, which it answers
+//!    model's files and binds a request socket of its own, which it responds
 //!    with (`Prepared`).
 //! 2. The daemon stops its service thread between two rounds and sends what
 //!    the thread served, its HTTP listener and the connection its engine's
@@ -44,11 +44,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::engine::control::EngineControl;
-use crate::http::admin::{Admin, HandedAdmin};
-use crate::http::listener::{HandedListener, Listener};
+use crate::http::admin::{Admin, AdminHandoff};
+use crate::http::listener::{Listener, ListenerHandoff};
 use crate::leader::{Leader, stats_sink};
 use crate::options::Stated;
-use crate::supervision::{Daemon, HandedService};
+use crate::supervision::{Daemon, ServiceHandoff};
 use frontend::openai::video_jobs::{VideoJob, VideoJobs};
 
 pub(crate) mod requests;
@@ -75,9 +75,9 @@ enum Message {
     /// [`Takeover`].
     Takeover(Box<Takeover>),
     /// Successor to daemon: the responses in flight it took over, which the
-    /// predecessor answers: a response named here is the successor's from
+    /// predecessor decides by: a response named here is the successor's from
     /// then on, and one the successor does not name resumes in the
-    /// predecessor (design §7.5.1 step 4).
+    /// predecessor.
     Adopted {
         pid: u32,
         streams: Vec<streams::Taken>,
@@ -131,17 +131,17 @@ struct Takeover {
     /// The responses in flight, which the successor takes over before it
     /// serves; their sockets follow the other descriptors, in this order.
     streams: Vec<streams::StreamHandoff>,
-    listener: HandedListener,
+    listener: ListenerHandoff,
     replicas: Vec<ReplicaHandoff>,
     adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
-    service: HandedService,
+    service: ServiceHandoff,
     service_descriptors: usize,
-    admin: HandedAdmin,
+    admin: AdminHandoff,
     jobs: Vec<(VideoJob, Option<u64>)>,
     then: Option<crate::updates::change::ApplyRequest>,
     /// Whether new requests waited when the predecessor handed over. The
     /// successor's gate starts as the predecessor's ended: a hot restart must
-    /// not reopen admissions (§7.5.1), and the in-process hold alone would
+    /// not reopen admissions, and the in-process hold alone would
     /// reopen them once the frontend serves.
     frontend_paused: bool,
     /// The modules the serving epoch runs. A configuration names a part of
@@ -165,7 +165,7 @@ struct ReplicaHandoff {
     paused: bool,
     asleep: bool,
     sleep_paused: bool,
-    unavailable: Vec<crate::updates::epoch::Unavailable>,
+    unavailable: Vec<crate::updates::Unavailable>,
 }
 
 /// What `POST /admin/restart` needs of the daemon it restarts.
@@ -174,14 +174,14 @@ pub(crate) struct Restarter {
     /// over.
     pub(crate) daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
     /// A duplicate of the HTTP listener, and what the successor needs of it.
-    listener: std::sync::Mutex<Option<(HandedListener, OwnedFd)>>,
+    listener: std::sync::Mutex<Option<(ListenerHandoff, OwnedFd)>>,
     stated: Stated,
     /// Cancelled once the successor serves: this daemon stops accepting.
     pub(crate) accepting: CancellationToken,
     /// Set once the deployment was handed over: this daemon detaches from
     /// the engine instead of shutting it down, and leaves the service and
     /// the storage to the successor.
-    pub(crate) handed_over: Arc<AtomicBool>,
+    pub(crate) handoff_sent: Arc<AtomicBool>,
     /// Whether the restart in flight has concluded, and how: `None` while one
     /// runs, `Some(true)` once a successor adopted the deployment, `Some(false)`
     /// when it gave up.
@@ -199,7 +199,7 @@ pub(crate) struct Restarter {
     /// when a restart starts and cleared when it concludes.
     in_flight: Arc<AtomicBool>,
     /// The responses in flight, which a restart pauses at an engine event
-    /// boundary and hands to the successor (design §7.5.1), attached once
+    /// boundary and hands to the successor, attached once
     /// the HTTP server serves.
     handoff: std::sync::Mutex<Option<Arc<crate::http::handoff::Handoff>>>,
 }
@@ -226,7 +226,7 @@ impl Restarter {
             )),
             stated,
             accepting,
-            handed_over: Arc::new(AtomicBool::new(false)),
+            handoff_sent: Arc::new(AtomicBool::new(false)),
             decided: tokio::sync::watch::channel(None).0,
             in_flight: Arc::new(AtomicBool::new(false)),
             handoff: std::sync::Mutex::new(None),
@@ -264,7 +264,7 @@ impl Restarter {
         jobs: &Arc<VideoJobs>,
     ) -> anyhow::Result<u32> {
         self.in_flight.store(true, Ordering::Release);
-        let outcome = self
+        let result = self
             .hand_over(executable, config, then, leader, admin, jobs)
             .await;
         // The restart is concluded however it ended: a daemon waiting to exit
@@ -272,9 +272,9 @@ impl Restarter {
         // only case in which this one may let go of it. The decision is stated
         // before the flag clears, so a waiter that sees the flag still set also
         // sees the decision.
-        let _ = self.decided.send(Some(outcome.is_ok()));
+        let _ = self.decided.send(Some(result.is_ok()));
         self.in_flight.store(false, Ordering::Release);
-        outcome
+        result
     }
 
     /// The restarter's channel receiver: whoever must wait for the decision
@@ -305,7 +305,7 @@ impl Restarter {
         };
         // No epoch change, rollback or relaunch replaces the engine meanwhile.
         let _quiet = leader.quiesce().await;
-        // The parked standbys are this daemon's processes (§2.5): the successor
+        // The parked standbys are this daemon's processes: the successor
         // numbers and starts its own once it has adopted the engines, so ending
         // them here keeps a second engine's memory off the device across the
         // handover instead of leaving the old daemon's copies parked behind it.
@@ -352,7 +352,7 @@ impl Restarter {
         let requests = match recv(&mut channel).await? {
             (Message::Prepared { requests }, _) => requests,
             (Message::Failed { reason }, _) => anyhow::bail!("the successor gave up: {reason}"),
-            (other, _) => anyhow::bail!("the successor answered {other:?}"),
+            (other, _) => anyhow::bail!("the successor responded {other:?}"),
         };
 
         // From here the service is the successor's.
@@ -394,7 +394,7 @@ impl Restarter {
             });
         }
         // Stop every response in flight at its next engine event boundary, so
-        // its state and its socket travel with the takeover (design §7.5.1).
+        // its state and its socket travel with the takeover.
         let mut paused = self.pause_streams().await;
         let mut stream_descriptors = std::mem::take(&mut paused.descriptors);
         let stream_records = std::mem::take(&mut paused.records);
@@ -403,11 +403,11 @@ impl Restarter {
         // stream. Continuation requests share this writer after handoff.
         {
             let mut sending = crate::leader::locked(&writer);
-            let jobs_handed = jobs.hand_over(job_relay(Arc::clone(&writer)));
+            let jobs_handoff = jobs.hand_over(job_relay(Arc::clone(&writer)));
             let service_count = service_descriptors.len();
             descriptors.extend(service_descriptors);
-            let mut job_records = Vec::with_capacity(jobs_handed.len());
-            for (record, media) in jobs_handed {
+            let mut job_records = Vec::with_capacity(jobs_handoff.len());
+            for (record, media) in jobs_handoff {
                 let artifact = match media {
                     Some(media) => {
                         descriptors.push(artifact_descriptor(&media)?);
@@ -452,22 +452,22 @@ impl Restarter {
             )?;
         }
         // The predecessor's copies of what it handed over stay open until the successor
-        // answers: closing them at the send was the earliest moment a peer could see its own
+        // responds: closing them at the send was the earliest moment a peer could see its own
         // interface go away, and the successor had by then neither resumed it nor claimed the
         // deployment.
-        self.handed_over.store(true, Ordering::Release);
+        self.handoff_sent.store(true, Ordering::Release);
         // From here the successor owns these engines: this daemon's watch sees their clients
         // go away with the handover and must not read that as a loss.
         for replica in leader.replicas() {
             replica
-                .handed_over
+                .handoff_sent
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         for replica in handoff {
             replica.client.attach(&requests);
         }
 
-        // The successor answers once: it either took the responses in flight
+        // The successor responds once: it either took the responses in flight
         // over, or serves without them, or gave up.
         let (pid, taken) = match recv(&mut channel).await? {
             (Message::Adopted { pid, streams }, _) => {
@@ -481,7 +481,7 @@ impl Restarter {
             (Message::Failed { reason }, _) => {
                 anyhow::bail!("the successor took the service and gave up: {reason}")
             }
-            (other, _) => anyhow::bail!("the successor answered {other:?}"),
+            (other, _) => anyhow::bail!("the successor responded {other:?}"),
         };
         // The successor holds the service now, and this daemon is done with its copies.
         drop(descriptors);
@@ -503,12 +503,12 @@ impl Restarter {
             let client = replica
                 .hold
                 .client()
-                .context("the handed-over replica has no client")?;
+                .context("the replica of the handoff has no client")?;
             let control = Arc::clone(
                 replica
                     .control
                     .get()
-                    .context("the handed-over replica has no request socket")?,
+                    .context("the replica of the handoff has no request socket")?,
             );
             replica.hold.hand_over(Arc::new(requests::RemoteHold::new(
                 Arc::clone(&continuations),
@@ -522,7 +522,7 @@ impl Restarter {
             loop {
                 match receive(&mut channel, None).await {
                     Ok((Message::Resumed { id, attachment }, _)) => {
-                        continuations.answer(id, attachment)
+                        continuations.respond(id, attachment)
                     }
                     Ok((message, _)) => warn!("the successor daemon sent {message:?}"),
                     Err(error) => {
@@ -652,7 +652,7 @@ async fn receive(
         );
         anyhow::ensure!(
             deadline.is_none_or(|deadline| Instant::now() < deadline),
-            "the other daemon did not answer in time"
+            "the other daemon did not respond in time"
         );
         channel.receive().context("reading the handoff socket")?;
         tokio::time::sleep(POLL).await;
@@ -770,14 +770,14 @@ async fn prepared_successor(
     // Each step of the successor names itself in the reason it gives the predecessor: a
     // failure here is reported as `the successor took the service and gave up: <reason>`,
     // and a transport error alone says what happened but not where.
-    let handed =
-        Listener::resume(listener, next()?).context("resuming the handed-over HTTP listener")?;
+    let resumed =
+        Listener::resume(listener, next()?).context("resuming the handoff's HTTP listener")?;
     let listener = match rebound {
         Some(rebound) => {
-            drop(handed);
+            drop(resumed);
             rebound
         }
-        None => handed,
+        None => resumed,
     };
     let replicas = replicas
         .into_iter()
@@ -813,19 +813,14 @@ async fn prepared_successor(
     )
     .context("resuming the node's daemon service")?;
     let epoch_records = Arc::new(crate::epoch::Epochs::new());
-    // Every later update commands the same main processes through this daemon's
-    // channel, as the first daemon's did after its start.
-    if let Some(commands) = daemon.commands() {
-        epoch_records.supervise(commands);
-    }
     let (updates, awake) = daemon
-        .updates(
+        .updater(
             Arc::clone(&epoch_records),
             config.served_model_name().to_owned(),
         )
-        .context("the leader's daemon serves no epoch layer")?;
-    Daemon::advance_epochs(Arc::clone(&updates), awake)
-        .context("starting the epoch layer's thread")?;
+        .context("the leader's daemon commands no engine")?;
+    Daemon::advance_updates(Arc::clone(&updates), awake)
+        .context("starting the updater's thread")?;
     let control = Arc::new(control);
     let adopting = Arc::clone(&control);
     let daemon_options = config.clone();
@@ -854,7 +849,7 @@ async fn prepared_successor(
     .await
     .context("the engines' adoption did not complete")??;
     let mut adopted = adopted.into_iter();
-    let (handed, options, served, observer, client) =
+    let (handoff, options, served, observer, client) =
         adopted.next().context("the takeover names no replicas")?;
     let served_epoch = served.epoch;
     let leader = Arc::new(
@@ -869,9 +864,9 @@ async fn prepared_successor(
         )
         .context("finishing the deployment the takeover names")?,
     );
-    // The successor adopts the epoch that serves (§2.5, §7.4, §7.5).
+    // The successor adopts the epoch that serves.
     {
-        let (record, process) = adopted_epoch(served_epoch, handed.engine, &options, modules)?;
+        let (record, process) = adopted_epoch(served_epoch, handoff.engine, &options, modules)?;
         epoch_records.record(served_epoch, record);
         let mut processes = epoch_records.processes();
         processes.push(process);
@@ -888,15 +883,12 @@ async fn prepared_successor(
     }
     let first = Arc::clone(&leader.replicas()[0]);
     *crate::leader::locked(&first.config) = options;
-    first.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
-    first.adopt_unavailable(handed.unavailable);
-    // §2.5 continues across the handoff: the successor adopts the engines and
-    // then keeps a standby of its own, or the deployment would serve without one
-    // until the next restart. The epoch's modules serve already, so it prepares
-    // from them as soon as it parks.
-    first.prepare_standby();
+    first.adopt_pause(handoff.paused, handoff.asleep, handoff.sleep_paused);
+    leader.updates.adopt_unavailable(handoff.unavailable);
+    // The successor adopts the engines and then keeps a standby of its own,
+    // or the deployment would serve without one until the next restart.
     first.start_standby();
-    for (index, (handed, options, served, observer, client)) in adopted.enumerate() {
+    for (index, (handoff, options, served, observer, client)) in adopted.enumerate() {
         let replica = crate::leader::Replica::new(
             leader.families.clone(),
             &options,
@@ -908,11 +900,9 @@ async fn prepared_successor(
         );
         let _ = replica.control.set(Arc::clone(&control));
         *crate::leader::locked(&replica.served) = Some(served);
-        replica.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
-        replica.adopt_unavailable(handed.unavailable);
+        replica.adopt_pause(handoff.paused, handoff.asleep, handoff.sleep_paused);
+        leader.updates.adopt_unavailable(handoff.unavailable);
         replica.monitor();
-        replica.prepare_standby();
-        replica.start_standby();
         leader
             .replicas
             .serving
@@ -946,7 +936,7 @@ async fn prepared_successor(
     }
     // The responses in flight go over once their engine streams do: a
     // response only moves when the engine serves it, and the predecessor
-    // answers these before it stops writing anything.
+    // decides these before it stops writing anything.
     if !streams.is_empty() {
         let adopting = Arc::clone(&leader);
         let mut sockets = std::iter::from_fn(|| next().ok());
@@ -1025,7 +1015,7 @@ async fn prepared_successor(
                             &Message::Resumed { id, attachment },
                             &[],
                         ) {
-                            warn!("answering a predecessor continuation failed: {error:#}");
+                            warn!("responding to a predecessor continuation failed: {error:#}");
                         }
                     });
                 }
@@ -1048,8 +1038,8 @@ async fn prepared_successor(
         &shutdown,
     )
     .await;
-    let handed_over = served.as_ref().is_ok_and(|handed| *handed);
-    if handed_over {
+    let handoff_sent = served.as_ref().is_ok_and(|handoff_sent| *handoff_sent);
+    if handoff_sent {
         // A second hot restart may finish this daemon's HTTP requests while
         // its predecessor still has streams. Keep forwarding their admission
         // to the latest owner until that predecessor drains and disconnects.
@@ -1058,20 +1048,20 @@ async fn prepared_successor(
         relay.abort();
     }
     let served = served.map(drop);
-    crate::http::finish(&config, &leader, daemon, retire, handed_over, served).await
+    crate::http::finish(&config, &leader, daemon, retire, handoff_sent, served).await
 }
 
 /// The epoch record and the process row of an epoch a restarting daemon
 /// adopts: the build config and the modules the adopted configuration
-/// fills, serving, at the launch generation the child reported (which is the
-/// identity it runs under, §7.4). The record's own generation stays `None`:
-/// that field is the MODEL generation the adopted child numbers for its
+/// fills, serving, at the launch generation the engine reported (which is the
+/// identity it runs under). The record's own generation stays `None`:
+/// that field is the MODEL generation the adopted engine numbers for its
 /// modules, and a daemon that adopted it never saw that number — the launch
 /// generation belongs to the process row alone.
 ///
-/// Without the record the epoch layer says no epoch serves and refuses the
+/// Without the record the updater says no epoch serves and refuses the
 /// next switch; without the row the next launch would be numbered 1 again,
-/// under a live child's generation (§2.5).
+/// under a live engine's generation.
 fn adopted_epoch(
     epoch: u64,
     engine: u64,
@@ -1112,8 +1102,8 @@ mod tests {
     use super::*;
 
     /// The adopted epoch states the configuration it serves, and its process
-    /// row the launch generation its child reported, so a later switch
-    /// compares against it and numbers its children above it. The record's
+    /// row the launch generation its engine reported, so a later switch
+    /// compares against it and numbers its engines above it. The record's
     /// generation is the model generation, which the adopting daemon did not
     /// see and does not invent.
     #[test]
@@ -1124,7 +1114,7 @@ mod tests {
         assert_eq!(record.status, crate::epoch::Status::Serving);
         assert_eq!(
             record.generation, None,
-            "the model generation is not the launch generation the child reported"
+            "the model generation is not the launch generation the engine reported"
         );
         assert_eq!(
             record.config,
