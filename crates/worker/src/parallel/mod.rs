@@ -1,10 +1,8 @@
-//! Cross-rank coordination: host collectives, the process-group plan with
-//! each stream's groups, and the storage and copy plans of expert and host
-//! weight prefetch, whose schedule the library owns.
+//! Cross-rank coordination off the device: the host collectives of a rank group.
 //!
-//! The host group is the only channel rank coordination uses off the device:
-//! startup agreement on block sizes, cache capacity and slot fits, plan
-//! comparison, warmup broadcasts, and the bootstrap bytes of device
-//! communicators. Device collectives never use it.
+//! The host group is the only channel rank coordination uses off the device: startup agreement
+//! on block sizes, cache capacity and slot fits, the comparison of the ranks' buckets, warm-up
+//! broadcasts, the bootstrap bytes of device communicators, and an expert union's agreement on
+//! each step. Device collectives never use it.
 
 pub mod host;
