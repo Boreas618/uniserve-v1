@@ -147,8 +147,8 @@ impl MainProcess {
     ///
     /// The worker states its own figures: the launches and device nanoseconds
     /// its runners counted, the jobs in flight the control thread's watchdog
-    /// reads, and the pools the arena books against the rank's budget - which is
-    /// the Storage Server's ledger invariant, a device never mapping more than its budget
+    /// reads, and the pools the arena reserves against the rank's budget - which is
+    /// the Storage Server's quota invariant, a device never mapping more than its budget
     /// allows. The scheduler-owned counters (`steps`, `batches`, `tokens`, the
     /// policy's fuel and calls) come from the schedulers' handle and stay zero
     /// until it exists.
@@ -173,7 +173,7 @@ impl MainProcess {
                 rank: rank as u32,
                 depth: u32::from(worker.running(0).is_some()),
             });
-            // One allocator books the device's three pools (`arena::DeviceMemory`), so the three
+            // One allocator reserves the device's three pools (`arena::DeviceMemory`), so the three
             // figures sum against one budget and item 5's invariant is reported as it is decided.
             let pools = worker.memory();
             memory.push(proto::request::wire::DeviceMemory {

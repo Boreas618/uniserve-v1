@@ -21,8 +21,8 @@ import "request.proto";
 
 // The first message on a connection, from the connecting side.
 message Hello {
-  // `ENGINE_INTERFACE_VERSION` of the sender's build; the peers refuse each other on a
-  // difference.
+  // `ENGINE_INTERFACE_VERSION` of the sender's build, which carries the storage protocol's
+  // version; the peers refuse each other on a difference.
   uint32 major = 1;
   // The sender's build: package version and source digest.
   string build = 3;
@@ -114,7 +114,7 @@ message Request {
     Stop stop = 3;
     Reserve reserve = 4;
     Claim claim = 5;
-    LedgerQuery ledger = 6;
+    UsageQuery usage = 6;
     KeepWeights keep_weights = 7;
     ThrottleTransfers throttle_transfers = 8;
     NodesQuery nodes = 9;
@@ -133,7 +133,7 @@ message Reply {
     Stopped stopped = 4;
     Reserved reserved = 5;
     Claimed claimed = 6;
-    LedgerReport ledger = 7;
+    UsageReport usage = 7;
     WeightsKept weights_kept = 8;
     TransfersThrottled transfers_throttled = 9;
     NodesKnown nodes = 10;
@@ -275,10 +275,10 @@ message Claimed {
   string tcp = 3;
 }
 
-// Read the storage ledgers the node's Storage Server keeps for the
-// deployment: one per GPU of the node it uses, with every item booked
+// Read the quotas the node's Storage Server keeps for the
+// deployment: one per GPU of the node it uses, with every item reserved
 // there. The daemon reads them over the claim it holds.
-message LedgerQuery {
+message UsageQuery {
   string host = 1;
   string deployment = 2;
 }
@@ -322,11 +322,11 @@ message ThrottleTransfers {
 
 message TransfersThrottled {}
 
-message LedgerReport {
-  // The Storage Server's `Ledger` answer as JSON: `{"ledgers": [...],
-  // "host_storage": {...}}` (the `storage` crate's `GpuLedger` and
+message UsageReport {
+  // The Storage Server's `Usage` response as JSON: `{"quotas": [...],
+  // "host_storage": {...}}` (the `storage` crate's `Quota` and
   // `HostStorage`).
-  string ledgers = 1;
+  string usage = 1;
 }
 
 // What a daemon tells an engine, unasked.

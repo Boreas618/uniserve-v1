@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ::storage::Client;
 use ::storage::connector::Settings;
+use ::storage::{Client, Role};
 use anyhow::Context;
 
 use crate::transfer::storage_name;
@@ -54,7 +54,7 @@ pub struct ServeOptions {
     /// NIXL's C API library the Transfer Server's agent loads for copies
     /// between hosts; the loader's search path finds it when `None`.
     pub nixl_library: Option<PathBuf>,
-    /// Go on with the server the predecessor of a hot restart hands over on
+    /// Go on with the server the predecessor of a restart in place passes on on
     /// the handoff socket at this descriptor, rather than binding the
     /// socket (`crate::restart`).
     pub predecessor: Option<i32>,
@@ -139,7 +139,7 @@ pub fn run_transfer_server(
 ///
 /// Fails when the server cannot be reached or refuses the listing.
 pub fn list(socket: &Path) -> ::storage::Result<()> {
-    let mut client = Client::connect_operator(socket)?;
+    let mut client = Client::connect(socket, Role::Operator)?;
     let listing = client.list()?;
     for tensor in &listing.tensors {
         let scopes: Vec<String> = tensor.scopes.iter().map(ToString::to_string).collect();
@@ -218,8 +218,8 @@ pub fn list(socket: &Path) -> ::storage::Result<()> {
             );
         }
     }
-    for ledger in &listing.ledgers {
-        println!("{}", ledger.describe());
+    for quota in &listing.quotas {
+        println!("{}", quota.describe());
     }
     Ok(())
 }
@@ -232,7 +232,7 @@ pub fn list(socket: &Path) -> ::storage::Result<()> {
 /// Fails when the server cannot be reached, or refuses because the
 /// deployment's head is connected.
 pub fn retire(socket: &Path, deployment: &str) -> ::storage::Result<()> {
-    let mut client = Client::connect_operator(socket)?;
+    let mut client = Client::connect(socket, Role::Operator)?;
     let released = client.retire(deployment.to_owned())?;
     println!("released {released} tensors of {deployment}");
     Ok(())
@@ -275,7 +275,7 @@ fn serve_on(options: &ServeOptions, ready: Option<service::Ready>) -> anyhow::Re
     run_until_stopped(server, &wake, &stop, lock)
 }
 
-/// Go on with the server a hot restart's predecessor hands over on the
+/// Go on with the server a restart in place's predecessor passes on over the
 /// handoff socket at `descriptor`, and serve until stopped.
 fn serve_resumed(options: &ServeOptions, descriptor: i32) -> anyhow::Result<()> {
     raise_descriptor_limit()?;
@@ -287,11 +287,11 @@ fn serve_resumed(options: &ServeOptions, descriptor: i32) -> anyhow::Result<()> 
     )
     .context("taking the server over from its predecessor")?;
     let lock = service::SocketLock::resume(lock, options.socket.clone());
-    tracing::info!(socket = %options.socket.display(), "storage server listening after a hot restart");
+    tracing::info!(socket = %options.socket.display(), "storage server listening after a restart in place");
     run_until_stopped(server, &wake, &stop, lock)
 }
 
-/// Serve until stopped, or until a hot restart handed the server over.
+/// Serve until stopped, or until a restart in place passed the server on.
 fn run_until_stopped(
     mut server: Server,
     wake: &OwnedFd,
@@ -301,9 +301,9 @@ fn run_until_stopped(
     match server.run(wake.as_fd(), &|| stop.load(Ordering::Acquire))? {
         Some(pending) => {
             let pid = server
-                .hand_over(pending, lock.hand_over())
+                .handoff(pending, lock.hand_over())
                 .context("handing the server to its successor")?;
-            tracing::info!(pid, "handed the server to its successor; exiting");
+            tracing::info!(pid, "passed the server to its successor; exiting");
         }
         None => tracing::info!("storage server stopped"),
     }

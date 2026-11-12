@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use storage::protocol::{PageShape, Reply, Request};
+use storage::protocol::{PageShape, Request, Response};
 use storage::{Claim, Client, Key, Role, Scope};
 use storage_server::Server;
 
@@ -103,12 +103,12 @@ impl StorageServer {
             kv_head_count: 0,
             page_bytes,
         };
-        let request = Request::PagePool {
+        let request = Request::Pool {
             shape,
             numa_node: None,
             bytes: Some(slots * page_bytes),
         };
-        let Reply::PagePool { pool, .. } = worker.call(&request, &[]).unwrap().reply else {
+        let Response::Pool { pool, .. } = worker.call(&request, &[]).unwrap().0 else {
             panic!("the latent pool was refused");
         };
         self._workers.push(worker);

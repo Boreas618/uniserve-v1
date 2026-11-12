@@ -190,7 +190,7 @@ impl Field {
 
     fn validate(&self) -> Result<()> {
         if self.strides.len() != self.shape.len() || self.element == 0 {
-            return Err(Error::Invalid(format!(
+            return Err(Error::Manifest(format!(
                 "field {} declares its shape and strides inconsistently",
                 self.tensor
             )));
@@ -203,7 +203,7 @@ impl Field {
             Encoding::Encoded { canonical, .. } => match canonical {
                 Some(canonical) => {
                     if canonical.strides.len() != canonical.shape.len() {
-                        return Err(Error::Invalid(format!(
+                        return Err(Error::Manifest(format!(
                             "the canonical form of field {} declares its shape and strides \
                              inconsistently",
                             self.tensor
@@ -229,7 +229,7 @@ fn validate_part(tensor: &str, shape: &[u64], logical: &Logical) -> Result<()> {
     let rank = shape.len();
     if logical.shape.len() != rank || logical.units.len() != rank || logical.segments.len() != rank
     {
-        return Err(Error::Invalid(format!(
+        return Err(Error::Manifest(format!(
             "field {tensor} declares its shape and logical part inconsistently"
         )));
     }
@@ -241,7 +241,7 @@ fn validate_part(tensor: &str, shape: &[u64], logical: &Logical) -> Result<()> {
                 .last()
                 .is_none_or(|last| last < logical.shape[dim]);
             if !fits_local || !fits_logical || segment.span.step == 0 {
-                return Err(Error::Invalid(format!(
+                return Err(Error::Manifest(format!(
                     "field {tensor} holds a segment outside its shapes along dimension {dim}"
                 )));
             }
@@ -604,7 +604,7 @@ impl StorageLayout {
         for field in &self.fields {
             field.validate()?;
             if field.bytes().end > self.bytes {
-                return Err(Error::Invalid(format!(
+                return Err(Error::Manifest(format!(
                     "field {} ends past its storage's {} bytes",
                     field.tensor, self.bytes
                 )));
@@ -668,7 +668,7 @@ impl StorageLayout {
             };
             let field = &self.fields[index];
             let source = fingerprint(&field.tensor).ok_or_else(|| {
-                Error::Invalid(format!(
+                Error::Manifest(format!(
                     "field {} has no tensor loading fingerprint",
                     field.tensor
                 ))
@@ -822,7 +822,7 @@ mod tests {
                     let global = (rank * groups + group) as usize;
                     assert_eq!(part[group as usize].1, whole[global].1);
                 }
-                // Its keys and values are a fraction of a granule: they
+                // Its keys and values are a fraction of a allocation: they
                 // share no chunk with the whole projection's.
                 for (_, key) in &part[groups as usize..] {
                     assert!(whole.iter().all(|(_, other)| other != key));
@@ -833,8 +833,8 @@ mod tests {
 
     #[test]
     fn a_vocabulary_shard_shares_the_aligned_rows_of_the_whole() {
-        // 151936 rows of 4 KiB: a quarter ends mid-granule, and the chunks
-        // up to the granule before it are the whole table's.
+        // 151936 rows of 4 KiB: a quarter ends mid-allocation, and the chunks
+        // up to the allocation before it are the whole table's.
         let degrees = [1, 2, 4];
         let whole = StorageLayout {
             bytes: 151_936 * 4096,

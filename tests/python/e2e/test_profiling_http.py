@@ -16,8 +16,8 @@ Storage Server of the test's own in a runtime directory the test creates
   the Perfetto
   converter turns it into a trace. One session runs at a time, and one
   naming two collectors of the device's performance monitors is refused.
-- A range_metrics session books its range profiler pass's device storage
-  with the worker's process item in the GPU's ledger until it ends.
+- A range_metrics session reserves its range profiler pass's device storage
+  with the worker's process item in the GPU's quota until it ends.
 - A session whose epoch is replaced ends with the epoch change, its file
   written.
 - The quality-of-service guard turns collectors off, costliest first, and
@@ -258,13 +258,13 @@ def test_a_session_records_its_collectors_into_its_file(
 
 
 def _process_bytes(base_url: str) -> int:
-    """The bytes the worker's process item books in its GPU's ledger."""
+    """The bytes the worker's process item reserves in its GPU's quota."""
     status = httpx.get(f"{base_url}/admin/config", timeout=60).json()
     entries = [
         entry
-        for node in status["ledgers"]
-        for ledger in node["ledgers"]
-        for entry in ledger["entries"]
+        for node in status["quotas"]
+        for quota in node["quotas"]
+        for entry in quota["reservations"]
         if entry["item"] == "process"
     ]
     assert len(entries) == 1, entries

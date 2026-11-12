@@ -27,7 +27,7 @@ use ipc::execution::{
     Batch, Batches, Computation, EpochOperation, Extent, Fault, HostPools, Inventory, Submission,
 };
 use ipc::memory;
-use worker::capacity::device::{DeviceBooking, DeviceBudget};
+use worker::capacity::device::{DeviceBudget, DeviceReservation};
 use worker::device::Worker;
 use worker::memory::allocation::Backing as _;
 use worker::memory::prefix_cache::PrefixCache;
@@ -132,7 +132,7 @@ pub struct Room {
 impl Room {
     /// Whether a load of `bytes` fits here once `given_back` bytes of the device leave. The graph
     /// pools a process gives back free the device and the quota alike, because a rank that serves
-    /// books them in the ledger and a suspension takes them out of it.
+    /// reserves them in the quota and a suspension takes them out of it.
     pub fn holds(self, bytes: u64, given_back: u64) -> bool {
         bytes <= self.quota.min(self.free).saturating_add(given_back)
     }
@@ -173,9 +173,9 @@ pub struct DataPlane {
     poisoned: Mutex<Option<String>>,
     /// The share of each device the deployment may hold.
     fraction: f64,
-    /// What each rank books beside the storage the Storage Server retains, in rank order, once the
+    /// What each rank reserves beside the storage the Storage Server retains, in rank order, once the
     /// ranks serve: the graph pools and the process, and a session's storage.
-    bookings: Mutex<Vec<DeviceBooking>>,
+    reservations: Mutex<Vec<DeviceReservation>>,
 }
 
 fn rejected(what: &str, error: impl std::fmt::Display) -> Error {
@@ -233,24 +233,24 @@ impl DataPlane {
             suspended: AtomicBool::new(false),
             poisoned: Mutex::new(None),
             fraction,
-            bookings: Mutex::new(Vec::new()),
+            reservations: Mutex::new(Vec::new()),
         }
     }
 
-    /// Books what the ranks hold beside the retained storage in their devices' ledgers, as they
+    /// Reserves what the ranks hold beside the retained storage in their devices' quotas, as they
     /// start to serve (§7.6): each rank's graph pools, and what its process holds beside them. From
     /// here on the quota binds the whole rank, so a storage that would take the deployment past it
     /// is refused at the Storage Server and not found out by the device.
     ///
-    /// Booked once: a process that already booked keeps its figures, and a standby books when it is
-    /// promoted, because until then the ledger counts what it maps of its predecessor.
+    /// Reserved once: a process that already reserved keeps its figures, and a standby reserves when it is
+    /// promoted, because until then the quota counts what it maps of its predecessor.
     ///
     /// # Errors
     ///
     /// When a rank's storage does not fit its quota, or NVML cannot state the process's storage.
-    pub fn book_serving(&self) -> Result<()> {
-        let mut bookings = lock(&self.bookings);
-        if !bookings.is_empty() {
+    pub fn reserve_serving(&self) -> Result<()> {
+        let mut reservations = lock(&self.reservations);
+        if !reservations.is_empty() {
             return Ok(());
         }
         let mut measured = Vec::with_capacity(self.ranks.len());
@@ -263,43 +263,43 @@ impl DataPlane {
                 Arc::clone(&rank.storage),
                 BTreeMap::new(),
             )?;
-            let booking = budget.booking(rank.device, self.fraction, graph, 0)?;
-            booking.submit(&rank.storage, !self.suspended.load(Ordering::Acquire))?;
-            measured.push(booking);
+            let reservation = budget.reservation(rank.device, self.fraction, graph, 0)?;
+            reservation.submit(&rank.storage, !self.suspended.load(Ordering::Acquire))?;
+            measured.push(reservation);
         }
-        *bookings = measured;
+        *reservations = measured;
         Ok(())
     }
 
-    /// Books again what the ranks book, the graph pools as `graphs` says: a suspended pool holds no
-    /// storage, and the ledger hands its bytes to what a sleep or a load wants them for.
+    /// Reserves again what the ranks reserve, the graph pools as `graphs` says: a suspended pool holds no
+    /// storage, and the quota hands its bytes to what a sleep or a load wants them for.
     fn rebook(&self, graphs: bool) -> Result<()> {
-        let bookings = lock(&self.bookings);
-        for (rank, booking) in self.ranks.iter().zip(bookings.iter()) {
-            booking.submit(&lock(rank).storage, graphs)?;
+        let reservations = lock(&self.reservations);
+        for (rank, reservation) in self.ranks.iter().zip(reservations.iter()) {
+            reservation.submit(&lock(rank).storage, graphs)?;
         }
         Ok(())
     }
 
-    /// Books `bytes` of device storage a session's collectors hold on `rank`'s device with the
-    /// rank's process. Answers the ledger's refusal; a process that books nothing yet, a standby,
-    /// has nothing to book it beside.
+    /// Reserves `bytes` of device storage a session's collectors hold on `rank`'s device with the
+    /// rank's process. Answers the quota's refusal; a process that reserves nothing yet, a standby,
+    /// has nothing to reserve it beside.
     fn book_profiling(&self, index: usize, bytes: u64) -> Result<Option<String>> {
-        let mut bookings = lock(&self.bookings);
-        let Some(booking) = bookings.get_mut(index) else {
+        let mut reservations = lock(&self.reservations);
+        let Some(reservation) = reservations.get_mut(index) else {
             return Ok(None);
         };
-        if booking.profiling == bytes {
+        if reservation.profiling == bytes {
             return Ok(None);
         }
-        let booked = std::mem::replace(&mut booking.profiling, bytes);
+        let reserved = std::mem::replace(&mut reservation.profiling, bytes);
         let graphs = !self.suspended.load(Ordering::Acquire);
-        match booking.submit(&lock(&self.ranks[index]).storage, graphs) {
+        match reservation.submit(&lock(&self.ranks[index]).storage, graphs) {
             Ok(_) => Ok(None),
             Err(error) => {
-                booking.profiling = booked;
+                reservation.profiling = reserved;
                 match error {
-                    // `Retained::book` answers the server's refusal of a booking past the quota so.
+                    // `Retained::reserve` answers the server's refusal of a reservation past the quota so.
                     Error::Unsupported(refusal) => Ok(Some(refusal)),
                     error => Err(error),
                 }
@@ -308,7 +308,7 @@ impl DataPlane {
     }
 
     /// Starts the profiling session `payload` states on every rank (`docs/profiling.md`): each
-    /// books what its collectors hold, then starts at its next batch boundary. A rank whose ledger
+    /// reserves what its collectors hold, then starts at its next batch boundary. A rank whose quota
     /// cannot fit the storage answers that it refused, and the daemon ends what the others started.
     ///
     /// # Errors
@@ -331,7 +331,7 @@ impl DataPlane {
                         "selected": true,
                         "refused": format!(
                             "range_metrics holds {held} bytes of device storage for its range \
-                             profiler pass, which the ledger of the rank's GPU cannot fit: \
+                             profiler pass, which the quota of the rank's GPU cannot fit: \
                              {refusal}"
                         ),
                     })
@@ -346,7 +346,7 @@ impl DataPlane {
             match started {
                 Ok(answer) => answers.push(answer.to_string()),
                 Err(error) => {
-                    self.unbook_profiling(index);
+                    self.release_profiling(index);
                     return Err(error);
                 }
             }
@@ -355,19 +355,19 @@ impl DataPlane {
     }
 
     /// The session's storage is no longer held on `index`'s device. A failure leaves the larger
-    /// booking in the ledger, which only overstates the rank's storage, so it is logged rather than
+    /// reservation in the quota, which only overstates the rank's storage, so it is logged rather than
     /// failing the session's end.
-    fn unbook_profiling(&self, index: usize) {
+    fn release_profiling(&self, index: usize) {
         let failure = match self.book_profiling(index, 0) {
             Ok(None) => return,
             Ok(Some(refusal)) => refusal,
             Err(error) => error.to_string(),
         };
-        tracing::warn!("unbooking the ended profiling session's device storage failed: {failure}");
+        tracing::warn!("releasing the ended profiling session's device storage failed: {failure}");
     }
 
     /// Ends the profiling session `payload` names on every rank: each writes what remains and closes
-    /// its file, and the ledger gives back what the session held.
+    /// its file, and the quota gives back what the session held.
     ///
     /// # Errors
     ///
@@ -390,7 +390,7 @@ impl DataPlane {
                 reason: reason.clone(),
                 rank: number,
             })?;
-            self.unbook_profiling(index);
+            self.release_profiling(index);
             answers.push(answer.to_string());
         }
         Ok(answers)
@@ -484,19 +484,19 @@ impl DataPlane {
     ///
     /// # Errors
     ///
-    /// When the ledger or the device cannot be read.
+    /// When the quota or the device cannot be read.
     pub fn room(&self) -> Result<Vec<Room>> {
         self.ranks
             .iter()
             .map(|rank| {
                 let rank = lock(rank);
                 let device = rank.device;
-                let (ledger, _) = rank.storage.ledger(device)?;
+                let (quota, _) = rank.storage.usage(device)?;
                 let free = device.memory_info()?.free;
                 Ok(Room {
-                    quota: ledger
-                        .quota
-                        .map_or(free, |quota| quota.saturating_sub(ledger.used())),
+                    quota: quota
+                        .limit
+                        .map_or(free, |limit| limit.saturating_sub(quota.usage())),
                     free,
                 })
             })
@@ -790,7 +790,7 @@ impl DataPlane {
                 let device = rank.device;
                 let planes = Self::planes_of(&rank);
                 let memory = device.memory_info()?;
-                let (ledger, _) = rank.storage.ledger(device)?;
+                let (quota, _) = rank.storage.usage(device)?;
                 Ok(memory::CacheStorageReport {
                     segments: planes
                         .as_ref()
@@ -802,7 +802,7 @@ impl DataPlane {
                     host: rank.host.clone(),
                     scope: Some(rank.storage.scope().clone()),
                     epoch: Some(rank.storage.epoch()),
-                    usage: Some(ledger),
+                    usage: Some(quota),
                 })
             })
             .collect()

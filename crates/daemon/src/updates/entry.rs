@@ -45,24 +45,21 @@ pub(crate) struct EpochState {
 /// The GPUs the deployment's epochs hold storage on, from every node's
 /// storage report (`nodes`): each one's host and name (`GPU-…`, as
 /// `nvidia-smi` prints its UUID), its total and quota and the bytes the
-/// deployment's ledger books there. A manager of several deployments reads
+/// deployment's quota reserves there. A manager of several deployments reads
 /// which GPUs they share from it.
 fn deployment_gpus(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut gpus = Vec::new();
     for node in nodes {
         let host = node["host"].as_str().unwrap_or_default();
-        let ledgers: Vec<storage::protocol::GpuLedger> =
-            serde_json::from_value(node["ledgers"].clone()).unwrap_or_default();
-        for ledger in ledgers
-            .iter()
-            .filter(|ledger| !ledger.deployment.is_empty())
-        {
+        let quotas: Vec<storage::protocol::Quota> =
+            serde_json::from_value(node["quotas"].clone()).unwrap_or_default();
+        for quota in quotas.iter().filter(|quota| !quota.deployment.is_empty()) {
             gpus.push(serde_json::json!({
                 "host": host,
-                "gpu": storage::protocol::gpu_name(&ledger.gpu),
-                "total": ledger.total,
-                "quota": ledger.quota,
-                "used": ledger.used(),
+                "gpu": storage::protocol::gpu_name(&quota.gpu),
+                "total": quota.total,
+                "quota": quota.limit,
+                "used": quota.usage(),
             }));
         }
     }
@@ -83,9 +80,9 @@ pub(crate) fn digest(config: &ServerArgs) -> anyhow::Result<String> {
 /// How long the closed engine of an epoch takes to exit.
 const CLOSED_EXIT: Duration = Duration::from_secs(60);
 
-/// How long the status waits for the storage ledgers, which each node's
+/// How long the status waits for the quotas, which each node's
 /// daemon reads from its Storage Server.
-const LEDGER_READ: Duration = Duration::from_secs(10);
+const QUOTA_READ: Duration = Duration::from_secs(10);
 
 /// Whether `target` differs from `served` in the fence probes' switch
 /// alone, which the workers change in place. Every other part of the
@@ -525,12 +522,12 @@ impl Leader {
             .iter()
             .filter_map(|replica| replica.hold().client())
             .find(|client| matches!(client.state(), EngineState::Ready | EngineState::Parked));
-        // Each node's daemon reads its ledgers over its claim; an engine this daemon did not launch
+        // Each node's daemon reads its quotas over its claim; an engine this daemon did not launch
         // (a simulated one) answers for itself.
         let control = replicas
             .iter()
             .find_map(|replica| replica.control.get().cloned());
-        let ledgers = match client {
+        let quotas = match client {
             Some(client) => {
                 let read = async {
                     match control {
@@ -543,7 +540,7 @@ impl Leader {
                         None => client.describe_storage().await,
                     }
                 };
-                match tokio::time::timeout(LEDGER_READ, read).await {
+                match tokio::time::timeout(QUOTA_READ, read).await {
                     Ok(Ok(nodes)) => serde_json::Value::Array(
                         nodes
                             .iter()
@@ -552,7 +549,7 @@ impl Leader {
                     ),
                     Ok(Err(error)) => serde_json::json!({ "error": error }),
                     Err(_) => serde_json::json!({
-                        "error": format!("the ledgers were not read within {LEDGER_READ:?}")
+                        "error": format!("the quotas were not read within {QUOTA_READ:?}")
                     }),
                 }
             }
@@ -560,7 +557,7 @@ impl Leader {
         };
         // The bytes a change in progress moved: what every node's Transfer
         // Server copied for the deployment since it began, read with the
-        // ledgers. One change runs at a time, so every transfer since is
+        // quotas. One change runs at a time, so every transfer since is
         // the change's.
         let statuses: Vec<_> = replicas
             .into_iter()
@@ -573,10 +570,10 @@ impl Leader {
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
         status["replicas"] = statuses.into();
-        status["gpus"] = ledgers.as_array().map_or(serde_json::Value::Null, |nodes| {
+        status["gpus"] = quotas.as_array().map_or(serde_json::Value::Null, |nodes| {
             deployment_gpus(nodes).into()
         });
-        status["ledgers"] = ledgers;
+        status["quotas"] = quotas;
         // The update in flight, or the one that ended last, with its trial.
         status["update"] = self.updates.status().unwrap_or_default();
         // A revert's mark lives with the epoch layer's last update; the
@@ -933,19 +930,17 @@ mod tests {
     fn node(host: &str, totals: &[(storage::protocol::Priority, u64, u64)]) -> String {
         let transfers: Vec<_> = totals
             .iter()
-            .map(
-                |&(priority, bytes, copied)| storage::protocol::TransferTotal {
-                    priority,
-                    bytes,
-                    copied,
-                },
-            )
+            .map(|&(priority, bytes, copied)| storage::protocol::TaskTotal {
+                priority,
+                bytes,
+                copied,
+            })
             .collect();
-        serde_json::json!({ "host": host, "ledgers": [], "transfers": transfers }).to_string()
+        serde_json::json!({ "host": host, "quotas": [], "transfers": transfers }).to_string()
     }
 
     /// The status names the epoch that executes; the engine reads no storage
-    /// ledgers (each node's daemon reads them over its claim), so it books no
+    /// quotas (each node's daemon reads them over its claim), so it reserves no
     /// GPUs; and an epoch whose engine is gone is unavailable.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_status_reports_the_executing_engine_and_one_that_is_gone() {
@@ -960,7 +955,7 @@ mod tests {
             status["executing"],
             serde_json::json!({ "epoch": epoch, "state": "executing" })
         );
-        // The engine refuses the ledger read, so the status states no GPUs.
+        // The engine refuses the quota read, so the status states no GPUs.
         assert_eq!(status["gpus"], serde_json::Value::Null);
 
         // An epoch whose engine no longer serves is unavailable.

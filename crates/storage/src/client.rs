@@ -1,12 +1,19 @@
-//! A connection to a Storage Server.
+//! The two clients of a Storage Server.
 //!
-//! One [`Client`] serves both uses: a worker calls it synchronously, at
-//! startup, close and promotion ([`Client::call`] and the typed requests
-//! beside it); the head submits requests ([`Client::submit`]) and collects
-//! their answers when the connection is readable ([`Client::pump`],
-//! [`Client::take`]), from its scheduling loop.
+//! [`Client`] is the engine's: one connection that speaks every request of
+//! the protocol. A worker calls it synchronously, at startup, close and
+//! promotion ([`Client::call`] and the typed operations beside it); a
+//! scheduler submits requests ([`Client::submit`]) and collects their
+//! responses when the connection is readable ([`Client::pump`],
+//! [`Client::take`]), from its step loop. The server's own processes (its
+//! Transfer Server and connector), a peer host and an operator use the same
+//! connection under their roles.
+//!
+//! [`ClaimClient`] is the daemon's: one deployment's claim at this host's
+//! server, which lasts while the client lives and crosses a daemon's restart
+//! in place with its connection ([`ClaimClient::handoff`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::ToSocketAddrs;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -14,50 +21,23 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
 use crate::protocol::{
-    Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostStorage, Item, Key, Link,
-    Listing, Location, Mode, PeerPool, Priority, Region, Registered, Reply, Request, Role, Scope,
-    ServerMessage, Span, StorageRecord, TensorRecord, Throttle, TransferTotal, VERSION, Welcome,
+    Claim, ClientMessage, Event, Hello, Item, Key, Link, Listing, Location, Mode, PeerPool,
+    Priority, Quota, Region, Registration, Request, Response, Role, Scope, ServerMessage, Span,
+    StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, Usage, VERSION, Welcome,
 };
 use crate::transport::Connection;
 
-/// Why a request failed.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("storage server connection: {0}")]
-    Io(#[from] io::Error),
-    #[error("the storage server refused the connection: {0}")]
-    Refused(String),
-    #[error("the storage server answered {kind:?}: {message}")]
-    Server { kind: ErrorKind, message: String },
-    #[error("the storage server answered out of protocol: {0}")]
-    Protocol(String),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
-/// A reply and the descriptors that came with it.
-#[derive(Debug)]
-pub struct Answer {
-    pub reply: Reply,
-    pub descriptors: Vec<OwnedFd>,
-}
-
-/// The tensors a `get` found, over their storages, and the keys it did not.
-#[derive(Debug)]
-pub struct Got {
-    pub tensors: Vec<TensorRecord>,
-    /// The storages the tensors name by index, with their descriptors.
-    pub storages: Vec<(StorageRecord, OwnedFd)>,
-    pub missing: Vec<Key>,
-}
-
-/// A connection to the Storage Server of this host.
+/// A connection to a Storage Server.
 pub struct Client {
     connection: Connection,
     next: u64,
-    /// Answers received and not yet taken, by request.
-    answers: HashMap<u64, Answer>,
+    /// Responses received and not yet taken, by request, each with the
+    /// descriptors that came with it.
+    responses: HashMap<u64, (Response, Vec<OwnedFd>)>,
     /// Events received and not yet taken, with their descriptors.
     events: VecDeque<(Event, Vec<OwnedFd>)>,
 }
@@ -80,9 +60,9 @@ impl Client {
     /// Connect to the server of another host at `address` (`host:port`,
     /// its `Endpoint`) as [`Role::Peer`]: the Transfer Server of this host
     /// that READs storage there, or a scheduler that pins the pages it
-    /// reads there ([`Client::peer_pin`]). Connecting, and every blocking call after
-    /// it ([`Client::call`]), fails once `timeout` passes without an
-    /// answer, so a host that stopped answering fails the caller's task
+    /// reads there ([`Client::peer_pin`]). Connecting, and every blocking
+    /// call after it ([`Client::call`]), fails once `timeout` passes without
+    /// a response, so a host that stopped responding fails the caller's task
     /// instead of holding it.
     pub fn connect_peer(address: &str, timeout: Duration) -> Result<Self> {
         let mut refused = None;
@@ -105,14 +85,6 @@ impl Client {
         })))
     }
 
-    /// Connect to the server at `socket` as an operator.
-    pub fn connect_operator(socket: &Path) -> Result<Self> {
-        Self::open(
-            Connection::new(UnixStream::connect(socket)?),
-            Role::Operator,
-        )
-    }
-
     fn open(mut connection: Connection, role: Role) -> Result<Self> {
         connection.send(
             &ClientMessage::Hello(Hello {
@@ -125,7 +97,7 @@ impl Client {
             ServerMessage::Welcome(Welcome::Accepted { .. }) => Ok(Self {
                 connection,
                 next: 1,
-                answers: HashMap::new(),
+                responses: HashMap::new(),
                 events: VecDeque::new(),
             }),
             ServerMessage::Welcome(Welcome::Refused { message }) => Err(Error::Refused(message)),
@@ -134,17 +106,12 @@ impl Client {
     }
 
     /// The connection's socket and the next request identity, for another
-    /// process to go on with ([`Client::resume`]), as a daemon's hot
-    /// restart hands its claim to its successor: the server knows the
+    /// process to go on with ([`Client::resume`]): the server knows the
     /// connection under the role it said hello as.
-    ///
-    /// # Errors
-    ///
-    /// Fails when answers, events or frames are buffered.
-    pub fn hand_over(self) -> Result<(OwnedFd, u64)> {
-        if !self.answers.is_empty() || !self.events.is_empty() {
+    fn handoff(self) -> Result<(OwnedFd, u64)> {
+        if !self.responses.is_empty() || !self.events.is_empty() {
             return Err(Error::Protocol(
-                "a connection with answers or events not taken cannot be handed over".into(),
+                "a connection with responses or events not taken cannot be passed on".into(),
             ));
         }
         let socket = match self.connection.into_socket()? {
@@ -154,24 +121,24 @@ impl Client {
         Ok((socket, self.next))
     }
 
-    /// Goes on with a Unix connection another process handed over
-    /// ([`Client::hand_over`]).
-    pub fn resume(descriptor: OwnedFd, next: u64) -> Self {
+    /// Goes on with a Unix connection another process passed on.
+    fn resume(descriptor: OwnedFd, next: u64) -> Self {
         Self {
             connection: Connection::new(UnixStream::from(descriptor)),
             next,
-            answers: HashMap::new(),
+            responses: HashMap::new(),
             events: VecDeque::new(),
         }
     }
 
-    /// The connection's descriptor, readable when answers or events arrive.
+    /// The connection's descriptor, readable when responses or events
+    /// arrive.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.connection.stream().as_fd()
     }
 
     /// Send `request` with `descriptors` and return its identity. The
-    /// answer is taken with [`Self::wait`] or [`Self::take`].
+    /// response is taken with [`Self::wait`] or [`Self::take`].
     pub fn submit(&mut self, request: &Request, descriptors: &[BorrowedFd<'_>]) -> Result<u64> {
         let id = self.next;
         self.next += 1;
@@ -196,9 +163,10 @@ impl Client {
         read
     }
 
-    /// The answer to request `id`, when it has arrived.
-    pub fn take(&mut self, id: u64) -> Option<Answer> {
-        self.answers.remove(&id)
+    /// The response to request `id`, with the descriptors that came with
+    /// it, when it has arrived.
+    pub fn take(&mut self, id: u64) -> Option<(Response, Vec<OwnedFd>)> {
+        self.responses.remove(&id)
     }
 
     /// The next event received, with the descriptors that came with it.
@@ -206,43 +174,46 @@ impl Client {
         self.events.pop_front()
     }
 
-    /// Consume one task's completion without waiting, discarding its progress
-    /// notifications. Other tasks' events stay queued for their owners.
-    /// Returns `None` while the transfer is pending or after it was consumed.
-    pub fn poll_transfer(
-        &mut self,
-        task: u64,
-    ) -> Result<Option<(u64, crate::protocol::TransferEnd)>> {
+    /// Consume one task's end without waiting, discarding its progress
+    /// events: the bytes it copied and how it ended. Other tasks' events
+    /// stay queued for their owners. Returns `None` while the task runs or
+    /// after its end was consumed.
+    pub fn poll_task(&mut self, task: u64) -> Result<Option<(u64, TaskStatus)>> {
         self.pump()?;
-        let mut completion = None;
+        let mut ended = None;
         self.events.retain(|(event, _)| match event {
-            Event::TransferProgress { task: found, .. } if *found == task => false,
-            Event::Transferred {
+            Event::TaskProgress { task: found, .. } if *found == task => false,
+            Event::TaskEnded {
                 task: found,
                 bytes,
-                end,
+                status,
             } if *found == task => {
-                completion = Some((*bytes, end.clone()));
+                ended = Some((*bytes, status.clone()));
                 false
             }
             _ => true,
         });
-        Ok(completion)
+        Ok(ended)
     }
 
-    /// Block until request `id` is answered.
-    pub fn wait(&mut self, id: u64) -> Result<Answer> {
+    /// Block until request `id` has its response.
+    pub fn wait(&mut self, id: u64) -> Result<(Response, Vec<OwnedFd>)> {
         loop {
-            if let Some(answer) = self.answers.remove(&id) {
-                return Ok(answer);
+            if let Some(response) = self.responses.remove(&id) {
+                return Ok(response);
             }
             let (message, descriptors) = self.connection.recv::<ServerMessage>()?;
             self.deliver(message, descriptors)?;
         }
     }
 
-    /// Send `request` and block for its answer.
-    pub fn call(&mut self, request: &Request, descriptors: &[BorrowedFd<'_>]) -> Result<Answer> {
+    /// Send `request` and block for its response, which may be the server's
+    /// refusal ([`Response::Error`]).
+    pub fn call(
+        &mut self,
+        request: &Request,
+        descriptors: &[BorrowedFd<'_>],
+    ) -> Result<(Response, Vec<OwnedFd>)> {
         let id = self.submit(request, descriptors)?;
         self.wait(id)
     }
@@ -263,8 +234,8 @@ impl Client {
 
     fn deliver(&mut self, message: ServerMessage, descriptors: Vec<OwnedFd>) -> Result<()> {
         match message {
-            ServerMessage::Reply { id, reply } => {
-                self.answers.insert(id, Answer { reply, descriptors });
+            ServerMessage::Response { id, response } => {
+                self.responses.insert(id, (response, descriptors));
             }
             ServerMessage::Event(event) => self.events.push_back((event, descriptors)),
             ServerMessage::Welcome(_) => {
@@ -274,11 +245,16 @@ impl Client {
         Ok(())
     }
 
-    /// The answer, unless the server answered with an error.
-    fn expect(answer: Answer) -> Result<Answer> {
-        match answer.reply {
-            Reply::Error { kind, message } => Err(Error::Server { kind, message }),
-            _ => Ok(answer),
+    /// Send `request` and block for its response; the server's refusal is
+    /// the error.
+    fn request(
+        &mut self,
+        request: &Request,
+        descriptors: &[BorrowedFd<'_>],
+    ) -> Result<(Response, Vec<OwnedFd>)> {
+        match self.call(request, descriptors)? {
+            (Response::Error { kind, message }, _) => Err(Error::Server { kind, message }),
+            response => Ok(response),
         }
     }
 
@@ -290,17 +266,47 @@ impl Client {
             epoch,
             retire,
         };
-        match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Claimed { claim } => Ok(claim),
+        match self.request(&request, &[])?.0 {
+            Response::Claimed { claim } => Ok(claim),
             other => Err(unexpected("claim", &other)),
         }
     }
 
-    /// Make the claimed, committed epochs' tensors and pages shared together.
-    pub fn publish_epochs(&mut self, epochs: Vec<u64>) -> Result<()> {
-        match Self::expect(self.call(&Request::PublishEpochs { epochs }, &[])?)?.reply {
-            Reply::EpochsPublished => Ok(()),
-            other => Err(unexpected("publishing epochs", &other)),
+    /// See [`Request::Publish`]: make the claimed, committed epochs' tensors
+    /// and pages shared together.
+    pub fn publish(&mut self, epochs: Vec<u64>) -> Result<()> {
+        match self.request(&Request::Publish { epochs }, &[])?.0 {
+            Response::Published => Ok(()),
+            other => Err(unexpected("publish", &other)),
+        }
+    }
+
+    /// See [`Request::KeepWeights`]. Returns how many tensors were released.
+    pub fn keep_weights(&mut self, epochs: Vec<u64>, cache_keys: Vec<Key>) -> Result<u64> {
+        match self
+            .request(&Request::KeepWeights { epochs, cache_keys }, &[])?
+            .0
+        {
+            Response::Retained { released } => Ok(released),
+            other => Err(unexpected("keep_weights", &other)),
+        }
+    }
+
+    /// See [`Request::Offload`]. Returns how many storages moved to host
+    /// storage and their bytes, once every copy ended.
+    pub fn offload(&mut self, epoch: u64) -> Result<(u64, u64)> {
+        match self.request(&Request::Offload { epoch }, &[])?.0 {
+            Response::Moved { storages, bytes } => Ok((storages, bytes)),
+            other => Err(unexpected("offload", &other)),
+        }
+    }
+
+    /// See [`Request::Restore`]. Returns how many storages returned to
+    /// their GPUs and their bytes, once every copy ended.
+    pub fn restore(&mut self, epoch: u64) -> Result<(u64, u64)> {
+        match self.request(&Request::Restore { epoch }, &[])?.0 {
+            Response::Moved { storages, bytes } => Ok((storages, bytes)),
+            other => Err(unexpected("restore", &other)),
         }
     }
 
@@ -308,48 +314,35 @@ impl Client {
     /// locations `at` (every copy when empty). Returns how many tensors
     /// were released.
     pub fn retain(&mut self, keys: Vec<Key>, at: Vec<Location>) -> Result<u64> {
-        match Self::expect(self.call(&Request::Retain { keys, at }, &[])?)?.reply {
-            Reply::Retained { released } => Ok(released),
+        match self.request(&Request::Retain { keys, at }, &[])?.0 {
+            Response::Retained { released } => Ok(released),
             other => Err(unexpected("retain", &other)),
         }
     }
 
     /// See [`Request::Get`]: the copies of `keys` at the locations `at`
-    /// (every copy when empty).
-    pub fn get(&mut self, keys: Vec<Key>, mode: Mode, at: Vec<Location>) -> Result<Got> {
-        let answer = Self::expect(self.call(&Request::Get { keys, mode, at }, &[])?)?;
-        Self::got(answer)
+    /// (every copy when empty), with one descriptor per storage of the
+    /// response, in order.
+    pub fn get(
+        &mut self,
+        keys: Vec<Key>,
+        mode: Mode,
+        at: Vec<Location>,
+    ) -> Result<(Tensors, Vec<OwnedFd>)> {
+        let response = self.request(&Request::Get { keys, mode, at }, &[])?;
+        tensors(response)
     }
 
-    /// Allocate retained host storage only after the server admits its
-    /// entire size. The caller maps the returned writable descriptor.
-    pub fn allocate_host(&mut self, key: Key, name: String, bytes: u64) -> Result<Got> {
-        let answer = Self::expect(self.call(&Request::AllocateHost { key, name, bytes }, &[])?)?;
-        Self::got(answer)
-    }
-
-    fn got(answer: Answer) -> Result<Got> {
-        match answer.reply {
-            Reply::Got {
-                tensors,
-                storages,
-                missing,
-            } => {
-                if storages.len() != answer.descriptors.len() {
-                    return Err(Error::Protocol(format!(
-                        "{} storages arrived with {} descriptors",
-                        storages.len(),
-                        answer.descriptors.len()
-                    )));
-                }
-                Ok(Got {
-                    tensors,
-                    storages: storages.into_iter().zip(answer.descriptors).collect(),
-                    missing,
-                })
-            }
-            other => Err(unexpected("get", &other)),
-        }
+    /// See [`Request::AllocateHost`]: retained host storage the server
+    /// admitted whole, as the tensor over it and its writable descriptor.
+    pub fn allocate_host(
+        &mut self,
+        key: Key,
+        name: String,
+        bytes: u64,
+    ) -> Result<(Tensors, Vec<OwnedFd>)> {
+        let response = self.request(&Request::AllocateHost { key, name, bytes }, &[])?;
+        tensors(response)
     }
 
     /// See [`Request::Put`]: publish `tensors` over `storages`, whose
@@ -366,24 +359,24 @@ impl Client {
             tensors,
             storages: records,
         };
-        match Self::expect(self.call(&request, &descriptors)?)?.reply {
-            Reply::Put => Ok(()),
+        match self.request(&request, &descriptors)?.0 {
+            Response::Put => Ok(()),
             other => Err(unexpected("put", &other)),
         }
     }
 
     /// See [`Request::Promote`].
     pub fn promote(&mut self, keys: Vec<Key>) -> Result<()> {
-        match Self::expect(self.call(&Request::Promote { keys }, &[])?)?.reply {
-            Reply::Promoted => Ok(()),
+        match self.request(&Request::Promote { keys }, &[])?.0 {
+            Response::Promoted => Ok(()),
             other => Err(unexpected("promote", &other)),
         }
     }
 
     /// See [`Request::Release`].
     pub fn release(&mut self, keys: Vec<Key>) -> Result<()> {
-        match Self::expect(self.call(&Request::Release { keys }, &[])?)?.reply {
-            Reply::Released => Ok(()),
+        match self.request(&Request::Release { keys }, &[])?.0 {
+            Response::Released => Ok(()),
             other => Err(unexpected("release", &other)),
         }
     }
@@ -391,71 +384,99 @@ impl Client {
     /// See [`Request::Rekey`]: move the copies at the locations `at`
     /// (every copy when empty).
     pub fn rekey(&mut self, moves: Vec<(Key, Key)>, at: Vec<Location>) -> Result<()> {
-        match Self::expect(self.call(&Request::Rekey { moves, at }, &[])?)?.reply {
-            Reply::Rekeyed => Ok(()),
+        match self.request(&Request::Rekey { moves, at }, &[])?.0 {
+            Response::Rekeyed => Ok(()),
             other => Err(unexpected("rekey", &other)),
         }
     }
 
-    /// See [`Request::Restart`]. Returns the successor's process id.
-    pub fn restart(&mut self, executable: Option<String>) -> Result<u32> {
-        match Self::expect(self.call(&Request::Restart { executable }, &[])?)?.reply {
-            Reply::Restarting { pid } => Ok(pid),
-            other => Err(unexpected("restart", &other)),
+    /// See [`Request::Read`]: the bytes of `deployment`'s read-only host
+    /// tensor `key`.
+    pub fn read(&mut self, deployment: String, key: Key) -> Result<Vec<u8>> {
+        match self.request(&Request::Read { deployment, key }, &[])?.0 {
+            Response::Read { bytes } => Ok(bytes),
+            other => Err(unexpected("read", &other)),
         }
     }
 
-    /// See [`Request::Retire`]. Returns how many tensors were released.
-    pub fn retire(&mut self, deployment: String) -> Result<u64> {
-        match Self::expect(self.call(&Request::Retire { deployment }, &[])?)?.reply {
-            Reply::Retired { released } => Ok(released),
-            other => Err(unexpected("retire", &other)),
+    /// See [`Request::Quota`]. Returns the quotas of `gpu` the caller
+    /// reserves against; a refusal is [`ErrorKind::Quota`], whose message
+    /// names every reservation of the quota it would overrun.
+    ///
+    /// [`ErrorKind::Quota`]: crate::protocol::ErrorKind::Quota
+    pub fn reserve(
+        &mut self,
+        gpu: [u8; 16],
+        total: u64,
+        limit: Option<u64>,
+        reservations: Vec<(Item, u64)>,
+    ) -> Result<Vec<Quota>> {
+        let request = Request::Quota {
+            gpu,
+            total,
+            limit,
+            reservations,
+        };
+        match self.request(&request, &[])?.0 {
+            Response::Usage(usage) => Ok(usage.quotas),
+            other => Err(unexpected("quota", &other)),
         }
     }
 
-    /// See [`Request::Transfer`]. Returns the task, whose progress and end
+    /// See [`Request::Usage`]: the quotas of `gpus` (every GPU when empty),
+    /// what the host admits of new host storage, and what the tasks of the
+    /// client's deployment copied.
+    pub fn usage(&mut self, gpus: Vec<[u8; 16]>) -> Result<Usage> {
+        match self.request(&Request::Usage { gpus }, &[])?.0 {
+            Response::Usage(usage) => Ok(usage),
+            other => Err(unexpected("usage", &other)),
+        }
+    }
+
+    /// See [`Request::Submit`]. Returns the task, whose progress and end
     /// arrive as events.
-    pub fn transfer(&mut self, spans: Vec<Span>, priority: Priority, update: u64) -> Result<u64> {
-        let request = Request::Transfer {
+    pub fn copy(&mut self, spans: Vec<Span>, priority: Priority, update: u64) -> Result<u64> {
+        let request = Request::Submit {
             spans,
             priority,
             update,
         };
-        match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Transferring { task } => Ok(task),
-            other => Err(unexpected("transfer", &other)),
+        match self.request(&request, &[])?.0 {
+            Response::Submitted { task } => Ok(task),
+            other => Err(unexpected("submit", &other)),
         }
     }
 
-    /// Hold transfer contexts between tasks until `close_transfer` or
-    /// connection closure. Each operation owns its separate session.
-    pub fn open_transfer(&mut self, gpus: Vec<[u8; 16]>) -> Result<u64> {
-        match Self::expect(self.call(&Request::OpenTransfer { gpus }, &[])?)?.reply {
-            Reply::TransferOpened { session } => Ok(session),
-            other => Err(unexpected("open transfer", &other)),
+    /// See [`Request::OpenSession`]: hold the Transfer Server's contexts on
+    /// `gpus` between tasks until [`Client::close_session`] or the
+    /// connection closes.
+    pub fn open_session(&mut self, gpus: Vec<[u8; 16]>) -> Result<u64> {
+        match self.request(&Request::OpenSession { gpus }, &[])?.0 {
+            Response::SessionOpened { session } => Ok(session),
+            other => Err(unexpected("open session", &other)),
         }
     }
 
-    /// Release a session; existing tasks retain their own physical holds.
-    pub fn close_transfer(&mut self, session: u64) -> Result<()> {
-        match Self::expect(self.call(&Request::CloseTransfer { session }, &[])?)?.reply {
-            Reply::TransferClosed => Ok(()),
-            other => Err(unexpected("close transfer", &other)),
+    /// See [`Request::CloseSession`]; running tasks keep their own holds.
+    pub fn close_session(&mut self, session: u64) -> Result<()> {
+        match self.request(&Request::CloseSession { session }, &[])?.0 {
+            Response::SessionClosed => Ok(()),
+            other => Err(unexpected("close session", &other)),
         }
     }
 
     /// See [`Request::Cancel`]. Returns how many tasks were cancelled.
     pub fn cancel(&mut self, tasks: Vec<u64>, update: Option<u64>) -> Result<u64> {
-        match Self::expect(self.call(&Request::Cancel { tasks, update }, &[])?)?.reply {
-            Reply::Cancelled { tasks } => Ok(tasks),
+        match self.request(&Request::Cancel { tasks, update }, &[])?.0 {
+            Response::Cancelled { tasks } => Ok(tasks),
             other => Err(unexpected("cancel", &other)),
         }
     }
 
     /// See [`Request::Throttle`].
     pub fn throttle(&mut self, links: Vec<Link>, throttle: Throttle) -> Result<()> {
-        match Self::expect(self.call(&Request::Throttle { links, throttle }, &[])?)?.reply {
-            Reply::Throttled => Ok(()),
+        match self.request(&Request::Throttle { links, throttle }, &[])?.0 {
+            Response::Throttled => Ok(()),
             other => Err(unexpected("throttle", &other)),
         }
     }
@@ -467,13 +488,13 @@ impl Client {
         &mut self,
         deployment: String,
         regions: Vec<Region>,
-    ) -> Result<(u64, Vec<u8>, Vec<Registered>)> {
+    ) -> Result<(u64, Vec<u8>, Vec<Registration>)> {
         let request = Request::Expose {
             deployment,
             regions,
         };
-        match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Exposed {
+        match self.request(&request, &[])?.0 {
+            Response::Exposed {
                 exposure,
                 metadata,
                 regions,
@@ -484,8 +505,8 @@ impl Client {
 
     /// See [`Request::Unexpose`].
     pub fn unexpose(&mut self, exposure: u64) -> Result<()> {
-        match Self::expect(self.call(&Request::Unexpose { exposure }, &[])?)?.reply {
-            Reply::Unexposed => Ok(()),
+        match self.request(&Request::Unexpose { exposure }, &[])?.0 {
+            Response::Unexposed => Ok(()),
             other => Err(unexpected("unexpose", &other)),
         }
     }
@@ -505,8 +526,8 @@ impl Client {
             layouts,
             keys,
         };
-        match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::PeerPinned { pools } => Ok(pools),
+        match self.request(&request, &[])?.0 {
+            Response::PeerPinned { pools } => Ok(pools),
             other => Err(unexpected("peer pin", &other)),
         }
     }
@@ -514,105 +535,217 @@ impl Client {
     /// See [`Request::PeerUnpin`]: end this connection's pins of the pages
     /// of `keys` in `pool`.
     pub fn peer_unpin(&mut self, pool: u64, keys: Vec<Key>) -> Result<()> {
-        match Self::expect(self.call(&Request::PeerUnpin { pool, keys }, &[])?)?.reply {
-            Reply::PeerUnpinned => Ok(()),
+        match self.request(&Request::PeerUnpin { pool, keys }, &[])?.0 {
+            Response::PeerUnpinned => Ok(()),
             other => Err(unexpected("peer unpin", &other)),
+        }
+    }
+
+    /// See [`Request::Endpoint`]: the `host:port` other hosts reach the
+    /// server at; `None` when it accepts local connections only.
+    pub fn endpoint(&mut self) -> Result<Option<String>> {
+        match self.request(&Request::Endpoint, &[])?.0 {
+            Response::Endpoint { tcp } => Ok(tcp),
+            other => Err(unexpected("endpoint", &other)),
         }
     }
 
     /// See [`Request::List`].
     pub fn list(&mut self) -> Result<Listing> {
-        match Self::expect(self.call(&Request::List, &[])?)?.reply {
-            Reply::Listing(listing) => Ok(listing),
+        match self.request(&Request::List, &[])?.0 {
+            Response::Listing(listing) => Ok(listing),
             other => Err(unexpected("list", &other)),
         }
     }
 
-    /// See [`Request::Read`]: the bytes of `deployment`'s read-only host
-    /// tensor `key`.
-    pub fn read(&mut self, deployment: String, key: Key) -> Result<Vec<u8>> {
-        match Self::expect(self.call(&Request::Read { deployment, key }, &[])?)?.reply {
-            Reply::Read { bytes } => Ok(bytes),
-            other => Err(unexpected("read", &other)),
+    /// See [`Request::Restart`]. Returns the successor's process id.
+    pub fn restart(&mut self, executable: Option<String>) -> Result<u32> {
+        match self.request(&Request::Restart { executable }, &[])?.0 {
+            Response::Restarting { pid } => Ok(pid),
+            other => Err(unexpected("restart", &other)),
         }
     }
 
-    /// See [`Request::Offload`] (`to_host`) and [`Request::Restore`].
-    /// Returns how many storages moved and their bytes, once every copy
-    /// ended.
-    pub fn move_weights(&mut self, epoch: u64, to_host: bool) -> Result<(u64, u64)> {
-        let request = if to_host {
-            Request::Offload { epoch }
-        } else {
-            Request::Restore { epoch }
+    /// See [`Request::Retire`]. Returns how many tensors were released.
+    pub fn retire(&mut self, deployment: String) -> Result<u64> {
+        match self.request(&Request::Retire { deployment }, &[])?.0 {
+            Response::Retired { released } => Ok(released),
+            other => Err(unexpected("retire", &other)),
+        }
+    }
+}
+
+/// The tensors of a response to a `Get`, with one descriptor per storage.
+fn tensors((response, descriptors): (Response, Vec<OwnedFd>)) -> Result<(Tensors, Vec<OwnedFd>)> {
+    match response {
+        Response::Tensors(tensors) => {
+            if tensors.storages.len() != descriptors.len() {
+                return Err(Error::Protocol(format!(
+                    "{} storages arrived with {} descriptors",
+                    tensors.storages.len(),
+                    descriptors.len()
+                )));
+            }
+            Ok((tensors, descriptors))
+        }
+        other => Err(unexpected("get", &other)),
+    }
+}
+
+fn unexpected(request: &str, response: &Response) -> Error {
+    Error::Protocol(format!("{request} was responded with {response:?}"))
+}
+
+/// One deployment's claim at this host's Storage Server: the daemon's
+/// client.
+///
+/// The claim lasts as long as the client: the claiming connection is the
+/// deployment's head, so the claim outlives every engine and every epoch. An
+/// engine that succeeds another claims the scopes of its own epoch under the
+/// same claim, and its workers state the same token as the serving epoch's,
+/// so neither epoch's storage is touched by the other's claim.
+pub struct ClaimClient {
+    client: Client,
+    deployment: String,
+    /// The claim's token, once the first epoch claimed.
+    claim: Option<Claim>,
+    /// The scopes each epoch claimed and did not retire, sorted.
+    epochs: BTreeMap<u64, Vec<Scope>>,
+}
+
+/// A [`ClaimClient`]'s state as it crosses to the daemon's successor in a
+/// restart in place; the claiming connection's descriptor travels beside it,
+/// so the Storage Server sees the same head throughout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimHandoff {
+    pub deployment: String,
+    pub claim: Option<Claim>,
+    pub epochs: BTreeMap<u64, Vec<Scope>>,
+    /// The connection's next request identity.
+    pub next: u64,
+}
+
+impl ClaimClient {
+    /// Connect to the server at `socket` as the head of `deployment`. The
+    /// connection holds every epoch of the claim, and reads and publishes
+    /// no page of its own.
+    pub fn connect(socket: &Path, deployment: &str) -> Result<Self> {
+        let role = Role::Head {
+            deployment: deployment.to_owned(),
+            epoch: 0,
         };
-        match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Moved { storages, bytes } => Ok((storages, bytes)),
-            other => Err(unexpected("move_weights", &other)),
-        }
+        Ok(Self {
+            client: Client::connect(socket, role)?,
+            deployment: deployment.to_owned(),
+            claim: None,
+            epochs: BTreeMap::new(),
+        })
     }
 
-    /// See [`Request::KeepWeights`]. Returns how many tensors were released.
+    /// Claim the deployment for `epoch`, which places `scopes` on the host,
+    /// and end every epoch of `retire` there ([`Request::Claim`]). An epoch
+    /// that claimed the same scopes and retires nothing keeps the claim
+    /// held, without asking the server. Returns the claim's token, which
+    /// the deployment's workers state.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the server cannot be reached, or refuses the claim
+    /// because another head of the deployment is connected.
+    pub fn claim(&mut self, epoch: u64, mut scopes: Vec<Scope>, retire: Vec<u64>) -> Result<Claim> {
+        scopes.sort();
+        if let Some(claim) = self.claim
+            && retire.is_empty()
+            && self.epochs.get(&epoch) == Some(&scopes)
+        {
+            return Ok(claim);
+        }
+
+        let claim = self.client.claim(epoch, scopes.clone(), retire.clone())?;
+        for retired in &retire {
+            self.epochs.remove(retired);
+        }
+        self.epochs.insert(epoch, scopes);
+        self.claim = Some(claim);
+        Ok(claim)
+    }
+
+    /// The deployment claimed.
+    pub fn deployment(&self) -> &str {
+        &self.deployment
+    }
+
+    /// See [`Request::Publish`]: publish the committed `epochs` together.
+    pub fn publish(&mut self, epochs: Vec<u64>) -> Result<()> {
+        self.client.publish(epochs)
+    }
+
+    /// See [`Request::KeepWeights`]: `epochs` keep their weights and the
+    /// rollback copies of `cache_keys` alone. Returns how many tensors were
+    /// released.
     pub fn keep_weights(&mut self, epochs: Vec<u64>, cache_keys: Vec<Key>) -> Result<u64> {
-        match Self::expect(self.call(&Request::KeepWeights { epochs, cache_keys }, &[])?)?.reply {
-            Reply::Retained { released } => Ok(released),
-            other => Err(unexpected("keep_weights", &other)),
-        }
+        self.client.keep_weights(epochs, cache_keys)
     }
 
-    /// See [`Request::Book`]. Returns the ledgers of `gpu` the caller books
-    /// in; a refusal is [`ErrorKind::Quota`], whose message names every
-    /// entry of the ledger it would overrun.
-    pub fn book(
-        &mut self,
-        gpu: [u8; 16],
-        total: u64,
-        quota: Option<u64>,
-        items: Vec<(Item, u64)>,
-    ) -> Result<Vec<GpuLedger>> {
-        let request = Request::Book {
-            gpu,
-            total,
-            quota,
-            items,
+    /// See [`Request::Offload`]: move `epoch`'s weights to host storage.
+    /// Returns how many storages moved and their bytes.
+    pub fn offload(&mut self, epoch: u64) -> Result<(u64, u64)> {
+        self.client.offload(epoch)
+    }
+
+    /// See [`Request::Restore`]: return `epoch`'s weights that an offload
+    /// left in host storage to the GPUs they left; nothing moves when there
+    /// are none. Returns how many storages moved and their bytes.
+    pub fn restore(&mut self, epoch: u64) -> Result<(u64, u64)> {
+        self.client.restore(epoch)
+    }
+
+    /// Halve or restore the byte budgets of the links the deployment's
+    /// tasks use ([`Request::Throttle`] with no links): a halving takes
+    /// every link a task of the deployment copies over now, a restoration
+    /// every link a halving reduced.
+    pub fn throttle(&mut self, throttle: Throttle) -> Result<()> {
+        self.client.throttle(Vec::new(), throttle)
+    }
+
+    /// The deployment's quotas of every GPU of the host, what the host
+    /// admits of new host storage and what the deployment's tasks copied
+    /// ([`Request::Usage`]).
+    pub fn usage(&mut self) -> Result<Usage> {
+        self.client.usage(Vec::new())
+    }
+
+    /// The `host:port` other hosts reach the server at; `None` when it
+    /// accepts local connections only.
+    pub fn endpoint(&mut self) -> Result<Option<String>> {
+        self.client.endpoint()
+    }
+
+    /// Passes the claim to another process ([`ClaimClient::resume`]): its
+    /// state and the claiming connection's descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection has unread messages.
+    pub fn handoff(self) -> Result<(ClaimHandoff, OwnedFd)> {
+        let (descriptor, next) = self.client.handoff()?;
+        let handoff = ClaimHandoff {
+            deployment: self.deployment,
+            claim: self.claim,
+            epochs: self.epochs,
+            next,
         };
-        match Self::expect(self.call(&request, &[])?)?.reply {
-            Reply::Ledger { ledgers, .. } => Ok(ledgers),
-            other => Err(unexpected("book", &other)),
-        }
+        Ok((handoff, descriptor))
     }
 
-    /// See [`Request::Ledger`]: the ledgers of `gpus` (every GPU when empty),
-    /// what the host admits of new host storage, and what the transfer
-    /// tasks of the client's deployment copied.
-    pub fn ledger(&mut self, gpus: Vec<[u8; 16]>) -> Result<Ledgers> {
-        match Self::expect(self.call(&Request::Ledger { gpus }, &[])?)?.reply {
-            Reply::Ledger {
-                ledgers,
-                host,
-                transfers,
-            } => Ok(Ledgers {
-                ledgers,
-                host,
-                transfers,
-            }),
-            other => Err(unexpected("ledger", &other)),
+    /// Goes on with a claim another process passed on, over its
+    /// connection's descriptor.
+    pub fn resume(handoff: ClaimHandoff, descriptor: OwnedFd) -> Self {
+        Self {
+            client: Client::resume(descriptor, handoff.next),
+            deployment: handoff.deployment,
+            claim: handoff.claim,
+            epochs: handoff.epochs,
         }
     }
-}
-
-/// What a [`Request::Ledger`] answers ([`Client::ledger`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ledgers {
-    /// The ledgers of the GPUs asked for.
-    pub ledgers: Vec<GpuLedger>,
-    /// What the host admits of new host storage.
-    pub host: HostStorage,
-    /// What the transfer tasks of the client's deployment copied on the
-    /// host, by priority.
-    pub transfers: Vec<TransferTotal>,
-}
-
-fn unexpected(request: &str, reply: &Reply) -> Error {
-    Error::Protocol(format!("{request} was answered with {reply:?}"))
 }

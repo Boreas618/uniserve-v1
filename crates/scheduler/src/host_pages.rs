@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use storage::protocol::{
-    ErrorKind, Event, PageShape, PageSlot, PageWindow, Priority, Region, Reply, Request, Span,
+    ErrorKind, Event, PageShape, PageSlot, PageWindow, Priority, Region, Request, Response, Span,
 };
 use storage::{Client, Key, Role, Scope};
 
@@ -123,7 +123,7 @@ impl PoolRead {
 
 /// What [`Servers::take`] takes: the events, each with the connection it
 /// arrived on, and the responses of the store's own purposes.
-pub(crate) type Arrivals<S> = (Vec<(usize, Event)>, Vec<(S, Reply)>);
+pub(crate) type Arrivals<S> = (Vec<(usize, Event)>, Vec<(S, Response)>);
 
 /// What a request to the host page pools is for: one of the store's own
 /// (`S`), whose response the store reads, or an end of the page lifecycle,
@@ -251,11 +251,11 @@ impl<S> Servers<S> {
     /// # Errors
     ///
     /// When the server cannot be reached or the request fails.
-    pub(crate) fn call(&mut self, client: usize, request: &Request) -> anyhow::Result<Reply> {
+    pub(crate) fn call(&mut self, client: usize, request: &Request) -> anyhow::Result<Response> {
         let connection = self.clients[client]
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("the storage server connection failed"))?;
-        Ok(connection.call(request, &[])?.reply)
+        Ok(connection.call(request, &[])?.0)
     }
 
     /// The connection to the Storage Server of the peer host at `endpoint`
@@ -292,7 +292,7 @@ impl<S> Servers<S> {
 
     /// Pin the published pages of `keys` of the deployment at the peer of
     /// connection `peer`, in its pools of the page `layouts`, responded
-    /// (`Reply::PeerPinned`) for `purpose`.
+    /// (`Response::PeerPinned`) for `purpose`.
     pub(crate) fn peer_pin(
         &mut self,
         peer: usize,
@@ -318,7 +318,7 @@ impl<S> Servers<S> {
     }
 
     /// Reserve slots for `keys` in `pool` for the head's own transfer task,
-    /// a peer read, responded (`Reply::Reserved`) for `purpose`.
+    /// a peer read, responded (`Response::Reserved`) for `purpose`.
     pub(crate) fn reserve_read(
         &mut self,
         client: usize,
@@ -336,11 +336,11 @@ impl<S> Servers<S> {
     }
 
     /// Submit the transfer task of `read` to its local server, at the
-    /// priority of what a request waits for, responded (`Reply::Transferring`)
-    /// for `purpose`; its end arrives as an [`Event::Transferred`] on that
+    /// priority of what a request waits for, responded (`Response::Submitted`)
+    /// for `purpose`; its end arrives as an [`Event::TaskEnded`] on that
     /// connection.
     pub(crate) fn read_pages(&mut self, read: &PoolRead, purpose: S) -> bool {
-        let request = Request::Transfer {
+        let request = Request::Submit {
             spans: read.spans(),
             priority: Priority::Request,
             update: 0,
@@ -349,7 +349,7 @@ impl<S> Servers<S> {
     }
 
     /// Cancel the transfer task `task` of connection `client`; its
-    /// [`Event::Transferred`] follows once it copies nothing any more.
+    /// [`Event::TaskEnded`] follows once it copies nothing any more.
     pub(crate) fn cancel_read(&mut self, client: usize, task: u64) -> bool {
         let cancel = Request::Cancel {
             tasks: vec![task],
@@ -389,7 +389,7 @@ impl<S> Servers<S> {
     }
 
     /// Pin `keys` in `pool` on connection `client` for `reader`, responded
-    /// (`Reply::Pinned`) for `purpose`: the slots of the pages the pool
+    /// (`Response::Pinned`) for `purpose`: the slots of the pages the pool
     /// holds, which it keeps until the reader unpins them.
     pub(crate) fn pin(
         &mut self,
@@ -428,7 +428,7 @@ impl<S> Servers<S> {
 
     /// Reserve slots for `keys` in `pool` for `writer`, the pages of one
     /// `window` evicted whole when one is named, responded
-    /// (`Reply::Reserved`) for `purpose`.
+    /// (`Response::Reserved`) for `purpose`.
     pub(crate) fn reserve(
         &mut self,
         client: usize,
@@ -481,7 +481,7 @@ impl<S> Servers<S> {
 
     /// Settles the response of a lifecycle end: releases what an orphaned pin
     /// or an abandoned reservation took, and reports a failure.
-    fn settle_response(&mut self, purpose: Purpose<S>, reply: Reply) {
+    fn settle_response(&mut self, purpose: Purpose<S>, reply: Response) {
         match (purpose, reply) {
             (Purpose::Store(_), _) => {}
             (
@@ -491,16 +491,16 @@ impl<S> Servers<S> {
                     reader,
                     keys,
                 },
-                Reply::Pinned { slots },
+                Response::Pinned { slots },
             ) => {
                 self.unpin(client, pool, &reader, pinned(&keys, &slots));
             }
-            (Purpose::PeerOrphan { peer, keys }, Reply::PeerPinned { pools }) => {
+            (Purpose::PeerOrphan { peer, keys }, Response::PeerPinned { pools }) => {
                 for pool in pools {
                     self.peer_unpin(peer, pool.pool, pinned(&keys, &pool.slots));
                 }
             }
-            (Purpose::Abandoned { client, pool, keys }, Reply::Reserved { slots }) => {
+            (Purpose::Abandoned { client, pool, keys }, Response::Reserved { slots }) => {
                 let reserved = keys
                     .into_iter()
                     .zip(&slots)
@@ -509,7 +509,7 @@ impl<S> Servers<S> {
                     .collect();
                 self.settle(client, pool, reserved, false);
             }
-            (_, Reply::Error { kind, message }) => {
+            (_, Response::Error { kind, message }) => {
                 tracing::warn!(
                     ?kind,
                     message,
@@ -526,7 +526,7 @@ impl<S> Servers<S> {
     /// with its purpose; the responses of lifecycle ends are settled here.
     ///
     /// A peer connection that failed is dropped, and each request it will
-    /// not respond gets its response with [`Reply::Error`]; the connections to the
+    /// not respond gets its response with [`Response::Error`]; the connections to the
     /// deployment's own hosts stay, as their failures are their ranks'.
     pub(crate) fn take(&mut self) -> Arrivals<S> {
         let mut events = Vec::new();
@@ -557,7 +557,7 @@ impl<S> Servers<S> {
                 .collect();
             for id in lost {
                 if let Some(purpose) = self.pending.remove(&id) {
-                    let reply = Reply::Error {
+                    let reply = Response::Error {
                         kind: ErrorKind::Unavailable,
                         message: "the peer storage server connection failed".to_owned(),
                     };
@@ -567,14 +567,14 @@ impl<S> Servers<S> {
         }
         let ids: Vec<(usize, u64)> = self.pending.keys().copied().collect();
         for id in ids {
-            let Some(response) = self.clients[id.0]
+            let Some((response, _)) = self.clients[id.0]
                 .as_mut()
                 .and_then(|client| client.take(id.1))
             else {
                 continue;
             };
             if let Some(purpose) = self.pending.remove(&id) {
-                responses.push((purpose, response.reply));
+                responses.push((purpose, response));
             }
         }
         let mut own = Vec::with_capacity(responses.len());
@@ -589,7 +589,7 @@ impl<S> Servers<S> {
 
     /// The responds to that arrived since the last call, each with its purpose,
     /// for a store that awaits no event.
-    pub(crate) fn responses(&mut self) -> Vec<(S, Reply)> {
+    pub(crate) fn responses(&mut self) -> Vec<(S, Response)> {
         self.take().1
     }
 

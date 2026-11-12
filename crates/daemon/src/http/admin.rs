@@ -517,7 +517,7 @@ struct ConfigBody {
 
 /// `GET /admin/config`: the configuration, its digest, the two slots'
 /// epochs, the change in progress, the trial, the configurations a
-/// rollback marked unavailable and every item of the GPUs' storage ledgers
+/// rollback marked unavailable and every item of the GPUs' quotas
 /// (`Leader::config_status`).
 async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
     let mut body = state.leader.config_status().await;

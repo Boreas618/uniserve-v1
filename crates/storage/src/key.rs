@@ -8,7 +8,7 @@
 //! | State | Key inputs | Function |
 //! | --- | --- | --- |
 //! | retained weights | the weight's canonical text (`nn::WeightKey`): the identity of each checkpoint file it is read from, the element type, the layout name the reading operator declares and its region of the logical tensor | [`weight`], one copy per GPU [`device_weight`] |
-//! | exclusive storages (KV cache segments, buffers, latent banks) | the owner's scope, the storage's name, the epoch that created it, its bytes and its GPU | [`exclusive`] |
+//! | exclusive storages (KV cache segments, buffers, latent buffers) | the owner's scope, the storage's name, the epoch that created it, its bytes and its GPU | [`exclusive`] |
 //! | KV pages, recurrent-state checkpoints | the chain of the group's pages before it, the group, the modality and the page's tokens, rooted at the group's page seed (what computes the pages and how they are laid out, [`page_seed`]) and the request's isolation key | [`page_root`], [`page_key`] |
 //! | encoder outputs | the output's name, what computes it and the digest of what it read; one key per page | [`encoder_output`], [`encoder_page`] |
 //! | latents | what computes the trajectory (the latent seed), the trajectory and its step count | [`latent_seed`], [`latent_content`] |
@@ -70,7 +70,7 @@ impl Digest {
 }
 
 /// The page seed of a cache group whose pages are computed and laid out as
-/// `identity` states: the group's upstream component identities and its
+/// `identity` states: the group's upstream stage identities and its
 /// page layout, as the ranks report them (`PrefixCacheInfo::identities`).
 /// The zero key for an empty identity, which a protocol consumer without a
 /// model reports: its pages are keyed by their tokens alone.

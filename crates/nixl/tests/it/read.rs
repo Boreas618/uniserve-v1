@@ -157,7 +157,7 @@ fn an_rdma_read_into_device_storage_mapped_again_at_a_released_address_lands_the
 /// READ through the network adapter, as another host's Transfer Server
 /// READs a read-only tensor. UCX registers host storage lazily by default,
 /// so a registration that asked for write access would leave this READ
-/// unanswered rather than fail.
+/// without a response rather than fail.
 #[test]
 #[ignore = "requires a CUDA device, an RDMA adapter and NIXL with read-only registration"]
 fn an_rdma_read_moves_read_only_host_storage_into_device_storage_of_another_process() {

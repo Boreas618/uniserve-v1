@@ -14,11 +14,11 @@
 //! storage to itself) and the device storage its context takes on each GPU
 //! ([`devices`]), then releases its contexts, connects as
 //! [`Role::Transfer`] and reports both ([`Request::Measured`]). It holds a
-//! GPU's context again only while it has work on the GPU, booked in the
-//! GPU's storage ledgers at the measured bytes meanwhile ([`contexts`]). It
+//! GPU's context again only while it has work on the GPU, reserved in the
+//! GPU's quotas at the measured bytes meanwhile ([`contexts`]). It
 //! then runs the server's tasks
-//! ([`Event::Transfer`]): every move goes to the lane of its link and of
-//! what runs its copies ([`lanes`]), by path:
+//! ([`Event::Task`]): every move goes to the copy thread of its link and of
+//! what runs its copies ([`copy threads`]), by path:
 //!
 //! | Source → destination | Runs on |
 //! | --- | --- |
@@ -32,10 +32,10 @@
 //! No compute kernel runs: copies use copy engines or the network adapters
 //! only, so the epoch executing beside them keeps its compute units. A
 //! same-GPU read-only mapping instead of a copy is the worker's own (it
-//! maps the storage from the server). A link from another host has a lane
+//! maps the storage from the server). A link from another host has a copy thread
 //! of its own, measured by its first copies long enough to time and then
 //! reported ([`Request::Measured`]), with the chunks, priorities and
-//! budget of every lane.
+//! budget of every copy thread.
 //!
 //! The same agent serves other hosts' READs of this host's storage: the
 //! server has it register the allocations a peer asks to expose
@@ -44,8 +44,8 @@
 //! need, stay until the peer ends the exposure ([`Event::Deregister`]). A
 //! task READing from another host ends its exposures there once it ended.
 //! What waits on another host, on a GPU's context or on a registration runs
-//! on a helper or lane thread, so the main thread keeps taking the server's
-//! events and the lanes' reports meanwhile, and places the bookings the
+//! on a helper or copy thread, so the main thread keeps taking the server's
+//! events and the copy threads' reports meanwhile, and places the reservations the
 //! other threads wait for.
 //!
 //! It also creates device storage the server holds from then on: an epoch's
@@ -56,15 +56,15 @@
 //! descriptor keeps the storage, and the server gives it back for the copy.
 //!
 //! It reports each task's progress and end ([`Request::Copied`]) only
-//! after the host saw the copies complete (an event its lane queried, or a
+//! after the host saw the copies complete (an event its copy thread queried, or a
 //! READ it polled), so no CUDA event crosses a process. It ends when the
 //! server closes its connection.
 
 mod contexts;
 mod devices;
-mod lanes;
 mod network;
 mod storage;
+mod threads;
 
 use std::collections::HashMap;
 use std::io;
@@ -75,17 +75,17 @@ use std::time::Duration;
 
 use ::storage::client::Client;
 use ::storage::protocol::{
-    Allocation, ContextBytes, Event, Item, Link, LinkEnd, Move, Priority, Registered, Reply,
-    Request, Role, TransferEnd,
+    Allocation, ContextBytes, Event, Item, Link, LinkEnd, Move, Priority, Registration, Request,
+    Response, Role, TaskStatus,
 };
 use platform::DeviceId;
 use rustix::event::{PollFd, PollFlags, poll};
 
-use contexts::{Booked, Booking, Bookings, Contexts, Hold};
+use contexts::{Contexts, GpuContext, Hold, Reservation, Reservations};
 use devices::Gpus;
-use lanes::{End, LaneKey, Lanes, Piece, Runner};
 use network::{Exposed, Inbound, Lease, Network, Sources};
-use storage::{Fabric, Mapped};
+use storage::{Fabric, Mapping};
+use threads::{CopyThreads, End, Piece, Runner, ThreadKey};
 
 /// How the Transfer Server copies.
 #[derive(Debug, Clone)]
@@ -101,16 +101,7 @@ pub struct Options {
     pub nixl_library: Option<PathBuf>,
 }
 
-/// Why the Transfer Server stopped.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Cuda(#[from] platform::Error),
-    #[error(transparent)]
-    Storage(#[from] ::storage::client::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-}
+use crate::Error;
 
 /// Measure this host's links, connect to the Storage Server on `socket`
 /// and run its tasks until it closes the connection.
@@ -126,7 +117,7 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
         .iter()
         .map(|measured| (measured.link.clone(), measured.bytes_per_second as f64))
         .collect();
-    let booked = booked(&gpus, &context_bytes)?;
+    let reserved = reserved(&gpus, &context_bytes)?;
 
     let mut client = Client::connect(socket, Role::Transfer)?;
     let (wake_reader, wake_writer) = rustix::pipe::pipe_with(
@@ -134,11 +125,11 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
     )
     .map_err(io::Error::from)?;
     let wake = Arc::new(wake_writer.try_clone()?);
-    let (booking_sender, bookings) = mpsc::channel();
+    let (reservation_sender, reservations) = mpsc::channel();
     let contexts = Arc::new(Contexts::new(
-        booked,
-        Bookings {
-            sender: booking_sender,
+        reserved,
+        Reservations {
+            sender: reservation_sender,
             wake: Arc::clone(&wake),
         },
     ));
@@ -158,12 +149,12 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
             })?;
     }
     let (sender, finished) = mpsc::channel();
-    let mut server = Served {
+    let mut server = TransferServer {
         gpus,
         contexts: Arc::clone(&contexts),
         allocations: HashMap::new(),
         helpers: Helpers { sender, wake },
-        lanes: Lanes::new(
+        threads: CopyThreads::new(
             wake_writer,
             options.chunk,
             bandwidths,
@@ -172,8 +163,8 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
         ),
         network,
         finished,
-        bookings,
-        answers: HashMap::new(),
+        reservations,
+        responses: HashMap::new(),
         exposing: HashMap::new(),
         exposures: HashMap::new(),
         sessions: HashMap::new(),
@@ -204,9 +195,7 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
             Ok(()) => {}
             // The server closes the connection when it stops, which ends
             // the Transfer Server.
-            Err(::storage::client::Error::Io(error))
-                if error.kind() == io::ErrorKind::UnexpectedEof =>
-            {
+            Err(::storage::Error::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
                 tracing::info!("the storage server closed the connection");
                 return Ok(());
             }
@@ -220,15 +209,15 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
                 server.send_with(&mut client, &report, descriptor.as_ref())?;
             }
         }
-        while let Ok(booking) = server.bookings.try_recv() {
-            server.book(&mut client, booking)?;
+        while let Ok(reservation) = server.reservations.try_recv() {
+            server.reserve(&mut client, reservation)?;
         }
-        // A lane reports a link it measured before the chunk that measured
+        // A copy thread reports a link it measured before the chunk that measured
         // it completes, so the links taken after the reports include every
         // link a reported task measured, and reach the server first: once
         // a task's submitter learns it ended, the listing has its links.
-        let reports = server.lanes.reports();
-        let links = server.lanes.measured();
+        let reports = server.threads.reports();
+        let links = server.threads.measured();
         if !links.is_empty() {
             let measured = Request::Measured {
                 links,
@@ -236,19 +225,24 @@ pub fn run(socket: &Path, options: &Options) -> Result<(), Error> {
             };
             server.send(&mut client, &measured)?;
         }
-        for (task, bytes, end) in reports {
-            if end.is_some() {
+        for (task, bytes, status) in reports {
+            if status.is_some() {
                 server.ended(task);
             }
-            server.send(&mut client, &Request::Copied { task, bytes, end })?;
+            let copied = Request::Copied {
+                task,
+                bytes,
+                status,
+            };
+            server.send(&mut client, &copied)?;
         }
         server.collect(&mut client);
     }
 }
 
-/// Each GPU as its context is booked: the context's bytes as measured, and
+/// Each GPU as its context is reserved: the context's bytes as measured, and
 /// the GPU's total storage as NVML reports it.
-fn booked(gpus: &Gpus, measured: &[ContextBytes]) -> Result<Vec<Booked>, Error> {
+fn reserved(gpus: &Gpus, measured: &[ContextBytes]) -> Result<Vec<GpuContext>, Error> {
     let identities: Vec<(DeviceId, [u8; 16])> = gpus.identities().collect();
     if identities.is_empty() {
         return Ok(Vec::new());
@@ -257,7 +251,7 @@ fn booked(gpus: &Gpus, measured: &[ContextBytes]) -> Result<Vec<Booked>, Error> 
     identities
         .into_iter()
         .map(|(device, uuid)| {
-            Ok(Booked {
+            Ok(GpuContext {
                 device,
                 uuid,
                 total: nvml.memory_info(device)?.total,
@@ -287,7 +281,7 @@ enum Done {
     Registered {
         request: u64,
         holds: Vec<Hold>,
-        registered: Result<(Vec<u8>, Vec<Registered>), String>,
+        registered: Result<(Vec<u8>, Vec<Registration>), String>,
     },
     /// The device storage of the server's allocation `request`: its POSIX
     /// descriptor and its size, rounded up to the GPU's granularity; or
@@ -300,7 +294,7 @@ enum Done {
 
 /// Runs work that waits on another host, on a GPU's context or on
 /// registering storage, off the main thread, and wakes the main thread with
-/// its outcome.
+/// its result.
 struct Helpers {
     sender: mpsc::Sender<Done>,
     /// The write end of the main thread's wake pipe.
@@ -322,7 +316,7 @@ impl Helpers {
                 }
             });
         if let Err(error) = spawned {
-            lanes::fatal("starting a helper thread", &error);
+            threads::fatal("starting a helper thread", &error);
         }
     }
 }
@@ -331,24 +325,24 @@ impl Helpers {
 type TaskHolds = HashMap<DeviceId, Hold>;
 
 /// The Transfer Server's state on its main thread.
-struct Served {
+struct TransferServer {
     gpus: Gpus,
     /// The GPUs' contexts, held while work needs them.
     contexts: Arc<Contexts>,
     /// The allocations the server gave, until it takes them back.
-    allocations: HashMap<Allocation, Arc<Mapped>>,
-    lanes: Lanes,
-    /// The NIXL agent of the path between hosts, which the lanes and the
+    allocations: HashMap<Allocation, Arc<Mapping>>,
+    threads: CopyThreads,
+    /// The NIXL agent of the path between hosts, which the copy threads and the
     /// helpers share.
     network: Arc<Network>,
     helpers: Helpers,
     /// What the helpers finished.
     finished: mpsc::Receiver<Done>,
-    /// The bookings of GPU contexts the main thread places in the server's
-    /// ledgers.
-    bookings: mpsc::Receiver<Booking>,
-    /// Bookings placed whose answer a thread waits for, by request.
-    answers: HashMap<u64, mpsc::SyncSender<Result<(), String>>>,
+    /// The reservations of GPU contexts the main thread places in the server's
+    /// quotas.
+    reservations: mpsc::Receiver<Reservation>,
+    /// Reservations placed whose respond to a thread waits for, by request.
+    responses: HashMap<u64, mpsc::SyncSender<Result<(), String>>>,
     /// The tasks whose sources other hosts are exposing, and whether the
     /// server cancelled each meanwhile.
     exposing: HashMap<u64, bool>,
@@ -360,11 +354,11 @@ struct Served {
     /// The exposures of other hosts each running task READs, which end
     /// with it.
     leases: HashMap<u64, Vec<Lease>>,
-    /// Requests sent and not answered yet.
+    /// Requests sent and not responded yet.
     replies: Vec<u64>,
 }
 
-impl Served {
+impl TransferServer {
     fn send(&mut self, client: &mut Client, request: &Request) -> Result<(), Error> {
         self.send_with(client, request, None)
     }
@@ -381,43 +375,43 @@ impl Served {
         Ok(())
     }
 
-    /// Place `booking` in the server's ledgers: a GPU's context, booked at
+    /// Place `reservation` in the server's quotas: a GPU's context, reserved at
     /// its bytes before a thread retains it, or ended once it was released.
-    fn book(&mut self, client: &mut Client, booking: Booking) -> Result<(), Error> {
-        let request = Request::Book {
-            gpu: booking.gpu,
-            total: booking.total,
-            quota: None,
-            items: vec![(Item::TransferContext, booking.bytes)],
+    fn reserve(&mut self, client: &mut Client, reservation: Reservation) -> Result<(), Error> {
+        let request = Request::Quota {
+            gpu: reservation.gpu,
+            total: reservation.total,
+            limit: None,
+            reservations: vec![(Item::TransferContext, reservation.bytes)],
         };
         let id = client.submit(&request, &[])?;
-        match booking.answer {
-            Some(answer) => {
-                self.answers.insert(id, answer);
+        match reservation.response {
+            Some(sender) => {
+                self.responses.insert(id, sender);
             }
             None => self.replies.push(id),
         }
         Ok(())
     }
 
-    /// Take the server's answers: a booking's answer goes to the thread that
+    /// Take the server's responses: a reservation's response goes to the thread that
     /// waits for it; an error to a report names a task the server no longer
     /// holds, which changes nothing here.
     fn collect(&mut self, client: &mut Client) {
-        self.answers.retain(|id, answer| match client.take(*id) {
-            Some(answered) => {
-                let outcome = match answered.reply {
-                    Reply::Error { message, .. } => Err(message),
+        self.responses.retain(|id, sender| match client.take(*id) {
+            Some((response, _)) => {
+                let result = match response {
+                    Response::Error { message, .. } => Err(message),
                     _ => Ok(()),
                 };
-                let _ = answer.send(outcome);
+                let _ = sender.send(result);
                 false
             }
             None => true,
         });
         self.replies.retain(|id| match client.take(*id) {
-            Some(answer) => {
-                if let Reply::Error { message, .. } = answer.reply {
+            Some((response, _)) => {
+                if let Response::Error { message, .. } = response {
                     tracing::warn!(message, "the storage server refused a report");
                 }
                 false
@@ -439,7 +433,7 @@ impl Served {
                     tracing::warn!(?allocation, "an allocation came without its descriptor");
                     return;
                 };
-                let mapped = Mapped::new(
+                let mapped = Mapping::new(
                     end,
                     bytes,
                     writable,
@@ -455,12 +449,12 @@ impl Served {
                 // READ of it fails from then on.
                 self.allocations.remove(&allocation);
             }
-            Event::Transfer {
+            Event::Task {
                 task,
                 priority,
                 moves,
             } => self.transfer(task, priority, &moves),
-            Event::TransferSession { session, gpus } => {
+            Event::Session { session, gpus } => {
                 if gpus.is_empty() {
                     if let Some(holds) = self.sessions.remove(&session) {
                         self.helpers.spawn(move || {
@@ -490,9 +484,9 @@ impl Served {
             }
             Event::Cancel { task } => match self.exposing.get_mut(&task) {
                 // Its pieces are not queued yet: it ends, cancelled, once
-                // the other hosts answered.
+                // the other hosts responded.
                 Some(cancelled) => *cancelled = true,
-                None => self.lanes.cancel(task),
+                None => self.threads.cancel(task),
             },
             Event::Throttle {
                 links,
@@ -505,7 +499,7 @@ impl Served {
                     ?throttle,
                     "changing link budgets"
                 );
-                self.lanes.throttle(&links, &tasks, throttle);
+                self.threads.throttle(&links, &tasks, throttle);
             }
             Event::Register {
                 request,
@@ -526,8 +520,8 @@ impl Served {
                     });
                 }
             }
-            Event::TransferProgress { .. }
-            | Event::Transferred { .. }
+            Event::TaskProgress { .. }
+            | Event::TaskEnded { .. }
             | Event::Prefetched { .. }
             | Event::Pool { .. }
             | Event::PoolReleased { .. }
@@ -537,7 +531,7 @@ impl Served {
         }
     }
 
-    /// Queue task `task`'s moves on their lanes, or fail it whole when one
+    /// Queue task `task`'s moves on their copy threads, or fail it whole when one
     /// cannot run here. A task with moves from other hosts queues once a
     /// helper had those hosts expose their sources.
     fn transfer(&mut self, task: u64, priority: Priority, moves: &[Move]) {
@@ -581,12 +575,12 @@ impl Served {
                     .map(|piece| pieces.push(piece)),
             };
             if let Err(message) = taken {
-                self.lanes.end(task, TransferEnd::Failed { message });
+                self.threads.end(task, TaskStatus::Failed { message });
                 return;
             }
         }
         if inbound.is_empty() {
-            self.lanes.submit(task, priority, pieces);
+            self.threads.submit(task, priority, pieces);
             return;
         }
 
@@ -609,7 +603,7 @@ impl Served {
     }
 
     /// Task `task` ended: the exposures of other hosts it READ from end, on
-    /// a helper, since each waits for its host's answer.
+    /// a helper, since each waits for its host's response.
     fn ended(&mut self, task: u64) {
         if let Some(leases) = self.leases.remove(&task) {
             let network = Arc::clone(&self.network);
@@ -652,7 +646,7 @@ impl Served {
 
     /// Create `bytes` of device storage on GPU `gpu` for the server's
     /// allocation `request`, on a helper: creating tens of gigabytes takes
-    /// a while, and the lanes' reports go on meanwhile.
+    /// a while, and the copy threads' reports go on meanwhile.
     fn allocate(&mut self, request: u64, gpu: [u8; 16], bytes: u64) {
         let held = self
             .gpus
@@ -667,7 +661,7 @@ impl Served {
             .and_then(|(device, readers)| Ok((self.contexts.hold(device)?, device, readers)));
         self.helpers.spawn(move || {
             // The allocation is made in the GPU's session, whose context the
-            // ledgers book while it is held; the session closes once the
+            // quotas reserve while it is held; the session closes once the
             // last hold ends, after the allocation's handle was released.
             let allocated = held.and_then(|(hold, device, readers)| {
                 hold.session()?;
@@ -689,18 +683,18 @@ impl Served {
                 let cancelled = self.exposing.remove(&task).unwrap_or(false);
                 match pieces {
                     Ok(sources) if cancelled => {
-                        self.lanes.end(task, TransferEnd::Cancelled);
+                        self.threads.end(task, TaskStatus::Cancelled);
                         self.leases.insert(task, sources.leases);
                         self.ended(task);
                     }
                     Ok(sources) => {
                         self.leases.insert(task, sources.leases);
-                        self.lanes.submit(task, priority, sources.pieces);
+                        self.threads.submit(task, priority, sources.pieces);
                     }
-                    Err(_) if cancelled => self.lanes.end(task, TransferEnd::Cancelled),
+                    Err(_) if cancelled => self.threads.end(task, TaskStatus::Cancelled),
                     Err(message) => {
                         tracing::warn!(task, message, "a task's sources on other hosts failed");
-                        self.lanes.end(task, TransferEnd::Failed { message });
+                        self.threads.end(task, TaskStatus::Failed { message });
                     }
                 }
                 None
@@ -770,7 +764,7 @@ impl Served {
         Ok(hold)
     }
 
-    /// The lane and the piece of one move between allocations of this host
+    /// The copy thread and the piece of one move between allocations of this host
     /// and of the fabric; `imports` holds the task's imports of other
     /// hosts' allocations, and `holds` its holds on the GPUs.
     fn piece(
@@ -779,7 +773,7 @@ impl Served {
         copy: &Move,
         imports: &mut Imports,
         holds: &mut TaskHolds,
-    ) -> Result<(LaneKey, Piece), String> {
+    ) -> Result<(ThreadKey, Piece), String> {
         let source = self.side(&copy.source)?;
         let destination = self.side(&copy.destination)?;
         let link = Link {
@@ -798,7 +792,7 @@ impl Served {
             source_pitch: copy.source_pitch,
             destination_pitch: copy.destination_pitch,
         };
-        Ok((LaneKey { link, runner }, piece))
+        Ok((ThreadKey { link, runner }, piece))
     }
 
     /// A piece's end on `runner`, holding the GPU whose context reaches it:
@@ -841,7 +835,7 @@ impl Served {
     }
 
     /// An allocation the server gave.
-    fn given(&self, allocation: &Allocation) -> Result<Arc<Mapped>, String> {
+    fn given(&self, allocation: &Allocation) -> Result<Arc<Mapping>, String> {
         match self.side(allocation)? {
             Side::Given(mapped) => Ok(mapped),
             Side::Fabric { .. } => {
@@ -917,9 +911,9 @@ impl Served {
 /// importing GPU.
 type Imports = HashMap<([u8; 64], DeviceId), Arc<Fabric>>;
 
-/// One side of a move, before the lane that copies it is known.
+/// One side of a move, before the copy thread that copies it is known.
 enum Side {
-    Given(Arc<Mapped>),
+    Given(Arc<Mapping>),
     Fabric {
         handle: [u8; 64],
         gpu: [u8; 16],

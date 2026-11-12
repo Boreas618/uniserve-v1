@@ -5,14 +5,14 @@
 //!
 //! Each server runs on a thread of the test process and is reached by its
 //! TCP endpoint as another host reaches it. No GPU and no NIXL is needed:
-//! the pins are bookkeeping of the source host's server, and the transfer
+//! the pins are accounting of the source host's server, and the transfer
 //! that writes the reading host's reservation never reaches a READ.
 
 use std::io::Read;
 use std::time::{Duration, Instant};
 
 use ::storage::protocol::{
-    ErrorKind, Event, ListedPool, PageSlot, Priority, Region, Reply, Request, TransferEnd,
+    ErrorKind, Event, PageSlot, PoolListing, Priority, Region, Request, Response, TaskStatus,
 };
 use ::storage::{Client, Key, Role};
 
@@ -23,7 +23,7 @@ use crate::transfer::{
     Gpus, Slow, pattern, read, remote_region, serving, slow, span, tensor_region, transfer_event,
 };
 
-/// How long a peer's blocking calls wait for an answer.
+/// How long a peer's blocking calls wait for an response.
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The layout of the pages `trial_pool` holds.
@@ -32,7 +32,7 @@ fn layout() -> Key {
 }
 
 /// Pool `pool` as the server on `socket` lists it.
-fn listed(socket: &std::path::Path, pool: u64) -> ListedPool {
+fn listed(socket: &std::path::Path, pool: u64) -> PoolListing {
     let mut operator = Client::connect(socket, Role::Operator).unwrap();
     operator
         .list()
@@ -66,7 +66,7 @@ fn a_peer_pins_only_the_pages_of_published_epochs() {
     let server = Running::with_transfer(|_| None);
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_epochs(vec![1]).unwrap();
+    daemon.publish(vec![1]).unwrap();
     let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let pool = trial_pool(&mut worker);
 
@@ -107,7 +107,7 @@ fn a_peer_pins_only_the_pages_of_published_epochs() {
 
     // The pinned page stays while the serving epoch fills the pool of four
     // slots: the page of epoch 2 gives way, the pinned one does not.
-    let Reply::Reserved { slots } = serving
+    let Response::Reserved { slots } = serving
         .call(
             &Request::Reserve {
                 pool,
@@ -118,7 +118,7 @@ fn a_peer_pins_only_the_pages_of_published_epochs() {
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the reservation was refused");
     };
@@ -145,7 +145,7 @@ fn a_peer_pins_only_the_pages_of_published_epochs() {
         .peer_pin("model".into(), vec![layout()], vec![key(2)])
         .unwrap();
     assert!(before.is_empty(), "{before:?}");
-    daemon.publish_epochs(vec![2]).unwrap();
+    daemon.publish(vec![2]).unwrap();
     let published = peer
         .peer_pin("model".into(), vec![layout()], vec![key(2)])
         .unwrap();
@@ -165,11 +165,11 @@ fn a_peer_pins_only_the_pages_of_published_epochs() {
             &[],
         )
         .unwrap()
-        .reply;
+        .0;
     assert!(
         matches!(
             refused,
-            Reply::Error {
+            Response::Error {
                 kind: ErrorKind::Invalid,
                 ..
             }
@@ -189,7 +189,7 @@ fn a_closed_peer_connection_ends_its_pins() {
     let server = Running::with_transfer(|_| None);
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_epochs(vec![1]).unwrap();
+    daemon.publish(vec![1]).unwrap();
     let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let pool = trial_pool(&mut worker);
     let mut serving = engine_head(&server.socket, 1);
@@ -217,7 +217,7 @@ fn a_closed_peer_connection_ends_its_pins() {
 /// Transfer Server may write them until then; then they are aborted.
 ///
 /// The task's source lies on a host that accepts the Transfer Server's
-/// connection and never answers, which holds the task until the test
+/// connection and never responds to, which holds the task until the test
 /// closes that connection.
 #[test]
 fn a_disconnected_heads_task_reservations_end_after_its_task() {
@@ -227,12 +227,12 @@ fn a_disconnected_heads_task_reservations_end_after_its_task() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut daemon = head(&reading.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_epochs(vec![1]).unwrap();
+    daemon.publish(vec![1]).unwrap();
     let mut worker = epoch_worker(&reading.socket, scope("text", 0), 1, claim);
     let pool = trial_pool(&mut worker);
     let mut reader = engine_head(&reading.socket, 1);
 
-    let Reply::Reserved { slots } = reader
+    let Response::Reserved { slots } = reader
         .call(
             &Request::Reserve {
                 pool,
@@ -243,7 +243,7 @@ fn a_disconnected_heads_task_reservations_end_after_its_task() {
             &[],
         )
         .unwrap()
-        .reply
+        .0
     else {
         panic!("the reservation was refused");
     };
@@ -251,11 +251,11 @@ fn a_disconnected_heads_task_reservations_end_after_its_task() {
         panic!("no slot was reserved: {slots:?}");
     };
 
-    // A source host that never answers the Transfer Server's hello.
+    // A source host that never responds to the Transfer Server's hello.
     let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let source_host = silent.local_addr().unwrap().to_string();
     let task = reader
-        .transfer(
+        .copy(
             vec![span(
                 remote_region(&source_host, Region::Pool { pool: 1 }),
                 0,
@@ -308,14 +308,14 @@ fn a_request_transfer_overtakes_a_promotion_on_its_link() {
     } = slow(&server, 256 << 20);
 
     let promotion = worker
-        .transfer(
+        .copy(
             vec![span(tensor_region(1), 0, tensor_region(2), 0, bytes - 4096)],
             Priority::Promotion,
             1,
         )
         .unwrap();
     let request = worker
-        .transfer(
+        .copy(
             vec![span(
                 tensor_region(1),
                 0,
@@ -330,8 +330,11 @@ fn a_request_transfer_overtakes_a_promotion_on_its_link() {
 
     let mut ended = Vec::new();
     while ended.len() < 2 {
-        if let Event::Transferred { task, end, .. } = transfer_event(&mut worker) {
-            assert_eq!(end, TransferEnd::Complete);
+        if let Event::TaskEnded {
+            task, status: end, ..
+        } = transfer_event(&mut worker)
+        {
+            assert_eq!(end, TaskStatus::Complete);
             ended.push(task);
         }
     }

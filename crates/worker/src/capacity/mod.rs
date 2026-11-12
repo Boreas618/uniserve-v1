@@ -4,8 +4,8 @@
 //! A deployment may use `⌊total × fraction⌋` of a GPU (its quota), and every
 //! epoch of the deployment that uses the GPU, with the host's Transfer
 //! Server, holds its storage within that one quota: the Storage Server keeps
-//! the GPU's ledger. A rank's grant is the quota less everything the ledger
-//! books beside the rank's own process, and less what the process holds now.
+//! the GPU's quota. A rank's grant is the quota less everything the quota
+//! reserves beside the rank's own process, and less what the process holds now.
 //!
 //! The plan that sizes the cache, the products and the graph pools from those
 //! figures is [`plan_rank`]; it reads the deployment's configuration and what
@@ -264,8 +264,8 @@ fn relay_bytes(requests: usize, depth: usize) -> u64 {
 /// The figure is capacity planning, so it lives here and the arena that maps
 /// the pools takes the bytes as an input. Ten percent of the device holds the
 /// buckets of a causal language model and a media model of the slice with
-/// room to spare; a rank that captures more books it as its own graph item,
-/// so the ledger refuses it before the device runs out.
+/// room to spare; a rank that captures more reserves it as its own graph item,
+/// so the quota refuses it before the device runs out.
 pub fn graph_storage_budget_bytes(total_device_bytes: i64) -> u64 {
     (total_device_bytes.max(0) as f64 * 0.10) as u64
 }

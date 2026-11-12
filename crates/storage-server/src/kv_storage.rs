@@ -15,7 +15,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use ::storage::protocol::Key;
 
-use crate::child::{Launch, Supervised};
+use crate::child::{Launch, Process};
 
 /// A task the connector runs for the server.
 pub(super) enum Task {
@@ -45,7 +45,7 @@ pub(super) enum Task {
 
 /// The connector process and its connection.
 pub(super) struct KvStorage {
-    pub(super) process: Supervised,
+    pub(super) process: Process,
     /// The connected connector's client.
     pub(super) client: Option<u64>,
     pub(super) tasks: HashMap<u64, Task>,
@@ -57,7 +57,7 @@ pub(super) struct KvStorage {
 impl KvStorage {
     pub(super) fn new(launch: Option<Launch>) -> Self {
         Self {
-            process: Supervised::new("Mooncake connector", launch),
+            process: Process::new("Mooncake connector", launch),
             client: None,
             tasks: HashMap::new(),
             next: 1,

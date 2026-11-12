@@ -10,7 +10,7 @@ use super::*;
 
 /// The allocation granularity of these epochs: small, so that shards of a
 /// few kilobytes lie on chunk bounds as gigabyte shards do on devices.
-const GRANULE: u64 = 256;
+const GRANULARITY: u64 = 256;
 
 /// The element of logical tensor `tensor` at `index`, as the bytes every
 /// epoch holding it stores.
@@ -93,7 +93,7 @@ fn storage(mut fields: Vec<Field>) -> Storage {
         bytes: offset,
         fields,
     };
-    Storage::chunked(layout, GRANULE, &[1, 2, 4], &|_| Some([3; 32])).unwrap()
+    Storage::chunked(layout, GRANULARITY, &[1, 2, 4], &|_| Some([3; 32])).unwrap()
 }
 
 /// What a rank of a small mixture-of-experts model holds under tensor
@@ -293,7 +293,7 @@ fn image(epoch: &Epoch) -> Vec<Vec<Vec<u8>>> {
             rank.storages
                 .iter()
                 .map(|storage| {
-                    let mut bytes = vec![0xAB; storage.layout.padded(GRANULE) as usize];
+                    let mut bytes = vec![0xAB; storage.layout.padded(GRANULARITY) as usize];
                     for field in &storage.layout.fields {
                         let range = field.bytes();
                         bytes[range.start as usize..range.end as usize]
@@ -317,7 +317,7 @@ fn apply(request: &Request, manifest: &Manifest) -> Vec<Vec<Vec<u8>>> {
         .map(|rank| {
             rank.storages
                 .iter()
-                .map(|storage| vec![0xCD; storage.layout.padded(GRANULE) as usize])
+                .map(|storage| vec![0xCD; storage.layout.padded(GRANULARITY) as usize])
                 .collect()
         })
         .collect();
@@ -481,7 +481,7 @@ fn tensor_parallel_replicas_become_expert_parallel_ranks() {
         gpus: (0..4).map(gpu).collect(),
         links: links(4),
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert!(manifest.missing.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
     // The query rows and the norm each target finds on its GPU are mapped.
@@ -601,7 +601,7 @@ fn ranks_take_the_gpus_that_hold_their_experts() {
         gpus: (0..4).map(gpu).collect(),
         links: links(4),
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert!(manifest.missing.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
     let holder = |rank: usize| manifest.gpus[rank];
@@ -640,7 +640,7 @@ fn running_target_ranks_keep_their_gpus() {
         gpus: (0..4).map(gpu).collect(),
         links: links(4),
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert_eq!(manifest.gpus, (0..4).map(gpu).collect::<Vec<_>>());
     assert!(manifest.missing.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
@@ -654,7 +654,7 @@ fn running_target_ranks_keep_their_gpus() {
 
     let mut partial = request.clone();
     partial.target.ranks[1].gpu = None;
-    assert!(Manifest::plan(&partial).is_err());
+    assert!(Manifest::compute(&partial).is_err());
 }
 
 #[test]
@@ -704,7 +704,7 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
         gpus: (0..4).map(gpu).collect(),
         links: measured.clone(),
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert!(manifest.missing.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
     // The ranks on the other host receive from both source GPUs.
@@ -739,7 +739,7 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
             bytes_per_second: 400_000_000_000,
         });
     }
-    let manifest = Manifest::plan(&fabric).unwrap();
+    let manifest = Manifest::compute(&fabric).unwrap();
     let seconds = |source: usize| {
         manifest
             .links
@@ -756,12 +756,12 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
         seconds(1)
     );
 
-    // Without a link from the other host's GPUs, no plan reaches them.
+    // Without a link from the other host's GPUs, no manifest reaches them.
     let mut unmeasured = request;
     unmeasured
         .links
         .retain(|measured| !matches!(measured.link.source, LinkEnd::Remote { .. }));
-    assert!(Manifest::plan(&unmeasured).is_err());
+    assert!(Manifest::compute(&unmeasured).is_err());
 }
 
 /// A `u32` field of `tokens` positions of 8 channels holding `segments`.
@@ -820,7 +820,7 @@ fn position_mod_n_and_strided_indices_redistribute() {
         gpus: (0..2).map(gpu).collect(),
         links: links(2),
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert!(manifest.missing.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
 }
@@ -842,7 +842,7 @@ fn column_view(rows: u64, columns: u64, first: u64, count: u64) -> Storage {
         bytes: rows * columns * view.element,
         fields: vec![view],
     };
-    Storage::chunked(layout, GRANULE, &[1, 2, 4], &|_| Some([3; 32])).unwrap()
+    Storage::chunked(layout, GRANULARITY, &[1, 2, 4], &|_| Some([3; 32])).unwrap()
 }
 
 #[test]
@@ -868,7 +868,7 @@ fn column_views_with_gaps_between_rows_redistribute() {
         gpus: (0..4).map(gpu).collect(),
         links: links(4),
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert!(manifest.missing.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
 }
@@ -886,7 +886,7 @@ fn borrowed_regions_copy_between_offsets_of_the_same_allocation() {
         gpus: vec![gpu(0)],
         links: links(1),
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     let mut allocation = vec![0_u8; 1_024];
     let expected: Vec<u8> = (0..256).map(|byte| (byte % 251) as u8).collect();
     allocation[64..320].copy_from_slice(&expected);
@@ -931,7 +931,7 @@ fn mixed_host_and_device_chunks_use_their_physical_links() {
             },
         ],
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert_fields_equal(&request, &apply(&request, &manifest));
     let traffic: BTreeMap<_, _> = manifest
         .links
@@ -994,7 +994,7 @@ fn host_staging_round_trip_preserves_borrowed_region_offsets() {
                 bytes_per_second: 256,
             }],
         };
-        let manifest = Manifest::plan(&request).unwrap();
+        let manifest = Manifest::compute(&request).unwrap();
         assert_eq!(manifest.copied_bytes(), 256);
         assert_eq!(
             manifest.links,
@@ -1070,7 +1070,7 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
         gpus: vec![gpu(0)],
         links: measured,
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert_eq!(
         manifest.links,
         vec![LinkLoad {
@@ -1100,7 +1100,7 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
 }
 
 /// Ranks on two hosts read the sources at other times and bind them from
-/// their own hosts: they plan from the storages both read, in the first
+/// their own hosts: they compute from the storages both read, in the first
 /// reader's order and bindings, and each binds that epoch from its host.
 #[test]
 fn ranks_on_two_hosts_plan_from_the_sources_both_read() {
@@ -1135,7 +1135,7 @@ fn ranks_on_two_hosts_plan_from_the_sources_both_read() {
     assert!(reading.same_storage(&agreed));
     assert_eq!(reading.ranks[0].storages, vec![remote(page("a"), gpu(0))]);
     assert_eq!(first.reading_of(&agreed).unwrap(), first);
-    // A reader that lacks a storage of the plan cannot bind it.
+    // A reader that lacks a storage of the manifest cannot bind it.
     assert!(first.reading_of(&second).is_none());
 }
 
@@ -1156,7 +1156,7 @@ fn one_gpu_copy_plan_binds_to_each_submitting_host() {
         };
     }
     assert!(request.source.same_storage(&remote));
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     let local_spans = manifest
         .bind(&request, &request.source)
         .spans()
@@ -1197,14 +1197,14 @@ fn one_gpu_copy_plan_binds_to_each_submitting_host() {
         );
     }
     // The same physical GPU remains a zero-copy source even when another
-    // planning host describes its transport as remote.
+    // computing host describes its transport as remote.
     let local_target = Request {
         source: remote,
         target: request.source.clone(),
         gpus: vec![gpu(0)],
         links: links(2),
     };
-    assert_eq!(Manifest::plan(&local_target).unwrap().copied_bytes(), 0);
+    assert_eq!(Manifest::compute(&local_target).unwrap().copied_bytes(), 0);
 }
 
 /// A field stored in this test's encoding, whose canonical form is the
@@ -1249,7 +1249,7 @@ fn encoded_fields_move_in_canonical_form() {
         gpus: vec![gpu(0)],
         links: links(2),
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert_eq!(manifest.encodes.len(), 2);
     assert_eq!(manifest.decodes.len(), 1);
     assert!(manifest.mappings.is_empty());
@@ -1271,20 +1271,20 @@ fn encoded_fields_move_in_canonical_form() {
         gpus: vec![gpu(0)],
         links: links(2),
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert!(manifest.encodes.is_empty() && manifest.decodes.is_empty());
     assert_fields_equal(&request, &apply(&request, &manifest));
 }
 
 /// A tensor a listing lists: `key` at `location`, retained by `epoch` of
 /// deployment `model`.
-fn listed(key: Key, name: &str, location: Location, epoch: u64) -> crate::protocol::ListedTensor {
+fn listed(key: Key, name: &str, location: Location, epoch: u64) -> crate::protocol::TensorListing {
     let scope = crate::Scope {
         deployment: "model".into(),
         group: "model".into(),
         rank: 0,
     };
-    crate::protocol::ListedTensor {
+    crate::protocol::TensorListing {
         key,
         name: name.into(),
         scopes: vec![scope.clone()],
@@ -1368,7 +1368,7 @@ fn a_epochs_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
     }
     let mut listing = crate::protocol::Listing {
         tensors,
-        transfer: Some(crate::protocol::ListedTransfer {
+        transfer: Some(crate::protocol::TransferListing {
             pid: 1,
             links: links(2),
             contexts: Vec::new(),
@@ -1451,7 +1451,7 @@ fn unchanged_fields_of_a_packed_weight_storage_remain_transfer_sources() {
     );
     let listing = crate::protocol::Listing {
         tensors,
-        transfer: Some(crate::protocol::ListedTransfer {
+        transfer: Some(crate::protocol::TransferListing {
             pid: 1,
             links: links(2),
             contexts: Vec::new(),
@@ -1484,7 +1484,7 @@ fn unchanged_fields_of_a_packed_weight_storage_remain_transfer_sources() {
         gpus: vec![gpu(1)],
         links: links(2),
     };
-    let manifest = Manifest::plan(&request).unwrap();
+    let manifest = Manifest::compute(&request).unwrap();
     assert_fields_equal(&request, &apply(&request, &manifest));
     // The changed tensor cannot be supplied under the requested identity.
     assert!(

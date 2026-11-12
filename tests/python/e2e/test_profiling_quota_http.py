@@ -1,9 +1,9 @@
-"""A profiling session's device storage in its GPU's storage ledger.
+"""A profiling session's device storage in its GPU's quota.
 
 Qwen3 serves on the GPU the module's lease granted with its
 KV cache sized by the deployment's quota. A ``range_metrics`` session whose
-pass takes more device storage than the ledger has room for first has the
-KV cache give back tail segments for it; the worker's process item books
+pass takes more device storage than the quota has room for first has the
+KV cache give back tail segments for it; the worker's process item reserves
 the pass while the session runs, and the cache grows back once it ends. A
 pass that even every segment past the first cannot make room for is
 refused, naming its bytes.
@@ -64,33 +64,33 @@ def served(
         yield base_url
 
 
-def _ledger(base_url: str) -> dict:
-    """The storage ledger of the worker's GPU."""
+def _quota(base_url: str) -> dict:
+    """The quota of the worker's GPU."""
     status = httpx.get(f"{base_url}/admin/config", timeout=60).json()
-    [ledger] = [
-        ledger
-        for node in status["ledgers"]
-        for ledger in node["ledgers"]
-        if any(entry["item"] == "process" for entry in ledger["entries"])
+    [quota] = [
+        quota
+        for node in status["quotas"]
+        for quota in node["quotas"]
+        if any(entry["item"] == "process" for entry in quota["reservations"])
     ]
-    return ledger
+    return quota
 
 
-def _bytes(ledger: dict, item: str) -> int:
+def _bytes(quota: dict, item: str) -> int:
     return sum(
-        entry["bytes"] for entry in ledger["entries"] if entry["item"] == item
+        entry["bytes"] for entry in quota["reservations"] if entry["item"] == item
     )
 
 
-def _room(ledger: dict) -> int:
-    return ledger["quota"] - sum(entry["bytes"] for entry in ledger["entries"])
+def _room(quota: dict) -> int:
+    return quota["limit"] - sum(entry["bytes"] for entry in quota["reservations"])
 
 
 def test_the_cache_makes_room_for_a_session_and_grows_back(
     served: str, tmp_path: Path
 ):
-    before = _ledger(served)
-    # A pass 4 GiB past the ledger's room.
+    before = _quota(served)
+    # A pass 4 GiB past the quota's room.
     ranges = _ranges_past(_room(before) + (4 << 30))
     storage = _pass_storage(ranges)
     start(
@@ -102,7 +102,7 @@ def test_the_cache_makes_room_for_a_session_and_grows_back(
             "output_dir": str(tmp_path / "profiles"),
         },
     )
-    during = _ledger(served)
+    during = _quota(served)
     assert _bytes(during, "process") == _bytes(before, "process") + storage
     given_back = _bytes(before, "cache_segment") - _bytes(
         during, "cache_segment"
@@ -113,7 +113,7 @@ def test_the_cache_makes_room_for_a_session_and_grows_back(
     stopped = httpx.delete(f"{served}/admin/profile", timeout=600)
     assert stopped.status_code == 200, stopped.text
     assert ended(served, 60)["end_reason"] == "operator"
-    after = _ledger(served)
+    after = _quota(served)
     assert _bytes(after, "process") == _bytes(before, "process"), after
     assert _bytes(after, "cache_segment") == _bytes(before, "cache_segment"), (
         after
@@ -123,7 +123,7 @@ def test_the_cache_makes_room_for_a_session_and_grows_back(
 def test_a_pass_no_withdrawal_makes_room_for_is_refused(
     served: str, tmp_path: Path
 ):
-    before = _ledger(served)
+    before = _quota(served)
     # Past the room and every segment of the cache together.
     ranges = _ranges_past(_room(before) + _bytes(before, "cache_segment"))
     refused = httpx.post(
@@ -137,7 +137,7 @@ def test_a_pass_no_withdrawal_makes_room_for_is_refused(
     )
     assert refused.status_code == 400, refused.text
     assert str(_pass_storage(ranges)) in refused.text, refused.text
-    after = _ledger(served)
+    after = _quota(served)
     assert _bytes(after, "cache_segment") == _bytes(before, "cache_segment"), (
         after
     )

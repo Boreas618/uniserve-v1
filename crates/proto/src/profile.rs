@@ -242,7 +242,7 @@ impl SessionRequest {
     /// The device storage the session holds on the GPU of each worker it
     /// selects while it runs: a range profiler pass for `range_metrics`
     /// ([`RangeMetricsOptions::pass_storage`]); 0 otherwise. The worker
-    /// books it in the GPU's storage ledger beside its process.
+    /// reserves it in the GPU's quota beside its process.
     pub fn device_storage(&self) -> u64 {
         if self.collectors.contains(&Collector::RangeMetrics) {
             self.range_metrics.pass_storage()
