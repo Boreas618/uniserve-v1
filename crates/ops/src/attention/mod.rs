@@ -8,9 +8,9 @@
 //! query      [tokens, q_heads, head_dim]      one dtype, row-major
 //! key        [pages, page_size, kv_heads, head_dim]   pages of one cache
 //! value      [pages, page_size, kv_heads, head_dim]
-//! page_table [batch, max_pages] i32           each row's pages, from column 0
-//! seq_lens   [batch] i32                      keys visible to the row's last query
-//! cum_seq_lens_q [batch + 1] i32              prefill only: query offsets of the packed rows
+//! page_table [batch, max_pages] u32           each row's pages, from column 0
+//! seq_lens   [batch] u32                      keys visible to the row's last query
+//! cum_seq_lens_q [batch + 1] u32              prefill only: query offsets of the packed rows
 //! out        [tokens, q_heads, head_dim]
 //! ```
 //!
@@ -207,11 +207,11 @@ pub struct Args {
     pub key_scale: Option<Operand>,
     /// `[pages, 1, 1, 1]` f32: each page's value scale, as `key_scale`.
     pub value_scale: Option<Operand>,
-    /// `[batch, max_pages]` i32: each row's pages.
+    /// `[batch, max_pages]` u32: each row's pages.
     pub page_table: Operand,
-    /// `[batch]` i32: keys visible to the row's last query.
+    /// `[batch]` u32: keys visible to the row's last query.
     pub seq_lens: Operand,
-    /// `[batch + 1]` i32: packed query offsets; empty at decode.
+    /// `[batch + 1]` u32: packed query offsets; empty at decode.
     pub cum_seq_lens_q: Operand,
     /// `[tokens, q_heads, head_dim]` output.
     pub out: Operand,
@@ -501,11 +501,11 @@ impl Op for PagedAttention {
         check_vector_alignment(Self::NAME, "value", &args.value)?;
 
         args.page_table.require_rank(Self::NAME, 2)?;
-        if args.page_table.dtype != DType::I32 {
+        if args.page_table.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected i32 pages, found {}",
+                    "expected u32 pages, found {}",
                     abi::name(args.page_table.dtype)
                 ),
             ));
@@ -521,11 +521,11 @@ impl Op for PagedAttention {
 
         args.seq_lens
             .require_shape(Self::NAME, Shape::new(&[batch]))?;
-        if args.seq_lens.dtype != DType::I32 {
+        if args.seq_lens.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected i32 lengths, found {}",
+                    "expected u32 lengths, found {}",
                     abi::name(args.seq_lens.dtype)
                 ),
             ));
@@ -544,11 +544,11 @@ impl Op for PagedAttention {
 
         match descriptor.phase {
             Phase::Prefill => {
-                if args.cum_seq_lens_q.shape.rank() != 1 || args.cum_seq_lens_q.dtype != DType::I32
+                if args.cum_seq_lens_q.shape.rank() != 1 || args.cum_seq_lens_q.dtype != DType::U32
                 {
                     return Err(Error::argument(
                         Self::NAME,
-                        "a prefill passes its packed query offsets as an i32 [batch + 1] view",
+                        "a prefill passes its packed query offsets as a u32 [batch + 1] view",
                     ));
                 }
                 if batch > 0 && args.cum_seq_lens_q.numel() != batch + 1 {

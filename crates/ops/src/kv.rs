@@ -10,10 +10,10 @@
 //!
 //! which is the layout `paged_attention` reads (the store's
 //! `[blocks, block_size, local_kv_heads, head_dim]` with a per-block `initialized` marker). A write
-//! scatters one row per token into the slot the scheduler assigned it; a slot of `-1` writes nothing
-//! and initializes nothing, so a token that is not persisted leaves the page as it was. A flag is
-//! raised when a page receives its first element: the owner of a page zeroes only storage it
-//! created, and a reader must not read a page before it is initialized.
+//! scatters one row per token into the slot the scheduler assigned it; a slot of `u32::MAX` writes
+//! nothing and initializes nothing, so a token that is not persisted leaves the page as it was. A
+//! flag is raised when a page receives its first element: the owner of a page zeroes only storage
+//! it created, and a reader must not read a page before it is initialized.
 //!
 //! An **FP8 cache** is filled by a scaled write instead: the same scatter, with each element divided by
 //! the page's own scale and rounded to E4M3 on the way in. That scale is one `[pages, 1, 1, 1]` f32
@@ -84,7 +84,7 @@ pub struct Args {
     pub key_cache: Operand,
     /// `[pages, page, heads, head_dim]`.
     pub value_cache: Operand,
-    /// `[tokens]` i32: the flat slot `page · page_size + offset` of each token, or `-1`.
+    /// `[tokens]` u32: the flat slot `page · page_size + offset` of each token, or `u32::MAX`.
     pub slots: Operand,
     /// `[pages, 1, 1, 1]` u8 initialization flags of the key cache.
     pub key_initialized: Operand,
@@ -138,10 +138,10 @@ impl Op for KvWrite {
         }
         args.slots
             .require_shape(Self::NAME, Shape::new(&[tokens]))?;
-        if args.slots.dtype != DType::I32 {
+        if args.slots.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 slots, found {}", abi::name(args.slots.dtype)),
+                format!("expected u32 slots, found {}", abi::name(args.slots.dtype)),
             ));
         }
 
@@ -308,7 +308,7 @@ impl fmt::Display for ScaledWriteDescriptor {
 pub struct ScaledWriteArgs {
     /// `[tokens, heads · head_dim]` the layer's rotated keys or values, in full precision.
     pub source: Operand,
-    /// `[tokens]` i32: the flat slot `page · page_size + offset` of each token, or `-1`.
+    /// `[tokens]` u32: the flat slot `page · page_size + offset` of each token, or `u32::MAX`.
     pub slots: Operand,
     /// `[pages, 1, 1, 1]` f32: each page's scale, read for the growth rule and written back.
     pub scales: Operand,
@@ -361,10 +361,10 @@ impl Op for KvWriteScaled {
             .require_row(Self::NAME, descriptor.dtype, args.source.shape.dim(1))?;
         args.slots
             .require_shape(Self::NAME, Shape::new(&[tokens]))?;
-        if args.slots.dtype != DType::I32 {
+        if args.slots.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected i32 slots, found {}", abi::name(args.slots.dtype)),
+                format!("expected u32 slots, found {}", abi::name(args.slots.dtype)),
             ));
         }
 
