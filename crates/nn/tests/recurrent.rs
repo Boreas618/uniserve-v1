@@ -602,7 +602,10 @@ fn request_slots_name_their_window_and_their_slots() {
     };
     let channels = drafted.conv_channels() as usize;
     let tokens = 8;
-    assert_eq!(drafted.state_fields(DType::BF16)[0].dims, [6, channels]);
+    let fields = drafted.state_fields(DType::BF16);
+    assert_eq!(fields[0].dims, [6, channels]);
+    // The matrices keep a slot per token of a step; the window keeps its drafts in its one slot.
+    assert!(!fields[0].stepwise && fields[1].stepwise);
 
     let state = RecurrentState {
         query_offsets: meta(3, DType::U32),
@@ -897,11 +900,13 @@ fn a_gated_delta_net_states_its_fields_and_its_kernels() {
                 name: "conv",
                 dtype: DType::BF16,
                 dims: vec![3, 32],
+                stepwise: false,
             },
             StateField {
                 name: "recurrent",
                 dtype: DType::F32,
                 dims: vec![4, 4, 4],
+                stepwise: false,
             },
         ]
     );

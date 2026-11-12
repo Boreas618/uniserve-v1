@@ -81,6 +81,9 @@ impl GatedDeltaNetConfig {
     /// The state one layer keeps per request slot on this rank, in the order its buffers are
     /// lent to it: the convolution's window in the activations' type `dtype`, then the delta
     /// rule's FP32 matrices in the order [`Self::axes`] states.
+    ///
+    /// A deployment that drafts keeps the matrices after each token of a decode-phase row in a
+    /// slot of their own (`stepwise`), and the window's draft rows inside its one slot.
     pub fn state_fields(&self, dtype: DType) -> Vec<StateField> {
         let heads = (self.value_heads / self.split.size) as usize;
         let (key, value) = (self.key_dim as usize, self.value_dim as usize);
@@ -93,6 +96,7 @@ impl GatedDeltaNetConfig {
                     (self.conv_width.saturating_sub(1) + self.draft_tokens) as usize,
                     self.conv_channels() as usize,
                 ],
+                stepwise: false,
             },
             StateField {
                 name: "recurrent",
@@ -101,6 +105,7 @@ impl GatedDeltaNetConfig {
                     StateAxes::KeyValue => vec![heads, key, value],
                     StateAxes::ValueKey => vec![heads, value, key],
                 },
+                stepwise: self.draft_tokens > 0,
             },
         ]
     }

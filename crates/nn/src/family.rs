@@ -336,6 +336,14 @@ pub trait TextModel: CausalLm + Send + Sync {
     fn vision(&self) -> Option<&dyn Vision> {
         None
     }
+
+    /// Whether a layer reads the batch's token ids beside its embeddings, such as an n-gram
+    /// hash embedding: execution then lends [`crate::capability::TokenBatch::token_ids`] and
+    /// [`crate::capability::TokenBatch::ngram_context`] to every forward, and lends neither
+    /// when this is `false`.
+    fn reads_token_ids(&self) -> bool {
+        false
+    }
 }
 
 /// The recurrent state a causal language model keeps per request slot, as one rank holds it:
@@ -363,6 +371,12 @@ pub struct StateField {
     pub dtype: DType,
     /// Its extents after the slot axis.
     pub dims: Vec<usize>,
+    /// Whether the field keeps the state after each token of a decode-phase row in a slot of
+    /// its own, so a verification's acceptance chooses the slot that stands rather than copying
+    /// state ([`crate::capability::VerifySlots`]): a request of a speculating deployment then
+    /// owns `draft_tokens + 1` slots of the field. A field that keeps one slot per request, such
+    /// as a convolution window that holds its draft rows inside its own slot, is not stepwise.
+    pub stepwise: bool,
 }
 
 impl StateField {

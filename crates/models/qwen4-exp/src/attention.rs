@@ -157,11 +157,13 @@ impl IndexedAttention {
                 name: "index_ring",
                 dtype,
                 dims: vec![capacity, config.indexer.head_dim as usize],
+                stepwise: false,
             },
             StateField {
                 name: "index_ring_positions",
                 dtype: DType::I32,
                 dims: vec![capacity, qwen3::config::POSITION_AXES as usize],
+                stepwise: false,
             },
         ]
     }

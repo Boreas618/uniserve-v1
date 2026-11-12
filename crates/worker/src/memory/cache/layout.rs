@@ -675,11 +675,13 @@ mod tests {
                     name: "conv",
                     dtype: DType::BF16,
                     dims: vec![3, 8192],
+                    stepwise: false,
                 },
                 StateField {
                     name: "recurrent",
                     dtype: DType::F32,
                     dims: vec![32, 128, 128],
+                    stepwise: false,
                 },
             ],
         }

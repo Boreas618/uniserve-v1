@@ -510,6 +510,12 @@ impl TextModel for Qwen4ExpForCausalLm {
     fn vision(&self) -> Option<&dyn Vision> {
         self.visual.as_ref().map(|tower| tower as &dyn Vision)
     }
+
+    /// The PLE layers hash each token with the two before it, so the forward reads token ids
+    /// and their n-gram context whenever one layer holds a PLE layer.
+    fn reads_token_ids(&self) -> bool {
+        self.layers.iter().any(DecoderLayer::has_ple)
+    }
 }
 
 /// The key/value cache of `layers` attention layers of `config`, as `tensor`'s rank holds it:

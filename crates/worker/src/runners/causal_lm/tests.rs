@@ -288,6 +288,7 @@ impl TextModel for Tiny {
                 name: "state",
                 dtype: DType::BF16,
                 dims: vec![HIDDEN],
+                stepwise: false,
             }],
         })
     }
@@ -1747,6 +1748,7 @@ fn state_shape() -> StateShape {
             name: "state",
             dtype: DType::BF16,
             dims: vec![HIDDEN],
+            stepwise: false,
         }],
     }
 }

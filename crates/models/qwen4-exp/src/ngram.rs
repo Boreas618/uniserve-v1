@@ -378,6 +378,7 @@ impl PleLayer {
                 (history + draft_tokens) as usize,
                 (config.text.hidden_size * config.hyper_connection.streams) as usize,
             ],
+            stepwise: false,
         }]
     }
 

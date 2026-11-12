@@ -904,6 +904,7 @@ mod tests {
                 name: "state",
                 dtype: DType::U8,
                 dims: vec![40],
+                stepwise: false,
             }],
         };
         let layout = CacheLayout::hybrid(4, 2, 1, 4, PrefixCacheDtype::Float8E4m3Fn, &state)
