@@ -51,7 +51,7 @@ use super::nvfp4::{decoded, encoded, integer, launch_quantize, remainder};
 use super::{ACCUMULATE, Activation, columns, on_cpu};
 use crate::capability::ExpertExchange;
 use crate::error::{Error, Result};
-use crate::quantization::Nvfp4Stack;
+use crate::quantization::{Nvfp4Stack, ValueLayout};
 
 /// Permuted rows per tile: the row extent of the tile the grouped products are compiled for,
 /// which each expert's rows are padded to.
@@ -94,6 +94,20 @@ const ABSENT: u32 = u32::MAX;
 
 /// The map entry of a route of a token row the batch does not fill: the kernels' `-2`.
 const NOT_LIVE: u32 = u32::MAX - 1;
+
+/// The arrangement the gated product reads its `[up; gate]` stack's packed rows in: the two
+/// halves interleaved row by row, then shuffled inside the blocks of one tile.
+pub(crate) const GATED_VALUE_LAYOUT: ValueLayout = ValueLayout::InterleavedShuffled {
+    epilogue_tile_m: MMA_TILE.0,
+};
+
+/// The arrangement the second product reads its `down` stack's packed rows in.
+pub(crate) const DOWN_VALUE_LAYOUT: ValueLayout = ValueLayout::Shuffled {
+    epilogue_tile_m: MMA_TILE.0,
+};
+
+/// The arrangement both packed products read their weights' block scales in.
+pub(crate) const WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
 
 /// The arrangement the gated product reads its activation's block scales in: its kernels read
 /// the tokens they route in the linear form.
@@ -1402,7 +1416,46 @@ fn sort_formula(
 
 #[cfg(test)]
 mod tests {
-    use super::workspace_bytes;
+    use ops::fp4::ScaleLayout;
+
+    use super::{
+        ACTIVATION_SCALE_LAYOUT, GATED_TOKEN_SCALE_LAYOUT, WEIGHT_SCALE_LAYOUT, workspace_bytes,
+    };
+
+    /// The block-scale layouts each packed product's kernels are built for, held against the
+    /// packages.
+    ///
+    /// A product's kernels are compiled with one layout for each operand, and nothing compares
+    /// the two at a launch: a package built for one form and given a table in the other reads
+    /// every block scale at the wrong offset and computes plausible numbers. The packages name
+    /// the weights' table `mSfLayoutA` and the tokens' `mSfLayoutB`, and the two products
+    /// differ in the second alone.
+    #[test]
+    fn a_packed_product_s_package_states_the_scale_layouts_its_function_passes() {
+        let name = |layout: ScaleLayout| match layout {
+            ScaleLayout::Linear => "\"linear\"",
+            ScaleLayout::Swizzled128X4 => "\"swizzled_128x4\"",
+        };
+
+        for (operator, tokens) in [
+            ("gather_gemm_nvfp4", GATED_TOKEN_SCALE_LAYOUT),
+            ("route_gemm_nvfp4", ACTIVATION_SCALE_LAYOUT),
+        ] {
+            let package = std::path::Path::new(ops::KERNELS)
+                .join(operator)
+                .join("trtllm/package.toml");
+            let stated = std::fs::read_to_string(&package)
+                .unwrap_or_else(|error| panic!("{}: {error}", package.display()));
+
+            for (option, layout) in [("mSfLayoutA", WEIGHT_SCALE_LAYOUT), ("mSfLayoutB", tokens)] {
+                let line = format!("{option} = {}", name(layout));
+                assert!(
+                    stated.contains(&line),
+                    "{operator}'s package does not state `{line}`"
+                );
+            }
+        }
+    }
 
     /// The packed products' workspaces follow the package's arithmetic over the bucket's route
     /// count: 15 tokens over 128 experts are 120 tiles of 128 permuted rows, for which the

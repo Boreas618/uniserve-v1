@@ -53,6 +53,7 @@ pub use embedding::{embedding, vocabulary_shard};
 pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
 pub use linear::{WeightOrder, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
+pub(crate) use moe::{DOWN_VALUE_LAYOUT, GATED_VALUE_LAYOUT, WEIGHT_SCALE_LAYOUT};
 pub use moe::{
     EXPANDED_TO_PERMUTED, NUM_NON_EXITING_TILES, PERMUTED_TO_EXPANDED, PERMUTED_TO_TOKEN,
     SORT_MAPS, TILE_ROWS, TILE_TO_EXPERT, TILE_TO_LIMIT, TOTAL_PADDED_TOKENS, expert_combine,

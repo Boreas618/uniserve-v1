@@ -12,11 +12,16 @@ mod support;
 use std::ops::Range;
 use std::path::Path;
 
+use nn::collective::Split;
 use nn::functional::{self, Activation};
+use nn::modules::{MoE, MoEConfig};
 use nn::quantization::{Declaration, Nvfp4Names, Nvfp4Stack, ValueLayout};
 use nn::{Checkpoint, CpuWeights, DType, Device, ExpertExchange, Tensor, WeightLoader};
 use ops::fp4::ScaleLayout;
-use support::{assert_close, encode, f32_bytes, meta, recorded, sequence, shard, tensor, values};
+use support::{
+    assert_close, encode, f32_bytes, meta, operators, recorded, recorded_split, sequence, shard,
+    tensor, values,
+};
 
 /// The tolerance of an FP32 result against a reference accumulated in another order.
 const F32_TOLERANCE: f32 = 1e-4;
@@ -916,6 +921,375 @@ fn the_packed_products_multiply_the_encoded_rows_by_the_experts_decoded_weights(
     }
 }
 
+// ---- The module -------------------------------------------------------------------------------
+
+/// A block of four experts under `mlp`, hidden 8 and intermediate 6, routed to two.
+fn dense_config() -> MoEConfig {
+    MoEConfig {
+        hidden: 8,
+        intermediate: 6,
+        experts: 4,
+        top: 2,
+        activation: Activation::Silu,
+        renormalize: true,
+        router: "gate",
+        list: "experts",
+        up: "up_proj",
+        gate: "gate_proj",
+        down: "down_proj",
+        stacked: None,
+        order: vec![0, 1, 2, 3],
+        split: Split::WHOLE,
+        exchange: Split::WHOLE,
+    }
+}
+
+/// The router and the experts of [`dense_config`]'s block.
+fn dense_block() -> (Vec<f32>, Vec<[Vec<f32>; 3]>) {
+    (
+        sequence(4 * 8, 70),
+        (0..4)
+            .map(|expert| dense_expert(8, 6, 71 + 3 * expert))
+            .collect(),
+    )
+}
+
+/// The checkpoint of [`dense_block`], one module per expert, stored as `dtype`.
+fn dense_checkpoint(directory: &Path, dtype: DType) -> Checkpoint {
+    let (router, experts) = dense_block();
+    let mut tensors = vec![("mlp.gate.weight".to_owned(), vec![4, 8], router)];
+    for (expert, [up, gate, down]) in experts.into_iter().enumerate() {
+        tensors.extend([
+            (
+                format!("mlp.experts.{expert}.up_proj.weight"),
+                vec![6, 8],
+                up,
+            ),
+            (
+                format!("mlp.experts.{expert}.gate_proj.weight"),
+                vec![6, 8],
+                gate,
+            ),
+            (
+                format!("mlp.experts.{expert}.down_proj.weight"),
+                vec![8, 6],
+                down,
+            ),
+        ]);
+    }
+
+    let typed: Vec<(&str, DType, Vec<usize>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, shape, values)| (name.as_str(), dtype, shape.clone(), encode(dtype, values)))
+        .collect();
+    shard(directory, "model.safetensors", &typed);
+
+    Checkpoint::open(directory).unwrap()
+}
+
+/// `Σ_routes weight · expert(x)` for every row of `x`, by the block's own router and experts.
+fn block_by_hand(x: &[f32]) -> Vec<f32> {
+    let (router, experts) = dense_block();
+    let scores: Vec<f32> = x.chunks(8).flat_map(|row| product(&router, row)).collect();
+    let (ids, weights) = route_by_hand(&scores, 4, 2);
+
+    x.chunks(8)
+        .enumerate()
+        .flat_map(|(token, row)| {
+            let mut sum = vec![0.0_f32; 8];
+            for route in token * 2..(token + 1) * 2 {
+                let expert = expert_by_hand(row, &experts[ids[route] as usize]);
+                for (sum, value) in sum.iter_mut().zip(expert) {
+                    *sum += weights[route] * value;
+                }
+            }
+            sum
+        })
+        .collect()
+}
+
+#[test]
+fn a_block_loads_its_experts_and_sums_each_token_s_routes() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(directory.path(), DType::F32);
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+
+    let block = MoE::load(&dense_config(), loader.root().pp("mlp")).unwrap();
+    assert_eq!(
+        (block.experts(), block.local_experts(), block.top()),
+        (4, 4, 2)
+    );
+
+    let x = sequence(5 * 8, 80);
+    let x_tensor = tensor(&x, (5, 8), DType::F32);
+    let out = block.forward(&x_tensor, None, None).unwrap();
+    assert_eq!(out.dims(), [5, 8]);
+    assert_close(&values(&out), &block_by_hand(&x), F32_TOLERANCE);
+
+    // Where the experts are stored changes no token's output: the stacks are laid out in the
+    // order's slots, and each route is written as its expert's slot.
+    let redistributed = MoE::load(
+        &MoEConfig {
+            order: vec![2, 0, 3, 1],
+            ..dense_config()
+        },
+        loader.root().pp("mlp"),
+    )
+    .unwrap();
+    let moved = redistributed.forward(&x_tensor, None, None).unwrap();
+    assert_close(&values(&moved), &block_by_hand(&x), F32_TOLERANCE);
+
+    let (router, _) = dense_block();
+    let scores: Vec<f32> = x.chunks(8).flat_map(|row| product(&router, row)).collect();
+    let (chosen, weights) = route_by_hand(&scores, 4, 2);
+    let slot_of = [1_u32, 3, 0, 2];
+    let (slots, routed_weights) = redistributed.route(&x_tensor).unwrap();
+    assert_eq!(
+        entries(&slots),
+        chosen
+            .iter()
+            .map(|expert| slot_of[*expert as usize])
+            .collect::<Vec<_>>()
+    );
+    assert_close(&values(&routed_weights), &weights, F32_TOLERANCE);
+
+    // The rows a batch does not fill route nowhere.
+    let live = block
+        .forward(&x_tensor, Some(&indices(&[3], 1)), None)
+        .unwrap();
+    let live = values(&live);
+    assert_close(&live[..3 * 8], &block_by_hand(&x)[..3 * 8], F32_TOLERANCE);
+    assert!(live[3 * 8..].iter().all(|value| *value == 0.0));
+}
+
+#[test]
+fn a_block_reads_stacked_experts_as_it_reads_one_module_each() {
+    let modules = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(modules.path(), DType::F32);
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    let config = MoEConfig {
+        order: vec![3, 1, 0, 2],
+        stacked: Some(["gate_up_proj", "down_proj"]),
+        ..dense_config()
+    };
+    let block = MoE::load(&config, loader.root().pp("mlp")).unwrap();
+
+    // The same experts as two stacked tensors: each expert's gate rows before its up rows.
+    let stacked = tempfile::tempdir().unwrap();
+    let (router, experts) = dense_block();
+    let gate_up: Vec<f32> = experts
+        .iter()
+        .flat_map(|[up, gate, _]| gate.iter().chain(up).copied())
+        .collect();
+    let down: Vec<f32> = experts
+        .iter()
+        .flat_map(|[_, _, down]| down.iter().copied())
+        .collect();
+    shard(
+        stacked.path(),
+        "model.safetensors",
+        &[
+            (
+                "mlp.gate.weight",
+                DType::F32,
+                vec![4, 8],
+                f32_bytes(&router),
+            ),
+            (
+                "mlp.experts.gate_up_proj",
+                DType::F32,
+                vec![4, 12, 8],
+                f32_bytes(&gate_up),
+            ),
+            (
+                "mlp.experts.down_proj",
+                DType::F32,
+                vec![4, 8, 6],
+                f32_bytes(&down),
+            ),
+        ],
+    );
+    let stacked_checkpoint = Checkpoint::open(stacked.path()).unwrap();
+    let stacked_store = CpuWeights::new();
+    let stacked_loader = WeightLoader::new(&stacked_checkpoint, &stacked_store, None, None);
+    let from_stacks = MoE::load(&config, stacked_loader.root().pp("mlp")).unwrap();
+
+    let x = tensor(&sequence(5 * 8, 81), (5, 8), DType::F32);
+    assert_eq!(
+        values(&from_stacks.forward(&x, None, None).unwrap()),
+        values(&block.forward(&x, None, None).unwrap())
+    );
+}
+
+#[test]
+fn a_block_refuses_a_routing_or_a_share_its_checkpoint_does_not_have() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(directory.path(), DType::F32);
+    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let refused = |config: MoEConfig| {
+        MoE::load(&config, loader.root().pp("mlp"))
+            .err()
+            .expect("a refused block")
+            .to_string()
+    };
+
+    // No route, more routes than the router's kernel holds, and more than the experts.
+    for top in [0, 9, 5] {
+        let message = refused(MoEConfig {
+            top,
+            ..dense_config()
+        });
+        assert!(message.contains("top"), "{message}");
+    }
+
+    // An order that is not every expert once.
+    for order in [vec![0, 1, 2], vec![0, 0, 1, 2], vec![0, 1, 2, 4]] {
+        let message = refused(MoEConfig {
+            order,
+            ..dense_config()
+        });
+        assert!(message.contains("permutation"), "{message}");
+    }
+
+    // Splits that do not divide the experts or their width, and a rank outside its group.
+    let third = Split { size: 3, rank: 0 };
+    let outside = Split { size: 2, rank: 2 };
+    for config in [
+        MoEConfig {
+            exchange: third,
+            ..dense_config()
+        },
+        MoEConfig {
+            exchange: outside,
+            ..dense_config()
+        },
+        MoEConfig {
+            split: Split { size: 4, rank: 0 },
+            ..dense_config()
+        },
+        MoEConfig {
+            split: outside,
+            ..dense_config()
+        },
+    ] {
+        let message = refused(config);
+        assert!(
+            message.contains("mlp") && message.contains("group"),
+            "{message}"
+        );
+    }
+
+    // A router of another expert count than the block routes over.
+    let message = refused(MoEConfig {
+        experts: 8,
+        order: (0..8).collect(),
+        ..dense_config()
+    });
+    assert!(message.contains("mlp.gate.weight"), "{message}");
+}
+
+#[test]
+fn a_block_split_over_a_tensor_group_holds_its_share_and_reduces_its_sum() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(directory.path(), DType::BF16);
+    let config = MoEConfig {
+        split: Split { size: 2, rank: 1 },
+        ..dense_config()
+    };
+
+    // The second rank holds rows 3..6 of every gate and up projection and columns 3..6 of every
+    // down projection.
+    let store = CpuWeights::new();
+    let loader = WeightLoader::new(&checkpoint, &store, None, None);
+    MoE::load(&config, loader.root().pp("mlp")).unwrap();
+    let keys: Vec<String> = store.keys().iter().map(ToString::to_string).collect();
+    for piece in [
+        "|bf16|up_gate|mlp.experts.0.up_proj.weight+mlp.experts.0.gate_proj.weight+",
+        "[24..216][4, 6, 8]|stride_8",
+        "|bf16|down|mlp.experts.0.down_proj.weight+",
+        "[3..99][4, 8, 3]|stride_6",
+    ] {
+        assert!(
+            keys.iter().any(|key| key.contains(piece)),
+            "no key holds `{piece}`: {keys:#?}"
+        );
+    }
+
+    // Its output is a partial sum: a forward with no group is refused, and one with a group
+    // states the same kernels as a whole block over half the width.
+    let meta_loader = WeightLoader::meta(&checkpoint, None, None);
+    let block = MoE::load(&config, meta_loader.root().pp("mlp")).unwrap();
+    let (alone, _) = recorded(|| block.forward(&meta((4, 8), DType::BF16), None, None));
+    let message = alone.err().unwrap().to_string();
+    assert!(message.contains("no group"), "{message}");
+
+    let (grouped, launches) = recorded_split(Some((1, 2)), || {
+        block.forward(&meta((4, 8), DType::BF16), None, None)
+    });
+    assert_eq!(grouped.unwrap().dims(), [4, 8]);
+    assert_eq!(
+        launches[2..],
+        [
+            (
+                "moe_sort",
+                "experts_4_top_2_local_4_tile_128_scales_f32_counted_true"
+            ),
+            (
+                "gather_gemm",
+                "hidden_8_intermediate_3_experts_4_top_2_activation_silu_dtype_bf16_\
+                 tile_128x128_cluster_1x1"
+            ),
+            (
+                "route_gemm",
+                "hidden_8_intermediate_3_experts_4_top_2_dtype_bf16_tile_128x128_cluster_1x1"
+            ),
+            (
+                "moe_unpermute",
+                "layout_permuted_hidden_8_top_2_experts_4_input_bf16_scales_f32_output_bf16"
+            ),
+        ]
+        .map(|(operator, key)| (operator, key.to_owned()))
+    );
+}
+
+#[test]
+fn a_dense_block_states_its_routing_its_products_and_its_combine() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(directory.path(), DType::BF16);
+    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let block = MoE::load(&dense_config(), loader.root().pp("mlp")).unwrap();
+
+    let (output, launches) = recorded(|| {
+        block.forward(
+            &meta((15, 8), DType::BF16),
+            Some(&meta(1, DType::U32)),
+            None,
+        )
+    });
+    assert_eq!(output.unwrap().dims(), [15, 8]);
+    assert_eq!(
+        operators(&launches),
+        [
+            "gemm",
+            "topk_softmax",
+            "moe_sort",
+            "gather_gemm",
+            "route_gemm",
+            "moe_unpermute"
+        ]
+    );
+    assert_eq!(
+        launches[1].1,
+        "scores_bf16_experts_4_top_2_renormalize_true_scale_none"
+    );
+    assert_eq!(
+        launches[2].1,
+        "experts_4_top_2_local_4_tile_128_scales_f32_counted_true"
+    );
+}
+
 /// A stack of `experts` packed matrices `[rows, columns]` as meta tensors: what a product's
 /// kernels are named by.
 fn meta_stack(experts: usize, rows: usize, columns: usize, projections: usize) -> Nvfp4Stack {
@@ -999,6 +1373,62 @@ fn the_packed_products_name_the_checkpoint_s_scale_type_and_their_activation_lay
     );
 }
 
+/// A block of two packed experts under `mlp`, hidden 32 and intermediate 16, routed to both.
+fn packed_config() -> MoEConfig {
+    MoEConfig {
+        hidden: 32,
+        intermediate: 16,
+        experts: 2,
+        top: 2,
+        order: vec![0, 1],
+        ..dense_config()
+    }
+}
+
+#[test]
+fn a_calibrated_block_runs_the_packed_products_over_its_stacks() {
+    let directory = tempfile::tempdir().unwrap();
+    let (checkpoint, _) = packed_checkpoint(directory.path(), 2);
+    let store = CpuWeights::new();
+    let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
+    loader.declare(&Declaration::read(&checkpoint).unwrap());
+    let block = MoE::load(&packed_config(), loader.root().pp("mlp")).unwrap();
+
+    // The block computes what the functions compute over the stacks in the routed products'
+    // arrangement, which the test above holds against the checkpoint's own fields.
+    let x = tensor(&sequence(3 * 32, 63), (3, 32), DType::BF16);
+    let (up_gate, down) = routed_stacks(&loader);
+    let (ids, weights) = block.route(&x).unwrap();
+    let maps = functional::moe_sort(&ids, &weights, 2, 0..2, None).unwrap();
+    let gated = functional::gather_gemm_nvfp4(&x, &up_gate, &maps, Activation::Silu, 2).unwrap();
+    let products = functional::route_gemm_nvfp4(&gated, &down, &maps, 2).unwrap();
+    let expected = functional::moe_unpermute(&products, &maps, &weights, 2, None).unwrap();
+
+    let out = block.forward(&x, None, None).unwrap();
+    assert_eq!((out.dims(), out.dtype()), (&[3, 32][..], DType::BF16));
+    assert_eq!(values(&out), values(&expected));
+    assert!(values(&out).iter().any(|value| *value != 0.0));
+
+    // Stacks of another width than the block states, and packed experts split by a tensor
+    // group, are refused at load.
+    for config in [
+        MoEConfig {
+            intermediate: 32,
+            ..packed_config()
+        },
+        MoEConfig {
+            split: Split { size: 2, rank: 0 },
+            ..packed_config()
+        },
+    ] {
+        let message = MoE::load(&config, loader.root().pp("mlp"))
+            .err()
+            .expect("a refused block")
+            .to_string();
+        assert!(message.contains("packed"), "{message}");
+    }
+}
+
 // ---- The exchange -----------------------------------------------------------------------------
 
 /// The rows of an exchange over `ranks` ranks of `rank_rows` rows each, of `hidden` elements
@@ -1021,6 +1451,172 @@ fn exchange(ranks: u32, rank_rows: u32, hidden: usize, top: usize) -> ExpertExch
         fused: false,
         source_only: false,
     }
+}
+
+/// The key of one launch of the dense block's exchange in `mode`.
+fn exchange_key(mode: &str) -> String {
+    format!(
+        "mode_{mode}_hidden_8_intermediate_6_top_2_experts_4_max_tokens_4_ranks_2_attention_0_\
+         dtype_bf16"
+    )
+}
+
+#[test]
+fn a_block_over_an_expert_group_exchanges_its_routes_around_its_own_experts() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(directory.path(), DType::BF16);
+    let loader = WeightLoader::meta(&checkpoint, None, None);
+    let block = MoE::load(
+        &MoEConfig {
+            exchange: Split { size: 2, rank: 1 },
+            ..dense_config()
+        },
+        loader.root().pp("mlp"),
+    )
+    .unwrap();
+    assert_eq!((block.experts(), block.local_experts()), (4, 2));
+
+    // Without the group's exchange the block has no rows to read.
+    let (alone, _) = recorded(|| block.forward(&meta((3, 8), DType::BF16), None, None));
+    let message = alone.err().unwrap().to_string();
+    assert!(message.contains("exchange"), "{message}");
+
+    // With it: dispatch, the rank's own experts over the rows it received, and combine. The
+    // received rows are those of every rank, so the sort is over eight rows of this rank's two
+    // experts.
+    let lent = exchange(2, 4, 8, 2);
+    let live_tokens = meta(1, DType::U32);
+    let (output, launches) = recorded_split(Some((1, 2)), || {
+        block.forward(&meta((3, 8), DType::BF16), Some(&live_tokens), Some(&lent))
+    });
+    assert_eq!(output.unwrap().dims(), [3, 8]);
+    assert_eq!(
+        launches[1..],
+        [
+            (
+                "topk_softmax",
+                "scores_bf16_experts_4_top_2_renormalize_true_scale_none".to_owned()
+            ),
+            ("expert_exchange", exchange_key("dispatch")),
+            (
+                "moe_sort",
+                "experts_4_top_2_local_2_tile_128_scales_f32_counted_true".to_owned()
+            ),
+            (
+                "gather_gemm",
+                "hidden_8_intermediate_6_experts_2_top_2_activation_silu_dtype_bf16_\
+                 tile_128x128_cluster_1x1"
+                    .to_owned()
+            ),
+            (
+                "route_gemm",
+                "hidden_8_intermediate_6_experts_2_top_2_dtype_bf16_tile_128x128_cluster_1x1"
+                    .to_owned()
+            ),
+            (
+                "moe_unpermute",
+                "layout_permuted_hidden_8_top_2_experts_4_input_bf16_scales_f32_output_bf16"
+                    .to_owned()
+            ),
+            ("expert_exchange", exchange_key("combine")),
+        ]
+    );
+
+    // A rank with no tokens of its own joins the step: it sends nothing and serves its peers.
+    let (joined, launches) = recorded_split(Some((1, 2)), || block.join_expert_step(&lent));
+    joined.unwrap();
+    assert_eq!(
+        operators(&launches),
+        [
+            "expert_exchange",
+            "moe_sort",
+            "gather_gemm",
+            "route_gemm",
+            "moe_unpermute",
+            "expert_exchange"
+        ]
+    );
+
+    // A step shaped for fewer rows per rank sorts and multiplies that many of each rank's.
+    let narrow = ExpertExchange {
+        step_rows: 2,
+        ..lent.clone()
+    };
+    let (stepped, _) = recorded(|| block.forward(&meta((2, 8), DType::BF16), None, Some(&narrow)));
+    assert_eq!(stepped.unwrap().dims(), [2, 8]);
+
+    // A rank that holds no experts sends its routes and takes its sums back.
+    let source = ExpertExchange {
+        source_only: true,
+        ..lent.clone()
+    };
+    let (sent, launches) =
+        recorded(|| block.forward(&meta((3, 8), DType::BF16), None, Some(&source)));
+    sent.unwrap();
+    assert_eq!(
+        operators(&launches)[2..],
+        ["expert_exchange", "expert_exchange"]
+    );
+
+    // More tokens than a rank's block carries, and an exchange of another group, are refused.
+    let (crowded, _) = recorded(|| block.forward(&meta((5, 8), DType::BF16), None, Some(&lent)));
+    let message = crowded.err().unwrap().to_string();
+    assert!(message.contains("5 tokens"), "{message}");
+
+    let wider = exchange(4, 4, 8, 2);
+    let (other, _) = recorded(|| block.forward(&meta((3, 8), DType::BF16), None, Some(&wider)));
+    let message = other.err().unwrap().to_string();
+    assert!(message.contains("4 ranks"), "{message}");
+}
+
+#[test]
+fn a_calibrated_block_over_an_expert_group_runs_in_the_exchange_s_one_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let (checkpoint, _) = packed_checkpoint(directory.path(), 2);
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    loader.declare(&Declaration::read(&checkpoint).unwrap());
+    let block = MoE::load(
+        &MoEConfig {
+            exchange: Split { size: 2, rank: 0 },
+            ..packed_config()
+        },
+        loader.root().pp("mlp"),
+    )
+    .unwrap();
+    assert_eq!(block.local_experts(), 1);
+
+    let fused = ExpertExchange {
+        fused: true,
+        ..exchange(2, 4, 32, 2)
+    };
+    let (output, launches) =
+        recorded(|| block.forward(&meta((3, 32), DType::BF16), None, Some(&fused)));
+    assert_eq!(output.unwrap().dims(), [3, 32]);
+    assert_eq!(
+        launches[2..],
+        [
+            (
+                "nvfp4_quantize",
+                "input_bf16_columns_32_layout_linear_block_32_pdl_false"
+            ),
+            (
+                "expert_exchange",
+                "mode_fused_hidden_32_intermediate_16_top_2_experts_2_max_tokens_4_ranks_2_\
+                 attention_0_dtype_bf16"
+            ),
+        ]
+        .map(|(operator, key)| (operator, key.to_owned()))
+    );
+
+    // A join encodes nothing: it has no rows of its own.
+    let (joined, launches) = recorded(|| block.join_expert_step(&fused));
+    joined.unwrap();
+    assert_eq!(operators(&launches), ["expert_exchange"]);
+
+    // Packed experts over a group run fused, and an exchange of two launches refuses them.
+    let two = exchange(2, 4, 32, 2);
+    let (refused, _) = recorded(|| block.forward(&meta((3, 32), DType::BF16), None, Some(&two)));
+    assert!(refused.err().unwrap().to_string().contains("fused"));
 }
 
 #[test]
