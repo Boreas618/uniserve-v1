@@ -43,8 +43,8 @@
 //!
 //! Page tables and unit ids are `u32`. A pooled table never holds `nn::NO_SLOT`: a page a row
 //! does not hold names unit 0, the padding unit, because a table entry feeds a gather. The slot
-//! column of a shadow forward ([`scratch_column`]) holds `nn::NO_SLOT` where a token writes
-//! nothing, as the slot column of a served batch does.
+//! column of a shadow forward, which its runner numbers over the scratch set's pages, holds
+//! `nn::NO_SLOT` where a token writes nothing, as the slot column of a served batch does.
 
 pub mod conversion;
 pub mod host;
@@ -67,7 +67,6 @@ use self::host::HostTier;
 pub use self::layout::{CacheLayout, Checkpoint, GroupLayout};
 use self::planes::Planes;
 use self::scratch::ScratchPages;
-pub use self::scratch::{scratch_column, scratch_slot_mapping};
 pub use self::segments::PlaneSegment;
 use self::tables::PageTables;
 use crate::memory::allocation::Storage;
@@ -814,7 +813,7 @@ impl KvCacheMemory {
 
     /// The scratch set's page table for a shadow forward of `rows` rows of `pages` pages each,
     /// `[rows, pages]` U32, for every attention group: row `r` names the scratch pages
-    /// `r · pages .. (r + 1) · pages`, which [`scratch_column`] numbers the row's slots in.
+    /// `r · pages .. (r + 1) · pages`, which the runner numbers the row's slots in.
     ///
     /// # Errors
     ///

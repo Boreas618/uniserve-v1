@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use nn::{KvPlanes, NO_SLOT};
+use nn::KvPlanes;
 use platform::{Buffer, CopyBatch, DeviceId, PoolKind, SourceOrder, Stream, memset_d8, memset_d32};
 use uniserve_tensor::{DType, Tensor};
 
@@ -350,139 +350,6 @@ impl ScratchPages {
     }
 }
 
-/// The cache slots a shadow forward writes: the tokens of the served batch, in the scratch
-/// set's numbering.
-///
-/// A slot is flat over one plane's pages (`page · page_size + offset`), and the scratch set
-/// gives row `r` the pages `r · pages .. (r + 1) · pages`. So token `t` of row `r` at position
-/// `p` writes `(r · pages + p / page_size) · page_size + p % page_size`, which is inside the
-/// row's own pages and never a slot a request is served from. A token the served batch does not
-/// write (`slots[t] == NO_SLOT`, a padding token) writes nothing here either.
-///
-/// `positions` is the batch's `[tokens]` rotary positions, `query_offsets` its `[rows + 1]`
-/// packed offsets, and `slots` its `[tokens]` slot column. The result is the `[tokens]` slot
-/// column the shadow forward reads in place of the served batch's, [`NO_SLOT`] where a token
-/// writes nothing.
-///
-/// # Errors
-///
-/// Columns that describe different token counts, a negative position, or a position past the
-/// row's `pages` pages.
-pub fn scratch_slot_mapping(
-    positions: &[i32],
-    query_offsets: &[u32],
-    slots: &[u32],
-    pages: u32,
-    page_size: u32,
-) -> Result<Vec<u32>> {
-    if page_size == 0 || pages == 0 {
-        return Err(Error::Invariant(
-            "a scratch page set needs pages of at least one token".into(),
-        ));
-    }
-    if query_offsets.len() < 2 {
-        return Err(Error::Invariant(
-            "a batch's packed query offsets name no row".into(),
-        ));
-    }
-    match query_offsets.last() {
-        Some(tokens) if *tokens as usize == positions.len() && positions.len() == slots.len() => {}
-        _ => {
-            return Err(Error::Invariant(
-                "the batch's offsets, positions and slots describe different token counts".into(),
-            ));
-        }
-    }
-
-    let mut mapping = vec![NO_SLOT; positions.len()];
-    for (row, bounds) in query_offsets.windows(2).enumerate() {
-        let (start, end) = (bounds[0] as usize, bounds[1] as usize);
-        if end < start || end > positions.len() {
-            return Err(Error::Invariant(format!(
-                "row {row}'s packed query offsets are {start}..{end}"
-            )));
-        }
-
-        for token in start..end {
-            if slots[token] == NO_SLOT {
-                continue;
-            }
-            let position = u32::try_from(positions[token]).map_err(|_| {
-                Error::Invariant(format!(
-                    "token {token} writes cache position {}, which is no position",
-                    positions[token]
-                ))
-            })?;
-
-            let (page, offset) = (position / page_size, position % page_size);
-            if page >= pages {
-                return Err(Error::Invalid(format!(
-                    "row {row} writes position {position}, which needs page {page} of a scratch \
-                     set of {pages} pages a row; the shadow forward's page set is too small"
-                )));
-            }
-
-            let flat = (row as u64 * u64::from(pages) + u64::from(page)) * u64::from(page_size)
-                + u64::from(offset);
-            mapping[token] = u32::try_from(flat)
-                .ok()
-                .filter(|slot| *slot != NO_SLOT)
-                .ok_or_else(|| {
-                    Error::Invalid(format!(
-                        "a scratch slot of {flat} is outside the range a slot column holds"
-                    ))
-                })?;
-        }
-    }
-    Ok(mapping)
-}
-
-/// The scratch slot column a shadow forward reads, over the **bucket's** `tokens` tokens.
-///
-/// A captured graph addresses the whole column, so it states a value for every token of the
-/// bucket: the batch's `live` tokens by [`scratch_slot_mapping`], and [`NO_SLOT`] for the
-/// tokens the batch does not hold, because a value left from an earlier batch would send the
-/// shadow forward's writes into a page of another row. `query_offsets` is the batch's
-/// `[rows + 1]` column, whose last entry is `live`; `positions` and `slots` hold at least the
-/// live tokens.
-///
-/// # Errors
-///
-/// A batch of more live tokens than the bucket or than its columns hold, and what
-/// [`scratch_slot_mapping`] refuses.
-pub fn scratch_column(
-    positions: &[i32],
-    query_offsets: &[u32],
-    slots: &[u32],
-    live: usize,
-    tokens: usize,
-    pages: u32,
-    page_size: u32,
-) -> Result<Vec<u32>> {
-    if live > positions.len() || live > slots.len() || tokens < live {
-        return Err(Error::Invariant(format!(
-            "a batch of {live} live token(s) in a bucket of {tokens} names {} position(s) and {} \
-             slot(s)",
-            positions.len(),
-            slots.len()
-        )));
-    }
-
-    let mut mapping = if live == 0 {
-        Vec::new()
-    } else {
-        scratch_slot_mapping(
-            &positions[..live],
-            query_offsets,
-            &slots[..live],
-            pages,
-            page_size,
-        )?
-    };
-    mapping.resize(tokens, NO_SLOT);
-    Ok(mapping)
-}
-
 #[cfg(test)]
 mod tests {
     use ipc::PrefixCacheDtype;
@@ -531,62 +398,6 @@ mod tests {
         // Four rows of four pages are more than the set's twelve.
         assert!(set.table(4, 4).is_err());
         assert!(ScratchPages::meta(layout, 0).is_err());
-        Ok(())
-    }
-
-    /// Every token of a shadow forward writes a page of its own row of the set.
-    #[test]
-    fn a_shadow_forward_writes_its_own_scratch_pages() -> Result<()> {
-        let mapping =
-            scratch_slot_mapping(&[5, 6, 7, 0, 1], &[0, 3, 5], &[10, 11, 12, 20, 21], 2, 4)?;
-
-        // Row 0: positions 5..8 are page 1, offsets 1..3. Row 1: positions 0..2 of its page 0,
-        // which is the set's page 2.
-        assert_eq!(mapping, vec![5, 6, 7, 8, 9]);
-        Ok(())
-    }
-
-    /// A token the served batch does not write writes no scratch page either, and a position
-    /// past the row's pages is refused by name instead of wrapped into another row's.
-    #[test]
-    fn a_padding_token_writes_nothing_and_a_full_set_is_refused() -> Result<()> {
-        let mapping = scratch_slot_mapping(&[0, 0], &[0, 2], &[NO_SLOT, 3], 1, 4)?;
-        assert_eq!(mapping, vec![NO_SLOT, 0]);
-
-        let error = scratch_slot_mapping(&[9], &[0, 1], &[7], 1, 4)
-            .expect_err("position 9 needs page 2 of a one-page row");
-        assert!(error.to_string().contains("page 2"), "{error}");
-
-        // The three columns describe one batch.
-        assert!(scratch_slot_mapping(&[0, 1], &[0, 3], &[7, 8], 1, 4).is_err());
-        assert!(scratch_slot_mapping(&[-1], &[0, 1], &[7], 1, 4).is_err());
-        Ok(())
-    }
-
-    /// A bucket wider than the batch names no page for the tokens the batch does not hold.
-    #[test]
-    fn a_partial_buckets_scratch_tail_names_no_page() -> Result<()> {
-        let mapping = scratch_column(&[0, 1, 2], &[0, 3], &[10, 11, 12], 3, 8, 2, 4)?;
-        assert_eq!(mapping.len(), 8);
-        assert_eq!(&mapping[..3], &[0, 1, 2]);
-        assert!(mapping[3..].iter().all(|slot| *slot == NO_SLOT));
-
-        // A batch that holds nothing writes nothing, whatever the bucket's width.
-        assert_eq!(
-            scratch_column(&[], &[0], &[], 0, 4, 2, 4)?,
-            vec![NO_SLOT; 4]
-        );
-
-        // Two live tokens do not fit a bucket of one, nor one a bucket of none.
-        let error = scratch_column(&[0, 1], &[0, 2], &[7, 8], 2, 1, 1, 4)
-            .expect_err("two live tokens in a bucket of one");
-        assert!(error.to_string().contains("bucket of"), "{error}");
-        assert!(scratch_column(&[0], &[0, 1], &[7], 1, 0, 1, 4).is_err());
-
-        // A slot column shorter than the live count is a batch whose columns disagree.
-        let error = scratch_column(&[0, 1], &[0, 2], &[7], 2, 2, 1, 4)
-            .expect_err("two positions and one slot");
-        assert!(error.to_string().contains("slot(s)"), "{error}");
         Ok(())
     }
 }

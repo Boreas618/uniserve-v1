@@ -432,58 +432,6 @@ impl CausalLmRunner {
         Ok(())
     }
 
-    /// Prepares the inputs of a paired forward of `batch`, a batch the runner served, and
-    /// returns the bucket the executor passes to `Graphs::shadow`.
-    ///
-    /// The columns are the batch's own, padded as a serving step's, except that every token
-    /// writes its row's scratch pages, every row gathers its own row of the scratch set's
-    /// page table, and the commit table is inert (`columns`). No slot is started and no page
-    /// work is issued: the forward reads the slots' state as it stands and writes none of it.
-    ///
-    /// # Errors
-    ///
-    /// As [`Runner::prepare_inputs`]; [`Error::Unsupported`] for a model that keeps a
-    /// recurrent state, which has no scratch state to advance, for a member of an expert
-    /// union, whose exchange launches wait for the other members', and for a runner that was
-    /// lent no scratch page set; [`Error::Invalid`] for a row whose tokens lie past its
-    /// scratch pages.
-    pub fn prepare_shadow_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
-        if self.union.is_some() {
-            return Err(Error::Unsupported(
-                "a paired forward of a member of an expert union would wait on its device for \
-                 exchange launches the other members do not make"
-                    .into(),
-            ));
-        }
-        if self.state.is_some() {
-            return Err(Error::Unsupported(
-                "a paired forward of a model that keeps a recurrent state has no scratch state \
-                 to advance"
-                    .into(),
-            ));
-        }
-        if self.scratch.is_empty() {
-            return Err(Error::Unsupported(
-                "the runner was lent no scratch page set to compute a paired forward over".into(),
-            ));
-        }
-        let bucket = self.choose(batch)?;
-
-        let rows = &batch.columns.rows;
-        let scratch = columns::scratch_column(
-            &rows.positions,
-            &rows.query_offsets,
-            &rows.slot_mapping,
-            bucket.tokens as usize,
-            self.config.scratch_pages,
-            self.config.page_size,
-        )?;
-
-        self.fill(batch, &bucket, Some(&scratch))?;
-        self.paired.set(true);
-        Ok(bucket)
-    }
-
     /// The runner's config.
     pub const fn config(&self) -> &CausalLmConfig {
         &self.config
@@ -918,6 +866,58 @@ impl Runner for CausalLmRunner {
         let bucket = self.choose(batch)?;
 
         self.fill(batch, &bucket, None)?;
+        Ok(bucket)
+    }
+
+    /// Prepares the inputs of a paired forward of `batch`, a batch the runner served, and
+    /// returns the bucket the executor passes to `Graphs::shadow`.
+    ///
+    /// The columns are the batch's own, padded as a serving step's, except that every token
+    /// writes its row's scratch pages, every row gathers its own row of the scratch set's
+    /// page table, and the commit table is inert (`columns`). No slot is started and no page
+    /// work is issued: the forward reads the slots' state as it stands and writes none of it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::prepare_inputs`]; [`Error::Unsupported`] for a model that keeps a
+    /// recurrent state, which has no scratch state to advance, for a member of an expert
+    /// union, whose exchange launches wait for the other members', and for a runner that was
+    /// lent no scratch page set; [`Error::Invalid`] for a row whose tokens lie past its
+    /// scratch pages.
+    fn prepare_shadow_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+        if self.union.is_some() {
+            return Err(Error::Unsupported(
+                "a paired forward of a member of an expert union would wait on its device for \
+                 exchange launches the other members do not make"
+                    .into(),
+            ));
+        }
+        if self.state.is_some() {
+            return Err(Error::Unsupported(
+                "a paired forward of a model that keeps a recurrent state has no scratch state \
+                 to advance"
+                    .into(),
+            ));
+        }
+        if self.scratch.is_empty() {
+            return Err(Error::Unsupported(
+                "the runner was lent no scratch page set to compute a paired forward over".into(),
+            ));
+        }
+        let bucket = self.choose(batch)?;
+
+        let rows = &batch.columns.rows;
+        let scratch = columns::scratch_column(
+            &rows.positions,
+            &rows.query_offsets,
+            &rows.slot_mapping,
+            bucket.tokens as usize,
+            self.config.scratch_pages,
+            self.config.page_size,
+        )?;
+
+        self.fill(batch, &bucket, Some(&scratch))?;
+        self.paired.set(true);
         Ok(bucket)
     }
 
