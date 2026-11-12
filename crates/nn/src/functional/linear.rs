@@ -515,12 +515,12 @@ fn e4m3_values(scales: &Tensor) -> Result<Tensor> {
 
 /// `value` as a one-element tensor of `like`'s integer element type, for integer arithmetic,
 /// which the scalar operators of the tensor library evaluate in floating point.
-fn integer(value: u32, like: &Tensor) -> Result<Tensor> {
+pub(super) fn integer(value: u32, like: &Tensor) -> Result<Tensor> {
     Ok(Tensor::new(value, &Device::Cpu)?.to_dtype(like.dtype())?)
 }
 
 /// `values mod modulus`, elementwise over an integer tensor.
-fn remainder(values: &Tensor, modulus: u32) -> Result<Tensor> {
+pub(super) fn remainder(values: &Tensor, modulus: u32) -> Result<Tensor> {
     let modulus = integer(modulus, values)?;
     let whole = values.broadcast_div(&modulus)?.broadcast_mul(&modulus)?;
 

@@ -13,6 +13,7 @@ mod head;
 mod linear;
 mod mlp;
 mod norm;
+mod rotary;
 
 pub use embedding::{Embedding, EmbeddingConfig};
 pub use head::{LmHead, LmHeadConfig};
@@ -21,3 +22,4 @@ pub use mlp::{GateUp, Mlp, MlpConfig};
 pub use norm::{
     GatedRmsNorm, GatedRmsNormConfig, LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig,
 };
+pub use rotary::{Precision, Rotary, RotaryConfig, Spectrum, Yarn};
