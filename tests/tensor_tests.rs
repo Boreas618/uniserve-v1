@@ -1916,10 +1916,51 @@ fn view(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Sums of 16-bit floats accumulate in F32 and round once. Accumulated in the element type, a
+/// sum stops growing as soon as a term is below half of its last place: the cases below would
+/// then stop far short of 65536 for the ones and give 1 for each column.
+fn half_precision_sums(device: &Device) -> Result<()> {
+    // BF16 holds eight significant bits and F16 eleven: past 256 and 2048 an added one is
+    // lost. The counts are far enough past those that a loop keeping a few partial sums in
+    // the element type would lose ones as well; the F16 count stays below its largest value.
+    for (dtype, count) in [(DType::BF16, 65536), (DType::F16, 32768)] {
+        let ones = Tensor::ones(count, dtype, device)?;
+        let total = ones.sum_all()?.to_dtype(DType::F32)?;
+        assert_eq!(total.to_scalar::<f32>()?, count as f32, "{dtype:?}");
+    }
+
+    // A one followed by 64 terms a quarter of its last place: together they are 64 quarters.
+    for (dtype, term, expected) in [
+        (DType::BF16, 2f32.powi(-9), 1.125f32),
+        (DType::F16, 2f32.powi(-12), 1.015625),
+    ] {
+        let mut column = vec![term; 65];
+        column[0] = 1.;
+        let column = Tensor::from_vec(column, (65, 1), device)?.to_dtype(dtype)?;
+        let columns = Tensor::cat(&[&column, &column], 1)?;
+
+        // Along the first axis of a contiguous tensor, along the last one of its transpose,
+        // and along the last one of a contiguous tensor.
+        let sums = columns.sum(0)?.to_dtype(DType::F32)?;
+        assert_eq!(sums.to_vec1::<f32>()?, [expected; 2], "{dtype:?}");
+        let sums = columns.t()?.sum(1)?.to_dtype(DType::F32)?;
+        assert_eq!(sums.to_vec1::<f32>()?, [expected; 2], "{dtype:?}");
+        let sums = columns.t()?.contiguous()?.sum_keepdim(1)?;
+        assert_eq!(sums.dtype(), dtype);
+        assert_eq!(
+            sums.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+            [[expected], [expected]],
+            "{dtype:?}"
+        );
+    }
+    Ok(())
+}
+
 test_device!(zeros);
 test_device!(ones);
 test_device!(sigmoid);
 test_device!(view);
+test_device!(half_precision_sums);
 test_device!(full);
 test_device!(const_set);
 test_device!(arange);

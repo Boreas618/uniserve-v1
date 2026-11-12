@@ -372,9 +372,28 @@ impl ReduceSum<'_> {
 }
 
 impl Map1 for ReduceSum<'_> {
+    /// The sums of `src` along the reduced dimensions.
+    ///
+    /// A sum of F16 or BF16 elements accumulates in F32, which holds every 16-bit float, and
+    /// rounds once into the element type, as the product of two such matrices does
+    /// ([`MatMul::f_widened`]): a sum accumulated in the 16-bit type stops growing once a term
+    /// is below half of its last place.
     #[inline(always)]
     fn f<T: WithDType>(&self, src: &[T], src_l: &Layout) -> Result<Vec<T>> {
-        self.fold_impl(src, src_l, T::zero())
+        let widened = match T::cpu_storage_ref(src) {
+            CpuStorageRef::F16(src) => src.to_f32_vec(),
+            CpuStorageRef::BF16(src) => src.to_f32_vec(),
+            _ => return self.fold_impl(src, src_l, T::zero()),
+        };
+
+        let sums = self.fold_impl::<f32>(&widened, src_l, 0.0)?;
+
+        let sums = match T::DTYPE {
+            DType::F16 => CpuStorage::F16(Vec::from_f32_slice(&sums)),
+            DType::BF16 => CpuStorage::BF16(Vec::from_f32_slice(&sums)),
+            _ => Err(Error::UnsupportedDTypeForOp(T::DTYPE, "sum").bt())?,
+        };
+        T::cpu_storage_data(sums)
     }
 }
 

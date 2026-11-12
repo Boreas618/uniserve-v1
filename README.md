@@ -33,6 +33,7 @@ Arithmetic follows PyTorch where the two have the same expression:
 
 - An integer tensor computes in its element type: `+`, `-` and `*` wrap, `/` truncates toward zero (`torch.div(.., rounding_mode="trunc")`), and `remainder` is `torch.remainder`, whose result is zero or has the sign of the divisor. A zero integer divisor is an error on the CPU backend.
 - A scalar operand of an integer tensor (`&x + 1.0`, `7.0 / &x`) is an integer of the element type and the operation is the one of two tensors, so it is exact for every value. No operation changes the element type: a scalar with a fractional part is an error, where PyTorch would return a float tensor, and so is one outside the element type's range, which PyTorch refuses as well; a caller that wants the float result converts the tensor with `to_dtype` first.
+- Sums and matrix products of `BF16` and `F16` tensors accumulate in `F32` on the CPU backend and round once into the element type. Other element-wise operations on those types round each step in the element type.
 - `Tensor::view(dtype)` is PyTorch's `Tensor.view(dtype)` between element types of one size. On a backend device the result shares the tensor's memory; the CPU backend's storage is a vector of one element type, so there the result holds a copy of the bytes.
 
 ## Devices and the backend interface
