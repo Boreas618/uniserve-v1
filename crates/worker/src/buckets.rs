@@ -1,21 +1,20 @@
 //! Bucket choice: which captured size a forward is padded into.
 //!
 //! A captured graph addresses fixed buffers, so a forward may only be served by a graph captured
-//! for a size that holds it, and each batch is planned into the smallest captured bucket that holds
-//! it. This module is the arithmetic of that rule and nothing else: a [`Shape`] asks for
-//! rows and tokens of one kind of work, a [`Bucket`] is a captured size, and [`Buckets`] answers
-//! which captured bucket serves a shape, and in which order the buckets are captured.
+//! for a size that holds it, and each batch runs in the smallest captured bucket that holds it.
+//! This module is the arithmetic of that rule and nothing else: a [`Shape`] states the rows and
+//! tokens of one kind of work, a [`Bucket`] is a captured size, and [`Buckets`] selects the
+//! captured bucket that serves a shape and states the order in which the buckets are captured.
 //!
-//! The ordering rules come from the design:
+//! The ordering rules:
 //!
 //! - the smallest captured bucket that holds a forward serves it, never a larger one, and a
-//!   forward no bucket holds is an error, never an eager fallback (4.5, `specs/replaceable-processes.md`
-//!   §9.2);
-//! - captures run largest first, so the smaller captures reuse the graph pool's blocks
-//!   (`specs/replaceable-processes.md` §9.3).
+//!   forward no bucket holds is an error, never an eager fallback;
+//! - captures run largest first, so the smaller captures reuse the allocator blocks of the
+//!   larger ones.
 //!
 //! Everything here is host arithmetic on plain integers, so it is testable without a device and
-//! runs on the scheduler's critical path without allocating: [`Buckets::select`] walks a sorted
+//! runs on the scheduler's critical path without allocating: [`Buckets::select`] scans a sorted
 //! vector and [`Bucket::holds`] compares three pairs of integers.
 
 use std::collections::BTreeSet;
@@ -29,8 +28,8 @@ use crate::error::{Error, Result};
 /// A captured size: the rows and tokens a bucket's graph holds, and what it computes.
 ///
 /// Buckets are ordered by size, variant first, then rows, then tokens, so that the smallest
-/// bucket holding a shape is the first one an ascending walk finds and the largest bucket is the
-/// last. The ordering is what the capture order and the reclaim order both read.
+/// bucket holding a shape is the first one an ascending scan finds and the largest bucket is the
+/// last. The ordering is what the capture order and the preemption order both read.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Bucket {
     pub variant: Variant,
@@ -39,7 +38,7 @@ pub struct Bucket {
     /// A media computation's extent, and [`Extent::None`] for the four causal-LM variants.
     pub extent: Extent,
     /// The request this bucket serves as `(frames, width, height)`, when the extent alone does not
-    /// say: a layout states latents, and a request states output frames and a canvas.
+    /// say: a layout states latents, and a request states output frames and a resolution.
     pub serves: Option<(u32, u32, u32)>,
     /// The rows per rank an expert step of this bucket's graph holds, or zero outside an expert
     /// union. A union's ranks agree a step's rows before they launch, and the graph is the one whose
@@ -92,7 +91,7 @@ impl Bucket {
     /// A denoising bucket: one step over `rows` requests of one `layout`.
     ///
     /// The layout is the extent because it *is* the size of the work: a step's velocity is one
-    /// tensor per canvas, and two layouts of the same row count are different graphs.
+    /// tensor of the layout's shape, and two layouts of the same row count are different graphs.
     pub const fn denoise(rows: u32, layout: proto::video::Layout) -> Self {
         Self {
             variant: Variant::Denoise,
@@ -122,14 +121,13 @@ impl Bucket {
 
     /// Whether this bucket serves `computation`.
     ///
-    /// **The one rule two places ask** — the plan's selection ([`Buckets::select_media`]) and the
-    /// device's routing of a media batch (`runners::runner_for_media`) — because two statements of
-    /// it disagreed: a host bucket states no extent, so the exact match refused the video encode the
-    /// device would have served.
+    /// This is the one statement of the rule, which the selection of a media bucket
+    /// ([`Buckets::select_media`]) and the executor's routing of a media batch to its runner both
+    /// read.
     ///
     /// A stated extent is matched exactly; `Extent::None` on the caller's side is a caller that does
-    /// not know the shape, and the bucket's own extent is then the answer; and a host bucket holds
-    /// every computation of its call, whatever its rows, tokens or canvas, because it captures no
+    /// not know the shape, and the bucket's own extent then decides; and a host bucket holds every
+    /// computation of its call, whatever its rows, tokens or resolution, because it captures no
     /// graph and so no size narrows it.
     pub fn holds_computation(&self, computation: &Computation) -> bool {
         let Some(variant) = computation.variant() else {
@@ -140,9 +138,8 @@ impl Bucket {
         }
         // A host call's bucket states which device serves the call and no bound at all: the stage
         // serves a batch of however many requests of that call arrived, one after the other, and
-        // `Bucket::host`'s one row is the shape of one request rather than a capacity. Comparing a
-        // batch's rows against it would drop every batch of two, silently and only when a
-        // deployment served two requests at once - the one case a first run never reaches.
+        // `Bucket::host`'s one row is the shape of one request rather than a capacity, so a
+        // batch's rows are not compared against it.
         if self.variant.host() {
             return true;
         }
@@ -163,9 +160,9 @@ impl Bucket {
 
     /// Whether this bucket serves a request of `frames` frames at `width` by `height`.
     ///
-    /// A clip's bucket is the canvas's whatever the timeline, a track's is the timeline's whatever
-    /// the canvas, and a step's is both, in a layout whose prompt rows and condition rows hold the
-    /// request's. An encode's states neither.
+    /// A clip's bucket is the resolution's whatever the timeline, a track's is the timeline's
+    /// whatever the resolution, and a step's is both, in a layout whose prompt rows and condition
+    /// rows hold the request's. An encode's states neither.
     fn serves_request(
         &self,
         frames: u32,
@@ -203,13 +200,12 @@ impl Bucket {
 
     /// A host call's bucket: a computation no graph is captured for.
     ///
-    /// The artifact's three host calls are served in this process (§2.4), so the device states
-    /// them without capturing anything: what the bucket answers is which device serves the call,
-    /// and one row is the shape of one request rather than a bound, which is why
+    /// The three host calls of a media output are served by the engine on the host, so their
+    /// runner states them without capturing anything: the bucket says which device serves the
+    /// call, and one row is the shape of one request rather than a bound, which is why
     /// [`Bucket::holds_computation`] measures no computation against it. It carries no extent
-    /// because there is
-    /// no canvas to state - an audio track's samples come from the decoder's window and a mux
-    /// reads what the encodes already wrote.
+    /// because there is no resolution to state: an audio track's samples come from the decoder's
+    /// window and a mux reads what the encodes already wrote.
     pub const fn host(variant: Variant) -> Self {
         Self {
             variant,
@@ -240,9 +236,9 @@ impl Bucket {
     /// Whether this bucket is a causal-LM forward, and the refusal when it is not.
     ///
     /// The two families are refused by name rather than served from one another's graphs: a
-    /// causal-LM runner that was handed a media bucket would replay a graph shaped for a latent
-    /// canvas over token rows, and a catalogue typo would read as wrong tokens rather than as the
-    /// mistake it is.
+    /// causal-LM runner given a media bucket would replay a graph shaped for a latent layout over
+    /// token rows, and a mistaken bucket set would read as wrong tokens rather than as the mistake
+    /// it is.
     pub fn causal_lm(self) -> Result<()> {
         if self.extent == Extent::None && !self.variant.media() {
             return Ok(());
@@ -267,8 +263,8 @@ impl Bucket {
     /// Whether a forward of `shape` is served by this bucket: the same variant, and room for its
     /// rows and tokens.
     pub const fn holds(self, shape: &Shape) -> bool {
-        // A media computation is planned by its extent rather than by a `Shape`, and a graph
-        // captured for one canvas holds no other, so no shape is served by a media bucket.
+        // A media computation is selected by its extent rather than by a `Shape`, and a graph
+        // captured for one extent holds no other, so no shape is served by a media bucket.
         matches!(self.extent, Extent::None)
             && self.variant as u8 == shape.variant as u8
             && self.rows >= shape.rows
@@ -324,13 +320,13 @@ impl fmt::Display for Bucket {
 
 /// The decode row counts captured when the build config names none: dense small batches kept exact,
 /// then strides of eight, because a bucket is captured for every size in the list.
-pub fn decode_catalog() -> Vec<u32> {
+pub fn default_decode_rows() -> Vec<u32> {
     (1..=32).chain((40..=128).step_by(8)).collect()
 }
 
 /// The prefill token counts captured when the build config names none: fine near one prompt's first
 /// chunk, coarser as chunks grow, which is where a bucket's cost is amortised.
-pub fn prefill_catalog() -> Vec<u32> {
+pub fn default_prefill_tokens() -> Vec<u32> {
     (4..=32)
         .step_by(4)
         .chain((48..=256).step_by(16))
@@ -360,10 +356,10 @@ pub fn prefill_row_buckets(rows: u32) -> Vec<u32> {
 
 /// The buckets one runner captures, in the order it captures them.
 ///
-/// The set is fixed when the worker is bound, from the build config's graph sizes
+/// The set is fixed when its runner is built, from the build config's graph sizes
 /// (`cuda_graph_config`): a bucket the set does not hold is a configuration error found at
 /// startup, not a scheduling surprise at the first odd-sized batch. The vector is kept sorted
-/// ascending and walked backwards for capture, so both hot paths are a single scan.
+/// ascending and scanned backwards for capture, so both hot paths are a single scan.
 #[derive(Clone, Default, Debug)]
 pub struct Buckets {
     /// Every bucket, ascending by size.
@@ -412,14 +408,14 @@ impl Buckets {
         Self::new(buckets)
     }
 
-    /// The bucket set of a batch plan that admits `rows` rows and `tokens` tokens, from the sizes
-    /// the deployment configured and the catalog where it configured none (4.5).
+    /// The bucket set of a rank that admits batches of `rows` rows and `tokens` tokens, from the
+    /// sizes the deployment configured and the default sizes where it configured none.
     ///
-    /// A bucket is captured for each size and never for a size the batch plan cannot admit, so a
+    /// A bucket is captured for each size and never for a size the batch bound cannot admit, so a
     /// configured size above the bound is dropped rather than captured and never used. `sampled`
     /// also captures the sampling variants, which a deployment that samples needs and one that
-    /// serves logits only does not pay for. A plan whose sizes all exceed the bound is refused here,
-    /// at startup, rather than at the first batch of an unusual shape.
+    /// serves logits only does not pay for. Sizes that all exceed the bound are refused here, at
+    /// startup, rather than at the first batch of an unusual shape.
     pub fn for_batch(
         decode: Option<&[u32]>,
         prefill: Option<&[u32]>,
@@ -429,11 +425,11 @@ impl Buckets {
     ) -> Result<Self> {
         let mut decode: Vec<u32> = match decode {
             Some(sizes) => sizes.to_vec(),
-            None => decode_catalog(),
+            None => default_decode_rows(),
         };
         let mut prefill: Vec<u32> = match prefill {
             Some(sizes) => sizes.to_vec(),
-            None => prefill_catalog(),
+            None => default_prefill_tokens(),
         };
         decode.retain(|size| *size != 0 && *size <= rows);
         prefill.retain(|size| *size != 0 && *size <= tokens);
@@ -446,40 +442,40 @@ impl Buckets {
     }
 
     /// The bucket set of an epoch that fixes no batch bound of its own: the configured sizes, or the
-    /// catalog where the config names none, and no size dropped.
+    /// default sizes where the config names none, and no size dropped.
     ///
     /// This is the set an epoch captures; the bound it implies - the largest decode rows and the
-    /// largest prefill tokens - is what the capacity plan and the scheduler admit, so the buckets
+    /// largest prefill tokens - is what capacity fitting and the scheduler admit, so the buckets
     /// come first and the batch bound follows them rather than the other way round.
     pub fn default_causal_lm(
         decode: Option<&[u32]>,
         prefill: Option<&[u32]>,
         sampled: bool,
     ) -> Self {
-        let decode = decode.map_or_else(decode_catalog, <[u32]>::to_vec);
-        let prefill = prefill.map_or_else(prefill_catalog, <[u32]>::to_vec);
-        // A zero size names no bucket; a plan that states one is not a plan to refuse, only a size
-        // to drop, since the rest of the set still serves.
+        let decode = decode.map_or_else(default_decode_rows, <[u32]>::to_vec);
+        let prefill = prefill.map_or_else(default_prefill_tokens, <[u32]>::to_vec);
+        // A zero size names no bucket; a config that states one is not refused, the size is
+        // dropped, since the rest of the set still serves.
         let decode: Vec<u32> = decode.into_iter().filter(|size| *size != 0).collect();
         let prefill: Vec<u32> = prefill.into_iter().filter(|size| *size != 0).collect();
         Self::causal_lm(&decode, &prefill, sampled)
     }
 
     /// The largest decode row count and prefill token count the set captures: **the batch bound the
-    /// mechanism may admit**, not an estimate of one.
+    /// scheduler may admit**, not an estimate of one.
     ///
-    /// A rank that serves captured graphs only is never handed a batch larger than its largest
-    /// bucket, so the catalogue is the rank's admission bound and the two must not drift: whatever
-    /// states a batch capacity for this rank (the epoch plan's rank facts) states these figures, not
-    /// the build config's, which may be larger. [`Self::require`] is the other half - a shape that
-    /// exceeds the bound is refused naming the bound and the shape, so a mechanism bug is a named
-    /// refusal rather than a batch no graph can serve.
+    /// A rank that serves captured graphs only is never given a batch larger than its largest
+    /// bucket, so the bucket set is the rank's admission bound and the two must not drift: whatever
+    /// states a batch capacity for this rank (what the rank reports to the engine) states these
+    /// figures, not the build config's, which may be larger. [`Self::require`] is the other half - a
+    /// shape that exceeds the bound is refused naming the bound and the shape, so a scheduler bug is
+    /// a named refusal rather than a batch no graph can serve.
     pub fn bounds(&self) -> (u32, u32) {
         let mut rows = 0;
         let mut tokens = 0;
         for bucket in self.iter() {
-            // A media computation is admitted by its own plan (`select_media`), and its rows and
-            // tokens are not a language-model batch size: counting one here would let a decode
+            // A media computation is admitted by its own selection (`select_media`), and its rows
+            // and tokens are not a language-model batch size: counting one here would let a decode
             // clip's single row or a denoising step's zero tokens move the admission bound a
             // scheduler states for the token path. **A host call's bucket states no extent either**
             // - it captures no graph - so the variant is what keeps its one row out of the bound.
@@ -525,11 +521,11 @@ impl Buckets {
 
     /// The smallest captured bucket that holds `shape`, or a refusal naming the shape.
     ///
-    /// 4.5's planning rule is this one lookup: a batch is planned into the smallest captured bucket
-    /// that holds it, because a larger bucket still produces correct tokens and only costs
-    /// throughput while a smaller one would corrupt them. A shape no bucket holds is refused where
-    /// it is planned - by name, with the shape and the variant - rather than clamped down to a
-    /// bucket that does not hold it, or grown into one that was never captured.
+    /// A batch runs in the smallest captured bucket that holds it, because a larger bucket still
+    /// produces correct tokens and only costs throughput while a smaller one would corrupt them. A
+    /// shape no bucket holds is refused where it is selected - by name, with the shape and the
+    /// variant - rather than clamped down to a bucket that does not hold it, or grown into one that
+    /// was never captured.
     pub fn require(&self, shape: &Shape) -> Result<Bucket> {
         self.select(shape).ok_or_else(|| {
             let (rows, tokens) = self.bounds();
@@ -543,17 +539,17 @@ impl Buckets {
 
     /// The one bucket a media computation runs in, or `None` when this rank has none for it.
     ///
-    /// A media computation is planned by what it is, not by a `Shape`: the variant says which kind of
-    /// graph it needs, and rows and tokens are room to spare.
+    /// A media computation is selected by what it is, not by a `Shape`: the variant says which kind
+    /// of graph it needs, and rows and tokens are room to spare.
     ///
-    /// **An extent a caller states narrows the search; one it cannot state does not.** A caller that
-    /// states a `Latents` layout or a `Clip` is matched to the graph captured for exactly that, so a
-    /// 25-frame step cannot run in a 13-frame graph. `Extent::None` is the caller saying it does not
-    /// know: a denoising step's extent is its latent layout and a decode's is its clip, and the engine
-    /// that forms the computation knows neither until the runner that planned the bucket has
-    /// answered, so requiring agreement would refuse every bucket the runners planned. The bucket's
-    /// own extent is still what decides what the runner does with the batch, and it is copied back
-    /// into the answer.
+    /// **An extent a caller states narrows the search; one it cannot state does not.** A caller
+    /// that states a `Latents` layout or a `Clip` is matched to the graph captured for exactly
+    /// that, so a 25-frame step cannot run in a 13-frame graph. `Extent::None` is the caller saying
+    /// it does not know: a denoising step's extent is its latent layout and a decode's is its clip,
+    /// and the engine that forms the computation knows neither until the runner that states the
+    /// bucket has reported it, so requiring agreement would refuse every bucket the runners state.
+    /// The bucket's own extent is still what decides what the runner does with the batch, and it is
+    /// returned with the bucket.
     ///
     /// No bucket serving the computation is the worker stating it does not serve it.
     pub fn select_media(&self, computation: &Computation) -> Option<Bucket> {
@@ -563,14 +559,13 @@ impl Buckets {
             .find(|bucket| bucket.holds_computation(computation))
     }
 
-    /// The buckets in capture order: largest first, so smaller captures reuse the graph pool's
-    /// blocks of the larger ones.
+    /// The buckets in capture order: largest first, so smaller captures reuse the allocator blocks
+    /// of the larger ones.
     pub fn capture_order(&self) -> impl Iterator<Item = &Bucket> {
         self.ascending.iter().rev()
     }
 
-    /// The largest bucket of each variant, which a plan of that variant's static activations is
-    /// sized for.
+    /// The largest bucket of `variant`, which that variant's static activations are sized for.
     pub fn largest(&self, variant: Variant) -> Option<Bucket> {
         self.ascending
             .iter()
@@ -584,8 +579,8 @@ impl Buckets {
         self.ascending.binary_search(bucket).is_ok()
     }
 
-    /// The bytes the largest bucket of each variant can need, given `bytes` as the footprint of
-    /// one full bucket: what an arena must be able to map before it captures the set.
+    /// The largest bucket of the set: the one whose footprint an allocator must be able to hold
+    /// before the set is captured.
     pub fn largest_footprint(&self) -> Option<Bucket> {
         self.ascending.last().copied()
     }
@@ -595,7 +590,8 @@ impl Buckets {
 mod tests {
     use super::*;
 
-    /// A request finds the bucket of its own timeline, canvas and prompt, and never a longer one.
+    /// A request finds the bucket of its own timeline, resolution and prompt, and never a longer
+    /// one.
     #[test]
     fn a_request_selects_the_bucket_of_its_own_timeline() {
         let layout = |frames: u32, text_rows: u32| proto::video::Layout {
@@ -613,8 +609,8 @@ mod tests {
         let short = Bucket::denoise(1, layout(37, 1024)).serving(124, 1344, 768);
         let wide = Bucket::denoise(1, layout(37, 2048)).serving(124, 1344, 768);
         let long = Bucket::denoise(1, layout(57, 1024)).serving(192, 1344, 768);
-        let plan = Buckets::new([short, wide, long]);
-        let asked = |frames, text_rows| Computation {
+        let buckets = Buckets::new([short, wide, long]);
+        let request = |frames, text_rows| Computation {
             call: ipc::MediaCall::Denoising,
             rows: 1,
             tokens: 0,
@@ -626,10 +622,10 @@ mod tests {
                 condition_rows: 0,
             },
         };
-        assert_eq!(plan.select_media(&asked(124, 537)), Some(short));
-        assert_eq!(plan.select_media(&asked(124, 1500)), Some(wide));
-        assert_eq!(plan.select_media(&asked(192, 537)), Some(long));
-        assert_eq!(plan.select_media(&asked(141, 537)), None);
+        assert_eq!(buckets.select_media(&request(124, 537)), Some(short));
+        assert_eq!(buckets.select_media(&request(124, 1500)), Some(wide));
+        assert_eq!(buckets.select_media(&request(192, 537)), Some(long));
+        assert_eq!(buckets.select_media(&request(141, 537)), None);
     }
 
     /// A request without conditions finds the layout that holds none, and one with conditions the
@@ -652,8 +648,8 @@ mod tests {
         let plain = Bucket::denoise(1, layout(0)).serving(124, 1344, 768);
         let low = Bucket::denoise(1, layout(2048)).serving(124, 1344, 768);
         let high = Bucket::denoise(1, layout(8192)).serving(124, 1344, 768);
-        let plan = Buckets::new([high, low, plain]);
-        let asked = |condition_rows| Computation {
+        let buckets = Buckets::new([high, low, plain]);
+        let request = |condition_rows| Computation {
             call: ipc::MediaCall::Denoising,
             rows: 1,
             tokens: 0,
@@ -665,23 +661,22 @@ mod tests {
                 condition_rows,
             },
         };
-        assert_eq!(plan.select_media(&asked(0)), Some(plain));
-        assert_eq!(plan.select_media(&asked(1024)), Some(low));
-        assert_eq!(plan.select_media(&asked(2048)), Some(low));
-        assert_eq!(plan.select_media(&asked(2176)), Some(high));
-        assert_eq!(plan.select_media(&asked(8192)), Some(high));
-        assert_eq!(plan.select_media(&asked(8320)), None);
+        assert_eq!(buckets.select_media(&request(0)), Some(plain));
+        assert_eq!(buckets.select_media(&request(1024)), Some(low));
+        assert_eq!(buckets.select_media(&request(2048)), Some(low));
+        assert_eq!(buckets.select_media(&request(2176)), Some(high));
+        assert_eq!(buckets.select_media(&request(8192)), Some(high));
+        assert_eq!(buckets.select_media(&request(8320)), None);
     }
 
     /// A host call's bucket serves its call whatever the batch holds, because it states no bound.
     ///
-    /// The artifact's three calls are served in this process, one request after another, so a batch
-    /// of two of them is the same call twice and the same bucket serves both. Measured against one
-    /// row - the shape of one request - a batch of two matched nothing, and the mechanism's only
-    /// trace of that is a debug line, which is the kind of stop a deployment reads as a hang.
+    /// The three host calls of a media output are served by the engine on the host, one request
+    /// after another, so a batch of two of them is the same call twice and the same bucket serves
+    /// both: its one row is the shape of one request and not a capacity.
     #[test]
     fn a_host_bucket_serves_every_request_of_its_call() {
-        let plan = Buckets::new([
+        let buckets = Buckets::new([
             Bucket::host(Variant::VideoEncode),
             Bucket::host(Variant::AudioEncode),
             Bucket::host(Variant::Mux),
@@ -702,7 +697,7 @@ mod tests {
                 };
                 assert_eq!(batch.variant(), Some(variant));
                 assert_eq!(
-                    plan.select_media(&batch),
+                    buckets.select_media(&batch),
                     Some(Bucket::host(variant)),
                     "a {call:?} batch of {rows} request(s)"
                 );
@@ -720,15 +715,16 @@ mod tests {
                 width: 1344,
             },
         };
-        assert_eq!(plan.select_media(&two_clips), None);
+        assert_eq!(buckets.select_media(&two_clips), None);
     }
 
-    /// The worker states which media computations its plan serves, and the mechanism forms a
-    /// batch only where the answer is a bucket: a denoising step is served only by a graph captured
-    /// for its own latent layout, a decode only by one captured for its own clip, and a call no
-    /// variant states - audio decoding, a mux - is served nowhere rather than by the nearest graph.
+    /// The worker states which media computations its buckets serve, and the scheduler forms a
+    /// batch only where the selection is a bucket: a denoising step is served only by a graph
+    /// captured for its own latent layout, a decode only by one captured for its own clip, and a
+    /// call no variant states - audio decoding, a mux - is served nowhere rather than by the nearest
+    /// graph.
     #[test]
-    fn a_media_computation_is_planned_only_into_a_bucket_captured_for_it() {
+    fn a_media_computation_selects_only_a_bucket_captured_for_it() {
         let layout = proto::video::Layout {
             video: proto::video::LatentShape {
                 channels: 16,
@@ -741,7 +737,7 @@ mod tests {
             condition_rows: 0,
             condition_elements: 0,
         };
-        let plan = Buckets::new([
+        let buckets = Buckets::new([
             Bucket::denoise(1, layout),
             Bucket::clip(48, 768, 1344),
             Bucket::prefill(1, 512, Variant::Encode),
@@ -755,7 +751,7 @@ mod tests {
         };
         assert_eq!(denoise.variant(), Some(Variant::Denoise));
         assert_eq!(
-            plan.select_media(&denoise),
+            buckets.select_media(&denoise),
             Some(Bucket::denoise(1, layout))
         );
 
@@ -772,19 +768,17 @@ mod tests {
             }),
             ..denoise
         };
-        assert_eq!(plan.select_media(&other), None);
+        assert_eq!(buckets.select_media(&other), None);
 
         // The engine forms every media computation with `Extent::None`: a step's layout is the
-        // model's and a clip is the request's, and the mechanism knows neither until the runner that
-        // planned the bucket answers. The bucket's own extent is the answer then, and this is the
-        // case a served frame dies without - the batch matched no bucket and the only trace was a
-        // debug line.
+        // model's and a clip is the request's, and the scheduler knows neither until the runner that
+        // states the bucket reports it. The bucket's own extent decides then.
         let from_engine = Computation {
             extent: Extent::None,
             ..denoise
         };
         assert_eq!(
-            plan.select_media(&from_engine),
+            buckets.select_media(&from_engine),
             Some(Bucket::denoise(1, layout)),
             "a computation that cannot state its extent is served by the bucket that states one"
         );
@@ -800,15 +794,18 @@ mod tests {
             },
         };
         assert_eq!(clip.variant(), Some(Variant::Decode));
-        assert_eq!(plan.select_media(&clip), Some(Bucket::clip(48, 768, 1344)));
+        assert_eq!(
+            buckets.select_media(&clip),
+            Some(Bucket::clip(48, 768, 1344))
+        );
 
-        // The same for a decode: the engine states `Extent::None` and the clip's bucket answers.
+        // The same for a decode: the engine states `Extent::None` and the clip's bucket serves it.
         let clip_from_engine = Computation {
             extent: Extent::None,
             ..clip
         };
         assert_eq!(
-            plan.select_media(&clip_from_engine),
+            buckets.select_media(&clip_from_engine),
             Some(Bucket::clip(48, 768, 1344))
         );
 
@@ -822,14 +819,14 @@ mod tests {
         };
         assert_eq!(encode.variant(), Some(Variant::Encode));
         assert_eq!(
-            plan.select_media(&encode),
+            buckets.select_media(&encode),
             Some(Bucket::prefill(1, 512, Variant::Encode))
         );
 
         // The admission bound is the token path's: a media bucket's rows and tokens are not a
         // language-model batch size and must not move it - and a host call's bucket states no
         // extent at all, so the variant is what keeps its one row out of the bound too.
-        assert_eq!(plan.bounds(), (1, 512));
+        assert_eq!(buckets.bounds(), (1, 512));
         assert_eq!(
             Buckets::new([
                 Bucket::host(Variant::VideoEncode),
@@ -837,13 +834,13 @@ mod tests {
             ])
             .bounds(),
             (0, 0),
-            "a plan of host calls states no token admission bound"
+            "a set of host calls states no token admission bound"
         );
 
         // A track-only decode is a variant of its own whose whole extent is the layout: a `t2va`
         // clip carries a soundtrack, and the decode of the track has no raster to name. Two
-        // canvases of one duration collapse onto one track, which is why the bucket is built from
-        // the layout rather than from the clip the denoiser took it from.
+        // resolutions of one duration collapse onto one track, which is why the bucket is built
+        // from the layout rather than from the clip the denoiser took it from.
         let track = Bucket::audio(
             1,
             proto::video::Layout {
@@ -879,9 +876,9 @@ mod tests {
         };
         assert_eq!(tracks.select_media(&clip_decode), None);
 
-        // The artifact's three host calls are computations of their own - the worker encodes and
-        // muxes them in this process - and no device bucket serves one: they state a variant so a
-        // batch reaches the runner that does, and they select no graph.
+        // The three host calls of a media output are computations of their own - the engine
+        // encodes and muxes them on the host - and no device bucket serves one: they state a variant
+        // so a batch reaches the runner that does, and they select no graph.
         for (call, variant) in [
             (ipc::MediaCall::VideoEncoding, Variant::VideoEncode),
             (ipc::MediaCall::AudioEncoding, Variant::AudioEncode),
@@ -898,9 +895,9 @@ mod tests {
             assert_eq!(tracks.select_media(&host), None);
         }
 
-        // A host bucket captures no graph, so no canvas narrows it: a video encode states the clip
-        // it works at and the stage that serves it states no extent at all. A bucket captured for a
-        // canvas still holds that one and no other, which is the half of the rule that keeps a
+        // A host bucket captures no graph, so no resolution narrows it: a video encode states the
+        // clip it works at and the stage that serves it states no extent at all. A bucket captured
+        // for a clip still holds that one and no other, which is the half of the rule that keeps a
         // 25-frame step out of a 13-frame graph.
         let host = Buckets::new([Bucket::host(Variant::VideoEncode)]);
         let clip_encode = Computation {
@@ -916,10 +913,10 @@ mod tests {
         assert_eq!(
             host.select_media(&clip_encode),
             Some(Bucket::host(Variant::VideoEncode)),
-            "a call performed in this process is served whatever canvas it names"
+            "a call performed on the host is served whatever resolution it names"
         );
         assert_eq!(
-            plan.select_media(&Computation {
+            buckets.select_media(&Computation {
                 extent: Extent::Clip {
                     frames: 25,
                     height: 768,
@@ -928,11 +925,11 @@ mod tests {
                 ..clip
             }),
             None,
-            "a captured bucket holds the canvas it was captured for and no other"
+            "a captured bucket holds the clip it was captured for and no other"
         );
 
-        // A media read is host work: a plan that states no host bucket for it serves it nowhere,
-        // and the mechanism reads that as the capability it is.
+        // A media read is host work: a bucket set that states no host bucket for it serves it
+        // nowhere, and the scheduler reads that as the capability it is.
         let read = Computation {
             call: ipc::MediaCall::MediaReading,
             rows: 1,
@@ -940,14 +937,14 @@ mod tests {
             extent: Extent::None,
         };
         assert!(read.stated(), "a media read is a computation");
-        assert_eq!(plan.select_media(&read), None);
+        assert_eq!(buckets.select_media(&read), None);
         assert_eq!(tracks.select_media(&read), None);
     }
 
     /// The two families are refused by name rather than served from one another's graphs: a media
     /// bucket states an extent a causal-LM forward has no use for, and a media variant is never a
-    /// causal-LM variant - a catalogue that mixed them must fail where the batch is planned, not
-    /// serve tokens shaped by a graph captured for a canvas.
+    /// causal-LM variant - a bucket set that mixed them must fail where the batch selects its
+    /// bucket, not serve tokens shaped by a graph captured for a latent layout.
     #[test]
     fn a_media_bucket_is_sized_by_its_extent_and_refused_by_a_causal_lm_runner() {
         let layout = proto::video::Layout {
@@ -990,7 +987,7 @@ mod tests {
             .causal_lm()
             .expect("a decode bucket is a causal-LM bucket");
 
-        // Two layouts of one row count are two graphs, and the message states the canvas rather
+        // Two layouts of one row count are two graphs, and the message states the layout rather
         // than a token count nobody holds.
         let other = Bucket::denoise(
             1,
@@ -1007,25 +1004,25 @@ mod tests {
         assert_ne!(other, denoise);
         assert!(
             other.to_string().contains("25"),
-            "the display states the canvas: {other}"
+            "the display states the layout: {other}"
         );
     }
 
-    /// Every shape a scheduler can hand in is planned into the **smallest** captured bucket that
-    /// holds it, derived independently by brute force over the captured set: a larger bucket still
-    /// produces correct tokens and costs throughput, a smaller one would corrupt them.
+    /// Every shape a scheduler can submit selects the **smallest** captured bucket that holds it,
+    /// derived independently by brute force over the captured set: a larger bucket still produces
+    /// correct tokens and costs throughput, a smaller one would corrupt them.
     ///
-    /// The shapes are the ones a batch hands in, which is what makes the catalog able to hold them
+    /// The shapes are the ones a batch states, which is what makes the bucket set able to hold them
     /// at all: a decode forward's row count is its token count, and a prefill chunk holds at least
     /// as many tokens as rows. A shape outside both domains is the other test's subject - it is
-    /// refused by name rather than planned, and asking this one to plan it would assert a coverage
-    /// the catalog does not claim.
+    /// refused by name rather than selected, and expecting a bucket for it here would assert a
+    /// coverage the bucket set does not claim.
     #[test]
-    fn every_shape_is_planned_into_the_smallest_bucket_that_holds_it() {
+    fn every_shape_selects_the_smallest_bucket_that_holds_it() {
         let buckets = Buckets::causal_lm(&[1, 8, 32], &[128, 512], true);
         let captured: Vec<Bucket> = buckets.iter().copied().collect();
         assert!(!captured.is_empty());
-        let mut planned = 0;
+        let mut selected = 0;
         for &variant in &[
             Variant::DecodeGreedy,
             Variant::DecodeSampled,
@@ -1056,15 +1053,15 @@ mod tests {
                         assert_eq!(
                             buckets.select(&shape),
                             None,
-                            "{shape} has no holder and must not be planned"
+                            "{shape} has no holder and must not select a bucket"
                         );
                         continue;
                     };
-                    planned += 1;
+                    selected += 1;
                     assert_eq!(
                         buckets.select(&shape),
                         Some(expected),
-                        "{shape} must be planned into its smallest holder"
+                        "{shape} must select its smallest holder"
                     );
                     // Whatever it picks does hold the shape, and nothing smaller does.
                     for bucket in &captured {
@@ -1078,11 +1075,12 @@ mod tests {
                 }
             }
         }
-        assert!(planned > 0, "no shape was planned at all");
+        assert!(selected > 0, "no shape selected a bucket at all");
     }
 
-    /// A shape the plan does not cover is refused by name - with the shape and its variant - and
-    /// never clamped into a bucket that does not hold it or grown into one that was not captured.
+    /// A shape the bucket set does not cover is refused by name - with the shape and its variant -
+    /// and never clamped into a bucket that does not hold it or grown into one that was not
+    /// captured.
     #[test]
     fn an_uncovered_shape_is_refused_by_name() {
         let buckets = Buckets::causal_lm(&[1, 8], &[128], false);
@@ -1102,7 +1100,7 @@ mod tests {
         let sampled = Shape::decode(1, Variant::DecodeSampled);
         assert!(buckets.select(&sampled).is_none());
         assert!(buckets.require(&sampled).is_err());
-        // The refusal names the bound as well as the shape, so the shape a mechanism admitted and
+        // The refusal names the bound as well as the shape, so the shape a scheduler admitted and
         // the bound it exceeded are both in the one line a deployment's reader has.
         let (rows, tokens) = buckets.bounds();
         assert!(
@@ -1112,27 +1110,27 @@ mod tests {
         );
     }
 
-    /// The bound the epoch plan states as a rank's batch capacity is this set's `bounds()`, so no
-    /// batch the mechanism admits is larger than the largest warmed bucket - and a build config
-    /// asking for more is clamped by the catalogue rather than honoured.
+    /// The bound a rank reports as its batch capacity is this set's `bounds()`, so no batch the
+    /// scheduler admits is larger than the largest warmed bucket - and a build config asking for
+    /// more is clamped by the default sizes rather than honoured.
     ///
     /// This is the invariant that keeps a serving batch from reaching a bucket nobody captured:
     /// `require` would refuse it, and a refusal in the serving path ends the epoch, so the bound
     /// must never be stated above what is warmed.
     #[test]
     fn the_admission_bound_is_the_largest_warmed_bucket_and_never_the_build_configs() {
-        // A deployment that asks for far more than the default catalogue holds.
+        // A deployment that asks for far more than the default sizes hold.
         let buckets =
-            Buckets::for_batch(None, None, 256, 1_000_000, true).expect("the default catalogue");
+            Buckets::for_batch(None, None, 256, 1_000_000, true).expect("the default sizes");
         let (rows, tokens) = buckets.bounds();
         assert!(
             (rows, tokens) == (128, 16384),
-            "the catalogue tops at {rows} rows, {tokens} tokens"
+            "the default sizes top at {rows} rows, {tokens} tokens"
         );
 
-        // Every shape inside the bound is planned, at both edges and along each axis: the bound is
-        // only useful if it is covered, and a catalogue with a hole inside its own bound would be
-        // exactly the drift this test exists to catch.
+        // Every shape inside the bound selects a bucket, at both edges and along each axis: the
+        // bound is only useful if it is covered, and a bucket set with a hole inside its own bound
+        // would be exactly the drift this test exists to catch.
         for variant in [
             Variant::DecodeGreedy,
             Variant::DecodeSampled,
@@ -1244,13 +1242,13 @@ mod tests {
         }
     }
 
-    /// One capture per bucket, and a bucket per (size, computation) pair the plan admits: the
-    /// first generation's capture set is the bucket set, so its size follows from the configured
-    /// sizes and nothing else.
+    /// One capture per bucket, and a bucket per (size, computation) pair the batch bound admits:
+    /// the first generation's capture set is the bucket set, so its size follows from the
+    /// configured sizes and nothing else.
     ///
     /// The figure matters because the first generation has no serving generation to compare
     /// against - every operator of every bucket is new - so this count is the work it does before it
-    /// serves a request, and one executable per capture is not booked by any pool.
+    /// serves a request, and no pool accounts for the one executable each capture holds.
     #[test]
     fn the_capture_set_is_the_bucket_set() {
         // The e2e deployment's own sizes: 4 decode sizes and one prefill size, sampling on.
@@ -1260,13 +1258,13 @@ mod tests {
         // output, greedy output and scored) prefill: a prefill bucket holds any batch of fewer rows.
         assert_eq!(buckets.len(), 12, "12 buckets, so 12 captures");
 
-        // With no configured size the catalogues are the plan, and every size they state is
+        // With no configured size the default sizes are the set, and every size they state is
         // captured with each computation it admits. The count is derived from them here rather than
-        // written as a figure: a chunk never holds fewer tokens than its rows, so two catalogue
-        // entries can name one bucket and the set holds it once.
-        let catalog =
-            Buckets::for_batch(None, None, u32::MAX, u32::MAX, true).expect("the catalogues");
-        let (rows, tokens) = (decode_catalog(), prefill_catalog());
+        // written as a figure: a chunk never holds fewer tokens than its rows, so two default sizes
+        // can name one bucket and the set holds it once.
+        let defaults =
+            Buckets::for_batch(None, None, u32::MAX, u32::MAX, true).expect("the default sizes");
+        let (rows, tokens) = (default_decode_rows(), default_prefill_tokens());
         let mut stated: std::collections::BTreeSet<Bucket> = std::collections::BTreeSet::new();
         for &row in &rows {
             stated.insert(Bucket::decode(row, Variant::DecodeGreedy));
@@ -1286,24 +1284,24 @@ mod tests {
             }
         }
         assert_eq!(
-            catalog.len(),
+            defaults.len(),
             stated.len(),
-            "one bucket per (variant, rows, tokens) the catalogues state"
+            "one bucket per (variant, rows, tokens) the default sizes state"
         );
         for bucket in &stated {
             assert!(
-                catalog.contains(bucket),
-                "{bucket} is in the catalog's plan"
+                defaults.contains(bucket),
+                "{bucket} is one of the default buckets"
             );
         }
     }
 
-    /// The catalog is clamped to what the batch plan admits, so nothing is captured that no batch
-    /// can fill, and a batch of the bound's own shape is still served.
+    /// The default sizes are clamped to what the batch bound admits, so nothing is captured that no
+    /// batch can fill, and a batch of the bound's own shape is still served.
     #[test]
-    fn the_catalog_is_clamped_to_the_batch_bound() {
+    fn the_default_sizes_are_clamped_to_the_batch_bound() {
         let buckets =
-            Buckets::for_batch(None, None, 8, 64, false).expect("a plan within the catalog");
+            Buckets::for_batch(None, None, 8, 64, false).expect("default sizes within the bound");
         for bucket in buckets.iter() {
             assert!(bucket.rows <= 8, "{bucket} is wider than the batch bound");
             assert!(
@@ -1353,9 +1351,9 @@ mod tests {
 
     /// Sizes that all exceed the bound are refused at startup rather than failed in service.
     #[test]
-    fn a_plan_no_size_fits_is_refused() {
+    fn sizes_that_all_exceed_the_bound_are_refused() {
         assert!(Buckets::for_batch(Some(&[256]), Some(&[4096]), 8, 64, false).is_err());
-        // One size within the bound is enough for the plan to be usable.
+        // One size within the bound is enough for the set to be usable.
         assert!(Buckets::for_batch(Some(&[8, 256]), Some(&[4096]), 8, 64, false).is_ok());
     }
 
@@ -1363,8 +1361,8 @@ mod tests {
     #[test]
     fn sampling_variants_follow_the_deployment() {
         let rows = [4_u32];
-        let greedy = Buckets::for_batch(Some(&rows), None, 8, 64, false).expect("a plan");
-        let sampled = Buckets::for_batch(Some(&rows), None, 8, 64, true).expect("a plan");
+        let greedy = Buckets::for_batch(Some(&rows), None, 8, 64, false).expect("a bucket set");
+        let sampled = Buckets::for_batch(Some(&rows), None, 8, 64, true).expect("a bucket set");
         assert!(
             !greedy
                 .iter()
@@ -1385,19 +1383,28 @@ mod tests {
     }
 
     /// The set an epoch captures implies the batch bound it admits: the largest decode rows and the
-    /// largest prefill tokens, which is what the capacity plan and the scheduler read.
+    /// largest prefill tokens, which is what capacity fitting and the scheduler read.
     #[test]
     fn the_bounds_are_what_the_set_captures() {
         let buckets = Buckets::default_causal_lm(Some(&[1, 8]), Some(&[0, 64, 256]), true);
         assert_eq!(buckets.bounds(), (8, 256));
-        // A zero size names no bucket, and an epoch that configures no size takes the catalog.
+        // A zero size names no bucket, and an epoch that configures no size takes the default sizes.
         assert!(!buckets.contains(&Bucket::prefill(8, 0, Variant::PrefillWrite)));
-        let catalog = Buckets::default_causal_lm(None, None, false);
-        let (rows, tokens) = catalog.bounds();
-        assert_eq!(rows, decode_catalog().into_iter().max().expect("a catalog"));
+        let defaults = Buckets::default_causal_lm(None, None, false);
+        let (rows, tokens) = defaults.bounds();
+        assert_eq!(
+            rows,
+            default_decode_rows()
+                .into_iter()
+                .max()
+                .expect("default sizes")
+        );
         assert_eq!(
             tokens,
-            prefill_catalog().into_iter().max().expect("a catalog")
+            default_prefill_tokens()
+                .into_iter()
+                .max()
+                .expect("default sizes")
         );
     }
 }
