@@ -1,14 +1,12 @@
-//! Worker failures and their classification.
+//! The crate's error and its classification.
 //!
-//! Owners in this crate report [`Error`]. A failure that leaves a device
-//! context unusable, such as an illegal address, is classified once into a
-//! [`Failure`] with a stable [`ErrorCode`] and a fatality, which is what the
-//! main process needs to decide between a local retry, the 2.4 sticky-error
-//! teardown and the 7.3 automatic revert of an update on probation. The codes
-//! are the protocol's vocabulary (`ipc::ErrorCode`), so the control thread
-//! reports them unchanged.
+//! Every module of this crate fails with [`Error`]. A failure that leaves a device context
+//! unusable, such as an illegal address, is classified once into a [`Failure`] with a stable
+//! [`ErrorCode`] and a fatality, which is what the engine needs to decide between a local retry,
+//! stopping the device and the automatic rollback of an update on trial. The codes are the
+//! protocol's vocabulary (`ipc::ErrorCode`), so the control thread reports them unchanged.
 
-/// Invalid submissions and operations on unavailable worker state.
+/// What an operation of the worker failed with.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A socket, thread, shared-memory object or peer exchange failed, or a
@@ -28,12 +26,13 @@ pub enum Error {
     /// An operator's launch or a kernel's load failed.
     #[error(transparent)]
     Ops(#[from] ops::Error),
-    /// A model layer's computation failed.
+    /// A model's computation failed: a module, a tensor operation or a launch of the device
+    /// backend, which the tensor library and the backend carry here as typed causes.
     #[error(transparent)]
     Nn(#[from] nn::Error),
     /// The media encoders or the muxer refused: a raster or a track the codecs cannot take, or an
     /// assembly that is not complete. The class is the media crate's own, kept whole so a caller
-    /// can tell a plan refusal from a codec failure.
+    /// can tell a refused request from a codec failure.
     #[error(transparent)]
     Media(#[from] media::Error),
     #[error("{0}")]
@@ -48,7 +47,7 @@ pub enum Error {
     ReadBackpressure { returns: u64 },
     #[error("{0}")]
     Invariant(String),
-    /// A library, module or value does not satisfy the contract it is used
+    /// A library, module or value does not satisfy the interface it is used
     /// under: a missing descriptor, a kernel whose metadata contradicts its
     /// launch, a module path that names no file.
     #[error("{0}")]
@@ -109,6 +108,21 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// A tensor operation's failure is a model computation's: the conversion through `nn::Error`
+/// recovers the backend's typed cause the tensor library carried boxed.
+impl From<uniserve_tensor::Error> for Error {
+    fn from(error: uniserve_tensor::Error) -> Self {
+        Self::Nn(nn::Error::from(error))
+    }
+}
+
+/// A refusal of the device backend outside a tensor operation: a context, an allocation, a copy.
+impl From<backend::Error> for Error {
+    fn from(error: backend::Error) -> Self {
+        Self::Nn(nn::Error::Backend(error))
+    }
+}
 
 /// A second outcome of a completion that already has one is the worker's state error.
 impl From<ipc::execution::Settled> for Error {
@@ -213,12 +227,15 @@ fn driver_failure(error: &Error) -> Option<&platform::Error> {
     match error {
         Error::Cuda(failure) => Some(failure),
         Error::Ops(failure) => ops_driver_failure(failure),
-        Error::Nn(nn::Error::Platform(failure)) => Some(failure),
+        Error::Nn(nn::Error::Backend(backend::Error::Platform(failure))) => Some(failure),
         Error::Nn(
             nn::Error::Ops(failure)
-            | nn::Error::Launch {
-                source: failure, ..
-            },
+            | nn::Error::Backend(
+                backend::Error::Ops(failure)
+                | backend::Error::Launch {
+                    source: failure, ..
+                },
+            ),
         ) => ops_driver_failure(failure),
         Error::Shared(shared) => shared.downcast_ref::<Error>().and_then(driver_failure),
         Error::InFlight { error, .. } => driver_failure(error),
@@ -290,7 +307,7 @@ mod tests {
         };
         for error in [
             Error::Ops(ops::Error::Platform(platform())),
-            Error::Nn(nn::Error::Platform(platform())),
+            Error::Nn(nn::Error::Backend(backend::Error::Platform(platform()))),
             Error::Nn(nn::Error::Ops(ops::Error::Platform(platform()))),
         ] {
             let failure = Failure::classify(error, Some("decode"));

@@ -5985,8 +5985,8 @@ dependencies = [
 name = "worker"
 version = "2.0.0"
 dependencies = [
+ "backend",
  "base64 0.22.1",
- "build-server",
  "bytemuck",
  "crossbeam-channel",
  "indexmap 2.14.0",

@@ -5,12 +5,14 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The worker half of the main process: the resident-memory owners, the
-# transfer mechanisms, capacity, host groups, and the section 8 keys of the
-# Storage Server's derived state. The runners, graphs and arenas that issue
-# device work live beside these modules in the same crate.
+# Execution: one executor thread per device, the runners that serve a model through its
+# capability traits, their captured graphs, the sampler, and the device memory a rank holds.
+# `worker → nn → backend → ops → platform`, beside the tensor library.
 [dependencies]
 media = { path = "../media" }
+# The execution context a runner's forwards compute under, and tensors over memory the worker
+# owns: weights, cache planes, recurrent state and a graph's inputs.
+backend.workspace = true
 base64.workspace = true
 bytemuck.workspace = true
 crossbeam-channel.workspace = true
@@ -22,7 +24,7 @@ libloading.workspace = true
 nvtx.workspace = true
 nn.workspace = true
 ops.workspace = true
-# The element type of a kernel operand (`DType`).
+# Tensors: a runner's inputs and a forward's outputs.
 uniserve-tensor.workspace = true
 proto.workspace = true
 rusqlite.workspace = true
@@ -36,9 +38,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-# The recorded-walk capture case builds its generation through nn's device bench, which asks a
-# running Build Server for the kernels a walk records.
-build-server.workspace = true
 
 [lints]
 workspace = true
