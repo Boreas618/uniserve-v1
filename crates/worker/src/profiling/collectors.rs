@@ -1,19 +1,20 @@
 //! A session's collectors on one rank, and their arming at step boundaries.
 //!
-//! Every CUPTI-based collector reaches CUPTI through the process's one
-//! subscription (`platform::cupti::subscriber`): the timeline enables its records
-//! and callbacks on it, and the profiling APIs (range profiler, PM sampling,
-//! PC sampling) belong to the same CUPTI. A collector is prepared when the
-//! session starts ([`Collectors::prepare`]), armed and disarmed at step
-//! boundaries ([`Collectors::arm`], [`Collectors::disarm`]), drained while
-//! armed by the session's sampler thread ([`Collectors::drain`]), and
-//! released when the session ends or the quality-of-service guard turns it
-//! off ([`Collectors::release`]).
+//! Every CUPTI-based collector reaches CUPTI through the process's one subscription
+//! (`platform::cupti::subscriber`): the timeline enables its records and callbacks on it, and the
+//! profiling APIs (range profiler, PM sampling, PC sampling) belong to the same CUPTI. The range
+//! timeline needs no CUPTI: it keeps the stamps the process's range markers write
+//! ([`super::markers`]). A collector is prepared when the session starts
+//! ([`Collectors::prepare`]), armed and disarmed at step boundaries ([`Collectors::arm`],
+//! [`Collectors::disarm`]), drained while armed by the session's sampler thread
+//! ([`Collectors::drain`]), and released when the session ends or the quality-of-service guard
+//! turns it off ([`Collectors::release`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crossbeam_channel::Sender;
 use platform::cupti::pc_sampling::PcSampler;
 use platform::cupti::pm_sampling::PmSampler;
 use platform::cupti::range_profiler::{RangeProfiler, Ranges};
@@ -22,12 +23,11 @@ use platform::cupti::timeline::{self, Timeline};
 use platform::{DeviceId, PrimaryContext};
 use proto::profile::{Collector, GraphTrace, MetricRanges, SessionRequest};
 
-use super::artifact::{Message, Rows};
-use super::fences::{Fences, Tap};
+use super::artifact::{Message, send};
+use super::markers::Markers;
 use super::pc_sampling;
 
-/// The fewest samples a PM sampler's counter data image and hardware
-/// buffer hold.
+/// The fewest samples a PM sampler's counter data image and hardware buffer hold.
 const PM_MIN_SAMPLES: u64 = 256;
 
 /// A prepared collector.
@@ -37,21 +37,22 @@ enum Prepared {
         /// Whether this rank records into the process's timeline.
         joined: bool,
     },
-    FenceTimeline {
-        fences: Arc<Fences>,
-        components: Vec<String>,
+    /// The stamps of the process's range markers, of the classes matching a pattern of `classes`
+    /// (every class when empty).
+    RangeTimeline {
+        markers: Arc<Markers>,
+        classes: Vec<String>,
     },
     PmSampling(PmSampler),
     RangeMetrics {
         profiler: RangeProfiler,
         ranges: MetricRanges,
     },
-    /// The session's own PC sampler of the context `context`, every
-    /// `2^period` cycles, enabled while armed: CUPTI refuses to enable
-    /// activity records (`CUPTI_ERROR_NOT_COMPATIBLE`) while PC sampling
-    /// samples, so it is enabled at each arm after the timeline started
-    /// and disabled at each disarm before the timeline stops. It attributes
-    /// only kernels launched outside CUDA graphs ([`pc_sampling`]).
+    /// The session's own PC sampler of the context `context`, every `2^period` cycles, enabled
+    /// while armed: CUPTI refuses to enable activity records (`CUPTI_ERROR_NOT_COMPATIBLE`) while
+    /// PC sampling samples, so it is enabled at each arm after the timeline started and disabled
+    /// at each disarm before the timeline stops. It attributes only kernels launched outside CUDA
+    /// graphs ([`pc_sampling`]).
     PcSampling {
         context: usize,
         period: u32,
@@ -59,10 +60,9 @@ enum Prepared {
         /// Whether the stall reasons' names reached the file.
         reasons: bool,
     },
-    /// The rank's PC sampler ([`pc_sampling::of`]), enabled for the
-    /// rank's life: the first arm sets the session's period and a hardware
-    /// buffer that holds it, each arm starts it and each disarm stops it,
-    /// and it stays enabled after the session.
+    /// The rank's PC sampler ([`pc_sampling::of`]), enabled for the rank's life: the first arm
+    /// sets the session's period and a hardware buffer that holds it, each arm starts it and each
+    /// disarm stops it, and it stays enabled after the session.
     RankPcSampling {
         period: u32,
         /// Whether the session's period and buffer are set.
@@ -77,11 +77,11 @@ pub(crate) struct Collectors {
     device: Option<DeviceId>,
     context: Option<PrimaryContext>,
     prepared: BTreeMap<Collector, Prepared>,
-    rows: Rows,
+    /// The session file's writer.
+    rows: Sender<Message>,
     armed: bool,
-    /// The collectors prepared and not released, a bit each ([`bit`]),
-    /// which the session reads at every step without taking the lock the
-    /// sampler thread holds while it drains.
+    /// The collectors prepared and not released, a bit each ([`bit`]), which the session reads at
+    /// every step without taking the lock the sampler thread holds while it drains.
     running: Arc<AtomicU32>,
 }
 
@@ -108,8 +108,9 @@ static TIMELINE: Mutex<Option<SharedTimeline>> = Mutex::new(None);
 
 /// Where each recording rank's records go, by the device ordinal CUPTI names.
 ///
-/// Apart from [`TIMELINE`] because a timeline that stops delivers what remains from under that lock.
-static TIMELINE_RANKS: Mutex<BTreeMap<u32, Rows>> = Mutex::new(BTreeMap::new());
+/// Apart from [`TIMELINE`] because a timeline that stops delivers what remains from under that
+/// lock.
+static TIMELINE_RANKS: Mutex<BTreeMap<u32, Sender<Message>>> = Mutex::new(BTreeMap::new());
 
 /// The device a timeline record ran on, when it names one.
 fn device_of(record: &Record) -> Option<u32> {
@@ -127,15 +128,18 @@ fn device_of(record: &Record) -> Option<u32> {
     }
 }
 
-/// Hands one delivery to the recording ranks: a record to its device's rank, and one that names no
-/// device to all of them. Every rank gets the names, which later records refer to by id.
+/// Sends one delivery to the recording ranks: a record to its device's rank, and one that names
+/// no device to all of them. Every rank gets the names, which later records refer to by id.
 fn deliver(delivered: timeline::Delivered) {
     let ranks = crate::lock(&TIMELINE_RANKS);
     if let [(_, rows)] = ranks.iter().collect::<Vec<_>>()[..] {
-        rows.send(Message::Timeline {
-            records: delivered.records,
-            names: delivered.names,
-        });
+        send(
+            rows,
+            Message::Timeline {
+                records: delivered.records,
+                names: delivered.names,
+            },
+        );
         return;
     }
     let mut records: BTreeMap<u32, Vec<Record>> =
@@ -156,16 +160,23 @@ fn deliver(delivered: timeline::Delivered) {
     }
     for (device, held) in records {
         if let Some(rows) = ranks.get(&device) {
-            rows.send(Message::Timeline {
-                records: held,
-                names: delivered.names.clone(),
-            });
+            send(
+                rows,
+                Message::Timeline {
+                    records: held,
+                    names: delivered.names.clone(),
+                },
+            );
         }
     }
 }
 
 /// The rank of `device` records into the process's timeline, starting it when no rank does.
-fn join_timeline(device: DeviceId, graphs: GraphTrace, rows: &Rows) -> platform::Result<()> {
+fn join_timeline(
+    device: DeviceId,
+    graphs: GraphTrace,
+    rows: &Sender<Message>,
+) -> platform::Result<()> {
     let mut shared = crate::lock(&TIMELINE);
     let shared = shared.get_or_insert_with(SharedTimeline::default);
     let ordinal = device.0 as u32;
@@ -237,16 +248,16 @@ fn leave_timeline(device: DeviceId) {
     crate::lock(&TIMELINE_RANKS).remove(&ordinal);
 }
 
-/// The armed component-range profiler of each device, which the probes push and pop ranges on: a
-/// probe's entry pushes and its exit pops.
-static COMPONENT_RANGES: Mutex<Option<HashMap<i32, ComponentRanges>>> = Mutex::new(None);
+/// The armed module-range profiler of each device, which the range markers push and pop ranges
+/// on: a module's entry marker pushes and its exit marker pops.
+static MODULE_RANGES: Mutex<Option<HashMap<i32, ModuleRanges>>> = Mutex::new(None);
 
-/// Whether any device publishes a profiler, read by every probe.
-static COMPONENT_RANGES_ARMED: AtomicBool = AtomicBool::new(false);
+/// Whether any device publishes a profiler, read at every range marker's launch.
+static MODULE_RANGES_ARMED: AtomicBool = AtomicBool::new(false);
 
-/// Publish or withdraw `device`'s component-range profiler.
-fn publish_component_ranges(device: DeviceId, ranges: Option<ComponentRanges>) {
-    let mut published = crate::lock(&COMPONENT_RANGES);
+/// Publishes or withdraws `device`'s module-range profiler.
+fn publish_module_ranges(device: DeviceId, ranges: Option<ModuleRanges>) {
+    let mut published = crate::lock(&MODULE_RANGES);
     let map = published.get_or_insert_with(HashMap::new);
     match ranges {
         Some(ranges) => {
@@ -256,39 +267,40 @@ fn publish_component_ranges(device: DeviceId, ranges: Option<ComponentRanges>) {
             map.remove(&device.0);
         }
     }
-    COMPONENT_RANGES_ARMED.store(!map.is_empty(), Ordering::Release);
+    MODULE_RANGES_ARMED.store(!map.is_empty(), Ordering::Release);
 }
 
-/// Whether a probe pushes and pops component ranges now.
-pub(crate) fn component_ranges_armed() -> bool {
-    COMPONENT_RANGES_ARMED.load(Ordering::Acquire)
+/// Whether a range marker's launch pushes and pops module ranges now.
+pub(crate) fn module_ranges_armed() -> bool {
+    MODULE_RANGES_ARMED.load(Ordering::Acquire)
 }
 
-/// The armed component-range profiler: its object, reached by the probes.
-struct ComponentRanges {
+/// The armed module-range profiler: its object, reached by the range markers' launches, and the
+/// range each module instance takes, its path, by the instance's number.
+struct ModuleRanges {
     /// The profiler, shared with the collector that owns it.
     profiler: *const RangeProfiler,
     names: Vec<String>,
 }
 
-// SAFETY: the profiler pointer is valid while the owning collector is armed (the collector clears it
-// before it disarms or drops); CUPTI accepts the range calls from any thread.
-unsafe impl Send for ComponentRanges {}
+// SAFETY: the profiler pointer is valid while the owning collector is armed (the collector
+// withdraws it before it disarms or drops); CUPTI accepts the range calls from any thread.
+unsafe impl Send for ModuleRanges {}
 
-/// The probes' part: push or pop the component range of `probe`'s instance on `device`, while
-/// component ranges are armed and `capturing` is false (a capture pushes no host range).
-pub(crate) fn component_range(device: DeviceId, probe: u32, capturing: bool) {
+/// The range markers' part: pushes or pops the module range of `marker`'s instance on `device`,
+/// while module ranges are armed and `capturing` is false (a capture pushes no host range).
+pub(crate) fn module_range(device: DeviceId, marker: u32, capturing: bool) {
     if capturing {
         return;
     }
-    let published = crate::lock(&COMPONENT_RANGES);
+    let published = crate::lock(&MODULE_RANGES);
     let Some(ranges) = published.as_ref().and_then(|map| map.get(&device.0)) else {
         return;
     };
     // SAFETY: the pointer is valid while it is published (above).
     let profiler = unsafe { &*ranges.profiler };
-    let result = if probe.is_multiple_of(2) {
-        match ranges.names.get((probe / 2) as usize) {
+    let result = if marker.is_multiple_of(2) {
+        match ranges.names.get((marker / 2) as usize) {
             Some(name) => profiler.push(name),
             None => return,
         }
@@ -296,18 +308,18 @@ pub(crate) fn component_range(device: DeviceId, probe: u32, capturing: bool) {
         profiler.pop()
     };
     if let Err(error) = result {
-        tracing::debug!("a component range was not recorded: {error}");
+        tracing::debug!("a module range was not recorded: {error}");
     }
 }
 
 impl Collectors {
-    /// Prepare `request`'s collectors on `device`: what fails to prepare is
-    /// reported as unavailable, with its reason, and the session runs the
-    /// others.
+    /// Prepares `request`'s collectors on `device`, which send what they collect to `rows`, and
+    /// returns them with each collector's state by name: what fails to prepare is reported as
+    /// unavailable, with its reason, and the session runs the others.
     pub(crate) fn prepare(
         request: &SessionRequest,
         device: Option<DeviceId>,
-        rows: Rows,
+        rows: Sender<Message>,
     ) -> (Self, BTreeMap<String, String>) {
         let context = device.and_then(|device| PrimaryContext::retain(device).ok());
         let mut prepared = BTreeMap::new();
@@ -317,11 +329,14 @@ impl Collectors {
                 Ok(ready) => {
                     prepared.insert(collector, ready);
                     states.insert(collector.as_str().to_owned(), "prepared".to_owned());
-                    rows.send(Message::Collector {
-                        name: collector.as_str().to_owned(),
-                        state: "prepared".to_owned(),
-                        detail: String::new(),
-                    });
+                    send(
+                        &rows,
+                        Message::Collector {
+                            name: collector.as_str().to_owned(),
+                            state: "prepared".to_owned(),
+                            detail: String::new(),
+                        },
+                    );
                 }
                 Err(reason) => {
                     tracing::warn!(
@@ -332,11 +347,14 @@ impl Collectors {
                         collector.as_str().to_owned(),
                         format!("unavailable: {reason}"),
                     );
-                    rows.send(Message::Collector {
-                        name: collector.as_str().to_owned(),
-                        state: "unavailable".to_owned(),
-                        detail: reason,
-                    });
+                    send(
+                        &rows,
+                        Message::Collector {
+                            name: collector.as_str().to_owned(),
+                            state: "unavailable".to_owned(),
+                            detail: reason,
+                        },
+                    );
                 }
             }
         }
@@ -366,9 +384,9 @@ impl Collectors {
         self.prepared.keys().copied().collect()
     }
 
-    /// Start every prepared collector, in the order of [`Collector`], which
-    /// starts the timeline before PC sampling as CUPTI requires; one that
-    /// fails to start is released, with its reason recorded.
+    /// Starts every prepared collector, in the order of [`Collector`], which starts the timeline
+    /// before PC sampling as CUPTI requires; one that fails to start is released, with its reason
+    /// recorded.
     pub(crate) fn arm(&mut self) {
         if self.armed {
             return;
@@ -388,21 +406,10 @@ impl Collectors {
                         "the rank has no CUDA device".to_owned(),
                     )),
                 },
-                Prepared::FenceTimeline { fences, components } => match self.device {
-                    Some(device) => {
-                        let rows = self.rows.clone();
-                        fences
-                            .tap(
-                                device,
-                                Tap {
-                                    components: components.clone(),
-                                    sink: Box::new(move |device, records| {
-                                        rows.send(Message::Fences { device, records });
-                                    }),
-                                },
-                            )
-                            .map_err(|error| platform::Error::InvalidArgument(error.to_string()))
-                    }
+                Prepared::RangeTimeline { markers, classes } => match self.device {
+                    Some(device) => markers
+                        .tap(device, classes.clone(), self.rows.clone())
+                        .map_err(|error| platform::Error::InvalidArgument(error.to_string())),
                     None => Err(platform::Error::InvalidArgument(
                         "the rank has no CUDA device".to_owned(),
                     )),
@@ -410,16 +417,16 @@ impl Collectors {
                 Prepared::PmSampling(sampler) => sampler.start(),
                 Prepared::RangeMetrics { profiler, ranges } => profiler.start().map(|()| {
                     if *ranges == MetricRanges::Component
-                        && let (Some(fences), Some(device)) = (Fences::installed(), self.device)
+                        && let (Some(markers), Some(device)) = (Markers::installed(), self.device)
                     {
-                        publish_component_ranges(
+                        publish_module_ranges(
                             device,
-                            Some(ComponentRanges {
+                            Some(ModuleRanges {
                                 profiler: &raw const *profiler,
-                                names: fences
+                                names: markers
                                     .instances()
-                                    .iter()
-                                    .map(|instance| instance.path.clone())
+                                    .into_iter()
+                                    .map(|(_, path)| path)
                                     .collect(),
                             }),
                         );
@@ -439,8 +446,10 @@ impl Collectors {
                 .and_then(|mut enabled| {
                     enabled.start()?;
                     if !*reasons {
-                        self.rows
-                            .send(Message::PcReasons(enabled.stall_reasons().to_vec()));
+                        send(
+                            &self.rows,
+                            Message::PcReasons(enabled.stall_reasons().to_vec()),
+                        );
                         *reasons = true;
                     }
                     *sampler = Some(enabled);
@@ -460,8 +469,10 @@ impl Collectors {
                     }
                     sampler.start()?;
                     if !*reasons {
-                        self.rows
-                            .send(Message::PcReasons(sampler.stall_reasons().to_vec()));
+                        send(
+                            &self.rows,
+                            Message::PcReasons(sampler.stall_reasons().to_vec()),
+                        );
                         *reasons = true;
                     }
                     Ok(())
@@ -481,9 +492,8 @@ impl Collectors {
         self.armed = true;
     }
 
-    /// Stop every armed collector and hand what it collected to the file,
-    /// in the reverse order of [`Collectors::arm`]: PC sampling is disabled
-    /// before the timeline stops.
+    /// Stops every armed collector and sends what it collected to the file, in the reverse order
+    /// of [`Collectors::arm`]: PC sampling is disabled before the timeline stops.
     pub(crate) fn disarm(&mut self) {
         if !self.armed {
             return;
@@ -493,7 +503,7 @@ impl Collectors {
             .as_ref()
             .and_then(|context| context.enter().ok());
         if let Some(device) = self.device {
-            publish_component_ranges(device, None);
+            publish_module_ranges(device, None);
         }
         let mut failed = Vec::new();
         for (&collector, prepared) in self.prepared.iter_mut().rev() {
@@ -512,9 +522,8 @@ impl Collectors {
         }
     }
 
-    /// Hand what the armed samplers collected so far to the file: PM samples
-    /// and PC samples, which the hardware buffers would otherwise
-    /// overflow.
+    /// Sends what the armed samplers collected so far to the file: PM samples and PC samples,
+    /// which the hardware buffers would otherwise overflow.
     pub(crate) fn drain(&mut self) {
         if !self.armed {
             return;
@@ -529,23 +538,26 @@ impl Collectors {
                     if decoded.overflow {
                         tracing::warn!("a PM sampling read filled its image: samples were lost");
                     }
-                    self.rows.send(Message::Pm {
-                        metrics: sampler.metrics(),
-                        samples: decoded.samples,
-                    });
+                    send(
+                        &self.rows,
+                        Message::Pm {
+                            metrics: sampler.metrics(),
+                            samples: decoded.samples,
+                        },
+                    );
                 }),
                 Prepared::PcSampling {
                     sampler: Some(sampler),
                     ..
                 } => sampler.take().map(|taken| {
                     if taken.total_samples > 0 {
-                        self.rows.send(Message::Pc(taken));
+                        send(&self.rows, Message::Pc(taken));
                     }
                 }),
                 Prepared::RankPcSampling { .. } => with_rank_sampler(self.device, |sampler| {
                     let taken = sampler.take()?;
                     if taken.total_samples > 0 {
-                        self.rows.send(Message::Pc(taken));
+                        send(&self.rows, Message::Pc(taken));
                     }
                     Ok(())
                 }),
@@ -557,12 +569,12 @@ impl Collectors {
         }
     }
 
-    /// Stop the range profiler, hand its ranges to the file and start it
-    /// again, so that a long window never fills its counter data image.
+    /// Stops the range profiler, sends its ranges to the file and starts it again, so that a long
+    /// window never fills its counter data image.
     ///
-    /// A stop or start CUPTI refuses releases the collector as failed, with
-    /// CUPTI's result as the detail of its state: the profiler collects
-    /// nothing more, and the ranges of a failed stop are lost.
+    /// A stop or start CUPTI refuses releases the collector as failed, with CUPTI's result as the
+    /// detail of its state: the profiler collects nothing more, and the ranges of a failed stop
+    /// are lost.
     pub(crate) fn cycle_ranges(&mut self) {
         if !self.armed {
             return;
@@ -590,9 +602,9 @@ impl Collectors {
         }
     }
 
-    /// Release `collector`: stop it if armed, hand what it collected to the
-    /// file and record why it was released (`state`: `failed`, `released`
-    /// by the quality-of-service guard, or `ended`).
+    /// Releases `collector`: stops it if armed, sends what it collected to the file and records
+    /// why it was released (`state`: `failed`, `released` by the quality-of-service guard, or
+    /// `ended`). Returns whether the rank ran it.
     pub(crate) fn release(&mut self, collector: Collector, state: &str, detail: &str) -> bool {
         let Some(mut prepared) = self.prepared.remove(&collector) else {
             return false;
@@ -606,7 +618,7 @@ impl Collectors {
             if collector == Collector::RangeMetrics
                 && let Some(device) = self.device
             {
-                publish_component_ranges(device, None);
+                publish_module_ranges(device, None);
             }
             if let Err(error) = stop(&mut prepared, self.device, &self.rows) {
                 tracing::warn!(
@@ -616,15 +628,18 @@ impl Collectors {
             }
         }
         drop(prepared);
-        self.rows.send(Message::Collector {
-            name: collector.as_str().to_owned(),
-            state: state.to_owned(),
-            detail: detail.to_owned(),
-        });
+        send(
+            &self.rows,
+            Message::Collector {
+                name: collector.as_str().to_owned(),
+                state: state.to_owned(),
+                detail: detail.to_owned(),
+            },
+        );
         true
     }
 
-    /// Release every collector, the session ending.
+    /// Releases every collector, the session ending.
     pub(crate) fn release_all(&mut self, reason: &str) {
         self.disarm();
         for collector in self.names() {
@@ -633,11 +648,11 @@ impl Collectors {
     }
 }
 
-/// Stop one collector of the rank of `device` and hand what it collected to the file.
+/// Stops one collector of the rank of `device` and sends what it collected to the file.
 fn stop(
     prepared: &mut Prepared,
     device: Option<DeviceId>,
-    rows: &Rows,
+    rows: &Sender<Message>,
 ) -> std::result::Result<(), String> {
     match prepared {
         Prepared::Timeline { joined, .. } => {
@@ -648,10 +663,11 @@ fn stop(
             }
             Ok(())
         }
-        Prepared::FenceTimeline { fences, .. } => {
+        Prepared::RangeTimeline { markers, .. } => {
+            // What the device stamped so far reaches the file before the tap goes.
             if let Some(device) = device {
-                fences.poll_device(device, true);
-                fences.untap(device);
+                markers.read_device(device, true);
+                markers.untap(device);
             }
             Ok(())
         }
@@ -661,10 +677,13 @@ fn stop(
             if decoded.overflow {
                 tracing::warn!("a PM sampling read filled its image: samples were lost");
             }
-            rows.send(Message::Pm {
-                metrics: sampler.metrics(),
-                samples: decoded.samples,
-            });
+            send(
+                rows,
+                Message::Pm {
+                    metrics: sampler.metrics(),
+                    samples: decoded.samples,
+                },
+            );
             Ok(())
         }
         Prepared::RangeMetrics { profiler, .. } => {
@@ -679,21 +698,22 @@ fn stop(
             };
             sampler.stop().map_err(|error| error.to_string())?;
             let taken = sampler.take().map_err(|error| error.to_string())?;
-            rows.send(Message::Pc(taken));
+            send(rows, Message::Pc(taken));
             Ok(())
         }
         Prepared::RankPcSampling { .. } => with_rank_sampler(device, |sampler| {
             sampler.stop()?;
             let taken = sampler.take()?;
-            rows.send(Message::Pc(taken));
+            send(rows, Message::Pc(taken));
             Ok(())
         })
         .map_err(|error| error.to_string()),
     }
 }
 
+/// Sends the ranges one pass of `profiler` collected to the file.
 fn send_ranges(
-    rows: &Rows,
+    rows: &Sender<Message>,
     profiler: &RangeProfiler,
     collected: platform::cupti::range_profiler::Collected,
 ) {
@@ -703,13 +723,16 @@ fn send_ranges(
             collected.dropped
         );
     }
-    rows.send(Message::Ranges {
-        metrics: profiler.metrics(),
-        ranges: collected.ranges,
-    });
+    send(
+        rows,
+        Message::Ranges {
+            metrics: profiler.metrics(),
+            ranges: collected.ranges,
+        },
+    );
 }
 
-/// Prepare one collector, or say why it is unavailable.
+/// Prepares one collector, or says why it is unavailable.
 fn prepare(
     collector: Collector,
     request: &SessionRequest,
@@ -738,23 +761,22 @@ fn prepare(
             })
         }
         Collector::FenceTimeline => {
-            let fences = Fences::installed().ok_or_else(|| {
-                "the process has no fence probes (profiling_config.fence_components)".to_owned()
+            let markers = Markers::installed().ok_or_else(|| {
+                "the process has no range markers (profiling_config.fence_components)".to_owned()
             })?;
-            Ok(Prepared::FenceTimeline {
-                fences: Arc::clone(fences),
-                components: request.components.clone(),
+            Ok(Prepared::RangeTimeline {
+                markers: Arc::clone(markers),
+                classes: request.components.clone(),
             })
         }
         Collector::PmSampling => {
             cupti()?;
             let (_, device) = device()?;
             let options = &request.pm_sampling;
-            // The image and the hardware buffer hold twice the samples taken
-            // between two reads: a read whose image fills loses the samples
-            // past it. The buffer takes the image's bytes per sample, which
-            // exceed a raw record's (on GB200, 13.6 KB of image against 8 KiB
-            // of buffer for the default metrics).
+            // The image and the hardware buffer hold twice the samples taken between two reads: a
+            // read whose image fills loses the samples past it. The buffer takes the image's
+            // bytes per sample, which exceed a raw record's (on GB200, 13.6 KB of image against
+            // 8 KiB of buffer for the default metrics).
             let per_read =
                 (super::session::DRAIN_PERIOD.as_nanos() as u64).div_ceil(options.interval_ns);
             let samples = (2 * per_read).max(PM_MIN_SAMPLES);
@@ -778,8 +800,8 @@ fn prepare(
             let ranges = match options.ranges {
                 MetricRanges::Kernel => Ranges::Launches,
                 MetricRanges::Component => {
-                    if Fences::installed().is_none() {
-                        return Err("component ranges need the rank's fence probes \
+                    if Markers::installed().is_none() {
+                        return Err("module ranges need the rank's range markers \
                              (profiling_config.fence_components)"
                             .to_owned());
                     }
@@ -820,7 +842,7 @@ fn prepare(
     }
 }
 
-/// Run `work` on the PC sampler of the rank of `device`.
+/// Runs `work` on the PC sampler of the rank of `device`.
 fn with_rank_sampler(
     device: Option<DeviceId>,
     work: impl FnOnce(&mut PcSampler) -> platform::Result<()>,

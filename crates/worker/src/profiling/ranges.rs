@@ -1,9 +1,11 @@
 //! NVTX ranges of the `uniserve.worker` domain, switched at run time.
 //!
-//! The design's profiling story (`docs/profiling.md`) wants a timeline that shows each phase of a
-//! batch and each storage job beside the kernels they issue. Ranges are cheap and switched: the
-//! switch starts from `UNISERVE_NVTX` (`1`, `true`, `yes` or `on`) and a timeline session changes
-//! it while the process serves ([`set_enabled`]).
+//! A timeline (`docs/profiling.md`) shows each host phase of a batch and each storage job beside
+//! the kernels they issue. These ranges mark what a thread of the executor does on the host; the
+//! time a module of the model takes on the device is measured by the range markers
+//! ([`super::markers`]). Ranges are cheap and switched: the switch starts from `UNISERVE_NVTX`
+//! (`1`, `true`, `yes` or `on`) and a timeline session changes it while the process serves
+//! ([`set_enabled`]).
 //!
 //! NVTX reaches a tool through the injection library named in `NVTX_INJECTION64_PATH` when the
 //! process makes its first NVTX call: the process names CUPTI there as it starts
@@ -39,13 +41,13 @@ pub fn enabled() -> bool {
     switch().load(Ordering::Acquire)
 }
 
-/// Emit ranges from now on, or stop; returns whether they were emitted.
+/// Emits ranges from now on, or stops; returns whether they were emitted.
 pub fn set_enabled(value: bool) -> bool {
     switch().swap(value, Ordering::AcqRel)
 }
 
-/// Marks a synchronous phase on its executing thread: a batch being staged, a capture, a rebind,
-/// a storage job. The range closes when the returned guard drops.
+/// Marks a synchronous phase on its executing thread: a batch's inputs being prepared, a capture,
+/// a rebind, a storage job. The range closes when the returned guard drops.
 ///
 /// `batch` is the batch the phase belongs to, so a timeline can line the ranges up with the
 /// scheduler's steps; a phase with no single batch owner passes `None`.
