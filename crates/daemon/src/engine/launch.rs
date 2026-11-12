@@ -1,4 +1,4 @@
-//! The launch file a main process is started with (`uniserve engine --launch
+//! The launch file an engine is started with (`uniserve engine --launch
 //! <path>`).
 //!
 //! The engine takes the file's contents as its whole description: one flag,
@@ -6,12 +6,12 @@
 //! file carries the epoch's engine configuration inline, so the process reads
 //! nothing else the daemon wrote, and the daemon writes it atomically: a
 //! temporary file beside the target, synced, then renamed.
-//! The child reads it in its first instruction, so nothing may be observable
+//! The engine reads it in its first instruction, so nothing may be observable
 //! half-written.
 //!
 //! The launch's contents travel in the spawn request (`process::Spawn::launch`),
-//! and the daemon of the node that starts the child writes the file into its own
-//! runtime directory (`supervision::supervisor`), so a child on any node reads a
+//! and the daemon of the node that starts the engine writes the file into its own
+//! runtime directory (`supervision::supervisor`), so an engine on any node reads a
 //! file of its own host.
 
 use std::io;
@@ -26,7 +26,7 @@ pub(crate) fn launch_path(directory: &Path, engine: u64) -> PathBuf {
     directory.join(format!("launch-{engine}.json"))
 }
 
-/// Writes `launch` for the process `engine` and answers the path it was
+/// Writes `launch` for the process `engine` and returns the path it was
 /// written to.
 ///
 /// # Errors
@@ -62,7 +62,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         // The rename is the first moment the file exists under its real name,
-        // and it is atomic, so a child either reads the whole file or is
+        // and it is atomic, so an engine either reads the whole file or is
         // started after a failure this call reports.
         std::fs::rename(&temporary, path)
     })();

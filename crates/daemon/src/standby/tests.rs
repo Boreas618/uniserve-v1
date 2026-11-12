@@ -1,5 +1,5 @@
-//! The standby rules over a fake standbys (§2.5): what the daemon does to a
-//! domain's children for each lifecycle event.
+//! The standby rules over fake standbys: what the daemon does to a
+//! domain's engines for each lifecycle event.
 
 use std::collections::BTreeMap;
 
@@ -10,7 +10,7 @@ use proto::request::StandbyStorage;
 /// The serving generation the fake standbys's processes are at.
 const SERVING: u64 = 7;
 
-/// A process whose next child's generation the epoch layer took one after
+/// A process whose next engine's generation the caller took one after
 /// the serving one, as the counter gives it.
 fn process(host: &str, epoch: Option<u64>) -> MainProcess {
     MainProcess {
@@ -142,7 +142,7 @@ fn parked(standbys: &mut Standbys) {
     }
 }
 
-/// The generations the epoch layer takes for the next child of `hosts`, as
+/// The generations the caller takes for the next engine of `hosts`, as
 /// its counter gives them.
 fn allocated(standbys: &mut Standbys, hosts: &[&str], generation: u64) {
     for host in hosts {
@@ -269,7 +269,7 @@ fn a_parked_domain_is_promoted_on_a_sticky_fault_and_a_new_standby_follows() {
         .collect();
     assert_eq!(phases, vec!["parked", "parked"]);
 
-    // One promotion per parked child of the failing domain, all in one step;
+    // One promotion per parked engine of the failing domain, all in one step;
     // the node in no cross-node group keeps its own standby.
     let actions = standbys.failed("b", &failure("sticky"));
     assert_eq!(
@@ -281,14 +281,14 @@ fn a_parked_domain_is_promoted_on_a_sticky_fault_and_a_new_standby_follows() {
     assert!(standbys.failed("c", &failure("sticky")).is_empty());
 
     assert!(standbys.promoted("b", SERVING + 1).is_empty());
-    // The last answer stops the old generation of the domain's members.
+    // The last acknowledgement stops the old generation of the domain's members.
     assert_eq!(
         standbys.promoted("c", SERVING + 1),
         vec![stop("b", SERVING), stop("c", SERVING)]
     );
 
     // The promoted generation is `SERVING + 1`, the generation the epoch
-    // record now names; the epoch layer takes the next number from its
+    // record now names; the caller takes the next number from its
     // counter, so the domain's next standby is at `SERVING + 2`, never beside
     // the old generation.
     allocated(&mut standbys, &["b", "c"], SERVING + 2);
@@ -336,7 +336,7 @@ fn a_domain_with_a_member_that_has_no_parked_standby_relaunches_wholly() {
     start(&mut standbys);
     // `b` parked; `c` is still starting.
     standbys.parked("b", SERVING + 1);
-    // The epoch layer takes the next number for each member's replacement.
+    // The caller takes the next number for each member's replacement.
     allocated(&mut standbys, &["b", "c"], SERVING + 2);
     let actions = standbys.failed("b", &failure("illegal_address"));
     assert_eq!(
@@ -383,7 +383,7 @@ fn a_replacement_waits_for_the_epoch_layers_generation_numbers() {
     assert_eq!(standbys.state()[1].phase.as_str(), "allocating");
     // The first number is not enough; the round starts with the last one.
     assert!(standbys.allocated("b", 41).is_empty());
-    // The failed node's child is gone, so it is not stopped; its sibling
+    // The failed node's engine is gone, so it is not stopped; its sibling
     // still serves at the old generation and is stopped before its
     // replacement starts.
     assert_eq!(
@@ -421,8 +421,8 @@ fn an_epoch_that_stops_serving_retires_its_standby_and_its_domain_goes_on_short(
     let mut standbys = standbys();
     start(&mut standbys);
     parked(&mut standbys);
-    // The epoch stops serving on `c`: the standby layer owns that child and
-    // stops it, so the epoch layer never needs its generation.
+    // The epoch stops serving on `c`: the standby rules own that standby and
+    // stop it, so the caller never needs its generation.
     assert_eq!(standbys.retired("c"), vec![terminate("c", SERVING + 1)]);
     // A fault of the retired node replaces nothing.
     assert!(standbys.failed("c", &failure("sticky")).is_empty());
@@ -469,12 +469,12 @@ fn a_device_that_needs_a_reset_takes_its_standby_and_migrates_the_node() {
 }
 
 #[test]
-fn every_member_is_asked_to_promote_before_any_answer_is_awaited() {
+fn every_member_is_asked_to_promote_before_any_acknowledgement_is_awaited() {
     let mut standbys = standbys();
     start(&mut standbys);
     parked(&mut standbys);
     // The whole round's promotions are returned in one call, so the caller
-    // issues them all before it awaits any answer (a suspended epoch
+    // issues them all before it awaits any acknowledgement (a suspended epoch
     // restores its communication together).
     let actions = standbys.failed("c", &failure("launch_failed"));
     assert_eq!(
@@ -492,7 +492,7 @@ fn a_promotion_that_fails_relaunches_the_domain() {
     standbys.promoted("b", SERVING + 1);
     allocated(&mut standbys, &["b", "c"], SERVING + 2);
     let actions = standbys.promote_failed("c");
-    // The node whose promotion failed has no serving child to stop; every
+    // The node whose promotion failed has no serving engine to stop; every
     // other member of the domain is stopped and started again.
     assert_eq!(
         actions,
@@ -543,7 +543,7 @@ fn a_standby_that_cannot_fit_even_suspended_is_not_kept() {
         "the b/c domain keeps no standby when c cannot hold one"
     );
     // Without a standby the domain is replaced by a relaunch, with the
-    // numbers the epoch layer already took (nothing consumed them).
+    // numbers the caller already took (nothing consumed them).
     let actions = standbys.failed("b", &failure("sticky"));
     assert!(actions.contains(&relaunch("b", SERVING + 1)));
     assert!(actions.contains(&relaunch("c", SERVING + 1)));

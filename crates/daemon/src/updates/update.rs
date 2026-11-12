@@ -1,8 +1,7 @@
 //! One update: the phases that move a deployment to another set of modules as
 //! a trial.
 //!
-//! An update has one phase machine whatever it moves (`specs/updates.md`
-//! §3.1):
+//! An update has one phase machine whatever it moves:
 //!
 //! | Phase | Ends when |
 //! | --- | --- |

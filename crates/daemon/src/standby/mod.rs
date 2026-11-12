@@ -1,34 +1,34 @@
-//! The standby main processes of the serving epoch (design §2.5).
+//! The standby engines of the serving epoch.
 //!
-//! Beside every node's serving main process the daemon keeps a parked
-//! standby child of the same group, rank and epoch at the next launch
-//! generation. The child has its own CUDA contexts, so a sticky error of the
+//! Beside every node's serving engine the daemon keeps a parked
+//! standby of the same group, rank and epoch at the next launch
+//! generation. The standby has its own CUDA contexts, so a sticky error of the
 //! serving process cannot touch it; it maps the epoch's weights and cache
 //! read-only by the existing rules, captures its graphs on warmup scratch
 //! and parks, keeping its graph pools, scratch and communicators resident or
-//! suspended per `standby_storage`. When the serving child fails with a
+//! suspended per `standby_storage`. When the serving engine fails with a
 //! process-fatal fault, the node's whole failure domain is promoted: one
-//! promotion per parked child of the domain, all issued before any answer is
-//! awaited, because a suspended child restores its communication together
+//! promotion per parked engine of the domain, all issued before any
+//! acknowledgement is awaited, because a suspended engine restores its communication together
 //! with its peers. The epoch record then names the promoted generation, the
 //! old generation is stopped, and each node starts a new standby.
 //!
-//! The failure-domain rules are the engine's (`crates/scheduler/src/worker/
-//! group/{spawn,standby,relaunch}.rs`), carried over to main processes:
+//! The failure-domain rules are those of a worker group's ranks, carried over
+//! to engines:
 //!
-//! - One domain holds every main process that shares a cross-node epoch; a
+//! - One domain holds every engine that shares a cross-node epoch; a
 //!   node in no cross-node group is a domain of its own.
 //! - A domain promotes wholly or not at all: if any member has no parked
 //!   standby, every member is replaced by a relaunch instead.
-//! - A standby exists only while the epoch serves. An epoch in precopy or on
-//!   probation keeps none: a fault there reverts the update.
+//! - A standby exists only while the epoch serves. An epoch being prepared or
+//!   on trial keeps none: a fault there rolls the update back.
 //! - A standby that fails to start, or a parked one that dies, leaves its
 //!   domain to a relaunch.
 //! - A GPU that needs a reset takes its node's standby with it; the node
 //!   cannot run again and only migration to another node or replica helps.
 //!
 //! This module holds the rules only: the caller applies the [`Action`]s it
-//! returns to the real children and reports the lifecycle back through
+//! returns to the real engines and reports the lifecycle back through
 //! [`Standbys::parked`], [`Standbys::failed`], [`Standbys::promoted`] and the
 //! rest.
 
@@ -37,19 +37,19 @@ use std::collections::BTreeMap;
 use crate::epoch::{Failure, Status};
 use crate::options::StandbyStorage;
 
-/// One node's main process of an epoch, as the standby rules see it.
+/// One node's engine of an epoch, as the standby rules see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MainProcess {
     /// The node, by host identity.
     pub host: String,
-    /// The child's group and rank, which its standby child repeats.
+    /// The engine's group and rank, which its standby repeats.
     pub group: String,
     pub rank: u32,
     /// The generation that serves.
     pub generation: u64,
-    /// The generation the node's next child takes: the standby, or the
-    /// serving child a relaunch starts when no standby can be promoted. The
-    /// epoch layer takes it from the group and rank's **single generation
+    /// The generation the node's next engine takes: the standby, or the
+    /// serving engine a relaunch starts when no standby can be promoted. The
+    /// caller takes it from the group and rank's **single generation
     /// counter**, and it is above every live generation of that group and
     /// rank when taken; these rules never mint a generation number. `0` means
     /// none was taken: the rules then return [`Action::Allocate`] and change
@@ -65,7 +65,7 @@ pub struct MainProcess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StandbyRoom {
     /// Whether a device of the node is short of the share of its storage a
-    /// serving main process leaves beside it for graphs and activations.
+    /// serving engine leaves beside it for graphs and activations.
     pub crowded: bool,
     /// Whether the standby's graph pools fit on host storage and can be
     /// restored at their addresses at the promotion. A node where they do
@@ -93,10 +93,10 @@ pub enum Storage {
     Suspended,
 }
 
-/// What the daemon is to do to a child, returned by the rules.
+/// What the daemon is to do to an engine, returned by the rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Start the host's standby child: the serving child's group and rank at
+    /// Start the host's standby: the serving engine's group and rank at
     /// `generation`, in standby mode, keeping `storage`.
     Spawn {
         host: String,
@@ -105,18 +105,18 @@ pub enum Action {
         generation: u64,
         storage: Storage,
     },
-    /// Promote the parked child of `generation` in place (`Promote` down its
+    /// Promote the parked engine of `generation` in place (`Promote` down its
     /// connection): same process, graphs at their addresses.
     Promote { host: String, generation: u64 },
-    /// Stop the child of `generation` (`Stop { group, generation }`): the
-    /// old generation once its successor serves, or a serving child the
+    /// Stop the engine of `generation` (`Stop { group, generation }`): the
+    /// old generation once its successor serves, or a serving engine the
     /// domain replaces.
     Stop {
         host: String,
         group: String,
         generation: u64,
     },
-    /// Start the host's serving child again, the domain having no standby to
+    /// Start the host's serving engine again, the domain having no standby to
     /// promote.
     Relaunch {
         host: String,
@@ -124,10 +124,10 @@ pub enum Action {
         rank: u32,
         generation: u64,
     },
-    /// Terminate a standby child that can no longer be promoted.
+    /// Terminate a standby that can no longer be promoted.
     Terminate { host: String, generation: u64 },
-    /// The node needs a generation for its next child, and only the epoch
-    /// layer's counter can give one: take a number from the group and rank's
+    /// The node needs a generation for its next engine, and only the caller's
+    /// counter can give one: take a number from the group and rank's
     /// counter and record it with [`Standbys::allocated`].
     Allocate {
         host: String,
@@ -139,10 +139,10 @@ pub enum Action {
     Migrate { host: String },
 }
 
-/// Whether a failure replaces the whole failure domain (§2.5): the kinds
-/// [`Failure`] names for a process that cannot go on, and a stalled job
-/// (§2.4). A request-level failure replaces nothing: a refused request, a
-/// request's non-finite logits, or a scheduling policy reverted after a
+/// Whether a failure replaces the whole failure domain: the kinds
+/// [`Failure`] names for a process that cannot go on, and a stalled job.
+/// A request-level failure replaces nothing: a refused request, a
+/// request's non-finite logits, or a scheduling policy rolled back after a
 /// commit.
 pub fn replaces_domain(failure: &Failure) -> bool {
     matches!(
@@ -162,22 +162,22 @@ pub enum Phase {
     /// It has no standby: never started, dropped, or its loss already
     /// replaced.
     Absent,
-    /// Its standby children start and prepare.
+    /// Its standbys start and prepare.
     Starting,
     /// Every member's standby parked.
     Parked,
-    /// The domain's promotion is out and `answered` members have answered.
-    Promoting { answered: usize },
+    /// The domain's promotion is out and `acknowledged` members have acknowledged it.
+    Promoting { acknowledged: usize },
     /// The domain's members are started again, `awaiting` of them not yet
     /// serving.
     Relaunching { awaiting: usize },
-    /// A replacement round waits for the epoch layer's generation numbers:
+    /// A replacement round waits for its generation numbers:
     /// the caller takes one per node, records it with [`Standbys::allocated`],
     /// and the round's actions follow the last one.
     Allocating,
 }
 
-/// A node's standby child.
+/// A node's standby.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Standby {
     generation: u64,
@@ -190,12 +190,12 @@ struct Node {
     standby: Option<Standby>,
     /// It cannot run again after a device fault; no action names it.
     gone: bool,
-    /// Its epoch stopped serving there (drained, purged or switched away):
+    /// Its epoch stopped serving there (drained, released or switched away):
     /// its standby is gone and none starts until `serve` is called again.
     retired: bool,
 }
 
-/// The epoch's main processes and the standby rules over them.
+/// The epoch's engines and the standby rules over them.
 #[derive(Debug, Clone)]
 pub struct Standbys {
     nodes: Vec<Node>,
@@ -210,7 +210,7 @@ pub struct Standbys {
 }
 
 impl Standbys {
-    /// The standbys of the epoch's main processes, one per node; the failure
+    /// The standbys of the epoch's engines, one per node; the failure
     /// domains are derived from the cross-node epochs they join.
     pub fn new(processes: Vec<MainProcess>) -> Self {
         let mut domains: Vec<Vec<usize>> = Vec::new();
@@ -251,7 +251,7 @@ impl Standbys {
         }
     }
 
-    /// The failure domains: the main processes replaced, promoted or
+    /// The failure domains: the engines replaced, promoted or
     /// relaunched together.
     pub fn domains(&self) -> Vec<Vec<&MainProcess>> {
         self.domains
@@ -302,7 +302,7 @@ impl Standbys {
     }
 
     /// Starts the standby of every domain that may keep one: `standby` is
-    /// on, the epoch serves (an epoch in precopy or on probation keeps none),
+    /// on, the epoch serves (an epoch being prepared or on trial keeps none),
     /// the domain has no standby and some member can run.
     ///
     /// `facts` is what each node's devices can keep, as the daemon observed
@@ -359,7 +359,7 @@ impl Standbys {
                     generation,
                     parked: false,
                 });
-                // The number is spent; the next child needs a new one.
+                // The number is spent; the next engine needs a new one.
                 self.nodes[node].process.standby_generation = 0;
             }
             self.phases[domain] = Phase::Starting;
@@ -367,10 +367,10 @@ impl Standbys {
         actions
     }
 
-    /// The standby child of `host` reported that it prepared and parked:
+    /// The standby of `host` reported that it prepared and parked:
     /// `Report::Parked { generation }`, the report that gates the start of a
-    /// standby (the child mapped the epoch's weights and cache read-only,
-    /// captured its graphs on warmup scratch and parked). A child whose
+    /// standby (the engine mapped the epoch's weights and cache read-only,
+    /// captured its graphs on warmup scratch and parked). An engine whose
     /// preparation failed reports that failure instead, which the caller
     /// feeds to [`Standbys::standby_lost`]: a standby epoch is kept whole or not
     /// at all.
@@ -392,7 +392,7 @@ impl Standbys {
         }
     }
 
-    /// A standby child of `host` is gone: it failed to start or died, or it
+    /// A standby of `host` is gone: it failed to start or died, or it
     /// reported that its preparation failed (`Report::Parked` never came). A
     /// domain's standby is one epoch: a member's loss drops every member's
     /// standby, and the domain relaunches when it next fails.
@@ -421,13 +421,13 @@ impl Standbys {
         actions
     }
 
-    /// The serving child of `host` failed. A process-fatal failure replaces
+    /// The serving engine of `host` failed. A process-fatal failure replaces
     /// the whole domain: its parked standbys are promoted (every one asked
-    /// before any answer is awaited), or, when any member has none, every
+    /// before any acknowledgement is awaited), or, when any member has none, every
     /// member is started again. A request-level failure replaces nothing.
     ///
     /// The caller applies whatever actions come back and reports their
-    /// outcome through [`Standbys::promoted`], [`Standbys::promote_failed`] and
+    /// result through [`Standbys::promoted`], [`Standbys::promote_failed`] and
     /// [`Standbys::relaunched`]; it does not assume that a fault yields a
     /// promotion, because whether one is possible is the domain's state, not
     /// the failure's.
@@ -468,7 +468,7 @@ impl Standbys {
             }
         }
         if !promotions.is_empty() && promotions.len() == live.len() {
-            self.phases[domain] = Phase::Promoting { answered: 0 };
+            self.phases[domain] = Phase::Promoting { acknowledged: 0 };
             return promotions
                 .into_iter()
                 .map(|(node, generation)| Action::Promote {
@@ -482,7 +482,7 @@ impl Standbys {
         match self.relaunch_all(host, domain) {
             Some(actions) => actions,
             None => {
-                // The round waits for the epoch layer's generation numbers.
+                // The round waits for its generation numbers.
                 self.phases[domain] = Phase::Allocating;
                 self.deferred[domain] = Some(host.to_owned());
                 self.allocate_actions(domain)
@@ -506,7 +506,7 @@ impl Standbys {
             .collect()
     }
 
-    /// Records the generation the epoch layer took for `host`'s next child,
+    /// Records the generation the caller took for `host`'s next engine,
     /// from the group and rank's single counter. A replacement round that was
     /// waiting for numbers starts with the last one.
     pub fn allocated(&mut self, host: &str, generation: u64) -> Vec<Action> {
@@ -536,7 +536,7 @@ impl Standbys {
 
     /// Starts every live member of `domain` again and drops its standbys.
     /// Returns `None` when any live member has no generation for its next
-    /// child: the caller then asks the epoch layer for the numbers
+    /// engine: the caller then takes the numbers
     /// ([`Action::Allocate`]) and the round follows the last one.
     fn relaunch_all(&mut self, failed: &str, domain: usize) -> Option<Vec<Action>> {
         let live = self.live(domain);
@@ -570,7 +570,7 @@ impl Standbys {
                 rank: process.rank,
                 generation: next,
             });
-            // The number is spent; the next child needs a new one.
+            // The number is spent; the next engine needs a new one.
             self.nodes[node].process.standby_generation = 0;
         }
         self.phases[domain] = Phase::Relaunching {
@@ -580,14 +580,14 @@ impl Standbys {
     }
 
     /// The promotion of the host's standby took effect:
-    /// `Report::Promoted { generation }`, the report that the child serves in
-    /// place after its `Command::Promote`. Once every member answered, the old
+    /// `Report::Promoted { generation }`, the report that the engine serves in
+    /// place after its `Command::Promote`. Once every member acknowledged, the old
     /// generation is stopped and the domain may start a new standby.
     pub fn promoted(&mut self, host: &str, generation: u64) -> Vec<Action> {
         let Some(domain) = self.domain_of(host) else {
             return Vec::new();
         };
-        let Phase::Promoting { answered } = self.phases[domain] else {
+        let Phase::Promoting { acknowledged } = self.phases[domain] else {
             return Vec::new();
         };
         let matches = self
@@ -600,9 +600,9 @@ impl Standbys {
             return Vec::new();
         }
         let live = self.live(domain);
-        let answered = answered + 1;
-        if answered < live.len() {
-            self.phases[domain] = Phase::Promoting { answered };
+        let acknowledged = acknowledged + 1;
+        if acknowledged < live.len() {
+            self.phases[domain] = Phase::Promoting { acknowledged };
             return Vec::new();
         }
         let mut actions = Vec::new();
@@ -615,7 +615,7 @@ impl Standbys {
             });
             if let Some(standby) = self.nodes[node].standby.take() {
                 self.nodes[node].process.generation = standby.generation;
-                // The next child needs a number from the counter.
+                // The next engine needs a number from the counter.
                 self.nodes[node].process.standby_generation = 0;
             }
         }
@@ -641,7 +641,7 @@ impl Standbys {
         }
     }
 
-    /// The serving child of `host` started again at `generation`.
+    /// The serving engine of `host` started again at `generation`.
     pub fn relaunched(&mut self, host: &str, generation: u64) {
         let Some(domain) = self.domain_of(host) else {
             return;
@@ -663,13 +663,13 @@ impl Standbys {
     }
 
     /// The node cannot run again after a device fault (a GPU that needs a
-    /// reset): its standby died with the serving child, and only migration to
+    /// reset): its standby died with the serving engine, and only migration to
     /// another node or replica helps. The rest of its domain is relaunched.
     ///
     /// The returned [`Action::Migrate`] names the node whose requests the
-    /// epoch layer moves; where its rank layout goes — another node or another
-    /// replica — is the epoch layer's decision, and it must not leave the
-    /// epoch short a node: a deployment that lost a node re-plans it, rather
+    /// caller moves; where its rank layout goes — another node or another
+    /// replica — is the caller's decision, and it must not leave the
+    /// epoch short a node: a deployment that lost a node places it again, rather
     /// than serving with a domain's member missing.
     pub fn unusable(&mut self, host: &str) -> Vec<Action> {
         let Some(domain) = self.domain_of(host) else {
@@ -695,7 +695,7 @@ impl Standbys {
             return actions;
         }
         // The members that remain shared an epoch with the dead node: their
-        // serving children are replaced, and the requests migrate off the
+        // serving engines are replaced, and the requests migrate off the
         // node that cannot run. The epoch's rank layout loses the node, which
         // the caller decides.
         match self.relaunch_all(host, domain) {
@@ -711,18 +711,18 @@ impl Standbys {
         });
         actions
     }
-    /// The node's epoch stopped serving there: its main process was drained,
-    /// purged or switched away, so its standby is terminated and none starts
+    /// The node's epoch stopped serving there: its engine was drained,
+    /// released or switched away, so its standby is terminated and none starts
     /// until [`Standbys::serve`] is called again.
     ///
-    /// The standby layer owns the standby child, so it stops it: the epoch
-    /// layer does not need to know its generation. A replacement round in
-    /// flight owns the domain's children until it ends, so a retirement is
+    /// These rules own the standby, so they stop it: the caller
+    /// does not need to know its generation. A replacement round in
+    /// flight owns the domain's engines until it ends, so a retirement is
     /// refused then; the round's own actions stop them.
     ///
-    /// A revert retires the target epoch's standbys this way, and the restored
+    /// A rollback retires the target epoch's standbys this way, and the restored
     /// epoch starts a new standby at a fresh number from the same counter: a
-    /// retired child's generation is never reused.
+    /// retired engine's generation is never reused.
     pub fn retired(&mut self, host: &str) -> Vec<Action> {
         let Some(domain) = self.domain_of(host) else {
             return Vec::new();
@@ -832,7 +832,7 @@ pub fn rooms(reports: &[String], deployment: &str) -> BTreeMap<String, StandbyRo
     rooms
 }
 
-/// The one storage mode a domain's standby children take, or `None` when no
+/// The one storage mode a domain's standbys take, or `None` when no
 /// member can keep one.
 fn storage(mode: StandbyStorage, observed: &[StandbyRoom]) -> Option<Storage> {
     let mode = match mode {

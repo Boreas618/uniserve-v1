@@ -14,7 +14,7 @@
 //! A previous epoch kept in host storage on trial (`KeepWeights` with
 //! `to_host`) has its weights moved there by the server's Transfer Server
 //! (`Request::Offload`). Every claim of an epoch returns that epoch's weights
-//! to the GPUs they left before it is answered (`Request::Restore`), after
+//! to the GPUs they left before it gets its reply (`Request::Restore`), after
 //! the epochs it retires released their storage: an epoch started again at a
 //! rollback claims, and its workers then map its weights where they were.
 
@@ -65,7 +65,7 @@ impl ClaimHolder {
 
     /// Claims `claim`'s deployment for its epoch at this node's Storage
     /// Server, starting the server when the node has none and restarting it
-    /// when it speaks an earlier protocol, or answers the claim held when the
+    /// when it speaks an earlier protocol, or returns the claim held when the
     /// epoch claimed the same scopes and retires nothing.
     ///
     /// # Errors
@@ -342,7 +342,7 @@ impl ClaimHolder {
 }
 
 /// Returns `epoch`'s weights that an offload left in host storage to the
-/// GPUs they left (`Request::Restore`), which answers at once when there
+/// GPUs they left (`Request::Restore`), which responds at once when there
 /// are none.
 fn restore(client: &mut storage::Client, deployment: &str, epoch: u64) -> anyhow::Result<()> {
     use anyhow::Context as _;
@@ -366,15 +366,15 @@ fn restore(client: &mut storage::Client, deployment: &str, epoch: u64) -> anyhow
 /// restart: each claiming connection crosses as a descriptor, so the
 /// Storage Server sees the same head throughout.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HandedClaims {
+pub(crate) struct ClaimsHandoff {
     executable: std::path::PathBuf,
     remote_pages: bool,
-    claims: Vec<HandedClaim>,
+    claims: Vec<ClaimHandoff>,
 }
 
-/// One handed-over claim.
+/// One claim of the handoff.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct HandedClaim {
+struct ClaimHandoff {
     deployment: String,
     /// The scopes of a predecessor that knew no epochs, which epoch 0 holds.
     #[serde(default)]
@@ -397,13 +397,13 @@ impl ClaimHolder {
     /// # Errors
     ///
     /// Fails when a claiming connection has unread messages.
-    pub(crate) fn hand_over(&mut self) -> anyhow::Result<(HandedClaims, Vec<OwnedFd>)> {
+    pub(crate) fn hand_over(&mut self) -> anyhow::Result<(ClaimsHandoff, Vec<OwnedFd>)> {
         let mut claims = Vec::with_capacity(self.held.len());
         let mut descriptors = Vec::with_capacity(self.held.len());
         for (deployment, held) in self.held.drain() {
             let (descriptor, next) = held.client.hand_over()?;
             descriptors.push(descriptor);
-            claims.push(HandedClaim {
+            claims.push(ClaimHandoff {
                 deployment,
                 scopes: Vec::new(),
                 epochs: held.epochs,
@@ -414,7 +414,7 @@ impl ClaimHolder {
             });
         }
         Ok((
-            HandedClaims {
+            ClaimsHandoff {
                 executable: self.executable.clone(),
                 remote_pages: self.remote_pages,
                 claims,
@@ -427,11 +427,11 @@ impl ClaimHolder {
     /// connections' descriptors in its order; `address` is this node's.
     pub(crate) fn adopt(
         address: Option<std::net::IpAddr>,
-        handed: HandedClaims,
+        handoff: ClaimsHandoff,
         descriptors: Vec<OwnedFd>,
     ) -> Self {
-        let mut holder = Self::new(handed.executable, handed.remote_pages, address);
-        for (claim, descriptor) in handed.claims.into_iter().zip(descriptors) {
+        let mut holder = Self::new(handoff.executable, handoff.remote_pages, address);
+        for (claim, descriptor) in handoff.claims.into_iter().zip(descriptors) {
             holder.held.insert(
                 claim.deployment,
                 Held {

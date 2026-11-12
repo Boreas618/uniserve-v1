@@ -1,4 +1,4 @@
-//! Components shared by the crate's tests, one fixture each: the byte
+//! Fixtures shared by the crate's tests, one each: the byte
 //! tokenizer, in-storage tokenizer loading, the engine over schedulers whose
 //! worker is the batch-interface fake, the video service, and the server's
 //! router.
@@ -35,7 +35,7 @@ use frontend::model::{ModelConfig, SamplingDefaults};
 use frontend::openai::video_jobs::VideoJobs;
 use frontend::tokenizer::DynTokenizer;
 
-/// Served model name the test engines answer to.
+/// Served model name the test engines serve under.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
 
 /// The application crate's byte tokenizer, which the serving tests decode
@@ -164,15 +164,15 @@ pub(crate) fn fake_core(
 }
 
 /// Installs the tree's `fcfs` policy on `core` through the mechanism's own
-/// steps (§7.3 steps 2 and 3): `Precopy`, then the switchover at a batch
+/// steps: the policy's preparation, then the switch at a batch
 /// boundary.
 ///
 /// A deployed scheduler takes its policy from the Build Server while its
 /// epoch starts; a fixture's has none, so every fixture that submits a
 /// request needs this. The package is the real module this tree builds, with
 /// the arguments of `core`'s own batch capacity — the limits it declares fit
-/// the ceilings the mechanism checks them against, so the precopy is answered
-/// with success rather than a refusal that would hide behind a fixture.
+/// the ceilings the mechanism checks them against, so the preparation
+/// succeeds rather than meeting a refusal that would hide behind a fixture.
 ///
 /// Requires `SCHED_POLICY_WASM`; see [`testkit::packaged_policy`], whose panic
 /// states the command that builds the module.
@@ -182,15 +182,15 @@ pub(crate) fn policy_on(core: &SchedulerHandle) {
     let source: std::sync::Arc<dyn scheduler::PolicySource + Send + Sync> =
         std::sync::Arc::new(scheduler::PolicyBytes::new(module));
     core.prepare_policy(package, source)
-        .recv_timeout(POLICY_ANSWER)
+        .recv_timeout(POLICY_RESPONSE)
         .expect("the policy's preparation responds within the bound")
         .expect("the packaged policy's limits fit the scheduler's capacity");
     core.switch_policy()
-        .recv_timeout(POLICY_ANSWER)
+        .recv_timeout(POLICY_RESPONSE)
         .expect("the switch responds within the bound")
         .expect("the switch applies at the next batch boundary");
     // A scheduler that fatal-stops leaves its handle dead, and a dead handle is what
-    // an engine reports as "no live scheduler answered the state the route policy is
+    // an engine reports as "no live scheduler returned the state the route policy is
     // instantiated on" - a sentence about the wrong subject. Its own reason is here,
     // and standard error is where a test run carries it.
     if let Some(reason) = core.failure() {
@@ -198,12 +198,12 @@ pub(crate) fn policy_on(core: &SchedulerHandle) {
     }
 }
 
-/// How long a fixture waits for an answer it cannot proceed without.
+/// How long a fixture waits for a response it cannot proceed without.
 ///
-/// A scheduler that does not answer must state that, not hang: an unbounded
-/// `recv` in a fixture is a suite that stops with no line saying which answer it
+/// A scheduler that does not respond must state that, not hang: an unbounded
+/// `recv` in a fixture is a suite that stops with no line saying which response it
 /// never got, which is exactly how a 53-second run became a 42-minute one.
-pub(crate) const POLICY_ANSWER: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const POLICY_RESPONSE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How long the packaged policy module may take to be built on first use.
 ///
@@ -220,11 +220,11 @@ pub(crate) const POLICY_BUILD: std::time::Duration = std::time::Duration::from_s
 pub(crate) fn packaged_policy(
     capacity: scheduler::BatchCapacity,
 ) -> (scheduler::PolicyPackage, Vec<u8>) {
-    let (answered, answer) = std::sync::mpsc::channel();
+    let (built, package) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = answered.send(testkit::packaged_policy(capacity));
+        let _ = built.send(testkit::packaged_policy(capacity));
     });
-    answer.recv_timeout(POLICY_BUILD).unwrap_or_else(|_| {
+    package.recv_timeout(POLICY_BUILD).unwrap_or_else(|_| {
         panic!(
             "the fcfs policy module was not built within {} s: a cargo build inside this              process is waiting on a package cache or a wasm32 toolchain another process holds.              Set SCHED_POLICY_WASM to a module built with `cargo build -p scheduling-policy-fcfs              --target wasm32-unknown-unknown --release` to run without the build.",
             POLICY_BUILD.as_secs()
@@ -304,7 +304,7 @@ pub(crate) fn fake_engine(
                 // An engine stand-in that ends is the whole of a test's failure and
                 // otherwise leaves no line: the client reports only that its process
                 // ended, and the reason - a frame the engine refused, a scheduler that
-                // did not answer - is lost with the thread. Standard error, so a test
+                // did not respond - is lost with the thread. Standard error, so a test
                 // run with `--nocapture` carries it beside the assertion.
                 eprintln!("the engine stand-in ended: {error:#}");
             }
@@ -392,11 +392,11 @@ pub(crate) fn leader_over(
     )
 }
 
-/// How long a fixture's request may take to answer before it is a stall.
+/// How long a fixture's request may wait for its response before it is a stall.
 ///
-/// A handler that never answers, or a body that never ends, would otherwise
+/// A handler that never responds, or a body that never ends, would otherwise
 /// hold the whole run open with nothing said: every step of a fixture is
-/// driven by the test and a simulated engine answers at once, so a wait that
+/// driven by the test and a simulated engine responds at once, so a wait that
 /// outlives this is a defect and must name itself.
 pub(crate) const STALL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -409,19 +409,19 @@ pub(crate) async fn send(
     let waited = format!("{} {}", request.method(), request.uri());
     let response = match tokio::time::timeout(STALL, router.clone().oneshot(request)).await {
         Ok(response) => response.unwrap(),
-        Err(_) => panic!("{waited} answered nothing within {} s", STALL.as_secs()),
+        Err(_) => panic!("{waited} got no response within {} s", STALL.as_secs()),
     };
-    // A response answered as one document carries its body beside the response, and a connection
-    // reads it from there: the status of a failure is the body's outcome, so it is read here too.
+    // A response written as one document carries its body beside the response, and a connection
+    // reads it from there: the status of a failure is the body's result, so it is read here too.
     let document = response
         .extensions()
         .get::<crate::http::stream::HandedBody>()
         .and_then(crate::http::stream::HandedBody::take)
-        .filter(|handed| handed.stream.head_held());
+        .filter(|held| held.stream.head_held());
     let (mut parts, body) = response.into_parts();
-    let bytes = if let Some(mut handed) = document {
+    let bytes = if let Some(mut held) = document {
         use crate::http::stream::Opened;
-        let opened = tokio::time::timeout(STALL, handed.stream.opened()).await;
+        let opened = tokio::time::timeout(STALL, held.stream.opened()).await;
         let opened = opened.unwrap_or_else(|_| {
             panic!(
                 "{waited}'s document did not open within {} s",
@@ -460,14 +460,14 @@ pub(crate) async fn send_streamed(
     let waited = format!("{} {}", request.method(), request.uri());
     let response = match tokio::time::timeout(STALL, router.clone().oneshot(request)).await {
         Ok(response) => response.unwrap(),
-        Err(_) => panic!("{waited} answered nothing within {} s", STALL.as_secs()),
+        Err(_) => panic!("{waited} got no response within {} s", STALL.as_secs()),
     };
     assert_eq!(response.status(), StatusCode::OK, "{waited}");
     response
         .extensions()
         .get::<crate::http::stream::HandedBody>()
         .and_then(crate::http::stream::HandedBody::take)
-        .unwrap_or_else(|| panic!("{waited} answered no streamed body"))
+        .unwrap_or_else(|| panic!("{waited} returned no streamed body"))
         .stream
 }
 
@@ -490,8 +490,8 @@ pub(crate) fn connection(generation: u64) -> u64 {
 }
 
 /// The engines' and the node daemons' ends of a process link, played by
-/// `testkit::process`: every request the leader makes of a node is answered
-/// as a node answers it, every engine the leader spawns is a fake engine that
+/// `testkit::process`: every request the leader makes of a node gets the reply
+/// a node gives it, every engine the leader spawns is a fake engine that
 /// reports as the process interface states, and a test reads what each was
 /// sent.
 pub(crate) struct Engines {

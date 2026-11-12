@@ -43,10 +43,10 @@ pub(crate) enum Listener {
     },
 }
 
-/// What a successor daemon needs of a handed-over listener besides its
+/// What a successor daemon needs of a listener in a handoff besides its
 /// socket: a Unix socket's file, which the successor owns from then on.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HandedListener {
+pub(crate) struct ListenerHandoff {
     unix: bool,
     /// The socket file's path, device and inode.
     socket_file: Option<(PathBuf, u64, u64)>,
@@ -183,10 +183,10 @@ impl Listener {
     /// A duplicate of the listening socket and what the successor of a hot
     /// restart needs beside it ([`Listener::resume`]); the successor owns a
     /// Unix socket's file from then on.
-    pub(crate) fn hand_over(&mut self) -> Result<(HandedListener, OwnedFd)> {
+    pub(crate) fn hand_over(&mut self) -> Result<(ListenerHandoff, OwnedFd)> {
         match self {
             Self::Tcp(listener) => Ok((
-                HandedListener {
+                ListenerHandoff {
                     unix: false,
                     socket_file: None,
                 },
@@ -196,7 +196,7 @@ impl Listener {
                 listener,
                 socket_file,
             } => Ok((
-                HandedListener {
+                ListenerHandoff {
                     unix: true,
                     socket_file: socket_file.take().map(SocketFile::disown),
                 },
@@ -206,13 +206,13 @@ impl Listener {
     }
 
     /// Accepts on a listening socket a daemon this one replaced handed over.
-    pub(crate) fn resume(handed: HandedListener, descriptor: OwnedFd) -> Result<Self> {
-        if handed.unix {
+    pub(crate) fn resume(handoff: ListenerHandoff, descriptor: OwnedFd) -> Result<Self> {
+        if handoff.unix {
             let listener = std::os::unix::net::UnixListener::from(descriptor);
             listener.set_nonblocking(true)?;
             Ok(Self::Unix {
                 listener: UnixListener::from_std(listener)?,
-                socket_file: handed.socket_file.map(|(path, device, inode)| SocketFile {
+                socket_file: handoff.socket_file.map(|(path, device, inode)| SocketFile {
                     path,
                     device,
                     inode,

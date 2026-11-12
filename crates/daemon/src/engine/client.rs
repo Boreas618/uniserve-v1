@@ -127,8 +127,8 @@ pub enum StreamCancelCause {
 /// A request in flight, as the reader files its frames.
 struct Pending {
     events: mpsc::UnboundedSender<Event>,
-    /// Answered with the scheduler serving the request once the engine
-    /// accepts it, or with `None` when the request ends first.
+    /// Sent the scheduler serving the request once the engine
+    /// accepts it, or `None` when the request ends first.
     accepted: Option<oneshot::Sender<Option<u32>>>,
 }
 
@@ -139,8 +139,8 @@ struct Shared {
     requests: Mutex<HashMap<RequestId, Pending>>,
     state: watch::Sender<EngineState>,
     next_id: AtomicU64,
-    /// The hooks and configure commands awaiting their answer, by
-    /// identity: a hook's answer is each worker's result, a configure's
+    /// The hooks and configure commands awaiting their response, by
+    /// identity: a hook's response is each worker's result, a configure's
     /// none.
     responses: Mutex<HashMap<u64, Responder>>,
     /// The epoch the engine executes, which its statistics are recorded
@@ -165,7 +165,7 @@ enum Response {
 impl Shared {
     /// Sends one frame to the engine and says whether it was taken; a closed
     /// connection is ordinarily the reader's to report, so a caller that has
-    /// nowhere else to look for the answer reads the result instead.
+    /// nowhere else to learn of it reads the result instead.
     fn write(&self, kind: to_engine::Kind) -> proto::Result<()> {
         let message = wire::ToEngine { kind: Some(kind) };
         lock(&self.writer).send(&message)
@@ -203,10 +203,10 @@ pub struct EngineClient {
     /// The identity this daemon's engine control gave the engine; `None`
     /// for an engine it did not start.
     engine: Option<u64>,
-    /// The host the engine's main process runs on, when this daemon's engine
+    /// The host the engine runs on, when this daemon's engine
     /// control started it.
     host: Option<String>,
-    /// The engine's other main processes, when its worker group has ranks on
+    /// The engines on the other hosts, when the worker group has ranks on
     /// other hosts: one client per peer, which this client holds so that they
     /// end with it.
     peers: Vec<EngineClient>,
@@ -273,14 +273,14 @@ impl EngineClient {
         self
     }
 
-    /// The client of an engine whose main process runs on `host`.
+    /// The client of an engine that runs on `host`.
     #[must_use]
     pub fn on_host(mut self, host: &str) -> Self {
         self.host = Some(host.to_owned());
         self
     }
 
-    /// The scheduler node's client of an engine whose other main processes `peers` are: they end
+    /// The scheduler node's client of a deployment whose other engines `peers` are: they end
     /// with it, and a promotion promotes them with it.
     #[must_use]
     pub fn with_peers(mut self, peers: Vec<EngineClient>) -> Self {
@@ -288,7 +288,7 @@ impl EngineClient {
         self
     }
 
-    /// Every main process of the engine as the epoch layer commands it, the scheduler node's
+    /// Every engine process as the updater commands it, the scheduler node's
     /// first: its host and its number. Empty for an engine this daemon did not start.
     pub fn processes(&self) -> Vec<crate::engine::control::EpochProcess> {
         std::iter::once(self)
@@ -538,7 +538,7 @@ impl EngineClient {
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(command(id)),
             }));
-        // The reader marks the engine closed before it drops the responses it holds, so an answer
+        // The reader marks the engine closed before it drops the responses it holds, so a responder
         // registered after that finds the mark here and no reader ever drops it.
         if matches!(self.state(), EngineState::Stopped | EngineState::Failed(_)) {
             lock(&self.shared.responses).remove(&id);
@@ -662,8 +662,8 @@ impl EngineClient {
     /// Gives back the tail of the engine's KV cache until each device's
     /// storage ledger has room for `bytes`, overridden by `devices` on named
     /// GPUs, beside everything it books; the requests that hold the tail
-    /// run on, and the answer comes once they let it go. Returns each
-    /// device's plan.
+    /// run on, and the response comes once they let it go. Returns each
+    /// device's report.
     ///
     /// # Errors
     ///
@@ -746,12 +746,12 @@ impl EngineClient {
     /// `requests` beside this one (a hot restart's successor), which it then
     /// serves as well.
     ///
-    /// The command is the handover's second step (§7.5.1): the successor has no
+    /// The command is the handover's second step: the successor has no
     /// front on this engine until it arrives, so whether the engine was told is
     /// the difference between a handover that is waiting and one that can never
     /// finish. Everywhere else a refused frame is the reader's to report, and at
     /// a handover the reader may already be gone — so the write states its own
-    /// outcome, at the level a handover's failure deserves.
+    /// result, at the level a handover's failure deserves.
     pub fn attach(&self, requests: &str) {
         let command = to_engine::Kind::Engine(wire::EngineCommand {
             kind: Some(wire::engine_command::Kind::Attach(wire::Attach {
@@ -839,7 +839,7 @@ impl EngineClient {
 
 impl Drop for EngineClient {
     fn drop(&mut self) {
-        // A handed-over or borrowed front owns only its requests. Closing
+        // A front of a handoff or a borrowed front owns only its requests. Closing
         // it must not terminate the engine another daemon controls.
         if lock(&self.control).is_some() {
             self.shutdown();
@@ -938,9 +938,9 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                 }
             }
             Some(from_engine::Kind::Metrics(metrics)) => {
-                // The main process's allocator, which the deployment exports: each device's budget
+                // The engine's allocator, which the deployment exports: each device's budget
                 // and, per pool, the bytes it has mapped now (`uniserve:memory_budget`,
-                // `uniserve:memory_mapped`; design §4.1 and §8). The message arrives once a second
+                // `uniserve:memory_mapped`). The message arrives once a second
                 // while the process serves, so the series follow the allocator rather than a snapshot
                 // taken at launch.
                 //
@@ -1143,7 +1143,7 @@ impl EventStream {
 
     /// Gives the request's event stream up without cancelling the request:
     /// the engine's next consumer takes it over from the position this one
-    /// reached (design §7.5.1 step 4).
+    /// reached.
     pub fn hand_over(&mut self) {
         self.open = false;
     }
@@ -1167,7 +1167,7 @@ impl EventStream {
     /// [`Self::recv`] offers.
     ///
     /// A response driven from a poll loop reads its request's events one at a
-    /// time this way (design §7.5.1): it must not hold a future across a pause.
+    /// time this way: it must not hold a future across a pause.
     pub fn poll_recv(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Event>> {
         let event = std::task::ready!(self.events.poll_recv(cx));
         match &event {

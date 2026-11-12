@@ -90,7 +90,7 @@ pub(crate) struct Operation {
 /// The admin's event log and operations' record as a hot restart hands them
 /// to the successor.
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct HandedAdmin {
+pub(crate) struct AdminHandoff {
     events: Vec<AdminEvent>,
     next_event: u64,
     last: Option<Operation>,
@@ -112,9 +112,9 @@ pub(crate) struct Admin {
     retire: Arc<AtomicBool>,
     /// Set once a hot restart handed the deployment to a successor, which
     /// takes the operations from then on.
-    handed_over: AtomicBool,
+    handoff_sent: AtomicBool,
     /// The node's epoch records: the same instance the leader keeps, so the
-    /// admin reports and moves the records the epoch layer itself does (§7.2).
+    /// admin reports and moves the records the updater itself does.
     epochs: Arc<crate::epoch::Epochs>,
 }
 
@@ -138,8 +138,8 @@ impl Admin {
 
     /// An admin over `epochs`, the records the node's leader keeps: there is
     /// one `Epochs` per node and the admin holds the same instance, so
-    /// `GET /admin/config` and the update operations read what the epoch layer
-    /// itself moves (design §7.2).
+    /// `GET /admin/config` and the update operations read what the updater
+    /// itself moves.
     pub(crate) fn with_epochs(
         shutdown: CancellationToken,
         retire: Arc<AtomicBool>,
@@ -154,7 +154,7 @@ impl Admin {
             next_operation: AtomicU64::new(1),
             shutdown,
             retire,
-            handed_over: AtomicBool::new(false),
+            handoff_sent: AtomicBool::new(false),
             epochs,
         })
     }
@@ -167,9 +167,9 @@ impl Admin {
 
     /// The event log and the operations' record, for the successor of a hot
     /// restart to go on with ([`Admin::resume`]).
-    pub(crate) fn hand_over(&self) -> HandedAdmin {
-        self.handed_over.store(true, Ordering::Release);
-        HandedAdmin {
+    pub(crate) fn hand_over(&self) -> AdminHandoff {
+        self.handoff_sent.store(true, Ordering::Release);
+        AdminHandoff {
             events: locked(&self.events).iter().cloned().collect(),
             next_event: self.next_event.load(Ordering::Relaxed),
             last: locked(&self.last).clone(),
@@ -182,15 +182,17 @@ impl Admin {
     pub(crate) fn resume(
         shutdown: CancellationToken,
         retire: Arc<AtomicBool>,
-        handed: HandedAdmin,
+        handoff: AdminHandoff,
     ) -> Arc<Self> {
         let admin = Self::new(shutdown, retire);
-        *locked(&admin.events) = handed.events.into_iter().collect();
-        admin.next_event.store(handed.next_event, Ordering::Relaxed);
-        *locked(&admin.last) = handed.last;
+        *locked(&admin.events) = handoff.events.into_iter().collect();
+        admin
+            .next_event
+            .store(handoff.next_event, Ordering::Relaxed);
+        *locked(&admin.last) = handoff.last;
         admin
             .next_operation
-            .store(handed.next_operation, Ordering::Relaxed);
+            .store(handoff.next_operation, Ordering::Relaxed);
         admin
     }
 
@@ -268,7 +270,7 @@ impl Admin {
         if let Some(other) = running.as_ref() {
             return Err(Box::new(other.clone()));
         }
-        if self.handed_over.load(Ordering::Acquire) {
+        if self.handoff_sent.load(Ordering::Acquire) {
             return Err(Box::new(Operation {
                 id: 0,
                 kind: "restart".to_owned(),
@@ -294,15 +296,15 @@ impl Admin {
         Ok(operation)
     }
 
-    /// Ends `operation`, the running one, with `outcome`.
+    /// Ends `operation`, the running one, with `result`.
     fn end(
         &self,
         mut operation: Operation,
-        outcome: Result<serde_json::Value, String>,
+        result: Result<serde_json::Value, String>,
     ) -> Operation {
         *locked(&self.running) = None;
         operation.ended = Some(now());
-        match outcome {
+        match result {
             Ok(result) => {
                 operation.state = "succeeded".to_owned();
                 operation.result = Some(result);
@@ -519,7 +521,7 @@ fn yes() -> bool {
     true
 }
 
-/// Runs operation `kind` on a task of its own and answers with it: once it
+/// Runs operation `kind` on a task of its own and responds with it: once it
 /// ends when `wait`, else at once (`202`).
 async fn run<F>(admin: &Arc<Admin>, kind: &'static str, wait: bool, work: F) -> Response
 where
@@ -1084,7 +1086,7 @@ async fn unload_lora_adapter(State(state): State<AdminState>, body: axum::body::
 
 /// `POST /admin/profile`: starts a profiling session
 /// (`proto::profile::SessionRequest`) on every worker of the executing epoch
-/// at the engine's next step boundary (`crate::profiling`), and answers with
+/// at the engine's next step boundary (`crate::profiling`), and responds with
 /// it: its identity, each worker's file and collectors. One runs at a time:
 /// another is refused (`400`) until it ends.
 async fn start_profile(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
@@ -1112,7 +1114,7 @@ async fn profile_status(State(state): State<AdminState>) -> Json<serde_json::Val
 }
 
 /// `DELETE /admin/profile`: ends the running session at the engine's next
-/// step boundary, every worker writing its file, and answers with it.
+/// step boundary, every worker writing its file, and responds with it.
 async fn stop_profile(State(state): State<AdminState>) -> Response {
     let leader = Arc::clone(&state.leader);
     run(&state.admin, "profile", true, async move {
@@ -1140,7 +1142,7 @@ struct RestartBody {
 
 /// `POST /admin/restart`: hands the deployment to a successor daemon, which
 /// serves from then on while this one finishes the requests it took
-/// (`crate::restart`). Answers once the successor serves, with its process
+/// (`crate::restart`). Responds once the successor serves, with its process
 /// id.
 async fn restart(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let Some(restarter) = state.restarter.clone() else {
@@ -1184,7 +1186,7 @@ struct ShutdownBody {
 
 /// `POST /admin/shutdown`: brings the deployment down as SIGTERM does,
 /// finishing what is in flight within `server_config.shutdown_timeout`, and
-/// releases its storage unless `retire` is false. Answers at once (`202`).
+/// releases its storage unless `retire` is false. Responds at once (`202`).
 async fn shutdown(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let body = if body.is_empty() {
         ShutdownBody { retire: true }

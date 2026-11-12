@@ -499,7 +499,7 @@ pub struct UpdateConfig {
     /// default is the value measured on GB200 (`docs/configuration.md`).
     pub transfer_slowdown: f64,
     /// The most tokens a request in flight may have computed past the pages
-    /// the host KV cache holds of it at the switchover; unset uses the largest
+    /// the host KV cache holds of it at the switch; unset uses the largest
     /// source or target cache page.
     pub cache_tail_tokens: Option<std::num::NonZeroU32>,
     /// Source prefill tokens per scheduling step after the first warming

@@ -57,34 +57,34 @@ message Engine {
   // The deployment: the served model name.
   string deployment = 1;
   // The engine number the daemon started this process under, which the launch
-  // file states as `engine` and the epoch layer addresses commands by. The
+  // file states as `engine` and the updater addresses commands by. The
   // daemon keys this connection by it, so a command reaches the process it
   // names rather than the one that happened to connect in that order; zero
   // states no number, and a daemon refuses it rather than guessing.
   uint64 engine = 2;
-  // Which of a process's links this connection is. One main process has two:
+  // Which of a process's links this connection is. One engine has two:
   // the process link, which receives the epoch's generation commands, the
-  // storage claim and the §7.3 reports, and the request link, which carries the
+  // storage claim and the reports, and the request link, which carries the
   // epoch's requests and metrics. The two are separate sockets and both state
   // the same engine number, so the number alone cannot tell them apart.
   Interface interface = 3;
 }
 
-// The link of a main process a connection is.
+// The link of an engine a connection is.
 enum Interface {
   // Not stated: the daemon keeps the connection under the order it accepted it
-  // in and refuses nothing, which is how every client that is not a main
-  // process connects.
+  // in and refuses nothing, which is how every client that is not an engine
+  // connects.
   INTERFACE_UNSPECIFIED = 0;
   // The process link: the epoch's generation commands, its storage claim and
-  // its §7.3 reports travel here.
+  // its reports travel here.
   INTERFACE_PROCESS = 1;
   // The request link: the epoch's requests, their events and its metrics travel
   // here.
   INTERFACE_REQUESTS = 2;
 }
 
-// The answer to a `Hello`.
+// The response to a `Hello`.
 message Welcome {
   uint32 major = 1;
   string build = 3;
@@ -105,7 +105,7 @@ message Node {
 }
 
 // A request to a daemon. The leader forwards a request for another node to
-// that node's daemon, which answers it.
+// that node's daemon, which replies to it.
 message Request {
   // Chosen by the sender; the reply repeats it.
   uint64 id = 1;
@@ -123,7 +123,7 @@ message Request {
   }
 }
 
-// The answer to one request.
+// The reply to one request.
 message Reply {
   uint64 id = 1;
   // Why the request failed; empty when it succeeded.
@@ -143,7 +143,7 @@ message Reply {
 }
 
 // The deployment's nodes as the leader knows them now, a node that joined
-// the running deployment included. The leader answers it itself.
+// the running deployment included. The leader replies to it itself.
 message NodesQuery {}
 
 message NodesKnown {
@@ -186,10 +186,10 @@ message Spawn {
   // Reservations of this node whose sockets the process inherits, each at
   // the descriptor number its `Reserved` named.
   repeated uint64 inherit = 8;
-  // A main process's launch file (`proto::config::EngineArgs` as JSON); empty
+  // An engine's launch file (`proto::config::EngineArgs` as JSON); empty
   // for any other process. The node's daemon states its own node's facts in
   // it (its Build Server's socket), writes it to its runtime directory and
-  // passes `--launch <path>` after `arguments`, so a main process starts on
+  // passes `--launch <path>` after `arguments`, so an engine starts on
   // any node of the deployment from the same request.
   bytes launch = 9;
 }
@@ -217,7 +217,7 @@ message Reserve {
   string group = 2;
   // The engine that will spawn the process inheriting this socket. A
   // reservation is filed under this number rather than under the connection
-  // that asked for it: the asking connection may be the deployment's planning
+  // that asked for it: the asking connection may be the deployment's own
   // client, which is not the engine that spawns, and it may be re-established
   // between the reservation and the launch without changing whose socket it is.
   uint64 engine = 4;
@@ -238,9 +238,9 @@ message Reserved {
 
 // Have a node's daemon hold the deployment's claim at its Storage Server,
 // starting the server when the node has none. The claim lasts as long as the
-// daemon: a later claim of the same scopes answers the claim held. The
+// daemon: a later claim of the same scopes returns the claim held. The
 // epoch's weights that an earlier `KeepWeights` moved to host storage return
-// to the GPUs they left before the claim is answered (the server's
+// to the GPUs they left before the claim gets its reply (the server's
 // `Restore`), so that an epoch starting again at a rollback finds them where
 // its workers map them.
 message Claim {
@@ -323,7 +323,7 @@ message ThrottleTransfers {
 message TransfersThrottled {}
 
 message LedgerReport {
-  // The Storage Server's `Ledger` answer as JSON: `{"ledgers": [...],
+  // The Storage Server's `Ledger` response as JSON: `{"ledgers": [...],
   // "host_storage": {...}}` (the `storage` crate's `GpuLedger` and
   // `HostStorage`).
   string ledgers = 1;
@@ -333,7 +333,7 @@ message LedgerReport {
 message Event {
   oneof kind {
     Exit exit = 1;
-    // A command for the main process of one epoch.
+    // A command for the engine of one epoch.
     Command command = 2;
   }
 }
@@ -350,7 +350,7 @@ message PackageRevision {
   uint32 revision = 2;
   // The package's parameters as TOML key/value pairs: each value is the TOML
   // representation of that parameter's configured value, so `chunked_prefill_size
-  // = 4096` arrives as `chunked_prefill_size = "4096"`. A main process of
+  // = 4096` arrives as `chunked_prefill_size = "4096"`. An engine of
   // another build reads them back as TOML values.
   map<string, string> arguments = 3;
 }
@@ -358,7 +358,7 @@ message PackageRevision {
 // The phase of an operator's calls that a kernel package fills. An operator
 // is filled once for all its phases unless the configuration fills it per
 // phase, which attention allows (`prefill_attention_backend`,
-// `decode_attention_backend`, §5.2).
+// `decode_attention_backend`).
 enum PhaseKind {
   PHASE_KIND_UNSPECIFIED = 0;
   PHASE_KIND_PREFILL = 1;
@@ -375,7 +375,7 @@ message KernelPackage {
   optional PhaseKind phase = 2;
   PackageRevision package = 3;
   // The package itself, for a candidate the epoch's module set fixed for an
-  // operator without naming it for a phase: the main process selects among
+  // operator without naming it for a phase: the engine selects among
   // the operator's candidates for each descriptor key.
   optional string part = 4;
 }
@@ -634,7 +634,7 @@ message Exit {
 message Upstream {
   oneof kind {
     Request request = 1;
-    // The main process's report of its own state, unasked.
+    // The engine's report of its own state, unasked.
     Report report = 2;
   }
 }
@@ -658,11 +658,11 @@ message ToMember {
 }
 
 message Forwarded {
-  // The connection at the leader that asked: its answer and the exit report of a launch go back
+  // The connection at the leader that asked: its reply and the exit report of a launch go back
   // down it.
   uint64 engine = 1;
   Request request = 2;
-  // Whom the request is answered for: the engine number a process states, or the epoch's own owner
+  // Whom the request is served for: the engine number a process states, or the epoch's own owner
   // for a client. It differs from `engine` for a client, whose launches are the deployment's.
   uint64 owner = 3;
 }
@@ -670,12 +670,12 @@ message Forwarded {
 // What travels from a member daemon to the leader.
 message FromMember {
   oneof kind {
-    Answered answered = 1;
+    Replied replied = 1;
     Exited exited = 2;
   }
 }
 
-message Answered {
+message Replied {
   uint64 engine = 1;
   Reply reply = 2;
 }

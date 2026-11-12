@@ -19,7 +19,7 @@
 //!   up, a serving one changes it in place or in a new epoch on trial,
 //!   which `--commit-after` commits once it served that long. Each node is
 //!   one service's leader: the manager decides the order of their updates
-//!   from the GPUs and hosts they share and the storage their plans
+//!   from the GPUs and hosts they share and the storage their dry runs
 //!   require ([`updates`]), so that two services that share a GPU never
 //!   prepare at once.
 //! - `commit`, `rollback`: end each node's trial.
@@ -73,7 +73,7 @@ enum Command {
     /// Change each node's configuration: an idle node brings the
     /// deployment up, a serving one changes it in place or in a new epoch
     /// on trial. Nodes whose services share a GPU update one after another,
-    /// each once its plan fits; a failure stops the nodes not started.
+    /// each once its dry run fits; a failure stops the nodes not started.
     Apply {
         /// The whole TOML configuration, as `uniserve serve --config` reads
         /// it; each node's current one when unset.
@@ -86,7 +86,7 @@ enum Command {
         /// they reached (`keep`) or compute it again (`recompute`).
         #[arg(long, default_value = "keep")]
         in_flight: String,
-        /// Report each node's plan and the order the manager decides, and
+        /// Report each node's dry run and the order the manager decides, and
         /// change nothing.
         #[arg(long)]
         dry_run: bool,
@@ -171,7 +171,7 @@ impl Node {
         }
     }
 
-    /// `GET path` as JSON; `None` when the node answers 404 or 503.
+    /// `GET path` as JSON; `None` when the node responds 404 or 503.
     async fn get(&self, path: &str) -> Result<Option<Value>> {
         let response = self
             .request(reqwest::Method::GET, path)
@@ -189,17 +189,17 @@ impl Node {
             .await
             .with_context(|| format!("reading {}{path}", self.base))?;
         if !status.is_success() {
-            bail!("{}{path} answered {status}: {body}", self.base);
+            bail!("{}{path} responded {status}: {body}", self.base);
         }
         Ok(Some(body))
     }
 
-    /// `POST path` with a JSON body; the answer, which must succeed.
+    /// `POST path` with a JSON body; the response, which must succeed.
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         self.send(reqwest::Method::POST, path, body).await
     }
 
-    /// `PUT path` with a JSON body; the answer, which must succeed.
+    /// `PUT path` with a JSON body; the response, which must succeed.
     async fn put(&self, path: &str, body: &Value) -> Result<Value> {
         self.send(reqwest::Method::PUT, path, body).await
     }
@@ -217,7 +217,7 @@ impl Node {
             .await
             .with_context(|| format!("reading {}{path}", self.base))?;
         if !status.is_success() {
-            bail!("{}{path} answered {status}: {body}", self.base);
+            bail!("{}{path} responded {status}: {body}", self.base);
         }
         Ok(body)
     }
@@ -281,22 +281,22 @@ async fn main() -> Result<()> {
                 poll: Duration::from_secs(1),
             };
             if dry_run {
-                updates::plan(&nodes, &options).await
+                updates::dry_run(&nodes, &options).await
             } else {
                 updates::apply(&nodes, &options).await
             }
         }
         Command::Commit => {
             for node in &nodes {
-                let answer = node.post("/admin/config/commit", &json!({})).await?;
-                println!("{}: {}", node.base, answer["result"]);
+                let response = node.post("/admin/config/commit", &json!({})).await?;
+                println!("{}: {}", node.base, response["result"]);
             }
             Ok(())
         }
         Command::Rollback => {
             for node in &nodes {
-                let answer = node.post("/admin/config/rollback", &json!({})).await?;
-                println!("{}: {}", node.base, answer["result"]);
+                let response = node.post("/admin/config/rollback", &json!({})).await?;
+                println!("{}: {}", node.base, response["result"]);
             }
             Ok(())
         }
@@ -311,7 +311,7 @@ async fn main() -> Result<()> {
         Command::Restart { executable } => {
             for node in &nodes {
                 println!("{}: restarting", node.base);
-                let answer = node
+                let response = node
                     .post(
                         "/admin/restart",
                         &json!({ "executable": executable, "wait": true }),
@@ -322,7 +322,7 @@ async fn main() -> Result<()> {
                     })?;
                 println!(
                     "{}: the daemon {} serves",
-                    node.base, answer["result"]["pid"]
+                    node.base, response["result"]["pid"]
                 );
             }
             Ok(())
@@ -336,8 +336,8 @@ async fn main() -> Result<()> {
 /// Posts `path` to every node.
 async fn each(nodes: &[Node], path: &str) -> Result<()> {
     for node in nodes {
-        let answer = node.post(path, &json!({})).await?;
-        println!("{}: {} {}", node.base, answer["kind"], answer["state"]);
+        let response = node.post(path, &json!({})).await?;
+        println!("{}: {} {}", node.base, response["kind"], response["state"]);
     }
     Ok(())
 }

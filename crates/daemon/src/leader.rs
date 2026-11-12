@@ -349,7 +349,7 @@ impl Leader {
         }
     }
 
-    /// Ends every replica's parked standby (§2.5).
+    /// Ends every replica's parked standby.
     ///
     /// A daemon that hands the deployment to a successor calls this before the
     /// handoff: the successor numbers and starts its own standbys, and a parked
@@ -869,7 +869,7 @@ impl Leader {
         let info = client.info().clone();
 
         // A video checkpoint serves what its placed denoiser declares in the
-        // worker handshake, planned against the conditioner's vision
+        // worker handshake, prepared against the conditioner's vision
         // processor.
         // A chat family that takes images lowers them through its bound processor.
         let mut images = None;
@@ -1150,8 +1150,8 @@ impl Leader {
         Ok((Box::new(events), output))
     }
 
-    /// The model's tokenizer, which a successor builds a handed-over body's
-    /// decoder from.
+    /// The model's tokenizer, which a successor builds the decoder of a
+    /// handoff's body from.
     pub(crate) fn tokenizer(&self) -> frontend::tokenizer::DynTokenizer {
         self.processor.tokenizer()
     }
@@ -1173,10 +1173,10 @@ impl Leader {
     }
 
     /// Takes one request's engine event stream over from the process that
-    /// consumed it, going on after the position it reached (design §7.5.1
-    /// step 4): the request keeps generating in the engine that serves it,
-    /// and is neither cancelled nor submitted again. Both handed kinds of
-    /// response call it, with the replica and identity their state carries.
+    /// consumed it, going on after the position it reached:
+    /// the request keeps generating in the engine that serves it,
+    /// and is neither cancelled nor submitted again. Both kinds of response
+    /// in a handoff call it, with the replica and identity their state carries.
     ///
     /// # Errors
     ///
@@ -1192,21 +1192,21 @@ impl Leader {
             .replicas()
             .get(engine_replica as usize)
             .cloned()
-            .with_context(|| format!("the handed response names replica {engine_replica}"))?;
+            .with_context(|| format!("the response's handoff names replica {engine_replica}"))?;
         let client = replica
             .hold
             .client()
-            .context("the handed response's replica has no engine connection")?;
+            .context("the replica of the response's handoff has no engine connection")?;
         let id = proto::request::RequestId(
             engine_request_id
                 .parse()
-                .context("the handed response's engine identity")?,
+                .context("the engine identity of the response's handoff")?,
         );
         let stream = client.take_over(id, consumed)?;
         Ok(RequestEvents::taken_over(stream, consumed))
     }
 
-    /// Fetches, probes and plans a video request's media, presents its
+    /// Fetches, probes and prepares a video request's media, presents its
     /// prompt, and streams its output.
     ///
     /// Also returns what the request generates: its duration, frames and
@@ -1392,7 +1392,7 @@ pub struct LeaderStatus {
     /// The new requests the daemon holds before any engine takes them: while
     /// generation is paused, the engine sleeps, or no engine is ready.
     pub held: usize,
-    /// The launch generation of the main process that serves (the scheduler
+    /// The launch generation of the engine that serves (the scheduler
     /// node's, for a worker group over several hosts); `None` while none
     /// serves, or for an engine this daemon did not start. It names that
     /// process's row in `GET /admin/config`'s `processes`.
@@ -1556,13 +1556,13 @@ pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// The index a diffusers checkpoint states its components in.
+/// The index a diffusers checkpoint states its parts in.
 const MODULAR_INDEX: &str = "modular_model_index.json";
 
-/// The components of a diffusers checkpoint that decide how a request is processed.
-const PROCESSING_COMPONENTS: [&str; 4] = ["tokenizer", "processor", "scheduler", "audio_scheduler"];
+/// The parts of a diffusers checkpoint that decide how a request is processed.
+const PROCESSING_PARTS: [&str; 4] = ["tokenizer", "processor", "scheduler", "audio_scheduler"];
 
-/// [`same_processing`] for a diffusers checkpoint: the same index, and every file of the components
+/// [`same_processing`] for a diffusers checkpoint: the same index, and every file of the parts
 /// that process a request the same.
 fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(), String> {
     let read = |file: &std::path::Path| {
@@ -1570,12 +1570,12 @@ fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(),
     };
     if read(&served.join(MODULAR_INDEX))? != read(&path.join(MODULAR_INDEX))? {
         return Err(format!(
-            "the checkpoint at {} states other components than the served model: deploy it instead",
+            "the checkpoint at {} states other parts than the served model: deploy it instead",
             path.display()
         ));
     }
-    for component in PROCESSING_COMPONENTS {
-        let directory = served.join(component);
+    for part in PROCESSING_PARTS {
+        let directory = served.join(part);
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1584,9 +1584,9 @@ fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(),
         for entry in entries {
             let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
             let name = entry.file_name();
-            if read(&entry.path())? != read(&path.join(component).join(&name))? {
+            if read(&entry.path())? != read(&path.join(part).join(&name))? {
                 return Err(format!(
-                    "the checkpoint at {} has another {component}/{} than the served model, \
+                    "the checkpoint at {} has another {part}/{} than the served model, \
                      which changes how requests are processed: deploy it instead",
                     path.display(),
                     name.to_string_lossy()
@@ -1642,7 +1642,7 @@ pub(crate) struct Replica {
     /// The profiling session that runs, or the last that ended
     /// (`crate::profiling`).
     pub(crate) profiles: crate::profiling::Profiles,
-    /// The parked standby standing beside the serving engine (§2.5), if one is
+    /// The parked standby standing beside the serving engine, if one is
     /// live. Started by [`Replica::keep_standby`], taken by
     /// [`Replica::promote_standby`].
     pub(crate) standby: std::sync::Mutex<Option<Standby>>,
@@ -1655,10 +1655,10 @@ pub(crate) struct Replica {
     /// both start a process, since a second engine of the same scope is a
     /// whole copy of its device storage.
     standby_starting: tokio::sync::Mutex<()>,
-    /// Whether this daemon handed the engine to a successor (§7.5.1): the
+    /// Whether this daemon handed the engine to a successor: the
     /// successor owns its life then, and a watch that sees its client go away
     /// must not relaunch it.
-    pub(crate) handed_over: AtomicBool,
+    pub(crate) handoff_sent: AtomicBool,
     /// Whether an epoch update owns this replica's engines: from the moment its target serves
     /// until the update ended and the hold names the epoch that serves on. An engine lost
     /// meanwhile is the update's to judge, not the watcher's to relaunch.
@@ -1696,7 +1696,7 @@ impl Replica {
             standby: std::sync::Mutex::new(None),
             domain: std::sync::Mutex::new(None),
             standby_starting: tokio::sync::Mutex::new(()),
-            handed_over: AtomicBool::new(false),
+            handoff_sent: AtomicBool::new(false),
             following: AtomicBool::new(false),
         });
         hold.serve(client);
@@ -2330,7 +2330,7 @@ impl Replica {
     /// deployment serves. A switch moves service to its target through the
     /// frontend, and the replica's own engine is then the drained previous
     /// epoch's: it keeps no standby and is not promoted, because nothing routes
-    /// to it and a promoted process would be a second engine of a purged epoch.
+    /// to it and a promoted process would be a second engine of a released epoch.
     fn serves_serving_epoch(&self) -> bool {
         let Some(updater) = self
             .registry
@@ -2348,7 +2348,7 @@ impl Replica {
         epoch == served
     }
 
-    /// The failure-domain rules over `serving`'s main processes: the rules this replica keeps, or
+    /// The failure-domain rules over `serving`'s engines: the rules this replica keeps, or
     /// new ones when `serving` is another engine than theirs (a promotion or a relaunch replaced
     /// it).
     fn domain_of(
@@ -2483,13 +2483,13 @@ impl Replica {
     }
 
     /// Starts the standby that stands beside this replica's serving engine, if
-    /// one is wanted and none is live (§2.5).
+    /// one is wanted and none is live.
     ///
-    /// The failure-domain rules decide (`crate::standby::Standbys::serve`): the serving engine's
-    /// main processes are one domain, one per host its worker group spans, and the domain keeps a
+    /// The failure-domain rules decide (`crate::standby::Standbys::serve`): the serving epoch's
+    /// engines are one domain, one per host its worker group spans, and the domain keeps a
     /// standby of every member or of none, all resident or all suspended (the deployment's
     /// `worker_config.standby_storage`, its `auto` decided by what each host's devices can keep).
-    /// The standby world is started under numbers from the epoch layer's one allocator, claims
+    /// The standby world is started under numbers from the epoch records' one allocator, claims
     /// each scope's storage read-only (the launch file states the role and the storage mode), and
     /// parks once it is prepared. A replica whose engine is itself parked, draining or failing has
     /// no standby: there is nothing to stand beside.
@@ -2499,8 +2499,8 @@ impl Replica {
     /// Fails when the processes cannot be started or do not report that they
     /// stand by. The caller decides whether to retry.
     pub(crate) async fn keep_standby(self: &Arc<Self>) -> anyhow::Result<()> {
-        // `worker_config.standby` decides whether a standby exists at all
-        // (§2.5): each standby rank holds a CUDA context, graph pools and
+        // `worker_config.standby` decides whether a standby exists at all:
+        // each standby rank holds a CUDA context, graph pools and
         // workspaces of its own, and a deployment that has not reserved them
         // cannot hold a second engine of the same scope.
         let (wanted, storage) = {
@@ -2545,7 +2545,7 @@ impl Replica {
             return Ok(());
         };
         let epochs = Arc::clone(updater.epochs());
-        // The engine control numbered every main process it started, those of other hosts
+        // The engine control numbered every engine it started, those of other hosts
         // included: the standby's numbers come after them.
         epochs.launched_up_to(
             crate::engine::control::ENGINE_GROUP,
@@ -2559,7 +2559,7 @@ impl Replica {
         };
 
         // The rules' round: every member's next number from the one counter, then the spawns. One
-        // counter numbers every main process of the deployment, so the members' numbers differ.
+        // counter numbers every engine of the deployment, so the members' numbers differ.
         let (spawns, members) = {
             let mut domain = self.domain_of(&serving);
             let Some(standbys) = domain.as_mut() else {
@@ -2620,7 +2620,7 @@ impl Replica {
 
         // The standby executes the serving engine's epoch: it maps that epoch's
         // weights and its KV cache read-only, ready to be promoted into the same
-        // scope (§2.5). What a successor maps is the cache the serving engine
+        // scope. What a successor maps is the cache the serving engine
         // holds **now**, not the segments it started with: a cache that grew or
         // was resized since the launch would hand the standby units that are
         // shorter than the ones it will be promoted into, and the failure would
@@ -2692,12 +2692,12 @@ impl Replica {
         self.end_standby_world(&actions);
     }
 
-    /// Promotes the parked standby in place if this replica has one (§2.5), and
-    /// answers the client that now serves.
+    /// Promotes the parked standby in place if this replica has one, and
+    /// returns the client that now serves.
     ///
     /// The failure-domain rules decide (`crate::standby::Standbys::failed`): the domain's parked
     /// standbys are promoted together, every promotion issued before any is awaited, or, when a
-    /// member has none, the domain is relaunched instead and this answers `None`. The promoted
+    /// member has none, the domain is relaunched instead and this returns `None`. The promoted
     /// processes are the same processes, with their graphs at their addresses: each takes the
     /// storage its scope claimed read-only and serves under the serving engine's epoch.
     pub(crate) async fn promote_standby(self: &Arc<Self>) -> Option<Arc<EngineClient>> {
@@ -2706,7 +2706,7 @@ impl Replica {
         let starting = self.standby_starting.lock().await;
         let failure = crate::epoch::Failure {
             kind: "process_exit".to_owned(),
-            reason: "the serving engine's main process ended".to_owned(),
+            reason: "the serving engine ended".to_owned(),
             device: None,
         };
         let promotions: Vec<(String, u64)> = {
@@ -2803,7 +2803,7 @@ impl Replica {
     ///
     /// # Errors
     ///
-    /// Ends the parked standby this replica keeps, if it has one (§2.5).
+    /// Ends the parked standby this replica keeps, if it has one.
     ///
     /// A standby is a process of its own: ending it here means nothing of this
     /// replica's stays on the device after the daemon is gone, and a successor
@@ -3112,7 +3112,7 @@ impl Replica {
         }
         *locked(&self.config) = config;
         // A parked standby mapped the weights this update replaced, and a promotion would serve
-        // them: it starts again on the new ones (§2.5).
+        // them: it starts again on the new ones.
         self.restart_standby();
         info!(
             model = model_path,
@@ -3201,7 +3201,7 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
         // relaunch here would start a second engine for a deployment another daemon
         // serves.
         if replica
-            .handed_over
+            .handoff_sent
             .load(std::sync::atomic::Ordering::Acquire)
         {
             tracing::info!(
@@ -3385,7 +3385,7 @@ mod tests {
         })
     }
 
-    /// Answers `body` through the chat route of `engine`'s router.
+    /// Sends `body` through the chat route of `engine`'s router.
     async fn chat(
         router: &axum::Router,
         body: &serde_json::Value,
@@ -3471,7 +3471,7 @@ mod tests {
     async fn concurrent_requests_spread_over_engine_cores() {
         // Every wait in this test is bounded and named: an unbounded wait here
         // reads as a suite that hung, with no line saying which of the seven
-        // answers the leader never gave.
+        // responses the leader never gave.
         let mut clients = Vec::new();
         for _ in 0..2 {
             let core = serving_core("sim-model");
@@ -3547,8 +3547,8 @@ mod tests {
             .expect("shutdown replica");
     }
 
-    /// Awaits `future`, failing by name when it does not answer within
-    /// `seconds`: a test whose unbounded wait hangs says which answer it never
+    /// Awaits `future`, failing by name when it does not respond within
+    /// `seconds`: a test whose unbounded wait hangs says which response it never
     /// got instead of outliving the suite's bound in silence.
     async fn within<T>(
         seconds: u64,
@@ -3557,13 +3557,13 @@ mod tests {
     ) -> T {
         match tokio::time::timeout(Duration::from_secs(seconds), future).await {
             Ok(value) => value,
-            Err(_) => panic!("{what} did not answer within {seconds} s"),
+            Err(_) => panic!("{what} did not respond within {seconds} s"),
         }
     }
 
     /// A chat prompt that exceeds the total capacity of a two-unit prefix
     /// cache is submitted and then rejected by engine admission. The
-    /// non-streamed response holds its head for the outcome, so it answers
+    /// non-streamed response holds its head for the result, so it reports
     /// that rejection as HTTP 400.
     #[tokio::test]
     async fn chat_admission_rejection_remains_a_bad_request() {
@@ -3867,7 +3867,7 @@ mod tests {
     }
 
     /// A standby exists only where the deployment reserved room for one and the
-    /// replica's epoch is the epoch the deployment serves (§2.5). Each of the
+    /// replica's epoch is the epoch the deployment serves. Each of the
     /// three conditions is a whole engine's device storage when it is wrong.
     #[test]
     fn a_standby_exists_only_where_the_deployment_reserved_one_and_the_epoch_serves() {
@@ -3886,7 +3886,7 @@ mod tests {
         ));
         assert!(!keeps_standby(true, EngineState::Stopped, true));
         // An epoch a switch replaced keeps no standby: nothing routes to it, and
-        // its read-only claim would outlive the purge.
+        // its read-only claim would outlive the release.
         assert!(!keeps_standby(true, EngineState::Serving, false));
     }
 }

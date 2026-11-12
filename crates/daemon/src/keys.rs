@@ -1,7 +1,7 @@
-//! The kernel keys a deployment's main processes launch, recorded by a start that serves nothing
+//! The kernel keys a deployment's engines launch, recorded by a start that serves nothing
 //! (`uniserve keys`, `uniserve-engine --keys`).
 //!
-//! The launches are the ones a serving leader starts its main processes with: the model's facts
+//! The launches are the ones a serving leader starts its engines with: the model's facts
 //! resolved into the engine configuration ([`Leader::prepare`]), one configuration per independent
 //! replica (`replica_configs`), and each process placed on this node
 //! (`crate::engine::control::place`). Each launch is run by the engine package the deployment
@@ -20,7 +20,7 @@ use crate::engine::control::{BuildServer, Interfaces, ensure_build_server, place
 use crate::leader::{Leader, fix_modules, named_modules, replica_configs};
 use crate::options::{ServerArgs, Stated};
 
-/// The launch of every main process the deployment `config` starts on this node, in replica
+/// The launch of every engine the deployment `config` starts on this node, in replica
 /// order; `stated` holds the option paths the operator set, and `families` the families whose
 /// requests this build processes.
 ///
@@ -42,7 +42,7 @@ pub async fn launches(
         .into_iter()
         .zip(1..)
         .map(|(replica, engine)| {
-            // A serving daemon numbers its main processes from one as it starts them; the number
+            // A serving daemon numbers its engines from one as it starts them; the number
             // keys nothing a recorded start reads.
             place(
                 EngineArgs::new(replica, named.clone()),
@@ -57,7 +57,7 @@ pub async fn launches(
         .collect()
 }
 
-/// The kernel keys the deployment `config` launches, by operator: what every main process of it
+/// The kernel keys the deployment `config` launches, by operator: what every engine of it
 /// records in its profile runs, each key once.
 ///
 /// The deployment's module set is fixed and built at this host's Build Server, which is started

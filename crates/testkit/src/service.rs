@@ -1,7 +1,7 @@
-//! A stand-in for a main process's request interface, for the daemon's tests.
+//! A stand-in for an engine's request interface, for the daemon's tests.
 //!
 //! The daemon's tests drive a real `Leader` over the request interface. A
-//! serving deployment responds to that interface in the engine's main process
+//! serving deployment responds to that interface in the engine process
 //! (`engine::process::requests`), whose construction loads ranks onto devices
 //! from a launch file, so these tests serve it from here instead, over
 //! production schedulers whose worker is the batch-interface fake
@@ -122,7 +122,7 @@ struct Routing {
     /// Whether the engine parked by draining, so that a promotion resumes
     /// its schedulers instead of handing them a predecessor's index.
     drained: AtomicBool,
-    /// The control thread's routing policy (§4.4, §7.3).
+    /// The control thread's routing policy.
     route: Mutex<Router>,
 }
 
@@ -142,7 +142,7 @@ impl Routing {
             .collect()
     }
 
-    /// `route`: the rank that serves a request that has just arrived (§4.4);
+    /// `route`: the rank that serves a request that has just arrived;
     /// `None` when no routing policy serves or the policy failed.
     fn route(&self, arrival: &Arrival) -> Option<usize> {
         let ranks = self.ranks();
@@ -155,7 +155,7 @@ impl Routing {
         }
     }
 
-    /// §7.3 steps 2 and 3 on the control thread for the epoch's starting
+    /// The preparation and the switch on the control thread for the epoch's starting
     /// policy: prepares the route instance of `package` and puts it in.
     fn install_route(
         &self,
@@ -171,7 +171,7 @@ impl Routing {
     }
 
     /// The epoch's counters for the daemons' `/metrics` (`wire::Metrics`),
-    /// additive per epoch as the message promises (§2.3).
+    /// additive per epoch as the message promises.
     ///
     /// `steps` is the epoch's steps — a scheduler takes one per policy step, and
     /// the ranks step together, so it is the largest count any rank reached —
@@ -179,7 +179,7 @@ impl Routing {
     /// because a step submits one batch per (phase, stage). `tokens` sums
     /// the tokens the workers' forwards carried, `queue` is each rank's waiting
     /// depth, and `policy_fuel` and `policy_calls` are the instances' own
-    /// figures, summed by [`policy_usage`] (§12). The device's counters and the
+    /// figures, summed by [`policy_usage`]. The device's counters and the
     /// allocators' figures are not this thread's: they come with the worker's
     /// `counters()` and the allocators' reports.
     fn metrics(&self) -> wire::Metrics {
@@ -215,7 +215,7 @@ impl Routing {
         metrics
     }
 
-    /// §12's cost counters for the control thread's own route instance, which
+    /// The cost counters of the control thread's own route instance, which
     /// serves under the same epoch policy as the schedulers'.
     fn route_usage(&self) -> PolicyUsage {
         lock(&self.route).usage()
@@ -383,10 +383,10 @@ pub fn serve_engine(
 }
 
 /// The policy an epoch starts with, when its owner installs it directly
-/// rather than through the process interface (§7.3).
+/// rather than through the process interface.
 ///
-/// Production installs an epoch's policy with the daemon's `Precopy` and
-/// `Switchover` commands, which the epoch's command thread applies. A caller
+/// Production installs an epoch's policy with the daemon's `Prepare` and
+/// `Switch` commands, which the epoch's command thread applies. A caller
 /// that owns the engine's connection itself and sends no commands — the
 /// daemon library's in-process client is one — names the same installation
 /// here, and the engine serves its requests under it from the first one. The
@@ -501,7 +501,7 @@ fn serve(
     drop(streams);
     let _ = events_thread.join();
     lock(&routing.fronts).clear();
-    let mut outcome = opened;
+    let mut result = opened;
     for (writer, reader) in threads {
         let written = writer
             .join()
@@ -511,11 +511,11 @@ fn serve(
             .join()
             .map_err(|_| anyhow::anyhow!("a request reader panicked"))
             .and_then(|read| read);
-        if outcome.is_ok() {
-            outcome = written.and(read);
+        if result.is_ok() {
+            result = written.and(read);
         }
     }
-    outcome
+    result
 }
 
 /// The writer and reader threads of one daemon's connection.
@@ -637,8 +637,8 @@ fn read_requests(
                 }
                 Some(wire::engine_command::Kind::DescribeStorage(describe)) => {
                     // As an engine process responds to it: the storage usage and the transfer
-                    // budgets are each node's daemon's, read over its lease, and an epoch's main
-                    // process holds no lease of the deployment's.
+                    // budgets are each node's daemon's, read over its lease, and an epoch's engine
+                    // holds no lease of the deployment's.
                     routing.send(
                         front,
                         Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
@@ -756,7 +756,7 @@ fn submit_all(
         let Some(index) = recovered.or_else(|| routing.route(&arrival)) else {
             // The route policy could not respond — it failed and no previous
             // policy could take over, or no rank is alive to serve — so the
-            // request cannot be placed in this epoch (§7.3).
+            // request cannot be placed in this epoch.
             let (event, _) = Event::Error {
                 message: "the engine has no policy to route this request".to_owned(),
             }
@@ -1535,7 +1535,7 @@ fn forward_events(
                     }
                     None => {
                         // The last counters, before the epoch drains away
-                        // (§2.3: once more when it drains).
+                        // (once more when it drains).
                         let metrics = routing.metrics();
                         routing
                             .broadcast(|| Frame::plain(from_engine::Kind::Metrics(metrics.clone())));
@@ -1553,7 +1553,7 @@ fn forward_events(
                         }
                     }
                     // The epoch's counters, once a second beside the
-                    // statistics (design §2.3's `/metrics`).
+                    // statistics (the daemon's `/metrics`).
                     let metrics = routing.metrics();
                     routing.broadcast(|| Frame::plain(from_engine::Kind::Metrics(metrics.clone())));
                 }
@@ -1743,10 +1743,10 @@ fn write_frames(
     Ok(())
 }
 
-/// The epoch's policy cost (§12): the control thread's route instance and every
+/// The epoch's policy cost: the control thread's route instance and every
 /// scheduler's, summed. A scheduler that has no policy yet adds nothing.
 ///
-/// Each figure is cumulative per instance and a switchover carries a
+/// Each figure is cumulative per instance and a switch carries a
 /// scheduler's total forward, so the sum over the schedulers only grows.
 fn policy_usage(
     route: PolicyUsage,
@@ -1804,7 +1804,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     //! What routing sees of a request before a scheduler holds it, and what
-    //! the control thread's route instance is told as a request runs (§4.4).
+    //! the control thread's route instance is told as a request runs.
 
     use super::*;
     use proto::request::GenerationRequest;

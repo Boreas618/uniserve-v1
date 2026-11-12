@@ -21,8 +21,8 @@ use std::sync::Mutex;
 pub use proto::module::{ModuleSet, ModuleSlot, PackageRevision, PhaseKind};
 // The operators the configuration selects a backend for are named by the
 // module vocabulary (`proto::module::operator`), whose names each
-// operator's `Op::NAME` is: the daemon, the Build Server and the main
-// process cannot disagree about a slot's name.
+// operator's `Op::NAME` is: the daemon, the Build Server and the engine
+// cannot disagree about a slot's name.
 use proto::module::operator;
 use serde::Serialize;
 use serde_json::Value;
@@ -30,14 +30,14 @@ use serde_json::Value;
 use crate::options::ServerArgs;
 
 /// The key an epoch's modules are stored under: the operator, and the
-/// phase when the configuration fills it per phase (§5.2). Modules and
-/// slots are `proto::module`'s types, which the daemon, the main
-/// process and the Build Server all name modules with (§5.1).
+/// phase when the configuration fills it per phase. Modules and
+/// slots are `proto::module`'s types, which the daemon, the engine
+/// and the Build Server all name modules with.
 pub type KernelKey = ModuleSlot;
 
 /// One package as the process interface's wire form: its parameters as the
-/// TOML text of each value, so a main process of another build reads each
-/// back as the value it was (§5.1).
+/// TOML text of each value, so an engine of another build reads each
+/// back as the value it was.
 pub fn package_to_wire(package: &PackageRevision) -> proto::process::PackageRevision {
     proto::process::PackageRevision {
         backend: package.backend.clone(),
@@ -103,11 +103,11 @@ impl Status {
 pub struct EpochRecord {
     /// What built the epoch.
     pub config: proto::config::EngineConfig,
-    /// The engine package the epoch's main processes run as, at the revision
+    /// The engine package the epoch's engines run as, at the revision
     /// fixed when the epoch's configuration was applied.
     pub engine: PackageRevision,
     /// The kernel package that fills each operator, or each phase of one;
-    /// a phase of `None` covers every phase of its operator (§5.2).
+    /// a phase of `None` covers every phase of its operator.
     pub kernels: BTreeMap<KernelKey, PackageRevision>,
     /// The scheduling policy package.
     pub policy: PackageRevision,
@@ -134,7 +134,7 @@ pub enum ProcessState {
     /// It serves.
     Serving,
     /// It is parked: it executes nothing and keeps its storage until it is
-    /// promoted or ends (§2.5).
+    /// promoted or ends.
     Parked,
     /// It ended.
     Stopped,
@@ -142,12 +142,12 @@ pub enum ProcessState {
     Failed(String),
 }
 
-/// One main process a node's daemon manages, as `GET /admin/config` reports
+/// One engine a node's daemon manages, as `GET /admin/config` reports
 /// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedProcess {
     /// The worker group it runs in (`engine`, `worker`, ...): the group a
-    /// launch generation is allocated for (§2.5).
+    /// launch generation is allocated for.
     pub group: String,
     /// Its rank inside that group.
     pub rank: u64,
@@ -160,8 +160,8 @@ pub struct ManagedProcess {
     /// The LAUNCH generation: the identity of this launch of the process,
     /// which the daemon allocates ([`Epochs::next_generation`]) and the
     /// process names in its launch file and its reports. It is not the
-    /// model generation ([`EpochRecord::generation`]), which the main
-    /// process numbers for the modules it executes; 0 until launched.
+    /// model generation ([`EpochRecord::generation`]), which the engine
+    /// numbers for the modules it executes; 0 until launched.
     pub generation: u64,
     /// Where it is.
     pub state: ProcessState,
@@ -288,8 +288,8 @@ impl Epochs {
         locked(&self.records).insert(epoch, record);
     }
 
-    /// The launch generation to start `group`'s rank `rank` in (§2.5,
-    /// §7.4): one more than the highest launch generation this daemon knows,
+    /// The launch generation to start `group`'s rank `rank` in: one more than
+    /// the highest launch generation this daemon knows,
     /// which is the one it allocated last for that group and rank or the one
     /// the process table records — for any group and rank. A standby of a
     /// serving process is `serving + 1`, and a rank or group without a process
@@ -303,8 +303,8 @@ impl Epochs {
     }
 
     /// Records that the deployment launched processes under numbers up to `generation`, which
-    /// were taken elsewhere than [`Self::next_generation`]: the engine control numbers the main
-    /// processes of an engine over several hosts as it starts them, and processes of another node
+    /// were taken elsewhere than [`Self::next_generation`]: the engine control numbers the
+    /// engines of a deployment over several hosts as it starts them, and processes of another node
     /// are not in this node's process table. Later numbers of `group`'s rank `rank` are above it.
     pub fn launched_up_to(&self, group: &str, rank: u64, generation: u64) {
         let mut allocated = locked(&self.generations);
@@ -453,7 +453,7 @@ impl Epochs {
 
     /// Reports the node's processes from `table` from now on: the daemon that
     /// supervises them writes them there as they start and end, so the record
-    /// names every process of the deployment and never a stale one (§2.3).
+    /// names every process of the deployment and never a stale one.
     /// The first table attached is the one kept.
     pub fn attach_processes(&self, table: std::sync::Arc<Mutex<Vec<ManagedProcess>>>) {
         let _ = self.supervised.set(table);
@@ -470,7 +470,7 @@ impl Epochs {
             .collect::<Vec<_>>();
         // The rows the daemon supervises now, not the ones this record was
         // given before it attached its table: a process that started or ended
-        // is reported from the table's state (§2.3).
+        // is reported from the table's state.
         let processes = self
             .processes()
             .iter()
@@ -553,8 +553,8 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The operator names the epoch record keys its kernel packages by (§5.1,
-/// §5.2), of the operators whose backend a configuration selects. They must
+/// The operator names the epoch record keys its kernel packages by, of the
+/// operators whose backend a configuration selects. They must
 /// equal `crates/ops`'s `Op::NAME` of the same operator, which the model and
 /// sched swarms write, so a mismatch is a wrong Build Server lookup and
 /// shows up at prepare; they are stated once here for that reason.
@@ -567,16 +567,15 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// record's `policy` field.
 /// The module set `config` names: the engine package, the scheduling policy's
 /// and the kernel package of each operator, or phase of one, it selects a
-/// backend for (§5.1, §5.2).
+/// backend for.
 ///
 /// The backends and parameters come from the configuration; the revisions
-/// are fixed when the configuration is applied, at the Build Server
-/// (§5.1). A package's `revision` is zero until then, unless the
+/// are fixed when the configuration is applied, at the Build Server.
+/// A package's `revision` is zero until then, unless the
 /// configuration states one. An operator whose backend the configuration
 /// does not state, or leaves at `auto`, is absent: the deployment names
 /// nothing for it, and the Build Server selects its package for each of its
-/// descriptor keys among the packages that cover them, by manifest priority
-/// (§6.3).
+/// descriptor keys among the packages that cover them, by manifest priority.
 pub fn modules_of(config: &ServerArgs) -> ModuleSet {
     {
         let mut kernels = BTreeMap::new();
@@ -605,7 +604,7 @@ pub fn modules_of(config: &ServerArgs) -> ModuleSet {
             .filter(|backend| *backend != AUTO_BACKEND)
         {
             // The grouped expert GEMM is two operators, gather and route,
-            // and one package backend fills both (§9).
+            // and one package backend fills both.
             for operator in [operator::GATHER_GEMM, operator::ROUTE_GEMM] {
                 kernels.insert(
                     KernelKey::all(operator),
@@ -638,7 +637,7 @@ pub fn modules_of(config: &ServerArgs) -> ModuleSet {
 const AUTO_BACKEND: &str = "auto";
 
 /// The attention operator's modules: one entry for every phase when the
-/// per-phase backends agree, or one entry per phase when they differ (§5.2).
+/// per-phase backends agree, or one entry per phase when they differ.
 /// A phase left at `auto` names no package: the Build Server selects its
 /// keys' packages.
 fn attention_packages(config: &ServerArgs) -> Vec<(KernelKey, PackageRevision)> {
@@ -673,9 +672,8 @@ fn attention_packages(config: &ServerArgs) -> Vec<(KernelKey, PackageRevision)> 
         .collect()
 }
 
-/// The scheduling policy package's parameters: the values §7.7 assigns to the
-/// scheduling policy, which decides with them inside the build config's
-/// bounds (§4.4).
+/// The scheduling policy package's parameters: the configuration's values the
+/// scheduling policy decides with, inside the build config's bounds.
 fn policy_arguments(config: &ServerArgs) -> toml::Table {
     #[derive(Serialize)]
     struct Arguments {
@@ -693,7 +691,7 @@ fn policy_arguments(config: &ServerArgs) -> toml::Table {
     }
     let scheduler = &config.scheduler_config;
     // The token bound this launch gives its workers, which is the same
-    // `max_num_batched_tokens` its engine configuration states (§2.5): the policy's
+    // `max_num_batched_tokens` its engine configuration states: the policy's
     // declared limits are these bounds, not a second opinion about them. A
     // prefill chunk that the deployment states larger than its token bound is
     // refused by the mechanism (`PolicyError::BadLimits`), never clamped here.
@@ -742,7 +740,7 @@ fn policy_arguments(config: &ServerArgs) -> toml::Table {
     toml_arguments(&arguments)
 }
 
-/// `value`'s fields as the TOML table a package's arguments carry (§5.1).
+/// `value`'s fields as the TOML table a package's arguments carry.
 /// Values the field's serialization leaves out, such as an unset option, are
 /// absent.
 fn toml_arguments<T: Serialize>(value: &T) -> toml::Table {
@@ -754,7 +752,7 @@ fn toml_arguments<T: Serialize>(value: &T) -> toml::Table {
 
 /// The word a vocabulary value is named by, as the configuration spells it
 /// (`fcfs`, `deepep`): its serialized form, which is also the package
-/// backend's name (§5.1).
+/// backend's name.
 fn word<T: Serialize>(value: &T) -> String {
     match toml::Value::try_from(value) {
         Ok(toml::Value::String(word)) => word,
@@ -780,7 +778,7 @@ pub enum Change {
 }
 
 /// A deployment as the daemon routes a change between: its configuration,
-/// the build config it builds a main process from, and the modules it
+/// the build config it builds an engine from, and the modules it
 /// fills.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Epoch {
@@ -883,7 +881,8 @@ mod tests {
     }
 
     /// Another checkpoint's weights are other keys, so only a new epoch reads them: a change of
-    /// the model's files that fell to the generation layer would answer an update that moved nothing.
+    /// the model's files that fell to a generation update would report an update that moved
+    /// nothing.
     #[test]
     fn a_change_of_the_models_files_is_an_epoch_change() {
         let serving = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
@@ -902,7 +901,7 @@ mod tests {
 
     /// The process table reports what the daemon attached: every process it
     /// supervises, with the fields the daemon's own service wrote, and no
-    /// row of a process that ended (§2.3).
+    /// row of a process that ended.
     #[test]
     fn the_process_table_reports_the_processes_the_daemon_supervises() {
         let epochs = Epochs::new();
@@ -943,7 +942,7 @@ mod tests {
     /// `max_num_batched_tokens`, or the largest shape its captured graphs bound
     /// a batch to when it states no budget; an unstated prefill chunk is that
     /// same bound, so the policy's limits cannot disagree with the workers'
-    /// `BatchCapacity` (§4.4). A deployment that states a chunk larger than
+    /// `BatchCapacity`. A deployment that states a chunk larger than
     /// its bound keeps its own value here — the mechanism refuses it
     /// (`PolicyError::BadLimits`), and `ServerArgs::validate` refuses it at
     /// load by the option's name, rather than this code clamping it.
@@ -1054,14 +1053,14 @@ mod tests {
         );
     }
 
-    /// Which layer a change moves on is decided by what it moves, never by
-    /// the change itself (§7.2, §7.7): the host layer for the options the
-    /// daemon or the frontend read alone, the epoch layer for the values
-    /// that build a main process, the generation layer for the backends and
-    /// parameters of the modules, nothing for no change.
+    /// Which [`Change`] a change takes is decided by what it moves, never by
+    /// the change itself: `Host` for the options the
+    /// daemon or the frontend read alone, `Epoch` for the values
+    /// that build an engine, `Generation` for the backends and
+    /// parameters of the modules, `None` for no change.
     ///
-    /// This test is also the rule's enforcement: a value that leaks from the
-    /// generation layer's lists into [`proto::config::EngineConfig::of`], or out of it, fails
+    /// This test is also the rule's enforcement: a value that leaks from a
+    /// generation update's lists into [`proto::config::EngineConfig::of`], or out of it, fails
     /// here by name.
     #[test]
     fn a_change_is_routed_by_what_it_moves() {
@@ -1075,7 +1074,7 @@ mod tests {
             config
         }
 
-        // The frontend's own options (§7.7 host layer, frontend row).
+        // The frontend's own options: a `Host` change.
         let host_frontend: Vec<Case> = vec![
             ("server_config.port", |config: &mut ServerArgs| {
                 config.server_config.port = 8001
@@ -1089,7 +1088,7 @@ mod tests {
                     .insert("min_pixels".to_owned(), Value::from(1024));
             }),
         ];
-        // The daemon's own options (§7.7 host layer, daemon row).
+        // The daemon's own options: a `Host` change.
         let host_daemon: Vec<Case> = vec![
             ("logging_config.log_requests", |config: &mut ServerArgs| {
                 config.logging_config.log_requests = true
@@ -1098,7 +1097,7 @@ mod tests {
                 config.update_config.transfer_slowdown += 1.0
             }),
         ];
-        // The values that build a main process (§7.7 build-config row).
+        // The values that build an engine: an `Epoch` change.
         let epoch: Vec<Case> = vec![
             ("max_running_requests", |config: &mut ServerArgs| {
                 config.max_running_requests = NonZeroUsize::new(4).unwrap()
@@ -1124,8 +1123,7 @@ mod tests {
                 |config: &mut ServerArgs| config.profiling_config.graph_pc_sampling = true,
             ),
         ];
-        // The package backends (§7.7 backend row) and the package parameters
-        // (§7.7 parameter row).
+        // The package backends and the package parameters: a `Generation` change.
         let package: Vec<Case> = vec![
             ("scheduler_config.policy", |config: &mut ServerArgs| {
                 config.scheduler_config.policy = proto::request::SchedulingPolicy::Priority
@@ -1236,9 +1234,8 @@ mod tests {
             "in an expert-parallel deployment the exchange moves the modules"
         );
 
-        // Only the epoch layer's values build the main process: the host
-        // layer's and the generation layer's leave the build config equal
-        // (§7.7).
+        // Only an epoch update's values build the engine: the daemon's own
+        // options and a generation update's leave the build config equal.
         for (what, change) in host_frontend
             .iter()
             .chain(host_daemon.iter())
@@ -1260,7 +1257,7 @@ mod tests {
                     .expect("the configuration resolves")
                     .build_hash(),
                 base.engine.build_hash(),
-                "{what} builds the main process"
+                "{what} builds the engine"
             );
         }
 
@@ -1279,9 +1276,8 @@ mod tests {
 
     /// The modules a configuration fills are keyed by the operators the
     /// design names, with the attention operator split by phase only when
-    /// its per-phase fields state different backends (§5.2), and the
-    /// scheduling policy package carries the values that only inform its decisions
-    /// (§7.7).
+    /// its per-phase fields state different backends, and the
+    /// scheduling policy package carries the values that only inform its decisions.
     #[test]
     fn the_filled_modules_name_the_operators_and_phases() {
         let config = ServerArgs::default();
@@ -1290,7 +1286,7 @@ mod tests {
         // One attention package for every phase, and no expert exchange for a
         // deployment whose experts all live on one rank: the model's MoE block
         // takes its local arm and launches no exchange, so the slot is absent
-        // rather than filled with a package nothing calls (§5.1, §9). No
+        // rather than filled with a package nothing calls. No
         // grouped expert GEMM either, until the configuration names one.
         // The default attention backend is `auto`: the deployment names no
         // attention package, and the Build Server selects its packages.
@@ -1318,7 +1314,7 @@ mod tests {
         );
 
         // The scheduling policy package's backend is the policy's name, and its
-        // parameters are the values §7.7 assigns to it, as TOML strings.
+        // parameters are the configuration's values it reads, as TOML strings.
         assert_eq!(modules.policy.backend, "fcfs");
         assert_eq!(
             modules.policy.arguments["max_batch"],
@@ -1451,9 +1447,9 @@ mod tests {
     }
 
     /// The reports that fail an update become its failure, with the kind
-    /// the main process named; the acknowledgements do not.
+    /// the engine named; the acknowledgements do not.
     #[test]
-    fn the_main_processs_reports_become_the_updates_failure() {
+    fn the_engines_reports_become_the_updates_failure() {
         use proto::process::report::Kind;
 
         let fault = proto::process::Report {
@@ -1599,7 +1595,7 @@ mod tests {
 
     /// A launch generation is allocated in one place: one more than the
     /// highest generation the daemon knows for that group and rank, which is
-    /// the serving epoch's (§2.5, §7.4), so a standby of a serving epoch is
+    /// the serving epoch's, so a standby of a serving epoch is
     /// `serving + 1`, and two callers never get one number.
     #[test]
     fn a_launch_generation_is_one_more_than_the_serving_epochs() {
@@ -1658,7 +1654,7 @@ mod tests {
     }
 
     /// The epoch's engine configuration is written by the daemon into each
-    /// launch file and read by the main process through this same type, so
+    /// launch file and read by the engine through this same type, so
     /// what the writer serializes must read
     /// back: an unset list is written as `null` and must be read as `None`,
     /// not refused.

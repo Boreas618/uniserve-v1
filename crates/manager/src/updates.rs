@@ -1,5 +1,5 @@
-//! Updates of several services that share GPUs and hosts
-//! (`specs/online-operations.md` §5.1): the manager decides the order in
+//! Updates of several services that share GPUs and hosts:
+//! the manager decides the order in
 //! which their updates run and calls each service's admin API in turn; no
 //! node waits for it, and every step within one service is that service's
 //! own (`PUT /admin/config`, its trial, `POST /admin/config/commit`).
@@ -7,24 +7,24 @@
 //! Each `--node` is the leader daemon of one service (one served model
 //! name). Before it starts a service's update, the manager reads the GPUs
 //! the service's epochs hold (`GET /admin/config`, `gpus`) and asks for the
-//! update's plan (`PUT /admin/config` with `dry_run`): whether it starts a
+//! update's dry run (`PUT /admin/config` with `dry_run`): whether it starts a
 //! new epoch, the GPUs its successor prepares on, each host's host storage
 //! it requires and admits, and whether every GPU and host it uses has the
-//! storage it requires (the plan's `storage` and `redistribution`). The
+//! storage it requires (the dry run's `storage` and `redistribution`). The
 //! decision:
 //!
 //! - Services are taken in the order given. One whose update starts a new
 //!   epoch starts only when no update in progress (preparing, or on trial
 //!   until the manager commits it) holds one of its GPUs, so two services
-//!   that share a GPU are never prepared at once; when its plan, made just
+//!   that share a GPU are never prepared at once; when its dry run, made just
 //!   then, finds the storage it requires on every GPU and host; and when
 //!   the host storage it requires on a host, beside what the updates in
 //!   progress there required, is within what the host admits. Services
 //!   that share no GPU, and whose host storage fits together, update at
 //!   once.
-//! - A service that cannot start waits, and is planned again whenever an
+//! - A service that cannot start waits, and its dry run is made again whenever an
 //!   update in progress ends: a commit releases the previous epoch's
-//!   storage, which may make its plan fit.
+//!   storage, which may make it fit.
 //! - Each update runs to its end: applied in place, or a new epoch on
 //!   trial, which the manager commits once it served `--commit-after`
 //!   seconds (completing the service's remaining replica trials), or which
@@ -44,7 +44,7 @@ use crate::Node;
 /// A GPU: its host and its name as `nvidia-smi` prints its UUID.
 type Gpu = (String, String);
 
-/// What one service's update needs, from its status and its plan.
+/// What one service's update needs, from its status and its dry run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Needs {
     /// Whether the update changes anything.
@@ -56,43 +56,43 @@ pub(crate) struct Needs {
     /// on.
     pub(crate) gpus: BTreeSet<Gpu>,
     /// Each host's host storage the update requires and what the host
-    /// admits of new host storage, in bytes, as the plan found them.
+    /// admits of new host storage, in bytes, as the dry run found them.
     pub(crate) hosts: BTreeMap<String, (u64, u64)>,
-    /// Why the plan does not fit now: the refusals of its storage plans.
+    /// Why the update does not fit now: the refusals its dry run states.
     pub(crate) refusal: Option<String>,
 }
 
 impl Needs {
     /// What the update of a service needs, from its status (`GET
     /// /admin/config`) and its dry run's result (`PUT /admin/config` with
-    /// `dry_run`): one replica's plan, the plans of every independent
-    /// replica (`replicas`), a group change's plan (`previous_epochs`), or
+    /// `dry_run`): one replica's report, the reports of every independent
+    /// replica (`replicas`), a group change's report (`previous_epochs`), or
     /// an idle node's deployment (`deployment`).
-    pub(crate) fn of(status: &Value, planned: &Value) -> Self {
+    pub(crate) fn of(status: &Value, result: &Value) -> Self {
         let mut needs = Self::default();
         let held = status["gpus"].as_array().into_iter().flatten();
         needs.gpus.extend(held.filter_map(gpu));
-        if planned["change"] != "dry_run" {
+        if result["change"] != "dry_run" {
             return needs;
         }
-        let plan = &planned["dry_run"];
-        let plans: Vec<&Value> = match plan["replicas"].as_array() {
+        let dry_run = &result["dry_run"];
+        let replicas: Vec<&Value> = match dry_run["replicas"].as_array() {
             Some(replicas) => replicas.iter().collect(),
-            None => vec![plan],
+            None => vec![dry_run],
         };
         let mut refusals = Vec::new();
-        for plan in plans {
-            let epoch = !plan["steps"].is_null()
-                || plan["deployment"].is_string()
-                || plan["previous_epochs"].is_array();
+        for replica in replicas {
+            let epoch = !replica["steps"].is_null()
+                || replica["deployment"].is_string()
+                || replica["previous_epochs"].is_array();
             needs.epoch |= epoch;
-            needs.changes |= epoch || plan["epoch"] == true || plan["daemon"] == true;
+            needs.changes |= epoch || replica["epoch"] == true || replica["daemon"] == true;
 
-            // The storage plan names the GPUs the successor prepares on
+            // The report's `storage` names the GPUs the successor prepares on
             // beside the serving epoch, and each host's admission.
-            let storage = &plan["storage"];
-            let planned_gpus = storage["gpus"].as_array().into_iter().flatten();
-            needs.gpus.extend(planned_gpus.filter_map(gpu));
+            let storage = &replica["storage"];
+            let prepared_gpus = storage["gpus"].as_array().into_iter().flatten();
+            needs.gpus.extend(prepared_gpus.filter_map(gpu));
             for host in storage["hosts"].as_array().into_iter().flatten() {
                 let (Some(name), Some(required), Some(admits)) = (
                     host["host"].as_str(),
@@ -110,16 +110,16 @@ impl Needs {
                 refusals.push(
                     storage["refusal"]
                         .as_str()
-                        .unwrap_or("the storage plan does not fit")
+                        .unwrap_or("the storage does not fit")
                         .to_owned(),
                 );
             }
 
             // A successor on other GPUs (another parallel configuration,
-            // another replica's free GPUs) names them in its weights' plan.
-            let redistributions: Vec<&Value> = match plan["redistribution"].as_array() {
+            // another replica's free GPUs) names them in its `redistribution`.
+            let redistributions: Vec<&Value> = match replica["redistribution"].as_array() {
                 Some(reports) => reports.iter().collect(),
-                None => vec![&plan["redistribution"]],
+                None => vec![&replica["redistribution"]],
             };
             for report in redistributions {
                 let ranks = report["ranks"].as_array().into_iter().flatten();
@@ -133,8 +133,8 @@ impl Needs {
                     );
                 }
             }
-            if plan["feasible"] == false {
-                let group = plan["refusals"].as_array().into_iter().flatten();
+            if replica["feasible"] == false {
+                let group = replica["refusals"].as_array().into_iter().flatten();
                 refusals.extend(group.filter_map(Value::as_str).map(str::to_owned));
             }
         }
@@ -157,7 +157,7 @@ fn gpu(entry: &Value) -> Option<Gpu> {
 pub(crate) enum Wait {
     /// It shares GPU `gpu` with the update in progress of service `with`.
     Shares { with: usize, gpu: Gpu },
-    /// Its plan does not fit: the plan's refusal.
+    /// Its dry run does not fit: the dry run's refusal.
     Refused(String),
     /// Host `host` admits `admits` bytes of new host storage, and the
     /// update requires `required` beside the `others` the updates in
@@ -181,7 +181,7 @@ impl Wait {
                 "shares GPU {gpu} of {host} with {}, whose update is in progress",
                 nodes[*with].base
             ),
-            Wait::Refused(refusal) => format!("its plan does not fit: {refusal}"),
+            Wait::Refused(refusal) => format!("its dry run does not fit: {refusal}"),
             Wait::Host {
                 host,
                 required,
@@ -253,9 +253,9 @@ enum Ended {
 /// with every failed update, rolled-back trial and service that did not
 /// fit, once every update in progress ended.
 pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
-    let mut dry_run = options.body.clone();
-    dry_run["dry_run"] = json!(true);
-    dry_run["wait"] = json!(true);
+    let mut request = options.body.clone();
+    request["dry_run"] = json!(true);
+    request["wait"] = json!(true);
 
     let mut pending: VecDeque<usize> = (0..nodes.len()).collect();
     // The updates in progress or on trial, and what each needs.
@@ -265,21 +265,21 @@ pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
     let mut failures = Vec::new();
     let mut running = tokio::task::JoinSet::new();
     loop {
-        // Plan every waiting service again and start those that fit, in
+        // Make every waiting service's dry run again and start those that fit, in
         // order, while no update failed.
         let mut deferred = VecDeque::new();
         while failures.is_empty()
             && let Some(index) = pending.pop_front()
         {
             let node = &nodes[index];
-            let planned = async {
+            let read = async {
                 let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
-                let answer = node.put("/admin/config", &dry_run).await?;
-                Ok::<_, anyhow::Error>(Needs::of(&status, &answer["result"]))
+                let response = node.put("/admin/config", &request).await?;
+                Ok::<_, anyhow::Error>(Needs::of(&status, &response["result"]))
             }
             .await
-            .with_context(|| format!("{}: planning its update", node.base));
-            let needs = match planned {
+            .with_context(|| format!("{}: the dry run of its update", node.base));
+            let needs = match read {
                 Ok(needs) => needs,
                 Err(error) => {
                     failures.push(format!("{error:#}"));
@@ -305,7 +305,7 @@ pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
             let options = options.clone();
             running.spawn(async move { (index, update(&node, &options).await) });
         }
-        // Services not reached after a failure stay pending, unplanned.
+        // Services not reached after a failure stay pending, without a dry run.
         deferred.extend(pending.drain(..));
         pending = deferred;
 
@@ -372,24 +372,24 @@ pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
     Ok(())
 }
 
-/// Reports each service's plan and the order [`apply`] takes them in from
-/// these plans: after the services before it that share one of its GPUs,
-/// and once its plan fits. Changes nothing.
-pub(crate) async fn plan(nodes: &[Node], options: &Options) -> Result<()> {
-    let mut dry_run = options.body.clone();
-    dry_run["dry_run"] = json!(true);
-    dry_run["wait"] = json!(true);
-    let mut planned = Vec::new();
+/// Reports each service's dry run and the order [`apply`] takes them in from
+/// these: after the services before it that share one of its GPUs,
+/// and once its dry run fits. Changes nothing.
+pub(crate) async fn dry_run(nodes: &[Node], options: &Options) -> Result<()> {
+    let mut request = options.body.clone();
+    request["dry_run"] = json!(true);
+    request["wait"] = json!(true);
+    let mut services = Vec::new();
     for node in nodes {
         let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
-        let answer = node
-            .put("/admin/config", &dry_run)
+        let response = node
+            .put("/admin/config", &request)
             .await
-            .with_context(|| format!("{}: planning its update", node.base))?;
-        println!("{}: {}", node.base, answer["result"]);
-        planned.push(Needs::of(&status, &answer["result"]));
+            .with_context(|| format!("{}: the dry run of its update", node.base))?;
+        println!("{}: {}", node.base, response["result"]);
+        services.push(Needs::of(&status, &response["result"]));
     }
-    for (index, needs) in planned.iter().enumerate() {
+    for (index, needs) in services.iter().enumerate() {
         let base = &nodes[index].base;
         if !needs.changes {
             println!("{base}: unchanged");
@@ -399,7 +399,7 @@ pub(crate) async fn plan(nodes: &[Node], options: &Options) -> Result<()> {
             println!("{base}: changes without a new epoch, at once");
             continue;
         }
-        let after: Vec<&str> = planned[..index]
+        let after: Vec<&str> = services[..index]
             .iter()
             .enumerate()
             .filter(|(_, other)| other.epoch && !other.gpus.is_disjoint(&needs.gpus))
@@ -421,16 +421,16 @@ pub(crate) async fn plan(nodes: &[Node], options: &Options) -> Result<()> {
 /// trial to its end: committed once it served `options.commit_after`, with
 /// the service's remaining replica trials, or left on trial without it.
 async fn update(node: &Node, options: &Options) -> Result<Ended> {
-    let answer = node
+    let response = node
         .put("/admin/config", &options.body)
         .await
         .with_context(|| format!("{} did not change", node.base))?;
-    let mut result = answer["result"].clone();
+    let mut result = response["result"].clone();
     println!("{}: {result}", node.base);
     if result["change"] == "daemon" && result["then"] == "update" {
         // The hot restart's successor applies the rest of the change in an
         // operation of its own, after this one.
-        let after = answer["id"].as_u64().unwrap_or(0);
+        let after = response["id"].as_u64().unwrap_or(0);
         result = operation_after(node, after, options.poll).await?;
         println!("{}: {result}", node.base);
     }
@@ -522,8 +522,8 @@ mod tests {
         }
     }
 
-    /// A service's plan, as its daemon answers a dry run now.
-    type Planner = Box<dyn Fn(&Log) -> Value + Send + Sync>;
+    /// A service's dry run, as its daemon reports it now.
+    type DryRun = Box<dyn Fn(&Log) -> Value + Send + Sync>;
 
     /// One service's leader daemon, as far as the manager reads and drives
     /// its admin API.
@@ -531,7 +531,7 @@ mod tests {
         name: &'static str,
         /// The GPUs its epochs hold, as `GET /admin/config` names them.
         gpus: Vec<(&'static str, &'static str)>,
-        plan: Planner,
+        dry_run: DryRun,
         /// Whether its trials roll back by themselves.
         rolls_back: bool,
         trial: Mutex<Option<u64>>,
@@ -561,11 +561,11 @@ mod tests {
 
     async fn change(State(daemon): State<Arc<Daemon>>, Json(body): Json<Value>) -> Json<Value> {
         if body["dry_run"] == true {
-            daemon.log.record(format!("{}:plan", daemon.name));
-            let plan = (daemon.plan)(&daemon.log);
+            daemon.log.record(format!("{}:dry_run", daemon.name));
+            let report = (daemon.dry_run)(&daemon.log);
             return Json(json!({
                 "id": 1, "kind": "config", "state": "succeeded",
-                "result": { "change": "dry_run", "dry_run": plan },
+                "result": { "change": "dry_run", "dry_run": report },
             }));
         }
         daemon.log.record(format!("{}:apply", daemon.name));
@@ -607,7 +607,7 @@ mod tests {
         Node::new(&format!("http://{address}"), None).unwrap()
     }
 
-    /// The plan of a new epoch beside the serving one on `gpus`, requiring
+    /// The dry run of a new epoch beside the serving one on `gpus`, requiring
     /// `required` bytes of host storage of host `rank-0`, which admits
     /// 1000, and refused for `refusal`, as a daemon's dry run states it.
     fn epoch(gpus: &[(&str, &str)], required: u64, refusal: Option<&str>) -> Value {
@@ -632,22 +632,22 @@ mod tests {
     fn daemon(
         name: &'static str,
         gpus: &[(&'static str, &'static str)],
-        plan: Planner,
+        dry_run: DryRun,
         log: &Arc<Log>,
     ) -> Daemon {
         Daemon {
             name,
             gpus: gpus.to_vec(),
-            plan,
+            dry_run,
             rolls_back: false,
             trial: Mutex::new(None),
             log: Arc::clone(log),
         }
     }
 
-    /// A plan that is always `plan`.
-    fn always(plan: Value) -> Planner {
-        Box::new(move |_| plan.clone())
+    /// A dry run that always reports `report`.
+    fn always(report: Value) -> DryRun {
+        Box::new(move |_| report.clone())
     }
 
     fn options(commit_after: Option<Duration>) -> Options {
@@ -680,14 +680,14 @@ mod tests {
         assert!(["a", "b", "c"].iter().all(|service| log.committed(service)));
     }
 
-    /// A service on GPUs of its own whose plan does not fit starts once an
-    /// update ends and its plan, made again then, fits.
+    /// A service on GPUs of its own whose dry run does not fit starts once an
+    /// update ends and its dry run, made again then, fits.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_update_starts_once_its_plan_fits() {
+    async fn an_update_starts_once_its_dry_run_fits() {
         let log = Arc::new(Log::default());
         let first = [("rank-0", "GPU-0")];
         let second = [("rank-0", "GPU-1")];
-        let fits_after_first: Planner = Box::new(move |log: &Log| {
+        let fits_after_first: DryRun = Box::new(move |log: &Log| {
             let refusal = (!log.committed("a"))
                 .then_some("GPU-1 of rank-0 leaves the serving epoch's KV cache 0 bytes");
             epoch(&second, 0, refusal)
@@ -698,8 +698,12 @@ mod tests {
         ];
         apply(&nodes, &options(Some(TRIAL))).await.unwrap();
         assert!(log.at("b:apply") > log.at("a:commit"), "{:?}", log.calls());
-        let plans = log.calls().iter().filter(|call| *call == "b:plan").count();
-        assert_eq!(plans, 2, "{:?}", log.calls());
+        let dry_runs = log
+            .calls()
+            .iter()
+            .filter(|call| *call == "b:dry_run")
+            .count();
+        assert_eq!(dry_runs, 2, "{:?}", log.calls());
     }
 
     /// The host storage of updates on one host adds up: an update starts
@@ -791,28 +795,28 @@ mod tests {
         );
     }
 
-    /// A plan that fits nowhere while no update is in progress is refused,
+    /// An update that fits nowhere while no update is in progress is refused,
     /// naming its reason.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_plan_that_never_fits_is_refused() {
+    async fn an_update_that_never_fits_is_refused() {
         let log = Arc::new(Log::default());
         let gpus = [("rank-0", "GPU-0")];
         let refusal = "GPU-0 of rank-0 leaves the serving epoch's KV cache 0 bytes";
-        let plan = always(epoch(&gpus, 0, Some(refusal)));
-        let nodes = vec![serve(daemon("a", &gpus, plan, &log)).await];
+        let refused = always(epoch(&gpus, 0, Some(refusal)));
+        let nodes = vec![serve(daemon("a", &gpus, refused, &log)).await];
         let error = apply(&nodes, &options(Some(TRIAL)))
             .await
-            .expect_err("a plan that does not fit is refused");
+            .expect_err("an update that does not fit is refused");
         assert!(format!("{error:#}").contains(refusal), "{error:#}");
-        assert_eq!(log.calls(), ["a:plan"]);
+        assert_eq!(log.calls(), ["a:dry_run"]);
     }
 
     /// The GPUs an update uses are those its service's epochs hold, those
-    /// its storage plan prepares on, and its successor's target ranks;
-    /// every refusal of its plans is kept, and the largest host storage a
+    /// its dry run's `storage` prepares on, and its successor's target ranks;
+    /// every refusal of its dry run is kept, and the largest host storage a
     /// replica requires on a host is the update's.
     #[test]
-    fn an_updates_needs_come_from_its_status_and_every_replicas_plan() {
+    fn an_updates_needs_come_from_its_status_and_every_replicas_dry_run() {
         let status = json!({ "gpus": [{ "host": "rank-0", "gpu": "GPU-0" }] });
         let replica = |gpu: &str, target: &str, required: u64, feasible: bool| {
             json!({
@@ -830,14 +834,14 @@ mod tests {
                 },
             })
         };
-        let planned = json!({
+        let result = json!({
             "change": "dry_run",
             "dry_run": { "replicas": [
                 replica("GPU-0", "GPU-8", 100, true),
                 replica("GPU-1", "GPU-9", 300, false),
             ] },
         });
-        let needs = Needs::of(&status, &planned);
+        let needs = Needs::of(&status, &result);
         assert!(needs.changes && needs.epoch);
         let gpus: Vec<(&str, &str)> = needs
             .gpus

@@ -154,7 +154,7 @@ pub async fn node(
     }
     info!(%address, "the node serves no deployment yet");
     // The connection writer is what takes a response's body out of its extensions (`conn`), so a
-    // deployment's routes answer nothing through any other server.
+    // deployment's routes respond with nothing through any other server.
     let served = super::conn::serve(
         listener,
         app,
@@ -218,7 +218,7 @@ async fn idle_config(State(node): State<Arc<Node>>) -> Response {
     .into_response()
 }
 
-/// The first `PUT /admin/config`: brings a deployment up; answers once it
+/// The first `PUT /admin/config`: brings a deployment up; responds once it
 /// starts (`202`), with its name. A node that serves a deployment hands
 /// the request to the deployment's own admin API.
 async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
@@ -298,8 +298,8 @@ async fn run(
     token: CancellationToken,
 ) {
     let name = config.served_model_name().to_owned();
-    let outcome = serve_deployment(&node, &config, &stated, &token).await;
-    if let Err(error) = &outcome {
+    let served = serve_deployment(&node, &config, &stated, &token).await;
+    if let Err(error) = &served {
         warn!(deployment = name, "the deployment ended: {error:#}");
         *locked(&node.last_error) = Some(format!("{error:#}"));
     }
@@ -397,16 +397,16 @@ async fn serve_deployment(
     })
     .await
     .context("the daemon's stop did not complete")?;
-    let mut outcome = served.and(stopped);
+    let mut result = served.and(stopped);
     if retire.load(Ordering::Acquire) {
         let deployment = name.clone();
         let retired = tokio::task::spawn_blocking(move || retire_deployment(&deployment))
             .await
             .context("the deployment's release did not complete")
             .and_then(|retired| retired);
-        outcome = outcome.and(retired);
+        result = result.and(retired);
     }
-    outcome
+    result
 }
 
 /// `GET /admin/node`: what the node serves.

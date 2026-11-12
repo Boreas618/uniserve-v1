@@ -2,21 +2,21 @@
 //! leader to engines and other nodes' daemons, on every other node to the
 //! leader.
 //!
-//! The leader answers an engine's request for its own node itself and
+//! The leader replies to an engine's request for its own node itself and
 //! forwards a request for another node to that node's daemon, tagged with
-//! the engine connection it serves; the answer and the node's exits come
+//! the engine connection it serves; the reply and the node's exits come
 //! back the same way. A member daemon serves the leader's forwarded requests
 //! until the leader's connection closes, and then ends its processes.
 //!
 //! One thread does all of it, waiting on every connection and a wake pipe
-//! at once and polling its children for exits at a short interval, so no
+//! at once and polling its processes for exits at a short interval, so no
 //! request waits behind another node's.
 //!
 //! A hot restart of the daemon stops the thread between two rounds and
 //! hands everything it serves to the successor daemon: its listeners and
 //! connections as descriptors, with the bytes each received and has not
 //! taken, its pending stops, its processes and its claims
-//! ([`HandedService`]). The successor's thread goes on from there; no peer
+//! ([`ServiceHandoff`]). The successor's thread goes on from there; no peer
 //! sees a connection close.
 
 use std::collections::HashMap;
@@ -30,17 +30,17 @@ use std::time::Duration;
 
 use prost::Message as _;
 use proto::process::{
-    self, Answered, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface,
-    LedgerReport, Node, NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled,
+    self, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface, LedgerReport,
+    Node, NodesKnown, Replied, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled,
     Upstream, Welcome, downstream, event, from_member, hello, reply, request, to_member, upstream,
 };
 use proto::{Connection, Handed, Listener};
 
-use crate::supervision::claims::{ClaimHolder, HandedClaims};
+use crate::supervision::claims::{ClaimHolder, ClaimsHandoff};
 use crate::supervision::processes::Greeting;
-use crate::supervision::supervisor::{HandedProcesses, Supervisor};
+use crate::supervision::supervisor::{ProcessesHandoff, Supervisor};
 
-/// How often children are polled for exits while nothing else happens.
+/// How often the node's processes are polled for exits while nothing else happens.
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What the service thread reads its stop from.
@@ -88,10 +88,10 @@ pub(crate) struct Local {
 impl Local {
     /// Hands the supervisor's processes and the claims over: their state,
     /// and their descriptors appended to `descriptors`.
-    fn hand_over(&mut self, descriptors: &mut Vec<OwnedFd>) -> anyhow::Result<HandedLocal> {
+    fn hand_over(&mut self, descriptors: &mut Vec<OwnedFd>) -> anyhow::Result<LocalHandoff> {
         let (claims, claim_descriptors) = self.claims.hand_over()?;
         let (processes, process_descriptors) = self.supervisor.hand_over()?;
-        let handed = HandedLocal {
+        let handoff = LocalHandoff {
             claims,
             claim_descriptors: claim_descriptors.len(),
             processes,
@@ -100,41 +100,41 @@ impl Local {
         };
         descriptors.extend(claim_descriptors);
         descriptors.extend(process_descriptors);
-        Ok(handed)
+        Ok(handoff)
     }
 
-    /// Goes on with what [`Local::hand_over`] handed, taking its
+    /// Goes on with the handoff of [`Local::hand_over`], taking its
     /// descriptors from `descriptors`.
     fn adopt(
         host: String,
         devices: super::DeviceProbe,
-        handed: HandedLocal,
+        handoff: LocalHandoff,
         descriptors: &mut std::vec::IntoIter<OwnedFd>,
     ) -> anyhow::Result<Self> {
         let claims: Vec<OwnedFd> = descriptors
             .by_ref()
-            .take(handed.claim_descriptors)
+            .take(handoff.claim_descriptors)
             .collect();
         let processes: Vec<OwnedFd> = descriptors
             .by_ref()
-            .take(handed.process_descriptors)
+            .take(handoff.process_descriptors)
             .collect();
         anyhow::ensure!(
-            claims.len() == handed.claim_descriptors
-                && processes.len() == handed.process_descriptors,
-            "the handed-over service lacks descriptors"
+            claims.len() == handoff.claim_descriptors
+                && processes.len() == handoff.process_descriptors,
+            "the service's handoff lacks descriptors"
         );
         Ok(Self {
-            supervisor: Supervisor::adopt(host, handed.processes, processes)?,
-            claims: ClaimHolder::adopt(handed.address, handed.claims, claims),
-            address: handed.address,
+            supervisor: Supervisor::adopt(host, handoff.processes, processes)?,
+            claims: ClaimHolder::adopt(handoff.address, handoff.claims, claims),
+            address: handoff.address,
             devices,
         })
     }
 
-    /// Answers one request for this node on behalf of `engine`. `reporter` is
+    /// Replies to one request for this node on behalf of `engine`. `reporter` is
     /// the connection that asked, which a launch's exit report goes down.
-    fn answer(&mut self, engine: u64, reporter: u64, request: &Request) -> Reply {
+    fn reply(&mut self, engine: u64, reporter: u64, request: &Request) -> Reply {
         let mut reply = Reply {
             id: request.id,
             ..Reply::default()
@@ -153,7 +153,7 @@ impl Local {
             Some(request::Kind::Reserve(reserve)) => {
                 // A reservation is filed under the engine that will spawn the
                 // process inheriting it, which the request states: the asking
-                // connection may be the deployment's planning client, and it may
+                // connection may be the deployment's own client, and it may
                 // be re-established between the reservation and the launch
                 // without changing whose socket it is.
                 let owner = if reserve.engine == 0 {
@@ -207,7 +207,7 @@ impl Local {
                 }
             }
             Some(request::Kind::Nodes(_)) => {
-                reply.error = "the leader answers for the deployment's nodes".to_owned();
+                reply.error = "the leader replies for the deployment's nodes".to_owned();
             }
             Some(request::Kind::Devices(_)) => match (self.devices)() {
                 Ok(available) => {
@@ -243,7 +243,7 @@ impl Joins {
         }
     }
 
-    /// Accepts the connections waiting and answers every hello that
+    /// Accepts the connections waiting and replies to every hello that
     /// arrived: a member of a node rank other than the leader's and every
     /// member's in `members` joins, any other hello is refused. Returns the
     /// members that joined.
@@ -331,26 +331,26 @@ struct EngineConnection {
     /// The engine whose request link this is, once it stated one, held the same way.
     requests_of: Option<u64>,
     connection: Connection,
-    /// Whether its hello was answered.
+    /// Whether its hello was welcomed.
     welcomed: bool,
-    /// The owner this connection's requests are answered for: the engine
+    /// The owner this connection's requests are served for: the engine
     /// number a process link states, or `EPOCH_ENGINE` for a peer that is no
     /// process of the deployment — a worker's client, the daemon's own client.
     ///
     /// It is set by the hello and never by arrival: a reservation one
     /// connection makes is inherited by a spawn another connection sends, so
-    /// the two must be answered for the same owner even though the daemon
+    /// the two must be served for the same owner even though the daemon
     /// accepted them under different arrival numbers.
     owner: u64,
 }
 
-/// The owner id of the main processes the epoch layer starts: it is no
+/// The owner id of the engines the updater starts: it is no
 /// connection, so no disconnect ever releases them, and the service keeps
-/// them for the daemon's life (§2.5, §7.4).
+/// them for the daemon's life.
 pub(crate) const EPOCH_ENGINE: u64 = 0;
 
 /// The first key among the clients of the socket. A connection travels as one
-/// number to a member and back with a launch's answer and exit report, so a
+/// number to a member and back with a launch's reply and exit report, so a
 /// client's key must not be a number an engine holds or may state.
 const FIRST_CLIENT: u64 = 1 << 63;
 
@@ -368,7 +368,7 @@ fn connection_of<'a>(
 }
 
 /// Reports one exit: down the connection that asked for the launch, and to the
-/// epoch layer, whose switch reads every exit of the deployment (§7.3, §7.4).
+/// updater, whose switch reads every exit of the deployment.
 fn report_exit(
     reporter: u64,
     exit: Exit,
@@ -389,11 +389,11 @@ fn report_exit(
 /// what it served when `stop` asks for a hot restart's handoff, and `None`
 /// once it stopped.
 /// The daemon's process table: the processes this node supervises, which
-/// `GET /admin/config` reports and which a successor daemon keeps (§2.3).
+/// `GET /admin/config` reports and which a successor daemon keeps.
 pub(crate) type ProcessTable = std::sync::Arc<std::sync::Mutex<Vec<crate::epoch::ManagedProcess>>>;
 
-/// Publishes the node's live processes into `table`, keeping what the epoch
-/// layer recorded of each of them — its epoch, its build and the state it
+/// Publishes the node's live processes into `table`, keeping what the
+/// updater recorded of each of them — its epoch, its build and the state it
 /// reported — and dropping the rows of processes that ended.
 fn publish(local: &Local, table: &ProcessTable) {
     let live = local.supervisor.live();
@@ -411,14 +411,14 @@ fn publish(local: &Local, table: &ProcessTable) {
             group: process.group,
             rank: u64::from(process.rank),
             pid: Some(process.pid),
-            // The epoch a main process serves is its own report's, which the
-            // epoch layer records against this row.
+            // The epoch an engine serves is its own report's, which the
+            // updater records against this row.
             epoch: None,
             build: proto::BUILD.to_owned(),
             generation: process.generation,
             // The daemon sees it running; whether it serves requests, parks
-            // or failed is what the process itself reports, which the epoch
-            // layer records against this row.
+            // or failed is what the process itself reports, which the
+            // updater records against this row.
             state: crate::epoch::ProcessState::Serving,
         });
     }
@@ -428,7 +428,7 @@ fn publish(local: &Local, table: &ProcessTable) {
 /// one worker group's rank.
 fn same_process(
     row: &crate::epoch::ManagedProcess,
-    process: &crate::supervision::supervisor::HandedProcess,
+    process: &crate::supervision::supervisor::ProcessHandoff,
 ) -> bool {
     row.group == process.group
         && row.rank == u64::from(process.rank)
@@ -454,7 +454,7 @@ pub(crate) fn serve_leader(
     wake: Sender<()>,
     processes: ProcessTable,
     stop: &Stop,
-) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
+) -> anyhow::Result<Option<(ServiceHandoff, Vec<OwnedFd>)>> {
     let mut nodes = vec![Node {
         node_rank: 0,
         host: host.to_owned(),
@@ -506,45 +506,45 @@ pub(crate) struct LeaderService {
     engines: HashMap<u64, EngineConnection>,
     next_engine: u64,
     /// Peers of the process socket that are not processes of the deployment -
-    /// the daemon's own client, and the clients a main process's workers open.
+    /// the daemon's own client, and the clients an engine's workers open.
     /// They are served and never numbered, so no command can be addressed to
-    /// one of them (§2.3).
+    /// one of them.
     clients: HashMap<u64, EngineConnection>,
     next_client: u64,
     /// The connection each engine's process link is on, by engine number: the
     /// one link that receives that engine's commands, and the reason a second
-    /// process link for the same number is refused (§2.3).
+    /// process link for the same number is refused.
     process_links: HashMap<u64, u64>,
     /// The connection each engine's request link is on, by engine number. It
     /// never receives a command, and a second request link is refused.
     request_links: HashMap<u64, u64>,
     /// Stops of an engine, by its request id, awaiting the members'
-    /// answers.
+    /// replies.
     stops: HashMap<(u64, u64), PendingStop>,
-    /// The commands the daemon sends down to engines' main processes
+    /// The commands the daemon sends down to engines
     /// (`supervision::ProcessCommands`), each carried to its engine's
     /// connection.
     commands: Receiver<(u64, process::Command)>,
-    /// Where each `Upstream::Report` an engine's main process sends goes,
+    /// Where each `Upstream::Report` an engine sends goes,
     /// with the engine that sent it.
     reports: Sender<(u64, process::Report)>,
-    /// The epoch layer's requests, each with the answer it waits for: a
-    /// request for this node is answered at once, one for a node is answered
-    /// when its daemon's reply arrives.
+    /// The updater's requests, each with where its reply goes: a
+    /// request for this node gets its reply at once, one for another node
+    /// when that node's daemon's reply arrives.
     requests: Receiver<(Request, Sender<Reply>)>,
     /// Every peer that greeted the leader, with its build and its kind: the
-    /// epoch layer binds a peer to the launch it started once the peer's
+    /// updater binds a peer to the launch it started once the peer's
     /// report names it.
     greetings: Sender<(u64, Greeting)>,
-    /// Every supervised process that exited, for the epoch layer's switch.
+    /// Every supervised process that exited, for the updater's switch.
     exits: Sender<Exit>,
-    /// The epoch layer's requests a node has not answered yet, by request id.
+    /// The updater's requests a node has not replied to yet, by request id.
     pending: HashMap<u64, Sender<Reply>>,
-    /// A token per thing the epoch layer has to read: a greeting, a report or
+    /// A token per thing the updater has to read: a greeting, a report or
     /// an exit wakes the thread that advances the switch.
     wake: Sender<()>,
     /// The daemon's process table, which this service keeps current as
-    /// processes start and end (§2.3, §7.4).
+    /// processes start and end.
     processes: ProcessTable,
 }
 
@@ -552,7 +552,7 @@ pub(crate) struct LeaderService {
 pub(crate) fn run_leader(
     service: LeaderService,
     stop: &Stop,
-) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
+) -> anyhow::Result<Option<(ServiceHandoff, Vec<OwnedFd>)>> {
     let LeaderService {
         host,
         mut local,
@@ -580,7 +580,7 @@ pub(crate) fn run_leader(
     loop {
         // What this node supervises now, for the daemon's process table: the
         // loop turns on events, so a reader of `GET /admin/config` sees the
-        // processes that started and ended (§2.3).
+        // processes that started and ended.
         publish(&local, &processes);
         if stop.handoff() {
             let service = LeaderService {
@@ -613,7 +613,7 @@ pub(crate) fn run_leader(
             return Ok(None);
         }
         while let Some(connection) = listener.try_accept()? {
-            // The arrival numbering skips the numbers main processes state:
+            // The arrival numbering skips the numbers engines state:
             // an engine a launch named owns its number for the deployment's
             // life, and a later arrival must not be given it.
             while engines.contains_key(&next_engine) {
@@ -642,7 +642,7 @@ pub(crate) fn run_leader(
             }
         }
 
-        // The daemon's commands down to a main process (§2.3, §7.3): each
+        // The daemon's commands down to an engine: each
         // goes to its engine's connection, and a connection that cannot be
         // written closes that engine below.
         let mut closed = Vec::new();
@@ -664,10 +664,10 @@ pub(crate) fn run_leader(
             }
         }
 
-        // The epoch layer's requests (§7.4): a spawn, stop or claim it asks
+        // The updater's requests: a spawn, stop or claim it asks
         // for is executed here, by this node's supervisor and claims or by a
-        // member's daemon, and the answer goes back the way it came.
-        while let Ok((request, answer)) = requests.try_recv() {
+        // member's daemon, and the reply goes back the way it came.
+        while let Ok((request, waiter)) = requests.try_recv() {
             match route(
                 EPOCH_ENGINE,
                 EPOCH_ENGINE,
@@ -679,21 +679,21 @@ pub(crate) fn run_leader(
                 &mut stops,
             ) {
                 Some(reply) => {
-                    let _ = answer.send(reply);
+                    let _ = waiter.send(reply);
                 }
                 None => {
-                    pending.insert(request.id, answer);
+                    pending.insert(request.id, waiter);
                 }
             }
         }
 
-        // The main processes that stated an engine number this round, by the
+        // The engines that stated an engine number this round, by the
         // number their arrival gave them: applied once their hellos are read.
         let mut renumbered: Vec<(u64, u64)> = Vec::new();
         // Peers that stated no engine number and hold none: the daemon's own
-        // client of this socket, and the clients a main process's workers open.
+        // client of this socket, and the clients an engine's workers open.
         // Nothing addresses them, so they are kept out of the numbered registry
-        // and served for what they ask (§2.3).
+        // and served for what they ask.
         let mut unkeyed: Vec<u64> = Vec::new();
         // The request links that greeted this round, by the number they state:
         // filed beside the clients, because a command never goes down one.
@@ -705,8 +705,8 @@ pub(crate) fn run_leader(
                 if !peer.welcomed {
                     match peer.connection.try_recv::<Hello>() {
                         Ok(Some(hello)) => {
-                            // A main process says which of its links this is and
-                            // which engine it serves (§2.3): its process link
+                            // An engine says which of its links this is and
+                            // which engine number it holds: its process link
                             // takes the epoch's commands, its request link
                             // carries the epoch's requests, and a client of the
                             // socket is neither.
@@ -764,11 +764,11 @@ pub(crate) fn run_leader(
                                 break;
                             }
                             let frontend = matches!(hello.peer, Some(hello::Peer::Frontend(_)));
-                            // What this connection's requests are answered
+                            // What this connection's requests are served
                             // for: the number it states when it is a process
                             // of the deployment, and the epoch's own owner
                             // when it is a client. A frontend states no
-                            // number and is commanded by the epoch layer, so
+                            // number and is commanded by the updater, so
                             // it keeps the one its arrival gave it.
                             peer.owner = match (frontend, link, stated) {
                                 (false, Interface::Process | Interface::Requests, Some(number)) => {
@@ -793,9 +793,9 @@ pub(crate) fn run_leader(
                             // the socket, which is served for its queries and
                             // holds no number at all.
                             if frontend {
-                                // The frontend is commanded by the epoch layer
-                                // like a main process, and is filed by whatever
-                                // number it arrived with (§2.1).
+                                // The frontend is commanded by the updater
+                                // like an engine, and is filed by whatever
+                                // number it arrived with.
                             } else {
                                 match (link, stated) {
                                     // Only a process link takes a number: it is
@@ -819,9 +819,9 @@ pub(crate) fn run_leader(
                                     _ => unkeyed.push(engine),
                                 }
                             }
-                            // The epoch layer binds this connection to the
+                            // The updater binds this connection to the
                             // launch it started when the peer's first report
-                            // names the launch generation (§2.5). A client
+                            // names the launch generation. A client
                             // sends no report, and takes no greeting.
                             if frontend || link == Interface::Process {
                                 let _ = greetings.send((
@@ -865,7 +865,7 @@ pub(crate) fn run_leader(
                     Ok(Some(Upstream {
                         kind: Some(upstream::Kind::Report(report)),
                     })) => {
-                        // Reports go to the daemon's switch (§7.3); a
+                        // Reports go to the daemon's switch; a
                         // daemon that stopped reading them drops them.
                         let _ = reports.send((peer.owner, report));
                         let _ = wake.send(());
@@ -879,11 +879,11 @@ pub(crate) fn run_leader(
                 }
             }
         }
-        // Clients of the process socket: the daemon's own, and the ones a main
-        // process's workers open. They ask (a device inventory, a storage
-        // ledger, a launch) and are answered; they are never commanded, and a
+        // Clients of the process socket: the daemon's own, and the ones an
+        // engine's workers open. They ask (a device inventory, a storage
+        // ledger, a launch) and get a reply; they are never commanded, and a
         // client that goes takes with it the launches it asked for and nothing
-        // else: the deployment's owner stays, whose processes the epoch layer
+        // else: the deployment's owner stays, whose processes the updater
         // named.
         let mut gone = Vec::new();
         for (&client, peer) in &mut clients {
@@ -937,8 +937,8 @@ pub(crate) fn run_leader(
             }
             if engine == EPOCH_ENGINE {
                 // A client of the socket owns no process: it goes, and takes
-                // nothing with it — not the epoch layer's processes, which
-                // are named by the same owner (§2.3, §2.5).
+                // nothing with it — not the updater's processes, which
+                // are named by the same owner.
                 tracing::info!(client = key, "a client of the process socket disconnected");
                 continue;
             }
@@ -952,18 +952,18 @@ pub(crate) fn run_leader(
             }
         }
 
-        // Members: answers and exits on their nodes, for their engines.
+        // Members: replies and exits on their nodes, for their engines.
         let mut lost = Vec::new();
         for member in &mut members {
             loop {
                 match member.connection.try_recv::<FromMember>() {
                     Ok(Some(message)) => {
                         match message.kind {
-                            Some(from_member::Kind::Answered(Answered {
+                            Some(from_member::Kind::Replied(Replied {
                                 engine,
                                 reply: Some(reply),
                             })) => match stops.get_mut(&(engine, reply.id)) {
-                                // A stop is answered once every node stopped
+                                // A stop gets its reply once every node stopped
                                 // the group.
                                 Some(stop) => {
                                     if !reply.error.is_empty() {
@@ -976,7 +976,7 @@ pub(crate) fn run_leader(
                                     let Some(stop) = stops.remove(&(engine, reply.id)) else {
                                         continue;
                                     };
-                                    answer(
+                                    deliver(
                                         engine,
                                         stop.reply,
                                         &mut pending,
@@ -986,7 +986,13 @@ pub(crate) fn run_leader(
                                     continue;
                                 }
                                 None => {
-                                    answer(engine, reply, &mut pending, &mut engines, &mut clients);
+                                    deliver(
+                                        engine,
+                                        reply,
+                                        &mut pending,
+                                        &mut engines,
+                                        &mut clients,
+                                    );
                                     continue;
                                 }
                             },
@@ -1020,7 +1026,7 @@ pub(crate) fn run_leader(
         }
 
         // A lost node runs nothing more: requests for it fail from here on,
-        // and the stops that awaited it are answered without it.
+        // and the stops that awaited it get their reply without it.
         if !lost.is_empty() {
             members.retain(|member| !lost.contains(&member.node_rank));
             nodes.retain(|node| !lost.contains(&node.node_rank));
@@ -1033,7 +1039,7 @@ pub(crate) fn run_leader(
             }
             for key in settled {
                 if let Some(stop) = stops.remove(&key) {
-                    answer(key.0, stop.reply, &mut pending, &mut engines, &mut clients);
+                    deliver(key.0, stop.reply, &mut pending, &mut engines, &mut clients);
                 }
             }
         }
@@ -1068,8 +1074,8 @@ pub(crate) fn run_leader(
             }
         }
 
-        // The numbers main processes stated take effect before this round's
-        // commands go down, so a command the epoch layer sends right after a
+        // The numbers engines stated take effect before this round's
+        // commands go down, so a command the updater sends right after a
         // process reported itself ready already reaches that process.
         for (arrived, number) in renumbered.drain(..) {
             let Some(mut connection) = engines.remove(&arrived) else {
@@ -1079,14 +1085,14 @@ pub(crate) fn run_leader(
             if let Some(displaced) = engines.remove(&number) {
                 // Nothing addresses a peer that states no number: it is a
                 // worker's client or a client of this interface, and the
-                // number is the main process's.
+                // number is the engine's.
                 let fresh = next_engine;
                 next_engine += 1;
                 engines.insert(fresh, displaced);
                 tracing::info!(
                     engine = fresh,
                     stated = number,
-                    "a peer was moved off the number a main process states"
+                    "a peer was moved off the number an engine states"
                 );
             }
             engines.insert(number, connection);
@@ -1094,7 +1100,7 @@ pub(crate) fn run_leader(
             tracing::info!(
                 engine = number,
                 arrived,
-                "a main process is numbered by the engine it states"
+                "an engine is numbered by the number it states"
             );
         }
 
@@ -1113,17 +1119,17 @@ pub(crate) fn run_leader(
     }
 }
 
-/// A stop the leader applied on its own node, awaiting the members' answers.
+/// A stop the leader applied on its own node, awaiting the members' replies.
 struct PendingStop {
-    /// This node's answer, carrying the last error a member reports.
+    /// This node's reply, carrying the last error a member reports.
     reply: Reply,
-    /// The node ranks of the members that have not answered yet.
+    /// The node ranks of the members that have not replied yet.
     awaiting: Vec<u32>,
 }
 
-/// Delivers one reply: to the epoch layer when the main processes' owner
+/// Delivers one reply: to the updater when the engines' owner
 /// asked, otherwise down the connection that asked.
-fn answer(
+fn deliver(
     engine: u64,
     reply: Reply,
     pending: &mut HashMap<u64, Sender<Reply>>,
@@ -1139,15 +1145,15 @@ fn answer(
     }
 }
 
-/// Routes one engine request: answered here for this node, forwarded to the
-/// node's daemon otherwise, whose answer comes back later. A stop applies to
-/// every node and is answered once every node stopped the group: it waits in
-/// `stops` for the members' answers.
+/// Routes one engine request: served here for this node, forwarded to the
+/// node's daemon otherwise, whose reply comes back later. A stop applies to
+/// every node and gets its reply once every node stopped the group: it waits in
+/// `stops` for the members' replies.
 ///
-/// `engine` is the connection the answer goes back down, and `owner` the
-/// process the request is answered *for* — the engine number a process states,
+/// `engine` is the connection the reply goes back down, and `owner` the
+/// process the request is served *for* — the engine number a process states,
 /// or the epoch's own owner for a client. They differ for a client, which holds
-/// no engine number but whose launches are answered for the deployment.
+/// no engine number but whose launches are served for the deployment.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request, its two engine numbers and the service's routing state it reads and \
@@ -1203,14 +1209,14 @@ fn route(
                 .iter_mut()
                 .filter_map(|member| forward(member).then_some(member.node_rank))
                 .collect();
-            let reply = local.answer(owner, engine, request);
+            let reply = local.reply(owner, engine, request);
             if awaiting.is_empty() {
                 return Some(reply);
             }
             stops.insert((engine, request.id), PendingStop { reply, awaiting });
             None
         }
-        Some(target) if target == host => Some(local.answer(owner, engine, request)),
+        Some(target) if target == host => Some(local.reply(owner, engine, request)),
         Some(target) => match members.iter_mut().find(|member| member.host == target) {
             Some(member) => {
                 if forward(member) {
@@ -1237,19 +1243,19 @@ pub(crate) fn serve_member(
     mut local: Local,
     mut leader: Connection,
     stop: &Stop,
-) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
+) -> anyhow::Result<Option<(ServiceHandoff, Vec<OwnedFd>)>> {
     loop {
         if stop.handoff() {
             let mut descriptors = Vec::new();
             let local = local.hand_over(&mut descriptors)?;
             let leader = leader.hand_over();
-            let handed = HandedService::Member {
+            let handoff = ServiceHandoff::Member {
                 local,
-                leader: HandedConnection::of(&leader),
+                leader: ConnectionHandoff::of(&leader),
             };
             let mut ordered = vec![leader.descriptor];
             ordered.extend(descriptors);
-            return Ok(Some((handed, ordered)));
+            return Ok(Some((handoff, ordered)));
         }
         if stop.requested() {
             local.supervisor.terminate_all();
@@ -1265,9 +1271,9 @@ pub(crate) fn serve_member(
                             request: Some(request),
                         })),
                 })) => {
-                    let reply = local.answer(owner, engine, &request);
+                    let reply = local.reply(owner, engine, &request);
                     leader.send(&FromMember {
-                        kind: Some(from_member::Kind::Answered(Answered {
+                        kind: Some(from_member::Kind::Replied(Replied {
                             engine,
                             reply: Some(reply),
                         })),
@@ -1305,7 +1311,7 @@ pub(crate) fn serve_member(
 /// beside the descriptors that travel with it in the order the fields name
 /// them.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) enum HandedService {
+pub(crate) enum ServiceHandoff {
     Leader {
         host: String,
         /// The process socket: its address and whether it is a Unix
@@ -1318,40 +1324,40 @@ pub(crate) enum HandedService {
         #[serde(default)]
         joins: Option<(String, bool)>,
         /// Each engine connection, by its identity, after the listener.
-        engines: Vec<(u64, bool, HandedConnection)>,
+        engines: Vec<(u64, bool, ConnectionHandoff)>,
         next_engine: u64,
         /// Each client's connection, after the engines'.
         #[serde(default)]
-        clients: Vec<HandedClient>,
+        clients: Vec<ClientHandoff>,
         /// Each member's connection, after the clients'.
-        members: Vec<(u32, String, HandedConnection)>,
+        members: Vec<(u32, String, ConnectionHandoff)>,
         /// The deployment's nodes (`proto::process::Node`, encoded).
         nodes: Vec<Vec<u8>>,
         /// Each pending stop: its engine and request, this node's reply
-        /// (encoded) and the members that have not answered.
+        /// (encoded) and the members that have not replied.
         stops: Vec<(u64, u64, Vec<u8>, Vec<u32>)>,
         /// The claims' and processes' descriptors follow the members'.
-        local: HandedLocal,
+        local: LocalHandoff,
     },
     Member {
         /// The leader's connection, whose descriptor comes first.
-        leader: HandedConnection,
-        local: HandedLocal,
+        leader: ConnectionHandoff,
+        local: LocalHandoff,
     },
 }
 
 /// A connection's state, its descriptor travelling apart.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HandedConnection {
+pub(crate) struct ConnectionHandoff {
     unix: bool,
     received: Vec<u8>,
 }
 
-impl HandedConnection {
-    fn of(handed: &Handed) -> Self {
+impl ConnectionHandoff {
+    fn of(connection: &Handed) -> Self {
         Self {
-            unix: handed.unix,
-            received: handed.received.clone(),
+            unix: connection.unix,
+            received: connection.received.clone(),
         }
     }
 
@@ -1367,29 +1373,29 @@ impl HandedConnection {
 /// A client of the process socket, its descriptor travelling apart. A client
 /// that reached `clients` greeted, so nothing of its hello is left to read.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HandedClient {
+pub(crate) struct ClientHandoff {
     /// Its key among the clients.
     id: u64,
-    /// The owner its requests are answered for.
+    /// The owner its requests are served for.
     owner: u64,
     /// The engine whose request link it is, when it is one.
     requests_of: Option<u64>,
-    connection: HandedConnection,
+    connection: ConnectionHandoff,
 }
 
-/// The supervisor's processes and the node's claims, as handed over.
+/// The handoff of the supervisor's processes and the node's claims.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HandedLocal {
-    claims: HandedClaims,
+pub(crate) struct LocalHandoff {
+    claims: ClaimsHandoff,
     claim_descriptors: usize,
-    processes: HandedProcesses,
+    processes: ProcessesHandoff,
     process_descriptors: usize,
     address: Option<IpAddr>,
 }
 
 impl LeaderService {
     /// The handoff of everything the service holds.
-    fn hand_over(self) -> anyhow::Result<(HandedService, Vec<OwnedFd>)> {
+    fn hand_over(self) -> anyhow::Result<(ServiceHandoff, Vec<OwnedFd>)> {
         let Self {
             host,
             mut local,
@@ -1430,39 +1436,43 @@ impl LeaderService {
             descriptors.push(descriptor);
             (address, unix)
         });
-        let mut handed_engines = Vec::with_capacity(engines.len());
+        let mut engine_handoffs = Vec::with_capacity(engines.len());
         for (id, engine) in engines {
-            let handed = engine.connection.hand_over();
-            handed_engines.push((id, engine.welcomed, HandedConnection::of(&handed)));
-            descriptors.push(handed.descriptor);
+            let connection = engine.connection.hand_over();
+            engine_handoffs.push((id, engine.welcomed, ConnectionHandoff::of(&connection)));
+            descriptors.push(connection.descriptor);
         }
-        let mut handed_clients = Vec::with_capacity(clients.len());
+        let mut client_handoffs = Vec::with_capacity(clients.len());
         for (id, client) in clients {
-            let handed = client.connection.hand_over();
-            handed_clients.push(HandedClient {
+            let connection = client.connection.hand_over();
+            client_handoffs.push(ClientHandoff {
                 id,
                 owner: client.owner,
                 requests_of: client.requests_of,
-                connection: HandedConnection::of(&handed),
+                connection: ConnectionHandoff::of(&connection),
             });
-            descriptors.push(handed.descriptor);
+            descriptors.push(connection.descriptor);
         }
-        let mut handed_members = Vec::with_capacity(members.len());
+        let mut member_handoffs = Vec::with_capacity(members.len());
         for member in members {
-            let handed = member.connection.hand_over();
-            handed_members.push((member.node_rank, member.host, HandedConnection::of(&handed)));
-            descriptors.push(handed.descriptor);
+            let connection = member.connection.hand_over();
+            member_handoffs.push((
+                member.node_rank,
+                member.host,
+                ConnectionHandoff::of(&connection),
+            ));
+            descriptors.push(connection.descriptor);
         }
         let local = local.hand_over(&mut descriptors)?;
         Ok((
-            HandedService::Leader {
+            ServiceHandoff::Leader {
                 host,
                 listener: (address, unix),
                 joins,
-                engines: handed_engines,
+                engines: engine_handoffs,
                 next_engine,
-                clients: handed_clients,
-                members: handed_members,
+                clients: client_handoffs,
+                members: member_handoffs,
                 nodes: nodes.iter().map(prost::Message::encode_to_vec).collect(),
                 stops: stops
                     .into_iter()
@@ -1492,7 +1502,7 @@ impl LeaderService {
 pub(crate) fn resume(
     host: String,
     devices: super::DeviceProbe,
-    handed: HandedService,
+    handoff: ServiceHandoff,
     descriptors: Vec<OwnedFd>,
     commands: Receiver<(u64, process::Command)>,
     reports: Sender<(u64, process::Report)>,
@@ -1502,15 +1512,15 @@ pub(crate) fn resume(
     wake: Sender<()>,
     processes: ProcessTable,
     stop: &Stop,
-) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
+) -> anyhow::Result<Option<(ServiceHandoff, Vec<OwnedFd>)>> {
     let mut descriptors = descriptors.into_iter();
     let mut next = || {
         descriptors
             .next()
-            .ok_or_else(|| anyhow::anyhow!("the handed-over service lacks a descriptor"))
+            .ok_or_else(|| anyhow::anyhow!("the service's handoff lacks a descriptor"))
     };
-    match handed {
-        HandedService::Leader {
+    match handoff {
+        ServiceHandoff::Leader {
             host: leader_host,
             listener: (address, unix),
             joins,
@@ -1535,9 +1545,9 @@ pub(crate) fn resume(
                     EngineConnection {
                         connection: connection.resume(next()?)?,
                         welcomed,
-                        // A handed-over process link is filed under the number
+                        // A process link of the handoff is filed under the number
                         // its engine stated, which is the identity its
-                        // requests are answered for; a peer still unfiled
+                        // requests are served for; a peer still unfiled
                         // keeps the key it arrived under until it greets.
                         process_of: None,
                         requests_of: None,
@@ -1625,7 +1635,7 @@ pub(crate) fn resume(
                 stop,
             )
         }
-        HandedService::Member { leader, local } => {
+        ServiceHandoff::Member { leader, local } => {
             let leader = leader.resume(next()?)?;
             let mut rest: std::vec::IntoIter<OwnedFd> = descriptors.collect::<Vec<_>>().into_iter();
             let local = Local::adopt(host, devices, local, &mut rest)?;

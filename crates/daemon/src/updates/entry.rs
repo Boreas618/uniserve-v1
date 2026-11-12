@@ -96,7 +96,7 @@ fn switches_probes_only(served: &EngineConfig, target: &EngineConfig) -> bool {
 /// The parts of `config` a replica compares in place: all of it but what a
 /// module selection owns (the package backends, the scheduling policy, the
 /// expert exchange and the speculative cost figures). A change reaches a
-/// replica only once the module set has answered for those.
+/// replica only once the module set has accounted for those.
 fn comparable(config: &EngineConfig) -> EngineConfig {
     let mut comparable = config.clone();
     comparable.attention_backend = String::new();
@@ -902,8 +902,8 @@ mod tests {
             .expect("the configuration resolves")
     }
 
-    /// The fence probes' switch, and a component's probes switched off, change in place; the
-    /// probed components and PC sampling shape the captured graphs and take a new epoch.
+    /// The fence probes' switch, and a module's probes switched off, change in place; the
+    /// probed modules and PC sampling shape the captured graphs and take a new epoch.
     #[test]
     fn only_the_fence_probes_switch_changes_profiling_in_place() {
         let profiled = |profiling: proto::config::ProfilingConfig| EngineConfig {
@@ -921,7 +921,7 @@ mod tests {
             ..served.profiling.clone()
         });
         assert!(switches_probes_only(&served, &switched));
-        // A component's probes switch off in place too.
+        // A module's probes switch off in place too.
         let thinned = profiled(proto::config::ProfilingConfig {
             fence_probes_off: vec!["*.Attention".to_owned()],
             ..served.profiling.clone()

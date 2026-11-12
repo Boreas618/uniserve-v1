@@ -9,7 +9,7 @@
 //!
 //! The daemons talk the process interface (`proto::process`). Each member
 //! daemon joins the leader at the leader's address; the leader then accepts
-//! engines on its process socket, answers their requests for its own node
+//! engines on its process socket, replies to their requests for its own node
 //! and forwards the others to the member that owns the node (`service`).
 //!
 //! A hot restart hands a running daemon's service to its successor
@@ -22,7 +22,7 @@ pub(crate) mod processes;
 mod service;
 mod supervisor;
 
-pub(crate) use service::HandedService;
+pub(crate) use service::ServiceHandoff;
 pub use supervisor::LIFELINE_ENV;
 pub(crate) use supervisor::engine_executable;
 
@@ -71,19 +71,19 @@ pub struct DaemonOptions {
     /// leader.
     pub join_timeout: Duration,
     /// Reads which of this host's devices are idle, for the deployment's
-    /// planning of where its processes run.
+    /// placement of its processes.
     pub devices: DeviceProbe,
-    /// This node's Build Server, which the main processes the node starts resolve their
+    /// This node's Build Server, which the engines the node starts resolve their
     /// modules from (`build_config`).
     pub build_server: build_server::command::Settings,
 }
 
 /// Reads the ordinals of this host's idle devices from the driver.
 ///
-/// The daemon plans placements and supervises processes but runs no device
+/// The daemon places and supervises processes but runs no device
 /// code itself, so the executable that links the platform supplies the probe,
 /// as it supplies the Build Server's host targets. An `Err` states why the
-/// devices could not be read; the daemon answers the asking engine with it.
+/// devices could not be read; the daemon replies to the asking engine with it.
 pub type DeviceProbe = fn() -> Result<Vec<u32>, String>;
 
 /// The daemon's downward path to the engines its service supervises, and the
@@ -178,7 +178,7 @@ pub struct Daemon {
 
 /// How the service thread ended: stopped (`None`), or stopped for a hot
 /// restart with what it served and its descriptors.
-type Served = anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>>;
+type Served = anyhow::Result<Option<(ServiceHandoff, Vec<OwnedFd>)>>;
 
 impl Daemon {
     /// Starts this node's daemon. The leader binds its process socket and
@@ -243,7 +243,7 @@ impl Daemon {
             let (exits, exits_rx) = std::sync::mpsc::channel();
             let (activity, awake) = std::sync::mpsc::channel();
             // The processes this node supervises, which the service keeps
-            // current and the admin API reports (§2.3, §7.4).
+            // current and the admin API reports.
             let table: service::ProcessTable = Default::default();
             let published = Arc::clone(&table);
             let thread = std::thread::Builder::new()
@@ -322,7 +322,7 @@ impl Daemon {
         host: String,
         devices: DeviceProbe,
         address: Option<(String, Option<PathBuf>)>,
-        handed: HandedService,
+        service: ServiceHandoff,
         descriptors: Vec<OwnedFd>,
     ) -> anyhow::Result<Self> {
         let (wake, wake_reader) = UnixStream::pair().context("creating the daemon's wake")?;
@@ -342,7 +342,7 @@ impl Daemon {
         let (activity, awake) = std::sync::mpsc::channel();
         let table: service::ProcessTable = Default::default();
         let published = Arc::clone(&table);
-        let leader = matches!(handed, HandedService::Leader { .. });
+        let leader = matches!(service, ServiceHandoff::Leader { .. });
         let node = host.clone();
         let thread = std::thread::Builder::new()
             .name("daemon".into())
@@ -350,7 +350,7 @@ impl Daemon {
                 service::resume(
                     node,
                     devices,
-                    handed,
+                    service,
                     descriptors,
                     commands_rx,
                     reports,
@@ -400,7 +400,7 @@ impl Daemon {
     /// # Errors
     ///
     /// Fails when the service ended or failed before it handed over.
-    pub(crate) fn hand_over(&mut self) -> anyhow::Result<(HandedService, Vec<OwnedFd>)> {
+    pub(crate) fn hand_over(&mut self) -> anyhow::Result<(ServiceHandoff, Vec<OwnedFd>)> {
         use std::io::Write as _;
 
         self.handoff.store(true, Ordering::Release);
@@ -417,7 +417,7 @@ impl Daemon {
             .context("the daemon's service stopped before it handed over")
     }
 
-    /// The command channel to the main processes this node's daemon
+    /// The command channel to the engines this node's daemon
     /// supervises; `None` on a member, which supervises none here.
     pub fn commands(&self) -> Option<ProcessCommands> {
         self.commands.clone()
@@ -646,7 +646,7 @@ fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
     })?;
     let welcome: Welcome = connection
         .recv(options.join_timeout)?
-        .context("the leader did not answer this node's hello")?;
+        .context("the leader did not reply to this node's hello")?;
     anyhow::ensure!(
         welcome.refusal.is_empty(),
         "the leader refused this node: {}",
@@ -692,10 +692,10 @@ mod tests {
 
     /// A leader's service handed over goes on with what it served: a
     /// request on an engine connection the first service accepted is
-    /// answered by the successor's, which ends the process the first one
+    /// served by the successor's, which ends the process the first one
     /// started.
     #[test]
-    fn a_resumed_service_answers_the_connections_it_was_handed() {
+    fn a_resumed_service_serves_the_connections_of_its_handoff() {
         for network in [false, true] {
             resumed_service(network);
         }
@@ -724,7 +724,7 @@ mod tests {
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Engine(Engine {
                     deployment: "model".to_owned(),
-                    // A test client that asks for a spawn, not a main process: it states no engine
+                    // A test client that asks for a spawn, not an engine: it states no engine
                     // number and no interface, so no command is addressed to it.
                     engine: 0,
                     interface: 0,
@@ -747,11 +747,11 @@ mod tests {
             }),
         );
         let Some(reply::Kind::Spawned(spawned)) = reply(&mut engine).kind else {
-            panic!("the spawn was not answered");
+            panic!("the spawn got no reply");
         };
 
-        let (handed, descriptors) = daemon.hand_over().unwrap();
-        // The handed-over daemon ends nothing and leaves its socket.
+        let (handoff, descriptors) = daemon.hand_over().unwrap();
+        // The daemon that handed over ends nothing and leaves its socket.
         drop(daemon);
         assert_eq!(socket.exists(), !network);
         assert!(Path::new(&format!("/proc/{}", spawned.pid)).exists());
@@ -759,7 +759,7 @@ mod tests {
             "localhost".to_owned(),
             || Ok(Vec::new()),
             Some((address, (!network).then_some(socket.clone()))),
-            handed,
+            handoff,
             descriptors,
         )
         .unwrap();

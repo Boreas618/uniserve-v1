@@ -9,7 +9,7 @@
 //! arming it ([`Engine::refuse_prepare`], [`Engine::fault_at_switch`]) or by
 //! sending the report itself ([`Engine::fault`], [`Engine::rolled_back`]).
 //!
-//! [`node_reply`] answers the requests a leader makes of a node's daemon
+//! [`node_reply`] replies to the requests a leader makes of a node's daemon
 //! (`Spawn`, `Claim`, `Stop`, `KeepWeights`) the way a node does, with what
 //! [`Refusals`] names refused.
 

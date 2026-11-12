@@ -4,11 +4,11 @@
 //! supervision, through the process interface like any process of the
 //! deployment: [`EngineControl`] connects to the daemon's process socket and
 //! asks it to spawn `uniserve engine` on the node, which connects back to the
-//! daemon's request socket and says hello. The daemon answers with the
+//! daemon's request socket and says hello. The daemon responds with the
 //! engine's specification and waits until the engine reports that it serves;
 //! the engine's process lives for as long as its control connection does.
 //!
-//! An engine whose worker group has ranks on several hosts is one main process
+//! A deployment whose worker group has ranks on several hosts has one engine
 //! per host ([`world_hosts`]): the scheduler node's, on the deployment's engine
 //! host, and a peer on each other host. They are started together, the daemon
 //! having reserved on the scheduler node the two sockets the peers dial (the
@@ -40,13 +40,13 @@ const TARGET_STATE_READ: Duration = Duration::from_secs(60);
 /// once the daemon started it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long the daemon takes to answer the control connection.
+/// How long the daemon takes to reply on the control connection.
 const DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How often a wait rechecks the engine process while it starts.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Variables a main process's CUDA and NCCL libraries read before their first use, with the value it
+/// Variables an engine's CUDA and NCCL libraries read before their first use, with the value it
 /// runs with unless the daemon's own environment states the variable.
 ///
 /// - `CUDA_MODULE_LOADING=EAGER`: lazy module loading synchronizes the context when a kernel is first
@@ -58,7 +58,7 @@ const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
     ("NCCL_RUNTIME_CONNECT", "0"),
 ];
 
-/// The environment a main process is started under: stated on its command, so it precedes any CUDA
+/// The environment an engine is started under: stated on its command, so it precedes any CUDA
 /// or NCCL initialization.
 fn main_process_environment() -> std::collections::HashMap<String, String> {
     RUNTIME_DEFAULTS
@@ -109,7 +109,7 @@ pub struct EngineControl {
     /// The deployment the engines serve.
     deployment: String,
     /// This node's Build Server socket, which every engine process is told
-    /// to resolve an epoch's modules from (§5.3, §7.3).
+    /// to resolve an epoch's modules from.
     build_server: PathBuf,
     next_engine: AtomicU64,
     /// Engine handoffs can connect in any order. Reading and assigning
@@ -176,7 +176,7 @@ impl EngineControl {
 
     /// [`EngineControl::start`] under a number the caller allocated.
     ///
-    /// A standby's number comes from the epoch layer's one allocator
+    /// A standby's number comes from the epoch records' one allocator
     /// ([`crate::epoch::Epochs::next_generation`]), which also numbers the
     /// launches an epoch switch starts; two counters for one identity would
     /// drift the day a standby exists, so the standby path does not use
@@ -201,7 +201,7 @@ impl EngineControl {
         self.start_world(args, &numbers, stats)
     }
 
-    /// Starts the engine of `args` as one main process per host of its worker group, numbered
+    /// Starts the deployment of `args` as one engine per host of its worker group, numbered
     /// `numbers` in [`world_hosts`]'s order (the scheduler node's first), and returns the scheduler
     /// node's client, which holds the peers'. Each process reports that it serves, or that it
     /// stands by when `args` names a predecessor.
@@ -219,7 +219,7 @@ impl EngineControl {
         let hosts = world_hosts(&args.engine_config)?;
         anyhow::ensure!(
             numbers.len() == hosts.len(),
-            "{} engine numbers for the main processes of {} hosts",
+            "{} engine numbers for the engines of {} hosts",
             numbers.len(),
             hosts.len()
         );
@@ -301,7 +301,7 @@ impl EngineControl {
             );
         }
         let mut clients = clients.into_iter();
-        let scheduler = clients.next().context("an engine of no main process")?;
+        let scheduler = clients.next().context("a deployment of no engine")?;
         Ok(scheduler.with_peers(clients.collect()))
     }
 
@@ -329,7 +329,7 @@ impl EngineControl {
             );
             match reply.kind {
                 Some(reply::Kind::Reserved(reserved)) => Ok(reserved),
-                _ => anyhow::bail!("the daemon answered a reservation with another reply"),
+                _ => anyhow::bail!("the daemon sent another reply to a reservation"),
             }
         };
         let channel = reserve(1)?;
@@ -537,7 +537,7 @@ impl EngineControl {
         })?;
         let welcome: process::Welcome = control
             .recv(DAEMON_TIMEOUT)?
-            .context("the daemon did not answer the control connection")?;
+            .context("the daemon did not respond on the control connection")?;
         anyhow::ensure!(
             welcome.refusal.is_empty(),
             "the daemon refused the control connection: {}",
@@ -549,7 +549,7 @@ impl EngineControl {
 
     /// The storage ledgers every node's Storage Server keeps for the deployment, one JSON report
     /// per node: `{"host": ..., "ledgers": [...], "host_storage": {...}, "transfers": [...]}`.
-    /// Each node's daemon reads them over its claim, so no main process is asked.
+    /// Each node's daemon reads them over its claim, so no engine is asked.
     pub(crate) fn storage_reports(&self) -> anyhow::Result<Vec<String>> {
         let (mut connection, nodes) = self.connect()?;
         let mut reports = Vec::with_capacity(nodes.len());
@@ -564,18 +564,18 @@ impl EngineControl {
                     })),
                 })),
             })?;
-            let answer: process::Downstream = connection
+            let message: process::Downstream = connection
                 .recv(DAEMON_TIMEOUT)?
                 .context("the daemon did not report its storage ledgers")?;
-            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
-                anyhow::bail!("the daemon did not answer its ledger query");
+            let Some(downstream::Kind::Reply(reply)) = message.kind else {
+                anyhow::bail!("the daemon did not reply to its ledger query");
             };
             anyhow::ensure!(
-                answer.error.is_empty(),
+                reply.error.is_empty(),
                 "the storage ledgers of {host}: {}",
-                answer.error
+                reply.error
             );
-            let Some(reply::Kind::Ledger(report)) = answer.kind else {
+            let Some(reply::Kind::Ledger(report)) = reply.kind else {
                 anyhow::bail!("the daemon returned no storage ledger");
             };
             let mut report: serde_json::Value = serde_json::from_str(&report.ledgers)?;
@@ -587,7 +587,7 @@ impl EngineControl {
 
     /// Publishes one commit decision at every deployment node. Publication
     /// is atomic within each Storage Server and idempotent across retries;
-    /// the daemon retains its commit decision until every node has answered.
+    /// the daemon retains its commit decision until every node has replied.
     pub fn publish_epochs(
         &self,
         epochs: &[u64],
@@ -607,19 +607,19 @@ impl EngineControl {
                     })),
                 })),
             })?;
-            let answer: process::Downstream = connection
+            let message: process::Downstream = connection
                 .recv(DAEMON_TIMEOUT)?
                 .context("the daemon did not report epoch publication")?;
-            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
-                anyhow::bail!("the daemon did not answer epoch publication");
+            let Some(downstream::Kind::Reply(reply)) = message.kind else {
+                anyhow::bail!("the daemon did not reply to epoch publication");
             };
             anyhow::ensure!(
-                answer.error.is_empty(),
+                reply.error.is_empty(),
                 "publishing epochs at {host}: {}",
-                answer.error
+                reply.error
             );
             anyhow::ensure!(
-                matches!(answer.kind, Some(reply::Kind::EpochsPublished(_))),
+                matches!(reply.kind, Some(reply::Kind::EpochsPublished(_))),
                 "the daemon returned no publication result"
             );
             pending.remove(0);
@@ -628,9 +628,9 @@ impl EngineControl {
     }
 
     /// Has every node's daemon halve, or restore when not `halve`, the byte
-    /// budgets of the links the deployment's transfers use, and answers the
+    /// budgets of the links the deployment's transfers use, and returns the
     /// hosts that took it. A node that holds no claim of the deployment has
-    /// nothing to throttle and says so by answering.
+    /// nothing to throttle and says so in its reply.
     ///
     /// # Errors
     ///
@@ -651,17 +651,17 @@ impl EngineControl {
                     )),
                 })),
             })?;
-            let answer: process::Downstream = connection
+            let message: process::Downstream = connection
                 .recv(DAEMON_TIMEOUT)?
                 .context("the daemon did not report the throttle")?;
-            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
-                anyhow::bail!("the daemon did not answer the throttle");
+            let Some(downstream::Kind::Reply(reply)) = message.kind else {
+                anyhow::bail!("the daemon did not reply to the throttle");
             };
             anyhow::ensure!(
-                answer.error.is_empty(),
+                reply.error.is_empty(),
                 "throttling transfers at {}: {}",
                 node.host,
-                answer.error
+                reply.error
             );
             hosts.push(node.host);
         }
@@ -710,7 +710,7 @@ impl EngineControl {
         ))
     }
 
-    /// Has the daemon of `launch`'s host start the main process `launch` describes, inheriting the
+    /// Has the daemon of `launch`'s host start the engine `launch` describes, inheriting the
     /// sockets of `inherit`; returns the control connection the process lives under.
     fn spawn(&self, launch: &EngineArgs, inherit: Vec<u64>) -> anyhow::Result<Connection> {
         let engine = launch.engine;
@@ -744,13 +744,13 @@ impl EngineControl {
                 })),
             })),
         })?;
-        let answer = await_reply(&mut control, 1, "the engine's start")?;
+        let reply = await_reply(&mut control, 1, "the engine's start")?;
         anyhow::ensure!(
-            answer.error.is_empty(),
+            reply.error.is_empty(),
             "starting the engine process on {host}: {}",
-            answer.error
+            reply.error
         );
-        if let Some(reply::Kind::Spawned(spawned)) = answer.kind {
+        if let Some(reply::Kind::Spawned(spawned)) = reply.kind {
             tracing::info!(
                 engine,
                 host,
@@ -776,7 +776,7 @@ impl EngineControl {
             return Ok(connection);
         }
         let deadline = Instant::now() + CONNECT_TIMEOUT;
-        // Whether the handed-over control connection has been seen to close: the service
+        // Whether the handoff's control connection has been seen to close: the service
         // goes on with its accepted side, so an end here is a predecessor that left without
         // handing it over, and not the engine. Stated once.
         let mut control_closed = false;
@@ -847,28 +847,28 @@ impl Drop for EngineControl {
     }
 }
 
-/// Reads the reply `id` on a control connection, within the daemon's answer time.
+/// Reads the reply `id` on a control connection, within the daemon's reply time.
 fn await_reply(control: &mut Connection, id: u64, what: &str) -> anyhow::Result<process::Reply> {
     let deadline = Instant::now() + DAEMON_TIMEOUT;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         anyhow::ensure!(
             !remaining.is_zero(),
-            "the daemon did not answer {what} in time"
+            "the daemon did not reply to {what} in time"
         );
         let Some(message) = control.recv::<process::Downstream>(remaining)? else {
             continue;
         };
-        if let Some(downstream::Kind::Reply(answer)) = message.kind
-            && answer.id == id
+        if let Some(downstream::Kind::Reply(reply)) = message.kind
+            && reply.id == id
         {
-            return Ok(answer);
+            return Ok(reply);
         }
     }
 }
 
 /// Waits until every process of a world reported that it serves, or that it stands by when
-/// `standby`, and answers what each reported. The first failure ends the wait: a process that
+/// `standby`, and returns what each reported. The first failure ends the wait: a process that
 /// reports its start failed, or exits, as its control connection says.
 fn await_started(
     links: &mut [(Connection, Connection)],
@@ -988,8 +988,7 @@ fn exited(control: &mut Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One host's Build Server and the targets that host's devices build for
-/// (§5.1, §5.3, §6.3).
+/// One host's Build Server and the targets that host's devices build for.
 #[derive(Debug, Clone)]
 pub struct BuildServer {
     /// The host's identity in the deployment.
@@ -1001,8 +1000,7 @@ pub struct BuildServer {
     pub targets: Vec<build_server::Target>,
 }
 
-/// Selects the modules `filled` names at every host's Build Server
-/// (§5.1, §6.3):
+/// Selects the modules `filled` names at every host's Build Server:
 ///
 /// The leader host selects each slot's backend at its latest installed
 /// revision (`Selector::Latest`), which is the revision the epoch record
@@ -1011,17 +1009,17 @@ pub struct BuildServer {
 /// host, so a follower that lacks it fails the call rather than choosing
 /// another.
 ///
-/// The answer is `filled` with each package's revision and the parameters
+/// The output is `filled` with each package's revision and the parameters
 /// the Build Server selected for it, which is what the epoch record keeps
-/// and what `Precopy` sends to the main processes.
+/// and what `Prepare` sends to the engines.
 ///
 /// The step of the Build Server exchange the daemon is in.
 ///
 /// The exchange waits twice in a way this crate cannot bound: the client opens
-/// its socket, and reads the answer a Build Server may never send, with no
+/// its socket, and reads the response a Build Server may never send, with no
 /// deadline (`crates/build-server/src/protocol.rs`: `Connection::connect` and
 /// `Connection::receive`). Whoever times the call out reads the step recorded
-/// here, so a deadline names the wait rather than the phase (§7.3 step 1).
+/// here, so a deadline names the wait rather than the phase.
 #[derive(Clone)]
 pub struct PrepareSteps(std::sync::Arc<std::sync::Mutex<PrepareStep>>);
 
@@ -1067,7 +1065,7 @@ impl PrepareSteps {
 /// # Errors
 ///
 /// Fails when a host has no Build Server in `servers`, when a Build
-/// Server refuses or cannot build a module, and when a follower answers a
+/// Server refuses or cannot build a module, and when a follower returns a
 /// package other than the one the leader pinned.
 pub fn prepare_epoch(
     servers: &[BuildServer],
@@ -1115,7 +1113,7 @@ pub fn prepare_epoch(
 /// deployment uses: the engine, the scheduling policy and every kernel operator of this build.
 /// A package the deployment names takes the revision it states, else its latest installed one.
 /// Every candidate of an operator is recorded as well, one slot per package with the package as
-/// its part: for each descriptor key the main process later asks `cover` to select among exactly
+/// its part: for each descriptor key the engine later asks `cover` to select among exactly
 /// these revisions, so a package or a revision installed after this call is run by nobody until
 /// a configuration is applied again, and a later revision of one of them is a package change a
 /// configuration comparison sees.
@@ -1178,7 +1176,7 @@ fn candidates(
         .cover(&build_server::CoverRequest {
             op: op.to_owned(),
             // No target: a module set fixes revisions for every host of the deployment, and each
-            // main process selects among them for its own devices.
+            // engine selects among them for its own devices.
             targets: Vec::new(),
             keys: Vec::new(),
             preferred: preferred.to_vec(),
@@ -1209,7 +1207,7 @@ fn fix_revision(
 }
 
 /// Runs `prepare` at one host's Build Server for the module set `filled`,
-/// whose revisions are fixed, and answers it with the parameters each
+/// whose revisions are fixed, and returns it with the parameters each
 /// package runs with: its manifest's defaults under the deployment's
 /// arguments.
 fn prepare_at(
@@ -1236,7 +1234,7 @@ fn prepare_at(
         selector: build_server::Selector::Fixed(filled.engine.clone()),
     });
     // The engine's one module is built here, on every host, before any node
-    // starts a main process from it: a host whose store misses it builds the
+    // starts an engine from it: a host whose store misses it builds the
     // executable for its own platform now, while nothing waits on a start.
     let mut descriptors = descriptors.to_vec();
     descriptors.push(build_server::Descriptors {
@@ -1302,7 +1300,7 @@ fn prepare_at(
     };
     steps.at(
         &server.host,
-        "waiting for a Build Server's answer to the prepare",
+        "waiting for a Build Server's response to the prepare",
     );
     let prepared = client
         .prepare(&request, &mut progress)
@@ -1311,7 +1309,7 @@ fn prepare_at(
     tracing::info!(
         host = %server.host,
         prepared = prepared.len(),
-        "a Build Server answered"
+        "a Build Server responded"
     );
     let mut kernels = BTreeMap::new();
     let mut policy = None;
@@ -1343,7 +1341,7 @@ fn prepare_at(
 
 /// The slot the scheduling policy package fills: the name the policy packages state
 /// as their `op` (`crates/scheduling/policies/<backend>/package.toml`). The
-/// scheduling interface is not an operator (§5.1): the epoch record keeps its
+/// scheduling interface is not an operator: the epoch record keeps its
 /// package beside the kernels' rather than among them, so `prepare` names it
 /// by this slot and the daemon takes it back out.
 const POLICY_SLOT: &str = "scheduling";
@@ -1352,7 +1350,7 @@ const POLICY_SLOT: &str = "scheduling";
 /// registered under, which a command names and a report carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EpochProcess {
-    /// The node the main process runs on.
+    /// The node the engine runs on.
     pub host: String,
     /// The engine number its process connection is registered under, which a
     /// command names and a report carries.
@@ -1366,7 +1364,7 @@ impl crate::interference::Throttle for EngineControl {
     }
 }
 
-/// What a node's main process reaches, as its launch file states it.
+/// What a node's engine reaches, as its launch file states it.
 pub(crate) struct Interfaces<'a> {
     /// The leader daemon's request interface.
     pub(crate) requests: &'a str,
@@ -1405,7 +1403,7 @@ pub(crate) fn place(
     )
 }
 
-/// The ranks of the deployment's worker groups one host holds: a main process's place.
+/// The ranks of the deployment's worker groups one host holds: an engine's place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostRanks {
     /// The host, by host identity.
@@ -1417,7 +1415,7 @@ pub(crate) struct HostRanks {
 }
 
 /// The hosts of the deployment's worker groups, the engine host first, each with the consecutive
-/// ranks it holds: one main process per host serves an epoch (`docs/architecture.md`, The
+/// ranks it holds: one engine per host serves an epoch (`docs/architecture.md`, The
 /// channel), the engine host's holding rank 0 and the schedulers.
 ///
 /// # Errors
@@ -1437,7 +1435,7 @@ pub(crate) fn world_hosts(config: &proto::config::EngineConfig) -> anyhow::Resul
         if previous != Some(rank.host.as_str()) {
             anyhow::ensure!(
                 !order.contains(&rank.host),
-                "the ranks of host {} are not consecutive: a host's main process serves one run \
+                "the ranks of host {} are not consecutive: a host's engine serves one run \
                  of its group's ranks",
                 rank.host
             );
@@ -1448,7 +1446,7 @@ pub(crate) fn world_hosts(config: &proto::config::EngineConfig) -> anyhow::Resul
     anyhow::ensure!(
         order.first() == Some(engine_host),
         "the deployment's first rank runs on {:?} and its engine host is {engine_host}: the engine \
-         host's main process holds rank 0 and the schedulers",
+         host's engine holds rank 0 and the schedulers",
         order.first()
     );
     let mut first = 0_u32;
@@ -1515,7 +1513,7 @@ fn place_on(
 /// does state an order has already had it folded into the ranks by
 /// [`proto::config::WorkerGroupConfig::shorthand`]. Reading the ranks is the
 /// one account of both, and it is what the launch file states as the devices
-/// of this node's process (§2.3, §7.4).
+/// of this node's process.
 ///
 /// # Errors
 ///
@@ -1533,7 +1531,7 @@ fn local_devices(host: &str, config: &proto::config::EngineConfig) -> anyhow::Re
                 .strip_prefix("cuda:")
                 .with_context(|| {
                     format!(
-                        "host {host} runs a rank on {:?}: a main process serves CUDA devices",
+                        "host {host} runs a rank on {:?}: an engine serves CUDA devices",
                         rank.device
                     )
                 })?
@@ -1595,7 +1593,7 @@ mod tests {
         assert!(placed.build_server.is_empty());
     }
 
-    /// A worker group whose ranks spread over two hosts is one main process per host, the engine
+    /// A worker group whose ranks spread over two hosts has one engine per host, the engine
     /// host's first and holding rank 0, each with its own run of the group's ranks.
     #[test]
     fn a_group_over_two_hosts_is_one_process_per_host() {
@@ -1677,10 +1675,9 @@ mod tests {
         assert_eq!(parked.epoch, 3);
     }
 
-    /// A handed-over control connection whose accepted side is gone closed with the
+    /// A handoff's control connection whose accepted side is gone closed with the
     /// predecessor's service, and that is the predecessor leaving, not an engine exit:
-    /// the successor waits for the engine's own dial instead of refusing the adoption
-    /// (§7.5.1 step 2).
+    /// the successor waits for the engine's own dial instead of refusing the adoption.
     #[test]
     fn a_closed_control_connection_is_not_an_engine_exit() {
         let directory = tempfile::tempdir().unwrap();

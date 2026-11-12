@@ -402,7 +402,7 @@ fn a_rollback_by_decision_returns_to_the_kept_generation() {
 
     let report = deployment
         .updater
-        .rollback(decision("the answers got worse"))
+        .rollback(decision("the responses got worse"))
         .expect("an update is on trial");
     assert_eq!(report["phase"], "switching");
     assert_eq!(report["rollback"], true);
@@ -412,7 +412,7 @@ fn a_rollback_by_decision_returns_to_the_kept_generation() {
     assert_eq!(
         deployment.engines.received(PREVIOUS).last(),
         Some(&command::Kind::Rollback(process::Rollback {
-            reason: "the answers got worse".to_owned(),
+            reason: "the responses got worse".to_owned(),
         }))
     );
     assert_eq!(deployment.engines.engine(PREVIOUS).generation(), 1);
@@ -421,7 +421,7 @@ fn a_rollback_by_decision_returns_to_the_kept_generation() {
             .updater
             .unavailable(&deployment.target)
             .map(|mark| mark.reason),
-        Some("the answers got worse".to_owned())
+        Some("the responses got worse".to_owned())
     );
     // Another target is not marked.
     assert_eq!(deployment.updater.unavailable(&deployment.serving), None);
@@ -698,7 +698,7 @@ fn a_rollback_on_trial_returns_to_the_parked_previous_epoch() {
 
     deployment
         .updater
-        .rollback(decision("the model no longer answers usefully"))
+        .rollback(decision("the model no longer responds usefully"))
         .expect("an update is on trial");
     deployment.run();
 

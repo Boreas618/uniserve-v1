@@ -1,7 +1,7 @@
-//! The trial an update stands while it is on probation: the thresholds of
-//! `update_config.rollback`, read against what the main processes report.
+//! The trial an update stands in its `Trial` phase: the thresholds of
+//! `update_config.rollback`, read against what the engines report.
 //!
-//! A fault of the target reverts an update by itself, through the reports the
+//! A fault of the target rolls an update back by itself, through the reports the
 //! switch reads. This module adds what no process can report about itself: that
 //! its steps are slower, or its throughput lower, than the steps the deployment
 //! served before the promotion, or that the requests ending on it fail too
@@ -15,7 +15,7 @@
 //!   whole `window` of it passed, so a target is judged on as long a span as
 //!   the epoch it is compared with.
 //! - **The failure rate** is the share of the requests that ended since the
-//!   trial began that failed (`crate::leader::outcomes`): it needs no window,
+//!   trial began that failed (`crate::leader::request_counts`): it needs no window,
 //!   and it decides nothing before a request ended.
 //!
 //! A threshold left unset decides nothing, so a deployment that states none has
@@ -24,7 +24,7 @@
 //! the status shows the empty baseline.
 //!
 //! The trial only decides. [`Trial::breach`] names the first threshold it finds
-//! passed as the update's [`Failure`], and the caller reverts through the path a
+//! passed as the update's [`Failure`], and the caller rolls back through the path a
 //! fault takes, so the update ends unavailable with that reason.
 
 use std::sync::Arc;
@@ -37,8 +37,8 @@ use crate::observe::{Observer, Rates};
 use crate::options::RollbackConfig;
 
 /// How often a trial reads its thresholds and its switch's end: a report
-/// arrives once a second, and a revert waits for the hold to name the epoch
-/// that serves next, so this is part of the pause a revert costs.
+/// arrives once a second, and a rollback waits for the hold to name the epoch
+/// that serves next, so this is part of the pause a rollback costs.
 pub(crate) const INTERVAL: Duration = Duration::from_millis(100);
 
 /// One replica's reports a trial reads: the epoch the update serves it from,
@@ -71,51 +71,51 @@ impl Observed {
     }
 }
 
-/// An update on probation, as far as its thresholds read it.
+/// An update on trial, as far as its thresholds read it.
 pub(crate) struct Trial {
     thresholds: RollbackConfig,
     observed: Vec<Observed>,
-    /// When the trial began: reports and outcomes count from here.
+    /// When the trial began: reports and request counts start from here.
     began: Instant,
-    /// The request outcomes counted when the trial began.
-    outcomes: (u64, u64),
+    /// The requests that had ended, and those of them that had failed, when the trial began.
+    counts: (u64, u64),
 }
 
 impl Trial {
-    /// A trial of `thresholds` over `observed`, beginning now with `outcomes`
-    /// counted so far.
+    /// A trial of `thresholds` over `observed`, beginning now with the `counts`
+    /// of requests so far.
     pub(crate) fn begin(
         thresholds: RollbackConfig,
         observed: Vec<Observed>,
-        outcomes: (u64, u64),
+        counts: (u64, u64),
     ) -> Self {
         Self {
             thresholds,
             observed,
             began: Instant::now(),
-            outcomes,
+            counts,
         }
     }
 
-    /// The requests that ended and failed since the trial began, of `outcomes`
-    /// counted now.
-    fn since(&self, outcomes: (u64, u64)) -> (u64, u64) {
+    /// The requests that ended and failed since the trial began, of the `counts`
+    /// taken now.
+    fn since(&self, counts: (u64, u64)) -> (u64, u64) {
         (
-            outcomes.0.saturating_sub(self.outcomes.0),
-            outcomes.1.saturating_sub(self.outcomes.1),
+            counts.0.saturating_sub(self.counts.0),
+            counts.1.saturating_sub(self.counts.1),
         )
     }
 
-    /// The first threshold the trial passed, `outcomes` being the requests
-    /// counted now: what the update reverts with, or `None` while none is.
-    pub(crate) fn breach(&self, outcomes: (u64, u64)) -> Option<Failure> {
+    /// The first threshold the trial passed, `counts` being the requests
+    /// counted now: what the update rolls back with, or `None` while none is.
+    pub(crate) fn breach(&self, counts: (u64, u64)) -> Option<Failure> {
         let failure = |kind: &str, reason: String| Failure {
             kind: kind.to_owned(),
             reason,
             device: None,
         };
         if let Some(rate) = self.thresholds.failure_rate {
-            let (ended, failed) = self.since(outcomes);
+            let (ended, failed) = self.since(counts);
             if ended > 0 && failed as f64 / ended as f64 > rate {
                 return Some(failure(
                     "failure_rate",
@@ -168,8 +168,8 @@ impl Trial {
     }
 
     /// The trial as `GET /admin/config` reports it.
-    pub(crate) fn report(&self, outcomes: (u64, u64)) -> Value {
-        let (ended, failed) = self.since(outcomes);
+    pub(crate) fn report(&self, counts: (u64, u64)) -> Value {
+        let (ended, failed) = self.since(counts);
         let window = self.thresholds.window;
         let rates: Vec<_> = self
             .observed
@@ -236,7 +236,7 @@ mod tests {
         }
     }
 
-    /// A step past the regression reverts with that reason, and steps within
+    /// A step past the regression rolls back with that reason, and steps within
     /// it do not.
     #[test]
     fn a_slowed_target_breaches_the_step_time_regression() {

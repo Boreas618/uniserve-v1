@@ -70,7 +70,7 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 /// or until the leader's connection closes.
 ///
 /// The leader serves the HTTP API. Its listener is bound once the engine has
-/// started, so the port accepts connections only when the server can answer
+/// started, so the port accepts connections only when the server can respond to
 /// them. Cancellation before the engine has started stops the start and
 /// returns `Ok(())` without binding a listener. Once it has started, the
 /// server shuts down as `serve_on` describes, and the engine is shut down
@@ -180,13 +180,13 @@ pub async fn serve(
         .await
     }
     .await;
-    let handed_over = served.as_ref().is_ok_and(|handed| *handed);
+    let handoff_sent = served.as_ref().is_ok_and(|handoff_sent| *handoff_sent);
     finish(
         &config,
         &engine,
         daemon,
         retire,
-        handed_over,
+        handoff_sent,
         served.map(drop),
     )
     .await
@@ -219,7 +219,7 @@ pub(crate) async fn serve_leader(
         stated.clone(),
         accepting.clone(),
     )?);
-    let handed_over = Arc::clone(&restarter.handed_over);
+    let handoff_sent = Arc::clone(&restarter.handoff_sent);
     let restarting = restarter.restarting();
     let mut decided = restarter.decide();
     serve_on(
@@ -247,11 +247,11 @@ pub(crate) async fn serve_leader(
         if waited.is_err() {
             tracing::warn!(
                 "a restart was still in flight when this daemon stopped serving; its successor \
-                 may have been left holding a handoff nobody answers"
+                 may have been left holding a handoff nobody responds to"
             );
         }
     }
-    Ok(handed_over.load(Ordering::Acquire))
+    Ok(handoff_sent.load(Ordering::Acquire))
 }
 
 /// Ends a leader's serving: shuts its engine down, stops the daemon and,
@@ -269,10 +269,10 @@ pub(crate) async fn finish(
     engine: &Arc<Leader>,
     daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
     retire: Arc<AtomicBool>,
-    handed_over: bool,
+    handoff_sent: bool,
     served: Result<()>,
 ) -> Result<()> {
-    if handed_over {
+    if handoff_sent {
         info!("the successor daemon serves the deployment; this daemon exits");
         return served.and(engine.detach().await);
     }
@@ -377,7 +377,7 @@ async fn serve_on(
 
     // The daemon admits requests until its handoff's pause starts: from then
     // on the deployment's next request is the successor's, and each connection
-    // ends at its next request boundary (design §7.5.1 step 1). The registry
+    // ends at its next request boundary. The registry
     // exists once the router is built, and a daemon that cannot hand over (no
     // restarter) admits for as long as it serves.
     let admitting = restarter
@@ -387,7 +387,7 @@ async fn serve_on(
 
     // The responses the daemon this one replaced handed over go on here: each
     // connection writes the bytes the predecessor did not write and then goes
-    // on with the resumed body (design §7.5.1 step 4).
+    // on with the resumed body.
     for stream in crate::restart::streams::take_adopted() {
         let app = app.clone();
         let admitting = admitting.clone();
@@ -397,7 +397,7 @@ async fn serve_on(
             let adopted = request_id.clone();
             let ended = request_id.clone();
             // The adoption is recorded here and nowhere else: this process
-            // serves the response, and the moment §7.5.1 step 4 names is the
+            // serves the response, and the moment it records is the
             // one before its first frame of its own. The record of the
             // response's end names the response, not the connection this
             // process may go on serving.
@@ -417,7 +417,7 @@ async fn serve_on(
             .await
             .err();
             if let Some(error) = error {
-                tracing::warn!(%request_id, %error, "a handed-over connection ended");
+                tracing::warn!(%request_id, %error, "a connection of the handoff ended");
             }
         });
     }
@@ -450,13 +450,13 @@ async fn serve_on(
 
 /// Assembles the router of the tasks `engine` serves.
 ///
-/// Every engine answers the operational routes `/health` and `/metrics`,
+/// Every engine serves the operational routes `/health` and `/metrics`,
 /// which take no API key and are not counted in HTTP metrics, and `/version`,
 /// which takes the key but is not counted. `GET /v1/models` and the routes of
 /// each served task (`Leader::supported_tasks`) take the key and are counted.
 /// The generation routes (chat completions, image generation and synchronous
 /// video) share the in-flight limit. A path no
-/// route serves answers FastAPI's `404 {"detail": "Not Found"}`.
+/// route serves gets FastAPI's `404 {"detail": "Not Found"}`.
 ///
 /// Layers apply from the outside in: request ID (which also sets the
 /// `X-Request-Id` response header when enabled), tracing, body limit, API
@@ -543,7 +543,7 @@ pub(crate) fn router(
         }))
 }
 
-/// Answers `200 OK` while any scheduler is alive (`Leader::is_healthy`),
+/// Responds `200 OK` while any scheduler is alive (`Leader::is_healthy`),
 /// then `503 Service Unavailable`.
 async fn health(State(engine): State<Arc<Leader>>) -> StatusCode {
     if engine.is_healthy() {
@@ -571,7 +571,7 @@ async fn version() -> Json<serde_json::Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
-/// Answers a path no route serves as FastAPI does.
+/// Responds to a path no route serves as FastAPI does.
 async fn not_found() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -1061,7 +1061,7 @@ mod tests {
 
     /// A token model serves chat completions and no video route; a video
     /// model serves the video routes and no chat completions. A route the
-    /// model does not serve answers FastAPI's 404.
+    /// model does not serve gets FastAPI's 404.
     #[tokio::test]
     async fn routes_follow_the_served_tasks() {
         let not_found = json!({"detail": "Not Found"});
@@ -1126,10 +1126,10 @@ mod tests {
         assert_eq!(body["data"][0]["id"], SERVED_MODEL);
     }
 
-    /// A request whose response head is not ready within the timeout answers
-    /// 504; a zero timeout expires before any generation can answer.
+    /// A request whose response head is not ready within the timeout gets
+    /// 504; a zero timeout expires before any generation can respond.
     #[tokio::test]
-    async fn a_request_past_the_timeout_answers_504() {
+    async fn a_request_past_the_timeout_gets_504() {
         let router = router_with(
             served_engine(crate::test_support::CHAT),
             &ServerConfig {
@@ -1298,7 +1298,7 @@ mod tests {
             }
         });
 
-        // The server answers `100 Continue` once the handler waits for the
+        // The server responds `100 Continue` once the handler waits for the
         // body, which this client never sends, so the request is in flight.
         let mut connection = TcpStream::connect(&address).await.unwrap();
         connection
@@ -1340,12 +1340,12 @@ mod tests {
     }
 
     /// An engine rejection reaches an asynchronous job with the error code the
-    /// synchronous route answers the same rejection with.
+    /// synchronous route reports the same rejection with.
     #[tokio::test]
     async fn a_rejected_job_reports_the_synchronous_error_code() {
         let router = video_router();
 
-        // The simulator has no video media components, so the engine rejects
+        // The simulator has no video media stages, so the engine rejects
         // the request as invalid on both routes.
         let (sync_status, _, sync_body) =
             send(&router, post_json("/v1/videos/sync", &video_request())).await;
