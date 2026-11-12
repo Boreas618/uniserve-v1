@@ -1,13 +1,15 @@
 //! `CausalLmRunner` without a device: the bucket set, the profile run and the meta capture of
 //! every bucket, the bytes of the input tensors, the refusals, the page-work seam, the paired
-//! forward's inputs and the completion, over a small causal language model of `nn` operators
-//! on meta weights.
+//! forward's inputs, the completion and the step agreement of an expert union, over a small
+//! causal language model of `nn` operators on meta weights.
 //!
 //! The model exercises the cache through the modules a served model uses: its one layer
 //! writes its keys and values (`kv_write_`) and attends over them (`paged_attention`) through
 //! the page tables the runner gathers.
 
+use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ipc::execution::{
     Batch, BatchColumns, BatchId, BatchRow, BatchRows, CallId, CallOutput, FreshSlot,
@@ -23,16 +25,19 @@ use nn::functional::{
 use nn::modules::Linear;
 use nn::{CausalLm, ExpertExchange, KvCache, KvPlanes, NO_SLOT, RecurrentState, TokenBatch};
 use ops::Generation;
+use ops::moe::exchange::{Mode, TransportShape};
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE, TOP_K, TOP_P};
 use uniserve_tensor::{DType, Device, Tensor, WithDType};
 
 use super::columns::{self, Column, Layout};
+use super::experts::{self, JoinHook, Member};
 use super::output::calls_output;
 use super::{CausalLmConfig, CausalLmRunner, PageWork};
 use crate::Error;
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
+use crate::parallel::host::HostGroup;
 use crate::runner::Runner;
 
 const VOCABULARY: usize = 64;
@@ -66,6 +71,9 @@ struct Tiny {
     head: Linear,
     /// Whether the model keeps a recurrent state, which its forward then asks for.
     stateful: bool,
+    /// Whether the model's experts are split across ranks, whose exchange its forward then
+    /// asks for.
+    routed: bool,
 }
 
 impl Tiny {
@@ -81,6 +89,7 @@ impl Tiny {
             value: linear(HEADS * DIM),
             head: linear(VOCABULARY),
             stateful,
+            routed: false,
         }
     }
 }
@@ -95,7 +104,7 @@ impl CausalLm for Tiny {
         batch: &TokenBatch,
         cache: &[KvCache],
         state: Option<&RecurrentState>,
-        _exchange: Option<&ExpertExchange>,
+        exchange: Option<&ExpertExchange>,
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {
         let lent = state.is_some_and(|state| state.slots.dims() == [batch.rows()]);
@@ -107,6 +116,11 @@ impl CausalLm for Tiny {
         let [group] = cache else {
             return Err(nn::Error::Unsupported("one attention group".to_owned()));
         };
+        if self.routed != exchange.is_some_and(|exchange| exchange.step_rows > 0) {
+            return Err(nn::Error::Unsupported(
+                "the model's expert exchange is not the step's".to_owned(),
+            ));
+        }
         let tokens = batch.tokens();
 
         // A host value whose shape follows from the bucket: one FP32 per token.
@@ -147,6 +161,10 @@ impl CausalLm for Tiny {
     fn compute_logits(&self, hidden: &Tensor) -> nn::Result<Tensor> {
         Ok(self.head.forward(hidden)?.to_dtype(DType::F32)?)
     }
+
+    fn join_expert_step(&self, exchange: &ExpertExchange) -> nn::Result<()> {
+        exchange.check()
+    }
 }
 
 impl TextModel for Tiny {
@@ -182,7 +200,12 @@ impl TextModel for Tiny {
     }
 
     fn experts(&self) -> Option<ExpertShape> {
-        None
+        self.routed.then_some(ExpertShape {
+            experts: 8,
+            intermediate: 32,
+            top: 2,
+            encoded: false,
+        })
     }
 
     fn drafter(&self) -> Option<&dyn Drafter> {
@@ -1291,4 +1314,265 @@ fn the_runner_serves_the_phases_of_its_config() {
 
     assert_eq!(runner.phases(), [ipc::PhaseId(0)]);
     assert_eq!(runner.config().slots, SLOTS);
+}
+
+// ---- Expert unions ------------------------------------------------------------------------------
+
+/// The most rows a member of the tested union sends in a step: the largest bucket's tokens.
+const UNION_ROWS: u32 = 80;
+
+/// The host groups of a union of `size` members over loopback connections, in member order.
+fn host_groups(size: usize) -> Vec<Arc<HostGroup>> {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let mut listener = Some(listener);
+
+    std::thread::scope(|scope| {
+        let members: Vec<_> = (0..size)
+            .map(|rank| {
+                // The first member holds the listener the address names.
+                let listener = listener.take().filter(|_| rank == 0);
+                let address = address.as_str();
+
+                scope.spawn(move || {
+                    let timeout = Duration::from_secs(30);
+                    Arc::new(HostGroup::connect(address, listener, rank, size, timeout).unwrap())
+                })
+            })
+            .collect();
+
+        members
+            .into_iter()
+            .map(|member| member.join().unwrap())
+            .collect()
+    })
+}
+
+/// Member `rank` of a union of two over `group`, whose join batches go to `join`.
+fn member(group: &Arc<HostGroup>, rank: u32, join: JoinHook) -> Member {
+    let shape = TransportShape {
+        ranks: 2,
+        rank,
+        experts: 8,
+        hidden: HIDDEN as u32,
+        intermediate: 32,
+        max_tokens: UNION_ROWS,
+        top: 2,
+        dtype: DType::BF16,
+        device: 0,
+        attention_ranks: 0,
+    };
+
+    Member::new(Arc::clone(group), shape, Mode::Dispatch, join).unwrap()
+}
+
+/// A join hook that hands each join batch to the executor reading `inbox`.
+fn deliver(inbox: crossbeam_channel::Sender<Batch>) -> JoinHook {
+    Arc::new(move |batch| {
+        inbox
+            .send(batch)
+            .map_err(|_| Error::State("the member's executor is gone"))
+    })
+}
+
+/// A runner of a model that routes experts, as `member` of a union, with every bucket
+/// captured.
+fn union_runner(member: Member) -> CausalLmRunner {
+    let config = config();
+    let graphs = Graphs::meta(
+        Arc::new(Generation::new(0, [])),
+        CausalLmRunner::input_bytes(&config).unwrap(),
+    );
+    let model = Tiny {
+        routed: true,
+        ..Tiny::new(false)
+    };
+    let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
+
+    let mut runner = CausalLmRunner::new(
+        Arc::new(model),
+        config,
+        graphs,
+        None,
+        vec![group(PAGES, pooled)],
+        None,
+    )
+    .unwrap();
+    runner.join_union(member).unwrap();
+
+    runner.graphs().profile_run(&runner).unwrap();
+    for bucket in runner.buckets() {
+        runner.graphs().capture(&runner, &bucket).unwrap();
+    }
+    runner
+}
+
+#[test]
+fn a_union_member_captures_each_bucket_at_the_capacities_its_steps_meet() {
+    let stated = config().buckets;
+    let classes = experts::classes(&stated, UNION_ROWS);
+
+    // Every bucket and the join at the whole capacity; the buckets a step of a quarter of it
+    // holds, at the class of their own tokens or of the largest decode.
+    let whole = |bucket: Bucket| classes.contains(&bucket.at_capacity(UNION_ROWS));
+    assert!(stated.iter().all(|bucket| whole(*bucket)));
+    assert!(whole(Bucket::expert_join()));
+
+    let decode = Bucket::decode(2, Variant::DecodeGreedy);
+    let short = Bucket::prefill(4, 8, Variant::PrefillOutput);
+    let long = Bucket::prefill(4, 80, Variant::PrefillOutput);
+    assert!(classes.contains(&decode.at_capacity(4)));
+    assert!(classes.contains(&Bucket::expert_join().at_capacity(4)));
+    assert!(classes.contains(&short.at_capacity(8)));
+    assert_eq!(
+        classes
+            .iter()
+            .filter(|bucket| bucket.at_capacity(0) == long)
+            .count(),
+        1
+    );
+    assert_eq!(classes.len(), 2 * 4 + 2 * 4 + 4 + 2);
+
+    // A step runs the smallest class that holds it.
+    assert_eq!(classes.at_capacity(decode, 3), Some(decode.at_capacity(4)));
+    assert_eq!(
+        classes.at_capacity(decode, 5),
+        Some(decode.at_capacity(UNION_ROWS))
+    );
+}
+
+#[test]
+fn the_members_of_a_step_agree_on_the_most_tokens_any_of_them_sends() {
+    let groups = host_groups(2);
+    let (to_first, first_inbox) = crossbeam_channel::unbounded();
+    let (to_second, second_inbox) = crossbeam_channel::unbounded();
+    let mut first = member(&groups[0], 0, deliver(to_second));
+    let mut second = member(&groups[1], 1, deliver(to_first));
+    let phase = ipc::PhaseId(0);
+
+    // The first member has a batch of three tokens and the second none: its executor takes
+    // the join batch, and both leave the step at the first member's tokens.
+    std::thread::scope(|scope| {
+        let idle = scope.spawn(|| {
+            let join = second_inbox.recv().unwrap();
+            assert_eq!(join.shape.variant, Variant::ExpertJoin);
+            assert!(join.calls.is_empty());
+
+            second.join(&join).unwrap()
+        });
+
+        assert_eq!(first.enter(3, phase, 1).unwrap(), 3);
+        assert_eq!(idle.join().unwrap(), Some(3));
+    });
+
+    // Both members have a batch: the step holds the larger, and the join each asked of the
+    // other finds its step closed.
+    std::thread::scope(|scope| {
+        let other = scope.spawn(|| second.enter(9, phase, 1).unwrap());
+
+        assert_eq!(first.enter(5, phase, 1).unwrap(), 9);
+        assert_eq!(other.join().unwrap(), 9);
+    });
+    let late = first_inbox.recv().unwrap();
+    assert_eq!(first.join(&late).unwrap(), None);
+    let late = second_inbox.recv().unwrap();
+    assert_eq!(second.join(&late).unwrap(), None);
+
+    // A member enters with tokens of its own, no more than the transport holds, and joins no
+    // step past the union's next.
+    assert!(matches!(first.enter(0, phase, 1), Err(Error::Invalid(_))));
+    assert!(matches!(
+        first.enter(UNION_ROWS + 1, phase, 1),
+        Err(Error::Invalid(_))
+    ));
+    let mut ahead = late;
+    ahead.id = BatchId(7);
+    assert!(matches!(second.join(&ahead), Err(Error::Invariant(_))));
+}
+
+#[test]
+fn a_member_with_no_batch_is_driven_into_the_step_by_a_join_batch() {
+    let groups = host_groups(2);
+    let (to_first, _first_inbox) = crossbeam_channel::unbounded();
+    let (to_second, second_inbox) = crossbeam_channel::unbounded();
+    let mut first = union_runner(member(&groups[0], 0, deliver(to_second)));
+    let mut second = union_runner(member(&groups[1], 1, deliver(to_first)));
+
+    // Each bucket at each of its classes and the join at its two, largest first.
+    let buckets = first.buckets();
+    assert_eq!(buckets.len(), 22);
+    assert_eq!(first.graphs().buckets().len(), 22);
+    assert!(buckets.contains(&Bucket::expert_join().at_capacity(4)));
+
+    // The join computes the expert layers alone: no output, and no input tensor is read.
+    let join = Bucket::expert_join().at_capacity(UNION_ROWS);
+    let context = backend::Context::meta(None);
+    {
+        let _guard = context.enter();
+        assert!(first.forward(&join).unwrap().is_empty());
+    }
+    assert!(first.forward(&Bucket::expert_join()).is_err());
+
+    // The first member's batch blocks in the agreement until the second member's executor
+    // takes the join batch. Both then reach the replay of a captured class, which graphs
+    // that hold no device refuse.
+    std::thread::scope(|scope| {
+        let idle = scope.spawn(|| {
+            let join = second_inbox.recv().unwrap();
+            second.execute(&join)
+        });
+
+        let served = first.execute(&decode(&[1, 2, 3], &[0.0; 3]));
+        assert!(matches!(served, Err(Error::State(_))), "{served:?}");
+
+        let joined = idle.join().unwrap();
+        assert!(matches!(joined, Err(Error::State(_))), "{joined:?}");
+    });
+
+    // A member computes no paired forward: its exchange launches wait for the others'.
+    assert!(matches!(
+        first.prepare_shadow_inputs(&decode(&[1, 2], &[0.0, 0.0])),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn a_union_is_joined_by_a_runner_whose_model_routes_experts() {
+    let groups = host_groups(1);
+    let hook: JoinHook = Arc::new(|_| Ok(()));
+    let shape = TransportShape {
+        ranks: 1,
+        rank: 0,
+        experts: 8,
+        hidden: HIDDEN as u32,
+        intermediate: 32,
+        max_tokens: UNION_ROWS,
+        top: 2,
+        dtype: DType::BF16,
+        device: 0,
+        attention_ranks: 0,
+    };
+
+    // The model splits no experts.
+    let mut runner = runner(false);
+    let alone = Member::new(
+        Arc::clone(&groups[0]),
+        shape,
+        Mode::Dispatch,
+        Arc::clone(&hook),
+    );
+    assert!(runner.join_union(alone.unwrap()).is_err());
+
+    // A join batch reaches a runner outside a union.
+    let mut join = decode(&[1], &[0.0]);
+    join.shape = BatchShape::decode(1, Variant::ExpertJoin);
+    assert!(matches!(runner.execute(&join), Err(Error::Invalid(_))));
+
+    // A member that is not the group's.
+    let other = TransportShape {
+        rank: 1,
+        ranks: 2,
+        ..shape
+    };
+    assert!(Member::new(Arc::clone(&groups[0]), other, Mode::Dispatch, hook).is_err());
 }

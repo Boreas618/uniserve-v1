@@ -65,8 +65,20 @@
 //! ([`CausalLmRunner::set_scratch`]) in its own numbering, the commit table is inert and no
 //! slot is started, so nothing a serving request reads is written. A model that keeps a
 //! recurrent state has no scratch state to advance, and its paired forwards are refused.
+//!
+//! ## Expert unions
+//!
+//! A runner whose model's experts are split across ranks is a member of an expert union
+//! ([`CausalLmRunner::join_union`], [`experts`]). Its buckets are captured once per capacity
+//! class, with the join bucket beside them. Before the replay of a batch the member agrees
+//! the step's capacity with the other members, which blocks until each has entered, and
+//! replays the smallest class of its bucket that holds it; a member with no batch is driven
+//! by a join batch (`Variant::ExpertJoin`) and replays the join bucket, the expert layers
+//! alone. Everything of a step that can refuse the batch is done before the agreement: once
+//! a step is agreed, every member launches it, or the others wait on their devices.
 
 mod columns;
+pub mod experts;
 mod output;
 mod slots;
 
@@ -77,7 +89,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ipc::execution::{Batch, BatchOutput, RowKind};
+use ipc::execution::{Batch, BatchOutput, RowKind, Variant};
 use ipc::{PhaseId, TimingCounters};
 use nn::family::TextModel;
 use nn::{KvCache, PhaseKind, RecurrentState, TokenBatch};
@@ -87,6 +99,7 @@ use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
 use uniserve_tensor::{DType, Shape, Tensor};
 
 use self::columns::{Column, Layout};
+use self::experts::Member;
 use self::slots::Slots;
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
@@ -169,6 +182,17 @@ pub struct CausalLmRunner {
     /// `scratch`. Set by [`CausalLmRunner::prepare_shadow_inputs`] and cleared by every other
     /// fill of the input block, so no capture and no replay computes over the scratch set.
     paired: Cell<bool>,
+    /// The buckets the runner states: the config's, or their capacity classes and the join
+    /// bucket for a member of an expert union.
+    buckets: Buckets,
+    /// This rank's member of the expert union, for a model whose experts are split across
+    /// ranks.
+    union: Option<Member>,
+    /// The stream the graphs replay on; `None` for graphs that hold no device.
+    stream: Option<Stream>,
+    /// The bytes of the input block of the step being prepared: a batch's columns are padded
+    /// here, where a refusal costs nothing, before anything of the step is issued.
+    staged: Vec<u8>,
 }
 
 impl CausalLmRunner {
@@ -247,7 +271,13 @@ impl CausalLmRunner {
         check_state(&*model, state.as_ref())?;
 
         let vocabulary = model.vocabulary();
-        let slots = Slots::new(stream, config.slots, vocabulary, layout.rows() as u32, 1)?;
+        let slots = Slots::new(
+            stream.clone(),
+            config.slots,
+            vocabulary,
+            layout.rows() as u32,
+            1,
+        )?;
         let sampler = Sampler::new(
             SamplerConfig {
                 vocabulary,
@@ -263,6 +293,7 @@ impl CausalLmRunner {
         )?;
 
         let runner = Self {
+            buckets: config.buckets.clone(),
             model,
             config,
             graphs,
@@ -274,6 +305,9 @@ impl CausalLmRunner {
             page_work: None,
             scratch: Vec::new(),
             paired: Cell::new(false),
+            union: None,
+            stream,
+            staged: Vec::new(),
         };
 
         // Every input tensor lies inside the block the graphs were made for.
@@ -302,6 +336,54 @@ impl CausalLmRunner {
     /// A hook's error fails the batch.
     pub fn set_page_work(&mut self, hook: PageWorkHook) {
         self.page_work = Some(hook);
+    }
+
+    /// Makes the runner `member` of an expert union: its buckets become the capacity classes
+    /// of the config's buckets and the join bucket (`experts::classes`), its forwards are lent
+    /// the member's exchange, and its steps are agreed with the other members.
+    ///
+    /// It is called before the profile run and the captures, which state the buckets, and for
+    /// graphs that hold a device after the members created their transport
+    /// (`Member::create_transport`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a model that splits no experts, a member whose largest step is
+    /// smaller than the runner's largest bucket, or a runner that holds captured graphs.
+    pub fn join_union(&mut self, member: Member) -> Result<()> {
+        let (_, tokens) = self.config.buckets.bounds();
+        if self.model.experts().is_none() || member.capacity() < tokens {
+            return Err(Error::Invalid(format!(
+                "an expert union whose members send at most {} rows a step, for a model that \
+                 routes {} and buckets of up to {tokens} tokens",
+                member.capacity(),
+                match self.model.experts() {
+                    Some(_) => "experts",
+                    None => "no experts",
+                }
+            )));
+        }
+        if !self.graphs.buckets().is_empty() {
+            return Err(Error::Invalid(
+                "a runner joins an expert union before its buckets are captured".into(),
+            ));
+        }
+
+        self.buckets = experts::classes(&self.config.buckets, member.capacity());
+        self.graphs
+            .set_exchange(member.transport(), Some(member.meet()));
+        self.union = Some(member);
+        Ok(())
+    }
+
+    /// States whether the forwards that follow are a warm-up's, which every member of the
+    /// runner's expert union runs in step: each exchange launch of such a forward first meets
+    /// the other members on the host. The executor sets it around the captures of a warm-up
+    /// and clears it before the first batch. A runner outside a union ignores it.
+    pub fn set_warming(&self, warming: bool) {
+        if let Some(member) = &self.union {
+            member.set_warming(warming);
+        }
     }
 
     /// Lends the scratch page set paired forwards compute over: one `KvCache` per attention
@@ -361,10 +443,18 @@ impl CausalLmRunner {
     /// # Errors
     ///
     /// As [`Runner::prepare_inputs`]; [`Error::Unsupported`] for a model that keeps a
-    /// recurrent state, which has no scratch state to advance, and for a runner that was lent
-    /// no scratch page set; [`Error::Invalid`] for a row whose tokens lie past its scratch
-    /// pages.
+    /// recurrent state, which has no scratch state to advance, for a member of an expert
+    /// union, whose exchange launches wait for the other members', and for a runner that was
+    /// lent no scratch page set; [`Error::Invalid`] for a row whose tokens lie past its
+    /// scratch pages.
     pub fn prepare_shadow_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+        if self.union.is_some() {
+            return Err(Error::Unsupported(
+                "a paired forward of a member of an expert union would wait on its device for \
+                 exchange launches the other members do not make"
+                    .into(),
+            ));
+        }
         if self.state.is_some() {
             return Err(Error::Unsupported(
                 "a paired forward of a model that keeps a recurrent state has no scratch state \
@@ -479,23 +569,76 @@ impl CausalLmRunner {
             })
     }
 
-    /// Writes `batch`'s columns, padded to `bucket`, into the input block, with the host
+    /// Prepares the inputs of a step of `batch` in `bucket`: its padded columns, and the host
     /// values the bucket's forward computes; `scratch` is a paired forward's slot mapping.
-    fn fill(&self, batch: &Batch, bucket: &Bucket, scratch: Option<&[u32]>) -> Result<()> {
+    fn fill(&mut self, batch: &Batch, bucket: &Bucket, scratch: Option<&[u32]>) -> Result<()> {
+        self.stage(batch, bucket, scratch)?;
+        self.prepare_staged(bucket)
+    }
+
+    /// Pads `batch`'s columns to `bucket` in the runner's own bytes of the input block. The
+    /// columns of a bucket are those of every capacity class of it.
+    fn stage(&mut self, batch: &Batch, bucket: &Bucket, scratch: Option<&[u32]>) -> Result<()> {
+        self.staged.resize(self.layout.bytes() as usize, 0);
+
+        columns::fill(
+            &self.layout,
+            self.config.slots,
+            self.model.vocabulary(),
+            &batch.columns,
+            bucket,
+            scratch,
+            &mut self.staged,
+        )
+    }
+
+    /// Prepares the step of `bucket` over the staged columns: they are written into the input
+    /// block, with the host values the bucket's forward computes.
+    fn prepare_staged(&self, bucket: &Bucket) -> Result<()> {
         // The meta forward that writes the host values computes over the serving cache: a
         // forward's host values follow from the bucket alone.
         self.paired.set(false);
 
         self.graphs.prepare_inputs(self, bucket, |block| {
-            columns::fill(
-                &self.layout,
-                self.config.slots,
-                self.model.vocabulary(),
-                &batch.columns,
-                bucket,
-                scratch,
-                block,
-            )
+            block[..self.staged.len()].copy_from_slice(&self.staged);
+            Ok(())
+        })
+    }
+
+    /// One step of a member with no batch of its own: the expert layers of the step `batch`
+    /// asks it to join, or nothing when the member already took part in that step.
+    fn join_step(&mut self, batch: &Batch, started: Instant) -> Result<BatchOutput> {
+        let member = self.union.as_mut().ok_or_else(|| {
+            Error::Invalid(format!(
+                "batch {} asks a runner outside an expert union to join a step",
+                batch.id.0
+            ))
+        })?;
+        let Some(capacity) = member.join(batch)? else {
+            return Ok(BatchOutput::default());
+        };
+
+        let bucket = at_capacity(&self.graphs, &Bucket::expert_join(), capacity)?;
+        if let Some(stream) = &self.stream {
+            member.write(capacity, stream)?;
+        }
+
+        self.paired.set(false);
+        self.graphs.prepare_inputs(&*self, &bucket, |_| Ok(()))?;
+
+        let launched = Instant::now();
+        self.graphs.replay(&bucket)?;
+        self.graphs.wait()?;
+
+        Ok(BatchOutput {
+            calls: Vec::new(),
+            timing: TimingCounters {
+                queued_us: 0,
+                device_us: launched.elapsed().as_micros() as u64,
+                copy_us: 0,
+                host_us: launched.duration_since(started).as_micros() as u64,
+            },
+            forward_stats: None,
         })
     }
 
@@ -568,14 +711,34 @@ impl Runner for CausalLmRunner {
     }
 
     fn buckets(&self) -> Vec<Bucket> {
-        self.config.buckets.capture_order().copied().collect()
+        self.buckets.capture_order().copied().collect()
     }
 
     fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
-        if !self.config.buckets.contains(bucket) {
+        if !self.buckets.contains(bucket) {
             return Err(Error::Invariant(format!(
                 "bucket {bucket} is none the runner states"
             )));
+        }
+
+        // A member of an expert union is lent the exchange of the bucket's capacity class. Its
+        // join, and every bucket of a member that holds experts alone, is the expert layers
+        // of a step with no tokens of the member's own, and returns no output.
+        let exchange = match &self.union {
+            Some(member) => Some(member.exchange(bucket.capacity)?),
+            None => None,
+        };
+        let joins = bucket.variant == Variant::ExpertJoin
+            || self.union.as_ref().is_some_and(Member::experts_only);
+        if joins {
+            let exchange = exchange.ok_or_else(|| {
+                Error::Invariant(format!(
+                    "bucket {bucket} joins an expert step in a runner outside an expert union"
+                ))
+            })?;
+
+            self.model.join_expert_step(&exchange)?;
+            return Ok(Vec::new());
         }
         let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
         let decode = bucket.variant.is_decode();
@@ -636,7 +799,7 @@ impl Runner for CausalLmRunner {
         let hidden = {
             let embedded = self.model.embed_input_ids(&ids)?;
             self.model
-                .forward(&batch, &cache, state.as_ref(), None, &embedded)?
+                .forward(&batch, &cache, state.as_ref(), exchange.as_ref(), &embedded)?
         };
 
         // ---- The selection of one token per row ----
@@ -723,10 +886,15 @@ impl Runner for CausalLmRunner {
     }
 
     fn idle_inputs(&self, bucket: &Bucket, columns: &mut [u8]) -> Result<()> {
-        if !self.config.buckets.contains(bucket) {
+        if !self.buckets.contains(bucket) {
             return Err(Error::Invariant(format!(
                 "bucket {bucket} is none the runner states"
             )));
+        }
+
+        // A join reads no input tensor.
+        if bucket.variant == Variant::ExpertJoin {
+            return Ok(());
         }
 
         // An idle step is a serving step's forward: what a capture records.
@@ -754,9 +922,21 @@ impl Runner for CausalLmRunner {
     fn execute(&mut self, batch: &Batch) -> Result<BatchOutput> {
         let started = Instant::now();
 
-        // A batch that names no call computes nothing: it carries releases alone.
+        // A join names no call: it is this member's part in a step of the union.
+        if batch.shape.variant == Variant::ExpertJoin {
+            return self.join_step(batch, started);
+        }
+
+        // Any other batch that names no call computes nothing: it carries releases alone.
         if batch.calls.is_empty() && batch.columns.calls() == 0 {
             return Ok(BatchOutput::default());
+        }
+        if self.union.as_ref().is_some_and(Member::experts_only) {
+            return Err(Error::Invalid(format!(
+                "batch {} reached a member of an expert union that holds experts alone and \
+                 serves no request",
+                batch.id.0
+            )));
         }
 
         let work = carries_page_work(batch);
@@ -767,12 +947,15 @@ impl Runner for CausalLmRunner {
                 batch.id.0
             )));
         }
-        let bucket = self.prepare_inputs(batch)?;
+        // Everything that can refuse the batch comes first: the choice of a bucket and the
+        // padding of the columns.
+        let base = self.choose(batch)?;
+        self.stage(batch, &base, None)?;
 
         // The slot state's writes, ahead of the replay that reads them.
         self.slots.begin()?;
         self.slots
-            .start(&self.sampler, &batch.columns, bucket.variant.is_decode())?;
+            .start(&self.sampler, &batch.columns, base.variant.is_decode())?;
         if batch
             .columns
             .adjustments
@@ -782,7 +965,7 @@ impl Runner for CausalLmRunner {
         {
             let (_, masks) = sampler::adjustments(
                 &batch.columns.adjustments,
-                bucket.rows as usize,
+                base.rows as usize,
                 self.model.vocabulary(),
             )?;
             self.slots.ban(&masks)?;
@@ -791,6 +974,23 @@ impl Runner for CausalLmRunner {
         if let (true, Some(hook)) = (work, self.page_work.as_mut()) {
             hook(batch, PageWork::BeforeReplay)?;
         }
+
+        // A member of an expert union agrees the step with the other members, which blocks
+        // until each has entered it, and runs the capacity class that holds it.
+        let bucket = match self.union.as_mut() {
+            Some(member) => {
+                let tokens = batch.columns.tokens() as u32;
+                let capacity = member.enter(tokens, batch.phase, batch.generation)?;
+
+                let bucket = at_capacity(&self.graphs, &base, capacity)?;
+                if let Some(stream) = &self.stream {
+                    member.write(capacity, stream)?;
+                }
+                bucket
+            }
+            None => base,
+        };
+        self.prepare_staged(&bucket)?;
 
         let launched = Instant::now();
         let outputs = self.graphs.replay(&bucket)?;
@@ -833,6 +1033,21 @@ impl Runner for CausalLmRunner {
     fn graphs(&self) -> &Graphs {
         &self.graphs
     }
+}
+
+/// The smallest captured capacity class of `bucket` that holds a step of `capacity` rows a
+/// member.
+fn at_capacity(graphs: &Graphs, bucket: &Bucket, capacity: u32) -> Result<Bucket> {
+    let stated = bucket.at_capacity(0);
+
+    graphs
+        .select(|held| held.at_capacity(0) == stated && held.capacity >= capacity)
+        .ok_or_else(|| {
+            Error::Invariant(format!(
+                "no captured graph of bucket {bucket} holds an expert step of {capacity} rows a \
+                 member"
+            ))
+        })
 }
 
 /// Whether `batch` carries work on the cache's pages or the recurrent state's.
