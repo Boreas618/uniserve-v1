@@ -26,6 +26,7 @@ use ops::platform::{DeviceRange, Stream};
 use ops::{Generation, Route};
 
 use crate::allocator::{ALIGNMENT, Allocator};
+use crate::breaks::HostWork;
 use crate::collective::Group;
 use crate::profiler::Profiler;
 use crate::{Error, Result};
@@ -68,6 +69,8 @@ pub(crate) struct State {
     pub(crate) meet: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     /// What launches the range markers of the modules a forward enters.
     pub(crate) profiler: Option<Arc<dyn Profiler>>,
+    /// What takes the graph breaks of a forward execution captures ([`Context::set_breaks`]).
+    pub(crate) breaks: Option<Arc<dyn Fn(HostWork) -> Result<()> + Send + Sync>>,
 
     /// The launch table being recorded, as `(operator, key, module path)` in launch order, or
     /// `None` while none is.
@@ -83,7 +86,7 @@ pub(crate) struct State {
     /// The furthest `input_cursor` any forward reached.
     pub(crate) input_peak: u64,
     /// The input copies of this forward, as `(buffer offset, device address, bytes)`: the
-    /// host-to-device copies made while the stream was being captured.
+    /// host-to-device copies made while the stream was being captured, or under a meta context.
     pub(crate) input_copies: Vec<(u64, u64, u64)>,
 }
 
@@ -200,8 +203,9 @@ impl Context {
         self.state().launches.take().unwrap_or_default()
     }
 
-    /// The input copies recorded while the stream was captured, as
-    /// `(buffer offset, device address, bytes)` in the order the forward made them.
+    /// The input copies of the forward since the last reset, as
+    /// `(buffer offset, device address, bytes)` in the order the forward made them: those a
+    /// capture recorded, or those a meta forward states a capture of it records.
     pub fn take_input_copies(&self) -> Vec<(u64, u64, u64)> {
         std::mem::take(&mut self.state().input_copies)
     }
@@ -305,6 +309,16 @@ impl Context {
         self.state().profiler = profiler;
     }
 
+    /// What takes the graph breaks of this context's forwards ([`crate::graph_break`]), or
+    /// `None` to run each break's host work where the forward states it.
+    ///
+    /// Execution sets a taker around a capture: the taker ends the segment being captured,
+    /// keeps the host work for the replays and begins the next segment. It is called on the
+    /// forward's thread, between two launches of the forward.
+    pub fn set_breaks(&self, taker: Option<Arc<dyn Fn(HostWork) -> Result<()> + Send + Sync>>) {
+        self.state().breaks = taker;
+    }
+
     /// Whether this is a meta context: one with no stream, which launches and copies nothing.
     pub(crate) fn is_meta(&self) -> bool {
         self.device.is_none()
@@ -347,6 +361,7 @@ impl State {
             exchange: None,
             meet: None,
             profiler: None,
+            breaks: None,
             launches: None,
             paths: Vec::new(),
             input_memory: None,

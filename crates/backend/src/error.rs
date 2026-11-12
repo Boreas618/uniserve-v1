@@ -156,6 +156,10 @@ pub enum Error {
     #[error("a device-to-host read is refused while the stream is being captured")]
     CapturedRead,
 
+    /// A graph break's host work failed, or the break was stated where nothing takes it.
+    #[error("a graph break: {0}")]
+    Break(#[source] Box<dyn std::error::Error + Send + Sync>),
+
     /// The kernel library refused a call that is not an operator launch, such as a copy.
     #[error(transparent)]
     Ops(#[from] ops::Error),

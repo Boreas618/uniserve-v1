@@ -37,10 +37,12 @@
 //! Every kernel reaches the device through [`launch()`], so kernel updates, profile runs, graph
 //! rebinding and shadow comparison cover every launch alike. A fused operator of `nn` allocates
 //! its output with [`empty`], states its arguments with [`operand`] and calls [`launch()`]. A
-//! partitioned forward meets the other ranks of its group through [`collective`], and a module
-//! states the range its forward runs in through [`profiler::range`].
+//! partitioned forward meets the other ranks of its group through [`collective`], a module
+//! states the range its forward runs in through [`profiler::range`], and a forward states host
+//! work between two of its launches through [`graph_break()`].
 
 pub mod allocator;
+pub mod breaks;
 pub mod collective;
 pub mod context;
 mod device;
@@ -52,6 +54,7 @@ pub mod profiler;
 mod storage;
 
 pub use allocator::Allocator;
+pub use breaks::graph_break;
 pub use collective::Group;
 pub use context::{Context, ContextGuard};
 pub use device::{cuda, meta};
