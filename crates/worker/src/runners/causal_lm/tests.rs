@@ -572,7 +572,8 @@ fn the_runner_s_memory_is_a_function_of_its_config() {
 #[test]
 fn a_decode_batch_is_padded_with_rows_that_address_nothing() {
     // Three rows in a bucket of four: a greedy row beside two drawn ones.
-    let batch = decode(&[3, 0, 5], &[0.0, 0.7, 1.0]);
+    // The scheduler numbers request slots from one: the last row runs on the last slot.
+    let batch = decode(&[3, 1, SLOTS as i32], &[0.0, 0.7, 1.0]);
     let bucket = Bucket::decode(4, Variant::DecodeSampled);
     let (layout, block) = filled(&batch, &bucket, None);
 
@@ -589,11 +590,12 @@ fn a_decode_batch_is_padded_with_rows_that_address_nothing() {
     assert_eq!(u32s(Column::QueryOffsets, 5), [0, 1, 2, 3, 3]);
     assert_eq!(u32s(Column::LogitsRows, 4), [0, 1, 2, 0]);
 
-    // A padding row is no slot to the sampler, and gathers the padding row of the tables.
-    assert_eq!(u32s(Column::Slots, 4), [3, 0, 5, NO_SLOT]);
-    assert_eq!(u32s(Column::TableRows, 4), [3, 0, 5, SLOTS]);
-    assert_eq!(u32s(Column::SlotRows, 4), [3, 0, 5, SLOTS]);
-    assert_eq!(u32s(Column::CallSlots, 4), [3, 0, 5, SLOTS]);
+    // Request slot `s` owns row `s - 1` of every per-slot buffer. A padding row is no slot
+    // to the sampler, and gathers the padding row of the tables, the row past the last slot's.
+    assert_eq!(u32s(Column::Slots, 4), [2, 0, 5, NO_SLOT]);
+    assert_eq!(u32s(Column::TableRows, 4), [2, 0, 5, SLOTS]);
+    assert_eq!(u32s(Column::SlotRows, 4), [2, 0, 5, SLOTS]);
+    assert_eq!(u32s(Column::CallSlots, 4), [2, 0, 5, SLOTS]);
 
     // A greedy row in a drawing bucket draws from its one largest candidate.
     let parameters = layout.read::<f32>(&block, Column::Parameters, 4 * 8);
@@ -616,7 +618,7 @@ fn a_decode_batch_is_padded_with_rows_that_address_nothing() {
 
     // The commit table holds the batch's calls and an inert row past them.
     let table = i32s(Column::Commit, COMMIT_FIELDS * 4);
-    assert_eq!(table[column::SLOT * 4..][..4], [3, 0, 5, -1]);
+    assert_eq!(table[column::SLOT * 4..][..4], [2, 0, 5, -1]);
     assert_eq!(table[column::TASK * 4..][..4], [0, 1, 2, -1]);
     assert_eq!(i32s(Column::Valid, 4), [1; 4]);
     assert_eq!(i32s(Column::Active, 4), [1; 4]);
@@ -652,12 +654,12 @@ fn a_prefill_batch_is_padded_with_tokens_no_row_holds() {
     // nothing, and a padding row, read a hidden row whose sample is discarded.
     assert_eq!(u32s(Column::LogitsRows, 4), [2, 0, 0, 0]);
 
-    assert_eq!(u32s(Column::Slots, 4), [2, 4, NO_SLOT, NO_SLOT]);
-    assert_eq!(u32s(Column::TableRows, 4), [2, 4, SLOTS, SLOTS]);
-    assert_eq!(u32s(Column::CallSlots, 4), [2, 4, SLOTS, SLOTS]);
+    assert_eq!(u32s(Column::Slots, 4), [1, 3, NO_SLOT, NO_SLOT]);
+    assert_eq!(u32s(Column::TableRows, 4), [1, 3, SLOTS, SLOTS]);
+    assert_eq!(u32s(Column::CallSlots, 4), [1, 3, SLOTS, SLOTS]);
 
     let table = layout.read::<i32>(&block, Column::Commit, COMMIT_FIELDS * 4);
-    assert_eq!(table[column::SLOT * 4..][..4], [2, 4, -1, -1]);
+    assert_eq!(table[column::SLOT * 4..][..4], [1, 3, -1, -1]);
     assert_eq!(table[column::TASK * 4..][..4], [0, -1, -1, -1]);
     assert_eq!(table[column::CACHE_LENGTH * 4..][..4], [3, 2, 0, 0]);
 }
@@ -757,6 +759,44 @@ fn a_step_runs_the_smallest_captured_bucket_that_holds_it() {
 }
 
 #[test]
+fn the_last_request_slot_serves_and_gathers_its_own_rows() {
+    let mut runner = captured();
+
+    // Every per-slot buffer holds rows `0..SLOTS` for the slots `1..=SLOTS`: the last slot's
+    // batch is prepared, and starts its request on the last row.
+    let mut batch = decode(&[SLOTS as i32], &[0.0]);
+    batch.columns.fresh_slots = vec![FreshSlot {
+        slot: SLOTS,
+        history: vec![3, 3],
+    }];
+    batch.columns.adjustments.installs = vec![ipc::execution::SlotBias {
+        slot: SLOTS,
+        bias: vec![(3, 1.5)],
+        allowed: None,
+    }];
+    runner.prepare_inputs(&batch).unwrap();
+
+    // The slot's writes are made, and the step reaches the replay graphs with no device
+    // refuse.
+    let refused = runner.execute(&batch).unwrap_err();
+    assert!(matches!(refused, Error::State(_)), "{refused}");
+
+    // Its rows gather row `SLOTS - 1` of the page tables and of the slot state, and its call
+    // commits into that row; the padding row is the one after it.
+    let bucket = Bucket::decode(2, Variant::DecodeGreedy);
+    let (layout, block) = filled(&batch, &bucket, None);
+    let u32s = |column| layout.read::<u32>(&block, column, 2);
+
+    assert_eq!(u32s(Column::Slots), [SLOTS - 1, NO_SLOT]);
+    assert_eq!(u32s(Column::TableRows), [SLOTS - 1, SLOTS]);
+    assert_eq!(u32s(Column::SlotRows), [SLOTS - 1, SLOTS]);
+    assert_eq!(u32s(Column::CallSlots), [SLOTS - 1, SLOTS]);
+
+    let table = layout.read::<i32>(&block, Column::Commit, COMMIT_FIELDS * 4);
+    assert_eq!(table[column::SLOT * 4..][..2], [SLOTS as i32 - 1, -1]);
+}
+
+#[test]
 fn a_batch_no_bucket_holds_is_refused_by_its_shape_and_the_bound() {
     let mut runner = captured();
 
@@ -809,9 +849,14 @@ fn a_batch_the_runner_s_graphs_were_not_captured_for_is_refused() {
     ));
 
     // A row on a slot the runner holds no state for.
-    let slotted = decode(&[1, SLOTS as i32], &[0.0, 0.0]);
+    let slotted = decode(&[1, SLOTS as i32 + 1], &[0.0, 0.0]);
     let message = runner.prepare_inputs(&slotted).unwrap_err().to_string();
-    assert!(message.contains("slot 6"), "{message}");
+    assert!(message.contains("request slot 7"), "{message}");
+
+    // Slot zero is no request slot: the scheduler numbers them from one.
+    let zeroth = decode(&[0, 1], &[0.0, 0.0]);
+    let message = runner.prepare_inputs(&zeroth).unwrap_err().to_string();
+    assert!(message.contains("request slot 0"), "{message}");
 
     // Image rows and verifications, which the runner states no bucket for.
     let mut verified = decode(&[1, 2], &[0.0, 0.0]);
@@ -964,11 +1009,11 @@ fn a_slot_the_runner_does_not_hold_is_not_started() {
 
     let mut batch = decode(&[1, 2], &[0.0, 0.0]);
     batch.columns.fresh_slots = vec![FreshSlot {
-        slot: SLOTS,
+        slot: SLOTS + 1,
         history: vec![1, 2],
     }];
     let message = runner.execute(&batch).unwrap_err().to_string();
-    assert!(message.contains("fresh slot 6"), "{message}");
+    assert!(message.contains("request slot 7"), "{message}");
 
     // A fresh slot of a decode batch starts from its own row of the batch.
     let mut batch = decode(&[1, 2], &[0.0, 0.0]);
@@ -1012,7 +1057,7 @@ fn a_paired_forward_writes_its_rows_scratch_pages_and_commits_nothing() {
     );
     assert_eq!(
         layout.read::<u32>(&block, Column::SlotRows, 4),
-        [2, 4, SLOTS, SLOTS]
+        [1, 3, SLOTS, SLOTS]
     );
 
     let table = layout.read::<i32>(&block, Column::Commit, COMMIT_FIELDS * 4);

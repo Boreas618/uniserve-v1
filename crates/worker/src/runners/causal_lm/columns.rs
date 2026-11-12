@@ -50,6 +50,17 @@
 //! The commit table keeps the scheduler's signed form, because the commit kernel defines a
 //! negative slot and a negative task as a row that commits nothing.
 //!
+//! ## Request slots
+//!
+//! The scheduler numbers request slots from one: slot `s` of `1..=slots`. On the device a
+//! request slot owns **row `s - 1`** of every per-slot buffer (the runner's slot state, the
+//! sampler's count and bias tables, the pooled page tables, the recurrent state's buffers),
+//! and the padding row of the buffers that have one is the last, row `slots`. [`slot_row`]
+//! is that rule, applied where each of the scheduler's values enters: the rows' slots (the
+//! sampler's slot column, the table rows and the slot rows), the calls' slots, the slot field
+//! of the commit table, and the slots a batch starts (`slots`). Slot zero and a slot past
+//! `slots` name no request slot and are refused.
+//!
 //! ## Padding
 //!
 //! A padding token writes no cache slot. A row the batch does not fill is an empty sequence:
@@ -70,7 +81,7 @@
 use ipc::execution::{BatchColumns, BatchRow, BatchRows, RowKind};
 use ipc::philox::DrawAddress;
 use nn::NO_SLOT;
-use proto::module::commit::COMMIT_FIELDS;
+use proto::module::commit::{COMMIT_FIELDS, column};
 use proto::module::sampler::PARAMETER_COLUMNS;
 use uniserve_tensor::DType;
 
@@ -280,6 +291,21 @@ const fn index(value: i32, none: u32) -> u32 {
     if value < 0 { none } else { value as u32 }
 }
 
+/// The row request slot `slot` owns in every per-slot buffer of a runner of `slots` request
+/// slots: `slot - 1` (module documentation).
+///
+/// # Errors
+///
+/// [`Error::Invalid`] for slot zero and for a slot past `slots`.
+pub(crate) fn slot_row(slot: u32, slots: u32) -> Result<u32> {
+    if slot == 0 || slot > slots {
+        return Err(Error::Invalid(format!(
+            "request slot {slot} is none of a runner's {slots}, which are numbered from one"
+        )));
+    }
+    Ok(slot - 1)
+}
+
 /// A count the scheduler states signed, which no batch states negative.
 fn count(name: &str, value: i32) -> Result<u32> {
     u32::try_from(value)
@@ -407,13 +433,14 @@ pub(crate) fn fill(
     let mut sampler_slots = vec![NO_SLOT; bucket_rows];
     let mut slot_rows = vec![slots; bucket_rows];
     for (row, held) in columns.slots.iter().enumerate().take(sequences) {
-        if *held >= 0 && *held as u32 >= slots {
-            return Err(Error::Invalid(format!(
-                "row {row} of the batch names slot {held} of a runner of {slots} request slots"
-            )));
-        }
-        sampler_slots[row] = index(*held, NO_SLOT);
-        slot_rows[row] = index(*held, slots);
+        // A row on no slot states a negative one, and keeps the padding entries.
+        let Ok(slot) = u32::try_from(*held) else {
+            continue;
+        };
+        let own = slot_row(slot, slots)?;
+
+        sampler_slots[row] = own;
+        slot_rows[row] = own;
     }
     layout.put(block, Column::Slots, &sampler_slots)?;
     layout.put(block, Column::SlotRows, &slot_rows)?;
@@ -457,10 +484,18 @@ pub(crate) fn fill(
     // ---- The commit: one row per call, the rest of the table inert ----
 
     // A paired forward commits nothing: the slots' state is the serving requests'.
-    let table = match scratch {
+    let mut table = match scratch {
         Some(_) => sampler::commit_table(&sampler::inert_commit(calls), calls, layout.rows)?,
         None => sampler::commit_table(&columns.commit, calls, layout.rows)?,
     };
+
+    // The commit kernel indexes the slots' state by the table's slot field: a call's request
+    // slot becomes its row, and a negative slot stays a row that stores nothing.
+    for cell in &mut table[column::SLOT * layout.rows..][..calls] {
+        if let Ok(slot) = u32::try_from(*cell) {
+            *cell = slot_row(slot, slots)? as i32;
+        }
+    }
     layout.put(block, Column::Commit, &table)?;
 
     // The per-task columns of a step that verifies no draft: every task's token counts, no

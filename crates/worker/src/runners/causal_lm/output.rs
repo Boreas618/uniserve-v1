@@ -145,7 +145,7 @@ pub(crate) fn calls_output(
         // The commit table is one row per call, and the sampler's slots one per row: a call
         // reads the slot its rows share through the first row it owns.
         let slot = batch.columns.slots.get(call.rows.start as usize);
-        let state = if slot.is_some_and(|slot| *slot >= 0) {
+        let state = if slot.is_some_and(|slot| *slot > 0) {
             RowState {
                 step_index: position(&sampling, index),
                 cache_computed_len: position(&logical, index),

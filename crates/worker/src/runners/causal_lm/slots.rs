@@ -1,7 +1,8 @@
 //! The request slots' device state: what a step of a request reads on the device without a
 //! host round trip, and what the commit that ends the step advances.
 //!
-//! One row per request slot of each table, in memory this module owns:
+//! One row per request slot of each table, in memory this module owns. Request slot `s`, as
+//! the scheduler numbers it from one, owns row `s - 1` (`columns::slot_row`):
 //!
 //! | Table | Type and extent | Holds |
 //! | --- | --- | --- |
@@ -41,11 +42,12 @@
 
 use std::sync::Arc;
 
-use ipc::execution::BatchColumns;
+use ipc::execution::{BatchColumns, FreshSlot, SlotBias};
 use ops::sampler::ban_words;
 use platform::{PinnedBuffer, Stream};
 use uniserve_tensor::{DType, Shape, Tensor};
 
+use super::columns::slot_row;
 use crate::memory::allocation::Storage;
 use crate::sampler::Sampler;
 use crate::{Error, Result};
@@ -334,19 +336,18 @@ impl Slots {
         let row_bytes = u64::from(self.vocabulary) * 4;
 
         for fresh in &columns.fresh_slots {
-            if fresh.slot >= self.slots {
-                return Err(Error::Invalid(format!(
-                    "a fresh slot {} of a runner of {} request slots",
-                    fresh.slot, self.slots
-                )));
-            }
+            let own = slot_row(fresh.slot, self.slots)?;
 
-            // An empty history is a zeroed row, which the device fills without a copy.
+            // An empty history is a zeroed row, which the device fills without a copy. The
+            // sampler states a row's values for the row of its tables the slot owns.
             if fresh.history.is_empty() {
-                self.zero(COUNTS, u64::from(fresh.slot) * row_bytes, self.vocabulary)?;
+                self.zero(COUNTS, u64::from(own) * row_bytes, self.vocabulary)?;
             } else {
-                let row = sampler.count_row(fresh)?;
-                self.write(COUNTS, u64::from(fresh.slot) * row_bytes, &row)?;
+                let row = sampler.count_row(&FreshSlot {
+                    slot: own,
+                    history: fresh.history.clone(),
+                })?;
+                self.write(COUNTS, u64::from(own) * row_bytes, &row)?;
             }
 
             if decode {
@@ -355,8 +356,12 @@ impl Slots {
         }
 
         for install in &columns.adjustments.installs {
-            let row = sampler.bias_row(install)?;
-            self.write(BIAS, u64::from(install.slot) * row_bytes, &row)?;
+            let own = slot_row(install.slot, self.slots)?;
+            let row = sampler.bias_row(&SlotBias {
+                slot: own,
+                ..install.clone()
+            })?;
+            self.write(BIAS, u64::from(own) * row_bytes, &row)?;
         }
         Ok(())
     }
@@ -381,8 +386,9 @@ impl Slots {
         self.write(BANS, 0, masks)
     }
 
-    /// Starts `slot`'s commit state from its row of the decode batch `columns`.
+    /// Starts request slot `slot`'s commit state from its row of the decode batch `columns`.
     fn start_decode(&mut self, slot: u32, columns: &BatchColumns) -> Result<()> {
+        let own = u64::from(slot_row(slot, self.slots)?);
         let rows = &columns.rows;
         let row = columns
             .slots
@@ -412,12 +418,11 @@ impl Slots {
             ))
         })?;
 
-        let slot = u64::from(slot);
-        self.write(FUTURE, slot * u64::from(self.width) * 4, &[id])?;
-        self.write(LOGICAL, slot * 4, &[logical])?;
-        self.write(SAMPLING, slot * 4, &[sampling])?;
-        self.write(VERIFIED, slot * 4, &[verified])?;
-        self.write(PREDICATES, slot, &[1_u8])
+        self.write(FUTURE, own * u64::from(self.width) * 4, &[id])?;
+        self.write(LOGICAL, own * 4, &[logical])?;
+        self.write(SAMPLING, own * 4, &[sampling])?;
+        self.write(VERIFIED, own * 4, &[verified])?;
+        self.write(PREDICATES, own, &[1_u8])
     }
 
     /// Copies `values` to byte `offset` of `table`, on the stream.
