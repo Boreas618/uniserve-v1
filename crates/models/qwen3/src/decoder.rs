@@ -1,436 +1,379 @@
-//! The Qwen3 decoder layer and the stack of them, which every Qwen3 model composes.
+//! The Qwen3 decoder layer, which every Qwen3 model composes.
 //!
 //! The layer is Hugging Face's `Qwen3DecoderLayer`, with the feed-forward block of
-//! `Qwen3MoeDecoderLayer` and the token mixer and shared expert of `Qwen3_5MoeDecoderLayer`:
-//!
-//! under vLLM's residual contract (`Qwen3DecoderLayer.forward(positions, hidden_states, residual)`):
+//! `Qwen3MoeDecoderLayer` and the token mixer and shared expert of `Qwen3_5MoeDecoderLayer`,
+//! in vLLM's residual form (`Qwen3NextDecoderLayer.forward(hidden_states, residual,
+//! positions)`, `refs/vllm/vllm/model_executor/models/qwen3_next.py:583-655`):
 //!
 //! ```text
 //! residual None:     residual = hidden;            x = input_layernorm(hidden)
-//! residual Some(r):  x, residual = fused_add_rms_norm(hidden, r, input_layernorm)
-//! mixer:             hidden = self_attn(x)          (q/k RMSNorm fused into the rotation)
-//!                 or hidden = linear_attn(x)        (a gated delta network over the slot's state)
-//!                    x, residual = fused_add_rms_norm(hidden, residual, post_attention_layernorm)
-//! feed-forward:      hidden = mlp(x)                (gated MLP, or routed experts and a shared one)
+//! residual Some(r):  x, residual = input_layernorm(hidden, r)       add, then normalize
+//! mixer:             hidden = self_attn(x)          q/k RMSNorm fused into the rotation
+//!                 or hidden = linear_attn(x)        a gated delta network over the slot's state
+//!                    x, residual = post_attention_layernorm(hidden, residual)
+//! feed-forward:      hidden = mlp(x)                gated MLP, or routed experts and a shared one
 //! ```
 //!
-//! A layer answers its MLP output unsummed with the residual stream; the next layer's input norm,
-//! or the model's final norm, adds it in the same launch that normalizes the sum. The residual
-//! stream accumulates in place in the stack's input tensor.
+//! A layer returns `(hidden, residual)`: its feed-forward output, not yet added to the residual
+//! stream, and the stream. The next layer's input norm, or the model's final norm, adds the
+//! two in the operator that normalizes their sum.
 //!
-//! The MLP output crosses from one layer to the next, so it lands in one `[tokens, hidden]` buffer
-//! the stack reserves before its first layer ([`Mlp::forward_into`]); everything else a layer
-//! computes is reserved inside the layer's scope ([`nn::Forward::scoped`]) and handed back once its
-//! launches are enqueued, so every layer of a stack reuses the same addresses.
-//!
-//! The stack does not own a rotation: a model turns its queries and keys by the factors of its
-//! positions ([`rotary`]), and may hold more than one spectrum (a text batch and an image batch of
-//! a Qwen3.5 model turn by different spectra of the same rotary width).
+//! A layer holds no rotation: a model turns its queries and keys by the factors of its
+//! positions, computed once per forward, and may hold more than one spectrum (a text batch and
+//! an image batch of a Qwen3.5 model turn by different spectra of the same rotary width).
 
-use std::ops::Range;
-
-use nn::blocks::{
-    AttentionKind, GateUp, GatedDeltaNet, GatedMlp, GatedMlpSpec, Keys, QkNormNames, QkvAttention,
-    QkvAttentionSpec, RopeFactors, SharedExpert,
+use nn::functional::Rounding;
+use nn::modules::{
+    Attention, AttentionConfig, GateUp, GatedDeltaNet, GatedDeltaNetConfig, Mlp, MlpConfig, MoE,
+    MoEConfig, QkNorm, QkvBias, QkvLinearConfig, QkvNames, RmsNorm, RmsNormConfig, SharedExpert,
+    SharedExpertConfig,
 };
-use nn::family::Split;
-use nn::layers::{
-    Bias, Moe, QkNorm, QkvBias, QkvNames, QkvSpec, ResidualStream, RmsNorm, Rotary, RotarySpec,
-    Rounding, Spectrum,
-};
-use nn::weights::Scope;
-use nn::{DType, Forward, Operand, Shape};
+use nn::{ExpertExchange, KvCache, RecurrentState, Split, Tensor, TokenBatch, VarBuilder};
 
-use crate::config::{Config, Mixer, TextConfig};
+use crate::config::{Config, TextConfig};
 use crate::{Error, Result};
 
-/// The fence class of one decoder layer, at path `<stack>.layers.<i>`, which the deployment's
-/// fence patterns select (`docs/profiling.md`).
+/// The profiler class of one decoder layer, at path `<stack>.layers.<i>`, which a deployment's
+/// range patterns select (`docs/profiling.md`).
 pub const LAYER: &str = "models.qwen3.transformer.TransformerLayer";
-/// The fence class of a layer's token mixer, at path `<layer>.self_attn` or `<layer>.linear_attn`.
+
+/// The profiler class of a layer's token mixer, at path `<layer>.self_attn` or
+/// `<layer>.linear_attn`.
 pub const ATTENTION: &str = "models.qwen3.transformer.Attention";
-/// The fence class of a layer's feed-forward block, at path `<layer>.mlp`.
+
+/// The profiler class of a layer's feed-forward block, at path `<layer>.mlp`.
 pub const MLP: &str = "models.qwen3.transformer.MoE";
 
-/// A layer's feed-forward block.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "one block per layer, held for the model's lifetime; the routed block is the common one"
-)]
-pub enum Mlp {
-    /// `down(act(gate(x)) · up(x))`, column parallel in and row parallel out.
-    Dense(GatedMlp),
-    /// Routed experts, and the gated shared expert every token also passes through when the
-    /// checkpoint has one.
-    Experts {
-        routed: Moe,
-        shared: Option<SharedExpert>,
-    },
-}
-
-impl Mlp {
-    /// The dense gated MLP of `text` at `scope` (`gate_proj`, `up_proj`, `down_proj`).
-    ///
-    /// # Errors
-    ///
-    /// A module the loader refuses or a split that does not divide the intermediate width.
-    pub fn dense(scope: &mut Scope<'_, '_>, text: &TextConfig, split: Split) -> Result<Self> {
-        Ok(Self::Dense(GatedMlp::load(
-            scope,
-            gated_mlp(text.hidden_size, text.intermediate_size, text.hidden_act),
-            split,
-        )?))
-    }
-
-    /// Whether the block's output is a packed product that writes whole row classes, so the
-    /// buffer [`Self::forward_into`] writes must hold the class of its rows.
-    fn is_packed(&self) -> bool {
-        matches!(self, Self::Dense(mlp) if mlp.is_packed())
-    }
-
-    /// The block's output over `x`, `[rows, hidden]`, written into `update`.
-    fn forward_into(&self, f: &Forward, x: Operand, update: Operand) -> Result<()> {
-        match self {
-            Self::Dense(mlp) => mlp.forward_into(f, x, update)?,
-            Self::Experts { routed, shared } => {
-                routed.forward_into(f, x, update)?;
-                if let Some(shared) = shared {
-                    shared.forward(f, x, update)?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// The spec of a Qwen3 gated MLP of `hidden → intermediate → hidden` gated by `activation`, named
-/// as the checkpoint names it.
+/// The gated MLP of `hidden → intermediate → hidden` gated by `text`'s activation, named as a
+/// Qwen3 checkpoint names it, at `split`'s rank.
 ///
 /// The product `act(gate) · up` is one FP32 expression rounded once, as the references' fused
 /// `SiluAndMul` evaluates it.
-pub(crate) fn gated_mlp(
-    hidden: u32,
-    intermediate: u32,
-    activation: ops::activation::Activation,
-) -> GatedMlpSpec<'static> {
-    GatedMlpSpec {
-        hidden,
+fn gated_mlp(text: &TextConfig, intermediate: u32, split: Split) -> MlpConfig {
+    MlpConfig {
+        hidden: text.hidden_size,
         intermediate,
-        activation,
+        activation: text.hidden_act,
         rounding: Rounding::Fused,
         gate_up: GateUp::Split {
             gate: "gate_proj",
             up: "up_proj",
         },
         down: "down_proj",
-        bias: Bias::Absent,
+        bias: false,
+        split,
     }
 }
 
-/// A layer's token mixer.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "one mixer per layer, held for the model's lifetime and read on every forward"
-)]
-pub enum TokenMixer {
-    /// Q/K/V column parallel over the heads, per-head gains fused into the rotation, and the
-    /// row-parallel output projection (`self_attn`).
-    Attention(QkvAttention),
-    /// A gated delta network over the request slots' recurrent state (`linear_attn`).
-    Linear(GatedDeltaNet),
+/// The RMS normalization of the residual stream of `text`, at its epsilon and gain.
+pub(crate) fn stream_norm(text: &TextConfig) -> RmsNormConfig {
+    RmsNormConfig {
+        width: text.hidden_size,
+        eps: text.rms_norm_eps,
+        centred: text.rms_norm_centred,
+        output: None,
+    }
 }
 
 /// One decoder layer, its modules named as the checkpoint names them.
+///
+/// A layer mixes its tokens with `self_attn` or with `linear_attn`, and feeds them forward
+/// through `mlp` or through `experts` (with `shared_expert` beside them when the checkpoint
+/// has one): exactly one of each pair is loaded, as the references construct one of each
+/// (`qwen3_next.py:525-560`).
 pub struct DecoderLayer {
     input_layernorm: RmsNorm,
-    mixer: TokenMixer,
+    self_attn: Option<Attention>,
+    linear_attn: Option<GatedDeltaNet>,
     post_attention_layernorm: RmsNorm,
-    mlp: Mlp,
-    /// The layer's module path, which names it to the fence probes.
+    mlp: Option<Mlp>,
+    experts: Option<MoE>,
+    shared_expert: Option<SharedExpert>,
+    /// The layer's module path, which names its profiler ranges.
     path: String,
 }
 
 impl DecoderLayer {
-    /// Layer `layer` of `config` at `scope` (`<stack>.layers.<layer>`), at `split`'s rank of the
-    /// tensor-parallel group, its norms writing `dtype`, attending with `attention` when its mixer
-    /// is attention, and its feed-forward block read by `mlp` from the layer's `mlp` scope.
+    /// The layer the module at `vb` (`<stack>.layers.<i>`) states, at `tensor`'s rank of the
+    /// tensor-parallel group.
+    ///
+    /// `linear` loads a gated delta network as the mixer in place of attention. `routed` loads
+    /// routed experts (and the shared expert the configuration states) in place of the dense
+    /// MLP, held at `experts`' rank of the expert group in the slots `order` states, or in the
+    /// checkpoint's order when it states none.
     ///
     /// # Errors
     ///
-    /// A module the loader refuses or a split that does not divide what it shards.
+    /// A linear layer or a routed layer of a configuration that states neither network, a
+    /// module the loader refuses, or a split that does not divide what it shards.
     pub fn load(
-        scope: &mut Scope<'_, '_>,
         config: &Config,
-        layer: u32,
-        attention: AttentionKind,
-        split: Split,
-        dtype: DType,
-        mlp: &mut dyn FnMut(u32, &mut Scope<'_, '_>) -> Result<Mlp>,
+        vb: VarBuilder<'_, '_>,
+        linear: bool,
+        routed: bool,
+        (tensor, experts): (Split, Split),
+        order: Option<&Vec<u32>>,
     ) -> Result<Self> {
         let text = &config.text;
-        let norm = |scope: &mut Scope<'_, '_>, module: &str| {
-            RmsNorm::load(
-                &mut scope.scope(module),
-                text.hidden_size,
-                text.rms_norm_eps,
-                text.rms_norm_gain,
-                dtype,
+        let norm = stream_norm(text);
+        let refuse = |missing: &str| Error::Config(format!("{} states no {missing}", vb.path()));
+
+        let (self_attn, linear_attn) = if linear {
+            let network = text
+                .gated_delta_net
+                .ok_or_else(|| refuse("gated delta network"))?;
+            let network = GatedDeltaNetConfig {
+                split: tensor,
+                ..network
+            };
+
+            (
+                None,
+                Some(GatedDeltaNet::load(&network, vb.pp("linear_attn"))?),
             )
-        };
-        let input_layernorm = norm(scope, "input_layernorm")?;
-        let post_attention_layernorm = norm(scope, "post_attention_layernorm")?;
-        let mixer = match config.mixers[layer as usize] {
-            Mixer::Linear(spec) => TokenMixer::Linear(GatedDeltaNet::load(
-                &mut scope.scope("linear_attn"),
-                spec,
-                split,
-            )?),
-            Mixer::Attention => TokenMixer::Attention(QkvAttention::load(
-                &mut scope.scope("self_attn"),
-                QkvAttentionSpec {
-                    qkv: QkvSpec {
-                        hidden: text.hidden_size,
-                        heads: text.num_attention_heads,
-                        kv_heads: text.num_key_value_heads,
-                        head_dim: text.head_dim,
-                        gated: text.attn_output_gate,
-                    },
+        } else {
+            let attention = AttentionConfig {
+                qkv: QkvLinearConfig {
+                    hidden: text.hidden_size,
+                    heads: text.num_attention_heads,
+                    kv_heads: text.num_key_value_heads,
+                    head_dim: text.head_dim,
+                    gated: text.attn_output_gate,
                     names: QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
                     bias: if text.attention_bias {
                         QkvBias::Present
                     } else {
                         QkvBias::Absent
                     },
-                    output: "o_proj",
-                    output_bias: if text.attention_bias {
-                        Bias::Present
-                    } else {
-                        Bias::Absent
-                    },
-                    qk_norm: QkNormNames::Fused {
-                        query: "q_norm",
-                        key: "k_norm",
-                    },
-                    kind: attention,
-                    scale: text.rope.score_scale(text.head_dim)?,
+                    split: tensor,
                 },
-                split,
-            )?),
+                output: "o_proj",
+                output_bias: text.attention_bias,
+                qk_norm: QkNorm::Fused {
+                    gains: Some(["q_norm", "k_norm"]),
+                    eps: text.rms_norm_eps,
+                    centred: text.rms_norm_centred,
+                },
+                scale: text.rope.score_scale(text.head_dim)?,
+                causal: true,
+                window: None,
+                max_kv_len: text.max_position_embeddings,
+            };
+
+            (Some(Attention::load(&attention, vb.pp("self_attn"))?), None)
         };
-        let mlp = mlp(layer, &mut scope.scope("mlp"))?;
+
+        let (mlp, routed_experts, shared_expert) = if routed {
+            let moe = config
+                .moe
+                .as_ref()
+                .ok_or_else(|| refuse("routed experts"))?;
+            let block = MoEConfig {
+                hidden: text.hidden_size,
+                intermediate: moe.moe_intermediate_size,
+                experts: moe.num_experts,
+                top: moe.num_experts_per_tok,
+                activation: text.hidden_act,
+                renormalize: moe.norm_topk_prob,
+                router: "gate",
+                list: "experts",
+                up: "up_proj",
+                gate: "gate_proj",
+                down: "down_proj",
+                // Released Qwen3.5 BF16 checkpoints stack the experts; Qwen3-MoE and every
+                // calibrated export store one module per expert.
+                stacked: Some(["gate_up_proj", "down_proj"]),
+                order: order
+                    .cloned()
+                    .unwrap_or_else(|| (0..moe.num_experts).collect()),
+                split: tensor,
+                exchange: experts,
+            };
+            let shared = match moe.shared_expert_intermediate_size {
+                Some(intermediate) => Some(SharedExpert::load(
+                    &SharedExpertConfig {
+                        mlp: gated_mlp(text, intermediate, tensor),
+                        module: "shared_expert",
+                        gate: "shared_expert_gate",
+                    },
+                    vb.pp("mlp"),
+                )?),
+                None => None,
+            };
+
+            (None, Some(MoE::load(&block, vb.pp("mlp"))?), shared)
+        } else {
+            let dense = gated_mlp(text, text.intermediate_size, tensor);
+            (Some(Mlp::load(&dense, vb.pp("mlp"))?), None, None)
+        };
+
         Ok(Self {
-            input_layernorm,
-            mixer,
-            post_attention_layernorm,
+            input_layernorm: RmsNorm::load(&norm, vb.pp("input_layernorm"))?,
+            self_attn,
+            linear_attn,
+            post_attention_layernorm: RmsNorm::load(&norm, vb.pp("post_attention_layernorm"))?,
             mlp,
-            path: scope.path().to_owned(),
+            experts: routed_experts,
+            shared_expert,
+            path: vb.path().to_owned(),
         })
     }
 
-    /// The layer's feed-forward block.
-    pub const fn mlp(&self) -> &Mlp {
-        &self.mlp
+    /// Whether the layer's mixer is a gated delta network, which reads the recurrent state
+    /// and not the key/value cache.
+    pub const fn is_linear(&self) -> bool {
+        self.linear_attn.is_some()
     }
 
-    /// Run the layer over `hidden`, `[tokens, hidden]`, with the residual stream it has not been
-    /// added into (`None` for the first layer, whose `hidden` becomes the stream), and answer
-    /// `(hidden, residual)`: the layer's MLP output, written into `update`, and the stream, updated
-    /// in place.
+    /// The layer's routed experts, when it routes.
+    pub const fn experts(&self) -> Option<&MoE> {
+        self.experts.as_ref()
+    }
+
+    /// The layer's module path in the checkpoint.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The layer over the rows of `batch`: `(hidden, residual)`, the feed-forward output and
+    /// the residual stream it is not yet added to.
     ///
-    /// `rope` turns the attention's queries and keys; `keys` is what the mixer attends to or
-    /// advances. `update` may be `hidden` itself: the input norm has consumed it before the MLP
-    /// writes it. Every other intermediate is handed back before return.
+    /// `hidden` is `[tokens, hidden]`, with the stream it is not yet added to (`None` for a
+    /// stack's first layer, whose `hidden` becomes the stream). `rope` is the forward's
+    /// `(cos, sin)` factor tables. An attention layer writes its keys and values into layer
+    /// `ordinal` of `cache` and attends them; a linear layer reads and advances recurrent
+    /// layer `ordinal` of `state`. `exchange` is the expert group's exchange, lent when the
+    /// layer's experts are split over one.
     ///
     /// # Errors
     ///
-    /// Keys of another kind than the layer's mixer, or a view a layer refuses.
+    /// A linear layer run without a state, or tensors a module refuses.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the tensors a decoder layer reads and the state execution lends it"
+    )]
     pub fn forward(
         &self,
-        f: &Forward,
-        (hidden, residual): (Operand, Option<Operand>),
-        update: Operand,
-        rope: RopeFactors<'_>,
-        keys: Keys<'_>,
-    ) -> Result<(Operand, Operand)> {
-        f.scoped(|f| {
-            let (normalized, residual) = match residual {
-                None => (self.input_layernorm.forward(f, hidden, None)?, hidden),
-                Some(residual) => (
-                    self.input_layernorm.forward(
-                        f,
-                        hidden,
-                        Some(ResidualStream::in_place(residual)),
-                    )?,
-                    residual,
-                ),
-            };
-            let attended = match &self.mixer {
-                TokenMixer::Attention(attention) => {
-                    f.fenced(ATTENTION, format_args!("{}.self_attn", self.path), || {
-                        Ok::<_, Error>(attention.forward(f, normalized, Some(rope), keys)?)
+        hidden: &Tensor,
+        residual: Option<&Tensor>,
+        rope: (&Tensor, &Tensor),
+        batch: &TokenBatch,
+        cache: Option<&KvCache>,
+        state: Option<&RecurrentState>,
+        exchange: Option<&ExpertExchange>,
+        ordinal: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        nn::profiler::range(LAYER, &self.path, || {
+            let (normalized, residual) = self.normalize(hidden, residual)?;
+
+            let mixed = match (&self.self_attn, &self.linear_attn) {
+                (Some(attention), _) => {
+                    let cache = cache.ok_or_else(|| self.lent_no("key/value cache"))?;
+
+                    nn::profiler::range(ATTENTION, &format!("{}.self_attn", self.path), || {
+                        attention.forward_paged(&normalized, Some(rope), batch, cache, ordinal)
                     })?
                 }
-                TokenMixer::Linear(delta) => {
-                    let Keys::Recurrent {
-                        batch,
-                        cache,
-                        layer,
-                    } = keys
-                    else {
-                        return Err(Error::Config(format!(
-                            "{} is a gated delta network and was handed no recurrent state",
-                            self.path
-                        )));
-                    };
-                    f.fenced(ATTENTION, format_args!("{}.linear_attn", self.path), || {
-                        Ok::<_, Error>(delta.forward(
-                            f,
-                            normalized,
-                            batch,
-                            cache.state()?,
-                            layer,
-                        )?)
+                (None, Some(network)) => {
+                    let state = state.ok_or_else(|| self.lent_no("recurrent state"))?;
+
+                    nn::profiler::range(ATTENTION, &format!("{}.linear_attn", self.path), || {
+                        network.forward(&normalized, batch, state, ordinal)
                     })?
                 }
+                (None, None) => return Err(self.lent_no("token mixer")),
             };
-            let normalized = self.post_attention_layernorm.forward(
-                f,
-                attended,
-                Some(ResidualStream::in_place(residual)),
-            )?;
-            f.fenced(MLP, format_args!("{}.mlp", self.path), || {
-                self.mlp.forward_into(f, normalized, update)
-            })?;
-            Ok((update, residual))
+
+            self.feed_forward(&mixed, &residual, batch.live_tokens.as_ref(), exchange)
         })
     }
-}
 
-/// The rotary embedding of a stack of `text`'s heads at `split`'s rank, turning by `spectrum`, its
-/// per-head q/k RMSNorm fused at the stack's epsilon and gain, publishing its spectrum under
-/// `scope`.
-///
-/// # Errors
-///
-/// A split that does not divide the heads, or a spectrum the rotation refuses.
-pub fn rotary(
-    scope: &mut Scope<'_, '_>,
-    text: &TextConfig,
-    spectrum: Spectrum,
-    split: Split,
-) -> Result<Rotary> {
-    let (heads, kv_heads) = text.local_heads(split)?;
-    Ok(Rotary::load(
-        scope,
-        spectrum,
-        RotarySpec {
-            head_dim: text.head_dim,
-            heads,
-            kv_heads,
-            qk_norm: QkNorm::Fused {
-                epsilon: text.rms_norm_eps,
-                gain: text.rms_norm_gain,
-            },
-        },
-    )?)
-}
-
-/// A stack of decoder layers.
-pub struct DecoderStack {
-    layers: Vec<DecoderLayer>,
-}
-
-impl DecoderStack {
-    /// Layers `layers` of `config` under `scope` (`<scope>.layers.<i>`), as
-    /// [`DecoderLayer::load`] reads each. A consumer that truncates the checkpoint's stack loads a
-    /// prefix of its layers.
+    /// The layer over rows that attend as the variable-length sequences `offsets` names, with
+    /// no cache: `(hidden, residual)` as [`Self::forward`] returns them.
+    ///
+    /// `offsets` is the `[sequences + 1]` U32 cumulative row counts of the sequences, which
+    /// attend themselves under the causal mask, and `max_kv_len` the bound on one sequence's
+    /// keys.
     ///
     /// # Errors
     ///
-    /// An empty range or one past the checkpoint's layers, or what a layer's load refuses.
-    pub fn load(
-        scope: &mut Scope<'_, '_>,
-        config: &Config,
-        layers: Range<u32>,
-        attention: AttentionKind,
-        split: Split,
-        dtype: DType,
-        mlp: &mut dyn FnMut(u32, &mut Scope<'_, '_>) -> Result<Mlp>,
-    ) -> Result<Self> {
-        if layers.is_empty() || layers.end as usize > config.mixers.len() {
-            return Err(Error::Config(format!(
-                "decoder layers {layers:?} of a {}-layer stack",
-                config.mixers.len()
-            )));
-        }
-        let layers = layers
-            .map(|layer| {
-                DecoderLayer::load(
-                    &mut scope.scope(format!("layers.{layer}")),
-                    config,
-                    layer,
-                    attention,
-                    split,
-                    dtype,
-                    mlp,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self { layers })
-    }
-
-    /// The layers, in stack order.
-    pub fn layers(&self) -> &[DecoderLayer] {
-        &self.layers
-    }
-
-    /// Run every layer over `hidden`, `[tokens, hidden]`, and answer the last layer's
-    /// `(hidden, residual)`: its MLP output and the residual stream it has not been added into,
-    /// which the caller's final norm adds. The stream accumulates in place in `hidden`.
-    ///
-    /// The MLP output each layer hands the next is one buffer reserved here before the first layer,
-    /// at the packed row class when a layer's product writes whole classes. `keys` answers what
-    /// layer `index` attends to or advances; `after` runs after each layer over its MLP output,
-    /// where Qwen3-VL's DeepStack features join it. Each layer is fenced at its module path.
-    ///
-    /// # Errors
-    ///
-    /// What a layer, `keys` or `after` refuses, or an arena that cannot hold the carried output.
-    pub fn forward<'k>(
+    /// A linear layer, whose state only a batch's slots address, or tensors a module refuses.
+    pub fn forward_varlen(
         &self,
-        f: &Forward,
-        hidden: Operand,
-        rope: RopeFactors<'_>,
-        keys: impl Fn(usize) -> Result<Keys<'k>>,
-        mut after: impl FnMut(usize, Operand) -> Result<()>,
-    ) -> Result<(Operand, Operand)> {
-        let update = self.carried(f, hidden)?;
-        let (mut hidden, mut residual) = (hidden, None);
-        for (index, layer) in self.layers.iter().enumerate() {
-            let keys = keys(index)?;
-            let (output, stream) = f.fenced(LAYER, format_args!("{}", layer.path), || {
-                layer.forward(f, (hidden, residual), update, rope, keys)
-            })?;
-            after(index, output)?;
-            (hidden, residual) = (output, Some(stream));
-        }
-        let residual =
-            residual.ok_or_else(|| Error::Config("a decoder stack of no layers".to_owned()))?;
-        Ok((hidden, residual))
+        hidden: &Tensor,
+        residual: Option<&Tensor>,
+        rope: (&Tensor, &Tensor),
+        offsets: &Tensor,
+        max_kv_len: u32,
+    ) -> Result<(Tensor, Tensor)> {
+        nn::profiler::range(LAYER, &self.path, || {
+            let (normalized, residual) = self.normalize(hidden, residual)?;
+
+            let attention = self
+                .self_attn
+                .as_ref()
+                .ok_or_else(|| self.lent_no("attention over its own rows"))?;
+            let mixed =
+                nn::profiler::range(ATTENTION, &format!("{}.self_attn", self.path), || {
+                    attention.forward_varlen(
+                        &normalized,
+                        Some(rope),
+                        offsets,
+                        offsets,
+                        None,
+                        max_kv_len,
+                    )
+                })?;
+
+            self.feed_forward(&mixed, &residual, None, None)
+        })
     }
 
-    /// The buffer the layers' MLP outputs are carried in: `[tokens, hidden]` of `hidden`'s type,
-    /// at the start of a region of the packed row class when a layer's product is packed.
-    fn carried(&self, f: &Forward, hidden: Operand) -> Result<Operand> {
-        let tokens = hidden.shape.dim(0);
-        let held = if self.layers.iter().any(|layer| layer.mlp.is_packed()) {
-            let counted = u32::try_from(tokens)
-                .map_err(|_| Error::Config(format!("{tokens} activation rows")))?;
-            u64::from(ops::fp4::packed_rows(counted)?)
-        } else {
-            tokens
-        };
-        let region = f.empty(hidden.dtype, Shape::new(&[held, hidden.shape.dim(1)]))?;
-        Ok(region.narrow(0, 0, tokens)?)
+    /// The refusal of a forward that needs `what` and has none.
+    fn lent_no(&self, what: &str) -> Error {
+        Error::Config(format!("{} has no {what}", self.path))
+    }
+
+    /// The input norm: `(normalized, residual)`, the rows the mixer reads and the stream,
+    /// which `hidden` is added into when there is one and is itself otherwise.
+    fn normalize(&self, hidden: &Tensor, residual: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+        match residual {
+            None => Ok((self.input_layernorm.forward(hidden)?, hidden.clone())),
+            Some(residual) => Ok(self.input_layernorm.forward_residual(hidden, residual)?),
+        }
+    }
+
+    /// The second half of the layer: `mixed`, the mixer's output, is added into the stream,
+    /// and the feed-forward block runs over the normalized sum.
+    fn feed_forward(
+        &self,
+        mixed: &Tensor,
+        residual: &Tensor,
+        live_tokens: Option<&Tensor>,
+        exchange: Option<&ExpertExchange>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (normalized, residual) = self
+            .post_attention_layernorm
+            .forward_residual(mixed, residual)?;
+
+        let hidden = nn::profiler::range(MLP, &format!("{}.mlp", self.path), || {
+            match (&self.mlp, &self.experts) {
+                (Some(mlp), _) => mlp.forward(&normalized),
+                (None, Some(experts)) => {
+                    let routed = experts.forward(&normalized, live_tokens, exchange)?;
+
+                    match &self.shared_expert {
+                        Some(shared) => shared.forward(&normalized, routed),
+                        None => Ok(routed),
+                    }
+                }
+                (None, None) => Err(nn::Error::shape(
+                    "DecoderLayer",
+                    format!("{} has no feed-forward block", self.path),
+                )),
+            }
+        })?;
+
+        Ok((hidden, residual))
     }
 }

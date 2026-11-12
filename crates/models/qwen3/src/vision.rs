@@ -1,109 +1,65 @@
 //! The Qwen3-VL vision tower (`model.visual`): tubelet patches to language-width tokens.
 //!
-//! One image block's patches (a still image is one time step) are projected by the patch
-//! embedding, given a learned 2-D position resampled to their grid, rotated by a 2-D rotary
-//! position, encoded by `depth` pre-norm blocks, and merged so that every `merge × merge` block of
-//! patches becomes one token of the language model's width. The blocks the checkpoint names in
-//! `deepstack_visual_indexes` are merged the same way and returned beside the last one: these are
-//! the DeepStack features the language model adds at its own layer boundaries.
+//! One vision block's patches (a still image is one time step) are projected by the patch
+//! embedding, given a learned 2-D position resampled to their frame, rotated by a 2-D rotary
+//! position, encoded by `depth` pre-norm blocks, and merged so that every `merge × merge` block
+//! of patches becomes one token of the language model's width. The blocks the checkpoint names
+//! in `deepstack_visual_indexes` are merged the same way and returned beside the last one:
+//! these are the DeepStack features the language model adds at its own layer boundaries.
+//!
+//! The module tree is vLLM's `Qwen3_VisionTransformer`
+//! (`refs/vllm/vllm/model_executor/models/qwen3_vl.py:381-908`) and transformers'
+//! `Qwen3VLVisionModel` (`transformers/models/qwen3_vl/modeling_qwen3_vl.py:609-732`).
 //!
 //! ## What a grid decides
 //!
-//! The forward computes a grid's host values and places them on the device
-//! ([`nn::Forward::upload`]): the learned table's four taps and FP32 bilinear weights per patch
-//! ([`positions::position_samples`]), each patch's `(row, column)` rotary coordinates
-//! ([`positions::rotary_coordinates`]), and the attention offsets of the grid's time steps
-//! ([`positions::vision_lengths`]). Attention never crosses a time step: each temporal patch of a
-//! grid is one bidirectional sequence of `height · width` patches.
+//! The forward computes a grid's position tables as CPU tensors ([`crate::positions`]) and
+//! moves them to the device of the patches: the learned table's four rows and bilinear weights
+//! per patch, each patch's `(row, column)` rotary coordinates, and the offsets of the grid's
+//! time steps. Attention never crosses a time step: each temporal patch of a grid is one
+//! bidirectional sequence of `height · width` patches.
 //!
-//! The 2-D rotary is the reference's `RotaryEmbedding(head_dim / 2)` evaluated at two coordinates
-//! per patch: each axis reads the whole `head_dim / 4`-frequency spectrum with its own coordinate,
-//! the axes in contiguous blocks ([`Spectrum::Repeated`]), computed on the device from the
-//! uploaded coordinates.
+//! The 2-D rotary is the reference's `RotaryEmbedding(head_dim / 2)` evaluated at two
+//! coordinates per patch: each axis reads the whole `head_dim / 4`-frequency spectrum with its
+//! own coordinate, the axes in contiguous blocks ([`Spectrum::Repeated`]).
 //!
 //! ## Precision and layout
 //!
-//! The tower's activations are the checkpoint's own representation. The position blend accumulates
-//! in FP32 and rounds once into the activation type; the rotary factors are FP32. The patch
+//! The tower's activations are the checkpoint's own representation. The position blend
+//! multiplies the table's rows by FP32 weights, sums in FP32 and rounds once into the
+//! activation type (`modeling_qwen3_vl.py:702-703`); the rotary factors are FP32. The patch
 //! embedding reads the processor's flat channel-major tubelets against the checkpoint's Conv3d
-//! weight flattened in the same order: its kernel equals its stride, so it is one matrix product.
-//! The blocks' MLPs take the checkpoint's `gelu_pytorch_tanh`, the mergers PyTorch's exact
-//! `nn.GELU()`.
+//! weight flattened in the same order: its kernel equals its stride, so it is one matrix
+//! product. The blocks' MLPs take the checkpoint's `gelu_pytorch_tanh`, the mergers PyTorch's
+//! exact `nn.GELU()`.
 
-use nn::blocks::{AttentionKind, Keys, QkNormNames, QkvAttention, QkvAttentionSpec, RopeFactors};
-use nn::capability::{PatchFormat, PixelNorm, Vision};
-use nn::config::Fields;
-use nn::family::Split;
-use nn::layers::{
-    Bias, Gelu, LayerNorm, Linear, Parallel, Precision, QkNorm, QkvBias, QkvNames, QkvSpec,
-    Residual, Rotary, RotarySpec, Spectrum, Varlen,
+use nn::modules::{
+    Attention, AttentionConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, Parallel,
+    Precision, QkNorm, QkvBias, QkvLinearConfig, QkvNames, Rotary, RotaryConfig, Spectrum,
 };
-use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Forward, Operand, Shape, Weight};
-use ops::position::{Args as InterpolateArgs, Descriptor as InterpolateDescriptor};
+use nn::{DType, PatchFormat, PixelNorm, Split, Tensor, VarBuilder, Vision, functional};
 use processing::qwen_vl::ProcessorConfig;
 
 use crate::config::{POSITION_AXES, VisionConfig};
-use crate::{Error, Result, positions, write};
+use crate::{Error, Result, positions};
 
-/// The checkpoint's module path of the vision tower.
-const PREFIX: &str = "model.visual";
-
-/// Every normalization's variance floor (`LAYER_NORM_EPS` in the reference).
+/// Every normalization's variance floor (`partial(nn.LayerNorm, eps=1e-6)` in the reference).
 const LAYER_NORM_EPS: f32 = 1e-6;
 
 /// The 2-D rotary frequency base.
 const ROPE_THETA: f32 = 10_000.0;
 
-/// The fence class of one tower block, at path `model.visual.blocks.<i>`.
+/// The profiler class of one tower block, at path `model.visual.blocks.<i>`.
 const BLOCK: &str = "models.qwen3.vision.VisionBlock";
 
-/// The checkpoint's processor rules and its images' pixel normalization, or `None` when it states
-/// no processor files: such a checkpoint serves text alone.
-///
-/// # Errors
-///
-/// A file that is not a Qwen-VL processor config.
-pub fn open_processor(checkpoint: &nn::Checkpoint) -> Result<Option<(ProcessorConfig, PixelNorm)>> {
-    let [image_file, video_file] = ProcessorConfig::FILES;
-    let (Some(image), Some(video)) = (
-        checkpoint.sidecar(image_file)?,
-        checkpoint.sidecar(video_file)?,
-    ) else {
-        return Ok(None);
-    };
-    let norm = pixel_norm(&Fields::of(image_file, &image)?)?;
-    let processor = ProcessorConfig::from_values(&image, &video).map_err(Error::Config)?;
-    Ok(Some((processor, norm)))
-}
-
-/// The pixel normalization a processor's `image_mean` and `image_std` state: each RGB channel maps
-/// `x` in `[0, 255]` to `(x / 255 - mean) / std` ([`PixelNorm`]).
-///
-/// # Errors
-///
-/// Fields of the wrong type or length, or a deviation that is not positive.
-pub fn pixel_norm(values: &Fields<'_>) -> Result<PixelNorm> {
-    let owner = values.owner();
-    let mean = values.fixed_numbers("image_mean", 3)?;
-    let std = values.fixed_numbers("image_std", 3)?;
-    let mean: [f32; 3] = [mean[0] as f32, mean[1] as f32, mean[2] as f32];
-    let std: [f32; 3] = [std[0] as f32, std[1] as f32, std[2] as f32];
-    if std.iter().any(|value| *value <= 0.0) {
-        return Err(Error::Config(format!(
-            "{owner}.image_std must be positive, got {std:?}"
-        )));
-    }
-    Ok(PixelNorm { mean, std })
-}
-
-/// How the tower reads a clip's pixels as patch rows, which the runtime writes ([`PatchFormat`]).
+/// How the tower reads a clip's pixels as patch rows, which execution writes
+/// ([`PatchFormat`]).
 ///
 /// A row is one tubelet, channel-major (`channels · temporal · patch²`, the layout Qwen-VL
-/// processors emit), each element `(byte - 255 · mean) / (255 · std)` in FP32 rounded once to the
-/// tower's element type `dtype` (`tubelets.to(self.weight.dtype)`). The rows run over each temporal
-/// patch in merge-block order, and a temporal patch short of frames repeats the clip's last frame:
-/// an image is one frame repeated.
+/// processors emit), each element `(byte - 255 · mean) / (255 · std)` in FP32 rounded once to
+/// the tower's element type `dtype` (`tubelets.to(self.weight.dtype)`). The rows run over each
+/// temporal patch in merge-block order, and a temporal patch short of frames repeats the
+/// clip's last frame: an image is one frame repeated.
 pub fn patch_format(vision: &VisionConfig, norm: PixelNorm, dtype: DType) -> PatchFormat {
     PatchFormat {
         side: vision.patch_size,
@@ -115,152 +71,174 @@ pub fn patch_format(vision: &VisionConfig, norm: PixelNorm, dtype: DType) -> Pat
     }
 }
 
-/// One pre-norm block: attention and an ungated MLP, each added to the residual stream.
-struct VisionLayer {
+/// A projection with a bias at `vb`, whole on one rank.
+fn linear(vb: VarBuilder<'_, '_>, inputs: u32, outputs: u32) -> Result<Linear> {
+    let config = LinearConfig {
+        inputs,
+        outputs,
+        bias: true,
+        parallel: Parallel::None,
+    };
+
+    Ok(Linear::load(&config, vb)?)
+}
+
+/// A layer normalization with a bias over rows of `width` at `vb`.
+fn layer_norm(vb: VarBuilder<'_, '_>, width: u32) -> Result<LayerNorm> {
+    let config = LayerNormConfig {
+        width,
+        eps: LAYER_NORM_EPS,
+        bias: true,
+    };
+
+    Ok(LayerNorm::load(&config, vb)?)
+}
+
+/// One pre-norm block of the tower: attention and an ungated MLP, each added to the stream
+/// (`Qwen3_VisionBlock`).
+pub struct VisionBlock {
     norm1: LayerNorm,
-    /// The query, key and value windows of the checkpoint's fused `attn.qkv`, the 2-D rotation
-    /// without a norm, dense attention per time step, and `attn.proj`.
-    attention: QkvAttention,
+    /// The query, key and value rows of the checkpoint's fused `attn.qkv`, the 2-D rotation
+    /// without a norm, bidirectional attention per time step, and `attn.proj`.
+    attn: Attention,
     norm2: LayerNorm,
-    fc1: Linear,
-    fc2: Linear,
+    linear_fc1: Linear,
+    linear_fc2: Linear,
+    /// The block's module path, which names its profiler range.
     path: String,
 }
 
-impl VisionLayer {
-    /// The block at `scope`, its softmax scale `scale`.
-    fn load(scope: &mut Scope<'_, '_>, config: &VisionConfig, scale: f32) -> Result<Self> {
+impl VisionBlock {
+    /// The block at `vb` (`model.visual.blocks.<i>`), its softmax scale `scale`.
+    ///
+    /// # Errors
+    ///
+    /// A module the loader refuses.
+    pub fn load(config: &VisionConfig, vb: VarBuilder<'_, '_>, scale: f32) -> Result<Self> {
         let hidden = config.hidden_size;
-        let attention = QkvAttention::load(
-            &mut scope.scope("attn"),
-            QkvAttentionSpec {
-                qkv: QkvSpec {
-                    hidden,
-                    heads: config.num_heads,
-                    kv_heads: config.num_heads,
-                    head_dim: config.head_dim(),
-                    gated: false,
-                },
+        let attention = AttentionConfig {
+            qkv: QkvLinearConfig {
+                hidden,
+                heads: config.num_heads,
+                kv_heads: config.num_heads,
+                head_dim: config.head_dim(),
+                gated: false,
                 names: QkvNames::Fused("qkv"),
                 bias: QkvBias::Present,
-                output: "proj",
-                output_bias: Bias::Present,
-                qk_norm: QkNormNames::None,
-                // A block's key bound is its own grid's patches, a launch value.
-                kind: AttentionKind::Dense {
-                    max_keys: u32::MAX,
-                    causal: false,
-                    window: None,
-                },
-                scale,
+                split: Split::WHOLE,
             },
-            Split::WHOLE,
-        )?;
-        let norm1 = LayerNorm::load(&mut scope.scope("norm1"), hidden, LAYER_NORM_EPS)?;
-        let norm2 = LayerNorm::load(&mut scope.scope("norm2"), hidden, LAYER_NORM_EPS)?;
-        let linear = |scope: &mut Scope<'_, '_>, module: &str, inputs: u32, outputs: u32| {
-            Linear::load(
-                &mut scope.scope(module),
-                inputs,
-                outputs,
-                Bias::Present,
-                Parallel::None,
-            )
+            output: "proj",
+            output_bias: true,
+            qk_norm: QkNorm::None,
+            scale,
+            causal: false,
+            window: None,
+            // A block's key bound is its own grid's patches, which each forward states.
+            max_kv_len: u32::MAX,
         };
-        let mut mlp = scope.scope("mlp");
-        let fc1 = linear(&mut mlp, "linear_fc1", hidden, config.intermediate_size)?;
-        let fc2 = linear(&mut mlp, "linear_fc2", config.intermediate_size, hidden)?;
+        let mlp = vb.pp("mlp");
+
         Ok(Self {
-            norm1,
-            attention,
-            norm2,
-            fc1,
-            fc2,
-            path: scope.path().to_owned(),
+            norm1: layer_norm(vb.pp("norm1"), hidden)?,
+            attn: Attention::load(&attention, vb.pp("attn"))?,
+            norm2: layer_norm(vb.pp("norm2"), hidden)?,
+            linear_fc1: linear(mlp.pp("linear_fc1"), hidden, config.intermediate_size)?,
+            linear_fc2: linear(mlp.pp("linear_fc2"), config.intermediate_size, hidden)?,
+            path: vb.path().to_owned(),
         })
     }
 
-    /// The block over `hidden`, `[patches, hidden]`, updated in place.
-    fn forward(
+    /// The block over `hidden`, `[patches, hidden]`: the stream after it.
+    ///
+    /// `rope` is the grid's `(cos, sin)` factor tables and `offsets` the `[time + 1]` offsets
+    /// of its time steps, each one sequence of `frame` patches.
+    ///
+    /// # Errors
+    ///
+    /// Tensors a module refuses.
+    pub fn forward(
         &self,
-        f: &Forward,
-        hidden: Operand,
-        rope: RopeFactors<'_>,
-        varlen: Varlen,
-        gelu: Gelu,
-    ) -> Result<()> {
-        f.scoped(|f| {
-            let normalized = self.norm1.forward(f, hidden, None)?;
-            let attended =
-                self.attention
-                    .forward(f, normalized, Some(rope), Keys::Dense(Some(varlen)))?;
-            Residual::default().forward(f, hidden, attended, None)?;
-            let normalized = self.norm2.forward(f, hidden, None)?;
-            let activated = gelu.forward(f, self.fc1.forward(f, normalized)?)?;
-            let update = self.fc2.forward(f, activated)?;
-            Residual::default().forward(f, hidden, update, None)?;
-            Ok(())
+        hidden: &Tensor,
+        rope: (&Tensor, &Tensor),
+        offsets: &Tensor,
+        frame: u32,
+    ) -> Result<Tensor> {
+        nn::profiler::range(BLOCK, &self.path, || {
+            let patches = hidden.dim(0)? as u32;
+            let attended = self.attn.forward_varlen(
+                &self.norm1.forward(hidden)?,
+                Some(rope),
+                offsets,
+                offsets,
+                Some(frame),
+                patches,
+            )?;
+            let hidden = (hidden + attended)?;
+
+            let activated =
+                functional::gelu_tanh(&self.linear_fc1.forward(&self.norm2.forward(&hidden)?)?)?;
+            Ok((&hidden + self.linear_fc2.forward(&activated)?)?)
         })
     }
 }
 
-/// A patch merger: normalize, concatenate every `merge²` patch rows into one, project twice.
+/// A patch merger: normalize, read every `merge²` patch rows as one, project twice
+/// (`Qwen3_VisionPatchMerger`).
 ///
-/// The final merger normalizes each patch before the concatenation; a DeepStack merger normalizes
-/// the concatenated row (the reference's `use_postshuffle_norm`).
-struct PatchMerger {
+/// The final merger normalizes each patch before the rows are joined; a DeepStack merger
+/// normalizes the joined row (the reference's `use_postshuffle_norm`).
+pub struct PatchMerger {
     norm: LayerNorm,
-    fc1: Linear,
-    fc2: Linear,
-    width: u32,
-    normalizes_merged: bool,
+    linear_fc1: Linear,
+    linear_fc2: Linear,
+    /// The width of one joined row: `merge² · hidden`.
+    width: usize,
+    use_postshuffle_norm: bool,
 }
 
 impl PatchMerger {
-    /// The merger at `scope`.
-    fn load(
-        scope: &mut Scope<'_, '_>,
+    /// The merger at `vb`.
+    ///
+    /// # Errors
+    ///
+    /// A module the loader refuses.
+    pub fn load(
         config: &VisionConfig,
-        normalizes_merged: bool,
+        vb: VarBuilder<'_, '_>,
+        use_postshuffle_norm: bool,
     ) -> Result<Self> {
         let width = config.merged_width();
-        let normalized = if normalizes_merged {
+        let normalized = if use_postshuffle_norm {
             width
         } else {
             config.hidden_size
         };
+
         Ok(Self {
-            norm: LayerNorm::load(&mut scope.scope("norm"), normalized, LAYER_NORM_EPS)?,
-            fc1: Linear::load(
-                &mut scope.scope("linear_fc1"),
-                width,
-                width,
-                Bias::Present,
-                Parallel::None,
-            )?,
-            fc2: Linear::load(
-                &mut scope.scope("linear_fc2"),
-                width,
-                config.out_hidden_size,
-                Bias::Present,
-                Parallel::None,
-            )?,
-            width,
-            normalizes_merged,
+            norm: layer_norm(vb.pp("norm"), normalized)?,
+            linear_fc1: linear(vb.pp("linear_fc1"), width, width)?,
+            linear_fc2: linear(vb.pp("linear_fc2"), width, config.out_hidden_size)?,
+            width: width as usize,
+            use_postshuffle_norm,
         })
     }
 
-    /// `hidden`'s patch rows merged: `[patches / merge², out_hidden]`.
-    fn forward(&self, f: &Forward, hidden: Operand, gelu: Gelu) -> Result<Operand> {
-        let width = u64::from(self.width);
-        let merged = Shape::new(&[hidden.numel() / width, width]);
-        let normalized = if self.normalizes_merged {
-            self.norm.forward(f, hidden.reshape(merged), None)?
+    /// The patch rows of `hidden`, `[patches, hidden]`, merged: `[patches / merge²,
+    /// out_hidden]`.
+    ///
+    /// # Errors
+    ///
+    /// Tensors a module refuses.
+    pub fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
+        let merged = (hidden.elem_count() / self.width, self.width);
+        let normalized = if self.use_postshuffle_norm {
+            self.norm.forward(&hidden.reshape(merged)?)?
         } else {
-            self.norm.forward(f, hidden, None)?.reshape(merged)
+            self.norm.forward(hidden)?.reshape(merged)?
         };
-        let activated = gelu.forward(f, self.fc1.forward(f, normalized)?)?;
-        Ok(self.fc2.forward(f, activated)?)
+
+        let activated = functional::gelu(&self.linear_fc1.forward(&normalized)?)?;
+        Ok(self.linear_fc2.forward(&activated)?)
     }
 }
 
@@ -268,30 +246,29 @@ impl PatchMerger {
 pub struct VisionTower {
     config: VisionConfig,
     processor: ProcessorConfig,
-    format: PatchFormat,
-    dtype: DType,
-    patch: Linear,
-    position: Weight,
-    rotary: Rotary,
-    layers: Vec<VisionLayer>,
+    pixels: PixelNorm,
+    patch_embed: Linear,
+    /// `[num_position_embeddings, hidden]`: the learned position table, a square grid.
+    pos_embed: Tensor,
+    rotary_pos_emb: Rotary,
+    blocks: Vec<VisionBlock>,
     merger: PatchMerger,
     /// One merger per DeepStack block, in `deepstack_visual_indexes` order.
-    deepstack: Vec<PatchMerger>,
+    deepstack_merger_list: Vec<PatchMerger>,
 }
 
 impl VisionTower {
-    /// The tower of `config` read through `loader` in `dtype`, its images sized by `processor` and
-    /// normalized by `norm`.
+    /// The tower of `config` at `vb` (`model.visual`), its images sized by `processor` and
+    /// normalized by `pixels`.
     ///
     /// # Errors
     ///
-    /// A processor whose patch geometry is not the tower's, or a module the loader refuses.
+    /// A processor whose patch sizes are not the tower's, or a module the loader refuses.
     pub fn load(
-        loader: &mut WeightLoader<'_>,
         config: &VisionConfig,
+        vb: VarBuilder<'_, '_>,
         processor: ProcessorConfig,
-        norm: PixelNorm,
-        dtype: DType,
+        pixels: PixelNorm,
     ) -> Result<Self> {
         if (
             processor.patch_size,
@@ -303,7 +280,8 @@ impl VisionTower {
             config.spatial_merge_size,
         ) {
             return Err(Error::Config(format!(
-                "the processor patches {} over {} frames merging {}, the tower {} over {} merging {}",
+                "the processor patches {} over {} frames merging {}, the tower {} over {} \
+                 merging {}",
                 processor.patch_size,
                 processor.temporal_patch_size,
                 processor.merge_size,
@@ -312,62 +290,44 @@ impl VisionTower {
                 config.spatial_merge_size
             )));
         }
+
+        // Each of the two axes turns `head_dim / 4` pairs by the same spectrum.
         let head_dim = config.head_dim();
-        let spectrum = Spectrum::Repeated {
+        let rotary = RotaryConfig {
             theta: ROPE_THETA,
-            pairs: head_dim / 4,
-            axes: 2,
+            dim: head_dim,
+            spectrum: Spectrum::Repeated { axes: 2 },
             precision: Precision::F32,
         };
-        let scale = spectrum.score_scale(head_dim)?;
-        let mut tower = loader.scope(PREFIX);
-        let rotary = Rotary::load(
-            &mut tower.scope("rotary_pos_emb"),
-            spectrum,
-            RotarySpec {
-                head_dim,
-                heads: config.num_heads,
-                kv_heads: config.num_heads,
-                qk_norm: QkNorm::None,
-            },
-        )?;
-        let layers = (0..config.depth)
-            .map(|index| {
-                VisionLayer::load(&mut tower.scope(format!("blocks.{index}")), config, scale)
-            })
+        let scale = rotary.score_scale(head_dim)?;
+
+        let blocks = (0..config.depth)
+            .map(|index| VisionBlock::load(config, vb.pp("blocks").pp(index), scale))
             .collect::<Result<Vec<_>>>()?;
-        let deepstack = (0..config.deepstack_visual_indexes.len())
-            .map(|index| {
-                PatchMerger::load(
-                    &mut tower.scope(format!("deepstack_merger_list.{index}")),
-                    config,
-                    true,
-                )
-            })
+        let deepstack_merger_list = (0..config.deepstack_visual_indexes.len())
+            .map(|index| PatchMerger::load(config, vb.pp("deepstack_merger_list").pp(index), true))
             .collect::<Result<Vec<_>>>()?;
+
         Ok(Self {
-            patch: Linear::load(
-                &mut tower.scope("patch_embed.proj"),
+            patch_embed: linear(
+                vb.pp("patch_embed.proj"),
                 config.tubelet(),
                 config.hidden_size,
-                Bias::Present,
-                Parallel::None,
             )?,
-            position: tower.scope("pos_embed").tensor(
+            pos_embed: vb.pp("pos_embed").get(
+                (
+                    config.num_position_embeddings as usize,
+                    config.hidden_size as usize,
+                ),
                 "weight",
-                &[
-                    u64::from(config.num_position_embeddings),
-                    u64::from(config.hidden_size),
-                ],
             )?,
-            merger: PatchMerger::load(&mut tower.scope("merger"), config, false)?,
-            format: patch_format(config, norm, dtype),
+            rotary_pos_emb: Rotary::load(&rotary, vb.pp("rotary_pos_emb"))?,
+            merger: PatchMerger::load(config, vb.pp("merger"), false)?,
             config: config.clone(),
             processor,
-            dtype,
-            rotary,
-            layers,
-            deepstack,
+            pixels,
+            blocks,
+            deepstack_merger_list,
         })
     }
 
@@ -376,140 +336,85 @@ impl VisionTower {
         &self.config
     }
 
-    /// The patch rows and merged rows of one block of `grid` (patches), refused when a side is
-    /// not whole merge blocks.
-    fn rows(&self, grid: [u32; 3]) -> Result<(u64, u64)> {
+    /// The patch rows of one block of `grid`, refused when a side is not whole merge blocks.
+    fn patches(&self, grid: [u32; 3]) -> Result<u32> {
+        positions::check_grid(grid, self.config.spatial_merge_size)?;
         let [time, height, width] = grid;
-        let merge = self.config.spatial_merge_size;
-        if time == 0 || height == 0 || width == 0 || height % merge != 0 || width % merge != 0 {
-            return Err(Error::Config(format!(
-                "the grid {grid:?} is not whole {merge}x{merge} merge blocks"
-            )));
-        }
-        let patches = u64::from(time) * u64::from(height) * u64::from(width);
-        Ok((patches, patches / u64::from(merge * merge)))
+
+        time.checked_mul(height * width)
+            .ok_or_else(|| Error::Config(format!("a grid of {grid:?} patches")))
     }
 
-    /// Encode one block of `grid` from `pixels`, `[patches, tubelet]`: the merged features,
-    /// `[merged, out_hidden]`, and one DeepStack table of the same shape per DeepStack block.
+    /// The learned position of every patch of `grid`: `[patches, hidden]` in the table's
+    /// element type.
+    ///
+    /// Each patch blends the four table rows around its point with FP32 weights; the blend
+    /// accumulates in FP32 and rounds once. Every time step samples the same frame.
+    fn position_embedding(&self, grid: [u32; 3]) -> Result<Tensor> {
+        let [time, height, width] = grid;
+        let (side, merge) = (self.config.position_side(), self.config.spatial_merge_size);
+        let (frame, hidden) = ((height * width) as usize, self.config.hidden_size as usize);
+        let device = self.pos_embed.device();
+
+        let taps = positions::position_taps(side, height, width, merge)?.to_device(device)?;
+        let weights = positions::position_weights(side, height, width, merge)?
+            .unsqueeze(2)?
+            .to_device(device)?;
+
+        let rows = self
+            .pos_embed
+            .index_select(&taps.flatten_all()?, 0)?
+            .reshape((4, frame, hidden))?
+            .to_dtype(DType::F32)?;
+        let blended = rows.broadcast_mul(&weights)?.sum(0)?;
+
+        Ok(blended
+            .to_dtype(self.pos_embed.dtype())?
+            .repeat((time as usize, 1))?)
+    }
+
+    /// Encodes one block of `grid` from `pixels`, `[patches, tubelet]`: `[merged,
+    /// out_hidden · (1 + deepstack)]`, each merged row's features followed by its DeepStack
+    /// features in `deepstack_visual_indexes` order, as the reference returns them
+    /// (`qwen3_vl.py:905-906`).
     ///
     /// # Errors
     ///
-    /// Pixels that do not describe the grid, or what a layer refuses.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        grid: [u32; 3],
-        pixels: Operand,
-    ) -> Result<(Operand, Vec<Operand>)> {
-        let [time, height, width] = grid;
-        let (patches, _) = self.rows(grid)?;
-        if pixels.shape.dims() != [patches, u64::from(self.config.tubelet())] {
+    /// Pixels that do not describe the grid, or what a module refuses.
+    pub fn forward(&self, grid: [u32; 3], pixels: &Tensor) -> Result<Tensor> {
+        let patches = self.patches(grid)?;
+        if pixels.dims() != [patches as usize, self.config.tubelet() as usize] {
             return Err(Error::Config(format!(
                 "pixels of {:?} for a {grid:?} grid",
-                pixels.shape.dims()
+                pixels.dims()
             )));
         }
-        let merge = self.config.spatial_merge_size;
-        // Every time step samples the same grid, so one step's values repeat `time` times.
-        let repeat = |values: Vec<i32>| -> Vec<i32> {
-            values
-                .iter()
-                .copied()
-                .cycle()
-                .take(values.len() * time as usize)
-                .collect()
-        };
-        let (taps, blend) =
-            positions::position_samples(self.config.position_side(), height, width, merge)?;
-        let taps = f.upload(
-            &repeat(taps.into_iter().flatten().collect()),
-            Shape::new(&[patches, 4]),
-        )?;
-        let step: Vec<f32> = blend.into_iter().flatten().collect();
-        let blend = f.upload(
-            &step
-                .iter()
-                .copied()
-                .cycle()
-                .take(step.len() * time as usize)
-                .collect::<Vec<_>>(),
-            Shape::new(&[patches, 4]),
-        )?;
-        // `[axes, patches]` axis-major: every patch's row, then every patch's column.
-        let coordinates = positions::rotary_coordinates(height, width, merge)?;
-        let mut axes = Vec::with_capacity(2 * patches as usize);
-        for axis in 0..2 {
-            for _ in 0..time {
-                axes.extend(coordinates.iter().map(|coordinate| coordinate[axis] as i32));
-            }
-        }
-        let coordinates = f.upload(&axes, Shape::new(&[2, patches]))?;
-        let lengths = f.upload(
-            &positions::vision_lengths(time, height, width)?,
-            Shape::new(&[u64::from(time) + 1]),
-        )?;
+        let [_, height, width] = grid;
+        let device = pixels.device();
 
-        let hidden = self.patch.forward(f, pixels)?;
-        let resampled = self.interpolate(f, taps, blend, patches)?;
-        Residual::default().forward(f, hidden, resampled, None)?;
-        let rope = RopeFactors {
-            rotary: &self.rotary,
-            factors: self.rotary.factors(f, coordinates)?,
-        };
-        let varlen = Varlen {
-            cu_q: lengths,
-            cu_k: lengths,
-            max_q: Some(height * width),
-            max_k: u32::try_from(patches)
-                .map_err(|_| Error::Config(format!("a grid of {patches} patches")))?,
-        };
-        let mut deepstack = Vec::with_capacity(self.deepstack.len());
-        for (index, layer) in self.layers.iter().enumerate() {
-            f.fenced(BLOCK, format_args!("{}", layer.path), || {
-                layer.forward(f, hidden, rope, varlen, Gelu::tanh())
-            })?;
-            if let Some(position) = self
-                .config
-                .deepstack_visual_indexes
-                .iter()
-                .position(|block| *block as usize == index)
+        let hidden = (self.patch_embed.forward(pixels)? + self.position_embedding(grid)?)?;
+
+        let coordinates = positions::patch_coordinates(grid, self.config.spatial_merge_size)?
+            .to_device(device)?;
+        let (cos, sin) = self.rotary_pos_emb.forward(&coordinates)?;
+        let offsets = positions::frame_offsets(grid)?.to_device(device)?;
+
+        let mut hidden = hidden;
+        let mut deepstack_features = Vec::with_capacity(self.deepstack_merger_list.len());
+        for (index, block) in (0..).zip(&self.blocks) {
+            hidden = block.forward(&hidden, (&cos, &sin), &offsets, height * width)?;
+
+            let deepstack = self.config.deepstack_visual_indexes.iter();
+            if let Some(merger) = deepstack
+                .zip(&self.deepstack_merger_list)
+                .find_map(|(block, merger)| (*block == index).then_some(merger))
             {
-                deepstack.push(self.deepstack[position].forward(f, hidden, Gelu::exact())?);
+                deepstack_features.push(merger.forward(&hidden)?);
             }
         }
-        Ok((self.merger.forward(f, hidden, Gelu::exact())?, deepstack))
-    }
 
-    /// The learned position table resampled at `taps` with `weights`: `[patches, hidden]`, blended
-    /// in FP32 and rounded once into the activation type.
-    fn interpolate(
-        &self,
-        f: &Forward,
-        taps: Operand,
-        weights: Operand,
-        patches: u64,
-    ) -> Result<Operand> {
-        let out = f.empty(
-            self.dtype,
-            Shape::new(&[patches, u64::from(self.config.hidden_size)]),
-        )?;
-        f.operate::<ops::position::PositionInterpolate>(
-            &InterpolateDescriptor {
-                dtype: self.dtype,
-                channels: self.config.hidden_size,
-                in_side: self.config.position_side(),
-                block: 1024,
-                pdl: false,
-            },
-            InterpolateArgs {
-                table: self.position.view(),
-                indices: taps,
-                weights,
-                out,
-            },
-        )?;
-        Ok(out)
+        let features = [vec![self.merger.forward(&hidden)?], deepstack_features].concat();
+        Ok(Tensor::cat(&features, 1)?)
     }
 }
 
@@ -518,12 +423,13 @@ impl Vision for VisionTower {
         let grid = self
             .processor
             .image_grid(height, width)
-            .map_err(|error| nn::Error::from(Error::Config(error.to_string())))?;
+            .map_err(|error| Error::Config(error.to_string()))?;
+
         Ok([grid.t, grid.h, grid.w])
     }
 
     fn patch_format(&self) -> PatchFormat {
-        self.format
+        patch_format(&self.config, self.pixels, self.patch_embed.weight().dtype())
     }
 
     fn image_rows(&self, grid: [u32; 3]) -> nn::Result<u32> {
@@ -532,13 +438,16 @@ impl Vision for VisionTower {
                 Error::Config(format!("an image is one time step, not the grid {grid:?}")).into(),
             );
         }
-        let (_, merged) = self.rows(grid)?;
-        Ok(u32::try_from(merged).map_err(|_| Error::Config(format!("the grid {grid:?}")))?)
+        let merge = self.config.spatial_merge_size;
+
+        Ok(self.patches(grid)? / (merge * merge))
     }
 
     fn max_image_rows(&self) -> u32 {
-        // A resized image's area is at most the processor's pixel budget, in whole merged tokens.
+        // A resized image's area is at most the processor's pixel budget, in whole merged
+        // tokens.
         let token = u64::from(self.processor.patch_size * self.processor.merge_size).pow(2);
+
         u32::try_from(self.processor.image_max_pixels / token.max(1)).unwrap_or(u32::MAX)
     }
 
@@ -546,77 +455,30 @@ impl Vision for VisionTower {
         POSITION_AXES
     }
 
-    fn image_positions(
-        &self,
-        grid: [u32; 3],
-        start: u32,
-        out: &mut [&mut [i32]],
-    ) -> nn::Result<()> {
+    fn image_positions(&self, grid: [u32; 3], start: u32) -> nn::Result<Tensor> {
+        self.image_rows(grid)?;
+
+        Ok(positions::vision_block(
+            grid,
+            self.config.spatial_merge_size,
+            start,
+        )?)
+    }
+
+    fn encode_image(&self, grid: [u32; 3], pixels: &Tensor, out: &Tensor) -> nn::Result<()> {
         let rows = self.image_rows(grid)? as usize;
-        if out.len() != POSITION_AXES as usize || out.iter().any(|axis| axis.len() != rows) {
+        let width = self.config.out_hidden_size as usize;
+        if out.dims() != [rows, width] {
             return Err(Error::Config(format!(
-                "{} coordinate rows for an image of {rows} rows over {POSITION_AXES} axes",
-                out.len()
+                "an image of {rows} rows of {width} written into {:?}",
+                out.dims()
             ))
             .into());
         }
-        // The block alone, as `rope_index` places one run of placeholders at origin zero; `start`
-        // is added on every axis.
-        const PLACEHOLDER: u32 = 1;
-        let coordinates = positions::rope_index(
-            &vec![PLACEHOLDER; rows],
-            &[grid],
-            &[],
-            PLACEHOLDER,
-            PLACEHOLDER + 1,
-            self.config.spatial_merge_size,
-        )?;
-        for (row, coordinate) in coordinates.iter().enumerate() {
-            for (axis, value) in coordinate.iter().enumerate() {
-                out[axis][row] = i32::try_from(i64::from(start) + value).map_err(|_| {
-                    nn::Error::from(Error::Config(
-                        "an M-RoPE coordinate wider than an i32".to_owned(),
-                    ))
-                })?;
-            }
-        }
-        Ok(())
-    }
 
-    fn encode_image(
-        &self,
-        f: &Forward,
-        grid: [u32; 3],
-        pixels: Operand,
-        out: Operand,
-    ) -> nn::Result<()> {
-        f.scoped(|f| {
-            let (features, _) = self.forward(f, grid, pixels)?;
-            write(f, features, out)
-        })?;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_processor_states_three_positive_deviations() {
-        let fields =
-            serde_json::json!({"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.0, 0.5]});
-        let error =
-            pixel_norm(&Fields::of("preprocessor_config.json", &fields).expect("an object"))
-                .expect_err("a zero deviation is refused");
-        assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("image_std")),
-            "{error}"
-        );
-
-        let fields =
-            serde_json::json!({"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5]});
-        let norm = pixel_norm(&Fields::of("preprocessor_config.json", &fields).unwrap()).unwrap();
-        assert_eq!((norm.mean, norm.std), ([0.5; 3], [0.5; 3]));
+        // A causal language model's tower states no DeepStack block, so the features are the
+        // merged rows alone.
+        let features = self.forward(grid, pixels).map_err(nn::Error::from)?;
+        Ok(out.slice_set(&features.narrow(1, 0, width)?.contiguous()?, 0, 0)?)
     }
 }
