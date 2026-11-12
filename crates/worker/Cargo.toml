@@ -37,6 +37,8 @@ time.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The Storage Server the device tests of the weight store run against, in the test's process.
+storage-server.workspace = true
 tempfile.workspace = true
 # The device cases resolve the kernels their profile runs state at a running Build Server.
 build-server.workspace = true

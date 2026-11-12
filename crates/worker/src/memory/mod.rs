@@ -1,234 +1,63 @@
-//! The main process's resident memory.
+//! The storage a rank holds outside its own process, and the weights it serves from.
 //!
-//! Resident memory is device storage the epoch keeps until it retires: the KV
-//! cache planes, the latent pages, the retained weights and the encoder cache. Every one of
-//! them is an exclusive storage at the host's Storage Server, keyed by the
-//! inputs `storage::key` composes, so a restarted main process of the same
-//! scope and epoch maps what its predecessor left instead of loading it
-//! again.
+//! What an engine would lose by exiting, and that costs time or memory to rebuild, is storage
+//! the host's Storage Server retains by descriptor: an engine maps it, a successor of the same
+//! scope takes it again, and the server's quota keeps the epochs that map one GPU within one
+//! limit. This module is the rank's side of that server.
+//!
+//! | Module | Holds |
+//! | --- | --- |
+//! | [`allocation`] | [`Storage`](allocation::Storage): one allocation the rank owns or maps, and the tensor over a window of it that execution lends to a forward |
+//! | [`client`] | [`StorageClient`](client::StorageClient): the rank's connection to the Storage Server, the exclusive storages it takes there and its share of each GPU's quota |
+//! | [`exclusive`] | [`ExclusiveStorage`](exclusive::ExclusiveStorage): how an owner takes exclusive storage, at the server or local to the process |
+//! | [`host_pages`] | [`HostPages`](host_pages::HostPages): a rank's mapping of one host page pool |
+//! | [`weights`] | [`WeightStore`](weights::WeightStore): the retained weights of one device, which `nn::WeightLoader` publishes to and maps from |
+//! | [`reload`] | A second load of a serving model: its order compared with the one that serves, and the load that publishes what changed for an update in place |
+//!
+//! ## Two kinds of device storage
+//!
+//! **Retained weights** are read-only and shared: one allocation per weight key and GPU,
+//! mapped by every rank and epoch that loads the weight, with small weights packed into shared
+//! allocations. A weight tensor is `backend::retained` over the mapping's address, so the
+//! modules and graphs of a rank hold addresses that an update in place keeps while it changes
+//! the bytes behind them.
+//!
+//! **Exclusive storages** have one writer: the cache planes, the encoder cache and the latent
+//! buffers. Their owner takes them by name and length, resets what was created for it and
+//! keeps what a predecessor left, and lends windows of them to forwards as
+//! `backend::external` tensors.
+//!
+//! Host page pools are the third kind of storage the server keeps for a rank: host memory of
+//! equal pages, which the rank maps, registers for device copies and copies pages to and from.
 
 pub mod allocation;
-pub mod encoders;
-pub(crate) mod host_pages;
-pub mod latent;
-pub mod prefix_cache;
+pub mod client;
+pub mod exclusive;
+pub mod host_pages;
 pub mod reload;
-pub mod retained;
 pub mod weights;
 
-pub use prefix_cache::PrefixCache;
-pub use prefix_cache::block_tables::{
-    BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
-};
-pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, Checkpoint, GroupAxis, StatePlanes};
-pub use prefix_cache::planes::{CachePlanes, LaidSegment, PlaneLayout, UnitColumn};
+/// What the tests of this module's files share.
+#[cfg(test)]
+mod fixtures {
+    use std::path::Path;
 
-use std::sync::Mutex;
+    use nn::FileIdentity;
 
-use crate::lock;
-use std::sync::Arc;
+    /// The identity of a checkpoint file named after `name` under `directory`, as a Hugging
+    /// Face cache stores one: a file under `blobs/` is identified by its name alone, so the
+    /// identity does not depend on when the file was written, and two calls of one name give
+    /// one identity.
+    pub(crate) fn identity(directory: &Path, name: &str) -> FileIdentity {
+        let blobs = directory.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
 
-use platform::Stream;
+        // A blob's name is a 64-digit hexadecimal content hash; the fixture derives one from
+        // the name it is given.
+        let digest: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
+        let path = blobs.join(format!("{digest:0<64.64}"));
+        std::fs::write(&path, name).unwrap();
 
-use self::retained::ExclusiveStorage;
-use crate::Result;
-
-/// The main process's resident memory: the owners an epoch keeps until it
-/// retires.
-///
-/// Each owner is built by the process that knows its geometry and handed here,
-/// so that the main process holds one value for what a sleep gives back and a
-/// wake restores. The retained weights and the encoder cache join as their
-/// loaders publish; their storage is already keyed by `storage::key`.
-pub struct Memory {
-    /// The KV cache planes, their block tables and their host pages, or `None` on a rank that
-    /// keeps no paged cache: a media rank's resident state is each request's own footprint.
-    pub prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
-    /// The device this rank's memory lives on, as the plan states it.
-    pub device: crate::config::Device,
-    /// The device's pools, which the scratch page set a paired forward writes
-    /// is taken from: its bytes are reserved against the same allowance as every
-    /// other pool, so the shadow never writes memory the report cannot see.
-    pub pools: Arc<Mutex<crate::arena::Pools>>,
-}
-
-/// What the main process hands [`Memory::new`]: the parts only the deployment
-/// knows, beside the memory the capacity negotiation resolved.
-///
-/// Everything the resolved memory carries is read from it - the slot count, the
-/// block-table width, the entry bytes of a product, the relay depth - so a caller does not repeat a figure it already states.
-pub struct OpenMemory<'a> {
-    /// The memory [`capacity::plan_rank`](crate::capacity::plan_rank) resolved.
-    pub plan: &'a crate::capacity::MemoryConfig,
-    /// The rank's device, or `None` for a host-only rank.
-    pub device: Option<platform::DeviceId>,
-    /// The device's stream: any reset the owners queue runs here, before the
-    /// worker thread exists, and a stream accepts work without one.
-    pub stream: Option<&'a Stream>,
-    /// The device's pools, which a paired forward's scratch page set is taken
-    /// from.
-    pub pools: Arc<Mutex<crate::arena::Pools>>,
-}
-
-/// Release the resident cache segments of `cache`, which the Storage Server
-/// keeps for the next epoch: what a sleep gives back and a wake maps again.
-///
-/// The device storage the segments held is reserved as released before it is
-/// given back (`ExclusiveStorage::release_segments`), so the quota of the GPU
-/// never counts storage no process maps. A pool that is not segmented has no
-/// segment to give back, which is not an error.
-///
-/// **Only the segments go back.** The graph pool and the scratch region stay
-/// mapped: a capture's addresses are fixed for the life of its pool, so a wake
-/// is a remap and never a recapture, and a sleep that released a capture's reserve
-/// while its mapping stayed would let the next capture reserve the same bytes
-/// twice. A park therefore returns the KV and not the graphs.
-///
-/// One body for both callers: [`Memory::sleep`] on the control thread and the
-/// device thread's own command handler, which holds the cache handle and no
-/// `Memory`. A second copy of this body is the failure to avoid - it is where a
-/// divergence would surface as a rank that wakes with unwritten pages.
-///
-/// A pool that is not segmented says so and returns: it has nothing to give
-/// back, which is a different fact from a release that freed nothing, and the
-/// line is what tells the two apart in a run's log.
-pub fn sleep(cache: &Arc<Mutex<PrefixCache>>, storage: &mut dyn ExclusiveStorage) -> Result<()> {
-    let planes = {
-        let cache = lock(cache);
-        Arc::clone(cache.planes())
-    };
-    if planes.segments().is_none() {
-        tracing::info!(
-            pool = "the cache's segments",
-            "this cache holds one segment, so a sleep gives back nothing: the pool has no segment \
-             to release and the graph pool and scratch stay as they are"
-        );
-        return Ok(());
-    }
-    planes.release_segments(0, storage)
-}
-
-/// Map the released cache segments of `cache` again, `limit` of them or all,
-/// reservation their storage first: a reservation the GPU's quota refuses leaves the
-/// rank asleep rather than half woken.
-///
-/// Resets the units of the segments it created, on `stream`, which is
-/// synchronized before returning. A wake for a pool that never slept is a
-/// no-op, not an error: there is nothing to map again.
-pub fn wake(
-    cache: &Arc<Mutex<PrefixCache>>,
-    storage: &mut dyn ExclusiveStorage,
-    stream: &Stream,
-    limit: Option<u32>,
-) -> Result<()> {
-    let planes = {
-        let cache = lock(cache);
-        Arc::clone(cache.planes())
-    };
-    if planes.segments().is_none() {
-        return Ok(());
-    }
-    planes.restore_segments(storage, stream, limit)
-}
-
-impl Memory {
-    /// Allocates every resident owner the plan sized, in one call: the cache
-    /// planes and block tables, on a rank that keeps a paged cache.
-    ///
-    /// This is the epoch's budget becoming real: each owner is reserved against
-    /// the device's allowance as it is mapped, so the first `mapped <= budget`
-    /// reading after warmup counts every byte the plan charged.
-    ///
-    /// `storage` is the rank's Storage Server client; it stays the main
-    /// process's, so `sleep` and `wake` are the only calls that reach the
-    /// quota. The resets the owners queue run on `request.stream` before any
-    /// worker thread exists.
-    pub fn new(request: OpenMemory<'_>, storage: &mut dyn ExclusiveStorage) -> Result<Self> {
-        let plan = request.plan;
-        let info = &plan.info;
-        let cache = match (plan.cache.as_ref(), plan.planes.as_ref()) {
-            (Some(cache), layout) => Some(prefix_cache::PrefixCache::new(
-                Arc::clone(cache),
-                info.prefix_cache
-                    .as_ref()
-                    .ok_or_else(|| {
-                        crate::Error::Invariant(
-                            "a cache plan without the reported unit count".into(),
-                        )
-                    })?
-                    .num_units,
-                layout,
-                info.request_slots,
-                plan.width,
-                request.device,
-                request.stream,
-                storage,
-            )?),
-            // A rank that keeps no paged cache opens no cache planes and no block tables.
-            (None, _) => None,
-        };
-        Ok(Self {
-            prefix_cache: cache.map(|cache| Arc::new(Mutex::new(cache))),
-            device: request
-                .device
-                .map_or(crate::config::Device::Cpu, crate::config::Device::Cuda),
-            pools: request.pools,
-        })
-    }
-
-    /// Releases every owner: the cache planes give their segments back.
-    ///
-    /// The owners' storage returns itself as each owner goes, so this needs no
-    /// storage handle; it is the main process's last call on `Memory`.
-    pub fn close(self) -> Result<()> {
-        let Memory {
-            prefix_cache,
-            device,
-            pools,
-        } = self;
-        drop((device, pools));
-        if let Some(cache) = prefix_cache {
-            lock(&cache).close()?;
-        }
-        Ok(())
-    }
-
-    /// The bytes one token of this rank's pages takes in the host KV cache; zero on a rank that
-    /// keeps no paged cache.
-    pub fn host_token_bytes(&self) -> u64 {
-        self.prefix_cache.as_ref().map_or(0, |cache| {
-            prefix_cache::host::token_bytes(lock(cache).plan())
-        })
-    }
-
-    /// The page identity of each of this rank's cache groups for weights of `fingerprint`
-    /// (`PrefixCacheInfo::identities`); empty on a rank that keeps no paged cache.
-    pub fn page_identities(&self, fingerprint: &str) -> Vec<String> {
-        self.prefix_cache.as_ref().map_or_else(Vec::new, |cache| {
-            prefix_cache::host::page_identities(lock(cache).plan(), fingerprint)
-        })
-    }
-
-    /// How many cache groups this rank's pages come in.
-    pub fn cache_groups(&self) -> usize {
-        self.prefix_cache
-            .as_ref()
-            .map_or(0, |cache| lock(cache).plan().groups.len())
-    }
-
-    /// The device's pools, so a paired forward can take its scratch page set
-    /// from the same allowance as every other pool.
-    pub fn pools(&self) -> Arc<Mutex<crate::arena::Pools>> {
-        Arc::clone(&self.pools)
-    }
-
-    /// The cache pool as a reader shares it: the runner's provider holds this
-    /// clone for its whole life and takes the lock per call, so a read never
-    /// sees a half-installed table. The worker is the only writer.
-    ///
-    /// `None` on a rank that keeps no paged cache, which is what its scheduler
-    /// reads to know it takes no paged request.
-    pub fn shared_cache(&self) -> Option<Arc<Mutex<PrefixCache>>> {
-        self.prefix_cache.clone()
+        FileIdentity::of(&path).unwrap()
     }
 }

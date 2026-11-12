@@ -31,6 +31,7 @@
 //! | [`parallel`] | [`HostGroup`](parallel::host::HostGroup), the host collectives of a rank group over a TCP full mesh |
 //! | [`stream`] | [`EventPool`](stream::EventPool), the event leases storage owners defer their releases behind |
 //! | [`thread_pool`] | [`ThreadPool`](thread_pool::ThreadPool), a bounded pool of threads for one kind of blocking host work |
+//! | [`memory`] | The rank's storage at the host's Storage Server: [`Storage`](memory::allocation::Storage), the [`StorageClient`](memory::client::StorageClient) and the exclusive storages it takes, host page pools, and the [`WeightStore`](memory::weights::WeightStore) that `nn::WeightLoader` publishes to |
 //!
 //! ## Rules every module keeps
 //!
@@ -47,6 +48,7 @@ pub mod completion;
 pub mod config;
 pub mod error;
 pub mod graphs;
+pub mod memory;
 pub mod parallel;
 pub mod profiling;
 pub mod runner;
