@@ -596,8 +596,19 @@ impl<'a> WeightLoader<'a> {
     /// The resolution reads the shard headers once: a weight is packed when its shard stores a
     /// block scale beside it, whatever the declaration's exclusion list says. A meta loader's
     /// checkpoint holds the same headers, so it resolves the same way.
-    pub fn declare(&mut self, declaration: &Declaration) {
-        self.declaration = declaration.resolve(self.checkpoint);
+    ///
+    /// # Errors
+    ///
+    /// When the declaration and the shards contradict each other ([`Declaration::resolve`]).
+    pub fn declare(&mut self, declaration: &Declaration) -> Result<()> {
+        self.declaration = declaration.resolve(self.checkpoint)?;
+        Ok(())
+    }
+
+    /// The declaration every weight is read by, resolved against this loader's checkpoint: what
+    /// a module that reads packed fields takes their spelling and its activation scale from.
+    pub fn declaration(&self) -> &Declaration {
+        &self.declaration
     }
 
     /// How the checkpoint stores the weight named `weight`, by the resolved declaration.
@@ -776,15 +787,20 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
-    /// The BF16 bytes of the `[rows, columns]` matrix the NVFP4 fields of `name` state.
+    /// The BF16 bytes of the `[rows, columns]` matrix the NVFP4 fields of `name` state, read in
+    /// the declaration's spelling.
     fn decode_nvfp4(&self, name: &str, shape: &Shape) -> Result<Vec<u8>> {
-        let stem = name.strip_suffix("weight").ok_or_else(|| {
-            Error::weight(name, "an NVFP4 weight is a module's `weight`".to_owned())
+        let names = self.declaration.names();
+        let stem = name.strip_suffix(names.values).ok_or_else(|| {
+            Error::weight(
+                name,
+                format!("an NVFP4 weight is a module's `{}`", names.values),
+            )
         })?;
         let (rows, columns) = (dim(shape, 0), dim(shape, 1));
 
         let packed = self.checkpoint.read(name)?;
-        let scales_name = format!("{stem}weight_scale");
+        let scales_name = format!("{stem}{}", names.block_scale);
         let scales = self.checkpoint.locate(&scales_name)?;
         if scales.dtype != DType::F8E4M3 || numel(&scales.shape) * 16 != rows * columns {
             return Err(Error::weight(
@@ -799,7 +815,7 @@ impl<'a> WeightLoader<'a> {
         }
 
         let scales = self.checkpoint.read(&scales_name)?;
-        let tensor_scale = self.tensor_scale(&format!("{stem}weight_scale_2"))?;
+        let tensor_scale = self.tensor_scale(&format!("{stem}{}", names.tensor_scale))?;
         Ok(crate::quantization::decode_nvfp4(
             &packed,
             &scales,

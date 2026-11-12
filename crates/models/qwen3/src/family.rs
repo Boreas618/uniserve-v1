@@ -64,7 +64,7 @@ impl TextCheckpoint for Config {
         experts: &ExpertOrder,
     ) -> nn::Result<Arc<dyn TextModel>> {
         // Every later weight is read as the export declares it stored.
-        loader.declare(&self.quantization);
+        loader.declare(&self.quantization)?;
 
         Ok(Arc::new(Qwen3ForCausalLm::load(
             self,

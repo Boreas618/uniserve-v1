@@ -29,9 +29,14 @@ use crate::weights::{
 /// The two constructors are the export shapes this tree meets. **`weight_scale` is the same name
 /// in both and means the same thing**, the K16 block scales, so the two disagree about the
 /// packed values and the per-tensor scale only. The per-tensor scale is `weight_scale_2` in the
-/// vLLM spelling and `weight_tensor_scale` in the diffusers one, and an export that states no
-/// activation scale says so by having no tensor under [`Nvfp4Names::input_scale`], which the
-/// loader reports as this vocabulary and not as a missing name.
+/// vLLM spelling and `weight_tensor_scale` in the diffusers one. An export that keeps its
+/// calibration in a manifest stores no tensor under [`Nvfp4Names::input_scale`]: its activation
+/// scales are the manifest's ([`ModeloptManifest`](super::ModeloptManifest)), and a projection
+/// that reads the tensor of an export without one is refused under this vocabulary and not as a
+/// missing name.
+///
+/// A checkpoint's spelling is its declaration's ([`Declaration::names`](super::Declaration::names)),
+/// which every module that reads packed fields takes it from.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Nvfp4Names {
     /// What this vocabulary is called, in refusals: the export that writes it.
@@ -63,9 +68,9 @@ impl Nvfp4Names {
     /// The diffusers/ModelOpt spelling: `weight_packed`, `weight_scale`, `weight_tensor_scale`,
     /// `input_scale`.
     ///
-    /// This is what a multi-stage diffusers NVFP4 export states, in every stage it quantizes
-    /// (a `transformer` and a `vae`, say), and a stage may add `scale1`/`scale2` beside them for
-    /// the layers ModelOpt calibrated in a second scheme.
+    /// This is what a packed NVFP4 export of a diffusers pipeline states in every stage it
+    /// calibrates (a `transformer` and a `vae`, say). A packed projection keeps the `bias` its
+    /// module states, in the stage's own floating-point type.
     pub const fn diffusers() -> Self {
         Self {
             export: "diffusers ModelOpt",

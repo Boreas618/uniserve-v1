@@ -50,7 +50,7 @@ use crate::functional::{
 };
 use crate::modules::linear::{Linear, LinearConfig, Parallel};
 use crate::modules::mlp::{Mlp, MlpConfig};
-use crate::quantization::{Nvfp4Names, Nvfp4Stack, Scheme, ValueLayout};
+use crate::quantization::{Nvfp4Stack, Scheme, ValueLayout};
 use crate::var_builder::VarBuilder;
 use crate::weights::{PartBlock, WeightLayout, WeightSource, extents};
 
@@ -379,6 +379,7 @@ impl MoE {
         exchanged: bool,
     ) -> Result<Experts> {
         let loader = vb.loader();
+        let names = loader.declaration().names();
         let list = vb.pp(config.list);
         let (gated_layout, down_layout) = if exchanged {
             (ValueLayout::GateFirst, ValueLayout::Plain)
@@ -394,7 +395,7 @@ impl MoE {
             &[config.up, config.gate],
             window,
             config.experts,
-            Nvfp4Names::vllm(),
+            names,
             (gated_layout, WEIGHT_SCALE_LAYOUT),
             true,
         )?;
@@ -404,7 +405,7 @@ impl MoE {
             &[config.down],
             window,
             config.experts,
-            Nvfp4Names::vllm(),
+            names,
             (down_layout, WEIGHT_SCALE_LAYOUT),
             true,
         )?;

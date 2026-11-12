@@ -295,7 +295,9 @@ fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
 
     let store = CpuWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
-    loader.declare(&Declaration::read(&checkpoint).unwrap());
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
     let linear = Linear::load(&config, loader.root().pp("proj")).unwrap();
     assert_eq!(linear.weight().dtype(), DType::F8E4M3);
 
@@ -314,7 +316,9 @@ fn a_per_tensor_fp8_projection_is_chosen_by_the_checkpoint_s_declaration() {
 
     // A meta load chooses the same representation, and its forward states the FP8 product.
     let mut loader = WeightLoader::meta(&checkpoint, None, None);
-    loader.declare(&Declaration::read(&checkpoint).unwrap());
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
     let linear = Linear::load(&config, loader.root().pp("proj")).unwrap();
     let (output, launches) = recorded(|| linear.forward(&meta((3, 4), DType::BF16)));
     output.unwrap();
@@ -400,7 +404,9 @@ fn a_calibrated_nvfp4_projection_loads_its_fields_in_the_product_s_layout() {
 
     let store = CpuWeights::new();
     let mut loader = WeightLoader::new(&checkpoint, &store, None, None);
-    loader.declare(&Declaration::read(&checkpoint).unwrap());
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
     let linear = Linear::load(&PACKED, loader.root().pp("proj")).unwrap();
     assert!(linear.is_packed());
     assert_eq!(
@@ -437,6 +443,7 @@ fn a_calibrated_nvfp4_projection_loads_its_fields_in_the_product_s_layout() {
         &x,
         &Tensor::from_slice(&packed, (8, 16), &Device::Cpu).unwrap(),
         &Tensor::from_raw_buffer(&table, DType::F8E4M3, &[128, 4], &Device::Cpu).unwrap(),
+        None,
         &tensor(&[1.0 / input_scale], 1, DType::F32),
         &tensor(&[weight_scale * input_scale], 1, DType::F32),
     )
@@ -445,7 +452,7 @@ fn a_calibrated_nvfp4_projection_loads_its_fields_in_the_product_s_layout() {
     assert_eq!(out.dims(), [3, 8]);
     assert_eq!(values(&out), values(&expected));
 
-    // No calibrated export writes a bias beside a packed weight.
+    // A bias the module is asked for and the checkpoint does not store is refused by its name.
     let biased = Linear::load(
         &LinearConfig {
             bias: true,
@@ -453,7 +460,7 @@ fn a_calibrated_nvfp4_projection_loads_its_fields_in_the_product_s_layout() {
         },
         loader.root().pp("proj"),
     );
-    assert!(biased.err().unwrap().to_string().contains("bias"));
+    assert!(biased.err().unwrap().to_string().contains("proj.bias"));
 }
 
 #[test]
@@ -462,7 +469,9 @@ fn a_meta_load_of_a_packed_projection_states_the_encoder_and_the_product() {
     let (checkpoint, ..) = nvfp4_checkpoint(directory.path());
 
     let mut loader = WeightLoader::meta(&checkpoint, None, None);
-    loader.declare(&Declaration::read(&checkpoint).unwrap());
+    loader
+        .declare(&Declaration::read(&checkpoint).unwrap())
+        .unwrap();
     let linear = Linear::load(&PACKED, loader.root().pp("proj")).unwrap();
     assert!(linear.is_packed());
 
