@@ -105,3 +105,125 @@ R5, R8, R9 and R10 guard requests the core does not have; they are predicted wit
 
 - **Prediction:** `MC_Core` and `MC_Copies` complete with no violation; `RULES=NoR9` on `MC_Transfer` reports `TaskIsolation`, and the mutations of R1 to R7 report a violation as before.
 - **Outcome:** as predicted. `MC_Core`: complete, 773,021,171 states generated, 150,548,210 distinct, depth 52, no violation, 15 min 59 s on 48 workers. `MC_Copies`: complete, 94,751,160 generated, 22,596,078 distinct, depth 54, no violation, 2 min 35 s. Mutations: R1 `NoLeak`, R2 `FreeUnheld`, R3 `WriteIsolation`, R4 `KeyStable`, R6 `WriteIsolation`, R7 `KeyStable` on `MC_Core`; R5 `Exclusive` on `MC_Copies`; R9 `TaskIsolation` on `MC_Transfer`.
+
+## 15. Two epochs of one layout and the trial (`MC_Trial`), 2026-11-12
+
+- **Model:** validity is by device memory (`GroupMemory`): the groups of two epochs of one layout map the same memory, so a block one epoch committed is valid for the other. An epoch may be on trial: what it commits is visible to it alone (`vis`) until `CommitUpdate`; `Rollback` needs its owners gone and leaves its blocks visible to it alone; R1 refuses an `Attach` for a rolled-back epoch. Property P5 `TrialVisibility` is added: a block visible to one epoch is pinned and copied only for that epoch. Configuration: a serving epoch and a target on trial, one group and one owner each over the same memory, two units, one key, one batch per group, one stamped request under way.
+- **Prediction, all rules:** the search completes with no violation; the serving epoch's owner pinning a block the target committed, after the update is committed, is reached.
+- **Prediction, R8 left out:** P5 `TrialVisibility`: the serving epoch's owner pins a block the target committed while it is on trial. None of P1 to P3 is violated first on a shortest behaviour.
+- **Outcome:** as predicted. All rules: complete, 36,713,471 states generated, 7,388,077 distinct, depth 48, no violation, 37 s; the witness is reached. R8 left out: `TrialVisibility`.
+
+## 16. Regions of two layouts and `Resize` (`MC_Resize`), 2026-11-12
+
+- **Model:** a device unit belongs to a region and occupies a chunk of device memory; units of two regions may occupy the same chunk. `member` is the units in their regions; `Shrink` takes a free unit out of its region and `Grow` puts a unit in, under R10 only when no unit of a region occupies its chunk. An owner allocates in the region of its scheduler. `NoLeak` requires a unit outside its region to be neither free nor held, and `OneRegion` (P3) that no two units in regions occupy one chunk. Configuration: a serving epoch with a region of two units and a target epoch of another layout whose region starts empty over the same two chunks; one group, one slot row and one owner each; one batch per group; one stamped request under way.
+- **Prediction, all rules:** the search completes with no violation; both owners holding a private block at once is reached.
+- **Prediction, R10 left out:** P3 `OneRegion`: a unit of the target's region grows over a chunk a unit of the serving region still occupies.
+- **Outcome:** as predicted. All rules: complete, 73,399,823 states generated, 16,278,793 distinct, depth 56, no violation, 1 min 26 s; the witness is reached. R10 left out: `OneRegion`.
+
+## 17. The tiers, and the loss of an engine (`MC_Tiers`, `MC_Loss`), 2026-11-12
+
+- **Model:** tasks of the tiers: `Prefetch` from the remote store or a peer into a new host block, `Store` to the remote store by the connector's task, a deadline after which the request is answered, and the peer letting go of its pin; `Save` and `Restore` as copies between an owner's slot and a host block; the loss of an engine (A7): its batches and copies are over, its waiting commits and transfers are dropped, its owners are detached. `SourcesHeld` joins P2: no copy is cached from a source that was not held throughout its read. `Hazards` switches on behaviour of the system as built; H2 caches what a prefetch read whatever its peer did. `MC_Trial` was run after the change without a written prediction, as a check that the model still parses, and completed with no violation (8,552,255 distinct states; more than in entry 15 because `Shrink` and `Grow` now apply to it).
+- **Prediction, `MC_Tiers`, all rules:** the search completes with no violation; a key acknowledged by the remote store, a prefetched host copy and a restore that came due are reached.
+- **Prediction, `MC_Tiers`, R9 left out:** P1 `TaskIsolation`: a prefetch passes its deadline, its host block is released, and the task still writes it.
+- **Prediction, `MC_Tiers`, hazard H2:** P2 `SourcesHeld`: a prefetch from a peer caches its block after the peer let go of its pin.
+- **Prediction, `MC_Loss`, all rules:** the search completes with no violation; the surviving epoch's owner pinning a block the lost epoch committed is reached.
+- **Outcome, `MC_Tiers`, R9 left out:** as predicted: `TaskIsolation`. **Hazard H2:** as predicted: `SourcesHeld`. **Witnesses:** all three of `MC_Tiers` and that of `MC_Loss` are reached.
+- **Outcome, `MC_Tiers`, all rules:** not as predicted: `NoLeak` in 12 states. An owner saves its trajectory and is detached while the copy runs; when the `Finish` takes effect the slot row, which only the copy still held, is neither free nor held. The cause was the model's text: the branch that caches a stored or saved host block did not let go of what the copy read. Corrected; run again as entry 18.
+
+## 18. The tiers, corrected, and the loss of an engine (`MC_Tiers`, `MC_Loss`), 2026-11-12
+
+- **Prediction:** both searches complete with no violation.
+- **Outcome, `MC_Tiers`:** as predicted: complete, 184,027,175 states generated, 32,587,250 distinct, depth 44, no violation, 3 min 11 s.
+
+## 19. The whole suite on the model with tiers and losses (`suite.sh`), 2026-11-12
+
+- **Prediction:** every configuration of the design (`MC_Core`, `MC_Copies`, `MC_Transfer`, `MC_Trial`, `MC_Resize`, `MC_Tiers`, `MC_Loss`) completes with no violation; each rule left out and hazard H2 report the invariants `suite.sh` states for them.
+- **Outcome:** INCONCLUSIVE for four configurations. Every mutation and hazard H2 reported the stated invariant, and `MC_Loss` (3,205,242 distinct states), `MC_Trial` (8,552,255) and `MC_Resize` (16,278,793) completed with no violation. The run was stopped while `MC_Core`, `MC_Copies`, `MC_Transfer` and `MC_Tiers` were still searching, without a violation: `Shrink` and `Grow` apply to every unit of every configuration since entry 16 and multiply their states.
+- **Consequence:** a constant `Movable` names the units `Resize` may move; it is empty except in `MC_Resize`.
+
+## 20. The hazards of the system as built (`suite.sh hazards`), 2026-11-12
+
+Each hazard of `specs/kv-cache-s0.md` §6 is a switch of `KvCore` that replaces the designed behaviour by the behaviour that document describes. H6 and H13 are violations of P4 and are not in this entry.
+
+| Hazard | As modelled | Configuration | Predicted violation |
+| --- | --- | --- | --- |
+| H1 | A `Detach` releases what the owner's transfer holds while its task runs | `MC_Transfer` | P1 `TaskIsolation` |
+| H2 | A prefetch caches what it read whatever its peer did | `MC_Tiers` | P2 `SourcesHeld` |
+| H3 | The end of a failed copy takes effect without waiting for its stamp | `MC_Copies` | P1 `CopyIsolation` |
+| H4 | A key is taken to be on the host when its store is asked | `MC_Tiers` | P6 `Exactness` |
+| H5 | A `Detach` lets go of what the owner's copies hold while they run | `MC_Copies` | P1 `CopyIsolation` or `FreeUnheld` |
+| H7 | The session of a request is not checked | `MC_Trial` | P1 `WriteIsolation` or `ReadIsolation` |
+| H8 | The executor's rows are never cleared | `MC_Core` | P1 `WriteIsolation` or `ReadIsolation` |
+| H9 | An epoch that adopted another's cache evicts what the other epoch pins | `MC_Trial` | P1 `Exclusive`, `WriteIsolation` or `ReadIsolation` |
+| H10 | A block is shared while its writer still appends | `MC_Core` | P1 `WriteIsolation` or P2 `SharedUnwritten` |
+| H11 | An `Evict` is answered as done and the block stays cached | `MC_Core` | P6 `Exactness` |
+| H12 | State kept twice: the free list misses an evicted block | `MC_Core` | P3 `NoLeak` |
+
+- **Outcome:** as predicted for all eleven: H1 `TaskIsolation`, H2 `SourcesHeld`, H3 `CopyIsolation`, H4 `Exactness`, H5 `CopyIsolation`, H7 `WriteIsolation`, H8 `WriteIsolation`, H9 `Exclusive`, H10 `WriteIsolation`, H11 `Exactness`, H12 `NoLeak`. The thirteen goals of `addresses.smt2` are `unsat` (z3 4.8.9).
+
+## 21. The design and the mutations on the model with hazard switches (`suite.sh design mutations`), 2026-11-12
+
+- **Prediction:** the seven configurations complete with no violation and the eleven mutations report the invariants `suite.sh` states.
+- **Outcome:** INCONCLUSIVE, stopped on purpose after the eleven mutations reported the stated invariants and `MC_Loss` completed (2,754,061 distinct states): reading the model for its inductive invariant showed that one visibility per key is wrong once a key has copies on two tiers, and the model changes again (entry 22).
+
+## 22. Visibility per copy (`MC_Trial`, `MC_TrialTiers`), 2026-11-12
+
+- **Model:** a key's device copy and its host copy each have a visibility of their own, set when the copy is made by the epoch that makes it; a prefetched host copy is one every epoch may use; an epoch on trial fills no memory of a device block others may use (it loads into a block of its own, which stays private when the key already has a device block), and its host copies do not go to the remote store. `MC_TrialTiers` is `MC_Trial` with one host unit and two copies. The switches H6 (no deadline) and H13 (no give-up of a copy) are added for the liveness checks.
+- **Prediction:** `MC_Trial` and `MC_TrialTiers` complete with no violation; with R8 left out both report `TrialVisibility`.
+
+## 23. Finality as a checked property (`MC_Finality`), 2026-11-12
+
+- **Model:** `KvFinality` adds fairness to `KvCore` (the scheduler gives a copy up, stamped requests are stamped and taken, a batch ends, a due `Finish` takes effect, a task's deadline passes) and two temporal properties: a copy in flight ends, and a request that waits on a prefetch or a remote put is answered. One unit, one slot row, one host unit, one key, one owner, one batch, one request, one copy, one task; no symmetry.
+- **Prediction, design:** both properties hold.
+- **Prediction, H6 (no deadline):** `TaskFinality` is violated by a task that never completes.
+- **Prediction, H13 (no give-up):** `CopyFinality` is violated by a copy whose executor never returns its `Finish`.
+- **Outcome:** as predicted. Design: complete, 845,591 states generated, 183,894 distinct, both properties hold. H6: `TaskFinality` violated. H13: `CopyFinality` violated.
+
+## 24. `MC_TrialTiers`, smaller, 2026-11-12
+
+- **Outcome of entry 22:** `MC_Trial`: as predicted, complete, 7,388,077 distinct states, no violation; R8 left out reports `TrialVisibility` on both configurations. `MC_TrialTiers` with two units and two copies: INCONCLUSIVE, stopped at 114 million distinct states with the queue still growing and no violation.
+- **Model:** `MC_TrialTiers` with one unit and one copy.
+- **Prediction:** the search completes with no violation; R8 left out reports `TrialVisibility`.
+- **Outcome:** as predicted: complete, 88,133,355 states generated, 17,599,952 distinct, no violation; R8 left out reports `TrialVisibility`.
+
+## 25. The whole suite on the model as it stands (`suite.sh`), 2026-11-12
+
+- **Prediction:** the nine configurations of the design complete with no violation (`MC_Finality` with its two temporal properties); the twelve mutations and the thirteen hazards report the properties `suite.sh` states; the thirteen address goals are `unsat`.
+- **Outcome:** INCONCLUSIVE, stopped on purpose: writing the inductive invariant showed two places where the model is looser than the control plane the documents describe (entry 26), and the suite is run once after them.
+
+## 26. Stamping groups fixed at issue; a transfer hands on only unnamed entries, 2026-11-12
+
+- **Model:** the groups that stamp a request are recorded in the request when it is issued (`sg`), as `specs/scheduler-design.md` §3.1 has the scheduler hand a request to its executors once; before, they were read from the owner's group at the moment of submission. A transfer that ends hands the target executor only the entries no stamped request under way names (A1), where before only a `Detach` under way was considered.
+- **Prediction:** `MC_Transfer`, the configuration these two changes can affect most, completes with no violation; the other configurations and every mutation and hazard are run once by `suite.sh` after the inductive invariant is settled.
+- **Note:** the first run after this entry searched the model before the change, because the edit had not been applied; its result (no violation) says nothing about the change and is not counted.
+- **Outcome:** as predicted: `MC_Transfer` completes with no violation on the changed model: 182,674,180 states generated, 38,135,896 distinct.
+
+## 27. The inductive invariant as an invariant (`IndInv` of `KvInductive`), 2026-11-12
+
+- **Model:** `KvInductive` states `IndInv`: the allocation of every unit, what each deferred item, copy and task holds, what an executor's table and a completion not yet handed on may name, the stamps of requests, and what covers each unit a batch in flight addresses. Checked first on `MC_Loss` and `MC_Trial` without a written prediction: no violation (2,788,873 and 7,459,267 distinct states).
+- **Prediction:** `IndInv` is an invariant of `MC_Core`, `MC_Copies`, `MC_Transfer`, `MC_Tiers`, `MC_TrialTiers` and `MC_Resize`. Whether it is inductive is a separate question, for Apalache and TLAPS.
+- **Outcome so far:** `IndInv` is an invariant of `MC_Transfer` (38,135,896 distinct states), `MC_Tiers` (32,599,322), `MC_TrialTiers` (17,941,500) and `MC_Resize` (16,365,337); `MC_Core` and `MC_Copies` are still searching.
+
+## 28. Apalache: types, the initial state, and what `IndInv` implies (`MC_Apalache`), 2026-11-12
+
+- **Model:** `KvCore` and `KvInductive` carry Apalache's type annotations; the private holders of a unit are stated as two sets of one type each (`TableHolders`, `CopyWriters`), and one action's duplicate `UNCHANGED` is removed: neither changes the model's meaning. `IndInv` gains `TypeInv`, the values every variable takes. `MC_Apalache` fixes the constants (two epochs, three groups over two memories, two units, three slot rows, one host unit, one key, two owners, the second epoch on trial, either engine losable, both values of `Eager`) and generates any state of collections of at most three elements that satisfies `IndInv`.
+- **Not predicted in writing before the runs:** the type checker passes; `Init => IndInv` holds (length 0); `IndInv => Safety` holds for the generated states (3 min 46 s); the generated predicate is satisfiable by a state with a batch, a deferred item, a request, a copy and a task (Apalache refutes `NoWork`).
+- **Prediction for the inductive step** (`--init=IndInit --inv=IndInv --length=1`): I expect at least one counterexample to induction, most likely in `BatchesOk` or `RequestsOk`, whose clauses about stamps were written from the argument and never checked from an arbitrary state.
+- **Outcome so far, entry 27:** `IndInv` is an invariant of `MC_Copies` (47,047,135 distinct states) and of `MC_Core` as well: of all six.
+- **Outcome, entry 28, the inductive step:** as predicted, not inductive, though not where predicted: after 28 minutes Apalache reported `HandoffOk` violated by `Lose` with `Eager` false. The state before held a completion not yet handed on, for an owner of the epoch that is lost but a group of the other epoch, named by a request of the lost epoch; the loss removes the request and leaves the completion, which is then unnamed and names no live owner. `IndInv` said nothing about a named completion.
+- **Consequence:** `HandoffOk` states for every completion not yet handed on that its group is of its owner's epoch, and `DeferredOk` and `TasksOk` state the same of a transfer's target.
+
+## 29. The inductive step again (`MC_Apalache`), 2026-11-12
+
+- **Prediction:** another counterexample to induction, in `BatchesOk`, `RequestsOk` or `TablesMapped`. The check now skips the invariants of the generated state (`search.invariantFilter=1->.*`).
+- **Outcome:** as predicted, another counterexample, after 14 minutes, though again not in the conjuncts named: `CopiesOk` violated by `Attach`. The state before held a copy for an owner that was never attached; attaching it to another group breaks "an owner a copy writes for is in the copy's group". `IndInv` did not say that an owner a copy names was attached.
+- **Consequence:** `AllocOwner` (a unit is allocated only to an owner that was attached) joins `IndInv`; `CopiesOk` and `DeferredOk` state it of the owner a copy or a waiting transfer names; a remote put's block is a host unit.
+
+## 30. The inductive step, third run (`MC_Apalache`), 2026-11-12
+
+- **Prediction:** another counterexample to induction from a state no behaviour reaches; where, I cannot say.
+
+## 31. Outcome of entry 25: the whole suite, 2026-11-12
+
+- **Outcome:** as predicted, on the model with stamping groups fixed at issue (entry 26) and Apalache's type annotations (entry 28): the nine configurations complete with no violation, the twelve mutations and the thirteen hazards report the stated properties, and the thirteen address goals are `unsat`. Distinct states: `MC_Core` 172,191,447; `MC_Copies` 47,047,135; `MC_Transfer` 38,135,896; `MC_Tiers` 32,599,322; `MC_TrialTiers` 17,941,500; `MC_Resize` 16,365,337; `MC_Trial` 7,459,267; `MC_Loss` 2,788,873; `MC_Finality` 188,424 with both temporal properties. The run's lines are kept in `artifacts/buffer-pool/suite-2026-11-12.txt`.
+- **After the run, without a change of meaning:** `Reached` is stated without `CHOOSE` (a stamp is reached when every batch in flight of the group is later than it, or none is in flight and it is at most the last launched); the property formulas moved from `KvCore` into one module per property (`KvP1`, `KvP2`, `KvP3`, `KvP5`, `KvP6`, with `KvFinality` for P4) and are pinned (`pins.py`). Checked after each: `MC_Loss` and `MC_Finality` give the same state counts, a mutation and a hazard report the same invariants.

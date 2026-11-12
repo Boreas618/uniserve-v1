@@ -4,12 +4,13 @@
 # KvCore.tla that state it, the rules and assumptions it rests on, a behaviour
 # that violates it, and its status: proposed, approved, validated, checked
 # (model checking on stated bounds), proved, or for a liveness property tested.
-# A statement is approved by the owner; a formula becomes the property's once
-# the owner approves it, and from then on this file and the formulas are pinned
-# by hash.
+# `file` is the module that holds the property's formulas. Each entry and its
+# file are pinned by hash in pins.sha256: pins.py check fails when a pinned
+# entry or file differs, and a property is added by a new entry and a new file.
 
 [[property]]
 id = "P1"
+file = "KvP1.tla"
 name = "Isolation"
 kind = "safety"
 statement = """The buffer pool never has one unit in two blocks, never allocates a block that an \
@@ -20,47 +21,74 @@ formulas = ["FreeUnheld", "Exclusive", "WriteIsolation", "ReadIsolation", "CopyI
 rules = ["R1", "R2", "R3", "R7", "R9", "R10"]
 assumptions = ["A1", "A2", "A3", "A4", "A5", "A7"]
 violated_by = "A `Release` that takes effect while the batch that writes the block is in flight (R3 left out): `WriteIsolation`."
-statement_status = "approved"
-formula_status = "proposed"
+status = "checked"
 
 [[property]]
 id = "P2"
+file = "KvP2.tla"
 name = "Integrity"
 kind = "safety"
 statement = """A block is committed only after `completed` has reached the stamp of its `Commit`, \
 the destination of a copy becomes shared only after the stamp of its `Finish`, and a block is \
-stored, loaded, cloned or transferred only as a shared block or as its owner's private one. A \
-shared block is never the destination of a copy and never private again; its key never changes."""
-formulas = ["KeyStable", "PinsCached", "OneKey", "SharedUnwritten", "CopiesReadShared"]
-rules = ["R3", "R4", "R5", "R6", "R8"]
-assumptions = ["A1", "A2", "A3", "A4", "A6"]
+stored, loaded, cloned or transferred only as a shared block or as its owner's private one, \
+held for as long as it is read. A shared block is never the destination of a copy and never private again; its key never changes."""
+formulas = ["KeyStable", "PinsCached", "OneKey", "SharedUnwritten", "CopiesReadShared", "SourcesHeld"]
+rules = ["R3", "R4", "R5", "R6"]
+assumptions = ["A1", "A2", "A3", "A4", "A5", "A6"]
 violated_by = "A second block committed under a cached key replaces the first, which an owner still pins (R4 left out): `KeyStable`."
-statement_status = "approved"
-formula_status = "proposed"
+status = "checked"
 
 [[property]]
 id = "P3"
+file = "KvP3.tla"
 name = "Conservation"
 kind = "safety"
 statement = """Every unit is free or in exactly one block, and device memory is in one region. \
 When no owner exists, nothing is deferred and no copy is in flight, every block is free or \
 shared without a pin."""
-formulas = ["NoLeak", "Quiescent"]
+formulas = ["NoLeak", "Quiescent", "OneRegion"]
 rules = ["R2", "R10"]
 assumptions = []
 violated_by = "An owner that is attached is attached again and its first slot row is neither free nor held (R1 left out): `NoLeak`."
-statement_status = "approved"
-formula_status = "proposed"
+status = "checked"
 
 [[property]]
 id = "P4"
+file = "KvFinality.tla"
 name = "Finality"
 kind = "liveness"
 statement = """A request waiting on blocks, a copy or a task goes on: by the scheduler's own \
 bound for a copy, by the deadline for a task."""
-formulas = []
+formulas = ["CopyFinality", "TaskFinality"]
 rules = []
 assumptions = []
-violated_by = "A task that never completes and has no deadline: the request that waits on it never goes on."
-statement_status = "approved"
-formula_status = "tested, not proved"
+violated_by = "A task that never completes and has no deadline (hazard H6): `TaskFinality`."
+status = "checked on one configuration; tested with the implementation; not proved"
+
+[[property]]
+id = "P5"
+file = "KvP5.tla"
+name = "Trial visibility"
+kind = "safety"
+statement = """Until its update is committed, a copy an epoch on trial made (a block it \
+committed or loaded, a host copy it stored or saved) is pinned, loaded, cloned, restored and \
+stored only for that epoch, and an epoch on trial fills no memory of a block others may use."""
+formulas = ["TrialVisibility"]
+rules = ["R8"]
+assumptions = ["A6"]
+violated_by = "An owner of the serving epoch pins a block the epoch on trial committed (R8 left out): `TrialVisibility`."
+status = "checked"
+
+[[property]]
+id = "P6"
+file = "KvP6.tla"
+name = "Exactness"
+kind = "safety"
+statement = """A completion states what the buffer pool holds when it is produced: a key \
+answered `Committed`, `Loaded`, `Stored`, `Saved` or `Prefetched` is cached on that tier, and a \
+key listed as evicted is not cached on the tier it left."""
+formulas = ["Exactness"]
+rules = ["R1"]
+assumptions = []
+violated_by = "An `Evict` is answered as done while the block stays cached (hazard H11): `Exactness`."
+status = "checked"

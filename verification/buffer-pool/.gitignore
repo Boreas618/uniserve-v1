@@ -1,0 +1,4 @@
+.tlacache/
+states/
+_apalache-out/
+*_TTrace_*

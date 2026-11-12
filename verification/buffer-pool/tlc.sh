@@ -3,7 +3,8 @@
 # with the actions of the shortest behaviour, or the states of a complete search.
 #   tlc.sh MODULE [CONFIG] [-- extra TLC arguments]
 # With RULES=NoRn the configuration's rules are replaced by that definition of
-# the module: the mutation that leaves rule Rn out.
+# the module: the mutation that leaves rule Rn out. With HAZARDS=Hn the hazard
+# Hn of the system as built is switched on.
 # The full output is kept in $TLC_LOGS (default: a temporary directory).
 set -u
 T=${TLA_TOOLS:-/workspace/dev/tools/tla}
@@ -14,6 +15,9 @@ cfg="$config.cfg"; name="$config"
 if [ -n "${RULES:-}" ]; then
     name="$config-$RULES"; cfg="$logs/$name.cfg"
     sed "s/Rules <- AllRules/Rules <- $RULES/" "$config.cfg" > "$cfg"
+elif [ -n "${HAZARDS:-}" ]; then
+    name="$config-$HAZARDS"; cfg="$logs/$name.cfg"
+    sed "s/Hazards = {}/Hazards = {\"$HAZARDS\"}/" "$config.cfg" > "$cfg"
 fi
 log="$logs/$name.log"
 "$T"/jdk-21.0.13+9/bin/java -XX:+UseParallelGC -Xmx${TLC_HEAP:-32g} \
