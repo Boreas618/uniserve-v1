@@ -168,6 +168,12 @@ impl Context {
         self.allocator.peak()
     }
 
+    /// The most bytes any forward of this context allocated in total: the bytes of everything
+    /// one forward writes into tensors of its own.
+    pub fn allocated_peak(&self) -> u64 {
+        self.allocator.allocated_peak()
+    }
+
     /// The furthest byte of the input buffer any forward reached.
     pub fn input_peak(&self) -> u64 {
         self.state().input_peak
