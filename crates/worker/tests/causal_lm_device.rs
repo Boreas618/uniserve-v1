@@ -1,6 +1,7 @@
 //! `CausalLmRunner` on a device: a prefill commits its first token into its slot and a decode
 //! step continues from it; a slot whose first step is a decode starts from its batch's row;
-//! a batch's page work is issued around the replay.
+//! a batch's page work is issued around the replay; a runner that speculates commits the
+//! prefix a verification's samples agree with and proposes the drafts after it.
 //!
 //! Every case needs GPU 0 and a running Build Server (`UNISERVE_BUILD_SERVER_SOCKET`). Run
 //! them on a GPU host:
@@ -32,6 +33,7 @@ use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::module::sampler::{PARAMETER_COLUMNS, TOP_P};
 use uniserve_tensor::{DType, Tensor};
 use worker::buckets::Buckets;
+use worker::runners::causal_lm::speculation::DraftPool;
 use worker::runners::causal_lm::{CausalLmConfig, PageWork};
 use worker::{CausalLmRunner, Graphs, Runner};
 
@@ -67,13 +69,46 @@ struct Tiny {
     table: Tensor,
     gain: Tensor,
     head: Linear,
+    /// The model's drafter, in a deployment that speculates.
+    drafter: Option<TinyDrafter>,
     /// The weights' device memory.
     _memory: Vec<DeviceAllocation>,
 }
 
+/// A drafter with no attention layer: the normalized embedding of the token after its entry,
+/// which the model's head continues as the model continues that token. The hidden row it is
+/// lent enters the sum and leaves it again, so the row is read and the proposal does not
+/// depend on it.
+struct TinyDrafter {
+    gain: Tensor,
+}
+
+impl Drafter for TinyDrafter {
+    fn cache(&self) -> CacheShape {
+        CacheShape {
+            layers: 0,
+            kv_heads: 0,
+            head_dim: 0,
+        }
+    }
+
+    fn forward(
+        &self,
+        _batch: &TokenBatch,
+        _cache: &KvCache,
+        embedded: &Tensor,
+        hidden: &Tensor,
+    ) -> nn::Result<Tensor> {
+        let next = embedded.add(hidden)?.sub(hidden)?;
+
+        rms_norm(&next, &self.gain, 1e-6, false, next.dtype())
+    }
+}
+
 impl Tiny {
-    /// The model over meta weights: what a profile run computes on.
-    fn meta() -> Outcome<Self> {
+    /// The model over meta weights, with its drafter when `drafting`: what a profile run
+    /// computes on.
+    fn meta(drafting: bool) -> Outcome<Self> {
         let weight = |address: u64, dims: &[usize]| {
             backend::retained(address, dims, DType::F32, &backend::meta())
         };
@@ -86,24 +121,42 @@ impl Tiny {
                 None,
                 WeightOrder::NxK,
             )?,
+            drafter: match drafting {
+                true => Some(TinyDrafter {
+                    gain: weight(0x4_0000, &[HIDDEN])?,
+                }),
+                false => None,
+            },
             _memory: Vec::new(),
         })
     }
 
-    /// The model over weights on the device.
-    fn on_device(stream: &Stream) -> Outcome<Self> {
+    /// The model over weights on the device, with its drafter when `drafting`.
+    fn on_device(stream: &Stream, drafting: bool) -> Outcome<Self> {
         let table = units(VOCABULARY, |id| id % HIDDEN);
         let head = units(VOCABULARY, |token| (token + 1) % HIDDEN);
 
         let (table_memory, table) = support::weight(stream, &table, &[VOCABULARY, HIDDEN])?;
         let (gain_memory, gain) = support::weight(stream, &[1.0; HIDDEN], &[HIDDEN])?;
         let (head_memory, head) = support::weight(stream, &head, &[VOCABULARY, HIDDEN])?;
+        let mut memory = vec![table_memory, gain_memory, head_memory];
+
+        let drafter = match drafting {
+            true => {
+                let (gain_memory, gain) = support::weight(stream, &[1.0; HIDDEN], &[HIDDEN])?;
+                memory.push(gain_memory);
+
+                Some(TinyDrafter { gain })
+            }
+            false => None,
+        };
 
         Ok(Self {
             table,
             gain,
             head: Linear::new(head, None, WeightOrder::NxK)?,
-            _memory: vec![table_memory, gain_memory, head_memory],
+            drafter,
+            _memory: memory,
         })
     }
 }
@@ -159,12 +212,22 @@ impl TextModel for Tiny {
     }
 
     fn drafter(&self) -> Option<&dyn Drafter> {
-        None
+        self.drafter.as_ref().map(|drafter| drafter as &dyn Drafter)
     }
 }
 
-/// Decode buckets of two and four rows and prefill buckets of four rows over eight tokens.
-fn config() -> CausalLmConfig {
+/// The draft pool of the speculating bench: draft pages of one run of a page's tokens over
+/// four units. The test drafter reads no cache, so no page of it is written.
+const POOL: DraftPool = DraftPool {
+    group: 1,
+    span: 1,
+    page: PAGE,
+    units: 4,
+};
+
+/// Decode buckets of two and four rows and prefill buckets of four rows over eight tokens,
+/// for a runner that verifies at most `drafts` drafts a row.
+fn config(drafts: u32) -> CausalLmConfig {
     CausalLmConfig {
         phases: vec![ipc::PhaseId(0)],
         buckets: Buckets::causal_lm(&[2, 4], &[8], true),
@@ -173,6 +236,8 @@ fn config() -> CausalLmConfig {
         max_kv_len: MAX_KV_LEN,
         candidates: 2,
         scratch_pages: 0,
+        drafts,
+        draft_pool: (drafts > 0).then_some(POOL),
     }
 }
 
@@ -181,22 +246,43 @@ struct Bench {
     runner: CausalLmRunner,
     _kernels: Kernels,
     _region: DeviceAllocation,
+    /// The memory of the tensors the runner was lent.
+    _memory: Vec<DeviceAllocation>,
 }
 
 impl Bench {
+    /// A runner that speculates nothing.
     fn open() -> Outcome<Self> {
-        let config = config();
+        Self::speculating(0)
+    }
+
+    /// A runner that verifies at most `drafts` drafts a row with the model's drafter, and
+    /// none for zero.
+    fn speculating(drafts: u32) -> Outcome<Self> {
+        let config = config(drafts);
         let inputs = CausalLmRunner::input_bytes(&config)?;
 
+        // The draft cache of a drafter that reads none: no layer, and tensors nothing reads.
+        let draft = |unread: Tensor| KvCache {
+            block_tables: unread.clone(),
+            page_size: POOL.page,
+            layers: Vec::new(),
+            workspace: unread,
+        };
+
         // The profile run states the keys and the peaks before anything touches the device.
-        let profiled = CausalLmRunner::new(
-            Arc::new(Tiny::meta()?),
+        let mut profiled = CausalLmRunner::new(
+            Arc::new(Tiny::meta(drafts > 0)?),
             config.clone(),
             Graphs::meta(Arc::new(Generation::new(0, [])), inputs),
             None,
             Vec::new(),
             None,
         )?;
+        if drafts > 0 {
+            let unread = backend::retained(0x5_0000, &[4], DType::F32, &backend::meta())?;
+            profiled.set_draft_cache(draft(unread), None)?;
+        }
         profiled.graphs().profile_run(&profiled)?;
 
         let mut kernels = Kernels::open()?;
@@ -217,14 +303,20 @@ impl Bench {
             2,
         )?;
 
-        let runner = CausalLmRunner::new(
-            Arc::new(Tiny::on_device(&stream)?),
+        let mut memory = Vec::new();
+        let mut runner = CausalLmRunner::new(
+            Arc::new(Tiny::on_device(&stream, drafts > 0)?),
             config,
             graphs,
-            Some(stream),
+            Some(stream.clone()),
             Vec::new(),
             None,
         )?;
+        if drafts > 0 {
+            let (unread_memory, unread) = support::weight(&stream, &[0.0; 4], &[4])?;
+            memory.push(unread_memory);
+            runner.set_draft_cache(draft(unread), None)?;
+        }
         runner.graphs().profile_run(&runner)?;
         for bucket in runner.buckets() {
             runner.graphs().capture(&runner, &bucket)?;
@@ -234,6 +326,7 @@ impl Bench {
             runner,
             _kernels: kernels,
             _region: region,
+            _memory: memory,
         })
     }
 }
@@ -411,5 +504,102 @@ fn a_batch_s_page_work_is_issued_before_and_after_its_replay() -> Outcome {
         *calls.lock().unwrap(),
         [PageWork::BeforeReplay, PageWork::AfterReplay]
     );
+    Ok(())
+}
+
+/// A verification of `slot`, a fresh slot: the committed token `ids[0]` at `position`, where
+/// the request has drawn `position` tokens, followed by its drafts; the call proposes two
+/// drafts after the tokens it commits.
+fn verification(slot: u32, ids: &[i32], position: i32) -> Batch {
+    let tokens = ids.len() as i32;
+
+    let mut table = commit(slot, mode::VERIFY);
+    table[column::LOGICAL] = i64::from(position);
+    table[column::SAMPLING] = i64::from(position);
+    table[column::VISIBLE] = i64::from(position);
+
+    let columns = BatchColumns {
+        rows: BatchRows {
+            positions: (position..position + tokens).collect(),
+            seq_lens: vec![position + tokens],
+            ..BatchRows::default()
+        },
+        input_ids: ids.to_vec(),
+        draws: vec![DrawAddress {
+            key: 9,
+            position: (position + tokens) as u64,
+        }],
+        commit: table,
+        fresh_slots: vec![FreshSlot {
+            slot,
+            history: Vec::new(),
+        }],
+        drafts: vec![ipc::DraftWork {
+            proposals: 2,
+            ..ipc::DraftWork::default()
+        }],
+        ..BatchColumns::default()
+    };
+    batch(RowKind::Verify, Variant::DecodeGreedy, slot, columns)
+}
+
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_verification_commits_the_drafts_its_samples_agree_with_and_proposes_the_next() -> Outcome {
+    let mut bench = Bench::speculating(2)?;
+
+    // The model continues 7 with 6 and 6 with 5: both drafts agree, and the sample after
+    // them stands as well. The drafter proposes what follows the last committed token.
+    let output = bench.runner.execute(&verification(2, &[7, 6, 5], 3))?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(7), next(6), next(5)]);
+    assert_eq!(call.token_logprobs.len(), 3);
+    assert_eq!(call.draft_token_ids, [next(next(5)), next(next(next(5)))]);
+
+    // The slot stands behind the three tokens the verification committed.
+    assert_eq!((call.cache_computed_len, call.step_index), (6, 6));
+
+    // The second draft differs from the sample at its position: the first draft and that
+    // sample are committed, and the drafts continue from the sample.
+    let output = bench.runner.execute(&verification(3, &[7, 6, 9], 3))?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(7), next(6)]);
+    assert_eq!(call.draft_token_ids, [next(next(6)), next(next(next(6)))]);
+    assert_eq!((call.cache_computed_len, call.step_index), (5, 5));
+
+    // No draft agrees: the verification commits the token a decode at its position would.
+    let output = bench.runner.execute(&verification(4, &[7, 3, 2], 3))?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(7)]);
+    assert_eq!(call.draft_token_ids, [next(next(7)), next(next(next(7)))]);
+    assert_eq!((call.cache_computed_len, call.step_index), (4, 4));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU and a Build Server"]
+fn a_prompt_of_a_speculating_runner_proposes_the_drafts_after_its_first_token() -> Outcome {
+    let mut bench = Bench::speculating(2)?;
+
+    // The prompt samples the token after it, and the drafter continues from that token on
+    // the device: nothing is read back between the two graphs.
+    let mut batch = prompt(2, &[5, 6, 7]);
+    batch.columns.drafts = vec![ipc::DraftWork {
+        proposals: 2,
+        ..ipc::DraftWork::default()
+    }];
+
+    let output = bench.runner.execute(&batch)?;
+    let call = &output.calls[0];
+    assert_eq!(call.tokens, [next(7)]);
+    assert_eq!(call.draft_token_ids, [next(next(7)), next(next(next(7)))]);
+
+    // The verification of those drafts accepts both.
+    let drafts: Vec<i32> = call.draft_token_ids.iter().map(|id| *id as i32).collect();
+    let mut verified = verification(2, &[next(7) as i32, drafts[0], drafts[1]], 3);
+    verified.columns.fresh_slots.clear();
+
+    let output = bench.runner.execute(&verified)?;
+    assert_eq!(output.calls[0].tokens.len(), 3);
     Ok(())
 }

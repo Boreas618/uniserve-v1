@@ -72,6 +72,19 @@ impl Bucket {
         }
     }
 
+    /// A verification bucket of `rows` verifications of at most `drafts` drafts each: a row is
+    /// a committed token followed by its drafts, so the bucket holds `rows · (drafts + 1)`
+    /// tokens. `variant` is [`Variant::VerifyGreedy`] or [`Variant::VerifySampled`].
+    pub const fn verify(rows: u32, drafts: u32, variant: Variant) -> Self {
+        Self::prefill(rows, rows * (drafts + 1), variant)
+    }
+
+    /// The drafter's bucket behind a forward of `rows` rows holding `tokens` tokens: its
+    /// entries over those tokens, then the drafts each row proposes.
+    pub const fn draft(rows: u32, tokens: u32) -> Self {
+        Self::prefill(rows, tokens, Variant::Draft)
+    }
+
     /// A prefill or encode bucket of `rows` rows holding `tokens` tokens.
     ///
     /// An encode is the one media computation whose size is a row count and a token count: a
@@ -459,6 +472,41 @@ impl Buckets {
         let decode: Vec<u32> = decode.into_iter().filter(|size| *size != 0).collect();
         let prefill: Vec<u32> = prefill.into_iter().filter(|size| *size != 0).collect();
         Self::causal_lm(&decode, &prefill, sampled)
+    }
+
+    /// The set of a deployment that speculates with its model's drafter, verifying at most
+    /// `drafts` drafts a row: each decode bucket becomes the verification bucket of its rows
+    /// ([`Bucket::verify`]), because a speculating request's every decode step is a
+    /// verification, and every prefill and verification size gains the drafter's bucket
+    /// ([`Bucket::draft`]), which is issued behind the forward it follows. A set that
+    /// verifies no draft is returned as it is.
+    #[must_use]
+    pub fn with_drafts(&self, drafts: u32) -> Self {
+        if drafts == 0 {
+            return self.clone();
+        }
+
+        let mut buckets = Vec::with_capacity(2 * self.ascending.len());
+        for bucket in &self.ascending {
+            let target = match bucket.variant {
+                Variant::DecodeGreedy => Bucket::verify(bucket.rows, drafts, Variant::VerifyGreedy),
+                Variant::DecodeSampled => {
+                    Bucket::verify(bucket.rows, drafts, Variant::VerifySampled)
+                }
+                _ => *bucket,
+            };
+            buckets.push(target);
+
+            // A media computation and an expert join have no token the drafter reads.
+            let drafted = target.extent == Extent::None
+                && !target.variant.media()
+                && target.variant != Variant::ExpertJoin
+                && target.variant != Variant::TokenDenoise;
+            if drafted {
+                buckets.push(Bucket::draft(target.rows, target.tokens));
+            }
+        }
+        Self::new(buckets)
     }
 
     /// The largest decode row count and prefill token count the set captures: **the batch bound the

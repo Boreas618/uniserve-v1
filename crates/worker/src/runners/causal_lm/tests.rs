@@ -77,6 +77,8 @@ struct Tiny {
     /// Whether the model's experts are split across ranks, whose exchange its forward then
     /// asks for.
     routed: bool,
+    /// The model's drafter, when it loaded one.
+    drafter: Option<TinyDrafter>,
 }
 
 impl Tiny {
@@ -93,7 +95,91 @@ impl Tiny {
             head: linear(VOCABULARY),
             stateful,
             routed: false,
+            drafter: None,
         }
+    }
+
+    /// The model with its drafter loaded.
+    fn drafting(stateful: bool) -> Self {
+        Self {
+            drafter: Some(TinyDrafter::new()),
+            ..Self::new(stateful)
+        }
+    }
+}
+
+/// A drafter of one attention layer over the draft cache: it reads the sum of the model's
+/// hidden row and the next token's embedding.
+struct TinyDrafter {
+    gain: Tensor,
+    key: Linear,
+    value: Linear,
+}
+
+impl TinyDrafter {
+    fn new() -> Self {
+        let linear = || {
+            Linear::new(
+                meta((HEADS * DIM, HIDDEN), DType::BF16),
+                None,
+                WeightOrder::NxK,
+            )
+            .unwrap()
+        };
+
+        Self {
+            gain: meta(HIDDEN, DType::BF16),
+            key: linear(),
+            value: linear(),
+        }
+    }
+}
+
+impl Drafter for TinyDrafter {
+    fn cache(&self) -> CacheShape {
+        CacheShape {
+            layers: 1,
+            kv_heads: HEADS as u32,
+            head_dim: DIM as u32,
+        }
+    }
+
+    fn forward(
+        &self,
+        batch: &TokenBatch,
+        cache: &KvCache,
+        embedded: &Tensor,
+        hidden: &Tensor,
+    ) -> nn::Result<Tensor> {
+        let tokens = batch.tokens();
+        let fused = embedded.add(hidden)?;
+
+        zero_arrival_counters_(&cache.workspace)?;
+        let heads = |projected: Tensor| projected.reshape((tokens, HEADS, DIM));
+        kv_write_(
+            cache,
+            0,
+            batch,
+            &heads(self.key.forward(&fused)?)?,
+            &heads(self.value.forward(&fused)?)?,
+        )?;
+
+        let attended = paged_attention(
+            &heads(fused.clone())?,
+            batch,
+            cache,
+            0,
+            0.35,
+            None,
+            batch.max_kv_len,
+        )?;
+        rms_norm(
+            &attended.reshape((tokens, HIDDEN))?,
+            &self.gain,
+            1e-6,
+            false,
+            fused.dtype(),
+        )
     }
 }
 
@@ -110,7 +196,9 @@ impl CausalLm for Tiny {
         exchange: Option<&ExpertExchange>,
         hidden: &Tensor,
     ) -> nn::Result<Tensor> {
-        let lent = state.is_some_and(|state| state.slots.dims() == [batch.rows()]);
+        // The state's rows are the batch's, or a verification's sequences, which keep a trail.
+        let lent = state
+            .is_some_and(|state| state.slots.dims() == [batch.rows()] || state.trail.is_some());
         if self.stateful != lent {
             return Err(nn::Error::Unsupported(
                 "the model's recurrent state is not the batch's rows".to_owned(),
@@ -212,7 +300,7 @@ impl TextModel for Tiny {
     }
 
     fn drafter(&self) -> Option<&dyn Drafter> {
-        None
+        self.drafter.as_ref().map(|drafter| drafter as &dyn Drafter)
     }
 }
 
@@ -247,6 +335,8 @@ fn config() -> CausalLmConfig {
         max_kv_len: MAX_KV_LEN,
         candidates: CANDIDATES,
         scratch_pages: SCRATCH_PAGES,
+        drafts: 0,
+        draft_pool: None,
     }
 }
 
@@ -422,10 +512,28 @@ fn prefill(variant: Variant) -> Batch {
     batch(BatchShape::prefill(2, 5, variant), columns)
 }
 
+/// The completion `calls_output` names for `batch` served from `bucket`.
+fn completion(
+    batch: &Batch,
+    bucket: &Bucket,
+    vocabulary: u32,
+    candidates: u32,
+    outputs: &[Tensor],
+) -> crate::Result<Vec<ipc::execution::CallOutput>> {
+    calls_output(
+        &batch.calls,
+        &batch.columns,
+        bucket,
+        vocabulary,
+        candidates,
+        outputs,
+    )
+}
+
 /// The input block `columns::fill` writes for `batch` in `bucket`, over bytes that held
 /// something else, with the layout its columns are read by.
 fn filled(batch: &Batch, bucket: &Bucket, scratch: Option<&[u32]>) -> (Layout, Vec<u8>) {
-    let layout = Layout::of(config().buckets.iter()).unwrap();
+    let layout = Layout::of(config().buckets.iter(), 0, 0).unwrap();
     let mut block = vec![0xA5_u8; layout.bytes() as usize];
 
     columns::fill(
@@ -687,7 +795,7 @@ fn a_row_s_adjustments_are_its_bias_flag_and_its_ban_mask() {
 #[test]
 fn the_idle_inputs_of_every_bucket_write_and_commit_nothing() {
     let runner = runner(false);
-    let layout = Layout::of(config().buckets.iter()).unwrap();
+    let layout = Layout::of(config().buckets.iter(), 0, 0).unwrap();
 
     for bucket in runner.buckets() {
         let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
@@ -861,7 +969,7 @@ fn a_batch_the_runner_s_graphs_were_not_captured_for_is_refused() {
     let message = runner.prepare_inputs(&zeroth).unwrap_err().to_string();
     assert!(message.contains("request slot 0"), "{message}");
 
-    // Image rows and verifications, which the runner states no bucket for.
+    // A verification, which a runner whose config states no drafts serves none of.
     let mut verified = decode(&[1, 2], &[0.0, 0.0]);
     verified.columns.rows.calls[0].kind = RowKind::Verify;
     assert!(matches!(
@@ -1176,7 +1284,7 @@ fn a_call_s_tokens_carry_their_rows_scores_and_its_slot_s_positions() {
     let batch = decode(&[3, 1], &[0.0, 0.0]);
     let bucket = Bucket::decode(2, Variant::DecodeGreedy);
 
-    let output = calls_output(&batch, &bucket, 64, 2, &greedy_outputs([11, 22])).unwrap();
+    let output = completion(&batch, &bucket, 64, 2, &greedy_outputs([11, 22])).unwrap();
 
     let mut first = CallOutput::completed(
         CallId(100),
@@ -1225,7 +1333,7 @@ fn a_row_that_samples_nothing_gives_its_call_no_token() {
         tensor(&[3_i32, 2, 0, 0], 4),
         tensor(&[1_i32, 0, 0, 0], 4),
     ];
-    let output = calls_output(&batch, &bucket, 64, 0, &outputs).unwrap();
+    let output = completion(&batch, &bucket, 64, 0, &outputs).unwrap();
 
     assert_eq!(output.len(), 2);
     assert_eq!(output[0].tokens, [11]);
@@ -1257,7 +1365,7 @@ fn a_call_of_several_rows_reports_one_state_and_its_rows_tokens_in_order() {
     batch.calls = vec![CallId(9)];
     let bucket = Bucket::decode(2, Variant::DecodeGreedy);
 
-    let output = calls_output(&batch, &bucket, 64, 2, &greedy_outputs([11, 22])).unwrap();
+    let output = completion(&batch, &bucket, 64, 2, &greedy_outputs([11, 22])).unwrap();
 
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].tokens, [11, 22]);
@@ -1269,7 +1377,7 @@ fn a_call_of_several_rows_reports_one_state_and_its_rows_tokens_in_order() {
 
     // A call that runs on no slot reports no state.
     batch.columns.slots = vec![-1, -1];
-    let output = calls_output(&batch, &bucket, 64, 2, &greedy_outputs([11, 22])).unwrap();
+    let output = completion(&batch, &bucket, 64, 2, &greedy_outputs([11, 22])).unwrap();
     assert_eq!((output[0].step_index, output[0].cache_computed_len), (0, 0));
 }
 
@@ -1279,7 +1387,7 @@ fn a_row_that_could_not_be_sampled_fails_its_call_alone() {
 
     // A greedy row with no numeric logit chose the vocabulary's width.
     let batch = decode(&[3, 1], &[0.0, 0.0]);
-    let output = calls_output(&batch, &bucket, 64, 2, &greedy_outputs([64, 22])).unwrap();
+    let output = completion(&batch, &bucket, 64, 2, &greedy_outputs([64, 22])).unwrap();
 
     assert_eq!(output[0].status, CallStatus::Error);
     assert_eq!(output[0].error_code, Some(ErrorCode::NumericalFault));
@@ -1294,7 +1402,7 @@ fn a_row_that_could_not_be_sampled_fails_its_call_alone() {
     let mut outputs = greedy_outputs([11, 0]);
     outputs.push(tensor(&[1_i32, 0], 2));
 
-    let output = calls_output(&batch, &bucket, 64, 2, &outputs).unwrap();
+    let output = completion(&batch, &bucket, 64, 2, &outputs).unwrap();
     assert_eq!(output[0].tokens, [11]);
     assert_eq!(output[1].status, CallStatus::Error);
 }
@@ -1317,7 +1425,7 @@ fn a_scoring_bucket_reports_each_named_target_to_the_call_that_holds_its_token()
         tensor(&prompt_logprobs, 8),
         tensor(&[4_i32; 8], 8),
     ];
-    let output = calls_output(&batch, &bucket, 64, 0, &outputs).unwrap();
+    let output = completion(&batch, &bucket, 64, 0, &outputs).unwrap();
 
     // The first call holds tokens 0..3, of which two name a target; the second holds 3..5.
     assert_eq!(
@@ -1337,7 +1445,7 @@ fn outputs_that_are_not_the_bucket_s_are_refused() {
     let mut outputs = greedy_outputs([11, 22]);
     outputs.truncate(5);
     assert!(matches!(
-        calls_output(&batch, &bucket, 64, 2, &outputs),
+        completion(&batch, &bucket, 64, 2, &outputs),
         Err(Error::Invariant(_))
     ));
 
@@ -1346,14 +1454,14 @@ fn outputs_that_are_not_the_bucket_s_are_refused() {
     orphan.columns.rows.calls.pop();
     orphan.calls.pop();
     assert!(matches!(
-        calls_output(&orphan, &bucket, 64, 2, &greedy_outputs([11, 22])),
+        completion(&orphan, &bucket, 64, 2, &greedy_outputs([11, 22])),
         Err(Error::Invariant(_))
     ));
 
     // Another number of call ids than calls.
     let mut unnamed = decode(&[3, 1], &[0.0, 0.0]);
     unnamed.calls.pop();
-    assert!(calls_output(&unnamed, &bucket, 64, 2, &greedy_outputs([11, 22])).is_err());
+    assert!(completion(&unnamed, &bucket, 64, 2, &greedy_outputs([11, 22])).is_err());
 }
 
 #[test]
@@ -1809,4 +1917,938 @@ fn a_paired_forward_computes_over_the_scratch_pages_the_cache_opened() {
         .map(|(operator, _, _)| operator)
         .collect();
     assert_eq!(paired, serving);
+}
+
+// ---- Speculation --------------------------------------------------------------------------------
+
+use ipc::DraftWork;
+
+use super::output::verification_output;
+use super::speculation::{self, DraftPool};
+use crate::lock;
+
+/// The drafts a verification of the speculating test runner holds at most.
+const DRAFTS: u32 = 2;
+
+/// The draft pool of the test runner: draft pages of sixteen tokens, each two runs of eight,
+/// over sixteen units, in cache group one.
+const POOL: DraftPool = DraftPool {
+    group: 1,
+    span: 2,
+    page: 8,
+    units: 16,
+};
+
+/// The test config with two drafts a verification.
+fn speculating_config() -> CausalLmConfig {
+    CausalLmConfig {
+        drafts: DRAFTS,
+        draft_pool: Some(POOL),
+        ..config()
+    }
+}
+
+/// The draft cache of the test drafter: one layer over the pool's runs.
+fn draft_cache() -> KvCache {
+    let pages = (POOL.span * POOL.units) as usize;
+    let plane = || meta((pages, POOL.page as usize, HEADS, DIM), DType::BF16);
+    let flags = || meta((pages, 1, 1, 1), DType::U8);
+
+    KvCache {
+        block_tables: meta((1, 1), DType::U32),
+        page_size: POOL.page,
+        layers: vec![KvPlanes {
+            key: plane(),
+            value: plane(),
+            key_initialized: flags(),
+            value_initialized: flags(),
+            key_scale: None,
+            value_scale: None,
+        }],
+        workspace: meta(1 << 16, DType::U8),
+    }
+}
+
+/// A speculating runner of [`Tiny`] with its drafter, over graphs that hold no device.
+fn speculating(stateful: bool) -> CausalLmRunner {
+    let config = speculating_config();
+    let graphs = Graphs::meta(
+        Arc::new(Generation::new(0, [])),
+        CausalLmRunner::input_bytes(&config).unwrap(),
+    );
+
+    let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
+    let buffers = |rows: usize| vec![vec![meta((rows, HIDDEN), DType::BF16)]];
+    let state = stateful.then(|| (buffers(SLOTS as usize), buffers(SLOTS as usize)));
+
+    let mut runner = CausalLmRunner::new(
+        Arc::new(Tiny::drafting(stateful)),
+        config,
+        graphs,
+        None,
+        vec![group(PAGES, pooled)],
+        state,
+    )
+    .unwrap();
+
+    // The trail holds the state after each token of the largest verification: four rows of
+    // a committed token and two drafts.
+    runner
+        .set_draft_cache(draft_cache(), stateful.then(|| buffers(12)))
+        .unwrap();
+    runner
+}
+
+/// A verification batch of two calls, stated as the scheduler states it, in a decode's shape:
+/// slot 2's committed token 5 and the drafts 6 and 7 from position 10, and slot 4's committed
+/// token 8 and the draft 9 from position 20. The first call proposes two drafts and the
+/// second one, and the first counts its tokens in its penalties.
+fn verification(temperature: f32) -> Batch {
+    let call = |request: u32, row: u32| BatchRow {
+        request,
+        kind: RowKind::Verify,
+        cache_group: 0,
+        rows: row..row + 1,
+    };
+
+    let mut table = commit(&[(2, mode::VERIFY, 0), (4, mode::VERIFY, 1)]);
+    table[column::LOGICAL * 2..][..2].copy_from_slice(&[10, 20]);
+    table[column::SAMPLING * 2..][..2].copy_from_slice(&[3, 5]);
+    table[column::VISIBLE * 2..][..2].copy_from_slice(&[10, 20]);
+    table[column::PENALTIES * 2] = 1;
+
+    let columns = BatchColumns {
+        rows: BatchRows {
+            calls: vec![call(2, 0), call(4, 1)],
+            positions: vec![10, 11, 12, 20, 21],
+            slot_mapping: vec![26, 27, 28, 52, 53],
+            seq_lens: vec![13, 22],
+            query_offsets: vec![0, 3, 5],
+            logits_rows: vec![0, 1],
+        },
+        input_ids: vec![5, 6, 7, 8, 9],
+        slots: vec![2, 4],
+        parameters: [request(temperature), request(temperature)].concat(),
+        draws: vec![
+            DrawAddress {
+                key: 100,
+                position: 13,
+            },
+            DrawAddress {
+                key: 101,
+                position: 22,
+            },
+        ],
+        commit: table,
+        page_size: PAGE,
+        max_kv_len: MAX_KV_LEN,
+        drafts: vec![
+            DraftWork {
+                proposals: 2,
+                ..DraftWork::default()
+            },
+            DraftWork {
+                proposals: 1,
+                ..DraftWork::default()
+            },
+        ],
+        ..BatchColumns::default()
+    };
+
+    let variant = if temperature == 0.0 {
+        Variant::DecodeGreedy
+    } else {
+        Variant::DecodeSampled
+    };
+    batch(BatchShape::prefill(2, 5, variant), columns)
+}
+
+/// The layout of the speculating test runner's input tensors, and a block of its bytes that
+/// holds something else.
+fn speculating_block() -> (Layout, Vec<u8>) {
+    let buckets = config().buckets.with_drafts(DRAFTS);
+    let layout = Layout::of(buckets.iter(), DRAFTS, POOL.width(MAX_KV_LEN)).unwrap();
+    let block = vec![0xA5_u8; layout.bytes() as usize];
+
+    (layout, block)
+}
+
+#[test]
+fn a_speculating_runner_states_verification_and_drafter_buckets() {
+    let runner = speculating(false);
+    let buckets = runner.buckets();
+
+    // The eight prefill buckets, a verification bucket for each decode size and selection,
+    // and the drafter's bucket behind each prefill and verification size.
+    assert_eq!(buckets.len(), 8 + 4 + 4);
+    assert!(buckets.windows(2).all(|pair| pair[0] > pair[1]));
+    assert!(!buckets.iter().any(|bucket| bucket.variant.is_decode()));
+
+    // A verification of `rows` rows holds a committed token and two drafts a row.
+    for rows in [2, 4] {
+        for variant in [Variant::VerifyGreedy, Variant::VerifySampled] {
+            let bucket = Bucket::verify(rows, DRAFTS, variant);
+
+            assert_eq!(bucket.tokens, 3 * rows);
+            assert!(buckets.contains(&bucket), "{bucket}");
+        }
+        assert!(buckets.contains(&Bucket::draft(rows, 3 * rows)));
+    }
+    for tokens in [8, 80] {
+        assert!(buckets.contains(&Bucket::draft(4, tokens)));
+    }
+
+    // A set that verifies no draft is the set itself.
+    let plain = config().buckets;
+    assert_eq!(
+        plain.with_drafts(0).iter().collect::<Vec<_>>(),
+        plain.iter().collect::<Vec<_>>()
+    );
+
+    // The kept outputs and the input tensors are functions of the config.
+    let config = speculating_config();
+    let kept = CausalLmRunner::kept_bytes(&config, HIDDEN as u32, DType::BF16).unwrap();
+    assert!(kept >= (80 * HIDDEN * 2) as u64);
+    assert_eq!(
+        CausalLmRunner::kept_bytes(&self::config(), HIDDEN as u32, DType::BF16).unwrap(),
+        0
+    );
+    assert!(
+        CausalLmRunner::input_bytes(&config).unwrap()
+            > CausalLmRunner::input_bytes(&self::config()).unwrap()
+    );
+}
+
+#[test]
+fn the_verification_and_drafter_buckets_are_profiled_and_captured() {
+    let runner = speculating(false);
+    runner.graphs().profile_run(&runner).unwrap();
+
+    let reduce = <ops::reduce::Reduce as ops::Op>::NAME;
+    let drafts = DRAFTS as usize;
+
+    for bucket in runner.buckets() {
+        let launches = operators(&runner, &bucket);
+
+        match bucket.variant {
+            Variant::VerifyGreedy | Variant::VerifySampled => {
+                // One forward over every token, one selection, one commit.
+                for operator in ["kv_write", "paged_attention", "logits_shape", "slot_commit"] {
+                    assert_eq!(count(&launches, operator), 1, "{operator} in {bucket}");
+                }
+                let greedy = usize::from(bucket.variant.greedy());
+                assert_eq!(count(&launches, "argmax"), greedy, "{bucket}");
+                assert_eq!(count(&launches, "inverse_cdf"), 1 - greedy, "{bucket}");
+
+                // The agreed lengths are one reduction over the rows' runs.
+                assert_eq!(count(&launches, reduce), 1, "{bucket}");
+            }
+            Variant::Draft => {
+                // The entries and one chained step write and read the draft cache, and each
+                // step proposes; the drafter selects nothing through the sampler and commits
+                // nothing.
+                for operator in ["kv_write", "paged_attention", "argmax"] {
+                    assert_eq!(count(&launches, operator), drafts, "{operator} in {bucket}");
+                }
+                for operator in ["logits_shape", "slot_commit"] {
+                    assert_eq!(count(&launches, operator), 0, "{operator} in {bucket}");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A verification's tokens attend as decode rows; the drafter's entries attend as a
+    // prompt's rows and its chained steps as decode rows.
+    let phases = |bucket: &Bucket| -> Vec<bool> {
+        let table = runner.graphs().launch_table(bucket).unwrap();
+
+        table
+            .iter()
+            .filter(|(operator, _, _)| *operator == "paged_attention")
+            .map(|(_, key, _)| key.contains("phase_decode"))
+            .collect()
+    };
+    assert_eq!(
+        phases(&Bucket::verify(4, DRAFTS, Variant::VerifySampled)),
+        [true]
+    );
+    assert_eq!(phases(&Bucket::draft(4, 12)), [false, true]);
+
+    // Every bucket is captured with its profile run's launches.
+    for bucket in runner.buckets() {
+        runner.graphs().capture(&runner, &bucket).unwrap();
+    }
+    let mut ascending = runner.buckets();
+    ascending.reverse();
+    assert_eq!(runner.graphs().buckets(), ascending);
+
+    // The model's one host value is copied by the forwards that run it; the drafter's makes
+    // no copy.
+    let copies = |bucket: &Bucket| runner.graphs().input_copies(bucket).unwrap().len();
+    assert_eq!(copies(&Bucket::verify(2, DRAFTS, Variant::VerifyGreedy)), 1);
+    assert_eq!(copies(&Bucket::draft(2, 6)), 0);
+}
+
+#[test]
+fn a_verification_of_a_model_that_keeps_a_recurrent_state_settles_it_on_its_trail() {
+    let index = <ops::index::Index as ops::Op>::NAME;
+    let bucket = Bucket::verify(4, DRAFTS, Variant::VerifyGreedy);
+
+    let plain = speculating(false);
+    plain.graphs().profile_run(&plain).unwrap();
+    let stateful = speculating(true);
+    stateful.graphs().profile_run(&stateful).unwrap();
+
+    // The state's one field is settled by a gather from the trail and a scatter into the
+    // live buffer, which a model without a state does not launch.
+    let gathers = |runner: &CausalLmRunner| count(&operators(runner, &bucket), index);
+    assert_eq!(gathers(&stateful), gathers(&plain) + 2);
+
+    for bucket in stateful.buckets() {
+        stateful.graphs().capture(&stateful, &bucket).unwrap();
+    }
+
+    // A model that keeps a state verifies only with a trail of its largest verification.
+    let mut unlent = speculating(true);
+    let short = vec![vec![meta((11, HIDDEN), DType::BF16)]];
+    assert!(unlent.set_draft_cache(draft_cache(), Some(short)).is_err());
+    assert!(unlent.set_draft_cache(draft_cache(), None).is_err());
+}
+
+#[test]
+fn a_verification_batch_is_one_row_per_token_and_one_sequence_per_call() {
+    let batch = verification(0.7);
+    let bucket = Bucket::verify(4, DRAFTS, Variant::VerifySampled);
+    let (layout, mut block) = speculating_block();
+
+    speculation::fill_verification(
+        &layout,
+        SLOTS,
+        VOCABULARY as u32,
+        &batch.columns,
+        &speculation::token_rows(&batch.columns),
+        &bucket,
+        &mut block,
+    )
+    .unwrap();
+
+    let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
+    let i32s = |column, elements| layout.read::<i32>(&block, column, elements);
+    let none = NO_SLOT;
+
+    // ---- Each token is the decode step at its position ----
+
+    assert_eq!(u32s(Column::InputIds, 6), [5, 6, 7, 8, 9, 0]);
+    assert_eq!(i32s(Column::Positions, 6), [10, 11, 12, 20, 21, 0]);
+    assert_eq!(u32s(Column::SeqLens, 6), [11, 12, 13, 21, 22, 0]);
+    assert_eq!(
+        u32s(Column::QueryOffsets, 13),
+        [0, 1, 2, 3, 4, 5, 5, 5, 5, 5, 5, 5, 5]
+    );
+    assert_eq!(u32s(Column::LogitsRows, 6), [0, 1, 2, 3, 4, 0]);
+
+    // A token reads its request's pages and samples on its request's slot.
+    assert_eq!(u32s(Column::Slots, 6), [1, 1, 1, 3, 3, none]);
+    assert_eq!(u32s(Column::TableRows, 6), [1, 1, 1, 3, 3, SLOTS]);
+    assert_eq!(u32s(Column::CallSlots, 3), [1, 3, SLOTS]);
+
+    // A token draws at the position after it in its request's stream.
+    let draws = layout.read::<f32>(&block, Column::Draws, 6);
+    let expected = [
+        sampling_uniform(100, 11, 0, 0),
+        sampling_uniform(100, 12, 0, 0),
+        sampling_uniform(100, 13, 0, 0),
+        sampling_uniform(101, 21, 0, 0),
+        sampling_uniform(101, 22, 0, 0),
+    ];
+    assert_eq!(draws[..5], expected);
+    assert_eq!(draws[5], 0.0);
+
+    // ---- Each call is one sequence of the recurrent state ----
+
+    assert_eq!(u32s(Column::StateOffsets, 5), [0, 3, 5, 5, 5]);
+    assert_eq!(u32s(Column::StateLens, 4), [13, 22, 0, 0]);
+    assert_eq!(u32s(Column::StateSlots, 4), [1, 3, none, none]);
+    assert_eq!(u32s(Column::Firsts, 4), [0, 3, 0, 0]);
+
+    // ---- The drafts ----
+
+    // A token's sample is compared with the token after it, and its penalties count the
+    // drafts before it.
+    assert_eq!(u32s(Column::Drafts, 6), [6, 7, none, 9, none, none]);
+    assert_eq!(
+        u32s(Column::Extras, 12),
+        [none, none, 6, none, 6, 7, none, none, 9, none, none, none]
+    );
+
+    // A row's window ends at its last token, whose sample no draft follows.
+    assert_eq!(
+        u32s(Column::Windows, 12),
+        [0, 1, 2, 3, 4, 4, none, none, none, none, none, none]
+    );
+    assert_eq!(
+        u32s(Column::DraftTokens, 8),
+        [6, 7, 9, none, none, none, none, none]
+    );
+    assert_eq!(u32s(Column::DraftSteps, 8), [0, 1, 0, 1, 0, 1, 0, 1]);
+
+    // ---- The commit: a row per call, then a count row per draft ----
+
+    let rows = layout.rows();
+    let table = i32s(Column::Commit, COMMIT_FIELDS * rows);
+    let field = |field: usize, row: usize| table[field * rows + row];
+
+    assert_eq!((field(column::SLOT, 0), field(column::TASK, 0)), (1, 0));
+    assert_eq!((field(column::SLOT, 1), field(column::TASK, 1)), (3, 1));
+    assert_eq!(field(column::MODE, 1), mode::VERIFY as i32);
+    assert_eq!(field(column::VISIBLE, 1), 20);
+
+    // The counts of the bucket's four rows start behind them: two for the first call, which
+    // counts its tokens, and one for the second, which does not.
+    for (task, slot, counts) in [(4, 1, 1), (5, 1, 1), (6, 3, 0)] {
+        assert_eq!(field(column::SLOT, task), slot);
+        assert_eq!(field(column::MODE, task), mode::COUNT as i32);
+        assert_eq!(field(column::TASK, task), task as i32);
+        assert_eq!(field(column::PENALTIES, task), counts);
+    }
+    for inert in [2, 3, 7, 8, 11] {
+        assert_eq!(
+            (field(column::SLOT, inert), field(column::TASK, inert)),
+            (-1, -1)
+        );
+    }
+}
+
+#[test]
+fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
+    let (layout, mut block) = speculating_block();
+    let none = NO_SLOT;
+
+    // ---- Behind a verification ----
+
+    // Slot 2 holds the draft pages 0 and 1 in units 3 and 5; slot 4 holds none.
+    let batch = verification(0.0);
+    let tables = [(0, vec![3, 5]), (0, Vec::new())];
+    let bucket = Bucket::draft(4, 12);
+    speculation::fill_drafter(
+        &layout,
+        &POOL,
+        VOCABULARY as u32,
+        &batch.columns,
+        &tables,
+        &bucket,
+        &mut block,
+    )
+    .unwrap();
+
+    {
+        let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
+        let stride = layout.rows();
+
+        // An entry reads the token its own sampling row chose, and is written while its
+        // offset is within the length its verification agreed.
+        assert_eq!(u32s(Column::NextRows, 6), [0, 1, 2, 3, 4, none]);
+        assert_eq!(u32s(Column::NextIds, 6), [0; 6]);
+        assert_eq!(u32s(Column::EntryRows, 6), [0, 0, 0, 1, 1, none]);
+        assert_eq!(u32s(Column::EntrySteps, 6), [0, 1, 2, 0, 1, 1]);
+
+        // Position 10 is run 1 of draft page 0, in unit 3: page 16 + 3, offset 2. A slot
+        // that holds no draft page writes nothing.
+        assert_eq!(
+            u32s(Column::DraftSlots, 6),
+            [19 * 8 + 2, 19 * 8 + 3, 19 * 8 + 4, none, none, none]
+        );
+        assert_eq!(u32s(Column::NoSlots, 12), [none; 12]);
+        assert_eq!(u32s(Column::TokenCap, 12), [VOCABULARY as u32 - 1; 12]);
+
+        // A drafter row is a call's tokens, and reads the keys up to its last one.
+        assert_eq!(u32s(Column::StateOffsets, 5), [0, 3, 5, 5, 5]);
+        assert_eq!(u32s(Column::DraftLens, 4), [13, 22, 0, 0]);
+
+        // A row's table names run `c` of the draft page in unit `u` as page `c · 16 + u`,
+        // and the padding unit's pages where it holds none.
+        assert_eq!(
+            u32s(Column::DraftTables, 16),
+            [3, 19, 5, 21, 0, 16, 0, 16, 0, 16, 0, 16, 0, 16, 0, 16]
+        );
+
+        // The first proposal continues from the entry the agreed length names, from the
+        // row's first token on.
+        assert_eq!(u32s(Column::LastEntries, 4), [0, 3, 0, 0]);
+        assert_eq!(u32s(Column::ProposalRows, 4), [0, 1, none, none]);
+
+        // The chained step evaluates the position after the row's first, moved on the
+        // device by the length it agreed.
+        let positions = layout.read::<i32>(&block, Column::ChainPositions, 2 * stride);
+        assert_eq!(positions[stride..][..4], [11, 21, 0, 0]);
+        let lens = u32s(Column::ChainLens, 2 * stride);
+        assert_eq!(lens[stride..][..4], [12, 22, 0, 0]);
+
+        // Positions 11 to 13 of slot 2, then cells that hold no slot.
+        let slots = u32s(Column::ChainSlots, 12);
+        assert_eq!(
+            slots[..6],
+            [19 * 8 + 3, 19 * 8 + 4, 19 * 8 + 5, none, none, none]
+        );
+        assert_eq!(slots[6..], [none; 6]);
+
+        // The first call proposes two drafts, so its chained step writes its slot; the
+        // second proposes one and a row the batch does not hold none, and both read a cell
+        // that holds no slot.
+        let index = u32s(Column::ChainIndex, 2 * stride);
+        assert_eq!(index[stride..][..4], [0, 6 + 3, 12 + 3, 18 + 3]);
+
+        assert_eq!(u32s(Column::ChainOffsets, 5), [0, 1, 2, 2, 2]);
+        assert_eq!(u32s(Column::LiveRows, 1), [2]);
+    }
+
+    // ---- Behind a prompt ----
+
+    // Slot 2's three tokens end its prompt and sample; slot 4's two end none, and its call
+    // states the token after them.
+    let mut batch = prefill(Variant::PrefillGreedy);
+    batch.columns.drafts = vec![
+        DraftWork {
+            proposals: 2,
+            ..DraftWork::default()
+        },
+        DraftWork {
+            lookahead: Some(33),
+            ..DraftWork::default()
+        },
+    ];
+    let bucket = Bucket::draft(4, 8);
+    speculation::fill_drafter(
+        &layout,
+        &POOL,
+        VOCABULARY as u32,
+        &batch.columns,
+        &tables,
+        &bucket,
+        &mut block,
+    )
+    .unwrap();
+
+    {
+        let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
+        let stride = layout.rows();
+
+        // An entry reads the prompt's next token; the last one of a row that samples reads
+        // the row's token on the device, and the last one of a row that does not its call's
+        // lookahead.
+        assert_eq!(u32s(Column::NextIds, 6), [6, 7, 0, 9, 33, 0]);
+        assert_eq!(u32s(Column::NextRows, 6), [none, none, 0, none, none, none]);
+        assert_eq!(u32s(Column::EntryRows, 6), [none; 6]);
+        assert_eq!(u32s(Column::EntrySteps, 6), [0, 0, 0, 0, 0, 1]);
+        assert_eq!(u32s(Column::DraftSlots, 3), [3 * 8, 3 * 8 + 1, 3 * 8 + 2]);
+
+        // A prompt's proposals continue from its last entry, which the batch states.
+        assert_eq!(u32s(Column::LastEntries, 4), [2, 4, 0, 0]);
+        assert_eq!(u32s(Column::ProposalRows, 4), [none; 4]);
+        assert_eq!(u32s(Column::DraftLens, 4), [3, 2, 0, 0]);
+
+        let positions = layout.read::<i32>(&block, Column::ChainPositions, 2 * stride);
+        assert_eq!(positions[stride..][..4], [3, 2, 0, 0]);
+        let index = u32s(Column::ChainIndex, 2 * stride);
+        assert_eq!(index[stride..][..4], [0, 6 + 3, 12 + 3, 18 + 3]);
+    }
+
+    // A row whose last token's successor nobody states has no entry there.
+    batch.columns.drafts.clear();
+    speculation::fill_drafter(
+        &layout,
+        &POOL,
+        VOCABULARY as u32,
+        &batch.columns,
+        &tables,
+        &bucket,
+        &mut block,
+    )
+    .unwrap();
+
+    assert_eq!(
+        layout.read::<u32>(&block, Column::EntrySteps, 6),
+        [0, 0, 0, 0, 1, 1]
+    );
+    assert_eq!(layout.read::<u32>(&block, Column::LastEntries, 2), [2, 3]);
+}
+
+#[test]
+fn a_verification_agrees_the_drafts_its_samples_equal_up_to_the_first_that_differs() {
+    let cpu = Device::Cpu;
+    let none = NO_SLOT;
+
+    // Four verifications, packed: three drafts of which two agree; two drafts that both
+    // agree; two drafts of which the first differs; and a committed token alone.
+    let chosen = [7_u32, 8, 4, 5, 7, 8, 3, 1, 8, 3, 5];
+    let drafts = [7_u32, 8, 9, none, 7, 8, none, 7, 8, none, none];
+    let windows = [0_u32, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9, 9, 10, 10, 10, 10];
+    let firsts = [0_u32, 4, 7, 10];
+
+    let (agreed, last) = speculation::accept(
+        &Tensor::from_slice(&chosen, 11, &cpu).unwrap(),
+        &Tensor::from_slice(&drafts, 11, &cpu).unwrap(),
+        &Tensor::from_slice(&windows, (4, 4), &cpu).unwrap(),
+        &Tensor::from_slice(&firsts, 4, &cpu).unwrap(),
+    )
+    .unwrap();
+
+    // A verification commits its agreed drafts and the sample after them: three, three, one
+    // and one tokens.
+    assert_eq!(agreed.to_vec1::<u32>().unwrap(), [2, 2, 0, 0]);
+    assert_eq!(last.to_vec1::<u32>().unwrap(), [2, 6, 7, 10]);
+
+    // A row the batch does not hold agrees nothing.
+    let (agreed, last) = speculation::accept(
+        &Tensor::from_slice(&[0_u32, 0], 2, &cpu).unwrap(),
+        &Tensor::from_slice(&[none, none], 2, &cpu).unwrap(),
+        &Tensor::from_slice(&[none; 4], (2, 2), &cpu).unwrap(),
+        &Tensor::from_slice(&[0_u32, 0], 2, &cpu).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(agreed.to_vec1::<u32>().unwrap(), [0, 0]);
+    assert_eq!(last.to_vec1::<u32>().unwrap(), [0, 0]);
+}
+
+#[test]
+fn a_verification_s_call_reports_its_accepted_prefix_and_its_proposals() {
+    let batch = verification(0.0);
+    let bucket = Bucket::verify(4, DRAFTS, Variant::VerifyGreedy);
+
+    // The tokens sampled after each of the batch's five tokens, their scores, each call's
+    // positions after the commit, and the agreed lengths: both of the first call's drafts,
+    // and none of the second's one.
+    let mut tokens = vec![6_u32, 7, 40, 30, 31];
+    tokens.resize(12, 0);
+    let mut logprobs = vec![-0.1_f32, -0.2, -0.3, -0.4, -0.5];
+    logprobs.resize(12, 0.0);
+
+    let outputs = |tokens: &[u32]| {
+        vec![
+            tensor(tokens, 12),
+            tensor(&logprobs, 12),
+            tensor(&[1_i32; 12], 12),
+            tensor(&[13_i32, 21, 0, 0], 4),
+            tensor(&[6_i32, 6, 0, 0], 4),
+            tensor(&[2_u32, 0, 0, 0], 4),
+        ]
+    };
+    let completion = |tokens: &[u32]| {
+        verification_output(
+            &batch.calls,
+            &batch.columns,
+            &bucket,
+            VOCABULARY as u32,
+            0,
+            &outputs(tokens),
+        )
+        .unwrap()
+    };
+    let mut calls = completion(&tokens);
+
+    // The first call commits its two drafts and the sample after them; the second its
+    // first sample alone, as a decode at its position would.
+    assert_eq!(calls[0].tokens, [6, 7, 40]);
+    assert_eq!(calls[0].token_logprobs.len(), 3);
+    assert_eq!(calls[0].token_logprobs[2], [entry(40, -0.3, 1)]);
+    assert_eq!(
+        (calls[0].cache_computed_len, calls[0].cache_visible_len),
+        (13, 6)
+    );
+    assert_eq!(calls[1].tokens, [30]);
+    assert_eq!(calls[1].token_logprobs, [vec![entry(30, -0.4, 1)]]);
+    assert_eq!(calls[1].cache_computed_len, 21);
+
+    // Each chained step proposes for every row. A call takes as many as it asked for, up
+    // to the first that is no token.
+    let proposals = [
+        tensor(&[50_u32, 60, 0, 0], 4),
+        tensor(&[51_u32, 61, 0, 0], 4),
+    ];
+    speculation::propose(&batch, VOCABULARY as u32, &proposals, &mut calls).unwrap();
+    assert_eq!(calls[0].draft_token_ids, [50, 51]);
+    assert_eq!(calls[1].draft_token_ids, [60]);
+
+    let ended = [
+        tensor(&[VOCABULARY as u32, 60, 0, 0], 4),
+        tensor(&[51_u32, 61, 0, 0], 4),
+    ];
+    let mut calls = completion(&tokens);
+    speculation::propose(&batch, VOCABULARY as u32, &ended, &mut calls).unwrap();
+    assert!(calls[0].draft_token_ids.is_empty());
+
+    // A call one of whose samples is no token fails alone and proposes nothing.
+    tokens[1] = VOCABULARY as u32;
+    let mut calls = completion(&tokens);
+    speculation::propose(&batch, VOCABULARY as u32, &proposals, &mut calls).unwrap();
+    assert_eq!(calls[0].status, CallStatus::Error);
+    assert_eq!(calls[0].error_code, Some(ErrorCode::NumericalFault));
+    assert!(calls[0].tokens.is_empty() && calls[0].draft_token_ids.is_empty());
+    assert_eq!(calls[1].tokens, [30]);
+
+    // A prompt's call proposes from the row its last entry is in: the first samples the
+    // token after its prompt, and the second states no token after its own.
+    let prompt = prefill(Variant::PrefillGreedy);
+    let mut prompt = Batch {
+        columns: BatchColumns {
+            drafts: vec![
+                DraftWork {
+                    proposals: 1,
+                    ..DraftWork::default()
+                };
+                2
+            ],
+            ..prompt.columns.clone()
+        },
+        ..prompt
+    };
+    prompt.columns.rows.query_offsets = vec![0, 3, 4];
+    prompt.columns.rows.positions.truncate(4);
+    prompt.columns.rows.slot_mapping.truncate(4);
+    prompt.columns.input_ids.truncate(4);
+
+    let mut calls = vec![
+        ipc::execution::CallOutput::completed(CallId(100), vec![11], RowState::default()),
+        ipc::execution::CallOutput::completed(CallId(101), Vec::new(), RowState::default()),
+    ];
+    speculation::propose(&prompt, VOCABULARY as u32, &proposals, &mut calls).unwrap();
+    assert_eq!(calls[0].draft_token_ids, [50]);
+    assert!(calls[1].draft_token_ids.is_empty());
+}
+
+#[test]
+fn a_speculating_runner_serves_a_verification_from_its_verification_bucket() {
+    let mut runner = speculating(false);
+    runner.graphs().profile_run(&runner).unwrap();
+    for bucket in runner.buckets() {
+        runner.graphs().capture(&runner, &bucket).unwrap();
+    }
+
+    // A batch in a decode's shape whose calls verify takes the verification bucket of its
+    // selection, the smallest that holds its calls.
+    let bucket = runner.prepare_inputs(&verification(0.0)).unwrap();
+    assert_eq!(bucket, Bucket::verify(2, DRAFTS, Variant::VerifyGreedy));
+    let bucket = runner.prepare_inputs(&verification(0.7)).unwrap();
+    assert_eq!(bucket, Bucket::verify(2, DRAFTS, Variant::VerifySampled));
+
+    // A decode is a verification of no draft.
+    let mut decoded = decode(&[1, 2, 3], &[0.0; 3]);
+    decoded.columns.input_ids = vec![4, 5, 6];
+    let bucket = runner.prepare_inputs(&decoded).unwrap();
+    assert_eq!(bucket, Bucket::verify(4, DRAFTS, Variant::VerifyGreedy));
+
+    // A prompt is served from its prefill bucket.
+    let bucket = runner
+        .prepare_inputs(&prefill(Variant::PrefillGreedy))
+        .unwrap();
+    assert_eq!(bucket, Bucket::prefill(4, 8, Variant::PrefillGreedy));
+
+    // More drafts than the deployment verifies, and prompt rows beside verifications.
+    let mut long = verification(0.0);
+    long.columns.rows.calls.truncate(1);
+    long.columns.rows.seq_lens = vec![15];
+    long.columns.rows.query_offsets = vec![0, 5];
+    long.columns.rows.logits_rows.truncate(1);
+    long.columns.slots.truncate(1);
+    long.columns.parameters.truncate(PARAMETER_COLUMNS as usize);
+    long.columns.draws.truncate(1);
+    long.columns.commit = commit(&[(2, mode::VERIFY, 0)]);
+    long.columns.drafts.truncate(1);
+    long.calls.truncate(1);
+    let message = runner.prepare_inputs(&long).unwrap_err().to_string();
+    assert!(message.contains("carries 4 drafts"), "{message}");
+
+    let mut mixed = verification(0.0);
+    mixed.columns.rows.calls[1].kind = RowKind::Prefill;
+    let message = runner.prepare_inputs(&mixed).unwrap_err().to_string();
+    assert!(message.contains("mixes prompt rows"), "{message}");
+
+    // A verification's token rows share their request's pages: it has no paired forward.
+    assert!(matches!(
+        runner.prepare_shadow_inputs(&verification(0.0)),
+        Err(Error::Unsupported(_))
+    ));
+
+    // Graphs that hold no device replay nothing: the step is refused at its replay, after
+    // both graphs' columns were padded.
+    let refused = runner.execute(&verification(0.0)).unwrap_err();
+    assert!(matches!(refused, Error::State(_)), "{refused}");
+}
+
+#[test]
+fn speculation_is_refused_where_the_runner_does_not_serve_it() {
+    // A config that states drafts for a model that loaded no drafter, or without the draft
+    // pool of its cache.
+    let build = |model: Tiny, config: CausalLmConfig| {
+        let graphs = Graphs::meta(
+            Arc::new(Generation::new(0, [])),
+            CausalLmRunner::input_bytes(&config)?,
+        );
+        let pooled = meta((SLOTS as usize + 1, TABLE_WIDTH), DType::U32);
+
+        CausalLmRunner::new(
+            Arc::new(model),
+            config,
+            graphs,
+            None,
+            vec![group(PAGES, pooled)],
+            None,
+        )
+    };
+    let refused = build(Tiny::new(false), speculating_config()).err().unwrap();
+    assert!(
+        refused.to_string().contains("loaded no drafter"),
+        "{refused}"
+    );
+
+    let unpooled = CausalLmConfig {
+        draft_pool: None,
+        ..speculating_config()
+    };
+    assert!(matches!(
+        build(Tiny::drafting(false), unpooled),
+        Err(Error::Invalid(_))
+    ));
+
+    // A runner whose config states no drafts is lent no draft cache.
+    assert!(runner(false).set_draft_cache(draft_cache(), None).is_err());
+
+    // Experts split across ranks.
+    let groups = host_groups(2);
+    let (inbox, _outbox) = crossbeam_channel::unbounded();
+    let refused = speculating(false)
+        .join_union(member(&groups[0], 0, deliver(inbox)))
+        .unwrap_err();
+    assert!(matches!(refused, Error::Unsupported(_)), "{refused}");
+
+    // A refill of the draft cache of a model that keeps a recurrent state.
+    let mut stateful = speculating(true);
+    let mut refill = prefill(Variant::PrefillWrite);
+    refill.columns.rows.logits_rows = vec![-1, -1];
+    refill.columns.commit = commit(&[(2, mode::CACHE, -1), (4, mode::CACHE, -1)]);
+    refill.columns.checkpoints = vec![0, 0];
+    refill.columns.drafts = vec![
+        DraftWork {
+            refill: Some(0),
+            lookahead: Some(9),
+            ..DraftWork::default()
+        },
+        DraftWork::default(),
+    ];
+    let refused = stateful.prepare_inputs(&refill).unwrap_err();
+    assert!(matches!(refused, Error::Unsupported(_)), "{refused}");
+}
+
+#[test]
+fn a_draft_page_is_read_as_runs_of_the_pool_s_pages() {
+    // Draft pages of 512 tokens in eight runs of 64, in a pool of 100 units.
+    let pool = DraftPool {
+        group: 1,
+        span: 8,
+        page: 64,
+        units: 100,
+    };
+    assert_eq!(pool.width(2048), 32);
+
+    // A table from draft page 2 that holds unit 7 there and none for page 3.
+    let units = [7, 0];
+
+    // Position 1100 is draft page 2, run 1, offset 12: run 1 of unit 7 is page 107.
+    assert_eq!(pool.slot(2, &units, 1100), 107 * 64 + 12);
+
+    // Page 3 holds no unit, and neither does a page before the table's first: nothing is
+    // written there.
+    assert_eq!(pool.slot(2, &units, 1600), NO_SLOT);
+    assert_eq!(pool.slot(2, &units, 10), NO_SLOT);
+
+    // A row names each run of a draft page it holds, and the padding unit's elsewhere.
+    let mut row = Vec::new();
+    pool.row(2, &units, 18, &mut row);
+    assert_eq!(row[16..18], [7, 100 + 7]);
+    assert_eq!(row[..2], [0, 100]);
+}
+
+#[test]
+fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
+    let (heads, dim) = (HEADS as u32, DIM as u32);
+    let dtype = ipc::PrefixCacheDtype::BFloat16;
+    let layout = CacheLayout::hybrid(PAGE, 1, heads, dim, dtype, &state_shape())
+        .and_then(|layout| layout.with_draft(1, heads, dim))
+        .unwrap();
+    let cache_config = KvCacheConfig {
+        layout: Arc::new(layout),
+        ..cache_config(true)
+    };
+
+    let cache = Arc::new(Mutex::new(
+        KvCacheMemory::meta(cache_config.clone()).unwrap(),
+    ));
+    let pool = DraftPool::of(&cache_config.layout, cache_config.units).unwrap();
+    assert_eq!(pool.units, PAGES as u32);
+    assert_eq!(Some(pool.group as usize), cache_config.layout.draft_group());
+
+    let config = CausalLmConfig {
+        drafts: DRAFTS,
+        draft_pool: Some(pool),
+        ..config()
+    };
+    let state = |trail: u32| {
+        StateMemory::meta(
+            StateConfig {
+                shape: state_shape(),
+                slots: SLOTS,
+                rows: 4,
+                trail,
+            },
+            &cache_config,
+        )
+        .unwrap()
+    };
+    let over = |config: CausalLmConfig, state: &StateMemory| {
+        let graphs = Graphs::meta(
+            Arc::new(Generation::new(0, [])),
+            CausalLmRunner::input_bytes(&config)?,
+        );
+        let model = Arc::new(Tiny::drafting(true));
+
+        CausalLmRunner::over(model, config, graphs, None, &lock(&cache), Some(state))
+    };
+
+    // The runner is lent the draft group's planes and the state's trail, and captures its
+    // verification and drafter buckets over them.
+    let mut runner = over(config.clone(), &state(12)).unwrap();
+    runner.graphs().profile_run(&runner).unwrap();
+    for bucket in runner.buckets() {
+        runner.graphs().capture(&runner, &bucket).unwrap();
+    }
+    assert_eq!(runner.graphs().buckets().len(), 16);
+
+    // A state opened with no trail, or with one shorter than a verification, verifies
+    // nothing; neither does a config that states another draft pool than the cache's.
+    assert!(over(config.clone(), &state(0)).is_err());
+    assert!(over(config.clone(), &state(11)).is_err());
+    let moved = CausalLmConfig {
+        draft_pool: Some(DraftPool {
+            units: pool.units + 1,
+            ..pool
+        }),
+        ..config
+    };
+    assert!(over(moved, &state(12)).is_err());
+
+    // A slot's draft pages are the ones the scheduler installed for it.
+    let mut pages = wiring::draft_pages(Arc::clone(&cache));
+    assert_eq!(pages(2), None);
+
+    let installed = ipc::BlockTable {
+        request_pool_idx: 2,
+        group_id: pool.group,
+        start_page: 0,
+        unit_ids: vec![ipc::UnitId(3)],
+        allocated_tokens: pool.page * pool.span,
+    };
+    lock(&cache).install(&[installed], None).unwrap();
+    assert_eq!(pages(2), Some((0, vec![3])));
+    runner.set_draft_pages(pages);
 }

@@ -77,11 +77,22 @@
 //! by a join batch (`Variant::ExpertJoin`) and replays the join bucket, the expert layers
 //! alone. Everything of a step that can refuse the batch is done before the agreement: once
 //! a step is agreed, every member launches it, or the others wait on their devices.
+//!
+//! ## Speculation
+//!
+//! A runner whose config states drafts speculates with its model's drafter ([`speculation`]).
+//! Its decode buckets are verification buckets, and every prefill and verification bucket has
+//! the drafter's bucket of its rows and tokens beside it. A step replays two graphs back to
+//! back: the batch's own, which for a verification samples every token, accepts the drafts
+//! its samples agree with and commits them, and the drafter's, which writes the draft cache
+//! and proposes each row's next drafts. Nothing is read back between them: what the second
+//! graph and the completion read of the first is kept in the runner's memory.
 
 mod columns;
 pub mod experts;
 mod output;
 mod slots;
+pub mod speculation;
 pub mod wiring;
 
 #[cfg(test)]
@@ -91,7 +102,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ipc::execution::{Batch, BatchOutput, RowKind, Variant};
+use ipc::execution::{Batch, BatchOutput, RowKind, Shape as BatchShape, Variant};
 use ipc::{PhaseId, TimingCounters};
 use nn::family::TextModel;
 use nn::{KvCache, PhaseKind, RecurrentState, TokenBatch};
@@ -103,6 +114,7 @@ use uniserve_tensor::{DType, Shape, Tensor};
 use self::columns::{Column, Layout};
 use self::experts::Member;
 use self::slots::Slots;
+use self::speculation::{DraftPages, DraftPool, Kept, Speculation};
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
 use crate::runner::Runner;
@@ -136,6 +148,13 @@ pub struct CausalLmConfig {
     /// The pages each row of a paired forward addresses in the scratch page set, and zero for
     /// a runner that computes no paired forward. A row whose tokens lie past them is refused.
     pub scratch_pages: u32,
+    /// The drafts a verification holds at most (`speculative_config.num_draft_tokens`), and
+    /// zero for a runner that speculates nothing. A runner that states some serves its decode
+    /// steps as verifications and runs its model's drafter behind every step.
+    pub drafts: u32,
+    /// How the draft cache lies in the cache's unit pool ([`DraftPool::of`]): stated exactly
+    /// when `drafts` is above zero.
+    pub draft_pool: Option<DraftPool>,
 }
 
 /// Which part of a batch's page work the rank's cache issues.
@@ -193,6 +212,9 @@ pub struct CausalLmRunner {
     /// This rank's member of the expert union, for a model whose experts are split across
     /// ranks.
     union: Option<Member>,
+    /// What a runner that speculates holds beside its sampler: the draft cache it is lent,
+    /// the selection of its verifications and what its forwards keep.
+    speculation: Option<Speculation>,
     /// The stream the graphs replay on; `None` for graphs that hold no device.
     stream: Option<Stream>,
     /// The bytes of the input block of the step being prepared: a batch's columns are padded
@@ -208,7 +230,31 @@ impl CausalLmRunner {
     ///
     /// [`Error::Invalid`] for a config with no bucket.
     pub fn input_bytes(config: &CausalLmConfig) -> Result<u64> {
-        Ok(Layout::of(config.buckets.iter())?.bytes())
+        Ok(stated(config)?.1.bytes())
+    }
+
+    /// The bytes of device memory a runner that speculates keeps its target forwards' outputs
+    /// in, for a model of `hidden`-wide rows of `dtype`: each bucket's chosen tokens and
+    /// scores and the hidden rows of the largest, which the drafter's forward reads. Zero for
+    /// a config that states no drafts.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a config with no bucket, or one that states drafts and no draft
+    /// pool.
+    pub fn kept_bytes(config: &CausalLmConfig, hidden: u32, dtype: DType) -> Result<u64> {
+        if config.drafts == 0 {
+            return Ok(0);
+        }
+        let layout = stated(config)?.1;
+
+        Kept::bytes(
+            layout.rows(),
+            layout.tokens(),
+            config.candidates,
+            hidden,
+            dtype,
+        )
     }
 
     /// The bytes of device memory the request slots' state takes for `config` over a
@@ -219,7 +265,7 @@ impl CausalLmRunner {
     ///
     /// [`Error::Invalid`] for a config with no bucket.
     pub fn slot_bytes(config: &CausalLmConfig, vocabulary: u32) -> Result<u64> {
-        let layout = Layout::of(config.buckets.iter())?;
+        let layout = stated(config)?.1;
 
         Ok(Slots::bytes(
             config.slots,
@@ -250,8 +296,9 @@ impl CausalLmRunner {
     ///
     /// [`Error::Invalid`] for a bucket that is no causal forward, input tensors `graphs` do
     /// not hold, a stream without a device or the reverse, a cache that is not the model's
-    /// layers over `config`'s page size and slots, or a state that is not the model's; the
-    /// refusals of the slot state's allocation and of the sampler.
+    /// layers over `config`'s page size and slots, a state that is not the model's, or a
+    /// config that states drafts for a model that loaded no drafter or without the draft pool
+    /// of its cache; the refusals of the slot state's allocation and of the sampler.
     pub fn new(
         model: Arc<dyn TextModel>,
         config: CausalLmConfig,
@@ -263,7 +310,7 @@ impl CausalLmRunner {
         for bucket in config.buckets.iter() {
             bucket.causal_lm()?;
         }
-        let layout = Layout::of(config.buckets.iter())?;
+        let (buckets, layout) = stated(&config)?;
 
         if graphs.enter().is_ok() != stream.is_some() {
             return Err(Error::Invalid(
@@ -297,8 +344,48 @@ impl CausalLmRunner {
             slots.bias().clone(),
         )?;
 
+        let speculation = match config.draft_pool {
+            Some(pool) if config.drafts > 0 => {
+                if model.drafter().is_none() {
+                    return Err(Error::Invalid(
+                        "the deployment speculates and its model loaded no drafter".into(),
+                    ));
+                }
+
+                // A verification's rows count the drafts before the position they sample.
+                let verifier = Sampler::new(
+                    SamplerConfig {
+                        extras: config.drafts,
+                        ..*sampler.config()
+                    },
+                    slots.counts().clone(),
+                    slots.bias().clone(),
+                )?;
+                let kept = Kept::new(
+                    stream.as_ref(),
+                    layout.rows(),
+                    layout.tokens(),
+                    config.candidates,
+                    model.hidden(),
+                    model.dtype(),
+                )?;
+
+                Some(Speculation {
+                    drafts: config.drafts,
+                    pool,
+                    kept,
+                    verifier,
+                    draft: None,
+                    trail: None,
+                    pages: None,
+                })
+            }
+            _ => None,
+        };
+
         let runner = Self {
-            buckets: config.buckets.clone(),
+            buckets,
+            speculation,
             model,
             config,
             graphs,
@@ -324,6 +411,82 @@ impl CausalLmRunner {
             )));
         }
         Ok(runner)
+    }
+
+    /// Lends a runner that speculates the draft cache its drafter's forwards compute over,
+    /// and the trail of the recurrent state when its model keeps one.
+    ///
+    /// - `draft` is the draft group as the rank's cache lends it: the drafter's planes, pages
+    ///   of the draft pool's page size, and the workspace. Its `block_tables` is not read: a
+    ///   forward states each row's pages as an input column.
+    /// - `trail` is the trail buffers of the recurrent state, in the layout of
+    ///   `nn::RecurrentState::trail`, with a row for each token of the largest verification
+    ///   bucket.
+    ///
+    /// The caller keeps their memory as it keeps the cache's and the state's.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a runner that speculates nothing, a draft cache that is not the
+    /// drafter's layers over the draft pool's pages, or a trail that is not the model's
+    /// recurrent state over the tokens of a verification.
+    pub fn set_draft_cache(&mut self, draft: KvCache, trail: Option<StateBuffers>) -> Result<()> {
+        let layers = self.model.drafter().map(|drafter| drafter.cache().layers);
+        let Some(speculation) = self.speculation.as_mut() else {
+            return Err(Error::Invalid(
+                "a draft cache lent to a runner whose config states no drafts".into(),
+            ));
+        };
+
+        if Some(draft.layers.len() as u32) != layers || draft.page_size != speculation.pool.page {
+            return Err(Error::Invalid(format!(
+                "a draft cache of {} layers over pages of {} tokens, and the drafter's {layers:?} \
+                 layers read pages of {}",
+                draft.layers.len(),
+                draft.page_size,
+                speculation.pool.page
+            )));
+        }
+
+        // The trail holds the state after every token of the largest verification.
+        let tokens = self
+            .buckets
+            .iter()
+            .filter(|bucket| verifies(bucket.variant))
+            .map(|bucket| bucket.tokens as usize)
+            .max()
+            .unwrap_or(0);
+        let fields = self.model.state().map(|shape| shape.fields.len());
+        let trailed = match (&trail, fields) {
+            (None, None) => true,
+            (Some(trail), Some(fields)) => trail.iter().all(|layer| {
+                layer.len() == fields
+                    && layer
+                        .iter()
+                        .all(|field| field.dims().first().is_some_and(|rows| *rows >= tokens))
+            }),
+            _ => false,
+        };
+        if !trailed {
+            return Err(Error::Invalid(format!(
+                "a verification of a model that keeps a recurrent state keeps a trail of its \
+                 {tokens} tokens for every field, and a model that keeps none is lent none"
+            )));
+        }
+
+        speculation.draft = Some(draft);
+        speculation.trail = trail;
+        Ok(())
+    }
+
+    /// Sets what states a request slot's installed pages of the draft group
+    /// ([`DraftPages`]): what each drafter row's page table is built from. A runner given
+    /// none reads the tables its batches carry alone. A runner that speculates nothing
+    /// ignores it.
+    pub fn set_draft_pages(&mut self, pages: DraftPages) {
+        if let Some(speculation) = self.speculation.as_mut() {
+            speculation.pages = Some(pages);
+        }
     }
 
     /// Sets what issues a batch's page work on the runner's stream.
@@ -354,8 +517,14 @@ impl CausalLmRunner {
     /// # Errors
     ///
     /// [`Error::Invalid`] for a model that splits no experts, a member whose largest step is
-    /// smaller than the runner's largest bucket, or a runner that holds captured graphs.
+    /// smaller than the runner's largest bucket, or a runner that holds captured graphs;
+    /// [`Error::Unsupported`] for a runner that speculates.
     pub fn join_union(&mut self, member: Member) -> Result<()> {
+        if self.speculation.is_some() {
+            return Err(Error::Unsupported(
+                "speculative decoding of a model whose experts are split across ranks".into(),
+            ));
+        }
         let (_, tokens) = self.config.buckets.bounds();
         if self.model.experts().is_none() || member.capacity() < tokens {
             return Err(Error::Invalid(format!(
@@ -409,6 +578,7 @@ impl CausalLmRunner {
     /// cache's groups and layers over the config's page size and scratch pages.
     pub fn set_scratch(&mut self, scratch: Vec<KvCache>) -> Result<()> {
         let pages = self.config.scratch_pages as usize;
+        let rows = self.scratch_rows() as usize;
         let same_groups = scratch.len() == self.cache.len()
             && scratch
                 .iter()
@@ -419,7 +589,7 @@ impl CausalLmRunner {
             let table = &group.block_tables;
 
             table.rank() == 2
-                && table.dims()[0] >= self.layout.rows()
+                && table.dims()[0] >= rows
                 && table.dims()[1] == pages
                 && table.dtype() == DType::U32
                 && group.page_size == self.config.page_size
@@ -427,15 +597,20 @@ impl CausalLmRunner {
         if pages == 0 || !same_groups || !tabled {
             return Err(Error::Invalid(format!(
                 "a scratch page set of {} groups for a cache of {}, whose tables are not u32 \
-                 rows of {pages} pages for the {} rows of the largest bucket",
+                 rows of {pages} pages for the {rows} rows of the largest bucket",
                 scratch.len(),
-                self.cache.len(),
-                self.layout.rows()
+                self.cache.len()
             )));
         }
 
         self.scratch = scratch;
         Ok(())
+    }
+
+    /// The rows of a paired forward: those of the largest bucket whose rows are sequences. A
+    /// verification's token rows share their request's pages and have no paired forward.
+    pub(crate) fn scratch_rows(&self) -> u32 {
+        self.config.buckets.bounds().0
     }
 
     /// The runner's config.
@@ -492,35 +667,120 @@ impl CausalLmRunner {
                 batch.id.0
             )));
         }
-        let verifies = columns
-            .rows
-            .calls
-            .iter()
-            .any(|call| call.kind == RowKind::Verify);
-        if verifies || !columns.drafts.is_empty() {
-            return Err(Error::Unsupported(format!(
-                "batch {} verifies or drafts tokens, and this runner speculates nothing",
-                batch.id.0
-            )));
-        }
+        let verify = match &self.speculation {
+            Some(speculation) => {
+                let refills = columns.drafts.iter().any(|work| work.refill.is_some());
+                if refills && self.state.is_some() {
+                    return Err(Error::Unsupported(format!(
+                        "batch {} refills the draft cache of a model that keeps a recurrent \
+                         state, which needs a scratch state for each refill row",
+                        batch.id.0
+                    )));
+                }
+                speculation::verifies(columns, speculation.drafts)?
+            }
+            None => {
+                let verifies = columns
+                    .rows
+                    .calls
+                    .iter()
+                    .any(|call| call.kind == RowKind::Verify);
+                if verifies || !columns.drafts.is_empty() {
+                    return Err(Error::Unsupported(format!(
+                        "batch {} verifies or drafts tokens, and this runner's config states no \
+                         drafts",
+                        batch.id.0
+                    )));
+                }
+                false
+            }
+        };
 
         refuse_drawn_rows(&shape.variant, &columns.parameters)?;
 
+        // A verification is served from the verification bucket of its selection, whether its
+        // batch states a decode's shape or a verification's.
+        let shape = if verify {
+            let stated = matches!(
+                shape.variant,
+                Variant::DecodeGreedy | Variant::DecodeSampled
+            ) || verifies(shape.variant);
+            if !stated {
+                return Err(Error::Invalid(format!(
+                    "batch {} verifies drafts and states the shape {shape}",
+                    batch.id.0
+                )));
+            }
+
+            BatchShape::prefill(
+                columns.calls() as u32,
+                columns.tokens() as u32,
+                match shape.variant.greedy() {
+                    true => Variant::VerifyGreedy,
+                    false => Variant::VerifySampled,
+                },
+            )
+        } else {
+            shape
+        };
+
         self.graphs
             .select(|bucket| bucket.holds(&shape))
-            .ok_or_else(|| match self.config.buckets.select(&shape) {
-                Some(bucket) => Error::State(match bucket.variant.is_decode() {
-                    true => "a decode bucket that holds the batch is not captured",
-                    false => "a prefill bucket that holds the batch is not captured",
-                }),
-                None => {
-                    let (rows, tokens) = self.config.buckets.bounds();
-                    Error::Invalid(format!(
-                        "no bucket holds {shape}: the runner's buckets top at {rows} rows and \
-                         {tokens} tokens, and a batch past that bound is admitted as smaller ones"
-                    ))
+            .ok_or_else(|| {
+                let stated = self.config.buckets.with_drafts(self.config.drafts);
+
+                match stated.select(&shape) {
+                    Some(bucket) if verifies(bucket.variant) => {
+                        Error::State("a verification bucket that holds the batch is not captured")
+                    }
+                    Some(bucket) => Error::State(match bucket.variant.is_decode() {
+                        true => "a decode bucket that holds the batch is not captured",
+                        false => "a prefill bucket that holds the batch is not captured",
+                    }),
+                    None => {
+                        let (rows, tokens) = stated.bounds();
+                        Error::Invalid(format!(
+                            "no bucket holds {shape}: the runner's buckets top at {rows} rows \
+                             and {tokens} tokens, and a batch past that bound is admitted as \
+                             smaller ones"
+                        ))
+                    }
                 }
             })
+    }
+
+    /// The installed draft pages of each row of `batch`, `(first page, units)` in row order:
+    /// the table the batch itself carries for the row's slot, or the one the cache holds.
+    fn draft_tables(&mut self, batch: &Batch) -> Vec<(u32, Vec<u32>)> {
+        let Some(speculation) = self.speculation.as_mut() else {
+            return Vec::new();
+        };
+        let group = speculation.pool.group;
+
+        let mut tables = Vec::with_capacity(batch.columns.slots.len());
+        for held in &batch.columns.slots {
+            let Some(slot) = u32::try_from(*held).ok().filter(|slot| *slot > 0) else {
+                tables.push((0, Vec::new()));
+                continue;
+            };
+
+            let carried = batch
+                .block_tables
+                .iter()
+                .find(|table| table.request_pool_idx == slot && table.group_id == group)
+                .map(|table| {
+                    let units = table.unit_ids.iter().map(|unit| unit.0).collect();
+                    (table.start_page, units)
+                });
+            let installed = match (carried, speculation.pages.as_mut()) {
+                (Some(carried), _) => Some(carried),
+                (None, Some(pages)) => pages(slot),
+                (None, None) => None,
+            };
+
+            tables.push(installed.unwrap_or_default());
+        }
+        tables
     }
 
     /// Prepares the inputs of a step of `batch` in `bucket`: its padded columns, and the host
@@ -530,20 +790,61 @@ impl CausalLmRunner {
         self.prepare_staged(bucket)
     }
 
-    /// Pads `batch`'s columns to `bucket` in the runner's own bytes of the input block. The
-    /// columns of a bucket are those of every capacity class of it.
-    fn stage(&mut self, batch: &Batch, bucket: &Bucket, scratch: Option<&[u32]>) -> Result<()> {
+    /// Pads `batch`'s columns to `bucket` in the runner's own bytes of the input block, and
+    /// returns the ban masks of the step's sampling rows (`sampler::adjustments`), empty for
+    /// a step that bans nothing. The columns of a bucket are those of every capacity class of
+    /// it. A runner that speculates also pads the columns of the drafter's forward behind the
+    /// bucket, which lie in the same block.
+    fn stage(
+        &mut self,
+        batch: &Batch,
+        bucket: &Bucket,
+        scratch: Option<&[u32]>,
+    ) -> Result<Vec<u32>> {
         self.staged.resize(self.layout.bytes() as usize, 0);
+        let vocabulary = self.model.vocabulary();
+        let verify = verifies(bucket.variant);
 
-        columns::fill(
-            &self.layout,
-            self.config.slots,
-            self.model.vocabulary(),
-            &batch.columns,
-            bucket,
-            scratch,
-            &mut self.staged,
-        )
+        let masks = if verify {
+            // Each token of a verification is a sampling row.
+            let rows = speculation::token_rows(&batch.columns);
+
+            speculation::fill_verification(
+                &self.layout,
+                self.config.slots,
+                vocabulary,
+                &batch.columns,
+                &rows,
+                bucket,
+                &mut self.staged,
+            )?;
+            sampler::adjustments(&rows.adjustments, bucket.tokens as usize, vocabulary)?.1
+        } else {
+            columns::fill(
+                &self.layout,
+                self.config.slots,
+                vocabulary,
+                &batch.columns,
+                bucket,
+                scratch,
+                &mut self.staged,
+            )?;
+            sampler::adjustments(&batch.columns.adjustments, bucket.rows as usize, vocabulary)?.1
+        };
+
+        let tables = self.draft_tables(batch);
+        if let Some(speculation) = &self.speculation {
+            speculation::fill_drafter(
+                &self.layout,
+                &speculation.pool,
+                vocabulary,
+                &batch.columns,
+                &tables,
+                bucket,
+                &mut self.staged,
+            )?;
+        }
+        Ok(masks)
     }
 
     /// Prepares the step of `bucket` over the staged columns: they are written into the input
@@ -673,6 +974,14 @@ impl Runner for CausalLmRunner {
             return Err(Error::Invariant(format!(
                 "bucket {bucket} is none the runner states"
             )));
+        }
+
+        // A runner that speculates states the verification buckets and the drafter's.
+        if verifies(bucket.variant) {
+            return self.forward_verification(bucket);
+        }
+        if bucket.variant == Variant::Draft {
+            return self.forward_drafter(bucket);
         }
 
         // A member of an expert union is lent the exchange of the bucket's capacity class. Its
@@ -827,16 +1136,49 @@ impl Runner for CausalLmRunner {
         let logical = self.slots.logical().index_select(&call_slots, 0)?;
         let sampling = self.slots.sampling().index_select(&call_slots, 0)?;
 
-        // The order `output` states.
-        let mut outputs = Vec::with_capacity(12);
+        // The order `output` states, each entry with its place among the kept tensors.
         let mut scores = scores.into_iter();
-        outputs.push(chosen);
-        outputs.extend(scores.by_ref().take(2));
-        outputs.extend([logical, sampling]);
-        outputs.extend(scores);
-        outputs.extend(valid);
-        outputs.extend(prompt);
-        Ok(outputs)
+        let mut outputs = vec![(speculation::CHOSEN, chosen)];
+
+        outputs.extend(
+            [speculation::LOGPROBS, speculation::RANKS]
+                .into_iter()
+                .zip(scores.by_ref()),
+        );
+        outputs.extend([
+            (speculation::LOGICAL, logical),
+            (speculation::SAMPLING, sampling),
+        ]);
+        outputs.extend(
+            [speculation::TOP_VALUES, speculation::TOP_IDS]
+                .into_iter()
+                .zip(scores),
+        );
+        outputs.extend(valid.map(|valid| (speculation::VALID, valid)));
+        outputs.extend(
+            [
+                speculation::PROMPT_LOGPROBS,
+                speculation::PROMPT_RANKS,
+                speculation::PROMPT_VALUES,
+                speculation::PROMPT_IDS,
+            ]
+            .into_iter()
+            .zip(prompt),
+        );
+
+        // The drafter's forward follows this one and takes the allocator's memory again: a
+        // runner that speculates keeps the outputs and the hidden rows in its own.
+        match &self.speculation {
+            Some(speculation) => {
+                speculation.kept.keep(speculation::HIDDEN, &hidden)?;
+
+                outputs
+                    .into_iter()
+                    .map(|(entry, output)| speculation.kept.keep(entry, &output))
+                    .collect()
+            }
+            None => Ok(outputs.into_iter().map(|(_, output)| output).collect()),
+        }
     }
 
     fn idle_inputs(&self, bucket: &Bucket, columns: &mut [u8]) -> Result<()> {
@@ -854,16 +1196,53 @@ impl Runner for CausalLmRunner {
         // An idle step is a serving step's forward: what a capture records.
         self.paired.set(false);
 
-        let idle = columns::idle(bucket, self.config.page_size, self.config.max_kv_len);
+        let vocabulary = self.model.vocabulary();
+        let (page_size, max_kv_len) = (self.config.page_size, self.config.max_kv_len);
+
+        if verifies(bucket.variant) {
+            let idle =
+                speculation::idle_verification(bucket, self.config.drafts, page_size, max_kv_len);
+
+            return speculation::fill_verification(
+                &self.layout,
+                self.config.slots,
+                vocabulary,
+                &idle,
+                &speculation::token_rows(&idle),
+                bucket,
+                columns,
+            );
+        }
+
+        // The drafter's idle step follows an idle prefill of its rows and tokens: entries that
+        // write no page of the draft cache, and rows that propose nothing.
+        let target = match bucket.variant {
+            Variant::Draft => Bucket::prefill(bucket.rows, bucket.tokens, Variant::PrefillWrite),
+            _ => *bucket,
+        };
+        let idle = columns::idle(&target, page_size, max_kv_len);
         columns::fill(
             &self.layout,
             self.config.slots,
-            self.model.vocabulary(),
+            vocabulary,
             &idle,
-            bucket,
+            &target,
             None,
             columns,
-        )
+        )?;
+
+        match &self.speculation {
+            Some(speculation) if bucket.variant == Variant::Draft => speculation::fill_drafter(
+                &self.layout,
+                &speculation.pool,
+                vocabulary,
+                &idle,
+                &[],
+                bucket,
+                columns,
+            ),
+            _ => Ok(()),
+        }
     }
 
     fn prepare_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
@@ -888,9 +1267,9 @@ impl Runner for CausalLmRunner {
     ///
     /// As [`Runner::prepare_inputs`]; [`Error::Unsupported`] for a model that keeps a
     /// recurrent state, which has no scratch state to advance, for a member of an expert
-    /// union, whose exchange launches wait for the other members', and for a runner that was
-    /// lent no scratch page set; [`Error::Invalid`] for a row whose tokens lie past its
-    /// scratch pages.
+    /// union, whose exchange launches wait for the other members', for a verification, and
+    /// for a runner that was lent no scratch page set; [`Error::Invalid`] for a row whose
+    /// tokens lie past its scratch pages.
     fn prepare_shadow_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
         if self.union.is_some() {
             return Err(Error::Unsupported(
@@ -912,6 +1291,13 @@ impl Runner for CausalLmRunner {
             ));
         }
         let bucket = self.choose(batch)?;
+        if verifies(bucket.variant) {
+            return Err(Error::Unsupported(
+                "a paired forward of a verification: its token rows share one request's pages, \
+                 and the scratch page set gives each row its own"
+                    .into(),
+            ));
+        }
 
         let rows = &batch.columns.rows;
         let scratch = columns::scratch_column(
@@ -964,24 +1350,28 @@ impl Runner for CausalLmRunner {
         // Everything that can refuse the batch comes first: the choice of a bucket and the
         // padding of the columns.
         let base = self.choose(batch)?;
-        self.stage(batch, &base, None)?;
+        let verify = verifies(base.variant);
+
+        // A runner that speculates issues the drafter's graph behind the batch's own.
+        let drafter = match &self.speculation {
+            Some(_) => {
+                let drafter = Bucket::draft(base.rows, base.tokens);
+                if self.graphs.select(|held| *held == drafter).is_none() {
+                    return Err(Error::State(
+                        "the drafter's bucket behind the batch's is not captured",
+                    ));
+                }
+                Some(drafter)
+            }
+            None => None,
+        };
+        let masks = self.stage(batch, &base, None)?;
 
         // The slot state's writes, ahead of the replay that reads them.
         self.slots.begin()?;
         self.slots
             .start(&self.sampler, &batch.columns, base.variant.is_decode())?;
-        if batch
-            .columns
-            .adjustments
-            .banned
-            .iter()
-            .any(|row| !row.is_empty())
-        {
-            let (_, masks) = sampler::adjustments(
-                &batch.columns.adjustments,
-                base.rows as usize,
-                self.model.vocabulary(),
-            )?;
+        if !masks.is_empty() {
             self.slots.ban(&masks)?;
         }
 
@@ -1009,6 +1399,16 @@ impl Runner for CausalLmRunner {
         let launched = Instant::now();
         let outputs = self.graphs.replay(&bucket)?;
 
+        // The drafter's columns lie in the block the batch's graph was issued with, and its
+        // graph reads what that graph kept: the stream's order is their synchronization.
+        let proposals = match &drafter {
+            Some(drafter) => {
+                self.prepare_staged(drafter)?;
+                Some(self.graphs.replay(drafter)?)
+            }
+            None => None,
+        };
+
         if let (true, Some(hook)) = (work, self.page_work.as_mut()) {
             hook(batch, PageWork::AfterReplay)?;
         }
@@ -1020,13 +1420,32 @@ impl Runner for CausalLmRunner {
         // The read waits for the stream, and so for the copies issued behind the replay.
         let calls = {
             let _guard = self.graphs.enter()?;
-            output::calls_output(
-                batch,
-                &bucket,
-                self.model.vocabulary(),
-                self.config.candidates,
-                &outputs,
-            )?
+            let vocabulary = self.model.vocabulary();
+            let candidates = self.config.candidates;
+
+            let mut calls = if verify {
+                output::verification_output(
+                    &batch.calls,
+                    &batch.columns,
+                    &bucket,
+                    vocabulary,
+                    candidates,
+                    &outputs,
+                )?
+            } else {
+                output::calls_output(
+                    &batch.calls,
+                    &batch.columns,
+                    &bucket,
+                    vocabulary,
+                    candidates,
+                    &outputs,
+                )?
+            };
+            if let Some(proposals) = &proposals {
+                speculation::propose(batch, vocabulary, proposals, &mut calls)?;
+            }
+            calls
         };
 
         let host = launched.duration_since(started) + landed.elapsed();
@@ -1047,6 +1466,30 @@ impl Runner for CausalLmRunner {
     fn graphs(&self) -> &Graphs {
         &self.graphs
     }
+}
+
+/// The buckets a runner of `config` states outside an expert union, and the layout of its
+/// input tensors.
+fn stated(config: &CausalLmConfig) -> Result<(Buckets, Layout)> {
+    let buckets = config.buckets.with_drafts(config.drafts);
+
+    let pages = match (config.drafts, &config.draft_pool) {
+        (0, _) => 0,
+        (_, Some(pool)) => pool.width(config.max_kv_len),
+        (_, None) => {
+            return Err(Error::Invalid(
+                "a config that states drafts states the draft pool of its cache".into(),
+            ));
+        }
+    };
+    let layout = Layout::of(buckets.iter(), config.drafts, pages)?;
+
+    Ok((buckets, layout))
+}
+
+/// Whether a bucket of `variant` is a verification.
+const fn verifies(variant: Variant) -> bool {
+    matches!(variant, Variant::VerifyGreedy | Variant::VerifySampled)
 }
 
 /// The smallest captured capacity class of `bucket` that holds a step of `capacity` rows a

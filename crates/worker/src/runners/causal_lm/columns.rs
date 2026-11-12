@@ -34,6 +34,42 @@
 //! | [`Column::Points`] | I32 `[R]` | the span a verification accepted | `0` |
 //! | [`Column::LiveTokens`] | U32 `[1]` | the tokens the batch itself holds | |
 //!
+//! A runner that speculates lays out the columns of its verifications and of the drafter's
+//! forward behind them, which `speculation` states and fills. `D` is the drafts a verification
+//! holds at most and `W` the pages of a row of the drafter's page table; without speculation
+//! both are zero and the columns hold nothing. In a verification bucket the row columns above
+//! are one entry per token, each token being an attention row and a sampling row, and the
+//! columns below state its sequences.
+//!
+//! | Column | Type and extent | Holds | Padding entry |
+//! | --- | --- | --- | --- |
+//! | [`Column::StateOffsets`] | U32 `[R + 1]` | the packed token offsets of the batch's sequences | the batch's token count |
+//! | [`Column::StateLens`] | U32 `[R]` | the tokens each sequence has seen, its own included | `0` |
+//! | [`Column::StateSlots`] | U32 `[R]` | each sequence's request slot, as the recurrent state reads it | [`NO_SLOT`] |
+//! | [`Column::Drafts`] | U32 `[T]` | the draft each token's sample is compared with: the next token of its row | [`NO_SLOT`] |
+//! | [`Column::Extras`] | U32 `[T, D]` | the drafts before each token in its row, which its penalties count | [`NO_SLOT`] |
+//! | [`Column::Windows`] | U32 `[R, D + 1]` | the token of each row at each offset, its last one past its end | [`NO_SLOT`] |
+//! | [`Column::Firsts`] | U32 `[R]` | each row's first token | `0` |
+//! | [`Column::DraftTokens`] | U32 `[R, D]` | each row's drafts, the tokens its count tasks count | [`NO_SLOT`] |
+//! | [`Column::DraftSteps`] | U32 `[R, D]` | each draft's offset among its row's drafts | the offset |
+//! | [`Column::TokenCap`] | U32 `[T]` | the largest token of the vocabulary | the same |
+//! | [`Column::NextIds`] | U32 `[T]` | the token after each entry that the batch states | `0` |
+//! | [`Column::NextRows`] | U32 `[T]` | the sampling row whose token is the token after each entry | [`NO_SLOT`] |
+//! | [`Column::EntryRows`] | U32 `[T]` | the verification each entry belongs to | [`NO_SLOT`] |
+//! | [`Column::EntrySteps`] | U32 `[T]` | each entry's offset in its verification; `0` for an entry of a prompt, `1` for a token that is no entry | `1` |
+//! | [`Column::DraftSlots`] | U32 `[T]` | the draft cache slot each entry writes | [`NO_SLOT`] |
+//! | [`Column::NoSlots`] | U32 `[T]` | [`NO_SLOT`] | the same |
+//! | [`Column::DraftLens`] | U32 `[R]` | the keys visible to the last token of each drafter row | `0` |
+//! | [`Column::DraftTables`] | U32 `[R, W]` | each drafter row's pages of the draft cache | the padding unit's pages |
+//! | [`Column::LastEntries`] | U32 `[R]` | the last entry of each row a prompt states; a verification's first token | `0` |
+//! | [`Column::ProposalRows`] | U32 `[R]` | the verification each row is | [`NO_SLOT`] |
+//! | [`Column::ChainPositions`] | I32 `[D, R]` | the position each chained step of a row evaluates, before the drafts it accepted | `0` |
+//! | [`Column::ChainLens`] | U32 `[D, R]` | the keys visible to it | `0` |
+//! | [`Column::ChainSlots`] | U32 `[R, 3 D]` | the draft cache slots of the positions after a row's entries, then [`NO_SLOT`] | [`NO_SLOT`] |
+//! | [`Column::ChainIndex`] | U32 `[D, R]` | where each chained step of a row reads its slot in [`Column::ChainSlots`] | a [`NO_SLOT`] cell |
+//! | [`Column::ChainOffsets`] | U32 `[R + 1]` | the packed offsets of a chained step: one token a row | the batch's row count |
+//! | [`Column::LiveRows`] | U32 `[1]` | the rows the batch itself holds | |
+//!
 //! ## Indices
 //!
 //! The scheduler states indices as `i32` with `-1` for "none". On the device an index column
@@ -78,7 +114,7 @@
 //! in its own numbering ([`scratch_column`]), row `r` gathers row `r` of the scratch set's
 //! page table, and the commit table is inert.
 
-use ipc::execution::{BatchColumns, BatchRow, BatchRows, RowKind};
+use ipc::execution::{BatchColumns, BatchRow, BatchRows, RowKind, Variant};
 use ipc::philox::DrawAddress;
 use nn::NO_SLOT;
 use proto::module::commit::{COMMIT_FIELDS, column};
@@ -117,11 +153,37 @@ pub(crate) enum Column {
     Continuation,
     Points,
     LiveTokens,
+    StateOffsets,
+    StateLens,
+    StateSlots,
+    Drafts,
+    Extras,
+    Windows,
+    Firsts,
+    DraftTokens,
+    DraftSteps,
+    TokenCap,
+    NextIds,
+    NextRows,
+    EntryRows,
+    EntrySteps,
+    DraftSlots,
+    NoSlots,
+    DraftLens,
+    DraftTables,
+    LastEntries,
+    ProposalRows,
+    ChainPositions,
+    ChainLens,
+    ChainSlots,
+    ChainIndex,
+    ChainOffsets,
+    LiveRows,
 }
 
 impl Column {
     /// Every column, in the order the layout places them.
-    const ALL: [Self; 21] = [
+    const ALL: [Self; 47] = [
         Self::InputIds,
         Self::Positions,
         Self::SlotMapping,
@@ -143,14 +205,43 @@ impl Column {
         Self::Continuation,
         Self::Points,
         Self::LiveTokens,
+        Self::StateOffsets,
+        Self::StateLens,
+        Self::StateSlots,
+        Self::Drafts,
+        Self::Extras,
+        Self::Windows,
+        Self::Firsts,
+        Self::DraftTokens,
+        Self::DraftSteps,
+        Self::TokenCap,
+        Self::NextIds,
+        Self::NextRows,
+        Self::EntryRows,
+        Self::EntrySteps,
+        Self::DraftSlots,
+        Self::NoSlots,
+        Self::DraftLens,
+        Self::DraftTables,
+        Self::LastEntries,
+        Self::ProposalRows,
+        Self::ChainPositions,
+        Self::ChainLens,
+        Self::ChainSlots,
+        Self::ChainIndex,
+        Self::ChainOffsets,
+        Self::LiveRows,
     ];
 
     /// The element type of the column's tensor.
     pub(crate) const fn dtype(self) -> DType {
         match self {
-            Self::Positions | Self::Commit | Self::Valid | Self::Active | Self::Points => {
-                DType::I32
-            }
+            Self::Positions
+            | Self::Commit
+            | Self::Valid
+            | Self::Active
+            | Self::Points
+            | Self::ChainPositions => DType::I32,
             Self::Parameters | Self::Draws => DType::F32,
             Self::Continuation => DType::U8,
             _ => DType::U32,
@@ -165,15 +256,37 @@ impl Column {
         }
     }
 
-    /// The elements of the column in a layout of `rows` rows and `tokens` tokens.
-    const fn elements(self, rows: usize, tokens: usize) -> usize {
+    /// The elements of the column in a layout of `rows` rows and `tokens` tokens, for
+    /// verifications of at most `drafts` drafts and a drafter's page table of `pages` pages a
+    /// row.
+    const fn elements(self, rows: usize, tokens: usize, drafts: usize, pages: usize) -> usize {
         match self {
-            Self::InputIds | Self::Positions | Self::SlotMapping | Self::Targets => tokens,
-            Self::QueryOffsets => rows + 1,
+            Self::InputIds
+            | Self::Positions
+            | Self::SlotMapping
+            | Self::Targets
+            | Self::Drafts
+            | Self::NextIds
+            | Self::NextRows
+            | Self::EntryRows
+            | Self::EntrySteps
+            | Self::DraftSlots
+            | Self::NoSlots
+            | Self::TokenCap => tokens,
+            Self::QueryOffsets | Self::StateOffsets | Self::ChainOffsets => rows + 1,
             Self::Parameters => rows * PARAMETER_COLUMNS as usize,
             Self::Adjustments => rows * 2,
             Self::Commit => rows * COMMIT_FIELDS,
-            Self::LiveTokens => 1,
+            Self::LiveTokens | Self::LiveRows => 1,
+            Self::Extras => tokens * drafts,
+            Self::Windows => rows * (drafts + 1),
+            Self::DraftTokens
+            | Self::DraftSteps
+            | Self::ChainPositions
+            | Self::ChainLens
+            | Self::ChainIndex => rows * drafts,
+            Self::ChainSlots => rows * 3 * drafts,
+            Self::DraftTables => rows * pages,
             _ => rows,
         }
     }
@@ -189,6 +302,10 @@ pub(crate) struct Layout {
     rows: usize,
     /// The tokens a token column holds.
     tokens: usize,
+    /// The drafts a verification holds at most; zero for a runner that speculates nothing.
+    drafts: usize,
+    /// The pages of a row of the drafter's page table; zero without speculation.
+    pages: usize,
     /// Each column's offset in the block, in the order of [`Column::ALL`].
     offsets: [u64; Column::ALL.len()],
     /// The bytes of the block.
@@ -196,35 +313,51 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    /// The layout of columns of `rows` rows and `tokens` tokens.
-    pub(crate) fn new(rows: usize, tokens: usize) -> Self {
+    /// The layout of columns of `rows` rows and `tokens` tokens, for verifications of at most
+    /// `drafts` drafts and a drafter's page table of `pages` pages a row.
+    pub(crate) fn new(rows: usize, tokens: usize, drafts: usize, pages: usize) -> Self {
         let mut offsets = [0; Column::ALL.len()];
         let mut bytes = 0_u64;
 
         for (offset, column) in offsets.iter_mut().zip(Column::ALL) {
             *offset = bytes;
 
-            let length = column.elements(rows, tokens) as u64 * column.element();
-            bytes += length.next_multiple_of(ALIGNMENT);
+            let elements = column.elements(rows, tokens, drafts, pages) as u64;
+            bytes += (elements * column.element()).next_multiple_of(ALIGNMENT);
         }
 
         Self {
             rows,
             tokens,
+            drafts,
+            pages,
             offsets,
             bytes,
         }
     }
 
-    /// The layout that holds every bucket of `buckets`.
+    /// The layout that holds every bucket of `buckets`, for verifications of at most `drafts`
+    /// drafts and a drafter's page table of `pages` pages a row.
+    ///
+    /// Each token of a verification is an attention row and a sampling row, so a verification
+    /// bucket's row columns hold its tokens.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for an empty set.
-    pub(crate) fn of<'a>(buckets: impl IntoIterator<Item = &'a Bucket>) -> Result<Self> {
+    pub(crate) fn of<'a>(
+        buckets: impl IntoIterator<Item = &'a Bucket>,
+        drafts: u32,
+        pages: u32,
+    ) -> Result<Self> {
         let (mut rows, mut tokens) = (0, 0);
         for bucket in buckets {
-            rows = rows.max(bucket.rows as usize);
+            let sampled = match bucket.variant {
+                Variant::VerifyGreedy | Variant::VerifySampled => bucket.tokens,
+                _ => bucket.rows,
+            };
+
+            rows = rows.max(sampled as usize);
             tokens = tokens.max(bucket.tokens as usize);
         }
 
@@ -233,7 +366,22 @@ impl Layout {
                 "a causal runner with no bucket has no input tensor to lay out".into(),
             ));
         }
-        Ok(Self::new(rows, tokens))
+        Ok(Self::new(rows, tokens, drafts as usize, pages as usize))
+    }
+
+    /// The tokens a token column holds.
+    pub(crate) const fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// The drafts a verification holds at most.
+    pub(crate) const fn drafts(&self) -> usize {
+        self.drafts
+    }
+
+    /// The pages of a row of the drafter's page table.
+    pub(crate) const fn pages(&self) -> usize {
+        self.pages
     }
 
     /// The rows a row column holds: the capacity of the commit table.
@@ -252,10 +400,16 @@ impl Layout {
     }
 
     /// Writes `values` at the head of `column` in `block`, the bytes of the input block.
-    fn put<T: bytemuck::Pod>(&self, block: &mut [u8], column: Column, values: &[T]) -> Result<()> {
+    pub(crate) fn put<T: bytemuck::Pod>(
+        &self,
+        block: &mut [u8],
+        column: Column,
+        values: &[T],
+    ) -> Result<()> {
         let source: &[u8] = bytemuck::cast_slice(values);
         let start = self.offset(column) as usize;
-        let capacity = column.elements(self.rows, self.tokens) * column.element() as usize;
+        let elements = column.elements(self.rows, self.tokens, self.drafts, self.pages);
+        let capacity = elements * column.element() as usize;
 
         if source.len() > capacity || start + source.len() > block.len() {
             return Err(Error::Invariant(format!(

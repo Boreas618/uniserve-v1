@@ -21,6 +21,12 @@
 //! entry is its slot's), and the prompt scores by token. The join bucket of an expert union
 //! returns no output.
 //!
+//! A verification bucket returns the entries above up to the validity flags, the rows being
+//! its tokens and the calls its verifications, then each verification's agreed length, U32
+//! `[verifications]`. The drafter's bucket returns one entry per chained step: the draft each
+//! row proposes at that step, U32 `[rows]`. A runner that speculates returns its sampling
+//! outputs from the memory it keeps them in, in the same order.
+//!
 //! ## The completion
 //!
 //! [`calls_output`] names one [`CallOutput`] per call of the batch, in the batch's order:
@@ -35,11 +41,16 @@
 //! - a call one of whose rows could not be sampled (no candidate formed a distribution, or the
 //!   greedy choice is no token of the vocabulary) fails alone, as a numerical fault: the other
 //!   calls of the batch complete.
+//!
+//! [`verification_output`] names the same for a verification batch: a call's tokens are its
+//! accepted prefix, the drafts its own samples agreed with and the sample after them, each
+//! with its scores. The drafts a call proposes are added by `speculation::propose`.
 
-use ipc::execution::{Batch, CallOutput, RowState};
+use ipc::execution::{BatchColumns, CallId, CallOutput, RowState};
 use ipc::{CallStatus, ErrorCode};
 use uniserve_tensor::{Tensor, WithDType};
 
+use super::speculation::token_rows;
 use crate::buckets::Bucket;
 use crate::sampler::scored;
 use crate::{Error, Result};
@@ -60,11 +71,12 @@ fn position(column: &[i32], index: usize) -> u32 {
     length(column.get(index).copied().unwrap_or(0))
 }
 
-/// The completion of the step that served `batch` from `bucket`, from the forward's `outputs`
-/// in their order (module documentation).
+/// The completion of the step that served the batch of `calls` and `columns` from `bucket`,
+/// from the forward's `outputs` in their order (module documentation).
 ///
-/// `vocabulary` is the width of a logit row and `candidates` the most likely tokens a scored
-/// row reports, as the runner's sampler is configured.
+/// `calls` names each call of `columns` in their order. `vocabulary` is the width of a logit
+/// row and `candidates` the most likely tokens a scored row reports, as the runner's sampler
+/// is configured.
 ///
 /// # Errors
 ///
@@ -72,13 +84,14 @@ fn position(column: &[i32], index: usize) -> u32 {
 /// the batch names another number of call ids than calls, or when a row whose logits the batch
 /// asked for belongs to no call.
 pub(crate) fn calls_output(
-    batch: &Batch,
+    calls: &[CallId],
+    columns: &BatchColumns,
     bucket: &Bucket,
     vocabulary: u32,
     candidates: u32,
     outputs: &[Tensor],
 ) -> Result<Vec<CallOutput>> {
-    let rows = &batch.columns.rows;
+    let rows = &columns.rows;
     let width = candidates as usize;
 
     // ---- The outputs, in their order ----
@@ -124,10 +137,10 @@ pub(crate) fn calls_output(
 
     // ---- One completion per call, with its slot's state ----
 
-    if batch.calls.len() != rows.calls.len() {
+    if calls.len() != rows.calls.len() {
         return Err(Error::Invariant(format!(
             "the batch names {} call ids for its {} calls",
-            batch.calls.len(),
+            calls.len(),
             rows.calls.len()
         )));
     }
@@ -141,10 +154,10 @@ pub(crate) fn calls_output(
     }
 
     let mut output: Vec<CallOutput> = Vec::with_capacity(rows.calls.len());
-    for (index, (id, call)) in batch.calls.iter().zip(&rows.calls).enumerate() {
+    for (index, (id, call)) in calls.iter().zip(&rows.calls).enumerate() {
         // The commit table is one row per call, and the sampler's slots one per row: a call
         // reads the slot its rows share through the first row it owns.
-        let slot = batch.columns.slots.get(call.rows.start as usize);
+        let slot = columns.slots.get(call.rows.start as usize);
         let state = if slot.is_some_and(|slot| *slot > 0) {
             RowState {
                 step_index: position(&sampling, index),
@@ -239,8 +252,7 @@ pub(crate) fn calls_output(
         for (call, entry) in rows.calls.iter().zip(&mut output) {
             for token in offset(call.rows.start)..offset(call.rows.end) {
                 // A token whose target is negative scored nothing.
-                let Some(target) = batch
-                    .columns
+                let Some(target) = columns
                     .targets
                     .get(token)
                     .and_then(|target| u32::try_from(*target).ok())
@@ -264,5 +276,50 @@ pub(crate) fn calls_output(
         }
     }
 
+    Ok(output)
+}
+
+/// The completion of the step that served the verification batch of `calls` and `columns`
+/// from `bucket`, from the forward's `outputs` in their order (module documentation).
+///
+/// Each token of a verification sampled the position after it, so the batch's completion is
+/// that of its rows of one token ([`token_rows`]), of which a call keeps its accepted prefix:
+/// one more token than the length the device agreed for it. A call one of whose samples is no
+/// token fails alone, as in [`calls_output`].
+///
+/// # Errors
+///
+/// As [`calls_output`]; [`Error::Invariant`] for outputs that state no agreed length for a
+/// call.
+pub(crate) fn verification_output(
+    calls: &[CallId],
+    columns: &BatchColumns,
+    bucket: &Bucket,
+    vocabulary: u32,
+    candidates: u32,
+    outputs: &[Tensor],
+) -> Result<Vec<CallOutput>> {
+    let rows = token_rows(columns);
+    let mut output = calls_output(calls, &rows, bucket, vocabulary, candidates, outputs)?;
+
+    // The agreed lengths are the forward's last output, one per verification.
+    let agreed: Vec<u32> = match outputs.last() {
+        Some(agreed) => values(agreed)?,
+        None => Vec::new(),
+    };
+    if agreed.len() < output.len() {
+        return Err(Error::Invariant(format!(
+            "the forward of bucket {bucket} agreed lengths for {} verifications of {}",
+            agreed.len(),
+            output.len()
+        )));
+    }
+
+    for (entry, agreed) in output.iter_mut().zip(agreed) {
+        let accepted = agreed as usize + 1;
+
+        entry.tokens.truncate(accepted);
+        entry.token_logprobs.truncate(accepted);
+    }
     Ok(output)
 }

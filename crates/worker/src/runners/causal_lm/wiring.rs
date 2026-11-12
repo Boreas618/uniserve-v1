@@ -9,7 +9,9 @@
 //!   pooled page table and workspace, the state's live and checkpoint buffers, and the scratch
 //!   page set when the cache opened one;
 //! - [`page_work`] builds the hook that issues a batch's page work on the runner's stream, in
-//!   the order the cache module documents.
+//!   the order the cache module documents;
+//! - [`draft_pages`] builds what states a request slot's installed draft pages for a runner
+//!   that speculates.
 //!
 //! Both work over owners that hold no device (`KvCacheMemory::meta`, `StateMemory::meta`): the
 //! runner then computes over meta tensors, and the hook keeps the cache's host mirror of the
@@ -22,6 +24,7 @@ use nn::family::TextModel;
 use nn::{KvCache, NO_SLOT};
 use platform::{Event, Stream};
 
+use super::speculation::{DraftPages, DraftPool};
 use super::{CausalLmConfig, CausalLmRunner, PageWork, PageWorkHook};
 use crate::graphs::Graphs;
 use crate::memory::cache::KvCacheMemory;
@@ -72,7 +75,42 @@ impl CausalLmRunner {
         if cache.scratch_capacity() > 0 && runner.config.scratch_pages > 0 {
             runner.lend_scratch(cache)?;
         }
+        if runner.config.drafts > 0 {
+            runner.lend_draft(cache, state)?;
+        }
         Ok(runner)
+    }
+
+    /// Lends a runner that speculates the draft cache of `cache`, and the trail of `state`
+    /// for a model that keeps a recurrent state ([`CausalLmRunner::set_draft_cache`]).
+    ///
+    /// # Errors
+    ///
+    /// A cache that keeps no draft group or lies otherwise in the unit pool than the runner's
+    /// config states, or what [`CausalLmRunner::set_draft_cache`] refuses: a state opened
+    /// with no trail.
+    pub fn lend_draft(&mut self, cache: &KvCacheMemory, state: Option<&StateMemory>) -> Result<()> {
+        let pool = DraftPool::of(cache.layout(), cache.config().units)?;
+        if self.config.draft_pool != Some(pool) {
+            return Err(Error::Invalid(format!(
+                "the runner's config states the draft pool {:?} and the cache lays it out as \
+                 {pool:?}",
+                self.config.draft_pool
+            )));
+        }
+
+        // The drafter's forwards state their rows' pages themselves: the table lent here is
+        // not read.
+        let unread = attention_groups(cache)
+            .next()
+            .ok_or_else(|| Error::Invalid("a draft cache beside no attention group".into()))?;
+        let draft = cache.lend_draft(cache.page_table(unread)?)?;
+
+        let trail = match state {
+            Some(state) => state.trail()?,
+            None => None,
+        };
+        self.set_draft_cache(draft, trail)
     }
 
     /// Lends the runner the scratch page set `cache` opened, for its paired forwards: each
@@ -84,7 +122,7 @@ impl CausalLmRunner {
     /// A cache whose scratch pages are not open or hold fewer pages than the runner's rows
     /// address, or what [`CausalLmRunner::set_scratch`] refuses.
     pub fn lend_scratch(&mut self, cache: &KvCacheMemory) -> Result<()> {
-        let rows = self.layout.rows() as u32;
+        let rows = self.scratch_rows();
         let table = cache.scratch_table(rows, self.config.scratch_pages)?;
 
         let mut groups = Vec::new();
@@ -188,5 +226,20 @@ pub fn page_work(
             }
         }
         Ok(())
+    })
+}
+
+/// What states a request slot's installed pages of the draft group of `cache`, for a runner
+/// that speculates ([`CausalLmRunner::set_draft_pages`]): the slot's first draft page and the
+/// units of its pages from there on, as the scheduler last installed them, and `None` for a
+/// slot that holds none or a cache that keeps no draft group.
+pub fn draft_pages(cache: Arc<Mutex<KvCacheMemory>>) -> DraftPages {
+    Box::new(move |slot: u32| {
+        let cache = lock(&cache);
+        let group = cache.layout().draft_group()? as u32;
+
+        cache
+            .installed_pages(slot, group)
+            .map(|(first, units)| (first, units.to_vec()))
     })
 }
