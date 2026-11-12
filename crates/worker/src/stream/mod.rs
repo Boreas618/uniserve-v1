@@ -1,9 +1,6 @@
-//! Execution streams, the rank's set of them, and the events that order work
-//! across them.
+//! What orders host work behind a device's streams: the events storage owners wait on before
+//! they release storage that device work addressed.
 
 pub mod events;
-pub mod issue;
-pub mod recorded;
 
-pub use events::{DRAIN_LIMIT, Deferral, Deferred, EventPool, JobId, Submitter, drain_event};
-pub use issue::{Fill, HostFunction, Issue, RowFill};
+pub use events::{DRAIN_LIMIT, EventPool, JobId, Release, Submitter, drain_event};

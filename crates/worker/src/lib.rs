@@ -29,6 +29,7 @@
 //! | [`runner`] | The [`Runner`] interface a stage's runner implements |
 //! | [`profiling`] | The range markers that time a model's modules, the engine's `backend::Profiler`; CUPTI's always-on counters; profiling sessions and their collectors and files |
 //! | [`parallel`] | [`HostGroup`](parallel::host::HostGroup), the host collectives of a rank group over a TCP full mesh |
+//! | [`stream`] | [`EventPool`](stream::EventPool), the event leases storage owners defer their releases behind |
 //! | [`thread_pool`] | [`ThreadPool`](thread_pool::ThreadPool), a bounded pool of threads for one kind of blocking host work |
 //!
 //! ## Rules every module keeps
@@ -49,6 +50,7 @@ pub mod graphs;
 pub mod profiling;
 pub mod runner;
 pub mod parallel;
+pub mod stream;
 pub mod thread_pool;
 
 pub use error::{Error, Failure, Result};
