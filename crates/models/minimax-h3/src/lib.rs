@@ -19,11 +19,14 @@
 //! none. A model holds no runtime object: the execution context a forward computes under is the
 //! thread's, installed by execution (`AGENTS.md`, Model Library Boundary).
 
+pub mod audio_vae;
 pub mod config;
 pub mod modulation;
 pub mod packing;
 pub mod refiner;
 pub mod transformer;
+pub mod splice;
+pub mod video_vae;
 
 pub use config::{
     AudioVaeConfig, Config, DenoiserConfig, ScheduleConfig, TransformerConfig, VideoVaeConfig,
