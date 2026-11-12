@@ -35,15 +35,23 @@
 //! every launch site of an operator states the same key.
 
 mod activation;
+mod activation1d;
 mod attention;
+mod conv;
 mod embedding;
+mod frame;
 mod linear;
 mod logits;
 mod moe;
+mod noise;
 mod norm;
 mod nvfp4;
+mod pool;
 mod recurrent;
+mod residual_norm;
 mod rotary;
+mod sparse;
+mod vsa;
 
 use uniserve_tensor::{DType, Device, Shape, Tensor};
 
@@ -52,10 +60,13 @@ use crate::error::{Error, Result};
 pub use activation::{
     Activation, Rounding, act_and_mul, gelu, gelu_tanh, silu, snake, swiglu, value_first_swiglu,
 };
+pub use activation1d::activation1d;
 pub use attention::{
     dense_attention, dense_attention_varlen, kv_write_, paged_attention, zero_arrival_counters_,
 };
+pub use conv::{Padding, causal_pad, conv_transpose1d, conv1d, conv3d};
 pub use embedding::{embedding, vocabulary_shard};
+pub use frame::frame_norm_pad;
 pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
 pub use linear::{WeightOrder, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
@@ -66,10 +77,20 @@ pub use moe::{
     expert_dispatch, expert_exchange_fused, gather_gemm, gather_gemm_nvfp4, moe_sort,
     moe_unpermute, route_gemm, route_gemm_nvfp4, sigmoid_gated_add_, topk_softmax,
 };
+pub use noise::{philox_normal, philox_normal_rows};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
 pub use nvfp4::{ENCODE_CHUNK, encode_block, nvfp4_quantize};
+pub use pool::adaptive_avg_pool2d;
 pub use recurrent::{DELTA_RULE_CHUNK, causal_conv1d, gated_delta_rule};
+pub use residual_norm::{
+    modulated_rms_norm, modulated_rms_norm_, scaled_residual_layer_norm, scaled_residual_rms_norm_,
+};
 pub use rotary::{grid_positions, qk_norm_rope, qk_norm_rope_, rotary, rotary_factors};
+pub use sparse::sparse_attention;
+pub use vsa::{
+    vsa_add_gated_tiles_, vsa_compose_gated_rows, vsa_compress_pooled, vsa_prepare_tiles_,
+    vsa_scores, vsa_select_tiles, vsa_zero_padding_,
+};
 
 /// Whether the descriptors this crate builds are the programmatic-dependent-launch variants.
 pub(crate) const PDL: bool = false;
