@@ -50,8 +50,8 @@
 //! A stride-`s` temporal convolution pads two zero frames in front and none behind, so `T`
 //! frames become `ceil(T / s)`; a spatial downsampling pads the bottom and the right by one
 //! pixel and strides by two. A condition is cut into the clips of the frame rule
-//! ([`FRAMES`]), each clip encoded alone in overlapping tiles whose moments cross-fade where
-//! they meet ([`nn::vae::tiled_encode`]).
+//! ([`FRAMES`]), each clip encoded alone in overlapping tiles whose moments, projected by
+//! `quant_conv`, cross-fade where they meet ([`nn::vae::tiled_encode`]).
 
 use std::ops::Range;
 
@@ -849,7 +849,7 @@ pub struct VideoEncoder {
     /// The final normalization, which writes its output activated and padded for `conv_out`.
     norm_out: FrameNorm,
     conv_out: Conv3d,
-    /// The one-by-one projection of the moments.
+    /// The one-by-one projection of a tile's moments, before the tiles are blended.
     quant_conv: Conv3d,
     /// `[latent_channels, 1, 1, 1]` FP32: the latent space's per-channel mean.
     latents_mean: Tensor,
@@ -1048,13 +1048,14 @@ impl VideoEncoder {
     /// FP32 normalized by [`PIXEL_NORM`] (one frame for a still), to
     /// `[latent_channels, latent_frames, height / 16, width / 16]` in FP32.
     ///
-    /// Each clip of the frame rule ([`FRAMES`]) is encoded alone, in the checkpoint's tiles,
-    /// whose moments are stitched ([`nn::vae::tiled_encode`]). `quant_conv` then projects the
-    /// stitched moments of the whole condition once, the posterior is sampled under
-    /// [`POSTERIOR_SEED`] as `mean + exp(0.5 · clamp(logvar, −30, 20)) · noise` rounded
-    /// through FP16 (the reference's `DiagonalGaussianDistribution.sample` and
-    /// `use_fp16_latent`, `klvae.py:71-92`), and the sample is normalized per channel,
-    /// `(sample − mean) / std`.
+    /// Each clip of the frame rule ([`FRAMES`]) is encoded alone, in the checkpoint's tiles:
+    /// a tile's moments are projected by `quant_conv` (the reference's `encode`,
+    /// `klvae.py:1319-1321`, which its tiled encode calls per tile, `klvae.py:392-447`) and
+    /// the projected tiles are stitched ([`nn::vae::tiled_encode`]). The posterior of the
+    /// whole condition is sampled under [`POSTERIOR_SEED`] as
+    /// `mean + exp(0.5 · clamp(logvar, −30, 20)) · noise` rounded through FP16 (the
+    /// reference's `DiagonalGaussianDistribution.sample` and `use_fp16_latent`,
+    /// `klvae.py:71-92`), and the sample is normalized per channel, `(sample − mean) / std`.
     ///
     /// # Errors
     ///
@@ -1122,17 +1123,15 @@ impl VideoEncoder {
                         .narrow(3, column.start * spatial, column.len() * spatial)?
                         .unsqueeze(0)?;
 
-                    Ok(self.forward(&tile)?.squeeze(0)?)
+                    let moments = self.quant_conv.forward(&self.forward(&tile)?)?;
+                    Ok(moments.squeeze(0)?)
                 },
             )?;
             clips.push(moments);
         }
 
         // The posterior of the whole condition: its mean and its clamped log-variance.
-        let moments = self
-            .quant_conv
-            .forward(&Tensor::cat(&clips, 1)?.unsqueeze(0)?)?
-            .squeeze(0)?;
+        let moments = Tensor::cat(&clips, 1)?;
         let mean = moments.narrow(0, 0, channels)?;
         let std = (moments.narrow(0, channels, channels)?.clamp(-30.0, 20.0)? * 0.5)?.exp()?;
 
