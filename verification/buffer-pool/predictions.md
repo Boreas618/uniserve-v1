@@ -65,3 +65,43 @@ R5, R8, R9 and R10 guard requests the core does not have; they are predicted wit
 
 - **Prediction:** the search completes with no violation. `MC_Core` is unaffected by the correction (it has no copies) and is not run again for it.
 - **Outcome:** as predicted. The search completed: 27,997,818 states generated, 6,648,697 distinct, depth 51, no violation, in 34 s.
+
+## 9. Worker groups in the model; the earlier configurations again, 2026-11-12
+
+- **Model:** `KvCore` gains the validity of a shared block per group, tasks as holders, `Transfer` with its task, and the rule that an owner whose transfer waits or runs takes only a `Detach`. No prediction was written before `MC_Copies` was run again after the change; it was expected to pass as in entry 8.
+- **Outcome:** `MC_Copies` completed with no violation: 140,773,442 states generated, 33,499,148 distinct, depth 61, in 2 min 54 s. The state count rose because `Transfer` requests are now issued (and refused, with one group).
+
+## 10. Transfers between two groups (`MC_Transfer`), 2026-11-12
+
+- **Model:** two groups of one epoch with one slot row each, two units, one key, two owners, one position, one batch per group, one stamped request under way, no copies.
+- **Prediction, all rules:** the search completes with no violation, and an owner attached to the group it was transferred to, with its block in that group's table, is reached.
+- **Prediction, R9 left out:** P1 `TaskIsolation`: an owner is detached while its transfer's task runs, its block is reclaimed, and the task still writes it. `FreeUnheld` cannot report it, since without R9 a task is not a holder.
+- **Prediction, R3 left out:** P1 `WriteIsolation` or `ReadIsolation` by a `Release`, as in entry 5; if the shortest behaviour uses the transfer instead, `TaskIsolation` cannot fail (the task holds what it writes), so one of the two is reported.
+- **Outcome, all rules:** not as predicted: `ReadIsolation` in 13 states. A commit waits; its owner is transferred, and the task copies the block into the target group's memory; the commit comes due and the block is valid in the group that wrote it alone, while the owner, now in the target group, reads it there. The model recorded validity at the commit only for the writing group.
+- **Outcome, R9 left out:** not as predicted: `NoLeak` in 7 states. The mutation as modelled made a task hold nothing, so the slot row it took was neither free nor held: an artefact of the mutation.
+- **Outcome, witness:** an owner attached to the group it was transferred to is reached.
+- **Consequence:** a block whose commit takes effect after its owner was transferred with it is valid in both groups (the transfer copied it, and nothing wrote it since the commit was stamped); `specs/buffer-pool.md` §13 states it. The mutation of R9 is restated: a task holds its blocks, and without the rule a `Detach` releases them while the task runs.
+
+## 11. Transfers, restated (`MC_Transfer`), 2026-11-12
+
+- **Prediction, all rules:** the search completes with no violation.
+- **Prediction, R9 left out:** P1 `TaskIsolation`: the released block is free, or another owner's, while the task writes it.
+- **Outcome, R9 left out:** as predicted: `TaskIsolation` in 10 states.
+- **Outcome, all rules:** not as predicted: `ReadIsolation` in 16 states. As entry 10, but the owner's position is released after the transfer and before the commit comes due, so the rule of entry 10 (valid in the owner's group if the owner still holds the block) leaves the block valid in the writing group alone while a batch of the target group still reads it.
+- **Consequence:** the groups in which a block is valid are the block's own, kept while it is private: the group of its owner at allocation; after a transfer the target group alone, or both groups when a commit of the block waits (the block is then read-only in both). A commit does not change them. `ReadIsolation` requires every device block a batch reads, private or shared, to be valid in the batch's group.
+
+## 12. Transfers, validity kept per block (`MC_Transfer`), 2026-11-12
+
+- **Prediction, all rules:** the search completes with no violation.
+- **Outcome:** not as predicted: `TaskIsolation` in 16 states. A block whose commit waits is transferred to the second group and back; the second task copies it into the first group's memory, where it is still valid, and the commit comes due while the task writes it.
+- **Consequence:** a task copies exactly the owner's blocks that are not valid in the target group, private or shared.
+
+## 13. Transfers, a task copies what is not valid in the target (`MC_Transfer`), 2026-11-12
+
+- **Prediction, all rules:** the search completes with no violation.
+- **Outcome:** as predicted. The search completed: 186,819,804 states generated, 37,541,052 distinct, depth 86, no violation, in 3 min 32 s.
+
+## 14. The earlier configurations on the model with worker groups, 2026-11-12
+
+- **Prediction:** `MC_Core` and `MC_Copies` complete with no violation; `RULES=NoR9` on `MC_Transfer` reports `TaskIsolation`, and the mutations of R1 to R7 report a violation as before.
+- **Outcome:** as predicted. `MC_Core`: complete, 773,021,171 states generated, 150,548,210 distinct, depth 52, no violation, 15 min 59 s on 48 workers. `MC_Copies`: complete, 94,751,160 generated, 22,596,078 distinct, depth 54, no violation, 2 min 35 s. Mutations: R1 `NoLeak`, R2 `FreeUnheld`, R3 `WriteIsolation`, R4 `KeyStable`, R6 `WriteIsolation`, R7 `KeyStable` on `MC_Core`; R5 `Exclusive` on `MC_Copies`; R9 `TaskIsolation` on `MC_Transfer`.

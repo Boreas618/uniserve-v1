@@ -1,0 +1,66 @@
+# The property list of the buffer pool (specs/buffer-pool.md §17).
+#
+# One entry per property: its identifier, kind, statement, the formulas of
+# KvCore.tla that state it, the rules and assumptions it rests on, a behaviour
+# that violates it, and its status: proposed, approved, validated, checked
+# (model checking on stated bounds), proved, or for a liveness property tested.
+# A statement is approved by the owner; a formula becomes the property's once
+# the owner approves it, and from then on this file and the formulas are pinned
+# by hash.
+
+[[property]]
+id = "P1"
+name = "Isolation"
+kind = "safety"
+statement = """The buffer pool never has one unit in two blocks, never allocates a block that an \
+owner, the cache, deferred work or a copy holds, and reclaims a released block only when \
+`completed` has reached every stamp. With A1 to A4, a write lands only on a block allocated to \
+the writing request."""
+formulas = ["FreeUnheld", "Exclusive", "WriteIsolation", "ReadIsolation", "CopyIsolation", "TaskIsolation"]
+rules = ["R1", "R2", "R3", "R7", "R9", "R10"]
+assumptions = ["A1", "A2", "A3", "A4", "A5", "A7"]
+violated_by = "A `Release` that takes effect while the batch that writes the block is in flight (R3 left out): `WriteIsolation`."
+statement_status = "approved"
+formula_status = "proposed"
+
+[[property]]
+id = "P2"
+name = "Integrity"
+kind = "safety"
+statement = """A block is committed only after `completed` has reached the stamp of its `Commit`, \
+the destination of a copy becomes shared only after the stamp of its `Finish`, and a block is \
+stored, loaded, cloned or transferred only as a shared block or as its owner's private one. A \
+shared block is never the destination of a copy and never private again; its key never changes."""
+formulas = ["KeyStable", "PinsCached", "OneKey", "SharedUnwritten", "CopiesReadShared"]
+rules = ["R3", "R4", "R5", "R6", "R8"]
+assumptions = ["A1", "A2", "A3", "A4", "A6"]
+violated_by = "A second block committed under a cached key replaces the first, which an owner still pins (R4 left out): `KeyStable`."
+statement_status = "approved"
+formula_status = "proposed"
+
+[[property]]
+id = "P3"
+name = "Conservation"
+kind = "safety"
+statement = """Every unit is free or in exactly one block, and device memory is in one region. \
+When no owner exists, nothing is deferred and no copy is in flight, every block is free or \
+shared without a pin."""
+formulas = ["NoLeak", "Quiescent"]
+rules = ["R2", "R10"]
+assumptions = []
+violated_by = "An owner that is attached is attached again and its first slot row is neither free nor held (R1 left out): `NoLeak`."
+statement_status = "approved"
+formula_status = "proposed"
+
+[[property]]
+id = "P4"
+name = "Finality"
+kind = "liveness"
+statement = """A request waiting on blocks, a copy or a task goes on: by the scheduler's own \
+bound for a copy, by the deadline for a task."""
+formulas = []
+rules = []
+assumptions = []
+violated_by = "A task that never completes and has no deadline: the request that waits on it never goes on."
+statement_status = "approved"
+formula_status = "tested, not proved"

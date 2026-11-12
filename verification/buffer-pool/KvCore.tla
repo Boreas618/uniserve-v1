@@ -9,7 +9,7 @@
 (*                                                                         *)
 (* A block is one unit; a slot row is a unit of its group's slot region.   *)
 (* Holders are sets: a unit is free, or it is held by owners' table        *)
-(* entries, the cache, deferred work and copies. Each handler is one atomic       *)
+(* entries, the cache, deferred work, copies and tasks. Each handler is one atomic       *)
 (* action, because the buffer pool is one value changed through one        *)
 (* thread; what is not atomic is three actions: taken, due, finished.      *)
 (*                                                                         *)
@@ -48,6 +48,8 @@ VARIABLES
     deferred,    \* work that waits for stamps: releases, commits and the ends of copies
     copies,      \* the copies in flight, each holding the block it reads and the one it writes
     ncopy,       \* the copies ever asked for
+    tasks,       \* the transfers in flight, each holding the blocks it copies
+    valid,       \* [Units -> SUBSET Groups]: the groups whose memory holds a block's content
     \* The control plane: the executors and the requests under way.
     dbt,         \* [Groups -> [Owners -> [Rows -> entry]]]: the device block tables
     launched,    \* [Groups -> 0 .. MaxBatch]: the sequence of the last batch launched
@@ -58,7 +60,7 @@ VARIABLES
     alloc,       \* [AllUnits -> Owners \cup {NONE, "shared"}]: whom a held unit was allocated to
     sharedKey    \* [AllUnits -> Keys \cup {NONE}]: the key a unit became shared under
 
-pool == <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy>>
+pool == <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, copies, ncopy, tasks, valid>>
 plane == <<dbt, launched, inflight, handoff, requests>>
 vars == <<pool, plane, alloc, sharedKey>>
 
@@ -87,27 +89,31 @@ Reached(after) == \A g \in Groups : Completed(g) >= after[g]
 -----------------------------------------------------------------------------
 (* Holders. *)
 
-HeldIn(u, tbl, slt, cch, hch, dfr, cps) ==
+HeldIn(u, tbl, slt, cch, hch, dfr, cps, tsk) ==
     \/ \E o \in Owners, p \in Positions : tbl[o][p].u = u
     \/ \E o \in Owners : slt[o] = u
     \/ \E k \in Keys : cch[k] = u \/ hch[k] = u
     \/ \E d \in dfr : u \in d.units
     \/ \E c \in cps : u = c.read \/ u = c.write
+    \/ \E t \in tsk : t.held /\ (u \in t.units \/ u = t.slot)
 
 (* R2: runs return to a region only when the last reference is dropped.    *)
-Reclaimed(dropped, tbl, slt, cch, hch, dfr, cps) ==
-    IF On("R2") THEN {u \in dropped : ~HeldIn(u, tbl, slt, cch, hch, dfr, cps)} ELSE dropped
+ReclaimedWith(dropped, tbl, slt, cch, hch, dfr, cps, tsk) ==
+    IF On("R2") THEN {u \in dropped : ~HeldIn(u, tbl, slt, cch, hch, dfr, cps, tsk)} ELSE dropped
 
 Reset(f, gone) == [u \in AllUnits |-> IF u \in gone THEN NONE ELSE f[u]]
 
 (* Drop references to `units` in a state whose tables, slots, caches,      *)
-(* deferred work and copies are given: what nothing holds any more is      *)
-(* reclaimed.                                                              *)
-Drop(units, tbl, slt, cch, hch, dfr, cps) ==
-    LET gone == Reclaimed(units, tbl, slt, cch, hch, dfr, cps)
+(* deferred work, copies and tasks are given: what nothing holds any more  *)
+(* is reclaimed.                                                           *)
+DropWith(units, tbl, slt, cch, hch, dfr, cps, tsk) ==
+    LET gone == ReclaimedWith(units, tbl, slt, cch, hch, dfr, cps, tsk)
     IN /\ free' = free \cup gone
        /\ alloc' = Reset(alloc, gone)
        /\ sharedKey' = Reset(sharedKey, gone)
+
+Drop(units, tbl, slt, cch, hch, dfr, cps) ==
+    DropWith(units, tbl, slt, cch, hch, dfr, cps, tasks)
 
 Pinned(u) == \E o \in Owners, p \in Positions : table[o][p] = Shared(u)
 
@@ -118,6 +124,7 @@ Evictable(u) ==
     /\ On("R7") => ~Pinned(u)
     /\ On("R2") => ~\E d \in deferred : u \in d.units
     /\ On("R2") => ~\E c \in copies : u = c.read \/ u = c.write
+    /\ On("R2") => ~\E t \in tasks : t.held /\ u \in t.units
 
 (* A device unit for a new private block: a free one, or when the region   *)
 (* has none an evictable one, which leaves the cache.                      *)
@@ -130,12 +137,18 @@ Obtain(u) ==
 (* Whether a copy writes for position p of owner o.                        *)
 CopyFor(o, p) == \E c \in copies : c.o = o /\ c.p = p
 
+(* Whether owner o's transfer waits or runs. R1 refuses every request that *)
+(* names such an owner but its `Detach`.                                   *)
+Moving(o) ==
+    \/ \E t \in tasks : t.o = o
+    \/ \E d \in deferred : d.kind = "transfer" /\ d.o = o
+
 (* Whether stamped request r takes away the entry completion h fills.      *)
 Names(r, h) ==
     /\ r.e = OwnerEpoch[h.o]
     /\ r.o = h.o
     /\ CASE r.kind = "release" -> h.p \in r.ps
-         [] r.kind = "detach" -> TRUE
+         [] r.kind \in {"detach", "transfer"} -> TRUE
          [] r.kind = "commit" -> h.p = r.p
          [] OTHER -> FALSE
 
@@ -168,28 +181,30 @@ Attach(o, g) ==
     /\ ostate' = [ostate EXCEPT ![o] = "live"]
     /\ ogroup' = [ogroup EXCEPT ![o] = g]
     /\ table' = [table EXCEPT ![o] = [p \in Positions |-> Empty]]
-    /\ UNCHANGED <<cache, hcache, deferred, copies, ncopy, launched, inflight, requests, sharedKey>>
+    /\ UNCHANGED <<cache, hcache, deferred, copies, ncopy, tasks, valid, launched, inflight, requests, sharedKey>>
 
 Allocate(o, p) ==
     /\ ostate[o] = "live"
-    /\ On("R1") => table[o][p] = Empty /\ ~CopyFor(o, p)
+    /\ On("R1") => table[o][p] = Empty /\ ~CopyFor(o, p) /\ ~Moving(o)
     /\ \E u \in Units :
          /\ Obtain(u)
          /\ free' = free \ {u}
          /\ table' = [table EXCEPT ![o][p] = Private(u)]
          /\ alloc' = [alloc EXCEPT ![u] = o]
          /\ sharedKey' = [sharedKey EXCEPT ![u] = NONE]
+         /\ valid' = [valid EXCEPT ![u] = {ogroup[o]}]
          /\ Give([g |-> ogroup[o], o |-> o, p |-> p, u |-> u, w |-> TRUE])
-    /\ UNCHANGED <<ostate, ogroup, oslot, hcache, deferred, copies, ncopy, launched, inflight,
-                   requests>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, hcache, deferred, copies, ncopy, tasks, launched,
+                   inflight, requests>>
 
 Pin(o, p, k) ==
     /\ ostate[o] = "live"
     /\ cache[k] # NONE
-    /\ On("R1") => table[o][p] = Empty /\ ~CopyFor(o, p)
+    /\ ogroup[o] \in valid[cache[k]]
+    /\ On("R1") => table[o][p] = Empty /\ ~CopyFor(o, p) /\ ~Moving(o)
     /\ table' = [table EXCEPT ![o][p] = Shared(cache[k])]
     /\ Give([g |-> ogroup[o], o |-> o, p |-> p, u |-> cache[k], w |-> FALSE])
-    /\ UNCHANGED <<free, ostate, ogroup, oslot, cache, hcache, deferred, copies, ncopy, launched,
+    /\ UNCHANGED <<free, ostate, ogroup, oslot, cache, hcache, deferred, copies, ncopy, tasks, valid, launched,
                    inflight, requests, alloc, sharedKey>>
 
 Evict(k) ==
@@ -197,7 +212,7 @@ Evict(k) ==
     /\ Evictable(cache[k])
     /\ cache' = [cache EXCEPT ![k] = NONE]
     /\ Drop({cache[k]}, table, oslot, cache', hcache, deferred, copies)
-    /\ UNCHANGED <<ostate, ogroup, oslot, table, hcache, deferred, copies, ncopy, plane>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, hcache, deferred, copies, ncopy, tasks, valid, plane>>
 
 (* A host copy leaves the host tier when nothing but the cache holds it.   *)
 EvictHost(k) ==
@@ -205,7 +220,7 @@ EvictHost(k) ==
     /\ On("R2") => ~\E c \in copies : hcache[k] = c.read \/ hcache[k] = c.write
     /\ hcache' = [hcache EXCEPT ![k] = NONE]
     /\ Drop({hcache[k]}, table, oslot, cache, hcache', deferred, copies)
-    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, deferred, copies, ncopy, plane>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, deferred, copies, ncopy, tasks, valid, plane>>
 
 -----------------------------------------------------------------------------
 (* Copies the executor runs. The handler allocates the destination and the *)
@@ -215,6 +230,7 @@ EvictHost(k) ==
 Copy(kind, o, p, k, g, read, write) ==
     [id |-> ncopy + 1, kind |-> kind, o |-> o, p |-> p, k |-> k, g |-> g,
      read |-> read, write |-> write,
+     fill |-> FALSE,      \* whether it fills a group's memory of a shared block
      seq |-> 0,           \* the batch it ran with; 0 before it starts
      done |-> FALSE,      \* whether its executor returned its `Finish`
      stopped |-> FALSE]   \* whether the scheduler gave it up
@@ -225,7 +241,8 @@ Clone(o, p, k) ==
     /\ ncopy < MaxCopies
     /\ ostate[o] = "live"
     /\ cache[k] # NONE
-    /\ On("R1") => table[o][p] = Empty /\ ~CopyFor(o, p)
+    /\ ogroup[o] \in valid[cache[k]]
+    /\ On("R1") => table[o][p] = Empty /\ ~CopyFor(o, p) /\ ~Moving(o)
     /\ IF On("R5")
        THEN /\ \E w \in Units \ {cache[k]} :
                  /\ Obtain(w)
@@ -237,34 +254,47 @@ Clone(o, p, k) ==
             /\ UNCHANGED <<table, dbt, handoff>>
        ELSE /\ table' = [table EXCEPT ![o][p] = Private(cache[k])]
             /\ Give([g |-> ogroup[o], o |-> o, p |-> p, u |-> cache[k], w |-> TRUE])
-            /\ UNCHANGED <<free, cache, copies, ncopy, alloc, sharedKey>>
-    /\ UNCHANGED <<ostate, ogroup, oslot, hcache, deferred, launched, inflight, requests>>
+            /\ UNCHANGED <<free, cache, copies, ncopy, tasks, valid, alloc, sharedKey>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, hcache, deferred, tasks, valid, launched, inflight,
+                   requests>>
 
+(* A load brings a key from the host to the owner's group: into a new      *)
+(* block when the key has no device block, into the group's memory of its  *)
+(* block when that block is valid in other groups only.                    *)
 Load(o, p, k) ==
     /\ ncopy < MaxCopies
     /\ ostate[o] = "live"
     /\ hcache[k] # NONE
-    /\ cache[k] = NONE
-    /\ On("R1") => table[o][p] = Empty /\ ~CopyFor(o, p)
-    /\ \E w \in Units :
-         /\ Obtain(w)
-         /\ free' = free \ {w}
-         /\ alloc' = [alloc EXCEPT ![w] = o]
-         /\ sharedKey' = [sharedKey EXCEPT ![w] = NONE]
-         /\ copies' = copies \cup {Copy("load", o, p, k, ogroup[o], hcache[k], w)}
+    /\ On("R1") => table[o][p] = Empty /\ ~CopyFor(o, p) /\ ~Moving(o)
+    /\ IF cache[k] = NONE
+       THEN /\ \E w \in Units :
+                 /\ Obtain(w)
+                 /\ free' = free \ {w}
+                 /\ alloc' = [alloc EXCEPT ![w] = o]
+                 /\ sharedKey' = [sharedKey EXCEPT ![w] = NONE]
+                 /\ copies' = copies \cup {Copy("load", o, p, k, ogroup[o], hcache[k], w)}
+       ELSE /\ ogroup[o] \notin valid[cache[k]]
+            \* Nothing else fills that memory: no other load, no transfer.
+            /\ ~\E c \in copies : c.write = cache[k] /\ c.g = ogroup[o]
+            /\ ~\E t \in tasks : t.to = ogroup[o] /\ cache[k] \in t.writes
+            /\ copies' = copies \cup
+                 {[Copy("load", o, p, k, ogroup[o], hcache[k], cache[k]) EXCEPT !.fill = TRUE]}
+            /\ UNCHANGED <<free, cache, alloc, sharedKey>>
     /\ ncopy' = ncopy + 1
-    /\ UNCHANGED <<ostate, ogroup, oslot, table, hcache, deferred, plane>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, hcache, deferred, tasks, valid, plane>>
 
 Store(g, k) ==
     /\ ncopy < MaxCopies
     /\ cache[k] # NONE
+    /\ g \in valid[cache[k]]
     /\ hcache[k] = NONE
     /\ \E h \in free \cap HostUnits :
          /\ free' = free \ {h}
          /\ alloc' = [alloc EXCEPT ![h] = "copy"]
          /\ copies' = copies \cup {Copy("store", NONE, NONE, k, g, cache[k], h)}
     /\ ncopy' = ncopy + 1
-    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, plane, sharedKey>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, deferred, tasks, valid, plane,
+                   sharedKey>>
 
 -----------------------------------------------------------------------------
 (* The control plane issues a stamped request; the executor of every group *)
@@ -273,7 +303,7 @@ Store(g, k) ==
 
 Request(kind, e, o, ps, p, k, c, ok) ==
     [kind |-> kind, e |-> e, o |-> o, ps |-> ps, p |-> p, k |-> k, c |-> c, ok |-> ok,
-     after |-> NoStamp, by |-> {}]
+     to |-> NONE, after |-> NoStamp, by |-> {}]
 
 Issue ==
     /\ Cardinality(requests) < MaxRequests
@@ -284,6 +314,9 @@ Issue ==
               \/ requests' = requests \cup {Request("detach", e, o, {}, NONE, NONE, 0, FALSE)}
               \/ \E p \in Positions, k \in Keys :
                    requests' = requests \cup {Request("commit", e, o, {}, p, k, 0, FALSE)}
+              \/ \E g \in Groups :
+                   requests' = requests \cup
+                     {[Request("transfer", e, o, {}, NONE, NONE, 0, FALSE) EXCEPT !.to = g]}
          \* The scheduler gives a copy up.
          \/ \E c \in 1 .. ncopy :
               requests' = requests \cup {Request("finish", e, NONE, {}, NONE, NONE, c, FALSE)}
@@ -300,8 +333,9 @@ StampGroups(r) ==
            THEN \E c \in copies : c.id = r.c /\ c.g = g
            ELSE ogroup[r.o] = g}
 
-(* The executor applies r: it removes the entries of a release or a detach, *)
-(* marks the entry of a commit read-only, and attaches a copy that is      *)
+(* The executor applies r: it removes the entries of a release, a detach   *)
+(* or a transfer, marks the entry of a commit read-only, and attaches a    *)
+(* copy that is                                                            *)
 (* given up to no further batch. Then it stamps r with the last batch it   *)
 (* launched. A give-up for a copy whose own `Finish` it has returned is    *)
 (* discarded.                                                              *)
@@ -319,13 +353,13 @@ ExecStamp(g, r) ==
        ELSE /\ dbt' = [dbt EXCEPT ![g][r.o] =
                         [p \in Rows |->
                            CASE r.kind = "release" /\ p \in r.ps -> NoEntry
-                             [] r.kind = "detach" -> NoEntry
+                             [] r.kind \in {"detach", "transfer"} -> NoEntry
                              [] r.kind = "commit" /\ p = r.p -> [u |-> dbt[g][r.o][p].u, w |-> FALSE]
                              [] OTHER -> dbt[g][r.o][p]]]
             /\ requests' = (requests \ {r}) \cup
                              {[r EXCEPT !.after[g] = launched[g], !.by = @ \cup {g}]}
             /\ copies' = copies
-    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, ncopy, launched,
+    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, ncopy, tasks, valid, launched,
                    inflight, handoff, alloc, sharedKey>>
 
 (* A2: a request is submitted once every such group has stamped it.        *)
@@ -369,7 +403,7 @@ Launch(g) ==
                  cw |-> {c.write : c \in start}]}
           /\ copies' = {IF c \in start THEN [c EXCEPT !.seq = launched[g] + 1] ELSE c : c \in copies}
     /\ launched' = [launched EXCEPT ![g] = @ + 1]
-    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, ncopy, dbt,
+    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, ncopy, tasks, valid, dbt,
                    handoff, requests, alloc, sharedKey>>
 
 (* A batch ends after any delay.                                           *)
@@ -386,7 +420,7 @@ ExecFinish(c, ok) ==
     /\ requests' = requests \cup
          {[Request("finish", GroupEpoch[c.g], NONE, {}, NONE, NONE, c.id, ok)
              EXCEPT !.after[c.g] = launched[c.g], !.by = {c.g}]}
-    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, ncopy, dbt,
+    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, deferred, ncopy, tasks, valid, dbt,
                    launched, inflight, handoff, alloc, sharedKey>>
 
 -----------------------------------------------------------------------------
@@ -394,15 +428,16 @@ ExecFinish(c, ok) ==
 
 (* R3: what a stamped request takes away is released when `completed` of   *)
 (* every stamping group has reached its stamp.                             *)
-ReleaseUnits(units, after, tbl, slt) ==
+ReleaseUnits(units, after, tbl, slt, tsk) ==
     /\ table' = tbl
     /\ oslot' = slt
     /\ IF On("R3") /\ ~Reached(after) /\ units # {}
        THEN /\ deferred' = deferred \cup
                  {[kind |-> "release", units |-> units, after |-> after,
-                   o |-> NONE, p |-> NONE, k |-> NONE, c |-> 0, ok |-> FALSE]}
+                   o |-> NONE, p |-> NONE, k |-> NONE, c |-> 0, ok |-> FALSE,
+                   g |-> NONE, to |-> NONE]}
             /\ UNCHANGED <<free, alloc, sharedKey>>
-       ELSE /\ Drop(units, tbl, slt, cache, hcache, deferred, copies)
+       ELSE /\ DropWith(units, tbl, slt, cache, hcache, deferred, copies, tsk)
             /\ UNCHANGED deferred
 
 TakeRelease(r) ==
@@ -410,13 +445,14 @@ TakeRelease(r) ==
     /\ requests' = requests \ {r}
     /\ IF On("R1") /\ ~(/\ ostate[r.o] = "live"
                         /\ OwnerEpoch[r.o] = r.e
+                        /\ ~Moving(r.o)
                         /\ \A p \in r.ps : table[r.o][p] # Empty)
        THEN UNCHANGED <<pool, alloc, sharedKey>>
        ELSE /\ ReleaseUnits({table[r.o][p].u : p \in r.ps} \ {NONE}, r.after,
                             [table EXCEPT ![r.o] =
                                [p \in Positions |-> IF p \in r.ps THEN Empty ELSE table[r.o][p]]],
-                            oslot)
-            /\ UNCHANGED <<ostate, ogroup, cache, hcache, copies, ncopy>>
+                            oslot, tasks)
+            /\ UNCHANGED <<ostate, ogroup, cache, hcache, copies, ncopy, tasks, valid>>
     /\ handoff' = Kept(r)
     /\ UNCHANGED <<dbt, launched, inflight>>
 
@@ -425,12 +461,22 @@ TakeDetach(r) ==
     /\ requests' = requests \ {r}
     /\ IF On("R1") /\ ~(ostate[r.o] = "live" /\ OwnerEpoch[r.o] = r.e)
        THEN UNCHANGED <<pool, alloc, sharedKey>>
-       ELSE /\ ReleaseUnits(({table[r.o][p].u : p \in Positions} \cup {oslot[r.o]}) \ {NONE},
-                            r.after,
-                            [table EXCEPT ![r.o] = [p \in Positions |-> Empty]],
-                            [oslot EXCEPT ![r.o] = NONE])
-            /\ ostate' = [ostate EXCEPT ![r.o] = IF @ = "live" THEN "gone" ELSE @]
-            /\ UNCHANGED <<ogroup, cache, hcache, copies, ncopy>>
+       ELSE \* R9: a block a task holds is released only on the task's
+            \* completion. Without the rule the detach releases what the
+            \* owner's task holds, the task's slot row included.
+            LET mine == {t \in tasks : t.o = r.o /\ t.held}
+                tsk == IF On("R9") THEN tasks
+                       ELSE {IF t \in mine THEN [t EXCEPT !.held = FALSE] ELSE t : t \in tasks}
+                extra == IF On("R9") THEN {} ELSE {t.slot : t \in mine}
+            IN /\ tasks' = tsk
+               /\ ReleaseUnits(({table[r.o][p].u : p \in Positions} \cup {oslot[r.o]} \cup extra)
+                                  \ {NONE},
+                               r.after,
+                               [table EXCEPT ![r.o] = [p \in Positions |-> Empty]],
+                               [oslot EXCEPT ![r.o] = NONE],
+                               tsk)
+               /\ ostate' = [ostate EXCEPT ![r.o] = IF @ = "live" THEN "gone" ELSE @]
+               /\ UNCHANGED <<ogroup, cache, hcache, copies, ncopy, valid>>
     /\ handoff' = Kept(r)
     /\ UNCHANGED <<dbt, launched, inflight>>
 
@@ -442,15 +488,18 @@ TakeCommit(r) ==
     /\ IF ~(/\ ostate[r.o] = "live"
             /\ table[r.o][r.p].k = "private"
             /\ On("R1") => /\ OwnerEpoch[r.o] = r.e
+                           /\ ~Moving(r.o)
                            /\ ~\E d \in deferred : d.kind = "commit" /\ d.o = r.o /\ d.p = r.p)
        THEN UNCHANGED deferred
        ELSE deferred' = deferred \cup
               {[kind |-> "commit",
                 units |-> IF On("R6") THEN {table[r.o][r.p].u} ELSE {},
                 after |-> r.after,
-                o |-> r.o, p |-> r.p, k |-> r.k, c |-> 0, ok |-> FALSE]}
+                o |-> r.o, p |-> r.p, k |-> r.k, c |-> 0, ok |-> FALSE,
+                \* The group whose executor wrote the block: where it is valid.
+                g |-> ogroup[r.o], to |-> NONE]}
     /\ handoff' = Kept(r)
-    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, dbt, launched,
+    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, tasks, valid, dbt, launched,
                    inflight, alloc, sharedKey>>
 
 (* One `Finish` ends a copy: R1 refuses one that names no copy in flight,  *)
@@ -463,9 +512,30 @@ TakeFinish(r) ==
        THEN UNCHANGED deferred
        ELSE deferred' = deferred \cup
               {[kind |-> "finish", units |-> {}, after |-> r.after,
-                o |-> NONE, p |-> NONE, k |-> NONE, c |-> r.c, ok |-> r.ok]}
-    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, dbt, launched,
+                o |-> NONE, p |-> NONE, k |-> NONE, c |-> r.c, ok |-> r.ok,
+                g |-> NONE, to |-> NONE]}
+    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, tasks, valid, dbt, launched,
                    inflight, handoff, alloc, sharedKey>>
+
+(* A transfer waits for its stamps: until then the source group's batches  *)
+(* may still write the owner's blocks.                                     *)
+TakeTransfer(r) ==
+    /\ r \in requests /\ r.kind = "transfer" /\ Submittable(r)
+    /\ requests' = requests \ {r}
+    /\ IF ~(/\ ostate[r.o] = "live"
+            /\ On("R1") => /\ OwnerEpoch[r.o] = r.e
+                           /\ GroupEpoch[r.to] = r.e
+                           /\ r.to # ogroup[r.o]
+                           /\ ~Moving(r.o)
+                           /\ ~\E c \in copies : c.o = r.o)
+       THEN UNCHANGED deferred
+       ELSE deferred' = deferred \cup
+              {[kind |-> "transfer", units |-> {}, after |-> r.after,
+                o |-> r.o, p |-> NONE, k |-> NONE, c |-> 0, ok |-> FALSE,
+                g |-> NONE, to |-> r.to]}
+    /\ handoff' = Kept(r)
+    /\ UNCHANGED <<free, ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, tasks, valid,
+                   dbt, launched, inflight, alloc, sharedKey>>
 
 -----------------------------------------------------------------------------
 (* Deferred work comes due.                                                *)
@@ -475,7 +545,7 @@ ReleaseDue(d) ==
     /\ Reached(d.after)
     /\ deferred' = deferred \ {d}
     /\ Drop(d.units, table, oslot, cache, hcache, deferred', copies)
-    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, plane>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, tasks, valid, plane>>
 
 CommitDue(d) ==
     /\ d \in deferred /\ d.kind = "commit"
@@ -486,17 +556,18 @@ CommitDue(d) ==
            u == IF On("R6") THEN CHOOSE x \in d.units : TRUE
                 ELSE IF table[d.o][d.p].k = "private" THEN table[d.o][d.p].u ELSE NONE
        IN IF u = NONE
-          THEN UNCHANGED <<free, table, cache, alloc, sharedKey>>
+          THEN UNCHANGED <<free, table, cache, valid, alloc, sharedKey>>
           ELSE IF On("R4") /\ cache[d.k] # NONE
           \* R4: a key that is cached keeps its block; this one stays private.
           THEN /\ Drop(d.units, table, oslot, cache, hcache, deferred', copies)
-               /\ UNCHANGED <<table, cache>>
+               /\ UNCHANGED <<table, cache, valid>>
           ELSE /\ cache' = [cache EXCEPT ![d.k] = u]
+               /\ valid' = valid
                /\ table' = [table EXCEPT ![d.o][d.p] = IF @ = Private(u) THEN Shared(u) ELSE @]
                /\ free' = free
                /\ alloc' = [alloc EXCEPT ![u] = "shared"]
                /\ sharedKey' = [sharedKey EXCEPT ![u] = IF @ = NONE THEN d.k ELSE @]
-    /\ UNCHANGED <<ostate, ogroup, oslot, hcache, copies, ncopy, plane>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, hcache, copies, ncopy, tasks, plane>>
 
 (* The end of a copy takes effect (R3: once `completed` of its group has   *)
 (* reached the stamp of its `Finish`, so the copy has ended).              *)
@@ -511,30 +582,43 @@ FinishDue(d) ==
             IN CASE ~d.ok ->
                       \* Nothing was copied: the destination retires.
                       /\ Drop({c.read, c.write}, table, oslot, cache, hcache, deferred', copies')
-                      /\ UNCHANGED <<table, cache, hcache, dbt, handoff>>
+                      /\ UNCHANGED <<table, cache, hcache, valid, dbt, handoff>>
                  [] d.ok /\ c.kind = "clone" ->
                       \* The owner holds a private block with the cached content.
                       IF target
                       THEN /\ table' = [table EXCEPT ![c.o][c.p] = Private(c.write)]
+                           /\ valid' = [valid EXCEPT ![c.write] = {c.g}]
                            /\ Give([g |-> c.g, o |-> c.o, p |-> c.p, u |-> c.write, w |-> TRUE])
                            /\ Drop({c.read}, table', oslot, cache, hcache, deferred', copies')
                            /\ UNCHANGED <<cache, hcache>>
                       ELSE /\ Drop({c.read, c.write}, table, oslot, cache, hcache, deferred', copies')
-                           /\ UNCHANGED <<table, cache, hcache, dbt, handoff>>
-                 [] d.ok /\ c.kind = "load" ->
+                           /\ UNCHANGED <<table, cache, hcache, valid, dbt, handoff>>
+                 [] d.ok /\ c.kind = "load" /\ c.fill ->
+                      \* The group's memory of the shared block holds its content.
+                      /\ valid' = [valid EXCEPT ![c.write] = @ \cup {c.g}]
+                      /\ IF target
+                         THEN /\ table' = [table EXCEPT ![c.o][c.p] = Shared(c.write)]
+                              /\ Give([g |-> c.g, o |-> c.o, p |-> c.p, u |-> c.write, w |-> FALSE])
+                         ELSE UNCHANGED <<table, dbt, handoff>>
+                      /\ UNCHANGED <<free, cache, hcache, alloc, sharedKey>>
+                 [] d.ok /\ c.kind = "load" /\ ~c.fill ->
                       IF On("R4") /\ cache[c.k] # NONE
-                      \* R4: the key gained a device copy meanwhile; this block
+                      \* R4: the key gained a device block meanwhile; this block
                       \* stays private to the owner, which only reads it.
-                      THEN IF target
-                           THEN /\ table' = [table EXCEPT ![c.o][c.p] = Private(c.write)]
-                                /\ Give([g |-> c.g, o |-> c.o, p |-> c.p, u |-> c.write, w |-> FALSE])
-                                /\ Drop({c.read}, table', oslot, cache, hcache, deferred', copies')
-                                /\ UNCHANGED <<cache, hcache>>
-                           ELSE /\ Drop({c.read, c.write}, table, oslot, cache, hcache, deferred',
-                                        copies')
-                                /\ UNCHANGED <<table, cache, hcache, dbt, handoff>>
+                      THEN /\ IF target
+                              THEN /\ table' = [table EXCEPT ![c.o][c.p] = Private(c.write)]
+                                   /\ Give([g |-> c.g, o |-> c.o, p |-> c.p, u |-> c.write,
+                                            w |-> FALSE])
+                                   /\ Drop({c.read}, table', oslot, cache, hcache, deferred',
+                                           copies')
+                              ELSE /\ Drop({c.read, c.write}, table, oslot, cache, hcache,
+                                           deferred', copies')
+                                   /\ UNCHANGED <<table, dbt, handoff>>
+                           /\ valid' = [valid EXCEPT ![c.write] = {c.g}]
+                           /\ UNCHANGED <<cache, hcache>>
                       \* The block is shared on the device and pinned for the owner.
                       ELSE /\ cache' = [cache EXCEPT ![c.k] = c.write]
+                           /\ valid' = [valid EXCEPT ![c.write] = {c.g}]
                            /\ IF target
                               THEN /\ table' = [table EXCEPT ![c.o][c.p] = Shared(c.write)]
                                    /\ Give([g |-> c.g, o |-> c.o, p |-> c.p, u |-> c.write,
@@ -547,13 +631,82 @@ FinishDue(d) ==
                  [] d.ok /\ c.kind = "store" ->
                       IF On("R4") /\ hcache[c.k] # NONE
                       THEN /\ Drop({c.read, c.write}, table, oslot, cache, hcache, deferred', copies')
-                           /\ UNCHANGED <<table, cache, hcache, dbt, handoff>>
+                           /\ UNCHANGED <<table, cache, hcache, valid, dbt, handoff>>
                       ELSE /\ hcache' = [hcache EXCEPT ![c.k] = c.write]
                            /\ free' = free
                            /\ alloc' = [alloc EXCEPT ![c.write] = "shared"]
                            /\ sharedKey' = [sharedKey EXCEPT ![c.write] = c.k]
-                           /\ UNCHANGED <<table, cache, dbt, handoff>>
-    /\ UNCHANGED <<ostate, ogroup, oslot, ncopy, launched, inflight, requests>>
+                           /\ UNCHANGED <<table, cache, valid, dbt, handoff>>
+    /\ UNCHANGED <<ostate, ogroup, oslot, ncopy, tasks, launched, inflight, requests>>
+
+(* A transfer comes due: a task starts that copies into the target group's *)
+(* memory the owner's blocks that are not valid there. It holds every      *)
+(* block of the owner and a slot row of the target group.                  *)
+(* Without a free row there the transfer fails and nothing changes.        *)
+TransferDue(d) ==
+    /\ d \in deferred /\ d.kind = "transfer"
+    /\ On("R3") => Reached(d.after)
+    /\ LET units == {table[d.o][p].u : p \in Positions} \ {NONE}
+           rows == {s \in free \cap Slots : SlotGroup[s] = d.to}
+       IN \* It waits while a load fills the target group's memory of a block it holds.
+          /\ ~\E c \in copies : c.fill /\ c.g = d.to /\ c.write \in units
+          /\ deferred' = deferred \ {d}
+          /\ IF ostate[d.o] # "live" \/ rows = {}
+             THEN UNCHANGED <<free, tasks, alloc>>
+             ELSE \E s \in rows :
+                    /\ free' = free \ {s}
+                    /\ alloc' = [alloc EXCEPT ![s] = d.o]
+                    /\ tasks' = tasks \cup
+                         {[o |-> d.o, to |-> d.to, slot |-> s, held |-> TRUE,
+                           units |-> units \cup {oslot[d.o]},
+                           writes |-> {u \in units : d.to \notin valid[u]}]}
+    /\ UNCHANGED <<ostate, ogroup, oslot, table, cache, hcache, copies, ncopy, valid, plane,
+                   sharedKey>>
+
+(* A5: a task's completion is produced only after it stopped touching its  *)
+(* blocks. It may come at any time, as a success or a failure.             *)
+TaskEnd(t, ok) ==
+    /\ t \in tasks
+    /\ tasks' = tasks \ {t}
+    /\ IF ok /\ ostate[t.o] = "live"
+       THEN \* The owner is attached to the target group with its new slot row;
+            \* the executor of that group is handed every entry of the owner.
+            /\ ogroup' = [ogroup EXCEPT ![t.o] = t.to]
+            /\ oslot' = [oslot EXCEPT ![t.o] = t.slot]
+            \* The target group's memory holds what the task copied. A private
+            \* block that no commit froze is written there from now on, so the
+            \* source group's memory of it is stale.
+            /\ valid' = [u \in Units |->
+                           IF u \notin t.writes THEN valid[u]
+                           ELSE IF alloc[u] = "shared"
+                                   \/ \E d \in deferred : d.kind = "commit" /\ u \in d.units
+                                THEN valid[u] \cup {t.to}
+                                ELSE {t.to}]
+            /\ DropWith(t.units, table, oslot', cache, hcache, deferred, copies, tasks')
+            /\ IF \E r \in requests : r.kind = "detach" /\ r.o = t.o /\ r.e = OwnerEpoch[t.o]
+               THEN UNCHANGED <<dbt, handoff>>
+               ELSE LET entries ==
+                          {[g |-> t.to, o |-> t.o, p |-> p, u |-> table[t.o][p].u,
+                            w |-> /\ table[t.o][p].k = "private"
+                                  /\ ~\E d \in deferred :
+                                        d.kind = "commit" /\ d.o = t.o /\ d.p = p] :
+                             p \in {q \in Positions : table[t.o][q] # Empty}}
+                          \cup {[g |-> t.to, o |-> t.o, p |-> SLOT, u |-> t.slot, w |-> TRUE]}
+                    IN IF Eager
+                       THEN /\ handoff' = handoff
+                            /\ dbt' = [dbt EXCEPT ![t.to][t.o] =
+                                         [p \in Rows |->
+                                            IF \E h \in entries : h.p = p
+                                            THEN LET h == CHOOSE x \in entries : x.p = p
+                                                 IN [u |-> h.u, w |-> h.w]
+                                            ELSE NoEntry]]
+                       ELSE /\ handoff' = handoff \cup entries
+                            /\ dbt' = dbt
+       ELSE \* Failed, or the owner was detached meanwhile: what the task held retires.
+            /\ DropWith(t.units \cup {t.slot}, table, oslot, cache, hcache, deferred, copies, tasks')
+            /\ UNCHANGED <<ogroup, oslot, valid, dbt, handoff>>
+    /\ UNCHANGED <<ostate, table, cache, hcache, deferred, copies, ncopy, launched, inflight,
+                   requests>>
 
 -----------------------------------------------------------------------------
 
@@ -568,6 +721,8 @@ Init ==
     /\ deferred = {}
     /\ copies = {}
     /\ ncopy = 0
+    /\ tasks = {}
+    /\ valid = [u \in Units |-> {}]
     /\ dbt = [g \in Groups |-> [o \in Owners |-> [p \in Rows |-> NoEntry]]]
     /\ launched = [g \in Groups |-> 0]
     /\ inflight = {}
@@ -588,19 +743,21 @@ Next ==
     \/ \E g \in Groups : Launch(g)
     \/ \E b \in inflight : EndBatch(b)
     \/ \E c \in copies, ok \in BOOLEAN : ExecFinish(c, ok)
-    \/ \E r \in requests : TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r)
-    \/ \E d \in deferred : ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d)
+    \/ \E r \in requests :
+         TakeRelease(r) \/ TakeDetach(r) \/ TakeCommit(r) \/ TakeFinish(r) \/ TakeTransfer(r)
+    \/ \E d \in deferred : ReleaseDue(d) \/ CommitDue(d) \/ FinishDue(d) \/ TransferDue(d)
+    \/ \E t \in tasks, ok \in BOOLEAN : TaskEnd(t, ok)
 
 Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
 (* The properties. Their statements are those of specs/buffer-pool.md §17. *)
 
-Held(u) == HeldIn(u, table, oslot, cache, hcache, deferred, copies)
+Held(u) == HeldIn(u, table, oslot, cache, hcache, deferred, copies, tasks)
 PrivateHolders(u) ==
     {x \in Owners \X Positions : table[x[1]][x[2]] = Private(u)}
         \cup {x \in Owners \X {SLOT} : oslot[x[1]] = u}
-        \cup {<<c.id, "copy">> : c \in {x \in copies : x.write = u}}
+        \cup {<<c.id, "copy">> : c \in {x \in copies : x.write = u /\ ~x.fill}}
 CacheKeys(u) == {k \in Keys : cache[k] = u \/ hcache[k] = u}
 
 (* P1 Isolation, the buffer pool's part: a free unit has no holder, and a  *)
@@ -620,13 +777,24 @@ WriteIsolation ==
     \A b \in inflight : \A w \in b.writes : w[2] \notin free /\ alloc[w[2]] = w[1]
 ReadIsolation ==
     \A b \in inflight : \A r \in b.reads :
-        r[2] \notin free /\ alloc[r[2]] \in {r[1], "shared"}
+        /\ r[2] \notin free
+        /\ alloc[r[2]] \in {r[1], "shared"}
+        /\ r[2] \in Units => b.g \in valid[r[2]]
 CopyIsolation ==
     \A b \in inflight :
         /\ \A u \in b.cw : \E c \in copies : c.write = u /\ c.g = b.g /\ c.seq = b.seq
         /\ \A u \in b.cr : \E c \in copies : c.read = u /\ c.g = b.g /\ c.seq = b.seq
 
-P1 == FreeUnheld /\ Exclusive /\ WriteIsolation /\ ReadIsolation /\ CopyIsolation
+(* A task in flight writes only blocks of its owner, and of a shared block *)
+(* only the target group's memory while the block is not valid there.      *)
+TaskIsolation ==
+    \A t \in tasks :
+        /\ t.slot \notin free /\ alloc[t.slot] = t.o
+        /\ \A u \in t.writes :
+             /\ u \notin free
+             /\ alloc[u] = t.o \/ (alloc[u] = "shared" /\ t.to \notin valid[u])
+
+P1 == FreeUnheld /\ Exclusive /\ WriteIsolation /\ ReadIsolation /\ CopyIsolation /\ TaskIsolation
 
 (* P2 Integrity: a shared block is never private again, keeps its key, and *)
 (* is written neither by a batch nor by a copy; a copy reads a shared      *)
@@ -643,11 +811,12 @@ PinsCached ==
 OneKey == \A u \in AllUnits : Cardinality(CacheKeys(u)) <= 1
 (* A block is committed only after `completed` reached the stamp of its    *)
 (* commit, and the destination of a copy becomes shared only after the     *)
-(* stamp of its `Finish`: nothing in flight writes a shared block.         *)
+(* stamp of its `Finish`: nothing in flight writes memory in which a       *)
+(* shared block is valid.                                                  *)
 SharedUnwritten ==
     \A b \in inflight :
         /\ \A w \in b.writes : alloc[w[2]] # "shared"
-        /\ \A u \in b.cw : alloc[u] # "shared"
+        /\ \A u \in b.cw : alloc[u] = "shared" => b.g \notin valid[u]
 CopiesReadShared == \A b \in inflight : \A u \in b.cr : alloc[u] = "shared"
 
 P2 == KeyStable /\ PinsCached /\ OneKey /\ SharedUnwritten /\ CopiesReadShared
@@ -659,7 +828,8 @@ NoLeak == \A u \in AllUnits : u \in free \/ Held(u)
 Quiescent ==
     (/\ \A o \in Owners : ostate[o] # "live"
      /\ deferred = {}
-     /\ copies = {})
+     /\ copies = {}
+     /\ tasks = {})
         => \A u \in AllUnits : u \in free \/ (CacheKeys(u) # {} /\ ~Pinned(u))
 
 P3 == NoLeak /\ Quiescent
@@ -675,6 +845,7 @@ TypeOK ==
     /\ cache \in [Keys -> Units \cup {NONE}]
     /\ hcache \in [Keys -> HostUnits \cup {NONE}]
     /\ ncopy \in 0 .. MaxCopies
+    /\ valid \in [Units -> SUBSET Groups]
     /\ launched \in [Groups -> 0 .. MaxBatch]
     /\ alloc \in [AllUnits -> Owners \cup {NONE, "shared", "copy"}]
     /\ sharedKey \in [AllUnits -> Keys \cup {NONE}]
