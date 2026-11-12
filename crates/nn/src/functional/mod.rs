@@ -40,7 +40,9 @@ mod embedding;
 mod frame;
 mod linear;
 mod logits;
+mod noise;
 mod norm;
+mod pool;
 mod residual_norm;
 mod sparse;
 mod vsa;
@@ -58,7 +60,9 @@ pub use frame::frame_norm_pad;
 pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
 pub use linear::{ENCODE_CHUNK, WeightOrder, encode_block, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
+pub use noise::{philox_normal, philox_normal_rows};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
+pub use pool::adaptive_avg_pool2d;
 pub use residual_norm::{
     modulated_rms_norm, modulated_rms_norm_, scaled_residual_layer_norm, scaled_residual_rms_norm_,
 };

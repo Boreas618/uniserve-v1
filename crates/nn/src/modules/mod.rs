@@ -16,6 +16,7 @@ mod head;
 mod linear;
 mod mlp;
 mod norm;
+mod timestep;
 mod ulysses;
 mod vsa;
 
@@ -28,6 +29,9 @@ pub use linear::{Linear, LinearConfig, Parallel, QkvBias, QkvLinear, QkvLinearCo
 pub use mlp::{GateUp, Mlp, MlpConfig};
 pub use norm::{
     GatedRmsNorm, GatedRmsNormConfig, LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig,
+};
+pub use timestep::{
+    TimestepEmbedding, TimestepEmbeddingConfig, TimestepTable, TimestepTableConfig,
 };
 pub use ulysses::{UlyssesAttention, UlyssesAttentionConfig};
 pub use vsa::{VsaAttention, VsaAttentionConfig};

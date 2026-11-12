@@ -59,6 +59,7 @@
 //! | [`functional`] | The fused operators and stateless functions |
 //! | [`modules`] | `Linear`, `Embedding`, `LmHead`, `RmsNorm`, `LayerNorm`, `Mlp` and their parallel forms |
 //! | [`capability`] | The traits execution calls and the input values of their methods |
+//! | [`diffusion`] | Flow-matching schedules, the solver formulas and the sinusoidal time embedding |
 //! | [`family`] | The family traits, the registry and the shapes execution sizes a model by |
 //! | [`collective`], [`profiler`] | The model-facing forms of the backend's collectives and profiler ranges |
 
@@ -67,6 +68,7 @@ pub mod capability;
 pub mod checkpoint;
 pub mod collective;
 pub mod config;
+pub mod diffusion;
 pub mod error;
 pub mod family;
 pub mod functional;
