@@ -36,6 +36,7 @@
 
 mod activation;
 mod attention;
+mod commit;
 mod embedding;
 mod linear;
 mod logits;
@@ -44,6 +45,7 @@ mod norm;
 mod nvfp4;
 mod recurrent;
 mod rotary;
+mod sampling;
 
 use uniserve_tensor::{DType, Device, Shape, Tensor};
 
@@ -55,6 +57,7 @@ pub use activation::{
 pub use attention::{
     dense_attention, dense_attention_varlen, kv_write_, paged_attention, zero_arrival_counters_,
 };
+pub use commit::slot_commit_;
 pub use embedding::{embedding, vocabulary_shard};
 pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
 pub use linear::{WeightOrder, linear, linear_fp8, linear_nvfp4};
@@ -70,6 +73,10 @@ pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
 pub use nvfp4::{ENCODE_CHUNK, encode_block, nvfp4_quantize};
 pub use recurrent::{DELTA_RULE_CHUNK, causal_conv1d, gated_delta_rule};
 pub use rotary::{grid_positions, qk_norm_rope, qk_norm_rope_, rotary, rotary_factors};
+pub use sampling::{
+    argmax, candidate_order, filter_candidates_, inverse_cdf, log_softmax, logits_shape,
+    logprob_gather, softmax, top_k, top_logprobs,
+};
 
 /// Whether the descriptors this crate builds are the programmatic-dependent-launch variants.
 pub(crate) const PDL: bool = false;
