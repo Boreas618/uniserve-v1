@@ -4,14 +4,13 @@
 //! A sparse attention layer keeps one compressed index key per `ratio` consecutive tokens beside
 //! its pages of keys and values ([`KvPlanes::index_keys`](crate::KvPlanes::index_keys)). A query
 //! row scores the keys of the groups it may see ([`index_scores`]), keeps the best
-//! ([`top_k`]), and attends the tokens of those groups and of its own unfinished group
+//! ([`super::top_k`]), and attends the tokens of those groups and of its own unfinished group
 //! ([`indexed_attention`]), as vLLM's Qwen sparse attention does
 //! (`refs/vllm/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py:20-277`,
 //! `refs/vllm/vllm/models/qwen4_exp/nvidia/ops/qsa.py:75-330`):
 //!
 //! ```text
 //! index_scores        s[t, g] = Σ_h relu(q[t, h] · key[g])        g < visible[t], −inf otherwise
-//! top_k               the ids of a row's `width` largest entries, a tie to the lower id
 //! indexed_attention   o[t, i] = Σ_n softmax_n(q[t, i] · k[n, i / group] · scale) · v[n, i / group]
 //!                                                                  n ∈ selection[t], n ≥ 0
 //! ```
@@ -24,18 +23,14 @@ use ops::attention::{
     IndexScores, IndexScoresArgs, IndexScoresDescriptor, IndexedAttention, IndexedAttentionArgs,
     IndexedAttentionDescriptor,
 };
-use ops::sampler::{TopK, TopKArgs, TopKDescriptor, top_k_workspace};
 use uniserve_tensor::{DType, Device, Tensor};
 
-use super::{ACCUMULATE, PDL, on_cpu, row_tile};
+use super::{ACCUMULATE, on_cpu};
 use crate::capability::KvCache;
 use crate::error::{Error, Result};
 
 /// Index keys one `index_scores` kernel scores.
 const SCORES_BLOCK: u32 = 256;
-
-/// The widest tile one `top_k` pass reads.
-const TOP_K_TILE: u32 = 2048;
 
 /// The values of `column`, a U32 index column of a CPU batch.
 fn column(column: &Tensor) -> Result<Vec<u32>> {
@@ -171,69 +166,6 @@ pub fn index_scores(
         },
     )?;
     Ok(out)
-}
-
-/// The ids of the `width` largest entries of each row of `scores`, `[rows, columns]` FP32, in
-/// descending order of their entries, equal entries in ascending order of their ids:
-/// `[rows, width]` I32.
-///
-/// # Errors
-///
-/// Scores that are not FP32 rows, a width above the row's, or the operator's refusal.
-pub fn top_k(scores: &Tensor, width: usize) -> Result<Tensor> {
-    const OWNER: &str = "top_k";
-
-    let &[rows, columns] = scores.dims() else {
-        return Err(Error::shape(
-            OWNER,
-            format!("{:?} is not [rows, columns]", scores.dims()),
-        ));
-    };
-    if width == 0 || width > columns || scores.dtype() != DType::F32 {
-        return Err(Error::shape(
-            OWNER,
-            format!(
-                "the {width} largest of rows of {columns} {} entries",
-                ops::abi::name(scores.dtype())
-            ),
-        ));
-    }
-
-    if on_cpu(scores) {
-        let mut ids = Vec::with_capacity(rows * width);
-        for row in scores.to_vec2::<f32>()? {
-            let mut order: Vec<i32> = (0..columns as i32).collect();
-            // A stable sort keeps equal entries in ascending order of their ids.
-            order.sort_by(|a, b| row[*b as usize].total_cmp(&row[*a as usize]));
-            ids.extend_from_slice(&order[..width]);
-        }
-        return Ok(Tensor::from_vec(ids, (rows, width), &Device::Cpu)?);
-    }
-
-    let ids = backend::empty((rows, width), DType::I32)?;
-    let values = backend::empty((rows, width), DType::F32)?;
-    let workspace = top_k_workspace(rows as u64, width as u64);
-    let workspace = backend::empty(
-        (workspace.dim(0) as usize, workspace.dim(1) as usize),
-        DType::I32,
-    )?;
-    backend::launch::<TopK>(
-        &TopKDescriptor {
-            dtype: DType::F32,
-            vocabulary: columns as u32,
-            width: width as u32,
-            tile: row_tile(columns as u32).min(TOP_K_TILE),
-            ids: DType::I32,
-            pdl: PDL,
-        },
-        TopKArgs {
-            logits: backend::operand(scores)?,
-            values: backend::operand(&values)?,
-            ids: backend::operand(&ids)?,
-            workspace: backend::operand(&workspace)?,
-        },
-    )?;
-    Ok(ids)
 }
 
 /// Attention of each query row over the tokens its selection names, through the cache's pages:

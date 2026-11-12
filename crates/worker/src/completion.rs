@@ -1,53 +1,44 @@
-//! Shared operation results, waits, and completion observers.
+//! How an operation of the worker ended, and the completion its waiters share.
+//!
+//! Both are `ipc::execution`'s types over the worker's own error: a host task of a
+//! [`ThreadPool`](crate::thread_pool::ThreadPool) ends with an [`Outcome`] and is waited for
+//! through a [`Completion`], as a submission is over an [`ipc::execution::Fault`].
 
 use crate::Error;
 
 /// How an operation of the worker ended, with the worker's own error when it failed.
 ///
-/// Physical storage requires a successful retirement signal; a task result alone does not
-/// establish that a device has stopped.
+/// Storage a device addressed is released only on a success: a failure or a cancellation does not
+/// establish that the device stopped addressing it.
 ///
-/// The variants are `ipc::execution::Outcome`'s: a submission's outcome is the same type over a
+/// The variants are `ipc::execution::Outcome`'s: a submission ends with the same type over an
 /// [`ipc::execution::Fault`], which the worker's error converts into where a submission completes.
 pub type Outcome<T = ()> = ipc::execution::Outcome<T, Error>;
 
-/// One completion shared by an operation and its consumers, failing with the worker's own error.
+/// One completion shared by an operation and its waiters, failing with the worker's own error.
 ///
-/// `C` is the observer type: a shared [`Notify`] for physical retirements, which
-/// one observer may watch together with other signals, or a one-shot boxed closure for host task
-/// results. `T` is the operation's value. The type is `ipc::execution::Completion`, which a
-/// submission is built on too.
+/// `C` is the observer type, such as an [`ipc::execution::Waker`] that signals a waiter, and `T`
+/// the operation's value. The type is `ipc::execution::Completion`, which a submission is built
+/// on too.
 pub type Completion<C, T = ()> = ipc::execution::Completion<C, T, Error>;
-
-/// A completion or readiness observer. Observers only notify (wake a
-/// submission or the service loop); they never block or call back into the
-/// owner that notifies them.
-pub type Notify = std::sync::Arc<dyn Fn() + Send + Sync>;
-
-/// The physical retirement signal of storage an operation used.
-pub type Retirement = Completion<Notify, ()>;
-
-/// Run the observers of a completion, after its owner unlocked its state.
-pub fn notify(observers: Vec<Notify>) {
-    for observer in observers {
-        observer();
-    }
-}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::Result;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
+    use ipc::execution::Waker;
+
+    use super::*;
+    use crate::Result;
+
     #[test]
     fn a_subscriber_racing_completion_is_notified_exactly_once() -> Result<()> {
         for _ in 0..64 {
-            let completion = Retirement::default();
+            let completion = Completion::<Waker>::default();
             let calls = Arc::new(AtomicUsize::new(0));
-            let observer: Notify = {
+            let observer: Waker = {
                 let calls = Arc::clone(&calls);
                 Arc::new(move || {
                     calls.fetch_add(1, Ordering::Relaxed);
@@ -56,11 +47,13 @@ mod tests {
 
             thread::scope(|scope| -> Result<()> {
                 let subscriber = scope.spawn(|| {
-                    if let Some(callback) = completion.subscribe(observer) {
-                        callback();
+                    if let Some(observer) = completion.subscribe(observer) {
+                        observer();
                     }
                 });
-                notify(completion.complete(Ok(()))?);
+                for observer in completion.complete(Ok(()))? {
+                    observer();
+                }
                 subscriber
                     .join()
                     .map_err(|_| Error::State("subscriber panicked"))
@@ -75,8 +68,8 @@ mod tests {
     }
 
     #[test]
-    fn failure_and_cancellation_do_not_retire_storage() -> Result<()> {
-        let failed = Retirement::default();
+    fn a_failure_and_a_cancellation_are_done_and_not_succeeded() -> Result<()> {
+        let failed = Completion::<Waker>::default();
         assert!(!failed.done());
         failed.complete(Err(Error::transport("device completion unknown")))?;
         assert!(failed.done());
@@ -86,7 +79,7 @@ mod tests {
         };
         assert!(error.to_string().contains("device completion unknown"));
 
-        let cancelled = Retirement::default();
+        let cancelled = Completion::<Waker>::default();
         assert!(cancelled.cancel().0);
         assert!(cancelled.done());
         assert!(!cancelled.succeeded());

@@ -37,6 +37,7 @@
 mod activation;
 mod activation1d;
 mod attention;
+mod commit;
 mod conv;
 mod embedding;
 mod frame;
@@ -52,6 +53,7 @@ mod recurrent;
 mod residual_norm;
 mod rotary;
 mod rows;
+mod sampling;
 mod sparse;
 mod vsa;
 
@@ -66,10 +68,11 @@ pub use activation1d::activation1d;
 pub use attention::{
     dense_attention, dense_attention_varlen, kv_write_, paged_attention, zero_arrival_counters_,
 };
+pub use commit::slot_commit_;
 pub use conv::{Padding, causal_pad, conv_transpose1d, conv1d, conv3d};
 pub use embedding::{embedding, vocabulary_shard};
 pub use frame::frame_norm_pad;
-pub use indexed::{index_scores, indexed_attention, top_k};
+pub use indexed::{index_scores, indexed_attention};
 pub(crate) use linear::PRODUCT_SCALE_LAYOUT;
 pub use linear::{WeightOrder, linear, linear_fp8, linear_nvfp4};
 pub use logits::{LOGITS, vocab_unpad};
@@ -90,6 +93,10 @@ pub use residual_norm::{
 };
 pub use rotary::{grid_positions, qk_norm_rope, qk_norm_rope_, rotary, rotary_factors};
 pub use rows::place_rows_;
+pub use sampling::{
+    argmax, candidate_order, filter_candidates_, inverse_cdf, log_softmax, logits_shape,
+    logprob_gather, softmax, top_k, top_logprobs,
+};
 pub use sparse::sparse_attention;
 pub use vsa::{
     vsa_add_gated_tiles_, vsa_compose_gated_rows, vsa_compress_pooled, vsa_prepare_tiles_,

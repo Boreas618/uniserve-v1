@@ -1,363 +1,102 @@
-//! The runner a block's phase is served by, and the registry the device worker holds.
+//! The runner: what serves one stage a rank holds.
 //!
-//! A runner serves one block's phases: it owns the captured graphs of those
-//! phases, the arena their activations live in, and the slot state a token batch advances. It is
-//! called only on the device worker's thread and only one job at a time, which is why the design
-//! gives it `&mut self` and no synchronization.
+//! A runner owns its model through a capability trait of `nn::capability`, its input tensors and
+//! its [`Graphs`], which hold the execution context its forwards compute under. It is called
+//! only on its device's executor thread, one job at a time.
 //!
-//! [`Runner`] is the design's trait verbatim. Its `precopy`, `switchover` and `purge` are the
-//! runner's half of the generation update (7.3): precopy prepares the next generation's graphs
-//! from the current one, switchover takes effect at a batch boundary, and purge releases the graphs
-//! that still reference a replaced generation after its last batch.
+//! There is one implementation per capability. Everything the implementations share (the
+//! profile run, capture, replay, the input buffer, generations and shadow) is [`Graphs`]'s, which
+//! reaches a runner through this trait alone: [`Runner::buckets`] states what warm-up captures
+//! and [`Runner::forward`] is the one function that is run on the meta device, captured, and run
+//! again before each replay.
 
-use std::sync::Arc;
-
-use ipc::PhaseId;
-use ops::Generation;
+use ipc::execution::{Batch, BatchOutput};
+use uniserve_tensor::Tensor;
 
 use crate::Result;
-use crate::batch::Jobs;
-use ipc::execution::Batch;
+use crate::buckets::Bucket;
+use crate::graphs::Graphs;
 
-/// The worker's name for one runner on a device.
+/// The executor's name for one runner of its device.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RunnerId(pub u32);
 
-/// What the design calls a runner (4.5).
-///
-/// A runner serves the phases it names. `submit` turns one batch into the device work that serves
-/// it, after staging the batch's host columns; `precopy` prepares the graphs the next generation
-/// needs and returns the jobs that finish the preparation on the device; `switchover` and `purge`
-/// are executed at batch boundaries by the device worker.
+/// One stage a rank holds, as the executor and [`Graphs`] drive it.
 pub trait Runner: Send {
-    /// The phases this runner serves, as the scheduler addresses them (4.5).
-    fn phases(&self) -> &[PhaseId];
+    /// The phases this runner serves, as the scheduler addresses them in a batch.
+    fn phases(&self) -> &[ipc::PhaseId];
 
-    /// The stream this runner issues its work on, when it has one.
+    /// The buckets warm-up captures, largest first.
     ///
-    /// The worker waits on the runners' streams after each job: a runner owns the stream its
-    /// graphs replay on, and the worker has none of its own.
-    fn stream(&self) -> Option<&platform::Stream> {
-        None
-    }
+    /// The ranks of a group state the same buckets in the same order: a collective captured in
+    /// one rank's graph meets the same collective of every other rank's.
+    fn buckets(&self) -> Vec<Bucket>;
 
-    /// Whether a replay of this runner may be launched while its previous replay still runs.
+    /// The forward of one bucket over the runner's input tensors: the one function that is run
+    /// on the meta device, captured, and run again by `prepare_inputs` before each replay.
     ///
-    /// Launching a large graph takes the driver milliseconds, and the device sits idle for them
-    /// when the launch waits for the previous replay to end. A runner that says yes reads nothing
-    /// of a replay's staging from memory the next `submit` or `serve` writes.
-    fn overlaps_replays(&self) -> bool {
-        false
-    }
-
-    /// Whether the batch just staged may stay in flight once launched, which a runner whose answer
-    /// feeds the next launch refuses for that batch alone.
-    fn overlaps_staged(&self) -> bool {
-        self.overlaps_replays()
-    }
-
-    /// Turns `output`, the answer a replay gave when it launched, into its answer now that its work
-    /// has landed.
-    fn landed(
-        &mut self,
-        output: ipc::execution::BatchOutput,
-    ) -> Result<ipc::execution::BatchOutput> {
-        Ok(output)
-    }
-
-    /// Serves one batch: stage its inputs, choose its bucket, and return the device work.
-    fn submit(&mut self, batch: Batch) -> Result<Jobs>;
-
-    /// The media buckets this runner's plan captures, stated at spawn (2.4).
-    ///
-    /// Stated here rather than answered on demand because the mechanism chooses a device without
-    /// asking the device thread: the worker's handle mirrors this list beside the phases, the way
-    /// it mirrors those, and the mechanism's planner selects from the mirror. A causal-LM runner
-    /// states none - its plan holds no media graph (`plan::Bucket::causal_lm` refuses one).
-    fn media_plan(&self) -> Vec<crate::plan::Bucket> {
-        Vec::new()
-    }
-
-    /// The buckets the next generation captures, in capture order, as this runner sees them.
-    ///
-    /// The first generation of an epoch has nothing to compare against, so every operator of every
-    /// bucket is new and one capture per bucket records them all: this list is that work stated
-    /// before it begins, which is the only way a run can see the number before paying for it. It is
-    /// the same set `warmup` walks, in the same order.
-    fn capture_plan(&self) -> Vec<crate::plan::Bucket> {
-        Vec::new()
-    }
-
-    /// The resident cache this runner reads, when it reads one: what a sleep gives back and a wake
-    /// maps again (2.5).
-    ///
-    /// The caller dedups by the handle's address, because two runners of one device may share one
-    /// cache and a second wake would reset units the first had just mapped.
-    fn cache(
-        &self,
-    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
-        None
-    }
-
-    /// The rank's weights changed at their addresses (7.6): a runner fills again what it folded
-    /// from them. It runs on the device thread with nothing in flight, and its work completes
-    /// before a batch reads the weights. A runner that folds nothing has nothing to do.
-    fn weights_changed(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    /// Writes the trajectories of preempted requests that this runner holds to the host latent pool
-    /// slots the engine reserved (`ipc::LatentOffload`), and answers whether it held them. It runs
-    /// on the device thread behind every batch that advanced the trajectories, and the copies have
-    /// completed when it returns. A runner that holds no trajectory answers `false`.
-    fn offload_latents(&mut self, offloads: &[ipc::LatentOffload]) -> Result<bool> {
-        let _ = offloads;
-        Ok(false)
-    }
-
-    /// Hands the runner the device's record of the operators a generation update could not
-    /// compare (7.3 step 2).
-    ///
-    /// The record lives on the device worker because the control thread reports it when a
-    /// precopy finishes, and the runners themselves run on the device thread. A runner that
-    /// compares nothing ignores it.
-    fn attach_uncompared(&mut self, sink: std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        let _ = sink;
-    }
-
-    /// Turns one shadow batch of the scheduler's `shadow` pass into the paired forwards it needs
-    /// (7.3 step 2).
-    ///
-    /// `batch.generation` is the generation being prepared: the batch's columns say what to run and
-    /// the runner compares that generation's kernels against the serving one's, operator by
-    /// operator, without writing resident memory. A runner that shadows no operator returns no
-    /// job.
-    fn shadow(&mut self, batch: Batch) -> Result<Jobs> {
-        let _ = batch;
-        Err(crate::Error::Invariant(
-            "this runner has no shadow pass".into(),
-        ))
-    }
-
-    /// Captures every bucket of the serving generation that has no graph yet, largest first
-    /// (`specs/replaceable-processes.md` 9.4 step 3: the worker captures before it serves).
-    ///
-    /// The returned jobs are the captures, each performed by this runner when the device worker
-    /// reaches it, so a warmup interleaves with anything else the device is doing. A runner whose
-    /// buckets are all captured returns no job.
-    fn warmup(&mut self) -> Result<Jobs> {
-        let order = self.capture_plan();
-        Ok(self
-            .lifecycle_mut()
-            .map(|lifecycle| lifecycle.warmup(order))
-            .unwrap_or_default())
-    }
-
-    /// The lifecycle that holds this runner's graphs, generations and pools, for a runner that
-    /// captures any; the generation methods of this trait forward to it by default, so a runner
-    /// with no graph (a host stage) states nothing and a runner with one states this alone.
-    fn lifecycle_mut(&mut self) -> Option<&mut crate::runners::lifecycle::Lifecycle> {
-        None
-    }
-
-    /// Prepares the next generation (7.3): rebind the buckets whose program change leaves the
-    /// launch structure intact, recapture those whose structure changes, and return the jobs the
-    /// device must run between serving batches to finish it.
-    ///
-    /// Which of the two a bucket needs is a fact about the walk's launch structure against the
-    /// captured graph, so a runner returns the walk job and decides inside it (4.5).
-    ///
-    /// Precopy leaves the current generation serving. The runner holds both generations until
-    /// `purge` releases the old one.
-    fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs> {
-        match self.lifecycle_mut() {
-            Some(lifecycle) => lifecycle.precopy(next),
-            None => Ok(Jobs::default()),
-        }
-    }
-
-    /// Switches to `generation` at a batch boundary: from the next batch on, `submit` serves with
-    /// its kernels and graphs. The runner keeps the previous generation for a revert (7.3).
-    ///
-    /// A generation this runner did not prepare is refused by name: the daemon asks for the
-    /// cut-over only after `precopy` built the generation, so a switchover that finds nothing to
-    /// switch to is the two disagreeing about what was prepared - and the alternative, taking the
-    /// generation's number with no kernels and no graphs behind it, would serve an empty
-    /// generation that answers every later batch with "no graph for this bucket".
-    fn switchover(&mut self, generation: u64) -> Result<()> {
-        match self.lifecycle_mut() {
-            Some(lifecycle) => lifecycle.switchover(generation),
-            None => Ok(()),
-        }
-    }
-
-    /// Reverts a generation (7.3 step 4).
-    ///
-    /// After a switchover this is the switchover reversed: the generation kept for a revert serves
-    /// again and the failed one takes its place as the kept generation, so its graphs and kernels
-    /// live until `purge` releases them after the last batch that used them. A generation that
-    /// never took over has its graphs released here and the serving generation is untouched.
-    ///
-    /// Design 4.5's method list does not name it and a failed precopy cannot do without it, so it
-    /// is a filled silence beside `serve` and `warmup`.
-    fn revert(&mut self, generation: u64) {
-        if let Some(lifecycle) = self.lifecycle_mut() {
-            lifecycle.revert(generation);
-        }
-    }
-
-    /// Releases everything that references a generation older than `generation` (7.3): the graphs
-    /// and the kernels they held. It runs after the last batch of the old generation completed.
-    fn purge(&mut self, generation: u64) {
-        if let Some(lifecycle) = self.lifecycle_mut() {
-            lifecycle.purge(generation);
-        }
-    }
-
-    /// Releases everything that references `generation`, which was prepared and never served
-    /// (7.3 step 2): its graphs, the kernels they held, and its arena regions where nothing else
-    /// addresses them.
-    ///
-    /// This is not `purge`, which drops what is *older* than the serving generation: a precopy that
-    /// was abandoned leaves a generation *newer* than it, and only this call reaches that.
-    /// Abandons a prepared generation: its graphs go, then the arena regions no live generation
-    /// holds. A generation this runner serves - the serving one or probation's old one - is refused
-    /// by name: discarding it would take away the graphs that answer batches.
-    fn discard(&mut self, generation: u64) -> Result<()> {
-        match self.lifecycle_mut() {
-            Some(lifecycle) => lifecycle.discard(generation),
-            None => Ok(()),
-        }
-    }
-
-    /// Walks every bucket this runner captures, and every forward it launches eagerly while it warms
-    /// and serves, on a recording forward over a counting arena
-    /// ([`crate::runners::recording`]): the programs those forwards launch and the extent they
-    /// reserve in this runner's stream region.
-    ///
-    /// The device worker calls it once the pools are attached and before any capture maps a range,
-    /// claims the stream's region from the recorded peak, and answers the recorded keys to the
-    /// engine, which installs exactly those in the epoch's first generation. The walk issues no
-    /// device work. A runner that launches nothing on the device answers an empty recording, and its
-    /// stream keeps the even share.
-    fn record_walk(&mut self) -> crate::Result<crate::runners::recording::Footprint> {
-        Ok(crate::runners::recording::Footprint::default())
-    }
-
-    /// Gives the runner a staging region of `bytes`, the extent its recorded walk's uploads reached
-    /// ([`crate::runners::recording::Footprint::staging`]), before its first capture: every
-    /// forward of the runner uploads its host values through it ([`crate::staging`]).
+    /// It computes under the context installed on the thread, reads the runner's input tensors
+    /// at their fixed addresses and returns the forward's outputs in an order the runner fixes
+    /// per bucket. Its launches, allocations and host-to-device copies follow from the bucket
+    /// alone, never from a request's values.
     ///
     /// # Errors
     ///
-    /// When the page-locked allocation fails.
-    fn size_staging(&mut self, device: platform::DeviceId, bytes: u64) -> crate::Result<()> {
-        match self.lifecycle_mut() {
-            Some(lifecycle) => lifecycle.size_staging(device, bytes),
-            None => Ok(()),
-        }
-    }
+    /// What the model refuses, or a bucket this runner does not state.
+    fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>>;
 
-    /// Gives the runner the device's graph pools, before its first capture.
+    /// Writes into `columns`, the bytes of the runner's input tensors in the layout of their
+    /// device block, the inputs of an idle step of `bucket`: rows that address no slot, page,
+    /// token or request, so a forward over them reads and writes no request's state. Warm-up
+    /// runs each bucket's forward over these before it captures it, and a generation is
+    /// prepared over them beside the serving graphs.
     ///
-    /// One pool set exists per device and every runner issuing on it books into the same one
-    /// (4.1): two runners each reserving their own range would double-book the device's graph
-    /// storage. The device worker calls this when it starts.
-    fn attach_pools(&mut self, pools: std::sync::Arc<std::sync::Mutex<crate::arena::Pools>>) {
-        if let Some(lifecycle) = self.lifecycle_mut() {
-            lifecycle.attach_pools(pools);
-        }
-    }
-
-    /// Gives the runner the shadow harness of its device (7.3): the paired forward needs an
-    /// allocator-backed twin region, so the worker carves it and installs it here. A runner that
-    /// shadows no operator ignores it.
-    fn attach_shadow(&mut self, shadow: crate::shadow::Shadow, page_set_bytes: u64) {
-        let _ = (shadow, page_set_bytes);
-    }
-
-    /// Gives the runner the device's counters, when its work adds to them.
+    /// # Errors
     ///
-    /// The device worker calls this when it starts, beside [`Runner::attach_pools`]. A runner
-    /// that launches kernels adds their number here as it replays, so the metrics report's
-    /// `kernel_launches` is the device's figure and not a per-runner estimate.
-    fn attach_counters(&mut self, counters: std::sync::Arc<crate::device::SharedCounters>) {
-        let _ = counters;
-    }
+    /// A bucket this runner does not state.
+    fn idle_inputs(&self, bucket: &Bucket, columns: &mut [u8]) -> Result<()>;
 
-    /// Gives the runner the epoch's product store: the conditioning and trajectories one call
-    /// produces and another call of the same request reads.
+    /// Chooses the smallest bucket that holds `batch`, fills the input tensors from the batch's
+    /// columns and writes the host values the bucket's forward computes into the input buffer
+    /// ([`Graphs::prepare_inputs`]).
     ///
-    /// The device worker calls this when it starts, beside [`Runner::attach_pools`]. A runner that
-    /// produces or reads no product across calls ignores it; one that does refuses a call whose
-    /// product no call produced, rather than reading a region nobody wrote
-    /// ([`crate::runners::products`]).
-    fn attach_products(
-        &mut self,
-        products: std::sync::Arc<dyn crate::runners::products::Products>,
-    ) {
-        let _ = products;
-    }
-
-    /// Performs one job this runner returned from `submit` or `precopy`, on the device worker's
-    /// thread, when the worker reaches it in submission order.
+    /// # Errors
     ///
-    /// The design's trait has no such method and needs one: 4.5 has a recapture run "as a job on
-    /// the worker, alternating with serving batches", and only the runner owns the model and the
-    /// arena that a capture, a replay or a rebind needs. The worker cannot perform those jobs
-    /// itself, so the runner that returned them performs them here.
-    fn serve(&mut self, job: &crate::batch::Job) -> Result<ipc::execution::BatchOutput>;
-}
+    /// A batch no bucket holds, or columns the runner refuses.
+    fn prepare_inputs(&mut self, batch: &Batch) -> Result<Bucket>;
 
-/// One runner the device worker owns: its name, the phases it serves, and the runner itself.
-///
-/// What binds a runner to the worker: its name, the phases it serves, and the device it issues
-/// on.
-///
-/// The four travel together - a runner is named once, serves a fixed set of phases, and issues
-/// every job on one device's one stream - so a constructor that took them apart could be called
-/// with answers that belong to different runners.
-pub struct Binding {
-    /// The worker's name for this runner.
-    pub id: RunnerId,
-    /// The phases it serves, in scheduler order.
-    pub phases: Vec<PhaseId>,
-    /// The device it computes on.
-    pub device: platform::DeviceId,
-    /// The stream every job it issues runs on.
-    pub stream: platform::Stream,
-}
-
-/// The device worker keeps these in [`RunnerId`] order and serves a batch through the runner
-/// whose phase it names.
-pub struct NamedRunner {
-    /// The worker's name for this runner.
-    pub id: RunnerId,
-    /// The phases it serves, in the order its `phases` returns them.
-    pub phases: Vec<PhaseId>,
-    /// The runner itself.
-    pub runner: Box<dyn Runner>,
-}
-
-impl NamedRunner {
-    /// A named runner, taking the phase list from the runner itself.
-    pub fn new(id: RunnerId, runner: Box<dyn Runner>) -> Self {
-        let phases = runner.phases().to_vec();
-        Self { id, phases, runner }
+    /// As [`Runner::prepare_inputs`], for a shadow batch of the generation being prepared: the
+    /// inputs of a paired forward ([`Graphs::shadow`]), which must write no state a serving
+    /// request reads, so the runner redirects what the forward writes to scratch memory.
+    ///
+    /// # Errors
+    ///
+    /// The default refuses: a runner that states no scratch memory shadows nothing.
+    fn prepare_shadow_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+        let _ = batch;
+        Err(crate::Error::Unsupported(
+            "this runner prepares no inputs for a paired forward".to_owned(),
+        ))
     }
 
-    /// Whether this runner serves `phase`.
-    pub fn serves(&self, phase: PhaseId) -> bool {
-        self.phases.contains(&phase)
-    }
-}
+    /// One step: prepare the inputs, run the bucket's graph, read the outputs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::prepare_inputs`], or the device's failure.
+    fn execute(&mut self, batch: &Batch) -> Result<BatchOutput>;
 
-impl std::fmt::Debug for NamedRunner {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("NamedRunner")
-            .field("id", &self.id)
-            .field("phases", &self.phases)
-            .finish_non_exhaustive()
+    /// The runner's graphs: what the executor captures, switches and releases at a batch
+    /// boundary, and what a profile run of the runner is recorded in.
+    fn graphs(&self) -> &Graphs;
+
+    /// The runner's weights changed at their addresses: recompute what the runner or its model
+    /// derived from them. It runs on the executor thread with nothing in flight.
+    ///
+    /// # Errors
+    ///
+    /// What recomputing a derived constant fails with.
+    fn weights_changed(&mut self) -> Result<()> {
+        Ok(())
     }
 }

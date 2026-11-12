@@ -459,7 +459,9 @@ impl IndexedAttention {
         )?;
         let block_topk = self.indexer.block_topk() as usize;
         let kept_groups = block_topk.min(scores.dims()[1]);
-        let best = functional::top_k(&scores, kept_groups)?;
+        // The ids are below `i32::MAX`, so their U32 bits read as the I32 the columns below are.
+        let (_, best) = functional::top_k(&scores, kept_groups as u32)?;
+        let best = best.view(DType::I32)?;
 
         // The tokens of the selected groups, in rank order; a row that sees fewer groups
         // than it may keep names none past them.

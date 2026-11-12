@@ -925,7 +925,8 @@ fn the_indexed_functions_are_vllms_references() {
     );
 
     // The best groups of each row, as a set: the order among them is free.
-    let best: Vec<Vec<i32>> = functional::top_k(&scores, 8).unwrap().to_vec2().unwrap();
+    let (_, best) = functional::top_k(&scores, 8).unwrap();
+    let best: Vec<Vec<i32>> = best.view(DType::I32).unwrap().to_vec2().unwrap();
     let expected: Vec<Vec<i32>> = named("out.best").to_vec2().unwrap();
     for (row, (best, expected)) in best.iter().zip(&expected).enumerate() {
         let mut kept: Vec<i32> = expected

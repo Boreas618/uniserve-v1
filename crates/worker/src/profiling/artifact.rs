@@ -1,24 +1,22 @@
-//! A session's file: one SQLite database per rank, in UniServe's own
-//! schema.
+//! A session's file: one SQLite database per rank, in UniServe's own schema.
 //!
-//! The schema is versioned ([`SCHEMA_VERSION`]) and changes only by
-//! additions: a later version adds tables or columns, never removes or
-//! redefines one, so a reader of an earlier version reads every file of a
-//! later one. The file states its version and its own schema
-//! (`schema_version`, and SQLite's `sqlite_schema`).
+//! The schema is versioned ([`SCHEMA_VERSION`]) and changes only by additions: a later version
+//! adds tables or columns, never removes or redefines one, so a reader of an earlier version reads
+//! every file of a later one. The file states its version and its own schema (`schema_version`,
+//! and SQLite's `sqlite_schema`). Its table and column names are the file format
+//! `uniserve_eval.profile` reads: the range markers' stamps are the table `fence`, the markers
+//! `fence_probe`, and a module's class the column `component`.
 //!
-//! Every raw record kind has a table of its own, beside the tables that
-//! describe them: `metadata` (the session, the epoch, the rank, its device,
-//! the CUPTI version, the request, the clocks and what the identifiers
-//! mean), `strings` (kernel, API, NVTX and function names, by id), `clocks`
-//! (the alignment of every clock the records use) and `collectors` (what ran,
-//! and what the quality-of-service guard turned off). Times are nanoseconds
-//! in the clock `metadata` names for each table.
+//! Every raw record kind has a table of its own, beside the tables that describe them: `metadata`
+//! (the session, the epoch, the rank, its device, the CUPTI version, the request, the clocks and
+//! what the identifiers mean), `strings` (kernel, API, NVTX and function names, by id), `clocks`
+//! (the alignment of every clock the records use) and `collectors` (what ran, and what the
+//! quality-of-service guard turned off). Times are nanoseconds in the clock `metadata` names for
+//! each table.
 //!
-//! The writer is a thread of its own: collectors hand it rows over a
-//! channel ([`Writer`]) and never wait for the file. It commits a
-//! transaction per [`COMMIT_PERIOD`] and checkpoints the write-ahead log into
-//! the file when the session ends, leaving one file.
+//! The writer is a thread of its own: collectors send it rows over a channel ([`Writer::rows`],
+//! [`send`]) and never wait for the file. It commits a transaction per [`COMMIT_PERIOD`] and
+//! checkpoints the write-ahead log into the file when the session ends, leaving one file.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -34,7 +32,7 @@ use platform::cupti::range_profiler::Range;
 use platform::cupti::records::Record;
 use rusqlite::{Connection, params};
 
-use super::fences::FenceRecord;
+use super::markers::Stamp;
 use crate::{Error, Result};
 
 /// The schema's version.
@@ -107,8 +105,8 @@ CREATE TABLE pc_take (take INTEGER PRIMARY KEY, time INTEGER NOT NULL,
     non_user_samples INTEGER NOT NULL, hardware_buffer_full INTEGER NOT NULL);
 ";
 
-/// What the meaning of each table's identifiers and clocks is, written into
-/// `metadata` under `doc.<table>`.
+/// What the meaning of each table's identifiers and clocks is, written into `metadata` under
+/// `doc.<table>`.
 const DOCS: &[(&str, &str)] = &[
     (
         "doc.clocks",
@@ -129,15 +127,16 @@ const DOCS: &[(&str, &str)] = &[
     ),
     (
         "doc.fence",
-        "fence.probe is 2 * instance at a component instance's entry and 2 * instance + 1 at \
-         its exit (fence_probe), 1048574 at a step's begin and 1048575 at its end; \
-         fence.step is the low 32 bits of the step's batch id (steps.step).",
+        "fence.probe is the range marker that wrote the row: 2 * instance at a module \
+         instance's entry and 2 * instance + 1 at its exit (fence_probe, whose component is \
+         the module's class), 1048574 at a step's begin and 1048575 at its end; fence.step is \
+         the low 32 bits of the step's batch id (steps.step).",
     ),
     (
         "doc.steps",
         "A step is one batch's forward on the rank: its batch id, its stage (call kind) and \
-         whether the session's window recorded it; begin and end are when the rank's device \
-         thread submitted the forward's first work and saw its last complete.",
+         whether the session's window recorded it; begin and end are when the rank's \
+         executor submitted the forward's first work and saw its last complete.",
     ),
     (
         "doc.pc_sample",
@@ -155,15 +154,26 @@ pub(crate) enum Message {
         detail: String,
     },
     Clock(ClockRow),
-    Step(StepRow),
+    /// One step: its batch id, its stage, whether the session's window took it, and when its
+    /// forward began and ended on CUPTI's clock.
+    Step {
+        step: u64,
+        stage: String,
+        selected: bool,
+        begin: u64,
+        end: Option<u64>,
+    },
     Timeline {
         records: Vec<Record>,
         names: Vec<(u32, String)>,
     },
-    FenceProbes(Vec<(u32, String, String)>),
-    Fences {
+    /// The module instances that carry range markers, as `(class, path)` in their numbers'
+    /// order.
+    Instances(Vec<(String, String)>),
+    /// The stamps a reader took from `device`'s range markers.
+    Stamps {
         device: i32,
-        records: Vec<FenceRecord>,
+        stamps: Vec<Stamp>,
     },
     Pm {
         metrics: Vec<String>,
@@ -177,58 +187,40 @@ pub(crate) enum Message {
     Pc(Taken),
 }
 
-/// One sample of clocks at one instant.
-#[derive(Clone, Debug)]
+/// One sample of the clocks it names at one instant, to within `uncertainty`: a row of the
+/// file's `clocks`. Times are nanoseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClockRow {
+    /// What sampled the clocks: the session's `start` or `end`, or `globaltimer` for a device's
+    /// calibration.
     pub(crate) source: &'static str,
+    /// The CUDA device whose `%globaltimer` is `gpu`.
     pub(crate) device: Option<i32>,
     pub(crate) gpu: Option<u64>,
+    /// The host's `CLOCK_REALTIME` at the sample's midpoint.
     pub(crate) realtime: u64,
+    /// CUPTI's clock at the sample's midpoint.
     pub(crate) cupti: Option<u64>,
+    /// The host's `CLOCK_MONOTONIC`.
     pub(crate) monotonic: Option<u64>,
+    /// Half the time the sample took on the host: the alignment's bound.
     pub(crate) uncertainty: u64,
-}
-
-/// One step.
-#[derive(Clone, Debug)]
-pub(crate) struct StepRow {
-    pub(crate) step: u64,
-    pub(crate) stage: String,
-    pub(crate) selected: bool,
-    pub(crate) begin: u64,
-    pub(crate) end: Option<u64>,
-}
-
-/// What a finished file holds.
-#[derive(Clone, Debug, Default, serde::Serialize)]
-pub(crate) struct Summary {
-    pub(crate) path: PathBuf,
-    pub(crate) bytes: u64,
-    /// Rows by table.
-    pub(crate) rows: BTreeMap<String, u64>,
 }
 
 /// The writer of one session's file.
 pub(crate) struct Writer {
     sender: Sender<Message>,
-    thread: Option<JoinHandle<Result<Summary>>>,
+    thread: Option<JoinHandle<Result<serde_json::Value>>>,
     bytes: Arc<AtomicU64>,
 }
 
-/// Where collectors send rows; cloned into each.
-#[derive(Clone)]
-pub(crate) struct Rows(Sender<Message>);
-
-impl Rows {
-    /// Send `message`; a writer that ended (its file failed) drops it.
-    pub(crate) fn send(&self, message: Message) {
-        let _ = self.0.send(message);
-    }
+/// Sends `message` to the writer `rows` leads to; a writer that ended (its file failed) drops it.
+pub(crate) fn send(rows: &Sender<Message>, message: Message) {
+    let _ = rows.send(message);
 }
 
 impl Writer {
-    /// Create the file `path` with the schema and `metadata`, and start the
-    /// writer.
+    /// Creates the file `path` with the schema and `metadata`, and starts the writer.
     ///
     /// # Errors
     ///
@@ -281,9 +273,9 @@ impl Writer {
         })
     }
 
-    /// Where collectors send rows.
-    pub(crate) fn rows(&self) -> Rows {
-        Rows(self.sender.clone())
+    /// Where collectors send rows ([`send`]); each takes a clone.
+    pub(crate) fn rows(&self) -> Sender<Message> {
+        self.sender.clone()
     }
 
     /// The bytes the file holds so far, its write-ahead log included.
@@ -291,16 +283,17 @@ impl Writer {
         self.bytes.load(Ordering::Acquire)
     }
 
-    /// Write what remains, checkpoint the file and close it, once every
-    /// [`Rows`] clone is dropped.
+    /// Writes what remains, checkpoints the file and closes it, once every clone of
+    /// [`Writer::rows`] is dropped. Returns what the finished file holds, as the session's
+    /// response states it: its `path`, its `bytes` and its `rows` by table.
     ///
     /// # Errors
     ///
     /// Fails with the first error the file met.
-    pub(crate) fn finish(mut self) -> Result<Summary> {
+    pub(crate) fn finish(mut self) -> Result<serde_json::Value> {
         drop(self.sender);
         match self.thread.take().map(JoinHandle::join) {
-            Some(Ok(summary)) => summary,
+            Some(Ok(finished)) => finished,
             Some(Err(_)) => Err(Error::State("the profile writer panicked")),
             None => Err(Error::State("the profile writer finished already")),
         }
@@ -333,9 +326,13 @@ fn size(path: &Path) -> u64 {
 }
 
 impl File {
-    /// Write what arrives, a transaction per period, until every sender is
-    /// dropped; then checkpoint and close.
-    fn serve(mut self, receiver: &Receiver<Message>, bytes: &AtomicU64) -> Result<Summary> {
+    /// Writes what arrives, a transaction per period, until every sender is dropped; then
+    /// checkpoints and closes, and returns what the file holds ([`Writer::finish`]).
+    fn serve(
+        mut self,
+        receiver: &Receiver<Message>,
+        bytes: &AtomicU64,
+    ) -> Result<serde_json::Value> {
         let mut failed: Option<Error> = None;
         loop {
             let first = match receiver.recv_timeout(COMMIT_PERIOD) {
@@ -375,11 +372,11 @@ impl File {
             .map_err(|(_, error)| sqlite(&path, &error))?;
         let bytes_now = size(&path);
         bytes.store(bytes_now, Ordering::Release);
-        Ok(Summary {
-            path,
-            bytes: bytes_now,
-            rows: self.rows,
-        })
+        Ok(serde_json::json!({
+            "path": path,
+            "bytes": bytes_now,
+            "rows": self.rows,
+        }))
     }
 
     fn transaction(&mut self, write: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
@@ -402,7 +399,7 @@ impl File {
         *self.rows.entry(table.to_owned()).or_default() += rows;
     }
 
-    /// Insert `rows` into `table` with the statement `sql`.
+    /// Inserts `rows` into `table` with the statement `sql`.
     fn insert<P: rusqlite::Params>(
         &mut self,
         table: &str,
@@ -461,15 +458,21 @@ impl File {
                     clock.uncertainty as i64,
                 )],
             ),
-            Message::Step(step) => self.insert(
+            Message::Step {
+                step,
+                stage,
+                selected,
+                begin,
+                end,
+            } => self.insert(
                 "steps",
                 "INSERT INTO steps VALUES (?1, ?2, ?3, ?4, ?5)",
                 [(
-                    step.step as i64,
-                    step.stage,
-                    step.selected,
-                    step.begin as i64,
-                    step.end.map(|end| end as i64),
+                    step as i64,
+                    stage,
+                    selected,
+                    begin as i64,
+                    end.map(|end| end as i64),
                 )],
             ),
             Message::Timeline { records, names } => {
@@ -483,33 +486,35 @@ impl File {
                 }
                 Ok(())
             }
-            Message::FenceProbes(instances) => self.insert(
+            // An instance's entry marker is twice its number and its exit marker the next id.
+            Message::Instances(instances) => self.insert(
                 "fence_probe",
                 "INSERT INTO fence_probe VALUES (?1, ?2, ?3, ?4, ?5)",
                 instances
                     .into_iter()
-                    .flat_map(|(instance, path, component)| {
+                    .enumerate()
+                    .flat_map(|(instance, (class, path))| {
                         [("entry", 0), ("exit", 1)].map(|(site, offset)| {
                             (
-                                i64::from(2 * instance + offset),
-                                i64::from(instance),
+                                2 * instance as i64 + offset,
+                                instance as i64,
                                 site,
                                 path.clone(),
-                                component.clone(),
+                                class.clone(),
                             )
                         })
                     })
                     .collect::<Vec<_>>(),
             ),
-            Message::Fences { device, records } => self.insert(
+            Message::Stamps { device, stamps } => self.insert(
                 "fence",
                 "INSERT INTO fence VALUES (?1, ?2, ?3, ?4)",
-                records.into_iter().map(|record| {
+                stamps.into_iter().map(|stamp| {
                     (
                         device,
-                        record.time as i64,
-                        i64::from(record.probe),
-                        i64::from(record.step),
+                        stamp.time as i64,
+                        i64::from(stamp.marker),
+                        i64::from(stamp.step),
                     )
                 }),
             ),
@@ -622,7 +627,7 @@ impl File {
         }
     }
 
-    /// Insert one CUPTI record into its kind's table.
+    /// Inserts one CUPTI record into its kind's table.
     fn timeline(&mut self, record: Record) -> Result<()> {
         match record {
             Record::Kernel(kernel) => self.insert(
@@ -814,53 +819,64 @@ mod tests {
         let writer =
             Writer::create(path.clone(), vec![("session".to_owned(), "7".to_owned())]).unwrap();
         let rows = writer.rows();
-        rows.send(Message::Timeline {
-            records: vec![
-                Record::Kernel(Kernel {
-                    start: 10,
-                    end: 20,
-                    queued: 0,
-                    submitted: 0,
-                    device: 0,
-                    context: 1,
-                    stream: 7,
-                    correlation: 3,
-                    grid: [1, 1, 1],
-                    block: [128, 1, 1],
-                    registers: 32,
-                    static_shared: 0,
-                    dynamic_shared: 0,
-                    name: 1,
-                    graph: 0,
-                    graph_node: 0,
-                    launch_type: 0,
-                    channel: 0,
-                }),
-                Record::Api(Api {
-                    domain: 1,
-                    cbid: 307,
-                    name: 2,
-                    start: 5,
-                    end: 8,
-                    thread: 99,
-                    correlation: 3,
-                    result: 0,
-                }),
-            ],
-            names: vec![(1, "gemm".to_owned()), (2, "cuLaunchKernel".to_owned())],
-        });
-        rows.send(Message::Fences {
-            device: 0,
-            records: vec![FenceRecord {
-                time: 100,
-                probe: 4,
-                step: 9,
-            }],
-        });
+        send(
+            &rows,
+            Message::Timeline {
+                records: vec![
+                    Record::Kernel(Kernel {
+                        start: 10,
+                        end: 20,
+                        queued: 0,
+                        submitted: 0,
+                        device: 0,
+                        context: 1,
+                        stream: 7,
+                        correlation: 3,
+                        grid: [1, 1, 1],
+                        block: [128, 1, 1],
+                        registers: 32,
+                        static_shared: 0,
+                        dynamic_shared: 0,
+                        name: 1,
+                        graph: 0,
+                        graph_node: 0,
+                        launch_type: 0,
+                        channel: 0,
+                    }),
+                    Record::Api(Api {
+                        domain: 1,
+                        cbid: 307,
+                        name: 2,
+                        start: 5,
+                        end: 8,
+                        thread: 99,
+                        correlation: 3,
+                        result: 0,
+                    }),
+                ],
+                names: vec![(1, "gemm".to_owned()), (2, "cuLaunchKernel".to_owned())],
+            },
+        );
+        send(
+            &rows,
+            Message::Instances(vec![("Mlp".to_owned(), "layers.0.mlp".to_owned())]),
+        );
+        send(
+            &rows,
+            Message::Stamps {
+                device: 0,
+                stamps: vec![Stamp {
+                    time: 100,
+                    marker: 1,
+                    step: 9,
+                }],
+            },
+        );
         drop(rows);
-        let summary = writer.finish().unwrap();
-        assert_eq!(summary.rows.get("kernel"), Some(&1));
-        assert!(summary.bytes > 0);
+        let finished = writer.finish().unwrap();
+        assert_eq!(finished["rows"]["kernel"], 1);
+        assert_eq!(finished["path"], path.to_str().unwrap());
+        assert!(finished["bytes"].as_u64().unwrap() > 0);
         // One file: the write-ahead log was checkpointed into it.
         assert!(!directory.path().join("rank0.sqlite-wal").exists());
 
@@ -886,10 +902,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session, "7");
-        let probe: i64 = connection
-            .query_row("SELECT probe FROM fence", [], |row| row.get(0))
+        // The stamp of marker 1 is the exit of instance 0, which the file names.
+        let exited: (String, String, String) = connection
+            .query_row(
+                "SELECT site, path, component FROM fence JOIN fence_probe USING (probe)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
             .unwrap();
-        assert_eq!(probe, 4);
+        assert_eq!(
+            exited,
+            (
+                "exit".to_owned(),
+                "layers.0.mlp".to_owned(),
+                "Mlp".to_owned()
+            )
+        );
     }
 
     #[test]

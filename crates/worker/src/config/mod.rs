@@ -1,24 +1,9 @@
-//! Configuration resolved before model loading and physical capacity fitting.
+//! Configuration read before a model is loaded: the devices a rank computes on.
 //!
-//! What the design calls the build config is resolved
-//! here, before a main process loads a model: the deployment's rank layout of
-//! blocks on devices, the devices themselves, and the values physical capacity
-//! is fitted against. Numerical backend options stay with their program.
-//!
-//! Only the device grammar the worker needs so far lives here; the rest of
-//! the build config arrives with the main process's launch.
+//! The values here are read once from an engine's launch and are immutable afterwards. Options
+//! of the numerical backend stay with the backend, and the sizes device memory is fitted against
+//! stay with the owners of that memory.
 
 mod device;
 
 pub use device::Device;
-
-/// A malformed launch descriptor or configuration value.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct DescriptorError(String);
-
-impl DescriptorError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-}

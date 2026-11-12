@@ -904,8 +904,14 @@ fn a_host_tensor_moved_to_the_device_writes_its_bytes_into_the_input_buffer() {
     assert_eq!(memory[256..556], [9; 300]);
     assert_eq!(context.input_peak(), 556);
 
-    // A meta context issues nothing, so it has no input copy to hand to a graph.
-    assert!(context.take_input_copies().is_empty());
+    // A meta context issues nothing and states the input copies a capture would record: the
+    // offsets and the sizes of the last forward's copies.
+    let copies: Vec<(u64, u64)> = context
+        .take_input_copies()
+        .into_iter()
+        .map(|(offset, _, bytes)| (offset, bytes))
+        .collect();
+    assert_eq!(copies, [(0, 12), (256, 300)]);
 }
 
 #[test]

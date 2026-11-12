@@ -1421,6 +1421,19 @@ pub enum Variant {
     /// ([`BatchColumns::block_steps`]): the rows read their requests' cached context and write no
     /// cache page, and the step that stops a block reports the block's tokens.
     TokenDenoise,
+    /// One verification per row: a committed token followed by its drafts, each token evaluated
+    /// as the decode step at its position and sampled greedily; the row commits the drafts its
+    /// own samples agree with and the sample after them. A bucket of `rows` verifications holds
+    /// `rows` times one more than the deployment's drafts tokens.
+    VerifyGreedy,
+    /// A [`Self::VerifyGreedy`] whose tokens are drawn, a greedy row as a draw over its one
+    /// largest candidate.
+    VerifySampled,
+    /// The drafter's forward behind a prefill or a verification of the same rows and tokens:
+    /// its entries over the positions whose next token the step before it committed, then the
+    /// drafts each row proposes, chained on the device. No batch states it: the worker issues
+    /// it behind the batch it follows.
+    Draft,
 }
 
 impl Variant {
@@ -1429,6 +1442,8 @@ impl Variant {
     pub const fn stage(self) -> &'static str {
         match self {
             Self::DecodeGreedy | Self::DecodeSampled => "decode",
+            Self::VerifyGreedy | Self::VerifySampled => "verify",
+            Self::Draft => "draft",
             Self::PrefillWrite
             | Self::PrefillOutput
             | Self::PrefillGreedy
@@ -1469,6 +1484,9 @@ impl Variant {
             Self::ConditionEncode => "condition_encode",
             Self::ExpertJoin => "expert_join",
             Self::TokenDenoise => "token_denoise",
+            Self::VerifyGreedy => "verify_greedy",
+            Self::VerifySampled => "verify_sampled",
+            Self::Draft => "draft",
         }
     }
 
@@ -1547,7 +1565,7 @@ impl Variant {
     pub const fn greedy(self) -> bool {
         matches!(
             self,
-            Self::DecodeGreedy | Self::PrefillGreedy | Self::PrefillWrite
+            Self::DecodeGreedy | Self::PrefillGreedy | Self::PrefillWrite | Self::VerifyGreedy
         )
     }
 

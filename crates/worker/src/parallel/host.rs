@@ -2,11 +2,12 @@
 //!
 //! A [`HostGroup`] connects every member of a rank group to every other
 //! member once, at startup, and runs small host-side collectives over those
-//! connections: barriers, byte gathers and broadcasts, and integer
-//! reductions. It carries startup agreement (block sizes, cache capacity, slot
-//! fits), plan comparison, warmup broadcasts and the bootstrap bytes of
-//! device communicators (NCCL unique ids, torch store addresses). Device
-//! collectives never use it.
+//! connections: byte gathers, fixed-width record gathers, byte broadcasts and
+//! integer reductions. It carries startup agreement (block sizes, cache
+//! capacity, slot fits), the comparison of the ranks' buckets, warm-up
+//! broadcasts, the bootstrap bytes of device communicators (NCCL unique ids)
+//! and an expert union's agreement on each step. Device collectives never use
+//! it.
 //!
 //! Rendezvous: the group's first member holds a listening socket its
 //! daemon bound before the process existed (inherited as a descriptor), so
@@ -17,12 +18,10 @@
 //! member with a lower index above zero. One round forms the full mesh.
 //!
 //! Collective ordering: every member must call the same collectives in the
-//! same order. A subgroup shares its parent's connections, so the caller
-//! must not run a parent and a subgroup collective concurrently.
+//! same order, and one member runs one collective at a time.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
@@ -42,61 +41,41 @@ pub const FIXED_RECORD_BYTES: usize = 56;
 
 const CONNECT_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Where a group's members meet.
-pub struct Rendezvous {
-    /// The address every member was given.
-    address: String,
-    /// The first member's inherited listener.
-    listener: Option<TcpListener>,
-}
-
-impl Rendezvous {
-    /// A rendezvous at `address` (`host:port`), joined by connecting.
-    pub fn connect(address: impl Into<String>) -> Self {
-        Self {
-            address: address.into(),
-            listener: None,
-        }
-    }
-
-    /// The first member's rendezvous: it accepts on `listener`.
-    pub fn serve(address: impl Into<String>, listener: TcpListener) -> Self {
-        Self {
-            address: address.into(),
-            listener: Some(listener),
-        }
-    }
-}
-
 /// One member's connections to every other member of a group.
 pub struct HostGroup {
-    /// This member's index in `ranks`.
+    /// This member's index in the group.
     rank: usize,
-    /// Members' global ranks (process-epoch or union ranks), in member order.
-    ranks: Vec<usize>,
-    /// Connection to each member by index; `None` for this member.
-    peers: Vec<Option<Arc<TcpStream>>>,
+    /// The connection to each member by index; `None` for this member.
+    peers: Vec<Option<TcpStream>>,
 }
 
 impl HostGroup {
-    /// A group of one member, which needs no connections.
     /// A group of one member, which needs no connections: a rank that serves
-    /// alone still agrees its block size and slot count over a group, so the
-    /// planners take one shape for every deployment size.
-    pub fn single(rank: usize) -> Self {
+    /// alone still agrees its block size and slot count over a group, so
+    /// capacity fitting takes one shape for every deployment size.
+    pub fn single() -> Self {
         Self {
             rank: 0,
-            ranks: vec![rank],
             peers: vec![None],
         }
     }
 
-    /// Join the group of `size` members as member `rank` and form the mesh.
+    /// Joins the group of `size` members as member `rank` and forms the mesh.
     ///
-    /// Member 0 must hold the rendezvous listener. Fails when a member does
-    /// not join within `timeout` or reports an inconsistent identity.
+    /// `address` (`host:port`) is the rendezvous every member was given. The
+    /// first member passes the `listener` bound to it and accepts the others
+    /// there; every other member passes `None` and connects. A group of one
+    /// member uses neither.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when `rank` is outside the group or the listener is
+    /// held by another member than the first, and a transport error when a
+    /// member does not join within `timeout` or reports an inconsistent
+    /// identity.
     pub fn connect(
-        rendezvous: Rendezvous,
+        address: &str,
+        listener: Option<TcpListener>,
         rank: usize,
         size: usize,
         timeout: Duration,
@@ -107,24 +86,23 @@ impl HostGroup {
             ));
         }
         if size == 1 {
-            return Ok(Self::single(rank));
+            return Ok(Self::single());
         }
-        if (rank == 0) != rendezvous.listener.is_some() {
+        if (rank == 0) != listener.is_some() {
             return Err(Error::Invalid(
                 "exactly the first host-group member serves the rendezvous".into(),
             ));
         }
 
         let deadline = Instant::now() + timeout;
-        let mut peers: Vec<Option<Arc<TcpStream>>> = vec![None; size];
-        if let Some(listener) = rendezvous.listener {
+        let mut peers: Vec<Option<TcpStream>> = (0..size).map(|_| None).collect();
+        if let Some(listener) = listener {
             // Member 0: accept every other member, then publish the table.
             let mut table = vec![String::new(); size];
-            let mut joined = Vec::with_capacity(size - 1);
             listener
                 .set_nonblocking(true)
                 .map_err(|error| Error::transport_source("rendezvous listener", error))?;
-            while joined.len() < size - 1 {
+            for _ in 1..size {
                 let stream = accept(&listener, deadline)?;
                 let hello = read_frame(&stream)?;
                 let (member, address) = parse_hello(&hello, size)?;
@@ -134,18 +112,17 @@ impl HostGroup {
                     )));
                 }
                 table[member] = address;
-                let stream = Arc::new(stream);
-                peers[member] = Some(Arc::clone(&stream));
-                joined.push(stream);
+                peers[member] = Some(stream);
             }
+
             let encoded = table.join("\n").into_bytes();
-            for stream in &joined {
+            for stream in peers.iter().flatten() {
                 write_frame(stream, &encoded)?;
             }
         } else {
             // Other members: report a listener, receive the table, then
             // connect to every lower member above zero and accept the rest.
-            let first = connect(&rendezvous.address, deadline)?;
+            let first = connect(address, deadline)?;
             let interface = first
                 .local_addr()
                 .map_err(|error| Error::transport_source("host group connection", error))?
@@ -168,12 +145,12 @@ impl HostGroup {
                     "host group address table has the wrong size",
                 ));
             }
-            peers[0] = Some(Arc::new(first));
+            peers[0] = Some(first);
 
             for (member, address) in table.iter().enumerate().take(rank).skip(1) {
                 let stream = connect(address, deadline)?;
                 write_frame(&stream, rank.to_string().as_bytes())?;
-                peers[member] = Some(Arc::new(stream));
+                peers[member] = Some(stream);
             }
             listener
                 .set_nonblocking(true)
@@ -190,15 +167,11 @@ impl HostGroup {
                         "host group member {member} connected twice"
                     )));
                 }
-                peers[member] = Some(Arc::new(stream));
+                peers[member] = Some(stream);
             }
         }
 
-        let group = Self {
-            rank,
-            ranks: (0..size).collect(),
-            peers,
-        };
+        let group = Self { rank, peers };
         // No read may wait forever on a lost peer during startup.
         group.set_timeout(Some(timeout))?;
         Ok(group)
@@ -209,12 +182,19 @@ impl HostGroup {
         self.rank
     }
 
+    /// How many members the group has.
     pub fn size(&self) -> usize {
-        self.ranks.len()
+        self.peers.len()
     }
 
-    /// Bound every subsequent read and write; `None` waits indefinitely.
-    pub(crate) fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+    /// Bounds every subsequent read and write of a collective; `None` waits
+    /// indefinitely. A group starts bounded by the timeout it connected
+    /// with.
+    ///
+    /// # Errors
+    ///
+    /// A transport error when a connection refuses the bound.
+    pub fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         for stream in self.peers.iter().flatten() {
             stream
                 .set_read_timeout(timeout)
@@ -224,13 +204,19 @@ impl HostGroup {
         Ok(())
     }
 
-    /// Every member's bytes, in member order.
-    pub(crate) fn all_gather_bytes(&self, value: &[u8]) -> Result<Vec<Vec<u8>>> {
+    /// Gathers `value` from every member and returns the values in member
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// A transport error when a peer is lost or does not send within the
+    /// group's timeout.
+    pub fn all_gather_bytes(&self, value: &[u8]) -> Result<Vec<Vec<u8>>> {
         let peers: Vec<(usize, &TcpStream)> = self
             .peers
             .iter()
             .enumerate()
-            .filter_map(|(member, stream)| stream.as_deref().map(|stream| (member, stream)))
+            .filter_map(|(member, stream)| stream.as_ref().map(|stream| (member, stream)))
             .collect();
         let receive = || -> Result<Vec<Vec<u8>>> {
             let mut values = vec![Vec::new(); self.size()];
@@ -264,13 +250,19 @@ impl HostGroup {
         })
     }
 
-    /// Gather one fixed-width record from every member into `records`,
+    /// Gathers one fixed-width record from every member into `records`,
     /// member-major, without allocating.
     ///
     /// Every member passes a record of the same width, at most
     /// [`FIXED_RECORD_BYTES`]. Each record travels to each peer as one write
     /// of its length prefix and payload, so a small record such as an expert
     /// step agreement occupies one TCP segment per peer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when `local` is wider than a record or `records`
+    /// is not one record per member, and a transport error when a peer is
+    /// lost or sends a record of another width.
     pub fn all_gather_fixed(&self, local: &[u8], records: &mut [u8]) -> Result<()> {
         let width = local.len();
         if width > FIXED_RECORD_BYTES || records.len() != width * self.size() {
@@ -285,17 +277,17 @@ impl HostGroup {
         let frame = &frame[..8 + width];
         // Records are far below the socket buffers, so every member writes
         // to all peers before reading without risking a deadlock.
-        for mut stream in self.peers.iter().flatten().map(|stream| &**stream) {
+        for mut stream in self.peers.iter().flatten() {
             stream
                 .write_all(frame)
                 .map_err(|error| Error::transport_source("host group send", error))?;
         }
+
         records[self.rank * width..(self.rank + 1) * width].copy_from_slice(local);
         for (member, stream) in self.peers.iter().enumerate() {
-            let Some(stream) = stream.as_deref() else {
+            let Some(mut reader) = stream.as_ref() else {
                 continue;
             };
-            let mut reader = stream;
             let mut length = [0; 8];
             reader
                 .read_exact(&mut length)
@@ -312,7 +304,14 @@ impl HostGroup {
         Ok(())
     }
 
-    /// `root`'s bytes on every member. Only `root` supplies `value`.
+    /// Broadcasts member `root`'s bytes and returns them on every member.
+    /// Only `root` supplies `value`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when `root` is outside the group, when `root`
+    /// supplies no value or when another member supplies one, and a
+    /// transport error when the connection to `root` is lost.
     pub fn broadcast_bytes(&self, value: Option<&[u8]>, root: usize) -> Result<Vec<u8>> {
         if root >= self.size() {
             return Err(Error::Invalid(
@@ -335,8 +334,14 @@ impl HostGroup {
         read_frame(self.peer(root)?)
     }
 
-    /// Element-wise minimum of every member's integers.
-    pub(crate) fn all_reduce_min(&self, values: &[i64]) -> Result<Vec<i64>> {
+    /// Reduces every member's integers to their element-wise minimum, which
+    /// every member returns.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invariant`] when the members pass different counts of
+    /// values, and a transport error when a peer is lost.
+    pub fn all_reduce_min(&self, values: &[i64]) -> Result<Vec<i64>> {
         self.all_reduce(values, i64::min)
     }
 
@@ -365,7 +370,7 @@ impl HostGroup {
     fn peer(&self, member: usize) -> Result<&TcpStream> {
         self.peers
             .get(member)
-            .and_then(Option::as_deref)
+            .and_then(Option::as_ref)
             .ok_or_else(|| Error::Invariant(format!("host group has no connection to {member}")))
     }
 }
@@ -490,16 +495,13 @@ mod tests {
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..size)
                 .map(|rank| {
-                    let rendezvous = match listener.take().filter(|_| rank == 0) {
-                        Some(listener) => Rendezvous::serve(address.clone(), listener),
-                        None => Rendezvous::connect(address.clone()),
-                    };
+                    // The first member holds the listener the address names.
+                    let listener = listener.take().filter(|_| rank == 0);
+                    let address = address.as_str();
                     let body = &body;
                     scope.spawn(move || {
-                        body(
-                            HostGroup::connect(rendezvous, rank, size, Duration::from_secs(30))
-                                .unwrap(),
-                        )
+                        let timeout = Duration::from_secs(30);
+                        body(HostGroup::connect(address, listener, rank, size, timeout).unwrap())
                     })
                 })
                 .collect();
@@ -577,8 +579,7 @@ mod tests {
 
     #[test]
     fn a_single_member_group_needs_no_rendezvous() {
-        let group =
-            HostGroup::connect(Rendezvous::connect("unused:0"), 0, 1, Duration::ZERO).unwrap();
+        let group = HostGroup::connect("unused:0", None, 0, 1, Duration::ZERO).unwrap();
         assert_eq!(group.all_reduce_min(&[3]).unwrap(), vec![3]);
         assert_eq!(group.broadcast_bytes(Some(b"x"), 0).unwrap(), b"x");
     }

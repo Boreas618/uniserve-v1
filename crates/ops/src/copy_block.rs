@@ -261,11 +261,11 @@ impl Op for CopyBlock {
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
-        // The destination is the twin: a twin of the source would compare the source with itself and
-        // could never fail.
+        // The destination is shadowed: a shadow of the source would compare the source with
+        // itself and could never fail. The destination is a strided block of a larger tensor, so
+        // its shadow is the storage the block reaches, with the block's strides inside it.
         Args {
-            out: twins.shadow_of(args.out),
+            out: crate::strided::shadow_window(args.out, twins, stream),
             ..args
         }
     }

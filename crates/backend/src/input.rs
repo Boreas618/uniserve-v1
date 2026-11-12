@@ -10,12 +10,16 @@
 //! - while the stream is being captured, the copy is recorded as an **input copy** of the graph,
 //!   `(buffer offset, device address, bytes)`, and nothing is issued: execution issues a graph's
 //!   input copies before each replay;
-//! - a meta context issues nothing. With memory lent it writes the bytes, which is how the
-//!   forward of `prepare_inputs` puts a replay's values where the graph's input copies read
-//!   them; with none it only counts, which is how a profile run measures the buffer.
+//! - a meta context issues nothing and records the copy as a capture does, so a meta forward
+//!   states the input copies a capture of the same forward records. With memory lent it writes
+//!   the bytes, which is how the forward of `prepare_inputs` puts a replay's values where the
+//!   graph's input copies read them; with none it only counts, which is how a profile run
+//!   measures the buffer.
 //!
 //! Offsets depend on the sizes of the copies and their order alone, never on their values, so
-//! the three forwards of one bucket agree on every offset from the same reset.
+//! the three forwards of one bucket agree on every offset from the same reset. Execution checks
+//! that agreement when it captures: the input copies of the capture and of the meta forward
+//! over the same region are one list.
 
 use ops::DevicePtr;
 use ops::platform::{CaptureStatus, copy_from_host};
@@ -61,7 +65,9 @@ pub(crate) unsafe fn copy_to_device(address: u64, bytes: &[u8]) -> Result<()> {
         }
 
         let offset = reserve(&mut state, length)?;
-        if captured == Some(true) {
+
+        // An eager launching forward issues its copies at once and leaves none for a replay.
+        if captured != Some(false) {
             state.input_copies.push((offset, address, length));
         }
         state.input_memory.map(|(base, _)| base + offset)
@@ -147,8 +153,11 @@ mod tests {
         assert_eq!(memory[768], 12);
         assert_eq!(context.input_peak(), 769);
 
-        // A meta context issues nothing, so it has no input copy to hand to a graph.
-        assert!(context.take_input_copies().is_empty());
+        // A meta context issues nothing and states the input copies a capture would record.
+        assert_eq!(
+            context.take_input_copies(),
+            [(0, UNREAD, 3), (256, UNREAD, 300), (768, UNREAD, 1)]
+        );
     }
 
     #[test]
