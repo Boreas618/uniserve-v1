@@ -42,6 +42,8 @@ mod linear;
 mod logits;
 mod norm;
 mod residual_norm;
+mod sparse;
+mod vsa;
 
 use uniserve_tensor::{DType, Device, Shape, Tensor};
 
@@ -59,6 +61,11 @@ pub use logits::{LOGITS, vocab_unpad};
 pub use norm::{add_rms_norm, gated_rms_norm, layer_norm, rms_norm};
 pub use residual_norm::{
     modulated_rms_norm, modulated_rms_norm_, scaled_residual_layer_norm, scaled_residual_rms_norm_,
+};
+pub use sparse::sparse_attention;
+pub use vsa::{
+    vsa_add_gated_tiles_, vsa_compose_gated_rows, vsa_compress_pooled, vsa_prepare_tiles_,
+    vsa_scores, vsa_select_tiles, vsa_zero_padding_,
 };
 
 /// Whether the descriptors this crate builds are the programmatic-dependent-launch variants.

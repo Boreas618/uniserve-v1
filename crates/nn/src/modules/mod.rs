@@ -16,6 +16,8 @@ mod head;
 mod linear;
 mod mlp;
 mod norm;
+mod ulysses;
+mod vsa;
 
 pub use adaln::{AdaLnBlock, AdaLnBlockConfig, AdaLnOut, AdaLnOutConfig};
 pub use conv::{Conv1d, Conv3d, ConvConfig, ConvTranspose1d};
@@ -27,3 +29,5 @@ pub use mlp::{GateUp, Mlp, MlpConfig};
 pub use norm::{
     GatedRmsNorm, GatedRmsNormConfig, LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig,
 };
+pub use ulysses::{UlyssesAttention, UlyssesAttentionConfig};
+pub use vsa::{VsaAttention, VsaAttentionConfig};
