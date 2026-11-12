@@ -665,7 +665,9 @@ impl VideoDecoder {
             .collect::<uniserve_tensor::Result<Vec<Tensor>>>()?;
         let stitched = vae::stitch_tiles(&blocks, &rows, &columns)?;
 
-        Ok(video.slice_set(&stitched, 0, 0)?)
+        // A raster joined from strided tiles may itself be a strided view, and the product
+        // buffer is set from packed elements.
+        Ok(video.slice_set(&stitched.contiguous()?, 0, 0)?)
     }
 }
 
