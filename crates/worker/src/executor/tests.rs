@@ -244,6 +244,7 @@ fn batch(id: u64, phase: u16, rows: u32) -> Batch {
         latent_restores: Vec::new(),
         host_outputs: Vec::new(),
         images: Vec::new(),
+        buffers: Vec::new(),
         frees: Vec::new(),
         media: None,
     }

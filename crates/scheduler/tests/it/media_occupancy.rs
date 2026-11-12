@@ -90,6 +90,8 @@ struct Served {
     calls: Vec<ObservedCall>,
     /// Every event each request's stream delivered.
     ended: HashMap<RequestId, Vec<Event>>,
+    /// Every media batch the worker accepted, in order.
+    batches: Vec<ipc::execution::Batch>,
 }
 
 impl Served {
@@ -230,6 +232,7 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
         submissions: Vec::new(),
         calls: Vec::new(),
         ended: HashMap::from([(RequestId(90), events)]),
+        batches: Vec::new(),
     }
     .assert_completed(RequestId(90));
 }
@@ -394,6 +397,11 @@ fn record(
         submissions,
         calls,
         ended,
+        batches: accepted
+            .iter()
+            .filter(|accepted| accepted.batch.media.is_some())
+            .map(|accepted| accepted.batch.clone())
+            .collect(),
     }
 }
 
@@ -505,6 +513,83 @@ fn a_distributed_decoder_admits_calls_up_to_its_rank_width_in_media_units() {
             .any(|call| call.is(older, MediaCall::VideoDecoding)),
         "the younger request's decode waited for the older request to finish decoding: {:?}",
         served.submissions
+    );
+}
+
+/// A decode round after the first splices its first unit onto the tail of the
+/// previous round's last unit: it reads the tail product that round wrote,
+/// finds the span of every product it names in its batch, and is submitted
+/// only once that round has completed, which orders the tail's write before
+/// its read on every device.
+#[test]
+fn a_decode_round_reads_the_splice_tail_of_the_round_before_it() {
+    let request = RequestId(1);
+    let served = serve(video_pool(2, 1, 1), vec![video_request(request.0, 3)]);
+    served.assert_completed(request);
+
+    // Each decode round's row of the request: what it reads and writes, and
+    // the spans its batch carries.
+    let rounds = served
+        .batches
+        .iter()
+        .filter_map(|batch| {
+            let media = batch.media.as_ref()?;
+            if media.computation.call != MediaCall::VideoDecoding {
+                return None;
+            }
+            let row = (0..media.inputs.len()).find(|row| {
+                media
+                    .request(*row)
+                    .is_ok_and(|staged| staged.request.request_id == request)
+            })?;
+            Some((batch, &media.reads[row], &media.writes[row]))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rounds.len(),
+        2,
+        "three units decode in two rounds over two ranks"
+    );
+
+    let (_, first_reads, first_writes) = rounds[0];
+    let (second, second_reads, second_writes) = rounds[1];
+    assert_eq!(
+        first_reads.len(),
+        1,
+        "the first round reads the latents alone"
+    );
+    assert_eq!(
+        second_reads[..1],
+        first_reads[..],
+        "both rounds read the denoised latents"
+    );
+    let tail = second_reads
+        .get(1)
+        .expect("the second round reads a splice tail");
+    assert!(
+        first_writes.contains(tail),
+        "the tail the second round reads is one the first round wrote: {first_writes:?}"
+    );
+    for product in second_reads.iter().chain(second_writes) {
+        assert!(
+            second
+                .buffers
+                .iter()
+                .any(|(_, span)| span.buffer == *product),
+            "the batch places every product its row names: {product:?}"
+        );
+    }
+
+    let decodes = served.submissions_of(request, MediaCall::VideoDecoding);
+    assert_eq!(decodes.len(), 2);
+    assert!(
+        !decodes[1]
+            .1
+            .in_flight
+            .iter()
+            .any(|call| call.is(request, MediaCall::VideoDecoding)),
+        "the second round was submitted while the first was in flight: {:?}",
+        decodes[1].1
     );
 }
 

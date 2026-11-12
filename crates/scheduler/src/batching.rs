@@ -836,6 +836,8 @@ impl Scheduler {
             latent_restores: Vec::new(),
             host_outputs: Vec::new(),
             images: Vec::new(),
+            // Stated at submission, which reads the calls' dispatches.
+            buffers: Vec::new(),
             // Stated at submission, which reads the batch's commands.
             frees: Vec::new(),
             media: None,
@@ -1061,9 +1063,19 @@ impl Scheduler {
                     })
                 })
                 .collect(),
+            // Stated at submission, which reads the calls' dispatches.
+            buffers: Vec::new(),
             // Stated at submission, which reads the batch's commands.
             frees: Vec::new(),
-            media: Some(ipc::execution::MediaColumns::staged(stated, &requests)),
+            media: Some(ipc::execution::MediaColumns::staged(
+                stated,
+                &requests,
+                &batch
+                    .requests
+                    .iter()
+                    .map(|(call, _)| call)
+                    .collect::<Vec<_>>(),
+            )),
         });
     }
 

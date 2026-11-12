@@ -227,6 +227,12 @@ impl VideoGraph {
             product::VIDEO_UNITS,
             Some(request.sampling.video_units),
         );
+        // One splice tail per media unit, which the decode of the next unit reads.
+        produce(
+            MediaCall::VideoDecoding,
+            product::VIDEO_TAIL,
+            Some(request.sampling.video_units),
+        );
         produce(
             MediaCall::VideoEncoding,
             product::ENCODED_UNITS,
@@ -413,6 +419,7 @@ mod tests {
                 product::VIDEO_LATENTS,
                 product::AUDIO_LATENTS,
                 product::VIDEO_UNITS,
+                product::VIDEO_TAIL,
                 product::ENCODED_UNITS,
                 product::AUDIO_SAMPLES,
             ]

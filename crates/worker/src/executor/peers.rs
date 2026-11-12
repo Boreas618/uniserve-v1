@@ -824,6 +824,7 @@ mod tests {
             latent_restores: Vec::new(),
             host_outputs: Vec::new(),
             images: Vec::new(),
+            buffers: Vec::new(),
             frees: Vec::new(),
             media: None,
         }

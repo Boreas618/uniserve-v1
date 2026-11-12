@@ -355,6 +355,18 @@ fn an_image_prompt_is_written_by_one_context_prefill() {
             seq_lens: vec![25],
         }]
     );
+    // The prefill reads the feature at the span its encode wrote, on every rank.
+    let spans = |batch: &Batch| {
+        batch
+            .buffers
+            .iter()
+            .filter(|(_, span)| span.buffer == feature[0])
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let written = spans(&accepted[0].batch);
+    assert!(!written.is_empty(), "the encode's batch places its feature");
+    assert_eq!(spans(&accepted[1].batch), written);
     assert!(accepted.len() > 2);
     for step in &accepted[2..] {
         assert!(

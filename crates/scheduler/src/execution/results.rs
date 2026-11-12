@@ -237,6 +237,28 @@ impl Scheduler {
                         consumed_products.extend(state.condition_video_latents.iter().cloned());
                         consumed_products.extend(state.condition_audio_latents.iter().cloned());
                     }
+                    // A decode round read the splice tail of the unit before its
+                    // first, which no later round reads; the track's last round
+                    // wrote tails no round reads.
+                    CallKind::Media(MediaCall::VideoDecoding) => {
+                        consumed_products.extend(
+                            call.inputs
+                                .iter()
+                                .filter(|input| !state.latents.contains(input))
+                                .cloned(),
+                        );
+                        let last_round = decode.as_ref().is_some_and(|range| {
+                            range.cursor + range.max_units == state.request.sampling.video_units
+                        });
+                        if last_round
+                            && state
+                                .video_tail
+                                .as_ref()
+                                .is_some_and(|tail| tail.producer_call_id == call.call_id)
+                        {
+                            consumed_products.extend(state.video_tail.take());
+                        }
+                    }
                     // `valid` requires a denoising result to advance the trajectory.
                     CallKind::Media(MediaCall::Denoising) => {
                         let accepted = state.denoising.accept(record.step_index);

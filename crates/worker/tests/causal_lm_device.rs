@@ -373,6 +373,7 @@ fn batch(kind: RowKind, variant: Variant, slot: u32, mut columns: BatchColumns) 
         latent_restores: Vec::new(),
         host_outputs: Vec::new(),
         images: Vec::new(),
+        buffers: Vec::new(),
         frees: Vec::new(),
         media: None,
     }

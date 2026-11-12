@@ -108,6 +108,28 @@ pub(crate) fn media_units(name: &str, units: u32) -> OutputInfo {
     }
 }
 
+/// A video decoder's splice tails, `[units, 3, 1, height, width]`: one
+/// overlap frame of each media unit at the request's raster.
+pub(crate) fn video_tail(units: u32) -> OutputInfo {
+    OutputInfo {
+        name: "video_tail".to_owned(),
+        dtype: DType::F32,
+        shape_bound: ShapeBound {
+            dims: vec![
+                DimBound::Device { max: units },
+                DimBound::Static(3),
+                DimBound::Static(1),
+                DimBound::Static(MAX_RASTER.height),
+                DimBound::Static(MAX_RASTER.width),
+            ],
+        },
+        raster_axes: Some(RasterAxes {
+            height: 3,
+            width: 4,
+        }),
+    }
+}
+
 /// The fixture's stages: the media reader, text encoder, audio decoder
 /// and muxer on rank 0; the denoiser on the first `denoising_ranks` ranks, as
 /// a sequence-parallel denoiser runs; and the latent encoder, video decoder
@@ -171,7 +193,7 @@ pub(crate) fn video_stages(
             "video_decoder",
             (0..decoder_ranks).collect(),
             true,
-            vec![media_units("video_units", 32)],
+            vec![media_units("video_units", 32), video_tail(32)],
         ),
         stage(
             "video_codec",
