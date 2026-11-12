@@ -26,6 +26,9 @@ with one exponential and no cancellation at either end. ``a`` and ``b`` are the
 launch's scalars, in the computing type. On an integer element only the
 functions closed over the integers are compiled, and ``ceil``, ``floor`` and
 ``round`` are the identity there.
+
+Every exponential is libdevice's (``_exponential``), whose error is a few
+units in the last place of its result whatever the argument.
 """
 
 import strided
@@ -37,6 +40,20 @@ from triton.language.extra.cuda import libdevice
 #: instantiated so a kernel may read them.
 _SQRT_8_OVER_PI = tl.constexpr(1.5957691216057308)
 _SQRT_HALF = tl.constexpr(0.7071067811865476)
+
+
+@triton.jit
+def _exponential(value):
+    """``exp(value)``, relative to its own result over the whole range.
+
+    Triton compiles ``tl.exp`` of an FP32 value to PTX's ``ex2.approx`` of the
+    rounded product ``value * log2(e)``. That product's rounding is an
+    absolute error of the exponent, so the result's relative error grows with
+    ``|value|`` (about ``|value|`` unit round-offs), past any bound stated in
+    roundings. libdevice reduces the argument first and stays within a few
+    units in the last place.
+    """
+    return libdevice.exp(value)
 
 
 @triton.jit
@@ -55,7 +72,7 @@ def _evaluated(
 ):
     """``f(value)`` in the computing type, before the store's rounding."""
     if FUNCTION == "exp":
-        result = tl.exp(value)
+        result = _exponential(value)
     elif FUNCTION == "log":
         result = tl.log(value)
     elif FUNCTION == "sin":
@@ -80,7 +97,7 @@ def _evaluated(
             result = tl.abs(value)
     elif FUNCTION == "gelu":
         inner = _SQRT_8_OVER_PI * value * (1.0 + 0.044715 * value * value)
-        result = value / (1.0 + tl.exp(-inner))
+        result = value / (1.0 + _exponential(-inner))
     elif FUNCTION == "gelu_erf":
         result = (tl.erf(value * _SQRT_HALF) + 1.0) * 0.5 * value
     elif FUNCTION == "erf":
@@ -88,9 +105,9 @@ def _evaluated(
     elif FUNCTION == "relu":
         result = tl.maximum(value, 0)
     elif FUNCTION == "silu":
-        result = value / (1.0 + tl.exp(-value))
+        result = value / (1.0 + _exponential(-value))
     elif FUNCTION == "sigmoid":
-        result = 1.0 / (1.0 + tl.exp(-value))
+        result = 1.0 / (1.0 + _exponential(-value))
     elif FUNCTION == "ceil":
         if COMPUTE == "int":
             result = value
@@ -120,7 +137,7 @@ def _evaluated(
     elif FUNCTION == "powf":
         result = libdevice.pow(value, a + tl.zeros_like(value))
     else:
-        result = tl.where(value > 0, value, (tl.exp(value) - 1.0) * a)
+        result = tl.where(value > 0, value, (_exponential(value) - 1.0) * a)
     return result
 
 
