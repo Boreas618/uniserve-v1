@@ -3515,14 +3515,12 @@ dependencies = [
 name = "qwen3"
 version = "2.0.0"
 dependencies = [
+ "backend",
  "nn",
- "ops",
  "processing",
- "proto",
- "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
+ "uniserve-tensor",
 ]
 
 [[package]]

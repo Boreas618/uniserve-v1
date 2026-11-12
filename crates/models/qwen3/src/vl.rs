@@ -1,73 +1,64 @@
-//! The Qwen3-VL model as an encoder: a prompt's hidden states, its media spliced in.
+//! The Qwen3-VL model as an encoder: a prompt's hidden states, its media merged in.
 //!
-//! [`Qwen3VlModel`] is Hugging Face's `Qwen3VLModel` over a prefix of its decoder layers:
+//! [`Qwen3VlModel`] is Hugging Face's `Qwen3VLModel` over a prefix of its decoder layers
+//! (vLLM's `Qwen3LLMModel.forward`, `refs/vllm/vllm/model_executor/models/
+//! qwen3_vl.py:1852-1905`):
 //!
 //! ```text
 //! stream            = embed(ids)
 //! stream[vision]    = tower(images)                  merged rows replace the placeholder rows
-//! for layer j:      stream = layer_j(stream)         interleaved M-RoPE over (time, row, column)
-//!                   stream[vision] += deepstack_j    for j below the DeepStack count
-//! hidden            = norm(stream), or stream        when the consumer reads the raw state
+//! for layer j:      hidden, stream = layer_j(…)      interleaved M-RoPE over (time, row, column)
+//!                   hidden[vision] += deepstack_j    for j below the DeepStack count
+//! out               = norm(hidden + stream), or hidden + stream when the consumer reads the
+//!                     state before the final norm
 //! ```
 //!
-//! The DeepStack addition is `Qwen3VLTextModel._deepstack_process`: after decoder layer `j` the
-//! tower's DeepStack table `j` is added to the stream at the vision rows.
+//! The DeepStack addition is `Qwen3VLTextModel._deepstack_process`: after decoder layer `j`
+//! the tower's DeepStack feature `j` is added at the vision rows.
 //!
-//! The values a prompt decides are computed in the forward and uploaded: its M-RoPE coordinates
-//! ([`positions::rope_index`]) and the prompt row each merged vision row lands on
-//! ([`positions::vision_destinations`]). Their shapes follow from the layout's counts, so two
-//! prompts of one layout replay one capture.
+//! The values a prompt decides are computed in the forward as CPU tensors and moved to the
+//! device: its M-RoPE coordinates ([`positions::rope_index`]) and the prompt row each merged
+//! vision row takes ([`positions::vision_rows`]). Their shapes follow from the layout's
+//! counts, so two prompts of one layout replay one captured graph.
 //!
-//! The language model is tensor parallel; the tower is replicated on every rank, since every rank
-//! needs its features.
+//! The language model is tensor parallel; the tower is replicated on every rank, since every
+//! rank needs its features.
 
-use nn::blocks::{AttentionKind, Keys, RopeFactors};
-use nn::capability::{
-    Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape, PixelNorm,
-    TokenBatch,
-};
-use nn::family::Split;
-use nn::layers::{
-    IndexRows, Residual, ResidualStream, RmsNorm, Rotary, Varlen, VocabParallelEmbedding,
-};
-use nn::weights::WeightLoader;
-use nn::{DType, Forward, Shape};
-
-use crate::config::{Config, POSITION_AXES};
-use crate::decoder::{self, DecoderStack, Mlp};
-use crate::vision::VisionTower;
-use crate::{Error, Result, positions, write};
+use nn::modules::{Embedding, EmbeddingConfig, RmsNorm, Rotary};
+use nn::{Encoder, EncoderLayout, PixelNorm, Split, Tensor, TokenBatch, VarBuilder};
 use processing::qwen_vl::ProcessorConfig;
 
-/// The checkpoint's module path of the language model.
-const LANGUAGE_MODEL: &str = "model.language_model";
+use crate::config::Config;
+use crate::decoder::{self, DecoderLayer};
+use crate::vision::VisionTower;
+use crate::{Error, Result, positions};
 
-/// The Qwen3-VL model: the language model's embedding, a prefix of its decoder layers, the vision
-/// tower, and the final norm when the consumer reads normalized states.
+/// The Qwen3-VL model: the language model's embedding, a prefix of its decoder layers, the
+/// vision tower, and the final norm when the consumer reads normalized states.
 pub struct Qwen3VlModel {
     config: Config,
-    embedding: VocabParallelEmbedding,
-    rotary: Rotary,
-    stack: DecoderStack,
-    tower: VisionTower,
+    embed_tokens: Embedding,
+    rotary_emb: Rotary,
+    layers: Vec<DecoderLayer>,
+    visual: VisionTower,
     norm: Option<RmsNorm>,
 }
 
 impl Qwen3VlModel {
-    /// The model of `config` read through `loader` in `dtype`: its first `layers` decoder layers at
-    /// `split`'s rank of the tensor-parallel group, the tower whole with the processor rules
-    /// `images` states, and the final norm when `final_norm` asks for it.
+    /// The model of `config` at `vb` (the checkpoint's root): its first `layers` decoder
+    /// layers at `split`'s rank of the tensor-parallel group, the tower whole with the
+    /// processor rules and pixel normalization `images` states, and the final norm when
+    /// `final_norm` asks for it.
     ///
     /// # Errors
     ///
-    /// A configuration without a tower, more layers than the checkpoint holds, a split that does
-    /// not divide the heads, or a module the loader refuses.
+    /// A configuration without a tower, more layers than the checkpoint holds or none, a
+    /// split that does not divide the heads, or a module the loader refuses.
     pub fn load(
-        loader: &mut WeightLoader<'_>,
         config: &Config,
+        vb: VarBuilder<'_, '_>,
         images: (ProcessorConfig, PixelNorm),
         split: Split,
-        dtype: DType,
         layers: u32,
         final_norm: bool,
     ) -> Result<Self> {
@@ -76,47 +67,51 @@ impl Qwen3VlModel {
             .vision
             .as_ref()
             .ok_or_else(|| Error::Config("a Qwen3-VL model states no vision tower".to_owned()))?;
-        let mut language = loader.scope(LANGUAGE_MODEL);
-        let embedding = VocabParallelEmbedding::load(
-            &mut language.scope("embed_tokens"),
-            text.vocab_size,
-            text.hidden_size,
-            split,
-        )?;
-        let rotary = decoder::rotary(&mut language.scope("rotary_emb"), text, text.rope, split)?;
-        let stack = DecoderStack::load(
-            &mut language,
-            config,
-            0..layers,
-            // A prompt's key bound is its own rows, a launch value.
-            AttentionKind::Dense {
-                max_keys: u32::MAX,
-                causal: true,
-                window: None,
-            },
-            split,
-            dtype,
-            &mut |_, scope| Mlp::dense(scope, text, split),
-        )?;
-        let norm = final_norm
-            .then(|| {
-                RmsNorm::load(
-                    &mut language.scope("norm"),
-                    text.hidden_size,
-                    text.rms_norm_eps,
-                    text.rms_norm_gain,
-                    dtype,
+        if layers == 0 || layers > text.num_hidden_layers {
+            return Err(Error::Config(format!(
+                "decoder layers 0..{layers} of a {}-layer stack",
+                text.num_hidden_layers
+            )));
+        }
+        text.local_heads(split)?;
+
+        let model = vb.pp("model.language_model");
+        let stack = (0..layers)
+            .map(|layer| {
+                DecoderLayer::load(
+                    config,
+                    model.pp("layers").pp(layer),
+                    text.linear_layers[layer as usize],
+                    config.routes(layer),
+                    (split, Split::WHOLE),
+                    None,
                 )
             })
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
+        let norm = if final_norm {
+            Some(RmsNorm::load(
+                &decoder::stream_norm(text),
+                model.pp("norm"),
+            )?)
+        } else {
+            None
+        };
+
         let (processor, pixels) = images;
         Ok(Self {
-            tower: VisionTower::load(loader, vision, processor, pixels, dtype)?,
-            config: config.clone(),
-            embedding,
-            rotary,
-            stack,
+            embed_tokens: Embedding::load(
+                &EmbeddingConfig {
+                    vocabulary: text.vocab_size,
+                    hidden: text.hidden_size,
+                    split,
+                },
+                model.pp("embed_tokens"),
+            )?,
+            rotary_emb: Rotary::load(&text.rope, model.pp("rotary_emb"))?,
+            layers: stack,
+            visual: VisionTower::load(vision, vb.pp("model.visual"), processor, pixels)?,
             norm,
+            config: config.clone(),
         })
     }
 
@@ -127,13 +122,137 @@ impl Qwen3VlModel {
 
     /// The vision tower.
     pub const fn tower(&self) -> &VisionTower {
-        &self.tower
+        &self.visual
+    }
+
+    /// The tower's rows of the images of `layout`, in prompt order: `[merged,
+    /// hidden · (1 + deepstack)]`, or `None` for a prompt that presents no image.
+    fn vision_features(&self, images: &[Tensor], layout: &EncoderLayout) -> Result<Option<Tensor>> {
+        if layout.images.is_empty() {
+            return Ok(None);
+        }
+
+        let features = layout
+            .images
+            .iter()
+            .zip(images)
+            .map(|(grid, pixels)| self.visual.forward(*grid, pixels))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(Tensor::cat(&features, 0)?))
+    }
+
+    /// [`Encoder::encode`] over the prompt `prompt`.
+    fn forward(
+        &self,
+        prompt: &[u32],
+        ids: &Tensor,
+        batch: &TokenBatch,
+        images: &[Tensor],
+        layout: &EncoderLayout,
+        out: &Tensor,
+    ) -> Result<()> {
+        let tokens = layout.tokens as usize;
+        let hidden = self.config.text.hidden_size as usize;
+        if layout.rows != layout.tokens
+            || batch.tokens() != tokens
+            || prompt.len() != tokens
+            || ids.elem_count() != tokens
+            || out.dims() != [tokens, hidden]
+            || images.len() != layout.images.len()
+        {
+            return Err(Error::Config(format!(
+                "an encode of {} rows for {} tokens: {} batch tokens, {} prompt ids, {} device \
+                 ids, an output of {:?}, {} images for {} grids",
+                layout.rows,
+                layout.tokens,
+                batch.num_tokens,
+                prompt.len(),
+                ids.elem_count(),
+                out.dims(),
+                images.len(),
+                layout.images.len()
+            )));
+        }
+        let vision = self.visual.config();
+        let (image, video) = (vision.image_token_id, vision.video_token_id);
+        let device = ids.device();
+
+        // The prompt's M-RoPE coordinates, and the row each merged vision row takes.
+        let coordinates = positions::rope_index(
+            prompt,
+            &layout.images,
+            image,
+            video,
+            vision.spatial_merge_size,
+        )?
+        .to_device(device)?;
+        let rows = positions::vision_rows(prompt, image, video)?;
+
+        // The embeddings, the tower's rows replacing the placeholders' (`inputs_embeds[mask]
+        // = image_embeds`): each column of a row is written at the row's place.
+        let mut stream = self.embed_tokens.forward(ids)?;
+        let features = self.vision_features(images, layout)?;
+        let merged = features.as_ref().map_or(0, |features| features.dims()[0]);
+        if merged != rows.elem_count() {
+            return Err(Error::Config(format!(
+                "the images merge to {merged} rows and the prompt holds {} placeholders",
+                rows.elem_count()
+            )));
+        }
+
+        // Only a prompt that presents vision rows moves their places to the device.
+        let vision_rows = match &features {
+            Some(features) => {
+                let rows = rows.to_device(device)?;
+                let index = rows
+                    .unsqueeze(1)?
+                    .broadcast_as((merged, hidden))?
+                    .contiguous()?;
+
+                stream =
+                    stream.scatter(&index, &features.narrow(1, 0, hidden)?.contiguous()?, 0)?;
+                Some((rows, features))
+            }
+            None => None,
+        };
+
+        // The decoder layers over the packed prompt, each sequence attending itself; DeepStack
+        // feature `j` joins layer `j`'s output at the vision rows (`hidden_states +
+        // deepstack_input_embeds`, `qwen3_vl.py:1884-1888`).
+        let (cos, sin) = self.rotary_emb.forward(&coordinates)?;
+        let deepstack = vision.deepstack_visual_indexes.len();
+        let (mut output, mut residual) = (stream, None);
+        for (index, layer) in self.layers.iter().enumerate() {
+            let (mut hidden_states, stream) = layer.forward_varlen(
+                &output,
+                residual.as_ref(),
+                (&cos, &sin),
+                &batch.query_offsets,
+                layout.tokens,
+            )?;
+
+            if let Some((rows, features)) = vision_rows.as_ref().filter(|_| index < deepstack) {
+                let feature = features.narrow(1, (index + 1) * hidden, hidden)?;
+                hidden_states = hidden_states.index_add(rows, &feature.contiguous()?, 0)?;
+            }
+            (output, residual) = (hidden_states, Some(stream));
+        }
+        let residual =
+            residual.ok_or_else(|| Error::Config("a decoder stack of no layers".to_owned()))?;
+
+        // The last output joins the stream: added and normalized, or, for a consumer that
+        // reads the state before the final norm, added alone.
+        let encoded = match &self.norm {
+            Some(norm) => norm.forward_residual(&output, &residual)?.0,
+            None => (output + residual)?,
+        };
+        Ok(out.slice_set(&encoded, 0, 0)?)
     }
 }
 
 impl Encoder for Qwen3VlModel {
     /// One output row per presented token, the images' grids as the batch states them.
-    fn layout(&self, batch: &TokenBatch, images: &[ImageShape]) -> EncoderLayout {
+    fn layout(&self, batch: &TokenBatch, images: &[[u32; 3]]) -> EncoderLayout {
         EncoderLayout {
             rows: batch.num_tokens,
             tokens: batch.num_tokens,
@@ -143,146 +262,13 @@ impl Encoder for Qwen3VlModel {
 
     fn encode(
         &self,
-        f: &Forward,
-        prompt: &EncoderPrompt<'_>,
-        inputs: EncoderInputs<'_>,
-        out: EncoderOutputs,
+        prompt: &[u32],
+        ids: &Tensor,
+        batch: &TokenBatch,
+        images: &[Tensor],
+        layout: &EncoderLayout,
+        out: &Tensor,
     ) -> nn::Result<()> {
-        Ok(self.forward(f, prompt.ids, inputs, out)?)
-    }
-}
-
-impl Qwen3VlModel {
-    /// [`Encoder::encode`] over the prompt `ids`.
-    fn forward(
-        &self,
-        f: &Forward,
-        ids: &[u32],
-        inputs: EncoderInputs<'_>,
-        out: EncoderOutputs,
-    ) -> Result<()> {
-        let layout = inputs.layout;
-        let tokens = u64::from(layout.tokens);
-        let hidden = u64::from(self.config.text.hidden_size);
-        if layout.rows != layout.tokens
-            || inputs.batch.num_tokens != layout.tokens
-            || ids.len() as u64 != tokens
-            || inputs.ids.numel() != tokens
-            || out.hidden.shape.dims() != [tokens, hidden]
-            || inputs.images.len() != layout.images.len()
-        {
-            return Err(Error::Config(format!(
-                "an encode of {} rows for {} tokens: {} batch tokens, {} host ids, {} device ids, \
-                 an output of {:?}, {} images for {} grids",
-                layout.rows,
-                layout.tokens,
-                inputs.batch.num_tokens,
-                ids.len(),
-                inputs.ids.numel(),
-                out.hidden.shape.dims(),
-                inputs.images.len(),
-                layout.images.len()
-            )));
-        }
-        let vision = self.tower.config();
-        let grids: Vec<[u32; 3]> = layout.images.iter().map(|image| image.grid).collect();
-        let merge = vision.spatial_merge_size;
-
-        // The prompt's host values: its M-RoPE coordinates, axis-major, and the row each merged
-        // vision row takes.
-        let (image_grids, video_grids) = positions::run_grids(
-            ids,
-            &grids,
-            vision.image_token_id,
-            vision.video_token_id,
-            merge,
-        )?;
-        let coordinates = positions::rope_index(
-            ids,
-            &image_grids,
-            &video_grids,
-            vision.image_token_id,
-            vision.video_token_id,
-            merge,
-        )?;
-        let mut axes = vec![0_i32; POSITION_AXES as usize * ids.len()];
-        for (token, coordinate) in coordinates.iter().enumerate() {
-            for (axis, value) in coordinate.iter().enumerate() {
-                axes[axis * ids.len() + token] = i32::try_from(*value).map_err(|_| {
-                    Error::Config("an M-RoPE coordinate wider than an i32".to_owned())
-                })?;
-            }
-        }
-        let coordinates = f.upload(&axes, Shape::new(&[u64::from(POSITION_AXES), tokens]))?;
-        let rows =
-            positions::vision_destinations(ids, vision.image_token_id, vision.video_token_id);
-        let merged = rows.len() as u64;
-        let destinations = f.upload(&rows, Shape::new(&[merged]))?;
-
-        // The embeddings, the vision rows replacing the placeholders: the residual stream the
-        // stack accumulates in place. Each image's tower runs in its own scope; its DeepStack
-        // tables persist until their layers.
-        let stream = self.embedding.forward(f, inputs.ids)?;
-        let deepstack = (0..vision.deepstack_visual_indexes.len())
-            .map(|_| f.empty(stream.dtype, Shape::new(&[merged, hidden])))
-            .collect::<nn::Result<Vec<_>>>()?;
-        let mut offset = 0_u64;
-        for (grid, image) in grids.iter().zip(inputs.images) {
-            offset += f.scoped(|f| -> Result<u64> {
-                let (features, tables) = self.tower.forward(f, *grid, image.pixels)?;
-                let count = features.rows();
-                let landing = destinations.narrow(0, offset, count)?;
-                IndexRows.scatter(f, features, landing, stream)?;
-                for (table, kept) in tables.into_iter().zip(&deepstack) {
-                    write(f, table, kept.narrow(0, offset, count)?)?;
-                }
-                Ok(count)
-            })?;
-        }
-        if offset != merged {
-            return Err(Error::Config(format!(
-                "the images merge to {offset} rows and the prompt holds {merged} placeholders"
-            )));
-        }
-
-        // The decoder layers over the packed prompt; DeepStack table `j` joins layer `j`'s output
-        // at the vision rows (vLLM's `hidden_states + deepstack_input_embeds`).
-        let rope = RopeFactors {
-            rotary: &self.rotary,
-            factors: self.rotary.factors(f, coordinates)?,
-        };
-        let keys = Keys::Dense(Some(Varlen {
-            cu_q: inputs.batch.query_offsets,
-            cu_k: inputs.batch.query_offsets,
-            max_q: None,
-            max_k: layout.tokens,
-        }));
-        let (last, residual) = self.stack.forward(
-            f,
-            stream,
-            rope,
-            |_| Ok(keys),
-            |index, output| {
-                if let Some(table) = deepstack.get(index)
-                    && merged > 0
-                {
-                    IndexRows.scatter_add(f, *table, destinations, output)?;
-                }
-                Ok(())
-            },
-        )?;
-        // The last output joins the stream: added and normalized, or, for a consumer that reads
-        // the raw state, added alone; either lands in the runner's output rows.
-        match &self.norm {
-            Some(norm) => {
-                let normalized = norm.forward(f, last, Some(ResidualStream::in_place(residual)))?;
-                write(f, normalized, out.hidden)?;
-            }
-            None => {
-                let joined = Residual::default().forward(f, residual, last, None)?;
-                write(f, joined, out.hidden)?;
-            }
-        }
-        Ok(())
+        Ok(self.forward(prompt, ids, batch, images, layout, out)?)
     }
 }
