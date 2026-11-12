@@ -1,33 +1,9 @@
-//! The runners the device worker holds: one per block a deployment places on the device.
+//! The runners: one implementation of [`Runner`](crate::Runner) per capability a model exposes.
 //!
-//! There is one runner per capability the model exposes: `EncoderRunner`,
-//! `DenoiserRunner`, `DecoderRunner` and `CausalLmRunner`, plus the host-side `MediaRunner`. They
-//! share the graph tables, the pools and the staging rules and differ in the capability they call
-//! and in what a bucket of theirs means.
-//!
-//! This slice serves `CausalLmRunner` (Qwen3-MoE BF16, §11 step 2). The other three are added with
-//! the model that needs them (H3, §11 step 3); the trait, the graph table and the arena they build
-//! on are the same.
+//! A runner holds its model through a capability trait of `nn` and dispatches on nothing else.
+//! What the implementations share (the profile run, capture, replay, the input buffer and the
+//! generations) is [`Graphs`](crate::Graphs)'s.
 
-pub mod audio;
 pub mod causal_lm;
-pub(crate) mod columns;
-pub(crate) mod conditions;
-pub mod decoder;
-pub mod denoiser;
-pub mod encoder;
-pub mod experts;
-pub mod lifecycle;
-pub mod media;
-pub(crate) mod output;
-pub mod recording;
 
-pub use audio::AudioDecoderRunner;
 pub use causal_lm::CausalLmRunner;
-pub use decoder::DecoderRunner;
-pub mod products;
-pub mod resident;
-pub mod sampling;
-pub mod state;
-pub mod vision;
-pub mod warm;
