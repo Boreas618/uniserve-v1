@@ -56,6 +56,7 @@
 //! a batch's table installs, unit copies, page loads and offloads and state copies are issued
 //! by the rank's cache through the hook given to [`CausalLmRunner::set_page_work`]. A runner
 //! with no hook serves the batches that carry no page work and refuses one that carries some.
+//! [`wiring`] builds the runner and the hook from the rank's cache and state modules.
 //!
 //! ## Paired forwards
 //!
@@ -81,6 +82,7 @@ mod columns;
 pub mod experts;
 mod output;
 mod slots;
+pub mod wiring;
 
 #[cfg(test)]
 mod tests;
@@ -144,8 +146,11 @@ pub enum PageWork {
     /// issued, and each restored slot's recurrent state is copied into the live buffers.
     BeforeReplay,
     /// What the forward left: each kept checkpoint of the recurrent state is copied to its
-    /// page, and the batch's page offloads are issued.
+    /// page, and the batch's page offloads are waited for.
     AfterReplay,
+    /// What a paired forward reads: the pages its rows have cached are copied into the rows'
+    /// scratch pages.
+    BeforeShadow,
 }
 
 /// The buffers of a recurrent state, as `nn::RecurrentState` lays them out: one entry per
@@ -393,9 +398,10 @@ impl CausalLmRunner {
     /// (r + 1) · scratch_pages` of the set's planes.
     ///
     /// The caller keeps the set's memory as it keeps the cache's. Before each paired forward
-    /// it copies, on the runner's stream, the pages the batch's rows read into the rows'
+    /// the pages the batch's rows read are copied, on the runner's stream, into the rows'
     /// scratch pages (page `k` of row `r`'s request into page `r · scratch_pages + k`), so the
-    /// forward attends over the context the served batch attended over.
+    /// forward attends over the context the served batch attended over: the runner asks the
+    /// page-work hook for it ([`PageWork::BeforeShadow`]).
     ///
     /// # Errors
     ///
@@ -874,8 +880,9 @@ impl Runner for CausalLmRunner {
     ///
     /// The columns are the batch's own, padded as a serving step's, except that every token
     /// writes its row's scratch pages, every row gathers its own row of the scratch set's
-    /// page table, and the commit table is inert (`columns`). No slot is started and no page
-    /// work is issued: the forward reads the slots' state as it stands and writes none of it.
+    /// page table, and the commit table is inert (`columns`). No slot is started and none of
+    /// the batch's own page work is issued: the forward reads the slots' state as it stands
+    /// and writes none of it.
     ///
     /// # Errors
     ///
@@ -917,6 +924,11 @@ impl Runner for CausalLmRunner {
         )?;
 
         self.fill(batch, &bucket, Some(&scratch))?;
+
+        // The rows' cached history reaches their scratch pages ahead of the forward.
+        if let Some(hook) = self.page_work.as_mut() {
+            hook(batch, PageWork::BeforeShadow)?;
+        }
         self.paired.set(true);
         Ok(bucket)
     }

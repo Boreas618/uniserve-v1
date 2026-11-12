@@ -33,10 +33,13 @@ use uniserve_tensor::{DType, Device, Tensor, WithDType};
 use super::columns::{self, Column, Layout};
 use super::experts::{self, JoinHook, Member};
 use super::output::calls_output;
+use super::wiring;
 use super::{CausalLmConfig, CausalLmRunner, PageWork};
 use crate::Error;
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
+use crate::memory::cache::{CacheLayout, KvCacheConfig, KvCacheMemory};
+use crate::memory::state::{StateConfig, StateMemory};
 use crate::parallel::host::HostGroup;
 use crate::runner::Runner;
 
@@ -1620,4 +1623,190 @@ fn a_union_is_joined_by_a_runner_whose_model_routes_experts() {
         ..shape
     };
     assert!(Member::new(Arc::clone(&groups[0]), other, Mode::Dispatch, hook).is_err());
+}
+
+// ---- The runner over the rank's cache and state -------------------------------------------------
+
+/// The recurrent state the stateful test model keeps.
+fn state_shape() -> StateShape {
+    StateShape {
+        layers: 1,
+        fields: vec![StateField {
+            name: "state",
+            dtype: DType::BF16,
+            dims: vec![HIDDEN],
+        }],
+    }
+}
+
+/// The rank's cache of the test model: one attention layer of the model's heads over
+/// [`PAGES`] units, a row of [`TABLE_WIDTH`] pages per request slot, and the state pages of a
+/// model that keeps a recurrent state.
+fn cache_config(stateful: bool) -> KvCacheConfig {
+    let (heads, dim) = (HEADS as u32, DIM as u32);
+    let dtype = ipc::PrefixCacheDtype::BFloat16;
+    let layout = if stateful {
+        CacheLayout::hybrid(PAGE, 1, heads, dim, dtype, &state_shape())
+    } else {
+        CacheLayout::dense(PAGE, 1, heads, dim, dtype).validated()
+    };
+
+    KvCacheConfig {
+        layout: Arc::new(layout.unwrap()),
+        units: PAGES as u32,
+        slots: SLOTS,
+        width: TABLE_WIDTH as u32,
+        segments: None,
+        workspace_bytes: 1 << 16,
+    }
+}
+
+/// A runner over `cache` and `state`, with every bucket profiled and captured.
+fn over(cache: &KvCacheMemory, state: Option<&StateMemory>) -> CausalLmRunner {
+    let config = config();
+    let graphs = Graphs::meta(
+        Arc::new(Generation::new(0, [])),
+        CausalLmRunner::input_bytes(&config).unwrap(),
+    );
+    let model = Arc::new(Tiny::new(state.is_some()));
+
+    let runner = CausalLmRunner::over(model, config, graphs, None, cache, state).unwrap();
+    runner.graphs().profile_run(&runner).unwrap();
+    for bucket in runner.buckets() {
+        runner.graphs().capture(&runner, &bucket).unwrap();
+    }
+    runner
+}
+
+/// The scheduler's page table of `slot` in the attention group: `units` from page zero.
+fn block_table(slot: u32, units: &[u32]) -> ipc::BlockTable {
+    ipc::BlockTable {
+        request_pool_idx: slot,
+        group_id: 0,
+        start_page: 0,
+        unit_ids: units.iter().copied().map(ipc::UnitId).collect(),
+        allocated_tokens: units.len() as u32 * PAGE,
+    }
+}
+
+#[test]
+fn a_runner_over_the_rank_s_cache_and_state_profiles_and_captures_every_bucket() {
+    // A model that attends over the cache alone, and one that keeps a recurrent state.
+    let plain = KvCacheMemory::meta(cache_config(false)).unwrap();
+    assert_eq!(over(&plain, None).graphs().buckets().len(), 12);
+
+    let config = cache_config(true);
+    let cache = KvCacheMemory::meta(config.clone()).unwrap();
+    let state = StateMemory::meta(
+        StateConfig {
+            shape: state_shape(),
+            slots: SLOTS,
+            rows: 4,
+            trail: 0,
+        },
+        &config,
+    )
+    .unwrap();
+    assert_eq!(over(&cache, Some(&state)).graphs().buckets().len(), 12);
+
+    // A cache of other request slots than the runner's is not the runner's.
+    let mut fewer = cache_config(false);
+    fewer.slots = SLOTS - 1;
+    let fewer = KvCacheMemory::meta(fewer).unwrap();
+    let graphs = Graphs::meta(
+        Arc::new(Generation::new(0, [])),
+        CausalLmRunner::input_bytes(&self::config()).unwrap(),
+    );
+    let model = Arc::new(Tiny::new(false));
+    assert!(CausalLmRunner::over(model, self::config(), graphs, None, &fewer, None).is_err());
+}
+
+#[test]
+fn the_hook_issues_a_batch_s_page_work_on_the_cache_before_its_replay() {
+    let cache = Arc::new(Mutex::new(
+        KvCacheMemory::meta(cache_config(false)).unwrap(),
+    ));
+    let mut runner = over(&cache.lock().unwrap(), None);
+    runner.set_page_work(wiring::page_work(
+        Arc::clone(&cache),
+        None,
+        None,
+        SCRATCH_PAGES,
+    ));
+
+    // Every row of the pooled table names the padding unit before a request holds pages.
+    let width = TABLE_WIDTH;
+    assert!(
+        cache
+            .lock()
+            .unwrap()
+            .host_table(0)
+            .unwrap()
+            .iter()
+            .all(|unit| *unit == 0)
+    );
+
+    // A batch on the last slot and the first, with the pages the scheduler gave them. The
+    // tables are installed ahead of the replay, which graphs that hold no device refuse.
+    let mut batch = decode(&[SLOTS as i32, 1], &[0.0, 0.0]);
+    batch.block_tables = vec![block_table(SLOTS, &[3, 5]), block_table(1, &[7])];
+    let refused = runner.execute(&batch).unwrap_err();
+    assert!(matches!(refused, Error::State(_)), "{refused}");
+
+    {
+        let cache = cache.lock().unwrap();
+        let table = cache.host_table(0).unwrap();
+
+        // Slot `s` owns row `s - 1`, the row the runner's forward gathers for it, and the
+        // padding row past the last slot's still names the padding unit.
+        assert_eq!(table[..width], [7, 0, 0, 0]);
+        assert_eq!(table[(SLOTS as usize - 1) * width..][..width], [3, 5, 0, 0]);
+        assert_eq!(table[SLOTS as usize * width..], [0; TABLE_WIDTH]);
+        assert_eq!(cache.installed_pages(SLOTS, 0), Some((0, &[3, 5][..])));
+        assert_eq!(cache.installed_pages(2, 0), None);
+    }
+
+    // A table the cache refuses fails the batch before anything of it is installed.
+    let mut outside = decode(&[2, 1], &[0.0, 0.0]);
+    outside.block_tables = vec![block_table(2, &[9]), block_table(SLOTS + 1, &[4])];
+    let refused = runner.execute(&outside).unwrap_err();
+    assert!(matches!(refused, Error::Invalid(_)), "{refused}");
+    assert_eq!(cache.lock().unwrap().installed_pages(2, 0), None);
+}
+
+#[test]
+fn a_paired_forward_computes_over_the_scratch_pages_the_cache_opened() {
+    let mut cache = KvCacheMemory::meta(cache_config(false)).unwrap();
+
+    // A cache with no scratch pages lends none, and one whose set is too small for the rows
+    // of the largest bucket is refused.
+    let mut unlent = over(&cache, None);
+    assert!(unlent.lend_scratch(&cache).is_err());
+    assert!(matches!(
+        unlent.prepare_shadow_inputs(&decode(&[1, 2], &[0.0, 0.0])),
+        Err(Error::Unsupported(_))
+    ));
+
+    // Four rows of the largest bucket at two scratch pages each.
+    cache.open_scratch(4 * SCRATCH_PAGES, None).unwrap();
+    let mut runner = over(&cache, None);
+    let bucket = runner
+        .prepare_shadow_inputs(&decode(&[1, SLOTS as i32], &[0.0, 0.0]))
+        .unwrap();
+    assert_eq!(bucket, Bucket::decode(2, Variant::DecodeGreedy));
+
+    // The forward over the scratch planes makes the serving forward's launches.
+    let serving = operators(&runner, &bucket);
+    let context = backend::Context::meta(None);
+    context.record_launches();
+    {
+        let _guard = context.enter();
+        runner.forward(&bucket).unwrap();
+    }
+    let paired: Vec<&str> = context
+        .take_launches()
+        .into_iter()
+        .map(|(operator, _, _)| operator)
+        .collect();
+    assert_eq!(paired, serving);
 }
