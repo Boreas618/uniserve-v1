@@ -2475,6 +2475,88 @@ impl CpuStorage {
         }
     }
 
+    /// The elements of the storage read as `dtype`, an element type of the same size in bytes:
+    /// a storage that holds the same bytes at the same positions.
+    ///
+    /// The storage is a vector of one element type, so the result is a vector of its own and
+    /// does not share memory with `self`.
+    pub fn view(&self, dtype: DType) -> Result<Self> {
+        /// The bytes of the elements `values` holds.
+        fn bytes_of<T: WithDType>(values: &[T]) -> &[u8] {
+            // SAFETY: every element type of a tensor is plain data without padding, so its
+            // elements are `size_of_val(values)` initialized bytes.
+            unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values))
+            }
+        }
+
+        /// The elements whose bytes are `bytes`.
+        ///
+        /// # Safety
+        ///
+        /// Every bit pattern is a value of `T`.
+        unsafe fn elements_of<T: Copy>(bytes: &[u8]) -> Vec<T> {
+            let count = bytes.len() / std::mem::size_of::<T>();
+            let mut elements = Vec::<T>::with_capacity(count);
+
+            // SAFETY: the vector's buffer holds `count` elements, which are the bytes copied
+            // into it, and the two buffers are distinct allocations.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    elements.as_mut_ptr().cast(),
+                    count * std::mem::size_of::<T>(),
+                );
+                elements.set_len(count);
+            }
+            elements
+        }
+
+        let (from, size) = (self.dtype(), self.dtype().size_in_bytes());
+        if size == 0 || size != dtype.size_in_bytes() {
+            crate::bail!(
+                "cannot view {from:?} elements as {dtype:?}: the two element types differ in \
+                 size, or one of them is narrower than a byte"
+            )
+        }
+
+        let bytes = match self {
+            Self::U8(values) | Self::F8E8M0(values) => values.as_slice(),
+            Self::U32(values) => bytes_of(values),
+            Self::I16(values) => bytes_of(values),
+            Self::I32(values) => bytes_of(values),
+            Self::I64(values) => bytes_of(values),
+            Self::BF16(values) => bytes_of(values),
+            Self::F16(values) => bytes_of(values),
+            Self::F32(values) => bytes_of(values),
+            Self::F64(values) => bytes_of(values),
+            Self::F8E4M3(values) => bytes_of(values),
+            // Narrower than a byte: refused above.
+            Self::F6E2M3(values) | Self::F6E3M2(values) | Self::F4(values) => values.as_slice(),
+        };
+
+        // SAFETY: every bit pattern is a value of each integer and float element type.
+        let storage = unsafe {
+            match dtype {
+                DType::U8 => Self::U8(elements_of(bytes)),
+                DType::U32 => Self::U32(elements_of(bytes)),
+                DType::I16 => Self::I16(elements_of(bytes)),
+                DType::I32 => Self::I32(elements_of(bytes)),
+                DType::I64 => Self::I64(elements_of(bytes)),
+                DType::BF16 => Self::BF16(elements_of(bytes)),
+                DType::F16 => Self::F16(elements_of(bytes)),
+                DType::F32 => Self::F32(elements_of(bytes)),
+                DType::F64 => Self::F64(elements_of(bytes)),
+                DType::F8E4M3 => Self::F8E4M3(elements_of(bytes)),
+                DType::F8E8M0 => Self::F8E8M0(elements_of(bytes)),
+                DType::F6E2M3 | DType::F6E3M2 | DType::F4 => {
+                    return Err(Error::UnsupportedDTypeForOp(dtype, "view").bt())
+                }
+            }
+        };
+        Ok(storage)
+    }
+
     pub fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         match self {
             Self::BF16(storage) => {

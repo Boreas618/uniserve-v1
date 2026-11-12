@@ -1854,9 +1854,72 @@ fn sigmoid(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn view(device: &Device) -> Result<()> {
+    // No element is converted: each one keeps its bits.
+    let floats = [1f32, -2., 0.5, f32::INFINITY];
+    let tensor = Tensor::new(&floats, device)?;
+    let bits = tensor.view(DType::U32)?;
+    assert_eq!(bits.dtype(), DType::U32);
+    assert_eq!(bits.to_vec1::<u32>()?, floats.map(f32::to_bits));
+    assert_eq!(bits.view(DType::F32)?.to_vec1::<f32>()?, floats);
+
+    let unsigned = Tensor::new(&[u32::MAX, 1, 0x8000_0000], device)?;
+    assert_eq!(
+        unsigned.view(DType::I32)?.to_vec1::<i32>()?,
+        [-1, 1, i32::MIN]
+    );
+
+    // One byte: sign, four bits of exponent biased by seven, three of mantissa.
+    let bytes = Tensor::new(&[0x38u8, 0xc0, 0x00], device)?;
+    let narrow = bytes.view(DType::F8E4M3)?;
+    assert_eq!(narrow.dtype(), DType::F8E4M3);
+    assert_eq!(
+        narrow.to_dtype(DType::F32)?.to_vec1::<f32>()?,
+        [1., -2., 0.]
+    );
+    assert_eq!(narrow.view(DType::U8)?.to_vec1::<u8>()?, [0x38, 0xc0, 0x00]);
+
+    let words = Tensor::new(&[0x3f80i16, 0x3c00], device)?;
+    assert_eq!(
+        words.view(DType::BF16)?.to_vec1::<half::bf16>()?[0],
+        half::bf16::ONE
+    );
+    assert_eq!(
+        words.view(DType::F16)?.to_vec1::<half::f16>()?[1],
+        half::f16::ONE
+    );
+
+    let wide = Tensor::new(&[1.5f64, -0.], device)?;
+    assert_eq!(
+        wide.view(DType::I64)?.to_vec1::<i64>()?,
+        [1.5f64.to_bits() as i64, i64::MIN]
+    );
+
+    // The result views its elements as the tensor does: the shape, the strides and the start.
+    let grid = Tensor::arange(0u32, 12, device)?.reshape((3, 4))?;
+    let window = grid.t()?.narrow(0, 1, 2)?;
+    let signed = window.view(DType::I32)?;
+    assert_eq!(signed.dims(), [2, 3]);
+    assert_eq!(signed.stride(), window.stride());
+    assert_eq!(signed.to_vec2::<i32>()?, [[1, 5, 9], [2, 6, 10]]);
+
+    // The tensor's own element type is the tensor.
+    assert_eq!(
+        grid.view(DType::U32)?.to_vec2::<u32>()?,
+        grid.to_vec2::<u32>()?
+    );
+
+    // An element type of another size holds another number of elements.
+    for dtype in [DType::I64, DType::U8, DType::BF16, DType::F4] {
+        assert!(grid.view(dtype).is_err(), "{dtype:?}");
+    }
+    Ok(())
+}
+
 test_device!(zeros);
 test_device!(ones);
 test_device!(sigmoid);
+test_device!(view);
 test_device!(full);
 test_device!(const_set);
 test_device!(arange);

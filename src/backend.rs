@@ -131,6 +131,17 @@ pub trait BackendStorage: Debug + Send + Sync + 'static {
 
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Box<dyn BackendStorage>>;
 
+    /// The storage read as `dtype`, an element type of the same size in bytes: a storage whose
+    /// every element holds the bits of the element of `self` at its position.
+    ///
+    /// A backend whose storage is device memory returns a storage over the same memory, which
+    /// is PyTorch's `Tensor.view(dtype)`: nothing is copied or converted, and what is written
+    /// through either storage is read through the other. A backend that holds its elements in
+    /// a typed host container, as the CPU backend does, returns a copy of the bytes.
+    ///
+    /// An element type of another size, or one narrower than a byte, is an error.
+    fn view(&self, dtype: DType) -> Result<Box<dyn BackendStorage>>;
+
     /// Batched matrix product. `bmnk` is `(b, m, n, k)`: `self` views `b` matrices of `m` by
     /// `k`, `rhs` views `b` matrices of `k` by `n`, and the result holds `b` matrices of `m` by
     /// `n`.

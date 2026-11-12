@@ -2254,6 +2254,43 @@ impl Tensor {
         }
     }
 
+    /// The elements of the tensor read as `dtype`, an element type of the same size in bytes:
+    /// PyTorch's `Tensor.view(dtype)`. No element is converted: the result has the shape and
+    /// the strides of `self` and each element holds the bits of the element at its position,
+    /// so `U8` and `F8E4M3`, `U32`, `I32` and `F32`, `I16`, `F16` and `BF16`, and `I64` and
+    /// `F64` are read as one another.
+    ///
+    /// On a backend device the result shares the memory of `self`, as it does in PyTorch: what
+    /// is written through one tensor is read through the other. The CPU backend holds a
+    /// storage as a vector of one element type, so on the CPU the result is a storage of its
+    /// own with the same bytes.
+    ///
+    /// An element type of another size is an error, as is one narrower than a byte.
+    ///
+    /// ```rust
+    /// use uniserve_tensor::{Tensor, DType, Device};
+    /// let a = Tensor::new(&[1f32, -2.], &Device::Cpu)?;
+    /// let bits = a.view(DType::U32)?;
+    /// assert_eq!(bits.to_vec1::<u32>()?, [1f32.to_bits(), (-2f32).to_bits()]);
+    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// ```
+    pub fn view(&self, dtype: DType) -> Result<Self> {
+        if self.dtype() == dtype {
+            return Ok(self.clone());
+        }
+
+        let storage = self.storage().view(dtype)?;
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            device: storage.device(),
+            storage: Arc::new(RwLock::new(storage)),
+            // The reinterpreted storage keeps every element at its position.
+            layout: self.layout.clone(),
+            dtype,
+        };
+        Ok(Tensor(Arc::new(tensor_)))
+    }
+
     /// Returns a tensor that is in row major order. This is the same as the original tensor if it
     /// was already contiguous, otherwise a copy is triggered.
     pub fn contiguous(&self) -> Result<Tensor> {

@@ -135,6 +135,15 @@ impl Storage {
         }
     }
 
+    /// The elements of the storage read as `dtype`, an element type of the same size in bytes.
+    /// A backend storage shares its memory with the result; a CPU storage is copied.
+    pub(crate) fn view(&self, dtype: DType) -> Result<Self> {
+        match self {
+            Self::Cpu(storage) => Ok(Self::Cpu(storage.view(dtype)?)),
+            Self::Backend(storage) => Ok(Self::Backend(storage.view(dtype)?)),
+        }
+    }
+
     pub(crate) fn apply_op1(&self, l: &Layout, c: &dyn CustomOp1) -> Result<(Self, Shape)> {
         match self {
             Self::Cpu(storage) => {

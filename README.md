@@ -19,7 +19,7 @@ fn main() -> Result<()> {
 ## What the crate provides
 
 - `Tensor`: a reference-counted view (`Layout`: shape, strides, start offset) over a reference-counted `Storage`. Views (`narrow`, `reshape`, `transpose`, `permute`, `squeeze`, `unsqueeze`, `broadcast_as`, `chunk`, `t`, indexing with `i(...)`) share the storage of the tensor they come from.
-- Tensor operations built from backend primitives: element-wise arithmetic and comparisons with broadcasting, the integer operations `remainder`, `bitwise_and`, `bitwise_or`, `bitwise_xor`, `bitwise_left_shift` and `bitwise_right_shift`, `where_cond`, reductions, `to_dtype`, `contiguous`, `cat`, `stack`, `pad_with_zeros`, `gather`, `scatter`, `scatter_add`, `index_select`, `index_add`, `slice_set`, `matmul`, `conv1d`, `conv2d`, their transposed forms, pooling and upsampling.
+- Tensor operations built from backend primitives: element-wise arithmetic and comparisons with broadcasting, the integer operations `remainder`, `bitwise_and`, `bitwise_or`, `bitwise_xor`, `bitwise_left_shift` and `bitwise_right_shift`, `where_cond`, reductions, `to_dtype`, `view` (an element type of the same size read over the same elements), `contiguous`, `cat`, `stack`, `pad_with_zeros`, `gather`, `scatter`, `scatter_add`, `index_select`, `index_add`, `slice_set`, `matmul`, `conv1d`, `conv2d`, their transposed forms, pooling and upsampling.
 - `DType`: `U8`, `U32`, `I16`, `I32`, `I64`, `BF16`, `F16`, `F32`, `F64`, `F8E4M3`, and the packed types `F6E2M3`, `F6E3M2`, `F4`, `F8E8M0`, whose tensors keep their bytes as loaded and support no arithmetic.
 - `Shape`, `Dim`, `D`, `Layout`, `NdArray` and `WithDType` for building tensors from host values and reading them back (`to_vec0` to `to_vec3`, `to_scalar`).
 - `Module`: a `forward` over one tensor.
@@ -33,13 +33,14 @@ Arithmetic follows PyTorch where the two have the same expression:
 
 - An integer tensor computes in its element type: `+`, `-` and `*` wrap, `/` truncates toward zero (`torch.div(.., rounding_mode="trunc")`), and `remainder` is `torch.remainder`, whose result is zero or has the sign of the divisor. A zero integer divisor is an error on the CPU backend.
 - A scalar operand of an integer tensor (`&x + 1.0`, `7.0 / &x`) is an integer of the element type and the operation is the one of two tensors, so it is exact for every value. No operation changes the element type: a scalar with a fractional part is an error, where PyTorch would return a float tensor, and so is one outside the element type's range, which PyTorch refuses as well; a caller that wants the float result converts the tensor with `to_dtype` first.
+- `Tensor::view(dtype)` is PyTorch's `Tensor.view(dtype)` between element types of one size. On a backend device the result shares the tensor's memory; the CPU backend's storage is a vector of one element type, so there the result holds a copy of the bytes.
 
 ## Devices and the backend interface
 
 A `Device` is `Cpu` or `Backend(Arc<dyn BackendDevice>)`, and a `Storage` is `Cpu(CpuStorage)` or `Backend(Box<dyn BackendStorage>)`. The CPU backend is built in. Any other device is a pair of types implementing the two object-safe traits of `uniserve_tensor::backend` in another crate:
 
 - `BackendDevice` states the device's `DeviceLocation` (a kind such as `"cuda"` and an ordinal), decides with `same_device` which devices may meet in one operation, allocates storages (`zeros`, `alloc_uninit`), copies host values to the device (`storage_from_cpu_storage`) and waits for issued work (`synchronize`).
-- `BackendStorage` holds the elements of a tensor and implements the primitives tensor operations are built from: `affine`, `powf`, `elu`, `unary`, `binary`, `cmp`, `where_cond`, `reduce`, `to_dtype`, `matmul`, `index_select`, `gather`, `index_add`, `scatter_set`, `scatter_add_set`, `copy_strided_src`, `copy2d`, `const_set`, the convolutions, pooling and upsampling, together with `try_clone` and the device-to-host copy `to_cpu_storage`. Operations are named by the enums `UnaryOp`, `BinaryOp`, `CmpOp` and `ReduceOp`.
+- `BackendStorage` holds the elements of a tensor and implements the primitives tensor operations are built from: `affine`, `powf`, `elu`, `unary`, `binary`, `cmp`, `where_cond`, `reduce`, `to_dtype`, `view`, `matmul`, `index_select`, `gather`, `index_add`, `scatter_set`, `scatter_add_set`, `copy_strided_src`, `copy2d`, `const_set`, the convolutions, pooling and upsampling, together with `try_clone` and the device-to-host copy `to_cpu_storage`. Operations are named by the enums `UnaryOp`, `BinaryOp`, `CmpOp` and `ReduceOp`.
 
 Tensor operations are the same on every device. Each one validates shapes and element types, checks that its operands are on the same device, and calls one primitive of the storage's backend with the layouts of its operands. Another operand reaches the primitive as `&dyn BackendStorage`, which the backend downcasts through `as_any` to its own storage type.
 

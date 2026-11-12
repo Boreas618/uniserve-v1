@@ -269,6 +269,13 @@ impl BackendStorage for HostStorage {
         Ok(self.on_same_device(storage))
     }
 
+    /// The elements are a typed host vector, so the reinterpreted storage is a copy of its
+    /// bytes, as the CPU backend's is.
+    fn view(&self, dtype: DType) -> Result<Box<dyn BackendStorage>> {
+        let storage = self.storage.view(dtype)?;
+        Ok(self.on_same_device(storage))
+    }
+
     fn matmul(
         &self,
         rhs: &dyn BackendStorage,
