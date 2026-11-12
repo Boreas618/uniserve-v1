@@ -21,20 +21,20 @@
 //!
 //! | Module | Holds |
 //! | --- | --- |
-//! | [`buckets`] | [`Bucket`](buckets::Bucket), the key that fixes a graph's shapes, and the bucket sets a runner captures |
-//! | [`completion`] | How an operation ended and the completion its waiters share, over the crate's error |
-//! | [`config`] | The devices a rank computes on, as an engine's launch names them |
-//! | [`error`] | The crate's one error and its classification for the engine |
 //! | [`executor`] | [`Executor`]: the one thread per device that performs the device's jobs in submission order; its queue, the route of a batch to a node's executors and peers, the watchdog, and the control thread's and the peers' channels |
-//! | [`graphs`] | [`Graphs`]: the profile run, capture, replay through the input buffer, and the switch of generations, for every runner |
 //! | [`runner`] | The [`Runner`] interface a stage's runner implements |
-//! | [`runners`] | [`CausalLmRunner`], the runner of every causal language model: its input tensors, the request slots' device state, the forward of each bucket, the completion of a step, paired forwards over the scratch page set, and its membership of an expert union |
+//! | [`graphs`] | [`Graphs`]: the profile run, capture, replay through the input buffer, the switch of generations and the shadow of a changed operator, for every runner |
+//! | [`buckets`] | [`Bucket`](buckets::Bucket), the key that fixes a graph's shapes, and the bucket sets a runner captures |
+//! | [`runners`] | [`CausalLmRunner`], the runner of every causal language model: its input tensors, the request slots' device state, the forward of each bucket, the completion of a step, paired forwards over the scratch page set, its membership of an expert union, and its wiring over the rank's cache and state |
+//! | [`sampler`] | [`Sampler`](sampler::Sampler), the token selection that ends a causal forward, the commit of its tokens into the slots' state, and the host encodings of the columns it reads |
+//! | [`memory`] | The rank's storage at the host's Storage Server and what is kept in it: the [`WeightStore`](memory::weights::WeightStore) that `nn::WeightLoader` publishes to, the KV cache's planes and page tables ([`KvCacheMemory`](memory::cache::KvCacheMemory)), the recurrent state ([`StateMemory`](memory::state::StateMemory)), the division of a GPU's quota from the profile runs' peaks ([`memory::division`]) and the [`GraphPool`](memory::graph_pool::GraphPool) that maps the runners' regions |
 //! | [`profiling`] | The range markers that time a model's modules, the engine's `backend::Profiler`; CUPTI's always-on counters; profiling sessions and their collectors and files |
+//! | [`thread_pool`] | [`ThreadPool`](thread_pool::ThreadPool), a bounded pool of threads for one kind of blocking host work |
 //! | [`parallel`] | [`HostGroup`](parallel::host::HostGroup), the host collectives of a rank group over a TCP full mesh |
 //! | [`stream`] | [`EventPool`](stream::EventPool), the event leases storage owners defer their releases behind |
-//! | [`thread_pool`] | [`ThreadPool`](thread_pool::ThreadPool), a bounded pool of threads for one kind of blocking host work |
-//! | [`sampler`] | [`Sampler`](sampler::Sampler), the token selection that ends a causal forward, the commit of its tokens into the slots' state, and the host encodings of the columns it reads |
-//! | [`memory`] | The rank's storage at the host's Storage Server: [`Storage`](memory::allocation::Storage), the [`StorageClient`](memory::client::StorageClient) and the exclusive storages it takes, host page pools, and the [`WeightStore`](memory::weights::WeightStore) that `nn::WeightLoader` publishes to; the division of a GPU's quota when a rank starts ([`memory::division`]) and the [`GraphPool`](memory::graph_pool::GraphPool) that maps the runners' regions |
+//! | [`config`] | The devices a rank computes on, as an engine's launch names them |
+//! | [`completion`] | How an operation ended and the completion its waiters share, over the crate's error |
+//! | [`error`] | The crate's one error and its classification for the engine |
 //!
 //! ## Rules every module keeps
 //!
