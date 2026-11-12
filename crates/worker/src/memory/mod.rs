@@ -8,6 +8,7 @@
 //! | Module | Holds |
 //! | --- | --- |
 //! | [`allocation`] | [`Storage`](allocation::Storage): one allocation the rank owns or maps, and the tensor over a window of it that execution lends to a forward |
+//! | [`cache`] | [`KvCacheMemory`](cache::KvCacheMemory): the KV cache's planes, pooled page tables, host tier and scratch pages, lent to a causal forward as `nn::KvPlanes` and page-table tensors |
 //! | [`client`] | [`StorageClient`](client::StorageClient): the rank's connection to the Storage Server, the exclusive storages it takes there and its share of each GPU's quota |
 //! | [`exclusive`] | [`ExclusiveStorage`](exclusive::ExclusiveStorage): how an owner takes exclusive storage, at the server or local to the process |
 //! | [`host_pages`] | [`HostPages`](host_pages::HostPages): a rank's mapping of one host page pool |
@@ -15,6 +16,7 @@
 //! | [`graph_pool`] | [`GraphPool`](graph_pool::GraphPool): the runners' regions and the scratch pool of one device, mapped at fixed addresses and reserved in the GPU's quota |
 //! | [`weights`] | [`WeightStore`](weights::WeightStore): the retained weights of one device, which `nn::WeightLoader` publishes to and maps from |
 //! | [`reload`] | A second load of a serving model: its order compared with the one that serves, and the load that publishes what changed for an update in place |
+//! | [`state`] | [`StateMemory`](state::StateMemory): the live, checkpoint and trail buffers of a model's recurrent layers, and the copies between them and the cache's state pages |
 //!
 //! ## Two kinds of device storage
 //!
@@ -39,13 +41,45 @@
 //! the same quota, so the division of a GPU counts it beside the server's storages.
 
 pub mod allocation;
+pub mod cache;
 pub mod client;
 pub mod division;
 pub mod exclusive;
 pub mod graph_pool;
 pub mod host_pages;
 pub mod reload;
+pub mod state;
 pub mod weights;
+
+use platform::DeviceId;
+use uniserve_tensor::{DType, Shape, Tensor};
+
+use crate::Result;
+
+/// The tensor of `shape` elements of `dtype` at `address` of memory execution owns and lends to
+/// a forward: on `device`, or a meta tensor, which has a shape and an element type and no data,
+/// for an owner that holds no device.
+///
+/// # Safety
+///
+/// On a device, `address` is the first of the tensor's elements in memory the caller keeps
+/// mapped, and unwritten by anything but the kernels launched on the tensor, until every tensor
+/// over it is dropped and the stream work issued on them has completed. A meta tensor's address
+/// is never read.
+pub(crate) unsafe fn lend(
+    address: u64,
+    shape: impl Into<Shape>,
+    dtype: DType,
+    device: Option<DeviceId>,
+) -> Result<Tensor> {
+    let device = match device {
+        Some(device) => backend::cuda(device.0 as usize),
+        None => backend::meta(),
+    };
+
+    // SAFETY: forwarded from the caller.
+    Ok(unsafe { backend::external(address, shape, dtype, &device) }?)
+}
 
 /// What the tests of this module's files share.
 #[cfg(test)]
