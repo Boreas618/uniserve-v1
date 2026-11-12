@@ -23,7 +23,8 @@
 //! for the whole buffer, addressed flattened ([`philox_normal`]), or one key per row, each row
 //! its own stream ([`philox_normal_rows`]).
 //!
-//! The destination is execution's: latents it owns and lends, written in place.
+//! The destination is execution's: latents it owns and lends, written in place. A draw no
+//! buffer of execution holds is returned as a new tensor ([`philox_normal_like`]).
 
 use ops::noise::{KeySource, NOISE_BLOCK, NoiseArgs, NoiseDescriptor, NoiseKind, PhiloxNoise};
 use uniserve_tensor::{DType, Device, Tensor};
@@ -141,6 +142,35 @@ pub fn philox_normal(out: &Tensor, seed: u64, stage: u32, draw: u32, offset: u64
         },
     )?;
     Ok(())
+}
+
+/// Standard normal noise of `like`'s shape and element type, on `like`'s device: a new tensor
+/// whose element `i`, counted flattened, is element `offset + i` of `seed`'s stream
+/// ([`philox_normal`]).
+///
+/// The draw of a model's own intermediate, which no buffer of execution holds: the noise a VAE
+/// encoder samples its posterior with. `like` states the shape, the type and the device only;
+/// its elements are not read.
+///
+/// # Errors
+///
+/// When `like` has no axis, the tensor cannot be allocated, or the operator refuses its
+/// arguments.
+pub fn philox_normal_like(
+    like: &Tensor,
+    seed: u64,
+    stage: u32,
+    draw: u32,
+    offset: u64,
+) -> Result<Tensor> {
+    let out = if on_cpu(like) {
+        Tensor::zeros(like.shape(), like.dtype(), &Device::Cpu)?
+    } else {
+        backend::empty(like.shape(), like.dtype())?
+    };
+
+    philox_normal(&out, seed, stage, draw, offset)?;
+    Ok(out)
 }
 
 /// Draws standard normal noise into `out`, `[rows, elements]`, in place and in its element type,

@@ -60,6 +60,45 @@ pub fn all_gather(send: &Tensor, recv: &Tensor) -> Result<()> {
     Ok(backend::collective::all_gather(send, recv)?)
 }
 
+/// An unwritten tensor that holds one block of `block`'s shape and element type per rank of the
+/// forward's group, along the first axis: what a gather of every rank's block fills
+/// ([`all_gather`], [`start_gather_rows`]).
+///
+/// It is a block of the context's allocator, so a model that gathers into a tensor of its own
+/// names no allocation: it sets its own block and starts the gather of the rest.
+///
+/// # Errors
+///
+/// When no context is installed or it carries no group, or `block` has no axis.
+pub fn sequence_like(block: &Tensor) -> Result<Tensor> {
+    let Some((_, ranks)) = split() else {
+        return Err(crate::Error::Unsupported(
+            "a gather of every rank's block needs the group it runs over".to_owned(),
+        ));
+    };
+    let Some((rows, rest)) = block.dims().split_first() else {
+        return Err(crate::Error::shape(
+            "sequence_like",
+            "a block of no axis has no rank axis to gather along".to_owned(),
+        ));
+    };
+    let dims = [&[rows * ranks as usize], rest].concat();
+
+    Ok(backend::empty(dims, block.dtype())?)
+}
+
+/// Every rank's `send` in rank order: a new tensor of [`sequence_like`]'s shape, gathered.
+///
+/// # Errors
+///
+/// As [`sequence_like`] and [`all_gather`].
+pub fn gathered(send: &Tensor) -> Result<Tensor> {
+    let recv = sequence_like(send)?;
+
+    all_gather(send, &recv)?;
+    Ok(recv)
+}
+
 /// Exchanges equal blocks with every rank: block `j` of `send` goes to rank `j`, and block `j` of
 /// `recv` is what rank `j` sent here.
 ///

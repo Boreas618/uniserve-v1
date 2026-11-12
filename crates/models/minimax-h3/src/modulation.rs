@@ -1,216 +1,175 @@
-//! The diffusion transformer's timestep conditioning: the H3 row layout of its modulation and the
-//! projections that compute it.
+//! The transformer's timestep conditioning: the levels a step's rows are conditioned on, and
+//! the projections that turn each level into a block's modulation.
 //!
-//! Every layer is conditioned on the step's noise levels through six affine vectors per token -
-//! shift, scale and gate for the attention block and for the feed-forward block - and the final
-//! normalization carries two more. The released network computes them with one shared timestep
-//! embedding and one projection per layer, and the schedule is fixed, so the products are
-//! precomputed once for the schedule's distinct timesteps in an [`nn::diffusion::TimestepTable`].
-//! The table is computed at load on the device: one `Linear(frequency_dim → time_hidden_dim)`, a
-//! SiLU, one `Linear(time_hidden_dim → time_dim)` and then, per layer, one `Linear(time_dim → 18 ·
-//! hidden_size)` - about 260 MMAC per layer per distinct timestep, which no host-side boundary can
-//! absorb (`crate::Solver`'s note has the arithmetic).
+//! Every block is conditioned on the step's noise levels through six affine vectors per row
+//! (shift, scale and gate of the attention, then of the feed-forward), and the final norm
+//! through two. The network computes them with one shared timestep embedding and one
+//! projection per block:
+//!
+//! ```text
+//! t_emb   = time_embedder(sinusoidal(level))                    FP32
+//! block   = adaln_proj.linear(silu(t_emb))    [18 · hidden]     the stack's type
+//! output  = norm_out.linear(silu(t_emb))      [2 · hidden]
+//! ```
+//!
+//! (`refs/vllm-omni/…/minimax_h3/minimax_h3_transformer.py:366-407`,
+//! `minimax_h3_blocks.py:710-745`). The schedule is fixed, so the products are computed once
+//! for the schedule's distinct levels into an [`nn::modules::TimestepTable`] and gathered per
+//! step, as the reference derives its AdaLN tables at load.
 //!
 //! ## The row layout
 //!
-//! A step reads one modulation row per `(group, tag)`: the group is the timestep the token is
-//! conditioned on (the generated video's, the generated audio's, a visual condition's, an audio
-//! reference's) and the tag is the modality the token belongs to (video 0, text 1, audio 2). A
-//! layer's table row holds the three tags' six vectors each, so the gathered `[groups, 18 · hidden]`
-//! rows read as `[3 · groups, 6 · hidden]` and a token's row is `3 · group + tag`. The worker's
-//! per-request `modulation_indices` table holds that value for every packed row, and the layers of
-//! [`crate::transformer`] index with it.
+//! A step reads one modulation row per `(group, tag)`: the group is the level the row is
+//! conditioned on ([`crate::packing`]'s `GROUP_*`) and the tag the modality it belongs to
+//! (`TAG_*`). A block's table row holds the three tags' six vectors each, so the gathered
+//! `[groups, 18 · hidden]` rows read as `[3 · groups, 6 · hidden]` and a packed row's
+//! modulation row is `3 · group + tag`.
 
-use nn::diffusion::TimestepTable;
-use nn::layers::{Bias, Linear, Parallel};
-use nn::timestep::{TimestepEmbedding, TimestepSpec};
-use nn::weights::WeightLoader;
-use nn::{DType, Forward};
+use nn::modules::{
+    Linear, LinearConfig, Parallel, TimestepEmbedding, TimestepEmbeddingConfig, TimestepTable,
+};
+use nn::{DType, Device, Tensor, VarBuilder, functional};
 
+use crate::config::{ScheduleConfig, TransformerConfig};
 use crate::{Error, Result};
 
-/// The six affine vectors one layer reads per token: shift, scale and gate of the attention block,
-/// then of the feed-forward block.
-pub const VECTORS: usize = 6;
+/// The level a visual condition is anchored at, `t · clean + (1 − t) · noise`, and the level
+/// its timestep group sits at until the generated video is cleaner than it
+/// (`refs/vllm-omni/…/minimax_h3/pipeline_minimax_h3.py:233,394`).
+pub const VISUAL_CONDITION_TIME: f32 = 0.999;
 
-/// The three token tags a timestep group's vectors are stored for, in row order.
-pub const TAGS: u32 = 3;
+/// The level an audio reference sits at: its latent unchanged, so nothing is mixed in
+/// (`pipeline_minimax_h3.py:234,395`).
+pub const AUDIO_CONDITION_TIME: f32 = 1.0;
 
-/// How many timestep groups a step reads: the generated video and audio for a text-only denoiser
-/// (`t2va`), and for a `conditioned` one (`fl2va`, `ref2va`) also a visual condition's clean level
-/// and an audio reference's clean level.
-pub const fn groups(conditioned: bool) -> u32 {
+/// The modulation columns of one block's table row: three tags of six vectors, in hidden
+/// widths.
+pub const BLOCK_COLUMNS: u32 = 18;
+
+/// The modulation columns of the final norm's table row: a shift and a scale, in hidden
+/// widths.
+pub const OUTPUT_COLUMNS: u32 = 2;
+
+/// The timestep groups a step reads: the generated video and audio, and for a `conditioned`
+/// network also a visual condition's level and an audio reference's.
+pub const fn groups(conditioned: bool) -> usize {
     if conditioned { 4 } else { 2 }
 }
 
-/// The affine row a token selects inside one step's modulation matrix: `3 · group + tag`.
+/// The level of every group of every step of `schedule`: `[steps, groups]` FP32 on the CPU
+/// device, in the order of the `GROUP_*` constants.
 ///
-/// This is the value the worker writes into the per-request `modulation_indices` table, and the
-/// only request-dependent input of the conditioning.
-pub const fn row(group: u32, tag: u32) -> u32 {
-    TAGS * group + tag
+/// A level is the network time `1 − sigma`, in FP32. The generated video and audio have their
+/// own level per step; a visual condition's is the video's floored at
+/// [`VISUAL_CONDITION_TIME`], and an audio reference is clean at every step. Levels that
+/// coincide share one table entry.
+///
+/// # Errors
+///
+/// A tensor operation's refusal.
+pub fn levels(schedule: &ScheduleConfig, conditioned: bool) -> Result<Tensor> {
+    let steps = schedule.num_steps() as usize;
+    let time = |sigmas: &[f32]| -> Result<Tensor> {
+        Ok(Tensor::new(&sigmas[..steps], &Device::Cpu)?.affine(-1.0, 1.0)?)
+    };
+    let (video, audio) = (time(&schedule.video_sigmas)?, time(&schedule.audio_sigmas)?);
+
+    let mut columns = vec![video.clone(), audio];
+    if conditioned {
+        columns.push(video.maximum(f64::from(VISUAL_CONDITION_TIME))?);
+        columns.push(Tensor::full(AUDIO_CONDITION_TIME, steps, &Device::Cpu)?);
+    }
+
+    Ok(Tensor::stack(&columns, 1)?)
 }
 
-/// The noise level of every group of every step, step-major: the levels the timestep table holds.
-///
-/// The generated video and audio have their own level per step; the visual condition's level is
-/// the video's floored at the clean level the condition is anchored at
-/// ([`crate::denoiser::VISUAL_CONDITION_TIME`]), and an audio reference is clean at the top of the
-/// schedule. Levels that coincide share one table entry
-/// ([`nn::diffusion::TimestepTable::entries`]), which is where the table's saving comes from - the
-/// schedule's points repeat across the two modalities and the condition groups.
-pub fn levels(video: &[f32], audio: &[f32], conditioned: bool) -> Result<Vec<f32>> {
-    if video.is_empty() || video.len() != audio.len() {
-        return Err(Error::checkpoint(format!(
-            "{} video and {} audio noise levels are not one schedule's",
-            video.len(),
-            audio.len()
-        )));
-    }
-    let mut levels = Vec::with_capacity(video.len() * groups(conditioned) as usize);
-    for (video, audio) in video.iter().zip(audio) {
-        levels.extend([*video, *audio]);
-        if conditioned {
-            // A visual condition sits at the generated video's level until that level is cleaner
-            // than its anchor, and an audio reference is always clean.
-            levels.extend([
-                video.max(crate::denoiser::VISUAL_CONDITION_TIME),
-                crate::denoiser::AUDIO_CONDITION_TIME,
-            ]);
-        }
-    }
-    Ok(levels)
-}
-
-/// The projections the AdaLN tables are computed with: the shared timestep embedding, one
-/// modulation projection per layer and the final norm's.
-pub struct Projections {
-    /// `time_embedder`: `linear_1` `[time_hidden, frequency]` and `linear_2` `[time_dim,
-    /// time_hidden]`, FP32, with their biases.
+/// The projections the modulation tables are computed with: the shared timestep embedding, one
+/// modulation projection per block and the final norm's.
+pub struct Modulation {
+    /// `time_embedder`: FP32 at every preset.
     time: TimestepEmbedding,
-    /// One `adaln_proj.linear` per layer: `[18 * hidden, time_dim]`, with its bias.
-    layers: Vec<Linear>,
-    /// `norm_out.linear`: `[2 * hidden, time_dim]`, with its bias.
+    /// One `transformer_blocks.<i>.adaln_proj.linear` per block, `[18 · hidden, time_dim]`.
+    blocks: Vec<Linear>,
+    /// `norm_out.linear`, `[2 · hidden, time_dim]`.
     output: Linear,
-    frequency_dim: u32,
 }
 
-impl Projections {
-    /// Read the cache's projections out of a DiT partition's checkpoint.
-    pub fn load(
-        config: &crate::config::TransformerConfig,
-        loader: &mut WeightLoader<'_>,
-    ) -> Result<Self> {
-        // **The element type of each tensor is pinned by the reference, not by the deployment.**
-        // Its loading table fixes the timestep pair at FP32 and the modulation projections at BF16
-        // whatever the preset, and it casts the activation to the weight's
-        // type before each product. Our product has one element type for both
-        // operands, so the activation and the tables must agree with the weights on both sides - and
-        // the run's first stop was exactly this: an FP32 activation against whatever type the
-        // deployment's loader happened to publish.
-        //
-        // So the timestep pair is pinned FP32 and the modulation projections take the deployment's
-        // type (`None`: the loader's own policy), which is the stack's - the pair differ exactly as
-        // the reference's do. `compute` then crosses between them **once**, narrowing the timestep
-        // activation into the modulation type; the tables follow the projections, so a block's
-        // modulation and its activation are one type, and at a deployment that states FP32 the two
-        // halves coincide and the crossing is skipped.
-        let hidden = config.hidden_size;
-        let rows = VECTORS as u32 * hidden * TAGS;
-        // A modulation projection, read at the deployment's type.
-        let projection = |loader: &mut WeightLoader<'_>, name: &str, outputs: u32| {
+impl Modulation {
+    /// The projections the checkpoint at `vb` states.
+    ///
+    /// The element type of each is the reference's: the timestep pair is FP32 and the
+    /// modulation projections are the stack's, and the activation crosses between them once
+    /// (`minimax_h3_blocks.py:713-716`).
+    ///
+    /// # Errors
+    ///
+    /// A weight the loader refuses.
+    pub fn load(config: &TransformerConfig, vb: VarBuilder<'_, '_>) -> Result<Self> {
+        let projection = |vb: VarBuilder<'_, '_>, columns: u32| {
             Linear::load(
-                &mut loader.scope(name),
-                config.time_dim,
-                outputs,
-                Bias::Present,
-                Parallel::None,
+                &LinearConfig {
+                    inputs: config.time_dim,
+                    outputs: columns * config.hidden_size,
+                    bias: true,
+                    parallel: Parallel::None,
+                },
+                vb,
             )
         };
-        let layers = (0..config.num_hidden_layers)
-            .map(|index| {
-                projection(
-                    loader,
-                    &format!("transformer_blocks.{index}.adaln_proj.linear"),
-                    rows,
-                )
-            })
-            .collect::<nn::Result<Vec<_>>>()?;
+
         Ok(Self {
             time: TimestepEmbedding::load(
-                &mut loader.scope("time_embedder").pinned(DType::F32),
-                TimestepSpec {
+                &TimestepEmbeddingConfig {
                     frequency_dim: config.frequency_dim,
                     hidden: config.time_hidden_dim,
                     out: config.time_dim,
                 },
+                vb.pp("time_embedder").to_dtype(DType::F32),
             )?,
-            layers,
-            output: projection(loader, "norm_out.linear", 2 * hidden)?,
-            frequency_dim: config.frequency_dim,
+            blocks: (0..config.num_hidden_layers)
+                .map(|index| {
+                    let block = vb.pp("transformer_blocks").pp(index);
+                    projection(block.pp("adaln_proj").pp("linear"), BLOCK_COLUMNS)
+                })
+                .collect::<nn::Result<Vec<_>>>()?,
+            output: projection(vb.pp("norm_out").pp("linear"), OUTPUT_COLUMNS)?,
         })
     }
 
-    /// Fill `table`'s block and output tables from its embedding, `[entries, frequency_dim]` FP32.
-    ///
-    /// Each block table is `[entries, 18 * hidden]` and the output table `[entries, 2 * hidden]`:
-    /// the tables every step gathers rows from. They are the table's writable constants, written
-    /// once after the load ([`nn::capability::Denoiser::initialize`]); the levels they are computed
-    /// at are the schedule's, which do not change per request.
-    ///
-    /// The timestep pair computes in FP32 and the modulation projections in their weights' type,
-    /// which is the tables' type: the activation crosses between them once, as the reference's
-    /// `F.linear(activated_timesteps.to(weight.dtype), weight, bias)` does.
-    pub fn compute(&self, f: &Forward, table: &TimestepTable) -> Result<()> {
-        let embedding = table.frequencies();
-        if embedding.shape.rank() != 2 || embedding.shape.last() != u64::from(self.frequency_dim) {
-            return Err(Error::config(format!(
-                "an AdaLN embedding of {:?} is not [entries, {}]",
-                embedding.shape.dims(),
-                self.frequency_dim
-            )));
-        }
-        let time_type = self.time.dtype();
-        if time_type != DType::F32 || embedding.dtype != time_type {
-            return Err(Error::config(format!(
-                "the AdaLN timestep pair computes in {time_type} over a {} embedding; the \
-                 reference pins both to FP32",
-                ops::abi::name(embedding.dtype),
-                time_type = ops::abi::name(time_type)
-            )));
-        }
-        let dtype = self.dtype();
-        let output_table = table.output_table();
-        if output_table.dtype != dtype {
-            return Err(Error::config(format!(
-                "the AdaLN tables are {} and the projections' weights are {dtype}",
-                ops::abi::name(output_table.dtype),
-                dtype = ops::abi::name(dtype)
-            )));
-        }
-
-        // `silu(time_embedder(embedding))`, narrowed once into the projections' type.
-        let time = self.time.forward(f, embedding)?;
-        let activated = nn::layers::Silu.forward(f, time)?;
-        let narrow = if dtype == time_type {
-            activated
-        } else {
-            nn::layers::Cast.forward(f, activated, dtype)?
-        };
-
-        // Each projection writes its table: computed into the arena, then stored into the
-        // table's own storage (`inout ← 1 · product`).
-        for (index, layer) in self.layers.iter().enumerate() {
-            let product = layer.forward(f, narrow)?;
-            nn::layers::Axpby.forward(f, table.layer_table(index)?, product, 1.0, 0.0)?;
-        }
-        let product = self.output.forward(f, narrow)?;
-        Ok(nn::layers::Axpby.forward(f, output_table, product, 1.0, 0.0)?)
+    /// The element type the modulation projections compute in: the tables' type.
+    pub fn dtype(&self) -> DType {
+        self.output.weight().dtype()
     }
 
-    /// The element type the modulation projections read: the tables' type, and the cache's.
-    pub fn dtype(&self) -> DType {
-        self.layers[0].weight().dtype
+    /// Fills `table`'s block and output tables from its embedding, `[entries, frequency_dim]`
+    /// FP32: each block's `[entries, 18 · hidden]` and the final norm's `[entries, 2 · hidden]`.
+    ///
+    /// The timestep pair computes in FP32 and the projections in their weights' type: the
+    /// activation `silu(t_emb)` rounds into it once.
+    ///
+    /// # Errors
+    ///
+    /// Tables of another element type than the projections', or what a module refuses.
+    pub fn fill(&self, table: &TimestepTable) -> Result<()> {
+        let dtype = self.dtype();
+        if table.output_table().dtype() != dtype {
+            return Err(Error::config(format!(
+                "the modulation tables are {:?} and the projections' weights {dtype:?}",
+                table.output_table().dtype()
+            )));
+        }
+
+        let time = self.time.forward(table.frequencies())?;
+        let activated = functional::silu(&time)?.to_dtype(dtype)?;
+
+        for (index, block) in self.blocks.iter().enumerate() {
+            table
+                .layer_table(index)?
+                .slice_set(&block.forward(&activated)?, 0, 0)?;
+        }
+        Ok(table
+            .output_table()
+            .slice_set(&self.output.forward(&activated)?, 0, 0)?)
     }
 }
 
@@ -219,48 +178,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_token_row_is_the_group_and_tag() {
-        // Six vectors per group, three tags of two rows each: video, text, audio.
-        assert_eq!(row(0, 0), 0);
-        assert_eq!(row(0, 1), 1);
-        assert_eq!(row(0, 2), 2);
-        assert_eq!(row(1, 0), 3);
-        assert_eq!(row(3, 2), 11);
-        // The layer reshapes [groups, 18 · hidden] to [3 · groups, 6 · hidden], so a step of four
-        // groups holds twelve rows of six vectors.
-        assert_eq!(VECTORS, 6);
-        assert_eq!(groups(true) * TAGS, 12);
-    }
-
-    #[test]
     fn a_generated_step_reads_the_video_and_audio_levels() {
-        let levels = levels(&[0.9, 0.5], &[0.8, 0.4], false).unwrap();
-        assert_eq!(levels, vec![0.9, 0.8, 0.5, 0.4]);
-        let (times, table) = nn::diffusion::TimestepTable::entries(&levels, groups(false)).unwrap();
-        assert_eq!(times, vec![0.9, 0.8, 0.5, 0.4]);
-        assert_eq!(table, vec![0, 1, 2, 3]);
+        let schedule = ScheduleConfig::uniform(5, 1.0, 1.0).unwrap();
+        let levels = levels(&schedule, false).unwrap();
+
+        // One row per evaluation: the clean endpoint is no evaluation.
+        assert_eq!(levels.dims(), [4, groups(false)]);
+        assert_eq!(
+            levels.to_vec2::<f32>().unwrap(),
+            [[0.0, 0.0], [0.25, 0.25], [0.5, 0.5], [0.75, 0.75]]
+        );
     }
 
     #[test]
     fn a_conditioned_step_reads_four_levels() {
-        // The visual condition is the video's level floored at the clean anchor, and the audio
-        // reference is clean: at the first step both are 1.0, at the second they separate.
-        let levels = levels(&[1.0, 0.5], &[1.0, 0.5], true).unwrap();
-        let (times, table) = nn::diffusion::TimestepTable::entries(&levels, groups(true)).unwrap();
-        assert_eq!(times, vec![1.0, 0.5, 0.999]);
-        assert_eq!(table, vec![0, 0, 0, 0, 1, 1, 2, 0]);
-    }
+        // A visual condition sits at the generated video's level until that level is cleaner
+        // than its anchor, and an audio reference is clean at every step.
+        let schedule = ScheduleConfig::ladder(&[1000, 500, 1], 1000.0, 1.0, 1.0).unwrap();
+        let levels = levels(&schedule, true).unwrap().to_vec2::<f32>().unwrap();
 
-    #[test]
-    fn a_schedule_of_unequal_modalities_is_refused() {
-        assert!(levels(&[1.0, 0.5], &[1.0], false).is_err());
-        assert!(levels(&[], &[], false).is_err());
-    }
-
-    #[test]
-    fn the_groups_follow_the_tasks() {
-        // Only a text-to-video request skips the condition levels.
-        assert_eq!(groups(false), 2);
-        assert_eq!(groups(true), 4);
+        assert_eq!(levels[0], [0.0, 0.0, VISUAL_CONDITION_TIME, 1.0]);
+        assert_eq!(levels[1], [0.5, 0.5, VISUAL_CONDITION_TIME, 1.0]);
+        assert_eq!(levels[2][0], 1.0 - 0.001_f32);
+        assert_eq!(levels[2][2], VISUAL_CONDITION_TIME.max(1.0 - 0.001_f32));
     }
 }

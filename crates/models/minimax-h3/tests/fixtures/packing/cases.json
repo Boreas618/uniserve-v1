@@ -1,0 +1,391 @@
+[
+  {
+    "name": "t2va_small",
+    "width": 96,
+    "height": 64,
+    "frames": 22,
+    "text_tokens": 37,
+    "conditions": [],
+    "vision_spans": [],
+    "text_rows": 128,
+    "condition_rows": 0,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "t2va_one_token",
+    "width": 160,
+    "height": 96,
+    "frames": 39,
+    "text_tokens": 1,
+    "conditions": [],
+    "vision_spans": [],
+    "text_rows": 128,
+    "condition_rows": 0,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "t2va_longest",
+    "width": 64,
+    "height": 32,
+    "frames": 1008,
+    "text_tokens": 200,
+    "conditions": [],
+    "vision_spans": [],
+    "text_rows": 320,
+    "condition_rows": 0,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "fl2va_first",
+    "width": 96,
+    "height": 64,
+    "frames": 22,
+    "text_tokens": 50,
+    "conditions": [
+      {
+        "role": "first_frame",
+        "frames": 1,
+        "height": 64,
+        "width": 96,
+        "audio_samples": 0
+      }
+    ],
+    "vision_spans": [
+      [
+        10,
+        6
+      ]
+    ],
+    "text_rows": 128,
+    "condition_rows": 128,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "fl2va_last",
+    "width": 96,
+    "height": 64,
+    "frames": 107,
+    "text_tokens": 20,
+    "conditions": [
+      {
+        "role": "last_frame",
+        "frames": 1,
+        "height": 64,
+        "width": 96,
+        "audio_samples": 0
+      }
+    ],
+    "vision_spans": [],
+    "text_rows": 128,
+    "condition_rows": 128,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "fl2va_both",
+    "width": 96,
+    "height": 96,
+    "frames": 362,
+    "text_tokens": 64,
+    "conditions": [
+      {
+        "role": "first_frame",
+        "frames": 1,
+        "height": 96,
+        "width": 96,
+        "audio_samples": 0
+      },
+      {
+        "role": "last_frame",
+        "frames": 1,
+        "height": 96,
+        "width": 96,
+        "audio_samples": 0
+      }
+    ],
+    "vision_spans": [
+      [
+        3,
+        9
+      ],
+      [
+        20,
+        9
+      ]
+    ],
+    "text_rows": 128,
+    "condition_rows": 192,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "ref2va_image",
+    "width": 96,
+    "height": 64,
+    "frames": 22,
+    "text_tokens": 30,
+    "conditions": [
+      {
+        "role": "reference",
+        "frames": 1,
+        "height": 64,
+        "width": 128,
+        "audio_samples": 0
+      }
+    ],
+    "vision_spans": [],
+    "text_rows": 128,
+    "condition_rows": 128,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "ref2va_audio",
+    "width": 96,
+    "height": 64,
+    "frames": 22,
+    "text_tokens": 30,
+    "conditions": [
+      {
+        "role": "reference",
+        "frames": 0,
+        "height": 0,
+        "width": 0,
+        "audio_samples": 40000
+      }
+    ],
+    "vision_spans": [],
+    "text_rows": 128,
+    "condition_rows": 192,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "ref2va_video",
+    "width": 96,
+    "height": 64,
+    "frames": 22,
+    "text_tokens": 30,
+    "conditions": [
+      {
+        "role": "reference",
+        "frames": 30,
+        "height": 64,
+        "width": 64,
+        "audio_samples": 40000
+      }
+    ],
+    "vision_spans": [],
+    "text_rows": 128,
+    "condition_rows": 256,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "ref2va_blocks",
+    "width": 160,
+    "height": 96,
+    "frames": 56,
+    "text_tokens": 45,
+    "conditions": [
+      {
+        "role": "reference",
+        "frames": 1,
+        "height": 64,
+        "width": 128,
+        "audio_samples": 0
+      },
+      {
+        "role": "reference",
+        "frames": 17,
+        "height": 96,
+        "width": 64,
+        "audio_samples": 0
+      },
+      {
+        "role": "reference",
+        "frames": 0,
+        "height": 0,
+        "width": 0,
+        "audio_samples": 40000
+      },
+      {
+        "role": "reference",
+        "frames": 51,
+        "height": 64,
+        "width": 96,
+        "audio_samples": 8000
+      },
+      {
+        "role": "reference",
+        "frames": 1,
+        "height": 160,
+        "width": 96,
+        "audio_samples": 0
+      }
+    ],
+    "vision_spans": [],
+    "text_rows": 128,
+    "condition_rows": 576,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "ref2va_guided",
+    "width": 96,
+    "height": 64,
+    "frames": 22,
+    "text_tokens": 30,
+    "conditions": [
+      {
+        "role": "reference",
+        "frames": 1,
+        "height": 64,
+        "width": 128,
+        "audio_samples": 0
+      },
+      {
+        "role": "first_frame",
+        "frames": 1,
+        "height": 64,
+        "width": 96,
+        "audio_samples": 0
+      },
+      {
+        "role": "reference",
+        "frames": 0,
+        "height": 0,
+        "width": 0,
+        "audio_samples": 40000
+      },
+      {
+        "role": "last_frame",
+        "frames": 1,
+        "height": 64,
+        "width": 96,
+        "audio_samples": 0
+      }
+    ],
+    "vision_spans": [],
+    "text_rows": 128,
+    "condition_rows": 384,
+    "tile_rows": null,
+    "sparsity": 0.0,
+    "reference_keep": null
+  },
+  {
+    "name": "tiled_t2va",
+    "width": 352,
+    "height": 224,
+    "frames": 39,
+    "text_tokens": 70,
+    "conditions": [],
+    "vision_spans": [],
+    "text_rows": 192,
+    "condition_rows": 0,
+    "tile_rows": 64,
+    "sparsity": 0.9,
+    "reference_keep": null
+  },
+  {
+    "name": "tiled_fl2va",
+    "width": 160,
+    "height": 96,
+    "frames": 22,
+    "text_tokens": 64,
+    "conditions": [
+      {
+        "role": "first_frame",
+        "frames": 1,
+        "height": 96,
+        "width": 160,
+        "audio_samples": 0
+      }
+    ],
+    "vision_spans": [],
+    "text_rows": 128,
+    "condition_rows": 128,
+    "tile_rows": 64,
+    "sparsity": 0.8,
+    "reference_keep": null
+  },
+  {
+    "name": "tiled_ref2va",
+    "width": 288,
+    "height": 160,
+    "frames": 39,
+    "text_tokens": 45,
+    "conditions": [
+      {
+        "role": "reference",
+        "frames": 1,
+        "height": 64,
+        "width": 128,
+        "audio_samples": 0
+      },
+      {
+        "role": "reference",
+        "frames": 30,
+        "height": 160,
+        "width": 96,
+        "audio_samples": 0
+      },
+      {
+        "role": "reference",
+        "frames": 0,
+        "height": 0,
+        "width": 0,
+        "audio_samples": 40000
+      },
+      {
+        "role": "reference",
+        "frames": 51,
+        "height": 96,
+        "width": 288,
+        "audio_samples": 8000
+      }
+    ],
+    "vision_spans": [],
+    "text_rows": 256,
+    "condition_rows": 1792,
+    "tile_rows": 128,
+    "sparsity": 0.8,
+    "reference_keep": 0.5
+  },
+  {
+    "name": "tiled_ref2va_one_rate",
+    "width": 288,
+    "height": 160,
+    "frames": 22,
+    "text_tokens": 128,
+    "conditions": [
+      {
+        "role": "reference",
+        "frames": 30,
+        "height": 160,
+        "width": 96,
+        "audio_samples": 0
+      }
+    ],
+    "vision_spans": [],
+    "text_rows": 256,
+    "condition_rows": 640,
+    "tile_rows": 128,
+    "sparsity": 0.75,
+    "reference_keep": null
+  }
+]

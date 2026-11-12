@@ -376,6 +376,15 @@ fn a_draw_is_a_function_of_the_seed_and_the_element_alone() {
     functional::philox_normal(&other, SEED, 3, 2, 0).unwrap();
     assert_ne!(values(&other), expected);
 
+    // A draw returned as a new tensor is the same stream, in the shape and type of its model.
+    let like = Tensor::zeros((2, 3, 5), DType::BF16, &Device::Cpu).unwrap();
+    let drawn = functional::philox_normal_like(&like, SEED, 3, 1, 0).unwrap();
+    assert_eq!((drawn.dims(), drawn.dtype()), (like.dims(), DType::BF16));
+    assert_eq!(
+        values(&drawn),
+        expected.iter().copied().map(bf16).collect::<Vec<f32>>()
+    );
+
     // One key per row draws one stream per row, each from its own first element.
     let keys = [SEED as i64, -5];
     let rows = zeros(&[2, 9]);
@@ -407,12 +416,17 @@ fn a_draw_states_its_distribution_and_its_key_source() {
     let (drawn, launches) = recorded(|| {
         // A latent arrives as a four-axis raster and is drawn through its folded rows.
         functional::philox_normal(&meta((24, 37, 48, 84), DType::F32), 7, 0, 0, 0)?;
+        functional::philox_normal_like(&meta((24, 2, 3, 4), DType::F32), 7, 0, 0, 0)?;
         functional::philox_normal_rows(&meta((2, 207), DType::BF16), &meta(2, DType::I64), 0, 0, 0)
     });
     drawn.unwrap();
     assert_eq!(
         launches,
         [
+            (
+                "philox_noise",
+                "dtype_f32_block_1024_kind_normal_source_scalar"
+            ),
             (
                 "philox_noise",
                 "dtype_f32_block_1024_kind_normal_source_scalar"
