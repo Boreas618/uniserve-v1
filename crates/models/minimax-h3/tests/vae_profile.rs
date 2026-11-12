@@ -18,7 +18,6 @@
 
 mod support;
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use minimax_h3::audio_vae::{AudioDecoder, AudioEncoder, padded_samples};
@@ -28,23 +27,10 @@ use nn::{Checkpoint, Clip, DType, Decoder, LatentShape, Layout, WeightLoader};
 use processing::minimax_h3::{
     AUDIO_LATENTS_PER_SECOND, FRAMES, MAX_SECONDS, MIN_SECONDS, named_canvases,
 };
-use support::{Recording, meta, recorded};
+use support::{meta, recorded, report};
 
 /// The released checkpoint the runs read the headers of.
 const CHECKPOINT: &str = "/workspace/models/MiniMax-H3";
-
-/// The operators of the device backend's generic tensor primitives (`backend::primitives`);
-/// every other operator a forward launches is a fused operator of `nn`.
-const PRIMITIVES: [&str; 8] = [
-    "cast",
-    "copy_strided",
-    "elementwise_binary",
-    "elementwise_unary",
-    "elementwise_where",
-    "fill",
-    "index",
-    "reduce",
-];
 
 /// The stage `name` of the released checkpoint, opened by its headers.
 fn stage(name: &str) -> Checkpoint {
@@ -85,47 +71,6 @@ fn served_resolutions() -> [(u32, u32); 2] {
     resolutions.sort_by_key(|(width, height)| (width * height, *width));
 
     [resolutions[0], resolutions[resolutions.len() - 1]]
-}
-
-/// Checks that every launch of `recording` names an operator and a key, and prints the run's
-/// launches, kernel keys, operators by kind and allocator peak.
-fn report(run: &str, (launches, peak): &Recording) {
-    assert!(!launches.is_empty(), "{run} launched nothing");
-    for (index, (operator, key)) in launches.iter().enumerate() {
-        assert!(
-            !operator.is_empty() && !key.is_empty(),
-            "{run}: launch {index} states operator {operator:?} and key {key:?}"
-        );
-    }
-
-    // Each operator's launches and its distinct keys.
-    let mut operators: BTreeMap<&str, (usize, BTreeSet<&str>)> = BTreeMap::new();
-    for (operator, key) in launches {
-        let entry = operators.entry(operator).or_default();
-        entry.0 += 1;
-        entry.1.insert(key);
-    }
-    let keys: usize = operators.values().map(|(_, keys)| keys.len()).sum();
-
-    println!(
-        "{run}: {} launches, {keys} kernel keys, allocator peak {peak} bytes ({:.1} MiB)",
-        launches.len(),
-        *peak as f64 / (1 << 20) as f64
-    );
-    for (kind, generic) in [("generic primitives", true), ("fused operators", false)] {
-        let listed: Vec<String> = operators
-            .iter()
-            .filter(|(operator, _)| PRIMITIVES.contains(operator) == generic)
-            .map(|(operator, (count, keys))| format!("{operator} {count}/{}", keys.len()))
-            .collect();
-
-        println!("  {kind} (launches/keys): {}", listed.join(", "));
-    }
-    for (operator, (_, keys)) in &operators {
-        for key in keys {
-            println!("    {operator}: {key}");
-        }
-    }
 }
 
 #[test]

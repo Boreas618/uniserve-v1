@@ -4,6 +4,7 @@
 //! Each test file that declares `mod support;` compiles its own copy and uses part of it.
 #![allow(dead_code, reason = "each test crate uses part of the shared support")]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use nn::{DType, Device, Shape, Tensor};
@@ -211,4 +212,58 @@ pub(crate) fn recorded<T, E>(forward: impl FnOnce() -> Result<T, E>) -> (Result<
 /// The operators of a launch table, in launch order.
 pub(crate) fn operators(launches: &[(&'static str, String)]) -> Vec<&'static str> {
     launches.iter().map(|(operator, _)| *operator).collect()
+}
+
+/// The operators of the device backend's generic tensor primitives (`backend::primitives`);
+/// every other operator a forward launches is a fused operator of `nn`.
+pub(crate) const PRIMITIVES: [&str; 8] = [
+    "cast",
+    "copy_strided",
+    "elementwise_binary",
+    "elementwise_unary",
+    "elementwise_where",
+    "fill",
+    "index",
+    "reduce",
+];
+
+/// Checks that every launch of `recording` names an operator and a key, and prints the run's
+/// launches, kernel keys, operators by kind and allocator peak.
+pub(crate) fn report(run: &str, (launches, peak): &Recording) {
+    assert!(!launches.is_empty(), "{run} launched nothing");
+    for (index, (operator, key)) in launches.iter().enumerate() {
+        assert!(
+            !operator.is_empty() && !key.is_empty(),
+            "{run}: launch {index} states operator {operator:?} and key {key:?}"
+        );
+    }
+
+    // Each operator's launches and its distinct keys.
+    let mut operators: BTreeMap<&str, (usize, BTreeSet<&str>)> = BTreeMap::new();
+    for (operator, key) in launches {
+        let entry = operators.entry(operator).or_default();
+        entry.0 += 1;
+        entry.1.insert(key);
+    }
+    let keys: usize = operators.values().map(|(_, keys)| keys.len()).sum();
+
+    println!(
+        "{run}: {} launches, {keys} kernel keys, allocator peak {peak} bytes ({:.1} MiB)",
+        launches.len(),
+        *peak as f64 / (1 << 20) as f64
+    );
+    for (kind, generic) in [("generic primitives", true), ("fused operators", false)] {
+        let listed: Vec<String> = operators
+            .iter()
+            .filter(|(operator, _)| PRIMITIVES.contains(operator) == generic)
+            .map(|(operator, (count, keys))| format!("{operator} {count}/{}", keys.len()))
+            .collect();
+
+        println!("  {kind} (launches/keys): {}", listed.join(", "));
+    }
+    for (operator, (_, keys)) in &operators {
+        for key in keys {
+            println!("    {operator}: {key}");
+        }
+    }
 }
