@@ -7,7 +7,7 @@
 //! share one configuration, which the checkpoint's `vae/config.json` states.
 
 use nn::config::Fields;
-use nn::layers::Padding;
+use nn::functional::Padding;
 use serde_json::Value;
 
 use super::statistics;

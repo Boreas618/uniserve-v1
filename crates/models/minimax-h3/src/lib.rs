@@ -1,44 +1,27 @@
-//! MiniMax-H3 with FastH3: the checkpoint configuration read once at the loading boundary and the
-//! numerical pipeline.
+//! MiniMax-H3 and FastH3: the video-and-audio diffusion family, as a model file holds it.
 //!
-//! The crate holds one pipeline: the Qwen3-VL text encoder that conditions a request
-//! ([`qwen3::Qwen3VlModel`], truncated to [`config::RETAINED_LAYERS`] with no final norm), one or two
-//! diffusion transformer (DiT) partitions of the checkpoint ([`denoiser`]), the video and audio
-//! latent encoders a conditioned task reads ([`encoding`]), and the video and audio decoders. Each
-//! is a stage implementing an [`nn`] capability, and a deployment places a subset of them per worker
-//! group under the stage names of the deployment files: `text_encoder`, `transformer`,
-//! `transformer_ref`, `video_decoder`, `audio_decoder`, `latent_encoder`, `video_postprocessor`
-//! ([`family`]).
+//! The crate holds what a diffusers or vLLM-Omni model file holds, on the tensor library and
+//! [`nn`]:
 //!
-//! A checkpoint's JSON sidecars are read and validated once, into [`config::Config`]; every layer
-//! below consumes typed fields and borrowed views. Request processing - the request rules, the
-//! canvas and frame rules, prompt presentation - is [`processing::minimax_h3`]'s.
+//! - **configuration** ([`config`]): the checkpoint's sidecars, read and normalized once at the
+//!   loading boundary into one typed, immutable struct per numerical submodule;
+//! - **the module tree**: the diffusion transformer with its dense or video-sparse attention
+//!   ([`transformer`]), the denoiser around it ([`denoiser`]), the video VAE ([`video_vae`]),
+//!   the audio VAE with its vocoder and its encoder ([`audio_vae`]) and the clip splice
+//!   ([`splice`]). Every `forward` composes tensor operations and `nn` modules;
+//! - **the packed sequence** ([`packing`]): the row layout a request's latents, prompt and
+//!   conditions are laid out in, as CPU tensor expressions a forward moves to its device;
+//! - **the family value** ([`family`]): how a checkpoint opens, which stages a deployment places
+//!   on a rank, and what the loaded pipeline states to execution.
+//!
+//! The request side of the family (the resolution and frame rules, the prompt, the prepared
+//! conditions) is [`processing::minimax_h3`]'s; a model consumes those values and redefines
+//! none. A model holds no runtime object: the execution context a forward computes under is the
+//! thread's, installed by execution (`AGENTS.md`, Model Library Boundary).
 
-pub mod attention;
-pub mod attention_sparse;
-pub mod audio_vae;
-pub mod checkpoint;
-pub mod conditioning;
 pub mod config;
-pub mod denoiser;
-pub mod encoding;
-pub mod family;
-pub mod modulation;
-pub mod output;
-pub mod packing;
-pub mod schedule;
-pub mod solver;
-pub mod tiled_encode;
-pub mod transformer;
-pub mod video_vae;
 
-pub use config::{
-    AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, AUDIO_SAMPLE_RATE, AttentionKind,
-    AudioVaeConfig, CANVAS_RULE, Config, DenoiserConfig, FPS, FRAMES, MAX_SECONDS, MIN_SECONDS,
-    NAMED_ASPECT_RATIOS, NUM_TRAIN_TIMESTEPS, RETAINED_LAYERS, SPARSE_TILE_ROWS, ScheduleGrid,
-    ScheduleSpec, Shifts, TransformerConfig, UNIFORM_GRID_POINTS, VideoVaeConfig,
-};
-pub use family::MinimaxH3;
+pub use config::{AudioVaeConfig, VideoVaeConfig};
 pub use processing::minimax_h3::VideoTask;
 
 /// What this crate can fail with.
@@ -52,16 +35,21 @@ pub enum Error {
     Config(String),
 
     /// The checkpoint is not a MiniMax-H3 or FastH3 checkpoint this crate can open: a sidecar is
-    /// missing, a stage directory holds no shard set, or the export names a task no partition
+    /// missing, a stage directory holds no shard set, or the export names a task no network
     /// serves. The message names the file.
     #[error("checkpoint: {0}")]
     Checkpoint(String),
+
+    /// A request, a layout or a tensor a module of this crate was not loaded for.
+    #[error("request: {0}")]
+    Request(String),
 
     /// A capability the design names that this crate does not implement yet, said precisely.
     #[error("unsupported: {0}")]
     Unsupported(String),
 
-    /// A stage's checkpoint could not be opened, or a weight could not be read or converted.
+    /// The shared library's failure: a tensor operation, a launch, a weight that could not be
+    /// read or converted.
     #[error(transparent)]
     Nn(#[from] nn::Error),
 }
@@ -76,18 +64,16 @@ impl Error {
     pub(crate) fn checkpoint(problem: impl Into<String>) -> Self {
         Self::Checkpoint(problem.into())
     }
-}
 
-impl From<qwen3::Error> for Error {
-    /// A refusal of the Qwen3 family this crate composes, as the shared library reports it.
-    fn from(error: qwen3::Error) -> Self {
-        Self::Nn(error.into())
+    /// A request, a layout or a tensor a module was not loaded for.
+    pub(crate) fn request(problem: impl Into<String>) -> Self {
+        Self::Request(problem.into())
     }
 }
 
-impl From<ops::Error> for Error {
-    /// An operator-level refusal of a view (a narrow, a decode) as the shared library reports it.
-    fn from(error: ops::Error) -> Self {
+impl From<uniserve_tensor::Error> for Error {
+    /// A tensor operation's refusal, as the shared library reports it.
+    fn from(error: uniserve_tensor::Error) -> Self {
         Self::Nn(error.into())
     }
 }
