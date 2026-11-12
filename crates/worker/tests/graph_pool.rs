@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use platform::{DeviceId, PinnedBuffer, Stream};
+use platform::{DeviceId, DeviceRange, PinnedBuffer, PoolKind, Stream};
 use storage::{Client, Item, Role, Scope};
 use storage_server::Server;
 use worker::RunnerId;
@@ -137,7 +137,8 @@ fn the_runners_regions_are_mapped_apart_and_reserved_in_the_quota() {
     let (_head, client) = rank(&server);
 
     let sizes = [(RunnerId(0), 5 * MIB), (RunnerId(1), 3 * MIB)];
-    let mut pool = GraphPool::open(Arc::clone(&client), device, 0.5, &sizes, 4 * MIB).unwrap();
+    let mut pool =
+        GraphPool::open(Arc::clone(&client), device, 0.5, &sizes, 4 * MIB, 4 * MIB).unwrap();
 
     let first = pool.region(RunnerId(0)).unwrap();
     let second = pool.region(RunnerId(1)).unwrap();
@@ -165,6 +166,20 @@ fn the_runners_regions_are_mapped_apart_and_reserved_in_the_quota() {
     assert_eq!(reported(&pool, "scratch"), shadow.capacity());
     assert_eq!(reserved(&client, device), graph + shadow.capacity());
 
+    // A state owner's live buffers come from the resident pool through the pool's allocator
+    // and join the reservation too.
+    let live = pool
+        .allocator()
+        .allocate(PoolKind::Resident, MIB as usize)
+        .unwrap();
+    let resident = DeviceRange::from(&live).bytes() as u64;
+    assert!(resident >= MIB);
+    assert_eq!(reported(&pool, "resident"), resident);
+    assert_eq!(
+        reserved(&client, device),
+        graph + shadow.capacity() + resident
+    );
+
     let total = device.memory_info().unwrap().total;
     assert_eq!(pool.usage().budget, quota_limit(total, 0.5));
     assert_eq!(pool.usage().device, 0);
@@ -181,7 +196,7 @@ fn regions_past_the_quota_are_refused_and_reserve_nothing() {
     // A hundredth of the device is the limit; the second region alone is a fiftieth.
     let total = device.memory_info().unwrap().total;
     let sizes = [(RunnerId(0), 2 * MIB), (RunnerId(1), total / 50)];
-    let refused = GraphPool::open(Arc::clone(&client), device, 0.01, &sizes, 0);
+    let refused = GraphPool::open(Arc::clone(&client), device, 0.01, &sizes, 0, 0);
 
     assert!(refused.is_err());
     assert_eq!(reserved(&client, device), 0);
@@ -197,7 +212,7 @@ fn a_suspended_pool_is_restored_at_the_same_addresses_with_its_bytes() {
     let (_head, client) = rank(&server);
 
     let sizes = [(RunnerId(0), 4 * MIB)];
-    let mut pool = GraphPool::open(Arc::clone(&client), device, 0.5, &sizes, 0).unwrap();
+    let mut pool = GraphPool::open(Arc::clone(&client), device, 0.5, &sizes, 0, 0).unwrap();
     let region = pool.region(RunnerId(0)).unwrap();
     let mapped = pool.mapped();
 

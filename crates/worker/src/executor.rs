@@ -801,8 +801,14 @@ impl Thread {
             );
         }
         let Some(&(index, bucket)) = uncaptured.first() else {
+            self.set_warming(false);
             return Ok(false);
         };
+        let more = uncaptured.len() > 1;
+
+        // Every runner's forwards are a warm-up's while a bucket is left, so the members of an
+        // expert union capture in step; a batch served between two turns runs with it set.
+        self.set_warming(true);
 
         // A capture is long device work with no batch to show for it: the line that it started,
         // with none that it finished, is the shape a stuck warm-up has.
@@ -813,7 +819,13 @@ impl Thread {
 
         let started = Instant::now();
         let runner = &self.runners[index];
-        runner.graphs().capture(&**runner, &bucket)?;
+        let captured = runner.graphs().capture(&**runner, &bucket);
+
+        // The warm-up ends with its last capture, or with the capture that failed it.
+        if captured.is_err() || !more {
+            self.set_warming(false);
+        }
+        captured?;
 
         tracing::info!(
             device = ?self.device,
@@ -822,7 +834,14 @@ impl Thread {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "the bucket's capture finished"
         );
-        Ok(uncaptured.len() > 1)
+        Ok(more)
+    }
+
+    /// States `warming` on every runner ([`Runner::set_warming`]).
+    fn set_warming(&self, warming: bool) {
+        for runner in &self.runners {
+            runner.set_warming(warming);
+        }
     }
 
     /// One turn of the preparation of `next`: the first begins it on every runner, and each

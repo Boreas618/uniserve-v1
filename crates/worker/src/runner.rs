@@ -99,4 +99,27 @@ pub trait Runner: Send {
     fn weights_changed(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// States whether the forwards that follow are a warm-up's. The executor's capture job sets
+    /// it on every runner at each of its turns, so batches served between two captures run with
+    /// it set too, and clears it once no bucket is left or a capture failed. A runner whose
+    /// forwards meet other ranks on the host during a warm-up, such as a member of an expert
+    /// union, reads it; the default ignores it.
+    fn set_warming(&self, warming: bool) {
+        let _ = warming;
+    }
+
+    /// Writes the trajectories of preempted requests from their slots into the host latent
+    /// pools, the `ipc::LatentPageCopy` entries of this runner's rank. It runs on the executor
+    /// thread with nothing in flight, as a control operation (`Batches::offload_latents`).
+    ///
+    /// # Errors
+    ///
+    /// The default refuses: a runner that holds no trajectory offloads none.
+    fn offload_latents(&mut self, offloads: &[ipc::LatentOffload]) -> Result<()> {
+        let _ = offloads;
+        Err(crate::Error::Unsupported(
+            "this runner holds no trajectory to offload".to_owned(),
+        ))
+    }
 }

@@ -2,6 +2,7 @@
 //! capture and the whole generation state machine with every device step left out, driven
 //! through the executor's queue.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,8 @@ struct LoggingRunner {
     /// The batches whose execution the test holds, with the channels it holds them by: the
     /// runner sends the batch's id once it executes it and waits for the other to close.
     held: Option<(Vec<u64>, Sender<u64>, Receiver<()>)>,
+    /// What the executor last stated with `Runner::set_warming`.
+    warming: AtomicBool,
 }
 
 impl LoggingRunner {
@@ -73,6 +76,7 @@ impl LoggingRunner {
             gain: weight(0x2_0000, &[HIDDEN]),
             log: Arc::clone(log),
             held: None,
+            warming: AtomicBool::new(false),
         }
     }
 
@@ -103,8 +107,12 @@ impl Runner for LoggingRunner {
     }
 
     fn idle_inputs(&self, bucket: &Bucket, columns: &mut [u8]) -> Result<()> {
-        // A capture fills the idle inputs of its bucket once.
-        self.state(format!("capture {bucket}"));
+        // A capture fills the idle inputs of its bucket once, and is a warm-up's.
+        if self.warming.load(Ordering::Acquire) {
+            self.state(format!("capture {bucket}"));
+        } else {
+            self.state(format!("capture {bucket} outside a warm-up"));
+        }
         columns.fill(0);
         Ok(())
     }
@@ -137,8 +145,13 @@ impl Runner for LoggingRunner {
         }
 
         let loads: Vec<u32> = batch.page_loads.iter().map(|copy| copy.rank).collect();
+        let warming = if self.warming.load(Ordering::Acquire) {
+            " during a warm-up"
+        } else {
+            ""
+        };
         self.state(format!(
-            "execute {} at generation {} with the page loads of ranks {loads:?}",
+            "execute {} at generation {} with the page loads of ranks {loads:?}{warming}",
             batch.id.0,
             self.graphs.generation()
         ));
@@ -157,6 +170,10 @@ impl Runner for LoggingRunner {
 
     fn graphs(&self) -> &Graphs {
         &self.graphs
+    }
+
+    fn set_warming(&self, warming: bool) {
+        self.warming.store(warming, Ordering::Release);
     }
 
     fn weights_changed(&mut self) -> Result<()> {
@@ -438,12 +455,13 @@ fn warm_up_captures_every_bucket_largest_first_and_batches_run_between_captures(
     output_of(&served);
     output_of(&warm_up);
 
-    // One bucket per turn: the batch is executed after the first capture, not after the last.
+    // One bucket per turn: the batch is executed after the first capture, not after the last,
+    // and every runner's forwards are a warm-up's until the last capture.
     assert_eq!(
         entries(&log),
         [
             "a: capture decode_greedy/8 rows/8 tokens",
-            "a: execute 1 at generation 1 with the page loads of ranks []",
+            "a: execute 1 at generation 1 with the page loads of ranks [] during a warm-up",
             "a: capture decode_greedy/4 rows/4 tokens",
             "a: capture decode_greedy/2 rows/2 tokens",
             "b: capture decode_greedy/8 rows/8 tokens",
@@ -465,6 +483,13 @@ fn warm_up_captures_every_bucket_largest_first_and_batches_run_between_captures(
 
     output_of(&executor.warm_up().unwrap());
     assert_eq!(entries(&log).len(), 7);
+
+    // The warm-up ended: a batch after it is no warm-up's.
+    output_of(&executor.submit(batch(2, 0, 2)).unwrap());
+    assert_eq!(
+        entries(&log).last().map(String::as_str),
+        Some("a: execute 2 at generation 1 with the page loads of ranks []")
+    );
 }
 
 #[test]

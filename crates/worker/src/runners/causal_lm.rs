@@ -550,16 +550,6 @@ impl CausalLmRunner {
         Ok(())
     }
 
-    /// States whether the forwards that follow are a warm-up's, which every member of the
-    /// runner's expert union runs in step: each exchange launch of such a forward first meets
-    /// the other members on the host. The executor sets it around the captures of a warm-up
-    /// and clears it before the first batch. A runner outside a union ignores it.
-    pub fn set_warming(&self, warming: bool) {
-        if let Some(member) = &self.union {
-            member.set_warming(warming);
-        }
-    }
-
     /// Lends the scratch page set paired forwards compute over: one `KvCache` per attention
     /// group, in the order and with the layers of the runner's cache, whose `block_tables` is
     /// the set's own page table, `[rows, scratch_pages]` U32 for at least the rows of the
@@ -963,6 +953,15 @@ impl CausalLmRunner {
 impl Runner for CausalLmRunner {
     fn phases(&self) -> &[PhaseId] {
         &self.config.phases
+    }
+
+    /// A warm-up's forwards are run in step by every member of the runner's expert union: each
+    /// exchange launch of such a forward first meets the other members on the host. A runner
+    /// outside a union ignores it.
+    fn set_warming(&self, warming: bool) {
+        if let Some(member) = &self.union {
+            member.set_warming(warming);
+        }
     }
 
     fn buckets(&self) -> Vec<Bucket> {

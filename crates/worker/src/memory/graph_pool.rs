@@ -11,11 +11,13 @@
 //!
 //! The scratch pool holds what no serving forward reads: the regions the shadow outputs of
 //! paired forwards are written in ([`GraphPool::shadow`]) and the state snapshots of a model
-//! that keeps recurrent state ([`GraphPool::scratch`]).
+//! that keeps recurrent state ([`GraphPool::scratch`]). The resident pool holds the recurrent
+//! state's live buffers, which the state owner maps through the pool's allocator
+//! ([`GraphPool::allocator`]).
 //!
 //! ## The quota
 //!
-//! Both pools map through one `platform::Allocator`, which states each pool's mapped bytes to
+//! Every pool maps through one `platform::Allocator`, which states each pool's mapped bytes to
 //! its `platform::Budget` before it maps. The budget here reserves the sum with the Storage
 //! Server as the rank's [`Item::GraphPool`] in the GPU's quota, so a mapping the quota cannot
 //! hold is refused before any storage is created, and the epochs that share the GPU see what
@@ -92,12 +94,15 @@ pub struct GraphPool {
 }
 
 impl GraphPool {
-    /// Maps one region per runner on `device` and reserves the addresses of its scratch pool.
+    /// Maps one region per runner on `device` and reserves the addresses of its scratch and
+    /// resident pools.
     ///
     /// `regions` are each runner's bytes, the peak of its profile run; `scratch` is the bytes
     /// the scratch pool is divided ([`pool_bytes`](super::division::pool_bytes)), and zero
-    /// reserves none, for a rank that never shadows and keeps no state snapshot. `fraction` is the
-    /// deployment's `mem_fraction_static`, whose limit the pools' reservation restates.
+    /// reserves none, for a rank that never shadows and keeps no state snapshot. `resident` is
+    /// the bytes of the recurrent state's live buffers (`StateConfig::bytes`), and zero reserves
+    /// no resident pool, for a model that keeps no state. `fraction` is the deployment's
+    /// `mem_fraction_static`, whose limit the pools' reservation restates.
     ///
     /// # Errors
     ///
@@ -110,6 +115,7 @@ impl GraphPool {
         fraction: f64,
         regions: &[(RunnerId, u64)],
         scratch: u64,
+        resident: u64,
     ) -> Result<Self> {
         let total = device.memory_info()?.total;
         let limit = quota_limit(total, fraction);
@@ -130,6 +136,9 @@ impl GraphPool {
         allocator.reserve(PoolKind::Graph, addresses)?;
         if scratch > 0 {
             allocator.reserve(PoolKind::Scratch, addresses)?;
+        }
+        if resident > 0 {
+            allocator.reserve(PoolKind::Resident, addresses)?;
         }
 
         let mut mapped: Vec<(RunnerId, Buffer)> = Vec::with_capacity(regions.len());
@@ -198,6 +207,15 @@ impl GraphPool {
             .map_err(|_| Error::Resource("a scratch buffer is larger than the address space"))?;
 
         Ok(self.allocator.allocate(PoolKind::Scratch, bytes)?)
+    }
+
+    /// The device's allocator, for an owner that maps its buffers from the pools: the
+    /// recurrent state's live buffers from the resident pool (`StateMemory::open`) and the
+    /// scratch page set of paired forwards from the scratch pool
+    /// (`KvCacheMemory::open_scratch`). What it maps stays mapped until the pool drops, and is
+    /// suspended and restored with the pools.
+    pub fn allocator(&mut self) -> &mut Allocator {
+        &mut self.allocator
     }
 
     /// The bytes the pools map now: what the rank's process holds through them, which a
