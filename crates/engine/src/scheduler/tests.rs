@@ -92,7 +92,9 @@ pub(super) struct Bench {
 /// empty cache and nothing outstanding.
 pub(super) fn bench(ring_bytes: usize) -> Bench {
     let groups = configs().into_iter().map(|config| (config, capacity()));
-    let Ok(mut bench) = built(ring_bytes, SchedulerConfig::default(), groups.collect()) else {
+    let config = SchedulerConfig::default();
+    let policy = (idle_policy(), Parameters::default());
+    let Ok(mut bench) = built(ring_bytes, config, groups.collect(), policy) else {
         panic!("the startup checks pass the bench's groups");
     };
 
@@ -112,8 +114,9 @@ fn configs() -> Vec<WorkerGroupConfig> {
 }
 
 /// A scheduler of `config` over the first `groups.len()` of groups A and B, each with its
-/// configuration and capacity, on its queue pair with rings of `ring_bytes`, and the buffer
-/// pool's end of that queue pair; or the constructor's refusal.
+/// configuration and capacity, serving `policy` (a module and its package's arguments), on its
+/// queue pair with rings of `ring_bytes`, and the buffer pool's end of that queue pair; or the
+/// constructor's refusal.
 ///
 /// The session: regions numbered 4 to 7 (the KV regions of groups A and B, the product region
 /// both state, the slot rows), and the capacity words of region `n` at register `2 + 3 * (n - 4)`.
@@ -121,6 +124,7 @@ fn built(
     ring_bytes: usize,
     config: SchedulerConfig,
     groups: Vec<(WorkerGroupConfig, Capacity)>,
+    policy: (Arc<wasmtime::Module>, Parameters),
 ) -> Result<Bench, super::Error> {
     let region = |name: &str, units| Region {
         name: name.to_owned(),
@@ -184,7 +188,8 @@ fn built(
         0,
         engine,
         groups,
-        idle_policy(),
+        policy.0,
+        policy.1,
         Box::new(Recording(Arc::clone(&executors))),
         output,
         Arc::new(AtomicU64::new(0)),
@@ -850,7 +855,8 @@ fn the_snapshot_states_the_requests_the_cache_and_the_serving_groups() {
 #[test]
 fn a_scheduler_starts_by_listing_its_sessions_cached_blocks_and_orders_them() {
     let groups = configs().into_iter().map(|config| (config, capacity()));
-    let Ok(mut bench) = built(1024, SchedulerConfig::default(), groups.collect()) else {
+    let policy = (idle_policy(), Parameters::default());
+    let Ok(mut bench) = built(1024, SchedulerConfig::default(), groups.collect(), policy) else {
         panic!("the startup checks pass the bench's groups");
     };
 
@@ -884,7 +890,8 @@ fn a_scheduler_starts_by_listing_its_sessions_cached_blocks_and_orders_them() {
 /// them.
 #[test]
 fn the_startup_checks_refuse_a_deployment_its_executors_cannot_serve() {
-    let refusal = |groups| match built(1024, SchedulerConfig::default(), groups) {
+    let idle = || (idle_policy(), Parameters::default());
+    let refusal = |groups| match built(1024, SchedulerConfig::default(), groups, idle()) {
         Err(super::Error::InvalidRequest(message)) => message,
         Err(other) => panic!("refused for another cause: {other}"),
         Ok(_) => panic!("the deployment passed the startup checks"),
@@ -936,7 +943,7 @@ fn the_startup_checks_refuse_a_deployment_its_executors_cannot_serve() {
     let crossing = vec![decoder.clone(), encoder("elsewhere")];
     assert!(refusal(crossing).contains("decodes video units"));
     let beside = vec![decoder, encoder("localhost")];
-    assert!(built(1024, SchedulerConfig::default(), beside).is_ok());
+    assert!(built(1024, SchedulerConfig::default(), beside, idle()).is_ok());
 }
 
 /// `Configure` refuses a limit above what the executors hold, naming it: running requests beyond
@@ -953,7 +960,15 @@ fn configure_refuses_a_limit_above_what_the_executors_hold() {
     let groups = configs()
         .into_iter()
         .map(|config| (config, prefills.clone()));
-    let Ok(mut bench) = built(1024, SchedulerConfig::default(), groups.collect()) else {
+    // A policy whose limits the buckets hold.
+    let parameters = Parameters {
+        chunked_prefill_size: Some(512),
+        max_batch: Some(8),
+        max_num_batched_tokens: Some(512),
+        ..Parameters::default()
+    };
+    let policy = (packaged("fcfs"), parameters);
+    let Ok(mut bench) = built(1024, SchedulerConfig::default(), groups.collect(), policy) else {
         panic!("the startup checks pass both groups");
     };
     let mut configure = |config| {
@@ -1106,14 +1121,8 @@ fn a_failed_executor_job_stops_the_loop_and_reaches_the_engine() {
     assert_eq!(failed, [format!("an executor failed: {failure}")]);
 }
 
-/// A policy that admits nothing: tests that drive the queue pair, the views or the placement,
-/// which no policy decision reaches.
-pub(crate) fn idle_policy() -> Policy {
-    Policy::new(
-        toy("(i64.const 0)"),
-        Parameters::default(),
-        Snapshot::default(),
-        &Limits::default(),
-    )
-    .unwrap()
+/// A policy module that admits nothing, whose limits are the policy defaults: tests that drive
+/// the queue pair, the views or the placement, which no policy decision reaches.
+pub(crate) fn idle_policy() -> Arc<wasmtime::Module> {
+    toy("(i64.const 0)")
 }

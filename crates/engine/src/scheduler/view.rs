@@ -37,7 +37,8 @@ use super::{Request, RequestStatus, Scheduler, WorkerGroup, monotonic_nanos};
 ///   charges; `prefill_tokens` the prompt it computes (a resumed request's generated tokens
 ///   included); `generated_tokens` every token it generated, on this engine and before;
 ///   `prefilled_tokens` where its next prompt chunk starts; `cached_pages` the blocks its cache
-///   groups' tables hold; `refill_tokens` the draft cache's gap when a refill is ready.
+///   groups' tables hold; `refill_tokens` the draft cache's gap a refill can close, when one
+///   is ready.
 /// - `admitted_at` is the request's arrival once it is admitted: the row keeps no admission
 ///   instant, and arrival orders admitted requests as admission does but where the queue put a
 ///   resumed request first. `last_emitted_at`, `prefetch_tokens`, `reservation_units` and
@@ -95,8 +96,9 @@ pub fn view_of(request: &Request, groups: &[WorkerGroup]) -> RequestView {
     } else {
         0
     };
+    // The draft cache's gap a refill can close: up to its end (`Request::refill_end`).
     let refill = request
-        .num_computed_tokens
+        .refill_end()
         .saturating_sub(request.num_draft_tokens);
 
     RequestView {
@@ -175,6 +177,41 @@ fn replica_view(index: usize, group: &WorkerGroup, request: Option<&Request>) ->
         }),
         prefills_only: group.config.role == WorkerGroupRole::Prefill,
         holds_stage: request.is_some_and(|request| request.placement.contains(&Some(id))),
+    }
+}
+
+/// The snapshot of a scheduler of `groups` that holds no request and knows no cached block, as
+/// its policy starts from at the scheduler's construction (SD §5.2): the groups that serve
+/// phases, which a request may be placed on, and the phases they serve, each named with the
+/// first group that serves it. A scheduler states no ranks: routing is the engine's.
+pub(super) fn snapshot_of(groups: &[WorkerGroup]) -> Snapshot {
+    let serving: Vec<&WorkerGroup> = groups
+        .iter()
+        .filter(|group| group.capacity.phases != 0)
+        .collect();
+    let phases = Phase::ALL
+        .into_iter()
+        .filter_map(|phase| {
+            let group = serving
+                .iter()
+                .find(|group| served(group).any(|p| p == phase))?;
+            Some(PhaseView {
+                id: phase.id(),
+                kind: phase,
+                block: StageId(u32::from(group.id().0)),
+            })
+        })
+        .collect();
+    let replicas = serving
+        .iter()
+        .enumerate()
+        .map(|(index, group)| replica_view(index, group, None))
+        .collect();
+
+    Snapshot {
+        replicas,
+        phases,
+        ..Snapshot::default()
     }
 }
 
@@ -276,9 +313,8 @@ impl Scheduler {
 
     /// Everything a starting policy instance is told (SD §5.2): the view of every waiting
     /// request, in the queue's order, then of every running one; a page for every cached block
-    /// of a cache group and an encoding for every other cached block (an encoder output); the
-    /// groups a request may be placed on; and the phases they serve, each named with the first
-    /// group that serves it. A scheduler states no ranks: routing is the engine's.
+    /// of a cache group and an encoding for every other cached block (an encoder output); and
+    /// the groups of [`snapshot_of`].
     pub(super) fn snapshot(&self) -> Snapshot {
         let requests = self
             .waiting
@@ -287,41 +323,14 @@ impl Scheduler {
             .filter_map(|id| self.requests.get(id))
             .map(|request| view_of(request, &self.groups))
             .collect();
-
         let (pages, encodings) = self.cache_views();
-
-        let serving: Vec<&WorkerGroup> = self
-            .groups
-            .iter()
-            .filter(|group| group.capacity.phases != 0)
-            .collect();
-        let phases = Phase::ALL
-            .into_iter()
-            .filter_map(|phase| {
-                let group = serving
-                    .iter()
-                    .find(|group| served(group).any(|p| p == phase))?;
-                Some(PhaseView {
-                    id: phase.id(),
-                    kind: phase,
-                    block: StageId(u32::from(group.id().0)),
-                })
-            })
-            .collect();
-        let replicas = serving
-            .iter()
-            .enumerate()
-            .map(|(index, group)| replica_view(index, group, None))
-            .collect();
 
         Snapshot {
             step: self.step,
             requests,
             pages,
             encodings,
-            replicas,
-            phases,
-            ranks: Vec::new(),
+            ..snapshot_of(&self.groups)
         }
     }
 

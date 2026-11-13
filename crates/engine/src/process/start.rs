@@ -235,16 +235,8 @@ impl Engine {
             let (output, outputs) = crossbeam_channel::unbounded();
             let (executor, shadow) = executor_of(index, listed, inbox.clone())?;
 
-            // `Scheduler::new` takes an instance, made here on no state; the instance that
-            // serves is made on the scheduler's own state, as every later generation's is.
-            let bounds = scheduler::ceilings(groups.iter().map(|(_, capacity)| capacity));
-            let policy = Policy::new(
-                Arc::clone(&module),
-                parameters.clone(),
-                Snapshot::default(),
-                &bounds,
-            )?;
-            let mut scheduler = Scheduler::new(
+            // The scheduler instantiates its policy on its own state.
+            let scheduler = Scheduler::new(
                 scheduling.clone(),
                 limits.clone(),
                 open,
@@ -252,22 +244,13 @@ impl Engine {
                 index,
                 pair,
                 groups,
-                policy,
+                Arc::clone(&module),
+                parameters.clone(),
                 executor,
                 output,
                 Arc::clone(&served),
-            )?;
-            let (reply, replied) = crossbeam_channel::bounded(1);
-            scheduler.apply(Message::SetPolicy(
-                Arc::clone(&module),
-                parameters.clone(),
-                reply,
-            ));
-            replied
-                .recv()
-                .context("the scheduler answered no policy")?
-                .with_context(|| format!("instantiating scheduler {index}'s policy"))?;
-            scheduler.apply(Message::CommitPolicy);
+            )
+            .with_context(|| format!("starting scheduler {index}"))?;
 
             let thread = std::thread::Builder::new()
                 .name(format!("scheduler-{index}"))

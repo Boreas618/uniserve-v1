@@ -8,9 +8,9 @@
 //! Every completion read from the queue pair is applied here (`learn`), one dropped for a
 //! forgotten owner too, since what it states of the buffer pool's cache holds all the same; a
 //! request gives up the blocks it holds by `unpin`. Each change of a row is told to the policy
-//! (`Cached`, `Hit`, `Freed`, `Encoded`, SD §5.2). At the end of a step `install_victims`
-//! installs the head of each order by `Victims` and asks for a `List` when the buffer pool counts
-//! evictable units the scheduler cannot account for. The table is exact for what this queue pair
+//! (`Cached`, `Hit`, `Freed`, `Encoded`, SD §5.2). Before a step schedules, `install_victims`
+//! installs the head of each order by `Victims`, ahead of the step's allocations, and asks for a
+//! `List` when the buffer pool counts evictable units the scheduler cannot account for. The table is exact for what this queue pair
 //! commits and evicts; a wrong belief costs reuse, never a wrong block, since every request that
 //! names a key is answered from the buffer pool's own cache.
 
@@ -141,7 +141,7 @@ impl Scheduler {
         let copied;
         let (request, copy) = match &*request {
             R::Finish { copy, after, .. } => match self.outstanding.get(&copy.0) {
-                Some((_, request)) => {
+                Some((_, request, _)) => {
                     copied = request.clone();
                     (&copied, Some(stamped_groups(after)))
                 }
@@ -602,10 +602,11 @@ impl Scheduler {
         (pages, encodings)
     }
 
-    /// At the end of a step (SD §3.1, §4.5), for each region of this queue pair whose order's
+    /// Before a step schedules (SD §3.1, §4.5), for each region of this queue pair whose order's
     /// head is not the one installed: `Victims { region, keys }` with the leading keys of the
     /// order whose units cover what one step's allocations can take there (the whole order, as
-    /// far as a record holds it, while a drain shrinks the regions). Then `List`, when a region's
+    /// far as a record holds it, while a drain shrinks the regions). It is held ahead of the
+    /// step's `Allocate`s, which `available` lets take those units. Then `List`, when a region's
     /// `evictable` word counts more units than the scheduler can account for: blocks another
     /// queue pair or a closed session committed, which this queue pair's allocations evict only
     /// once a `Victims` names them.
@@ -666,7 +667,7 @@ impl Scheduler {
             || self
                 .outstanding
                 .values()
-                .any(|(_, request)| listing(request));
+                .any(|(_, request, _)| listing(request));
         if unknown && !asked {
             self.submit(runtime::Request::List);
         }
@@ -694,24 +695,31 @@ impl Scheduler {
     }
 
     /// The units one step's allocations can take from `region` (by index), SD §4.5: per class
-    /// taken from it, the blocks of `max_num_batched_tokens` tokens of the deployment's block
-    /// size and [`LOW_WATERMARK`] blocks per running request.
+    /// taken from it, the blocks of `max_num_batched_tokens` tokens of the class's own block size
+    /// and [`LOW_WATERMARK`] blocks per running request. A cache group's class (class `c` is
+    /// cache group `c`) holds the block size its groups state for it; a sized class, whose blocks
+    /// hold no tokens, is counted in blocks of the deployment's block size.
     fn reserve(&self, region: usize) -> u32 {
         let tokens = u32::try_from(self.config.max_num_batched_tokens).unwrap_or(u32::MAX);
         let stated = self
             .groups
             .iter()
             .find_map(|group| group.capacity.kv_cache.as_ref()?.block_size);
+        let deployment = stated.map_or(BLOCK_TOKENS, NonZeroU32::get);
         let running = u32::try_from(self.running.len()).unwrap_or(u32::MAX);
-        let blocks = tokens
-            .div_ceil(stated.map_or(BLOCK_TOKENS, NonZeroU32::get))
-            .saturating_add(LOW_WATERMARK.saturating_mul(running));
-        let units = self
-            .classes_in(region)
-            .map(|class| self.class_units(class, region).max(1));
-        units.fold(0, |reserve, units| {
-            reserve.saturating_add(blocks.saturating_mul(units))
-        })
+
+        let reserve = self.classes_in(region).map(|class| {
+            let block = self
+                .groups
+                .iter()
+                .find_map(|group| group.capacity.cache_groups.get(usize::from(class)))
+                .map_or(deployment, |&(_, block)| block);
+            let blocks = tokens
+                .div_ceil(block.max(1))
+                .saturating_add(LOW_WATERMARK.saturating_mul(running));
+            blocks.saturating_mul(self.class_units(class, region).max(1))
+        });
+        reserve.fold(0, u32::saturating_add)
     }
 
     /// The classes whose blocks `region` (by index) holds on this scheduler's side: as a device
@@ -741,16 +749,19 @@ impl Scheduler {
     /// `Prefetch`'s keys, each counted at the region's largest block. The scheduler's own
     /// requests thus never make it `List`.
     fn pending_shared(&self, region: usize) -> u32 {
-        let blocks = self.outstanding.values().map(|(_, request)| match request {
-            runtime::Request::Commit { .. } => 1,
-            runtime::Request::Store {
-                keys,
-                tier: Tier::Host,
-                ..
-            }
-            | runtime::Request::Prefetch { keys, .. } => keys.len(),
-            _ => 0,
-        });
+        let blocks = self
+            .outstanding
+            .values()
+            .map(|(_, request, _)| match request {
+                runtime::Request::Commit { .. } => 1,
+                runtime::Request::Store {
+                    keys,
+                    tier: Tier::Host,
+                    ..
+                }
+                | runtime::Request::Prefetch { keys, .. } => keys.len(),
+                _ => 0,
+            });
         let largest = self
             .classes_in(region)
             .map(|class| self.class_units(class, region))
@@ -779,8 +790,11 @@ mod tests {
     //! `scheduler::tests::bench`: group A's blocks of class `KV` lie in the region numbered 4,
     //! whose capacity words are registers 2 (`available`) and 4 (`evictable`).
 
+    use std::num::NonZeroU32;
     use std::sync::atomic::Ordering;
 
+    use ipc::CacheGroupKind;
+    use proto::config::KvCacheConfig;
     use scheduling_guest::{Event, PageId};
     use storage::Key;
     use storage::runtime::{self, Cause, Completion, OwnerId, Source, Tier};
@@ -974,6 +988,26 @@ mod tests {
         assert_eq!(written(&mut bench), [victims(&[key(2), key(3)])]);
         bench.scheduler.read_capacity();
         assert_eq!(bench.scheduler.available[0], 6);
+    }
+
+    /// The head of an order covers one step's tokens in blocks of the class's own size: a step
+    /// of 128 tokens takes 8 blocks of a cache group of 16-token blocks, whatever block size the
+    /// deployment states for its widest cache group (SD §4.5).
+    #[test]
+    fn the_head_covers_a_steps_tokens_in_blocks_of_the_classs_own_size() {
+        let mut bench = bench(4096);
+        bench.scheduler.config.max_num_batched_tokens = 128;
+        let capacity = &mut bench.scheduler.groups[0].capacity;
+        capacity.kv_cache = Some(KvCacheConfig {
+            block_size: NonZeroU32::new(64),
+            ..KvCacheConfig::default()
+        });
+        capacity.cache_groups = vec![(CacheGroupKind::Full, 16)];
+
+        let listed: Vec<(Key, u8)> = lookup(10).into_iter().map(|key| (key, DEVICE)).collect();
+        list(&mut bench, &listed);
+        bench.scheduler.install_victims();
+        assert_eq!(written(&mut bench), [victims(&lookup(8))]);
     }
 
     #[test]

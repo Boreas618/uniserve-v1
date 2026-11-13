@@ -162,13 +162,7 @@ impl Scheduler {
             Phase::Prefill => end == prompt && !image_end,
             _ => false,
         };
-        let prompt_text = request
-            .token_ids
-            .get(..input.prompt_token_ids.len() + input.generated_token_ids.len())?;
-        let generated = request
-            .token_ids
-            .get(input.prompt_token_ids.len()..)
-            .unwrap_or_default();
+        let generated = request.generated_ids();
 
         // The tokens the row may not sample: under the `min_tokens` floor counted with the
         // decodes in flight, the end-of-sequence tokens; and the last token of each bad word.
@@ -213,10 +207,12 @@ impl Scheduler {
             0
         };
         let draft = match phase {
+            // A chunk short of the prompt's end knows the token after it, unless an image row
+            // follows, which carries none.
             Phase::Prefill if speculates => DraftWork {
                 proposals: if end == prompt { proposals } else { 0 },
                 lookahead: if end < prompt {
-                    prompt_text.get(text_end).copied()
+                    lookahead(request, end, bos)
                 } else {
                     None
                 },
@@ -662,6 +658,11 @@ pub(super) fn banned_tokens(
 /// image's start. An output token still in flight is -1, and a context that ends with an image
 /// block puts `bos` first in its output.
 ///
+/// The request's `token_ids` hold one entry per cache position of its context (`Request::new`):
+/// the text between its image blocks, a 0 for each block row, a resumed request's generated
+/// tokens; its output follows from `num_prompt_tokens`. A segment of text is read at its cache
+/// positions, and the text index of the range's end counts the text alone.
+///
 /// `None` for a request that is not a token request, or a block held whole whose encoder output
 /// has no known position.
 fn context(
@@ -674,8 +675,9 @@ fn context(
 ) -> Option<(u32, usize, bool)> {
     let input = generation(request)?;
     let prompt = input.prompt_token_ids.len() + input.generated_token_ids.len();
-    let text = request.token_ids.get(..prompt)?;
-    let output = request.token_ids.get(prompt..)?;
+    let output = request
+        .token_ids
+        .get(usize::try_from(request.num_prompt_tokens).ok()?..)?;
 
     // Where the next segment starts: its cache and rotary positions, the text and the encoder
     // blocks before it. The rotary position and the text at the range's end, once reached.
@@ -685,9 +687,12 @@ fn context(
 
     let images = &input.multimodal_inputs.images;
     for image in images.iter().map(Some).chain(iter::once(None)) {
-        // The text before the image, or after the last one.
+        // The text before the image, or after the last one, at its cache positions.
         let until = image.map_or(prompt, |image| image.position as usize);
-        let segment = text.get(written..until)?;
+        let from = usize::try_from(cache).ok()?;
+        let segment = request
+            .token_ids
+            .get(from..from.checked_add(until.checked_sub(written)?)?)?;
         let count = u32::try_from(segment.len()).ok()?;
         let segment_end = cache.checked_add(count)?;
         if end.is_none() && range.end < segment_end {
@@ -1511,6 +1516,8 @@ mod tests {
             image(2, ImageEncoder::Vision, 4),
             image(5, ImageEncoder::Vision, 4),
         ];
+        // One entry per cache position, each image row 0 (`Request::new`).
+        context.token_ids = vec![1, 2, 0, 0, 0, 0, 3, 4, 5, 0, 0, 0, 0, 6, 7, 8];
         context.num_prompt_tokens = 16;
         context.encodings = vec![(Key([1; 32]), Some(4)), (Key([2; 32]), Some(5))];
         let batch = one(&mut scheduler, context, Phase::Prefill, 10);
@@ -1557,6 +1564,7 @@ mod tests {
         let mut scheduler = scheduler(&[]);
         let mut context = request(1, vec![1, 2, 3], 1, 0);
         input(&mut context).multimodal_inputs.images = vec![image(3, ImageEncoder::Vision, 2)];
+        context.token_ids = vec![1, 2, 3, 0, 0];
         context.num_prompt_tokens = 5;
         context.encodings = vec![(Key([1; 32]), Some(0))];
         let prefill = one(&mut scheduler, context, Phase::Prefill, 5);

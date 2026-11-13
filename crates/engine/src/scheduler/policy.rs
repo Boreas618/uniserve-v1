@@ -735,12 +735,13 @@ pub(crate) mod tests {
     /// expression of type `i64`), whose `sched_limits` and `sched_dispatch` reply `{}` (every limit
     /// at its default; a decision that names nothing) and whose other exports reply nothing.
     pub(crate) fn toy(body: &str) -> Arc<Module> {
-        // The `{}` reply lies at 2048: `ptr << 32 | len`.
-        let empty = (2048_u64 << 32) | 2;
+        // Every message is written at 1024, and the `{}` reply lies at 65024, at the end of the
+        // one page, past any snapshot a test's scheduler sends: `ptr << 32 | len`.
+        let empty = (65024_u64 << 32) | 2;
         let text = format!(
             r#"(module
                 (memory (export "memory") 1)
-                (data (i32.const 2048) "{{}}")
+                (data (i32.const 65024) "{{}}")
                 (func (export "sched_alloc") (param i32) (result i32) (i32.const 1024))
                 (func (export "sched_free") (param i32 i32))
                 (func (export "sched_init") (param i32 i32) (result i64) {body})

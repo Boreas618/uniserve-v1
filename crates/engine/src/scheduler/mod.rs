@@ -294,9 +294,11 @@ pub struct Scheduler {
     /// and the requests that must follow it into the submission queue.
     stamping: HashMap<u64, (runtime::Request, u8, Vec<runtime::Request>)>,
     /// Every request written into the submission queue whose completion has not been read, by its
-    /// number, with the owner it acts for. A request answered `Copy` stays until the answer to
-    /// its `Finish`.
-    outstanding: HashMap<u64, (Option<OwnerId>, runtime::Request)>,
+    /// number, with the owner it acts for and the bytes of the completion queue its answer may
+    /// take, bounded when it was written (`answer_bytes`): what bounds an answer (its owner's
+    /// attachment, the keys `cache` holds) may be gone before the answer is read. A request
+    /// answered `Copy` stays, owing what it owed, until the answer to its `Finish`.
+    outstanding: HashMap<u64, (Option<OwnerId>, runtime::Request, usize)>,
     /// The counter every number of this queue pair is drawn from: the number `post` writes a
     /// request under, and the number a request waits for its stamps under. Starts at 1, since
     /// the buffer pool takes only numbers above every one it took.
@@ -354,6 +356,13 @@ pub struct Scheduler {
     /// executor returns its `Finish` or the scheduler gives it up: a group with an entry is sent
     /// an empty batch when the step forms none for it (SD §2.1).
     copies: HashMap<u64, (GroupId, Instant)>,
+    /// Completions that give entries, read before the `Attached` that states the slot row they
+    /// are written under: by the owner of the attachment whose slot they wait for, each with the
+    /// group it is handed to and the number, request and completion `Executor::map` takes. The
+    /// buffer pool may answer an admission's requests in any order, and an executor writes a
+    /// completion's entries under the slot it is handed (SD §2.1 `Executor`, §3.1). They are
+    /// handed over when that `Attached` is read, and dropped with the owners they concern.
+    unmapped: HashMap<OwnerId, Vec<(GroupId, runtime::RequestId, runtime::Request, Completion)>>,
     /// Per region, whether a `Detach` was answered since the region's last `Resize` was
     /// submitted. The buffer pool writes a completion before the capacity words its request
     /// changed, so the words read with a `Detach`'s answer may not show its units yet; a drain
@@ -395,18 +404,24 @@ impl Scheduler {
     /// The scheduler's limits are `config`'s, lowered to what the executors hold (SD §7.1): the
     /// running requests to the slots the groups hold for them, a step's tokens to the widest
     /// prefill bucket the executors captured and its calls to their largest bucket's rows. Its
-    /// first request to the buffer pool is `List`, which teaches it the cached blocks its session
-    /// can reach (SD §4.5).
+    /// policy is `module`, constructed from the package's `parameters` and instantiated on the
+    /// scheduler's own snapshot, as every later generation's is (SD §3.9, §5.2): the groups and
+    /// the phases they serve, with no request and no cached block; its limits are checked against
+    /// what the executors captured. Its first request to the buffer pool is `List`, which teaches
+    /// it the cached blocks its session can reach (SD §4.5).
     ///
     /// # Errors
     ///
     /// [`Error::Storage`] when the layout and its answer do not state this scheduler: no such
     /// scheduler, other groups than `groups`, or regions and registers that do not match.
     /// [`Error::InvalidRequest`] for a deployment the startup checks refuse ([`resolved`]).
+    /// [`Error::Policy`] when the policy does not instantiate, or declares limits outside the
+    /// ceilings of the executors' captures.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the scheduler's parts come from four owners: the configuration, the session \
-                  with the buffer pool, the executors and the engine's channels"
+        reason = "the scheduler's parts come from five owners: the configuration, the session \
+                  with the buffer pool, the policy package, the executors and the engine's \
+                  channels"
     )]
     pub fn new(
         config: SchedulerConfig,
@@ -416,7 +431,8 @@ impl Scheduler {
         scheduler: usize,
         queue: QueuePair,
         groups: Vec<(WorkerGroupConfig, Capacity)>,
-        policy: Policy,
+        module: Arc<wasmtime::Module>,
+        parameters: Parameters,
         executor: Box<dyn Executor>,
         output: Sender<Output>,
         generation: Arc<AtomicU64>,
@@ -455,6 +471,11 @@ impl Scheduler {
             workers.push(WorkerGroup::new(config, capacity, group.clone()));
         }
         let config = resolved(config, &workers)?;
+
+        // A scheduler that holds no request and knows no cached block yet is told its groups.
+        let bounds = ceilings(workers.iter().map(|worker| &worker.capacity));
+        let snapshot = view::snapshot_of(&workers);
+        let policy = Policy::new(module, parameters, snapshot, &bounds).map_err(Error::Policy)?;
 
         // The page seeds every group of the scheduler states for its cache groups, one per class
         // in class order: one key chain serves all of them, so groups that state seeds must state
@@ -518,6 +539,7 @@ impl Scheduler {
             latent_seed: 0,
             short: HashMap::new(),
             copies: HashMap::new(),
+            unmapped: HashMap::new(),
             detached: vec![false; count],
             policy,
             executor,
@@ -734,12 +756,13 @@ impl Scheduler {
     /// One step after the messages, which waits for nothing:
     ///
     /// 1. every completion the buffer pool wrote is applied as it is read, the capacity words of
-    ///    every region are read (SD §4.1), and every copy past its bound is given up (§4.4);
+    ///    every region are read (SD §4.1), every copy past its bound is given up (§4.4), and the
+    ///    eviction order of each region whose head changed is installed, ahead of the requests
+    ///    the step's allocations make;
     /// 2. unless the scheduler is paused, `schedule` assembles the batches that fit now, and each
     ///    is handed to its group's executor;
-    /// 3. the eviction order of each region whose head changed is installed, and the step's
-    ///    requests are written into the submission queue as far as it and the completion queue
-    ///    have room;
+    /// 3. the step's requests are written into the submission queue as far as it and the
+    ///    completion queue have room;
     /// 4. a drain's deadline ends what it ends, `Pause` and `Drain` are answered once due
     ///    ([`Scheduler::reply_at_boundary`]), and the statistics leave once a second has passed.
     ///
@@ -769,6 +792,10 @@ impl Scheduler {
         // A prefill whose decode groups were all full when it finished transfers once one has
         // room.
         self.start_transfers();
+        // The eviction order goes ahead of the step's requests: `available` counts the units of
+        // the order beyond the installed head, which this step's allocations may take only once
+        // the buffer pool has taken a `Victims` that names them (SD §4.5).
+        self.install_victims();
 
         let batches = if self.paused {
             Vec::new()
@@ -788,7 +815,6 @@ impl Scheduler {
             self.executor.submit(batch);
         }
 
-        self.install_victims();
         if let Err(error) = self.post() {
             self.fail(error);
             return false;
@@ -898,7 +924,7 @@ impl Scheduler {
             || self
                 .outstanding
                 .values()
-                .any(|(_, request)| pending(request))
+                .any(|(_, request, _)| pending(request))
     }
 
     /// `Flush` (SD §2.4, gap G13 of the work breakdown): the requests the scheduler holds continue
@@ -1097,17 +1123,20 @@ impl Scheduler {
     ///   before its attachment is cleared, and an owner whose entries no table holds (a failed
     ///   `Transfer`) has its attachment cleared first. A `Finish { ok: false }` that gives a copy
     ///   up is handed to the copy's group. A request with no group to stamp it is held at once
-    ///   with no stamp. A `Detach` takes its owner out of `owners`.
+    ///   with no stamp. A `Detach` takes its owner out of `owners`, and the completions waiting
+    ///   for that owner's slot, or acting for it, are dropped with it.
     /// - An `Allocate`, a `Pin`, a `Load` or a `Clone` at positions a `Release` being stamped
     ///   frees waits behind that `Release`, so that the buffer pool takes it after the positions
     ///   are free.
     /// - Every other request is held, in order.
     ///
-    /// The caller submits no `Allocate` of an owner and class whose `Allocate` is outstanding:
-    /// that need is asked again after its completion.
-    fn submit(&mut self, request: runtime::Request) {
+    /// True when the request is to be written as a record of its own, which one completion
+    /// answers; false when it raised a held `Allocate`, whose completion answers both. The caller
+    /// submits no `Allocate` of an owner and class whose `Allocate` is outstanding: that need is
+    /// asked again after its completion.
+    fn submit(&mut self, request: runtime::Request) -> bool {
         if self.merge(&request) {
-            return;
+            return false;
         }
 
         let groups = match &request {
@@ -1121,7 +1150,7 @@ impl Scheduler {
             } => self
                 .outstanding
                 .get(&copy.0)
-                .and_then(|(_, copied)| self.copy_group(copied))
+                .and_then(|(_, copied, _)| self.copy_group(copied))
                 .into_iter()
                 .collect(),
             _ => {
@@ -1133,14 +1162,26 @@ impl Scheduler {
                     }
                     None => self.held.push(request),
                 }
-                return;
+                return true;
             }
         };
 
         if let runtime::Request::Detach { owner, .. } = &request {
             self.owners.remove(owner);
+            self.drop_unmapped(*owner);
         }
         self.hand(request, groups);
+        true
+    }
+
+    /// Drops the completions `unmapped` holds that `owner` leaving concerns: those waiting for
+    /// its slot, and those of requests acting for it, whose entries its `Detach` takes back.
+    pub(super) fn drop_unmapped(&mut self, owner: OwnerId) {
+        self.unmapped.remove(&owner);
+        for waiting in self.unmapped.values_mut() {
+            waiting.retain(|(_, _, request, _)| owner_of(request) != Some(owner));
+        }
+        self.unmapped.retain(|_, waiting| !waiting.is_empty());
     }
 
     /// Hands `request` to the executors of `groups` for their stamps and keeps it in `stamping`
@@ -1285,8 +1326,10 @@ impl Scheduler {
 
     /// Writes the held requests into the submission queue, in order, each under the next number,
     /// while the submission queue has room and the completion queue has room for a completion of
-    /// every request outstanding and of the one being written. The first that does not fit and
-    /// every one after it stay held for the next pass; nothing waits.
+    /// every request outstanding and of the one being written (SD §3.1). Each request's bound is
+    /// taken as it is written and kept with it in `outstanding` until its answer is read. The
+    /// first that does not fit and every one after it stay held for the next pass; nothing
+    /// waits.
     ///
     /// # Errors
     ///
@@ -1296,13 +1339,13 @@ impl Scheduler {
         let mut owed: usize = self
             .outstanding
             .values()
-            .map(|(_, request)| self.answer_bytes(request))
+            .map(|&(.., bytes)| bytes)
             .fold(0, usize::saturating_add);
 
         let first = self.next_submission;
-        let mut owners = Vec::new();
+        let mut written = Vec::new();
         let mut record = Vec::new();
-        while let Some(request) = self.held.get(owners.len()) {
+        while let Some(request) = self.held.get(written.len()) {
             let owner = self.acting_owner(request);
             let bytes = self.answer_bytes(request);
             if owed.saturating_add(bytes) > ring {
@@ -1310,19 +1353,20 @@ impl Scheduler {
             }
 
             record.clear();
-            let number = first + owners.len() as u64;
+            let number = first + written.len() as u64;
             request.encode(runtime::RequestId(number), &mut record);
             if !self.queue.submit(&record).map_err(storage_error)? {
                 break;
             }
-            owed += bytes;
-            owners.push(owner);
+            owed = owed.saturating_add(bytes);
+            written.push((owner, bytes));
         }
 
-        self.next_submission = first + owners.len() as u64;
-        let written: Vec<runtime::Request> = self.held.drain(..owners.len()).collect();
-        for (number, (owner, request)) in (first..).zip(owners.into_iter().zip(written)) {
-            self.outstanding.insert(number, (owner, request));
+        self.next_submission = first + written.len() as u64;
+        let requests: Vec<runtime::Request> = self.held.drain(..written.len()).collect();
+        for (number, ((owner, bytes), request)) in (first..).zip(written.into_iter().zip(requests))
+        {
+            self.outstanding.insert(number, (owner, request, bytes));
         }
         Ok(())
     }
@@ -1347,7 +1391,9 @@ impl Scheduler {
     /// Before it is returned, a completion that gives entries is handed to `Executor::map`: to the
     /// group an `Attach` or a `Transfer` names, to a copy's group, and otherwise to the owner's
     /// group and every other group that reads the class, each with the slot of the request's own
-    /// owner there.
+    /// owner there. Where that owner's `Attached` has not been read yet, the slot is not known
+    /// and the completion waits in `unmapped` for it ([`Scheduler::give`]): it is handed over as
+    /// that `Attached` is, whatever order the buffer pool answers in.
     ///
     /// # Errors
     ///
@@ -1376,7 +1422,7 @@ impl Scheduler {
             .map_err(storage_error)?
         {
             let (id, completion) = Completion::decode(&record).map_err(storage_error)?;
-            let (owner, mut request) = self.outstanding.remove(&id.0).ok_or_else(|| {
+            let (owner, mut request, bytes) = self.outstanding.remove(&id.0).ok_or_else(|| {
                 Error::Storage(format!(
                     "a completion answers request {}, which is not outstanding",
                     id.0
@@ -1395,7 +1441,7 @@ impl Scheduler {
                 if let Some((owner, copied)) = self.matched_finish(id, copy, request, &completion) {
                     return Ok(Some((copy, owner, copied, completion)));
                 }
-            } else if self.matched(id, owner, &request, &completion) {
+            } else if self.matched(id, owner, &request, &completion, bytes) {
                 return Ok(Some((id, owner, request, completion)));
             }
         }
@@ -1404,17 +1450,20 @@ impl Scheduler {
 
     /// Matches the completion of a request other than a `Finish`, as
     /// [`Scheduler::next_completion`] states: false when it is dropped, true when it was handed
-    /// to the executors that take it and is to be applied.
+    /// to the executors that take it, or waits for the slot it is handed under, and is to be
+    /// applied. `bytes` is what the request owed the completion queue.
     fn matched(
         &mut self,
         id: runtime::RequestId,
         owner: Option<OwnerId>,
         request: &runtime::Request,
         completion: &Completion,
+        bytes: usize,
     ) -> bool {
-        // A request answered `Copy` waits for the answer to its `Finish`.
+        // A request answered `Copy` waits for the answer to its `Finish`, owing what it owed.
         if matches!(completion, Completion::Copy { .. }) {
-            self.outstanding.insert(id.0, (owner, request.clone()));
+            self.outstanding
+                .insert(id.0, (owner, request.clone(), bytes));
         }
 
         let gives = matches!(
@@ -1436,15 +1485,53 @@ impl Scheduler {
         }
 
         for (group, slot) in self.mapped(owner, request, completion) {
-            self.executor
-                .map(group, slot, id, request.clone(), completion.clone());
+            self.give(group, slot, id, request.clone(), completion.clone());
         }
-        if let Completion::Copy { group, keys, .. } = completion {
-            let tokens = self.copy_tokens(request, keys, *group);
-            let bound = Instant::now() + memory::prefetch_wait(tokens);
-            self.copies.insert(id.0, (*group, bound));
+
+        // The slot of the owner's attachment, on the one group it is attached to, is known now:
+        // the completions read before it are handed over under it, in the order they were read.
+        if let (runtime::Request::Attach { owner, .. }, Completion::Attached { slot }) =
+            (request, completion)
+        {
+            for (group, number, waited, given) in self.unmapped.remove(owner).unwrap_or_default() {
+                self.give(group, Ok(*slot), number, waited, given);
+            }
         }
         true
+    }
+
+    /// Hands a completion that gives entries to `group`'s executor under `slot` (SD §2.1
+    /// `Executor::map`); a `Copy` it hands over is the executor's to run from then on, and enters
+    /// `copies` with its bound (SD §4.4). With `Err(owner)`, the slot is that of `owner`'s
+    /// attachment to `group`, whose `Attached` has not been read: the completion waits in
+    /// `unmapped` until it is.
+    fn give(
+        &mut self,
+        group: GroupId,
+        slot: Result<u32, OwnerId>,
+        id: runtime::RequestId,
+        request: runtime::Request,
+        completion: Completion,
+    ) {
+        let slot = match slot {
+            Ok(slot) => slot,
+            Err(owner) => {
+                let waiting = self.unmapped.entry(owner).or_default();
+                waiting.push((group, id, request, completion));
+                return;
+            }
+        };
+        if let Completion::Copy {
+            group: copier,
+            keys,
+            ..
+        } = &completion
+        {
+            let tokens = self.copy_tokens(&request, keys, *copier);
+            let bound = Instant::now() + memory::prefetch_wait(tokens);
+            self.copies.insert(id.0, (*copier, bound));
+        }
+        self.executor.map(group, slot, id, request, completion);
     }
 
     /// Gives up the copy that answered request `copy` with `Finish { copy, ok: false }`, stamped
@@ -1510,7 +1597,7 @@ impl Scheduler {
         if *completion == (Completion::Refused { cause: Cause::Copy }) {
             return None;
         }
-        let (owner, copied) = self.outstanding.remove(&copy.0)?;
+        let (owner, copied, _) = self.outstanding.remove(&copy.0)?;
         if self.forgotten(owner) {
             return None;
         }
@@ -1526,8 +1613,7 @@ impl Scheduler {
             }
             if let Some(group) = self.copy_group(&copied) {
                 let slot = self.slot_of(owner, group);
-                self.executor
-                    .map(group, slot, id, finish, completion.clone());
+                self.give(group, slot, id, finish, completion.clone());
             }
         }
         Some((owner, copied))
@@ -1562,7 +1648,7 @@ impl Scheduler {
             .held
             .iter()
             .chain(waiting)
-            .chain(self.outstanding.values().map(|(_, request)| request))
+            .chain(self.outstanding.values().map(|(_, request, _)| request))
             .flat_map(|request| self.taken(request))
             .collect();
         for (region, units) in asked {
@@ -1628,19 +1714,30 @@ impl Scheduler {
     fn acting_owner(&self, request: &runtime::Request) -> Option<OwnerId> {
         match request {
             runtime::Request::Finish { copy, .. } => {
-                self.outstanding.get(&copy.0).and_then(|(owner, _)| *owner)
+                self.outstanding.get(&copy.0).and_then(|(owner, ..)| *owner)
             }
             request => owner_of(request),
         }
     }
 
-    /// The slot row of the request `owner` is for on `group`; 0, a row no owner holds, when it
-    /// has none there.
-    fn slot_of(&self, owner: Option<OwnerId>, group: GroupId) -> u32 {
-        owner
+    /// The slot row of the request `owner` is for on `group`, which its attachment there states
+    /// once that attachment's `Attached` is read (slot rows start at 1); before then, `Err` with
+    /// the attachment's owner. 0, a row no owner holds, when the request has no attachment there
+    /// (a `Store`'s copy acts for no owner).
+    fn slot_of(&self, owner: Option<OwnerId>, group: GroupId) -> Result<u32, OwnerId> {
+        let attached = owner
             .and_then(|owner| self.request_of(owner))
-            .and_then(|request| request.slot_on(group))
-            .unwrap_or(0)
+            .and_then(|request| {
+                let attachments = request.attachments.iter();
+                attachments
+                    .into_iter()
+                    .find(|attachment| attachment.0 == group)
+            });
+        match attached {
+            Some(&(_, attached, 0, _)) => Err(attached),
+            Some(&(_, _, slot, _)) => Ok(slot),
+            None => Ok(0),
+        }
     }
 
     /// The groups whose device block tables may hold entries of `owner`, of `class` or of any
@@ -1698,18 +1795,18 @@ impl Scheduler {
         }
     }
 
-    /// The groups, each with its slot, that a completion of `request` is handed to by `map`:
-    /// none for a completion that gives no entries.
+    /// The groups, each with its slot as [`Scheduler::slot_of`] states it, that a completion of
+    /// `request` is handed to by `map`: none for a completion that gives no entries.
     fn mapped(
         &self,
         owner: Option<OwnerId>,
         request: &runtime::Request,
         completion: &Completion,
-    ) -> Vec<(GroupId, u32)> {
+    ) -> Vec<(GroupId, Result<u32, OwnerId>)> {
         match (request, completion) {
             (runtime::Request::Attach { group, .. }, Completion::Attached { slot })
             | (runtime::Request::Transfer { group, .. }, Completion::Transferred { slot, .. }) => {
-                vec![(*group, *slot)]
+                vec![(*group, Ok(*slot))]
             }
             (_, Completion::Copy { group, .. }) => vec![(*group, self.slot_of(owner, *group))],
             (
@@ -1747,7 +1844,7 @@ impl Scheduler {
             || self
                 .outstanding
                 .iter()
-                .any(|(later, (_, other))| *later > number && names(other))
+                .any(|(later, (_, other, _))| *later > number && names(other))
     }
 
     /// Per region (by index), the units an `Allocate` takes: its blocks in each region of its

@@ -154,6 +154,7 @@ impl Node {
             pairs.remove(0),
             vec![(config, capacity())],
             idle_policy(),
+            scheduling_guest::Parameters::default(),
             Box::new(groups),
             output,
             Arc::clone(&served),

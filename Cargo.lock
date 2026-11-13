@@ -4516,6 +4516,7 @@ dependencies = [
  "proto",
  "scheduler",
  "scheduling",
+ "scheduling-guest",
  "serde_json",
  "storage",
  "storage-server",
@@ -4523,6 +4524,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wasmtime",
 ]
 
 [[package]]

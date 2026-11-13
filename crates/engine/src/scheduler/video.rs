@@ -1000,6 +1000,7 @@ mod tests {
             QueuePair::create(1 << 12, 16).unwrap(),
             configs,
             crate::scheduler::tests::idle_policy(),
+            scheduling_guest::Parameters::default(),
             Box::new(Stamps(Arc::clone(&stamped))),
             output,
             Arc::new(AtomicU64::new(0)),

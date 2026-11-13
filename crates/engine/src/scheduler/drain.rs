@@ -6,9 +6,10 @@
 //! The drain is answered by `reply_at_boundary` (`mod.rs`) once no request remains and, with
 //! `shrink`, no `Detach` and no `Resize` of the scheduler is still to be taken or answered and
 //! every device region answered a `Resize` submitted after the last `Detach` was answered.
-//! `shrink_regions` therefore asks for a region's units while something there is free, or still
-//! retiring once no request remains, and once after each `Detach` answered, whose units the
-//! capacity words read with its answer may not show yet; the shrink ends once nothing more frees.
+//! `shrink_regions` therefore asks for a region's units while something there is free beyond
+//! what the running requests may still take before they end, or still retiring once no request
+//! remains, and once after each `Detach` answered, whose units the capacity words read with its
+//! answer may not show yet; the shrink ends once nothing more frees.
 
 use std::time::Instant;
 
@@ -75,32 +76,35 @@ impl Scheduler {
     }
 
     /// Gives a drain's device memory back (SD §3.8): for each device region of this queue pair
-    /// with no `Resize` held or outstanding, `Resize { region, units }` keeping the units neither
-    /// free nor evictable now, which the live requests still hold, when some are free or
-    /// evictable; once no request remains, also while units still retire, which come free once
-    /// the batches that may read them have ended; and when a `Detach` was answered since the
-    /// region's last `Resize` (`Scheduler::detached`). The buffer pool evicts in the order this queue
-    /// pair installed, the whole of each region's order while it shrinks (`install_victims`), and
-    /// never takes a private or pinned block, so a shrink stops short while requests run and each
-    /// `Resized` lets the next one take what has come free since. Each `Resized` is reported as
-    /// `Output::Shrunk` (`answered`).
+    /// with no `Resize` held or outstanding, `Resize { region, units }` giving back the units free
+    /// or evictable now that no running request may still take before it ends
+    /// (`Scheduler::units_to_end`), when there are such units; once no request remains, also
+    /// while units still retire, which come free once the batches that may read them have ended;
+    /// and when a `Detach` was answered since the region's last `Resize` (`Scheduler::detached`).
+    /// A running request steps on to its end, and gives its units back as it leaves. The buffer
+    /// pool evicts in the order this queue pair installed, the whole of each region's order
+    /// while it shrinks (`install_victims`), and never takes a private or pinned block, so a
+    /// shrink stops short while requests run and each `Resized` lets the next one take what has
+    /// come free since. Each `Resized` is reported as `Output::Shrunk` (`answered`).
     fn shrink_regions(&mut self) {
         let ended = self.requests.is_empty();
+        let kept = self.units_to_end();
         for (index, number) in self.device_regions() {
             if self.resizing_region(number) {
                 continue;
             }
             let available = self.available.get(index).copied().unwrap_or(0);
+            let free = available.saturating_sub(kept.get(index).copied().unwrap_or(0));
             let retiring = self.retiring.get(index).copied().unwrap_or(0);
             let detached = self.detached.get(index).copied().unwrap_or(false);
-            if available == 0 && (retiring == 0 || !ended) && !detached {
+            if free == 0 && (retiring == 0 || !ended) && !detached {
                 continue;
             }
 
             let capacity = self.capacity.get(index).copied().unwrap_or(0);
             self.submit(runtime::Request::Resize {
                 region: number,
-                units: capacity.saturating_sub(available),
+                units: capacity.saturating_sub(free),
             });
             if let Some(detached) = self.detached.get_mut(index) {
                 *detached = false;
@@ -128,7 +132,7 @@ impl Scheduler {
             runtime::Request::Resize { region, .. } => *region == number,
             _ => false,
         };
-        self.held.iter().any(of) || self.outstanding.values().any(|(_, request)| of(request))
+        self.held.iter().any(of) || self.outstanding.values().any(|(_, request, _)| of(request))
     }
 }
 

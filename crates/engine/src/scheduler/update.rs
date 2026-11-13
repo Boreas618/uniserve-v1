@@ -166,6 +166,13 @@ impl Scheduler {
         }
 
         self.record_drafts(id, batch, row, call.tokens.len(), !call.tokens.is_empty());
+        // The chunk that samples the prompt's first token asked the drafter for proposals after
+        // it, which the first verification carries (SD §7.2 "Speculation").
+        if !call.tokens.is_empty()
+            && let Some(request) = self.requests.get_mut(&id)
+        {
+            request.spec_token_ids.clone_from(&call.draft_token_ids);
+        }
         self.commit_filled(id, batch, row);
         self.give_up_behind(id, batch, row);
         if !self.prompt_scores(id, batch, row, &call) {
@@ -873,7 +880,7 @@ impl Scheduler {
             runtime::Request::Save { owner: other, .. } => other == owner,
             _ => false,
         };
-        self.held.iter().any(of) || self.outstanding.values().any(|(_, request)| of(request))
+        self.held.iter().any(of) || self.outstanding.values().any(|(_, request, _)| of(request))
     }
 }
 
@@ -950,7 +957,9 @@ impl Scheduler {
 
     /// The last answer of an admission arrived and its entries hold what its first call needs: it
     /// runs from its hit, and its draft cache from the draft blocks its hit pinned (SD §3.5,
-    /// §4.4); its queue wait and hit are counted (§7.5).
+    /// §4.4); its queue wait and hit are counted (§7.5). The policy is told `Admitted`, and the
+    /// request is marked: `Admitted` carries no phase, and the view the policy last had of the
+    /// admission may name none (SD §5.2).
     pub(super) fn admitted(&mut self, id: RequestId) {
         let now = Instant::now();
         let drafted = self
@@ -980,6 +989,7 @@ impl Scheduler {
         self.policy.events.push(Change::Admitted {
             request: PolicyRequestId(id.0),
         });
+        self.mark(id);
     }
 
     /// Starts moving a request a prefill group served to a decode group, once its prompt is
@@ -1104,6 +1114,27 @@ impl Scheduler {
         completion: &Completion,
         follow: Vec<runtime::Request>,
     ) {
+        // Draft blocks are outside admission and take only the units the regions have free (SD
+        // §3.6): a `Full` to them leaves the draft cache short, which a refill fills later.
+        if let (runtime::Request::Allocate { class, .. }, Completion::Full { .. }) =
+            (request, completion)
+        {
+            let drafts = self
+                .requests
+                .get(&id)
+                .and_then(|row| self.draft_class(row))
+                .is_some_and(|(draft, _)| draft == usize::from(*class));
+            if drafts {
+                if let Some(blocks) = self
+                    .requests
+                    .get_mut(&id)
+                    .and_then(|row| row.blocks.get_mut(usize::from(*class)))
+                {
+                    blocks.asked = blocks.end;
+                }
+                return self.answer_arrived(id);
+            }
+        }
         if let Completion::Full { .. } = completion {
             // An owner whose `Attach` found no room was never created, and takes no `Detach`.
             if let runtime::Request::Attach { .. } = request {
@@ -1111,6 +1142,7 @@ impl Scheduler {
                     row.attachments.retain(|attachment| attachment.1 != owner);
                 }
                 self.owners.remove(&owner);
+                self.drop_unmapped(owner);
             }
             return self.requeue(id);
         }

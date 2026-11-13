@@ -120,8 +120,8 @@ impl Scheduler {
     /// cover its next call and the low watermark asks for more, ahead of the step's admissions;
     /// then the blocks the policy offloads are stored to the host and the waiting requests it
     /// names are prefetched for; then, unless the scheduler drains, the waiting requests it
-    /// rejects leave and those it admits start their admission, in its order, until the first
-    /// that does not fit. A group with copies its executor has not finished, for which the step
+    /// rejects leave and those it admits start their admission, resumed requests first and in
+    /// its order otherwise, until the first that does not fit. A group with copies its executor has not finished, for which the step
     /// formed no batch, is sent an empty one, which runs the copies (SD §2.1).
     ///
     /// Nothing is formed while every group's queue is full, and nothing once the scheduler has
@@ -185,9 +185,18 @@ impl Scheduler {
                 let kind = RejectionKind::Overloaded;
                 self.reject_waiting(RequestId(reject.0), kind, POLICY_REJECTED);
             }
-            for admit in &output.admit {
+            // Resumed requests are tried before every request that starts (SD §3.2, §7.2 "The
+            // queue's order"). A view states no resume, so the policy's order holds among the
+            // resumed requests and among the others.
+            let mut admitted: Vec<RequestId> = output
+                .admit
+                .iter()
+                .map(|admit| RequestId(admit.0))
+                .collect();
+            admitted.sort_by_key(|id| !self.requests.get(id).is_some_and(Request::resumes));
+            for id in admitted {
                 // The first that does not fit stops the queue.
-                if !self.admit(RequestId(admit.0)) {
+                if !self.admit(id) {
                     break;
                 }
             }
@@ -490,10 +499,12 @@ impl Scheduler {
     /// `available` has given away this step. An `Allocate` of that owner and class still held is
     /// raised instead (`submit`); a class with one outstanding asks again once it is answered.
     ///
-    /// A class whose regions' `available` does not cover its blocks is not asked: the request is
-    /// short there, and `preempt` runs for it. A request that waits for a region's units since
-    /// its last shortage takes no further victims: it asks again once `available` shows them
-    /// there, or once nothing given up is still on its way back to the region.
+    /// A class whose regions' `available` does not cover all those blocks asks for the blocks
+    /// the next call writes alone, and the low watermark waits for units. One whose regions do
+    /// not cover even those is not asked: the request is short there (SD §3.6), and `preempt`
+    /// runs for it. A request that waits for a region's units since its last shortage takes no
+    /// further victims: it asks again once `available` shows them there, or once nothing given
+    /// up is still on its way back to the region.
     ///
     /// Every running request is visited, those the step left out for want of blocks included:
     /// one comparison per request and class.
@@ -503,7 +514,7 @@ impl Scheduler {
         let outstanding: HashSet<(OwnerId, u8)> = self
             .outstanding
             .values()
-            .filter_map(|(_, request)| match *request {
+            .filter_map(|(_, request, _)| match *request {
                 runtime::Request::Allocate { owner, class, .. } => Some((owner, class)),
                 _ => None,
             })
@@ -537,7 +548,7 @@ impl Scheduler {
                 continue;
             };
 
-            for (class, at, count, required) in self.ahead(request) {
+            for (class, at, count, needed) in self.ahead(request) {
                 if count == 0 || outstanding.contains(&(owner, class)) {
                     continue;
                 }
@@ -545,19 +556,28 @@ impl Scheduler {
                     continue;
                 };
                 let each = self.block_units(class, 0).unwrap_or(0);
-                let units = count.saturating_mul(each);
-                let short = regions
-                    .iter()
-                    .copied()
-                    .find(|&region| self.available.get(region).copied().unwrap_or(0) < units);
-                // The draft cache takes only the units the regions have free.
-                if let Some(region) = short {
-                    if let (true, Ok(region)) = (required, u8::try_from(region)) {
-                        self.preempt(id, region);
+                let short = |blocks: u32| {
+                    let units = blocks.saturating_mul(each);
+                    regions
+                        .iter()
+                        .copied()
+                        .find(|&region| self.available.get(region).copied().unwrap_or(0) < units)
+                };
+                // Every block asked for, or else those the next call writes. The low watermark
+                // and the draft cache take only the units the regions have free and wait for
+                // them; a next call whose own blocks are not covered leaves the request short.
+                let count = match (short(count), short(needed)) {
+                    (None, _) => count,
+                    (Some(_), None) if needed > 0 => needed,
+                    (Some(_), Some(region)) => {
+                        if let Ok(region) = u8::try_from(region) {
+                            self.preempt(id, region);
+                        }
                         break;
                     }
-                    continue;
-                }
+                    (Some(_), None) => continue,
+                };
+                let units = count.saturating_mul(each);
 
                 for &region in &regions {
                     if let Some(available) = self.available.get_mut(region) {
@@ -602,14 +622,32 @@ impl Scheduler {
             || self
                 .outstanding
                 .values()
-                .any(|(_, request)| gives_up(request))
+                .any(|(_, request, _)| gives_up(request))
     }
 
     /// The policy's `offload` (SD §3.4): one `Store` to the host per group whose memory holds
     /// the device copies of the blocks it names, with their keys in its order. A `PageId` that is
-    /// not in `cache`, not on the device, already on the host, or of a class without a host
-    /// region is skipped.
+    /// not in `cache`, not on the device, already on the host or being stored there (a block is
+    /// offered to the host once, SD §4.4), or of a class without a host region is skipped.
     fn offload(&mut self, pages: &[PageId]) {
+        // The keys a `Store` to the host held or outstanding names: until its answer, `cache`
+        // does not show them on the host.
+        let storing: HashSet<Key> = self
+            .held
+            .iter()
+            .chain(self.outstanding.values().map(|(_, request, _)| request))
+            .filter_map(|request| match request {
+                runtime::Request::Store {
+                    keys,
+                    tier: Tier::Host,
+                    ..
+                } => Some(keys),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+
         let mut stores: Vec<(GroupId, Vec<Key>)> = Vec::new();
         for page in pages {
             let Some(row) = self.cache.get(&page.0) else {
@@ -619,7 +657,7 @@ impl Scheduler {
                 .classes
                 .get(usize::from(row.class))
                 .is_some_and(|class| class.host.is_some());
-            if row.tiers & HOST != 0 || !hosted {
+            if row.tiers & HOST != 0 || !hosted || storing.contains(&row.key) {
                 continue;
             }
             let Some(group) = self.holder(row) else {
@@ -657,7 +695,7 @@ impl Scheduler {
         let fetching: HashSet<Key> = self
             .held
             .iter()
-            .chain(self.outstanding.values().map(|(_, request)| request))
+            .chain(self.outstanding.values().map(|(_, request, _)| request))
             .filter_map(|request| match request {
                 runtime::Request::Prefetch { keys, .. } => keys.first().copied(),
                 _ => None,
@@ -842,12 +880,15 @@ impl Scheduler {
     }
 
     /// Submits `request`, one of request `id`'s admission: its answer is one more the admission
-    /// waits for. The round that made it counted what it asks in the request's tables.
+    /// waits for, unless it raised the count of a held `Allocate` of the same owner and class
+    /// (SD §3.1), whose one answer the admission already waits for. The round that made it
+    /// counted what it asks in the request's tables.
     pub(super) fn ask(&mut self, id: RequestId, request: runtime::Request) {
-        if let Some(row) = self.requests.get_mut(&id) {
+        if self.submit(request)
+            && let Some(row) = self.requests.get_mut(&id)
+        {
             row.pending += 1;
         }
-        self.submit(request);
     }
 
     /// Whether `request`'s need fits what the regions have available now (SD §3.5, §7.2): in each
@@ -1054,7 +1095,8 @@ impl Scheduler {
     /// cover what it asks for ahead, or the buffer pool answered its `Allocate` with `Full`, after
     /// which its `asked` is back at `end` (SD §3.6).
     ///
-    /// A request that can never fit ends with `CacheCapacity`. Otherwise the units it lacks
+    /// A request that can never fit ends with `CacheCapacity`, once its calls in flight have
+    /// returned (`finish_outgrown`). Otherwise the units it lacks
     /// beyond the region's `available`, less the region's retiring units, which come back once
     /// the batches that may read them end, are relieved in this order until covered: draft
     /// tables of idle requests, admissions under way, the policy's victims (a running request
@@ -1066,7 +1108,8 @@ impl Scheduler {
     pub(super) fn preempt(&mut self, id: RequestId, region: u8) {
         let region = usize::from(region);
 
-        // A request that can never fit ends with `FinishReason::CacheCapacity`.
+        // A request that can never fit ends with `FinishReason::CacheCapacity`, or waits for its
+        // calls in flight to end first.
         if self.finish_outgrown(id, region) {
             return;
         }
@@ -1138,9 +1181,13 @@ impl Scheduler {
         }
     }
 
-    /// Ends running request `id` with `FinishReason::CacheCapacity` when the units it holds in
-    /// `region` and the units its next call still needs there exceed the region's capacity: no
-    /// victim could let it grow (`S/preemption/tokens.rs:133-164`). True when it ended.
+    /// Whether running request `id` can never fit in `region`: the units it holds there and the
+    /// units its next call still needs there exceed the region's capacity, so that no victim
+    /// could let it grow (`S/preemption/tokens.rs:133-164`). It ends with
+    /// `FinishReason::CacheCapacity` at the length the cache holds, once no call of it is in
+    /// flight: those calls write within the blocks it holds and may end it themselves, and their
+    /// outputs are applied (a call in flight of a finished request is dropped, SD §3.7). Until
+    /// then it waits, and takes no victim. True when it can never fit.
     fn finish_outgrown(&mut self, id: RequestId, region: usize) -> bool {
         let Some(request) = self.requests.get(&id) else {
             return false;
@@ -1152,14 +1199,18 @@ impl Scheduler {
             return false;
         }
 
-        let terminal = self.finished(id, FinishReason::CacheCapacity, None);
-        self.finish(id, terminal);
+        if request.idle() {
+            let terminal = self.finished(id, FinishReason::CacheCapacity, None);
+            self.finish(id, terminal);
+        } else {
+            self.wait_for_available(id, region);
+        }
         true
     }
 
-    /// The units of `region` (an index) request `id`'s next call and low watermark need beyond
-    /// the blocks it asked for: the `Allocate`s its call needs (SD §4.4), not those of its draft
-    /// cache, which takes only the units the regions have free.
+    /// The units of `region` (an index) request `id`'s next call needs beyond the blocks it asked
+    /// for: the blocks that call writes (SD §3.6, §4.4), neither those of the low watermark nor
+    /// those of its draft cache, which take only the units the regions have free.
     fn units_short(&self, id: RequestId, region: usize) -> u32 {
         let Some(request) = self.requests.get(&id) else {
             return 0;
@@ -1168,13 +1219,13 @@ impl Scheduler {
             return 0;
         };
         let mut short = 0u32;
-        for (class, _, count, required) in self.ahead(request) {
+        for (class, _, _, needed) in self.ahead(request) {
             let there = self
                 .class_regions(owner, class)
                 .is_some_and(|regions| regions.contains(&region));
-            if required && there {
+            if there {
                 let each = self.block_units(class, 0).unwrap_or(0);
-                short = short.saturating_add(count.saturating_mul(each));
+                short = short.saturating_add(needed.saturating_mul(each));
             }
         }
         short
@@ -1259,11 +1310,7 @@ impl Scheduler {
             .requests
             .values()
             .any(|request| request.status == RequestStatus::Finished);
-        let short = |request: &&Request| {
-            self.ahead(request)
-                .iter()
-                .any(|&(_, _, count, required)| required && count > 0)
-        };
+        let short = |request: &&Request| self.ahead(request).iter().any(|&(.., needed)| needed > 0);
         if tokens.len() < 2 || leaving || !tokens.iter().all(short) {
             return;
         }
@@ -1322,9 +1369,10 @@ mod tests {
     use proto::config::{KvCacheConfig, WorkerGroupRole};
     use proto::request::{GenerationFeatures, GenerationLimits, GenerationRequest, RequestId};
     use scheduling_guest::Event as PolicyEvent;
+    use scheduling_guest::ids::PageId;
     use scheduling_guest::limits::{Limits, Parameters};
     use scheduling_guest::view::Snapshot;
-    use storage::runtime::{self, Completion, OwnerId};
+    use storage::runtime::{self, Completion, OwnerId, Tier};
 
     use super::super::policy::tests::packaged;
     use super::super::tests::{A, Bench, KV, OWNER_A, bench, key};
@@ -1689,5 +1737,47 @@ mod tests {
             failed.as_deref(),
             Some("no batch formed for 1 running request(s) at step 0")
         );
+    }
+
+    /// A block the policy's `offload` names is offered to the host once: named again while its
+    /// `Store` is held or outstanding, before `cache` shows it on the host, it is not stored
+    /// again (SD §3.4 "The policy's `offload`", §4.4 "The write policy").
+    #[test]
+    fn a_block_the_policy_offloads_is_stored_once_until_its_store_is_answered() {
+        let mut bench = bench(4096);
+        // Group A's blocks of class `KV` have a host copy region; one is on the device in A.
+        bench.scheduler.classes[usize::from(KV)].host = Some((2, 1));
+        let block = super::super::Cached {
+            key: key(1),
+            class: KV,
+            tokens: 16,
+            tiers: super::super::cache::DEVICE,
+            groups: 1 << A.0,
+            pins: 1,
+            last_used: 1,
+        };
+        let page = PageId(super::super::Cached::id(&block.key));
+        bench.scheduler.cache.insert(page.0, block);
+
+        let store = runtime::Request::Store {
+            group: A,
+            keys: vec![key(1)],
+            tier: Tier::Host,
+        };
+        let written = |bench: &mut Bench| -> Vec<runtime::Request> {
+            bench.scheduler.post().unwrap();
+            bench
+                .take()
+                .into_iter()
+                .map(|(_, request)| request)
+                .collect()
+        };
+        bench.scheduler.offload(&[page]);
+        bench.scheduler.offload(&[page]);
+        assert_eq!(written(&mut bench), [store]);
+
+        // Outstanding, it is not offered again either.
+        bench.scheduler.offload(&[page]);
+        assert!(written(&mut bench).is_empty());
     }
 }

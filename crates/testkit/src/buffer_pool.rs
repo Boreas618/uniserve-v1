@@ -24,8 +24,8 @@
 //!
 //! The knobs: completions delayed by a number of turns, reordered, withheld until released; the
 //! pool stopped, so that it takes nothing, writes nothing and a submission queue fills; capacity
-//! words set by the case; tasks that fail. The records: every request taken and every completion
-//! written, in order.
+//! words set by the case; tasks that fail; requests refused for a cause the case names. The
+//! records: every request taken and every completion written, in order.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::Ordering;
@@ -43,6 +43,9 @@ const TASK_LIMIT_NS: u64 = 60_000_000_000;
 
 /// Which completions to withhold, by the request each answers.
 type Withhold = Box<dyn Fn(&Request, &Completion) -> bool>;
+
+/// Which requests to refuse, and the cause each is refused for.
+type Refuse = Box<dyn Fn(&Request) -> Option<Cause>>;
 
 /// A completion produced and not yet written: due at a turn, or withheld until released.
 struct Delayed {
@@ -77,6 +80,7 @@ pub struct InProcessPool {
     delay: u64,
     reorder: bool,
     withhold: Option<Withhold>,
+    refuse: Option<Refuse>,
     stopped: bool,
     capacity: HashMap<u8, (u32, u32, u32)>,
     fail_tasks: bool,
@@ -105,6 +109,7 @@ impl InProcessPool {
             delay: 0,
             reorder: false,
             withhold: None,
+            refuse: None,
             stopped: false,
             capacity: HashMap::new(),
             fail_tasks: false,
@@ -329,7 +334,12 @@ impl InProcessPool {
         served.executor.taken(id, &request);
         self.requests.insert((served.queue, id.0), request.clone());
         self.taken.push((served.queue, id, request.clone()));
-        self.pool.take(served.queue, id, request);
+        // A refused request changes nothing (`specs/buffer-pool.md` §9, R1).
+        let queue = served.queue;
+        if let Some(cause) = self.refuse.as_ref().and_then(|refuse| refuse(&request)) {
+            return self.produced(queue, id, Completion::Refused { cause });
+        }
+        self.pool.take(queue, id, request);
     }
 
     /// Runs a task the pool started to its end: a transfer copies everything, a prefetch the
@@ -450,6 +460,13 @@ impl InProcessPool {
             .iter()
             .filter(|delayed| delayed.withheld)
             .count()
+    }
+
+    /// Refuses, from now on, every request for which `cause` names a cause: the pool answers it
+    /// `Refused` with that cause and changes nothing, as it does a request that does not fit
+    /// (`specs/buffer-pool.md` §9, R1). A `cause` that names none refuses nothing more.
+    pub fn refuse(&mut self, cause: impl Fn(&Request) -> Option<Cause> + 'static) {
+        self.refuse = Some(Box::new(cause));
     }
 
     /// Stops the pool: a turn takes no request, reads no `completed` word and writes nothing, so

@@ -635,51 +635,61 @@ impl Scheduler {
 
     /// Where a running token request's next call starts and ends (SD §4.4): its next prefill
     /// chunk, else a verification of its drafts and proposals in a deployment that speculates,
-    /// else one decoded token.
-    fn next_call(&self, request: &Request) -> (Phase, u32, u32) {
+    /// else one decoded token. `None` once the prompt is scheduled and its calls in flight may
+    /// sample the last token its limit allows: it may make no further call
+    /// (`Request::reaches_limit`).
+    fn next_call(&self, request: &Request) -> Option<(Phase, u32, u32)> {
         let start = request.num_computed_tokens;
         if start < request.num_prompt_tokens {
             let end = start.saturating_add(self.first_chunk(request, start));
-            return (Phase::Prefill, start, end);
+            return Some((Phase::Prefill, start, end));
+        }
+        if request.reaches_limit() {
+            return None;
         }
         if self.config.draft_tokens == 0 {
-            return (Phase::Decode, start, start.saturating_add(1));
+            return Some((Phase::Decode, start, start.saturating_add(1)));
         }
         let eos = self
             .kv_group(request)
             .and_then(|id| self.group(id))
             .map_or(&[][..], |group| &group.capacity.eos_token_ids[..]);
         let verified = 1 + request.drafts(eos) + self.proposals(request);
-        (Phase::Verify, start, start.saturating_add(verified))
+        Some((Phase::Verify, start, start.saturating_add(verified)))
     }
 
     /// The `Allocate`s a running token request needs so that the blocks asked for cover its next
     /// call and [`LOW_WATERMARK`] blocks beyond it (SD §3.4 `allocate_ahead`, §4.4), per class:
-    /// the class, the position, the count, and whether the call needs it. A full-attention or
-    /// sliding-window class is grown from `asked`; a recurrent-state class asks for the
-    /// checkpoint its next call or refill keeps, one ahead at a time; the draft cache is grown
-    /// over the target's next call while it covers the request's tokens, or over its next refill
-    /// chunk, and no call needs it. The caller asks only what the regions' `available` covers,
-    /// and at most one `Allocate` per class outstanding.
-    pub(super) fn ahead(&self, request: &Request) -> Vec<(u8, u32, u32, bool)> {
+    /// the class, the position, the count, and how many of those blocks the next call itself
+    /// writes (the rest are the low watermark's). A full-attention or sliding-window class is
+    /// grown from `asked`; a recurrent-state class asks for the checkpoint its next call or refill
+    /// keeps, or a later decode keeps within the low watermark, one ahead at a time; the draft
+    /// cache is grown over the target's next call while it covers the request's tokens, or over
+    /// its next refill chunk, and no call needs it. A request with no next call asks for nothing.
+    /// The caller asks only what the regions' `available` covers, and at most one `Allocate` per
+    /// class outstanding; the request is short only when the blocks its next call writes are not
+    /// covered (SD §3.6).
+    pub(super) fn ahead(&self, request: &Request) -> Vec<(u8, u32, u32, u32)> {
         let mut asks = Vec::new();
         if request.status != RequestStatus::Running || request.generation().is_none() {
             return asks;
         }
-        let (phase, start, end) = self.next_call(request);
+        let Some((phase, start, end)) = self.next_call(request) else {
+            return asks;
+        };
         let state = self
             .state_shape(request)
             .map(|(class, block, _)| (class, block));
         let refill = (self.config.draft_tokens > 0
-            && request.num_draft_tokens < request.num_computed_tokens)
-            .then(|| {
-                let from = request.refill_start(state);
-                let budget = self.policy.limits.max_num_batched_tokens;
-                (
-                    from,
-                    from.saturating_add(request.refill_chunk(budget, state)),
-                )
-            });
+            && request.num_draft_tokens < request.refill_end())
+        .then(|| {
+            let from = request.refill_start(state);
+            let budget = self.policy.limits.max_num_batched_tokens;
+            (
+                from,
+                from.saturating_add(request.refill_chunk(budget, state)),
+            )
+        });
 
         for (index, (&(kind, block), blocks)) in
             self.shapes(request).iter().zip(&request.blocks).enumerate()
@@ -688,16 +698,17 @@ impl Scheduler {
                 continue;
             };
             if kind.is_state() {
-                let calls = [
-                    Some((phase, start, end)),
-                    refill.map(|(s, e)| (Phase::Refill, s, e)),
-                ];
-                if let Some(position) =
-                    calls.into_iter().flatten().find_map(|(phase, start, end)| {
-                        self.checkpoint_ahead(request, phase, start, end)
-                    })
-                {
-                    asks.push((class, position, 1, true));
+                // The checkpoint of the next call is needed when the call keeps it; a refill's
+                // is not, since a refill takes only the units the regions have free.
+                let target = self.checkpoint_ahead(request, phase, start, end);
+                let refilled = || {
+                    let (start, end) = refill?;
+                    let (position, _) =
+                        self.checkpoint_ahead(request, Phase::Refill, start, end)?;
+                    Some((position, false))
+                };
+                if let Some((position, kept)) = target.or_else(refilled) {
+                    asks.push((class, position, 1, u32::from(kept)));
                 }
                 continue;
             }
@@ -706,9 +717,15 @@ impl Scheduler {
                 (true, None) => (end, false),
                 (true, Some((_, end))) => (end, false),
             };
-            let wanted = end.div_ceil(block).saturating_add(LOW_WATERMARK);
+            let written = end.div_ceil(block);
+            let wanted = written.saturating_add(LOW_WATERMARK);
             if blocks.asked < wanted && (required || self.config.draft_tokens > 0) {
-                asks.push((class, blocks.asked, wanted - blocks.asked, required));
+                let needed = if required {
+                    written.saturating_sub(blocks.asked)
+                } else {
+                    0
+                };
+                asks.push((class, blocks.asked, wanted - blocks.asked, needed));
             }
         }
         asks
@@ -716,15 +733,16 @@ impl Scheduler {
 
     /// The position of the recurrent-state checkpoint a call of `phase` over `start..end` keeps
     /// and that the request does not hold or ask for yet, when it may ask for it now: the table
-    /// holds at most its base and asks for nothing, and the position lies beyond it. A decode
-    /// asks for the checkpoint of the next kept boundary once it lies within the low watermark.
+    /// holds at most its base and asks for nothing, and the position lies beyond it; with whether
+    /// the call itself keeps it. A decode asks for the checkpoint of the next kept boundary once
+    /// it lies within the low watermark, before a call keeps it.
     fn checkpoint_ahead(
         &self,
         request: &Request,
         phase: Phase,
         start: u32,
         end: u32,
-    ) -> Option<u32> {
+    ) -> Option<(u32, bool)> {
         let (class, block, interval) = self.state_shape(request)?;
         let blocks = request.blocks.get(class)?;
         if blocks.asked > blocks.end || checkpoints(blocks)[1].is_some() {
@@ -746,7 +764,8 @@ impl Scheduler {
         };
         let position = boundary / block - 1;
         let beyond = blocks.first == blocks.end || position >= blocks.end;
-        beyond.then_some(position)
+        let keeps = kept(phase, start, end, block, interval) == Some(boundary);
+        beyond.then_some((position, keeps))
     }
 
     /// Records that request `id` asked for positions `at..at + count` of `class`, as every
@@ -764,20 +783,75 @@ impl Scheduler {
 
     /// Per region (an index into the session's regions), the units the running requests still
     /// need to reach their next call and the low watermark (SD §4.4 "The admission reserve"),
-    /// which an admission leaves available.
+    /// which an admission leaves available: every class but the draft cache, which takes only
+    /// the units the regions have free.
     pub(super) fn admission_reserve(&self) -> Vec<u32> {
         let mut reserve = vec![0; self.regions.len()];
         for request in self.running.iter().filter_map(|id| self.requests.get(id)) {
             let Some(group) = self.kv_group(request) else {
                 continue;
             };
-            for (class, _, count, required) in self.ahead(request) {
-                if required {
+            let shapes = self.shapes(request);
+            for (class, _, count, _) in self.ahead(request) {
+                let drafts = shapes
+                    .get(usize::from(class))
+                    .is_some_and(|(kind, _)| kind.is_draft());
+                if !drafts {
                     self.charge_units(&mut reserve, group, class, count, 0);
                 }
             }
         }
         reserve
+    }
+
+    /// Per region (an index), the units the running requests may still take before they end,
+    /// beyond the blocks they asked for (SD §3.8: a draining scheduler keeps stepping its running
+    /// requests until they end). A token request's longest sequence is its context and every
+    /// token its limit lets it generate, at most its group's longest sequence; per class but the
+    /// draft cache, which takes only free units, it takes the blocks of that sequence and the low
+    /// watermark: all of them for full attention, those of its window and its next chunk for a
+    /// sliding window, two checkpoints for a recurrent state. A video request holds every block
+    /// it takes from its admission on.
+    pub(super) fn units_to_end(&self) -> Vec<u32> {
+        let mut units = vec![0; self.regions.len()];
+        for request in self.running.iter().filter_map(|id| self.requests.get(id)) {
+            let (Some(input), Some(group)) = (request.generation(), self.kv_group(request)) else {
+                continue;
+            };
+            let longest = self
+                .group(group)
+                .map_or(u32::MAX, |group| group.capacity.max_model_len);
+            let left = count(input.max_und_tokens).saturating_sub(request.generated());
+            let end = count(request.token_ids.len())
+                .saturating_add(left)
+                .min(longest);
+            let chunk = if request.num_computed_tokens < request.num_prompt_tokens {
+                self.first_chunk(request, request.num_computed_tokens)
+            } else {
+                1
+            };
+
+            for (index, (&(kind, block), blocks)) in
+                self.shapes(request).iter().zip(&request.blocks).enumerate()
+            {
+                let Ok(class) = u8::try_from(index) else {
+                    continue;
+                };
+                let block = block.max(1);
+                let most = match kind {
+                    CacheGroupKind::Draft => continue,
+                    CacheGroupKind::State => 2,
+                    CacheGroupKind::SlidingWindow { window } => end
+                        .div_ceil(block)
+                        .min((window + chunk).div_ceil(block) + 1),
+                    CacheGroupKind::Full => end.div_ceil(block),
+                };
+                let asked = blocks.asked.saturating_sub(blocks.first);
+                let need = most.saturating_add(LOW_WATERMARK).saturating_sub(asked);
+                self.charge_units(&mut units, group, class, need, 0);
+            }
+        }
+        units
     }
 }
 
@@ -1278,9 +1352,9 @@ impl Scheduler {
     }
 
     /// The `Allocate`s of a token request's first chunk from `hit` and the low watermark, per
-    /// cache class but the draft cache: a full-attention or sliding-window class from the
-    /// positions its read requests asked for, a recurrent-state class the checkpoint the chunk
-    /// keeps.
+    /// cache class: a full-attention or sliding-window class from the positions its read
+    /// requests asked for, a recurrent-state class the checkpoint the chunk keeps, and the draft
+    /// cache, where the deployment drafts, as full attention over the draft entries.
     fn first_call_asks(
         &self,
         request: &Request,
@@ -1299,7 +1373,18 @@ impl Scheduler {
                 continue;
             };
             let (at, count) = if kind.is_draft() {
-                continue;
+                // The draft cache over the first chunk, where the deployment drafts: the prefill
+                // writes its entries, which count only in draft blocks the request holds (SD
+                // §4.4). Draft blocks are outside admission: a `Full` to them leaves the draft
+                // cache short (`admission_answered`). A draft cache that reads blocks of the hit
+                // grows past them only once they are held (`allocate_ahead`), so that a pin that
+                // falls short leaves no gap in its table, which the admission does not settle
+                // on (`settled`).
+                if self.config.draft_tokens == 0 || table.asked > table.first {
+                    continue;
+                }
+                let wanted = end.div_ceil(block) + LOW_WATERMARK;
+                (table.asked, wanted.saturating_sub(table.asked))
             } else if kind.is_state() {
                 let Some(boundary) = kept(Phase::Prefill, hit, end, block, interval) else {
                     continue;
@@ -1418,6 +1503,10 @@ impl Scheduler {
         let loaded = matches!(completion, Completion::Loaded | Completion::Duplicate);
         let tokens = block(class).saturating_mul(held);
         let state = self.state_shape(request).map(|(state, _, _)| state);
+        let draft = self
+            .draft_class(request)
+            .is_some_and(|(draft, _)| draft == usize::from(class));
+        let read = count(keys.len());
         let Some(request) = self.requests.get_mut(&id) else {
             return follow;
         };
@@ -1439,6 +1528,12 @@ impl Scheduler {
             }
             if loaded && first_required == Some(usize::from(class)) {
                 request.num_host_tokens = request.num_host_tokens.saturating_add(tokens);
+            }
+            // A draft cache whose read fell short grows from what it holds: its blocks are
+            // outside admission, which settles without them, so no later round asks for the
+            // positions the read lost, and a block allocated past them would leave a gap.
+            if draft && held < read && blocks.asked == at.saturating_add(read) {
+                blocks.asked = blocks.end;
             }
         } else if held > 0 {
             follow.push(release(owner, class, at, held));
@@ -1630,8 +1725,9 @@ impl Scheduler {
     /// hit reads are given up; a recurrent-state table keeps the checkpoint the hit ends at and
     /// the one its first chunk keeps; and every position from the hit to the first chunk and the
     /// low watermark that holds no private entry (the clone of the expected partial last block,
-    /// or what an earlier round allocated from the expected hit on) is allocated. Fills `unpinned`
-    /// with the keys of the shared entries given up.
+    /// or what an earlier round allocated from the expected hit on) is allocated; the draft cache
+    /// keeps its read-only entries within the hit and is allocated again over the first chunk.
+    /// Fills `unpinned` with the keys of the shared entries given up.
     #[expect(
         clippy::too_many_arguments,
         reason = "the round reads the request and writes its counts, its asks and the keys it \
@@ -1683,21 +1779,33 @@ impl Scheduler {
                 continue;
             }
 
-            // The read-only entries the hit reads, and those outside it given up.
+            // The read-only entries the hit reads, and those outside it given up; the draft
+            // cache gives up its private entries too, and holds the first chunk again from the
+            // end of its read-only ones.
             let keep = if kind.is_draft() {
                 0..table.shared.min(hit / block)
             } else {
                 needed(kind, block, hit)
             };
             let read = table.first..table.shared;
+            let held = if kind.is_draft() {
+                table.end.max(read.end)
+            } else {
+                read.end
+            };
             let (before, beyond) = (
                 read.start..keep.start.min(read.end),
-                keep.end.max(read.start)..read.end,
+                keep.end.max(read.start)..held,
             );
             self.give_up(request, owner, index, before, read.end, asks, unpinned);
             self.give_up(request, owner, index, beyond, read.end, asks, unpinned);
             if kind.is_draft() {
                 *table = run(0, keep.end, keep.end);
+                let reach = end.div_ceil(block) + LOW_WATERMARK;
+                if self.config.draft_tokens > 0 && reach > keep.end {
+                    asks.push(allocate(owner, class, keep.end, reach - keep.end, 0));
+                    table.asked = reach;
+                }
                 continue;
             }
 
@@ -1857,8 +1965,15 @@ impl Scheduler {
                 continue;
             }
 
+            // A request that leaves as migratable comes back with its tokens as its prompt and
+            // computes the last of them again to sample, so it looks its blocks up to the token
+            // before its last (SD §4.4 "The hit": a partial last block ends at most at
+            // `prompt_len - 1`); a decode in flight as it left wrote that last token's entry,
+            // which no lookup reaches. Its blocks are committed as it looks them up.
             let written = if kind.is_draft() {
                 request.num_draft_tokens
+            } else if tails {
+                visible.min(count(request.token_ids.len()).saturating_sub(1))
             } else {
                 visible
             };
@@ -2217,13 +2332,14 @@ mod tests {
     //! beside it, answered by hand on a real queue pair.
 
     use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use ipc::CacheGroupKind;
     use ipc::batch::{Batch, BatchId, Columns, Phase, Shape, Variant};
     use proto::config::{KvCacheConfig, SchedulerConfig, WorkerGroupConfig};
-    use proto::request::{GenerationLimits, GenerationRequest, RequestId};
+    use proto::request::{Event, FinishReason, GenerationLimits, GenerationRequest, RequestId};
     use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
     use storage::{Key, QueuePair};
 
@@ -2231,7 +2347,7 @@ mod tests {
 
     use super::super::cache::{DEVICE, HOST, REMOTE};
     use super::super::tests::{capacity, idle_policy};
-    use super::super::{Blocks, Executor, Request, RequestStatus, Scheduler};
+    use super::super::{Blocks, Executor, Output, Request, RequestStatus, Scheduler};
     use super::{commit, run};
 
     const A: GroupId = GroupId(0);
@@ -2359,6 +2475,7 @@ mod tests {
             engine,
             vec![(groups[0].clone(), stated)],
             idle_policy(),
+            scheduling_guest::Parameters::default(),
             Box::new(Stamps(Arc::clone(&stamped))),
             output,
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2833,8 +2950,9 @@ mod tests {
             asked: 3,
         };
 
-        // The next decode writes token 10 into block 2; one more block is the low watermark.
-        assert_eq!(session.scheduler.ahead(session.row(id)), [(0, 3, 1, true)]);
+        // The next decode writes token 10 into block 2, which it holds; one more block is the
+        // low watermark, which the call does not write.
+        assert_eq!(session.scheduler.ahead(session.row(id)), [(0, 3, 1, 0)]);
         assert!(
             session
                 .scheduler
@@ -2857,6 +2975,123 @@ mod tests {
         );
     }
 
+    /// A request whose calls in flight may sample the last token its limit allows makes no
+    /// further call, and asks for no block ahead of one: a prompt that fills its blocks and may
+    /// generate one token is not short of the block a decode would write (SD §3.3 `Decode`, §3.6).
+    #[test]
+    fn a_request_whose_calls_in_flight_reach_its_limit_asks_for_nothing_ahead() {
+        let mut session = serving(&[full(4)], KvCacheConfig::default());
+        let id = session.request(1, (1..=8).collect());
+        let limit = |session: &mut Session, tokens: usize| {
+            if let proto::request::Request::Generation(input) = &mut session.row_mut(id).input {
+                input.max_und_tokens = tokens;
+            }
+        };
+        // The prompt's last chunk, which samples the first token, is in flight; the blocks hold
+        // the prompt and its low watermark.
+        let request = session.row_mut(id);
+        request.status = RequestStatus::Running;
+        request.num_computed_tokens = 8;
+        request.scheduled[Phase::Prefill.index()] = 1;
+        request.blocks[0] = Blocks {
+            first: 0,
+            shared: 0,
+            end: 3,
+            asked: 3,
+        };
+        limit(&mut session, 1);
+        assert!(session.scheduler.ahead(session.row(id)).is_empty());
+
+        // Allowed a second token, its decode writes token 8 into block 2, which it holds; the
+        // block after it is the low watermark.
+        limit(&mut session, 2);
+        assert_eq!(session.scheduler.ahead(session.row(id)), [(0, 3, 1, 0)]);
+        session.row_mut(id).blocks[0].end = 2;
+        session.row_mut(id).blocks[0].asked = 2;
+        assert_eq!(session.scheduler.ahead(session.row(id)), [(0, 2, 2, 1)]);
+    }
+
+    /// A request the whole cache cannot hold ends with `CacheCapacity`, at the length the cache
+    /// holds, once its calls in flight have returned: they write within its blocks and may end
+    /// it themselves, and their outputs are applied (SD §3.6, §3.7).
+    #[test]
+    fn a_request_the_cache_cannot_hold_ends_once_its_calls_in_flight_return() {
+        let mut session = serving(&[full(4)], KvCacheConfig::default());
+        let (output, outputs) = crossbeam_channel::unbounded();
+        session.scheduler.output = output;
+        // The device region holds four blocks, every one the request's: its prompt.
+        session.scheduler.capacity[0] = 4;
+        let id = session.request(1, (1..=16).collect());
+        session.scheduler.running.push(id);
+        let request = session.row_mut(id);
+        request.status = RequestStatus::Running;
+        request.queued = false;
+        request.num_computed_tokens = 16;
+        request.scheduled[Phase::Prefill.index()] = 1;
+        request.blocks[0] = Blocks {
+            first: 0,
+            shared: 0,
+            end: 4,
+            asked: 4,
+        };
+
+        // Its next decode writes block 4, which no victim could free; its prefill is in flight.
+        session.scheduler.preempt(id, 0);
+        assert_eq!(session.row(id).status, RequestStatus::Running);
+        assert!(outputs.try_recv().is_err());
+
+        session.row_mut(id).completed[Phase::Prefill.index()] = 1;
+        session.scheduler.preempt(id, 0);
+        let ended: Vec<Event> = outputs
+            .try_iter()
+            .filter_map(|output| match output {
+                Output::Event(of, event) if of == id => Some(event),
+                _ => None,
+            })
+            .collect();
+        let [Event::Finished { reason, .. }] = &ended[..] else {
+            panic!("{ended:?}");
+        };
+        assert_eq!(*reason, FinishReason::CacheCapacity);
+        assert!(!session.scheduler.requests.contains_key(&id));
+    }
+
+    /// A step installs the eviction order, whose head its `available` counts, ahead of the
+    /// allocations it asks for: the buffer pool takes the `Victims` first, so those allocations
+    /// may evict the blocks it names (SD §4.5).
+    #[test]
+    fn a_step_installs_the_eviction_order_ahead_of_its_allocations() {
+        let mut session = serving(&[full(4)], KvCacheConfig::default());
+        // One cached block no request holds; the region has room for the request's blocks.
+        let cached = Key([7; 32]);
+        session.list(&[(cached, 0, DEVICE)]);
+        session.pool.register(1).store(8, Ordering::Release);
+        let id = session.request(1, (1..=10).collect());
+        session.scheduler.running.push(id);
+        let request = session.row_mut(id);
+        request.status = RequestStatus::Running;
+        request.queued = false;
+        request.num_computed_tokens = 10;
+        request.blocks[0] = Blocks {
+            first: 0,
+            shared: 0,
+            end: 3,
+            asked: 3,
+        };
+
+        session.scheduler.step();
+        let mut record = Vec::new();
+        let mut written = Vec::new();
+        while session.pool.next_request(&mut record).unwrap() {
+            written.push(runtime::Request::decode(&record).unwrap().1);
+        }
+        let victims = runtime::Request::Victims {
+            region: 4,
+            keys: vec![cached],
+        };
+        assert_eq!(written, [victims, allocate(1, 0, 3, 1)]);
+    }
+
     #[test]
     fn filled_blocks_are_committed_in_order_and_a_migrating_tail_under_its_tail_key() {
         let mut session = serving(&[full(4)], KvCacheConfig::default());
@@ -2864,7 +3099,9 @@ mod tests {
         let keys = session.row(id).keys[0].clone();
         let request = session.row_mut(id);
         request.status = RequestStatus::Running;
+        // Its prompt is computed, and its prefill sampled its first token.
         request.num_computed_tokens = 10;
+        request.token_ids.push(11);
         request.blocks[0] = Blocks {
             first: 0,
             shared: 0,
@@ -2912,6 +3149,39 @@ mod tests {
         assert!(session.stamped().is_empty());
     }
 
+    /// A request that leaves as migratable with a decode in flight commits its tail as its
+    /// resubmission looks it up: up to the token before the last it was sent, whose entry the
+    /// decode in flight wrote and which the resubmission computes again (SD §4.4 "The hit").
+    #[test]
+    fn a_tail_left_with_a_decode_in_flight_ends_where_its_resubmission_looks_it_up() {
+        let mut session = serving(&[full(4)], KvCacheConfig::default());
+        let id = session.request(1, (1..=10).collect());
+        let request = session.row_mut(id);
+        request.status = RequestStatus::Running;
+        // Two tokens were sent; the decode that read the second wrote position 11 and its
+        // output was dropped as the request left.
+        request.token_ids.extend([11, 12]);
+        request.num_computed_tokens = 12;
+        request.blocks[0] = Blocks {
+            first: 0,
+            shared: 2,
+            end: 4,
+            asked: 4,
+        };
+
+        let tail = session.scheduler.tail_key(session.row(id), 0, 11).unwrap();
+        session.scheduler.commit_tails(id);
+        let commit = runtime::Request::Commit {
+            owner: OwnerId(1),
+            class: 0,
+            at: 2,
+            key: tail,
+            tokens: 3,
+            after: Vec::new(),
+        };
+        assert_eq!(session.stamped(), [commit]);
+    }
+
     /// A migratable request's tail is committed as it leaves, and its answer arrives after the
     /// owner's `Detach`: the commit outlives the `Detach` (BP §9, R6), so the answer is applied
     /// and the write policy stores the block to the host from the group that stamped it.
@@ -2926,6 +3196,7 @@ mod tests {
         let request = session.row_mut(id);
         request.status = RequestStatus::Running;
         request.num_computed_tokens = 10;
+        request.token_ids.push(11);
         request.blocks[0] = Blocks {
             first: 0,
             shared: 2,
@@ -3029,7 +3300,7 @@ mod tests {
             .scheduler
             .give_up_behind(id, &batch(Phase::Prefill, 8), 0);
         assert!(session.stamped().is_empty());
-        assert_eq!(session.scheduler.ahead(session.row(id))[1], (1, 3, 1, true));
+        assert_eq!(session.scheduler.ahead(session.row(id))[1], (1, 3, 1, 1));
         session.scheduler.count_asked(id, 1, 3, 1);
         session.answer(&[allocate(1, 1, 3, 1)], &[allocated(1)]);
         session.row_mut(id).blocks[0].end = 5;

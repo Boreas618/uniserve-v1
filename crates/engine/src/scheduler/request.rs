@@ -357,7 +357,7 @@ impl Request {
     /// - a verification, once the context is computed, in a deployment that speculates, with
     ///   nothing in flight;
     /// - a refill of its draft cache in such a deployment, once the context is computed, with
-    ///   nothing in flight, while the draft cache holds fewer tokens than the cache;
+    ///   nothing in flight, while the draft cache ends before [`Request::refill_end`];
     /// - under stop strings, no token call while the outputs of as many calls as the group's call
     ///   window are unacknowledged (`:486`).
     pub fn ready(&self, phase: Phase, groups: &[WorkerGroup]) -> bool {
@@ -392,7 +392,7 @@ impl Request {
                     && computed
                     && speculates
                     && self.idle()
-                    && self.num_draft_tokens < self.num_computed_tokens
+                    && self.num_draft_tokens < self.refill_end()
             }
             _ => false,
         }
@@ -573,13 +573,31 @@ impl Request {
         if resumes { start } else { 0 }
     }
 
+    /// Where a refill of the request's draft cache ends (SD §3.3 `Refill`, §7.2 "Speculation"):
+    /// at the tokens its cache holds, or one position before the first image block that ends
+    /// after the draft cache does. A draft entry is the drafter's evaluation of a position with
+    /// the token after it, and an image block's rows carry no token: no refill row reads one,
+    /// and none takes one as the token after its last (`rows.rs`). The draft cache counts its
+    /// entries from its start, so it never grows past the image either: such a request verifies
+    /// without drafts from there on.
+    pub fn refill_end(&self) -> u32 {
+        let image = self
+            .image_spans()
+            .filter(|&(_, rows, ..)| rows > 0)
+            .find(|&(block, rows, ..)| block.saturating_add(rows) > self.num_draft_tokens);
+        match image {
+            Some((block, ..)) => block.saturating_sub(1).min(self.num_computed_tokens),
+            None => self.num_computed_tokens,
+        }
+    }
+
     /// The tokens the next chunk of the request's refill takes within `budget` tokens (SD §3.4,
     /// §7.2 "A refill chunk", `S/speculation.rs:394-441`): from [`Request::refill_start`] toward
-    /// the tokens its cache holds, ending on a checkpoint boundary of `state` when it stops short
-    /// of them, so that the next chunk continues from a kept checkpoint. 0 when no chunk fits.
+    /// [`Request::refill_end`], ending on a checkpoint boundary of `state` when it stops short of
+    /// it, so that the next chunk continues from a kept checkpoint. 0 when no chunk fits.
     pub fn refill_chunk(&self, budget: u32, state: Option<(usize, u32)>) -> u32 {
         let start = self.refill_start(state);
-        let target = self.num_computed_tokens;
+        let target = self.refill_end();
         let mut end = start.saturating_add(budget).min(target);
         if end < target
             && let Some((_, block)) = state
@@ -627,7 +645,7 @@ impl Request {
 
     /// The generated tokens in order: a resumed request's, which end its context, then this
     /// engine's.
-    fn generated_ids(&self) -> &[u32] {
+    pub(super) fn generated_ids(&self) -> &[u32] {
         let resumed = self
             .generation()
             .map_or(0, |request| request.generated_token_ids.len());
@@ -746,9 +764,23 @@ impl Request {
             .bad_words_ids
             .iter()
             .all(|word| word.len() <= 1);
+        !others && single && ahead < window && !self.reaches_limit()
+    }
+
+    /// Whether the token calls of the request in flight may sample the last token its limit
+    /// allows (`S/execution/projection.rs:290-352`): its generated tokens and one token for each
+    /// prefill, decode and verification in flight reach `max_und_tokens`. Its next token call,
+    /// if any, waits for their outputs. False for a video request.
+    pub fn reaches_limit(&self) -> bool {
+        let Some(request) = self.generation() else {
+            return false;
+        };
+        let ahead = [Phase::Prefill, Phase::Decode, Phase::Verify]
+            .into_iter()
+            .map(|phase| u64::from(self.in_flight(phase)))
+            .sum::<u64>();
         let limit = u64::try_from(request.max_und_tokens).unwrap_or(u64::MAX);
-        let reached = u64::from(self.generated()) + u64::from(ahead) >= limit;
-        !others && single && ahead < window && !reached
+        u64::from(self.generated()) + ahead >= limit
     }
 }
 
