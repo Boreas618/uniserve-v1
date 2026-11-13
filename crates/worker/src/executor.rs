@@ -1,23 +1,27 @@
 //! `Executor`: one thread per device, the only issuer of work on the device's streams.
 //!
 //! Every other thread of the engine reaches a device through its executor's [`Queue`]: the
-//! scheduler submits a batch, the control thread a generation to prepare or switch to, a memory
-//! owner a copy it decided on. The executor thread takes the jobs one at a time in the order
-//! they were submitted and calls the device's runners, which nothing else calls. A stream's
-//! order is therefore the order of the jobs, and a job that must run with nothing in flight on
-//! the device only has to be a job.
+//! scheduler submits a batch, maps a completion of the buffer pool or has a request stamped, the
+//! control thread a generation to prepare or switch to, a memory owner a copy it decided on. The
+//! executor thread takes the jobs one at a time in the order they were submitted and calls the
+//! device's runners, which nothing else calls. A stream's order is therefore the order of the
+//! jobs, and a job that must run with nothing in flight on the device only has to be a job.
 //!
 //! ## Jobs
 //!
 //! A [`Job`] is one of:
 //!
 //! - a **batch to execute**, through the runner that serves the batch's phase
-//!   ([`Runner::execute`]). An expert-union member with no tokens of its own serves its part of
-//!   a peer's step as such a batch, of variant `ExpertJoin`, which the stepping peer submits
-//!   through this executor's queue;
+//!   ([`Runner::execute`]), under the number the engine gave it among the group's jobs. An
+//!   expert-union member with no tokens of its own serves its part of a peer's step as a batch of
+//!   variant `ExpertJoin`, which the stepping peer submits through [`Executor::join`] and which
+//!   takes no number: it addresses no device block table. A batch another rank of the group runs
+//!   alone is **passed**: the rank takes its number and runs nothing;
 //! - a **shadow batch** of the generation being prepared: one paired forward
 //!   ([`Graphs::shadow`](crate::Graphs::shadow)) per operator the batch's bucket launches whose
-//!   kernel the generation replaces;
+//!   kernel the generation replaces. It reads the device block tables, so it takes a number;
+//! - a completion of the buffer pool to **map** into the rank's device block tables, and
+//!   requests to **stamp** ([`BlockTables`]);
 //! - the **capture** of the runners' buckets (warm-up), largest first;
 //! - a generation to **prepare**, to **switch** to, to **commit** and to **roll back**, each
 //!   on every runner of the device;
@@ -25,20 +29,37 @@
 //! - a **wait** for stream events, which deferred storage release hangs on;
 //! - a **control operation**: a closure the executor calls with its runners. This is how a
 //!   memory owner or the engine runs what must happen at a batch boundary, with nothing in
-//!   flight on the device: page copies, sleeping and waking cache segments, suspending and
-//!   restoring graph storage, a weight update. Work a storage owner decides on another thread
-//!   is issued this way too, so nothing but the executor issues on the device's streams.
+//!   flight on the device: suspending and restoring graph storage, a weight update. Work a
+//!   storage owner decides on another thread is issued this way too, so nothing but the executor
+//!   issues on the device's streams.
 //!
 //! A capture, a preparation and a shadow batch take one queue turn per bucket or operator and
 //! go back to the tail in between, so batches submitted meanwhile are executed between two of
 //! their turns instead of behind all of them.
 //!
+//! ## The device block tables and the sequences
+//!
+//! The executor thread owns the rank's [`BlockTables`]. A completion the scheduler maps and a
+//! request it has stamped are jobs, so a batch sees exactly the entries of the jobs before it:
+//! "before the group's next batch launches" is the queue's order. Before each batch the executor
+//! hands every runner the table's changes and starts the copies queued since the last batch;
+//! when the batch has ended it applies the `Finish` of each copy it ran and returns it, stamped,
+//! with the batch's output.
+//!
+//! The rank counts the numbered jobs it has *launched* (the stamp a request gets when the rank
+//! applies it) and the ones it has *ended*: the last number whose job, and every earlier one,
+//! completed on the device. It states its ended sequence to the group's [`Sequences`] before the
+//! job's submission completes, so the group's `completed` word has passed a batch by the time its
+//! output is read. A numbered job that failed counts as ended only once the device has passed
+//! everything the runners issued; while that is unknown, nothing after it counts as ended either.
+//!
 //! ## Completion and waiting
 //!
-//! A job's [`Submission`] completes when the executor has issued the job's work: for a batch,
-//! when the runner returned its output. The executor never polls: an idle executor blocks on its
-//! queue, and what must wait for the device waits on a stream event
-//! ([`Graphs::wait`](crate::Graphs::wait), `platform::Event::synchronize`).
+//! A job's [`Submission`] completes when the executor has performed the job: for a batch, when
+//! the runner returned its output, which it does once the device completed the batch. The
+//! executor never polls: an idle executor blocks on its queue, and what must wait for the device
+//! waits on a stream event ([`Graphs::wait`](crate::Graphs::wait),
+//! `platform::Event::synchronize`).
 //!
 //! ## Failure
 //!
@@ -54,18 +75,20 @@
 //! | Module | Holds |
 //! | --- | --- |
 //! | [`queue`] | [`Queue`]: the jobs in submission order, the job in flight, the close |
-//! | [`batches`] | [`Executors`]: the engine's `ipc::execution::Batches` over a node's executors and its peers |
+//! | [`batches`] | [`Executors`]: a node's executors and peer links by worker group, numbering each group's jobs and handing them to every rank |
+//! | [`sequences`] | [`Sequences`]: the ended sequences of a group's ranks and its `completed` word |
 //! | [`watchdog`] | [`Watchdog`](watchdog::Watchdog): when the control thread looks at the jobs in flight, and which it reports |
 //! | [`control`] | [`Control`](control::Control): the control thread's connections to the daemon and its wake |
-//! | [`peers`] | The channel between the engine processes of an epoch: registration, batches to ranks on other hosts and their outputs |
+//! | [`peers`] | The channel between the engine processes of an epoch: registration, a group's jobs for ranks on other hosts and what they return |
 
 pub mod batches;
 pub mod control;
 pub mod peers;
 pub mod queue;
+pub mod sequences;
 pub mod watchdog;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,16 +96,19 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use ipc::PhaseId;
-use ipc::execution::{Batch, BatchId, BatchOutput, Computation, Outcome, Submission};
+use ipc::batch::{Batch, BatchId, BatchOutput, Phase, Variant};
 use ops::Generation;
 use platform::cupti::blocking::{Calls, Watched};
 use platform::{DeviceId, Event};
+use storage::runtime::{Completion, GroupId, Request, RequestId};
 
 pub use self::batches::Executors;
 use self::queue::Entry;
 pub use self::queue::Queue;
+pub use self::sequences::Sequences;
 use crate::buckets::Bucket;
+use crate::completion::{Outcome, Submission, add_stamp};
+use crate::memory::tables::BlockTables;
 use crate::profiling;
 use crate::profiling::session::{Change, Session};
 use crate::runner::Runner;
@@ -95,16 +121,36 @@ pub type Operation = Box<dyn FnOnce(&mut [Box<dyn Runner>]) -> Result<()> + Send
 
 /// One job of an executor's queue.
 pub enum Job {
-    /// Execute one batch through the runner that serves its phase.
-    Execute(Box<Batch>),
+    /// Execute one batch through the runner that serves its phase. `sequence` is the batch's
+    /// number among the group's jobs that address its device block tables; an expert join has
+    /// none.
+    Execute {
+        batch: Box<Batch>,
+        sequence: Option<u64>,
+    },
+    /// Take the number of a batch another rank of the group runs alone, and run nothing.
+    Pass(u64),
     /// Run the paired forwards of one shadow batch: the generation `batch.generation` names,
     /// which is being prepared, against the serving one, for each operator the batch's bucket
     /// launches whose kernel changed. One paired forward per queue turn.
     Shadow {
         batch: Box<Batch>,
+        /// The shadow batch's number, as a batch's.
+        sequence: u64,
         /// The changed operators already compared: zero when the job is submitted.
         compared: usize,
     },
+    /// Map `completion`, the buffer pool's answer to `request` numbered `id`, into the rank's
+    /// device block tables under `slot` ([`BlockTables::map`]).
+    Map {
+        slot: u32,
+        id: RequestId,
+        request: Request,
+        completion: Completion,
+    },
+    /// Apply requests to the rank's device block tables ([`BlockTables::apply`]) and return them
+    /// stamped with the number of the last job the rank launched.
+    Stamp(Vec<Request>),
     /// Capture every bucket the runners state and have no graph of, largest first: the warm-up.
     /// One bucket per queue turn.
     Capture,
@@ -140,7 +186,7 @@ impl Job {
     /// The batch the job executes or shadows.
     fn batch(&self) -> Option<&Batch> {
         match self {
-            Self::Execute(batch) | Self::Shadow { batch, .. } => Some(batch),
+            Self::Execute { batch, .. } | Self::Shadow { batch, .. } => Some(batch),
             _ => None,
         }
     }
@@ -149,7 +195,7 @@ impl Job {
     fn runs_forwards(&self) -> bool {
         matches!(
             self,
-            Self::Execute(_) | Self::Shadow { .. } | Self::Capture | Self::Prepare(_)
+            Self::Execute { .. } | Self::Shadow { .. } | Self::Capture | Self::Prepare(_)
         )
     }
 }
@@ -158,15 +204,29 @@ impl Job {
 impl std::fmt::Display for Job {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Execute(batch) => write!(
+            Self::Execute { batch, .. } => write!(
                 formatter,
-                "executing batch {} of phase {} ({})",
-                batch.id.0, batch.phase.0, batch.shape
+                "executing batch {} of phase {:?} ({})",
+                batch.id.0, batch.phase, batch.shape
+            ),
+            Self::Pass(sequence) => write!(
+                formatter,
+                "passing job {sequence}, which another rank runs alone"
             ),
             Self::Shadow { batch, .. } => write!(
                 formatter,
-                "shadowing generation {} on batch {} of phase {} ({})",
-                batch.generation, batch.id.0, batch.phase.0, batch.shape
+                "shadowing generation {} on batch {} of phase {:?} ({})",
+                batch.generation, batch.id.0, batch.phase, batch.shape
+            ),
+            Self::Map { id, .. } => write!(
+                formatter,
+                "mapping the completion of request {} into the block tables",
+                id.0
+            ),
+            Self::Stamp(requests) => write!(
+                formatter,
+                "applying and stamping {} requests",
+                requests.len()
             ),
             Self::Capture => formatter.write_str("warming up: capturing the runners' buckets"),
             Self::Prepare(next) => write!(formatter, "preparing generation {}", next.number()),
@@ -184,6 +244,26 @@ impl std::fmt::Display for Job {
     }
 }
 
+/// The rank a batch runs on alone, when its media rows name one: a video decode round or its
+/// encode. `None` for a batch every rank of the group runs.
+///
+/// # Errors
+///
+/// Rows that name different ranks, or some a rank and some none.
+pub(crate) fn alone(batch: &Batch) -> Result<Option<u32>> {
+    let Some(first) = batch.media.first() else {
+        return Ok(None);
+    };
+
+    match batch.media.iter().find(|row| row.rank != first.rank) {
+        Some(other) => Err(Error::Invalid(format!(
+            "batch {} names rank {:?} in one row and rank {:?} in another",
+            batch.id.0, first.rank, other.rank
+        ))),
+        None => Ok(first.rank),
+    }
+}
+
 /// What an executor has done since it started; monotonic sums the control thread reads while
 /// the executor adds to them.
 #[derive(Default)]
@@ -197,10 +277,10 @@ struct Counters {
 /// The executor of one device, as every other thread holds it.
 pub struct Executor {
     device: Option<DeviceId>,
-    /// The buckets the runners state, read before the runners moved to the executor thread: the
-    /// scheduler asks whether a media computation is served before it forms the batch, and that
-    /// is not a round trip to the executor.
-    buckets: Vec<Bucket>,
+    /// The worker group the device is a rank of, and the rank's place among those that report to
+    /// the group's [`Sequences`].
+    group: GroupId,
+    rank: usize,
     queue: Arc<Queue>,
     counters: Arc<Counters>,
     /// What the generation update in flight has no comparison for; see [`Executor::uncompared`].
@@ -209,29 +289,44 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// Starts the executor of `device` over `runners`, whose graphs serve `kernels`.
+    /// Starts the executor of `device` over `runners`, whose graphs serve `kernels`, as rank
+    /// `rank` of the worker group whose device block tables `tables` holds for this rank, and
+    /// which states its ended sequence to `sequences`.
     ///
     /// `device` is the CUDA device the runners issue on: the executor keeps its context current
     /// on the thread and checks it for a sticky error. `None` is an executor of runners that
     /// hold no device (host work, or graphs made by [`Graphs::meta`](crate::Graphs::meta)),
     /// which records no profiling session.
     ///
-    /// From this call on the runners are called on the executor thread alone.
+    /// From this call on the runners and the tables are the executor thread's alone.
     ///
     /// # Errors
     ///
-    /// When the thread cannot start.
+    /// Tables and sequences of different groups, a rank that does not report to the sequences,
+    /// or a thread that cannot start.
     pub fn spawn(
         device: Option<DeviceId>,
         runners: Vec<Box<dyn Runner>>,
         kernels: Arc<Generation>,
+        tables: BlockTables,
+        sequences: Arc<Sequences>,
+        rank: usize,
     ) -> Result<Self> {
-        let phases: Vec<PhaseId> = runners
+        let group = tables.group();
+        if sequences.group() != group || rank >= sequences.ranks() {
+            return Err(Error::Invalid(format!(
+                "an executor of group {} as rank {rank} reports to the sequences of group {}, \
+                 which has {} ranks",
+                group.0,
+                sequences.group().0,
+                sequences.ranks()
+            )));
+        }
+
+        let phases: Vec<Phase> = runners
             .iter()
             .flat_map(|runner| runner.phases().iter().copied())
             .collect();
-        let buckets: Vec<Bucket> = runners.iter().flat_map(|runner| runner.buckets()).collect();
-
         let queue = Queue::new(phases);
         let counters = Arc::new(Counters::default());
         let uncompared = Arc::new(Mutex::new(Vec::new()));
@@ -248,6 +343,11 @@ impl Executor {
             session: None,
             blocking: Calls::default(),
             renewals: profiling::graph_renewals(),
+            tables,
+            sequences,
+            rank,
+            launched: 0,
+            open: BTreeSet::new(),
         };
         let name = match device {
             Some(device) => format!("executor-{}", device.0),
@@ -260,7 +360,8 @@ impl Executor {
 
         Ok(Self {
             device,
-            buckets,
+            group,
+            rank,
             queue,
             counters,
             uncompared,
@@ -273,55 +374,124 @@ impl Executor {
         self.device
     }
 
-    /// The queue every thread submits this executor's jobs through. A peer of an expert union
-    /// holds it to submit the `ExpertJoin` batch of a step this executor's rank has no tokens
-    /// for.
+    /// The worker group the device is a rank of.
+    pub fn group(&self) -> GroupId {
+        self.group
+    }
+
+    /// The rank's place among those that report to the group's [`Sequences`].
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+
+    /// The queue the executor takes its jobs from: what the control thread's watchdog reads, and
+    /// what closes it.
     pub fn queue(&self) -> &Arc<Queue> {
         &self.queue
     }
 
     /// The phases the runners serve, in the runners' order.
-    pub fn phases(&self) -> &[PhaseId] {
+    pub fn phases(&self) -> &[Phase] {
         self.queue.phases()
     }
 
     /// Whether a runner of this executor serves `phase`.
-    pub fn serves(&self, phase: PhaseId) -> bool {
+    pub fn serves(&self, phase: Phase) -> bool {
         self.queue.phases().contains(&phase)
     }
 
-    /// The smallest bucket the runners state that holds `computation`, or `None` when this
-    /// executor serves no such computation.
-    ///
-    /// A computation that states an extent is matched to the bucket of exactly that extent; one
-    /// that states none gets the bucket the runners state ([`Bucket::holds_computation`]).
-    pub fn media(&self, computation: &Computation) -> Option<Bucket> {
-        self.buckets
-            .iter()
-            .copied()
-            .filter(|bucket| bucket.holds_computation(computation))
-            .min()
-    }
-
-    /// Submits `batch` for execution; the submission completes with the step's output.
+    /// Submits `batch`, the group's job number `sequence`, for execution; the submission completes
+    /// with the step's output and the stamped `Finish` of each copy that ran with it. The group's
+    /// jobs reach every rank in the order of their numbers ([`Executors`]).
     ///
     /// # Errors
     ///
     /// As [`Queue::submit`]: a batch no runner serves is refused here.
-    pub fn submit(&self, batch: Batch) -> Result<Submission> {
-        self.queue.submit(Job::Execute(Box::new(batch)))
+    pub fn submit(&self, sequence: u64, batch: Batch) -> Result<Submission> {
+        self.queue.submit(Job::Execute {
+            batch: Box::new(batch),
+            sequence: Some(sequence),
+        })
     }
 
-    /// Submits the paired forwards of the shadow batch `batch` ([`Job::Shadow`]).
+    /// Submits the group's job number `sequence`, a batch another rank runs alone: this rank
+    /// takes the number and runs nothing.
+    ///
+    /// # Errors
+    ///
+    /// Once the queue is closed.
+    pub fn pass(&self, sequence: u64) -> Result<Submission> {
+        self.queue.submit(Job::Pass(sequence))
+    }
+
+    /// Submits `batch`, a member's part in an expert union's step it has no tokens for (variant
+    /// `ExpertJoin`), which another member asks for: it addresses no device block table, so it
+    /// takes no number and starts no copy.
+    ///
+    /// # Errors
+    ///
+    /// A batch of another variant, or as [`Queue::submit`].
+    pub fn join(&self, batch: Batch) -> Result<Submission> {
+        if batch.shape.variant != Variant::ExpertJoin {
+            return Err(Error::Invalid(format!(
+                "batch {} of variant {} is no expert join: a batch that addresses the device \
+                 block tables is numbered by its group",
+                batch.id.0, batch.shape.variant
+            )));
+        }
+
+        self.queue.submit(Job::Execute {
+            batch: Box::new(batch),
+            sequence: None,
+        })
+    }
+
+    /// Submits the paired forwards of the shadow batch `batch`, the group's job number `sequence`
+    /// ([`Job::Shadow`]).
     ///
     /// # Errors
     ///
     /// As [`Queue::submit`].
-    pub fn shadow(&self, batch: Batch) -> Result<Submission> {
+    pub fn shadow(&self, sequence: u64, batch: Batch) -> Result<Submission> {
         self.queue.submit(Job::Shadow {
             batch: Box::new(batch),
+            sequence,
             compared: 0,
         })
+    }
+
+    /// Submits the map of `completion`, the buffer pool's answer to `request` numbered `id`, into
+    /// the rank's device block tables under `slot` ([`BlockTables::map`]): every job submitted
+    /// after it sees what it gives. The submission fails when the tables refuse the pair.
+    ///
+    /// # Errors
+    ///
+    /// Once the queue is closed.
+    pub fn map(
+        &self,
+        slot: u32,
+        id: RequestId,
+        request: Request,
+        completion: Completion,
+    ) -> Result<Submission> {
+        self.queue.submit(Job::Map {
+            slot,
+            id,
+            request,
+            completion,
+        })
+    }
+
+    /// Submits the application of `requests` to the rank's device block tables
+    /// ([`BlockTables::apply`]); the submission completes with them, each with the group's
+    /// stamp as this rank states it: the number of the last job it launched before it applied
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Once the queue is closed.
+    pub fn stamp(&self, requests: Vec<Request>) -> Result<Submission> {
+        self.queue.submit(Job::Stamp(requests))
     }
 
     /// Submits the capture of every bucket the runners state ([`Job::Capture`]).
@@ -488,10 +658,10 @@ impl Executor {
     ///
     /// When the executor thread panicked.
     pub fn close(mut self) -> Result<()> {
-        self.join()
+        self.join_thread()
     }
 
-    fn join(&mut self) -> Result<()> {
+    fn join_thread(&mut self) -> Result<()> {
         self.queue.close();
 
         match self.thread.take() {
@@ -505,7 +675,7 @@ impl Executor {
 
 impl Drop for Executor {
     fn drop(&mut self) {
-        if self.join().is_err() {
+        if self.join_thread().is_err() {
             tracing::error!(device = ?self.device, "an executor thread panicked");
         }
     }
@@ -516,6 +686,8 @@ impl std::fmt::Debug for Executor {
         formatter
             .debug_struct("Executor")
             .field("device", &self.device)
+            .field("group", &self.group)
+            .field("rank", &self.rank)
             .field("queue", &self.queue)
             .finish_non_exhaustive()
     }
@@ -532,8 +704,8 @@ fn returned<T>(submission: &Submission, receiver: &Receiver<T>) -> Result<T> {
     }
 }
 
-/// The executor thread's state: the runners nothing else calls, and what the thread keeps
-/// between two jobs.
+/// The executor thread's state: the runners and the tables nothing else touches, and what the
+/// thread keeps between two jobs.
 struct Thread {
     device: Option<DeviceId>,
     /// The device's runners; `RunnerId(index)` names `runners[index]`.
@@ -557,6 +729,16 @@ struct Thread {
     blocking: Calls,
     /// The process's count of graph renewals the runners' executables were instantiated at.
     renewals: u64,
+    /// The rank's device block tables.
+    tables: BlockTables,
+    /// Where the rank states its ended sequence, as rank `rank`.
+    sequences: Arc<Sequences>,
+    rank: usize,
+    /// The number of the last numbered job the rank launched: the stamp of a request it applies.
+    launched: u64,
+    /// The numbered jobs the rank launched that have not ended: a job of several turns ends with
+    /// its last, after later jobs; a failed job ends once the device has passed it.
+    open: BTreeSet<u64>,
 }
 
 impl Thread {
@@ -597,7 +779,7 @@ impl Thread {
 
             let counted = job.runs_forwards();
             let started = Instant::now();
-            let turn = self.perform(job, started.saturating_duration_since(submitted));
+            let turn = self.turn(job, started.saturating_duration_since(submitted));
             if counted {
                 let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 self.counters
@@ -611,7 +793,7 @@ impl Thread {
                     submission,
                     submitted,
                 }),
-                Ok(ControlFlow::Break(output)) => self.queue.complete(submission, Ok(output)),
+                Ok(ControlFlow::Break(returned)) => self.queue.complete(submission, Ok(returned)),
                 Err(error) => {
                     tracing::warn!(
                         device = ?self.device,
@@ -619,30 +801,124 @@ impl Thread {
                         in_flight = self.queue.performing().as_deref().unwrap_or_default(),
                         "an executor's job failed"
                     );
-
-                    // A failure may be the first symptom of a sticky error.
-                    self.check_sticky();
                     self.queue.complete(submission, Err(error));
                 }
             }
         }
     }
 
-    /// Performs one turn of `job`, which waited `queued` in the queue: the job's output when it
+    /// Performs one turn of `job`, which waited `queued` in the queue, and keeps the rank's
+    /// sequences: a numbered job is launched with its first turn and ends with its last, or with
+    /// its failure once the device has passed what the runners issued. Returns the job's value
+    /// when it ended, or the job's remainder, which goes back to the tail of the queue.
+    ///
+    /// The ended sequence is stated before the job's submission completes, so the group's
+    /// `completed` covers a batch before its output is read.
+    fn turn(
+        &mut self,
+        job: Job,
+        queued: Duration,
+    ) -> Result<ControlFlow<(BatchOutput, Vec<Request>), Job>> {
+        // The number of a numbered job, and whether this turn is its first.
+        let (sequence, first) = match &job {
+            Job::Execute { sequence, .. } => (*sequence, true),
+            Job::Pass(sequence) => (Some(*sequence), true),
+            Job::Shadow {
+                sequence, compared, ..
+            } => (Some(*sequence), *compared == 0),
+            _ => (None, false),
+        };
+        if let Some(sequence) = sequence
+            && first
+        {
+            self.launch(sequence);
+        }
+
+        let turn = self.perform(job, queued);
+        if turn.is_err() {
+            // A failure may be the first symptom of a sticky error.
+            self.check_sticky();
+        }
+
+        if let Some(sequence) = sequence
+            && !matches!(turn, Ok(ControlFlow::Continue(_)))
+        {
+            self.end(sequence, turn.is_ok());
+        }
+        turn
+    }
+
+    /// The rank launched the group's job number `sequence`.
+    fn launch(&mut self, sequence: u64) {
+        self.launched = self.launched.max(sequence);
+        self.open.insert(sequence);
+    }
+
+    /// The group's job number `sequence` ended, `ran` when it succeeded: the rank states the
+    /// last number it has ended with every earlier one ended. A failed job ends only once the
+    /// device has passed everything the runners issued; while that is unknown it stays open, and
+    /// nothing after it counts as ended.
+    fn end(&mut self, sequence: u64, ran: bool) {
+        if !ran && let Err(error) = self.settle() {
+            tracing::error!(
+                device = ?self.device,
+                sequence,
+                %error,
+                "a failed job's device work cannot be awaited; the group's completed word stays \
+                 below it"
+            );
+            return;
+        }
+
+        self.open.remove(&sequence);
+        // Numbers start at 1: the one before the first open job is at least 0, which names none.
+        let ended = match self.open.first() {
+            Some(first) => first.saturating_sub(1),
+            None => self.launched,
+        };
+        self.sequences.ended(self.rank, ended);
+    }
+
+    /// Performs one turn of `job`, which waited `queued` in the queue: the job's value when it
     /// ended, or the job's remainder, which goes back to the tail of the queue.
-    fn perform(&mut self, job: Job, queued: Duration) -> Result<ControlFlow<BatchOutput, Job>> {
-        let done = ControlFlow::Break(BatchOutput::default());
+    fn perform(
+        &mut self,
+        job: Job,
+        queued: Duration,
+    ) -> Result<ControlFlow<(BatchOutput, Vec<Request>), Job>> {
+        let done = ControlFlow::Break((BatchOutput::default(), Vec::new()));
 
         match job {
-            Job::Execute(batch) => Ok(ControlFlow::Break(self.execute(&batch, queued)?)),
-            Job::Shadow { batch, compared } => Ok(if self.shadow(&batch, compared)? {
+            Job::Execute { batch, sequence } => {
+                Ok(ControlFlow::Break(self.execute(&batch, sequence, queued)?))
+            }
+            Job::Pass(_) => Ok(done),
+            Job::Shadow {
+                batch,
+                sequence,
+                compared,
+            } => Ok(if self.shadow(&batch, compared)? {
                 ControlFlow::Continue(Job::Shadow {
                     batch,
+                    sequence,
                     compared: compared + 1,
                 })
             } else {
                 done
             }),
+            Job::Map {
+                slot,
+                id,
+                request,
+                completion,
+            } => {
+                self.tables.map(slot, id, &request, &completion)?;
+                Ok(done)
+            }
+            Job::Stamp(requests) => Ok(ControlFlow::Break((
+                BatchOutput::default(),
+                self.stamp(requests)?,
+            ))),
             Job::Capture => Ok(if self.capture()? {
                 ControlFlow::Continue(Job::Capture)
             } else {
@@ -692,8 +968,28 @@ impl Thread {
         }
     }
 
-    /// Executes `batch` through the runner that serves its phase.
-    fn execute(&mut self, batch: &Batch, queued: Duration) -> Result<BatchOutput> {
+    /// Applies `requests` to the tables and stamps each with the number of the last job the rank
+    /// launched, as this group's stamp.
+    fn stamp(&mut self, mut requests: Vec<Request>) -> Result<Vec<Request>> {
+        let group = self.tables.group();
+
+        for request in &mut requests {
+            self.tables.apply(request)?;
+            add_stamp(request, group, self.launched);
+        }
+        Ok(requests)
+    }
+
+    /// Executes `batch`, numbered `sequence` unless it is an expert join, through the runner that
+    /// serves its phase: the tables' changes go to every runner first, and the copies queued
+    /// since the last batch start with a numbered batch every rank of the group runs. Returns
+    /// the output and the stamped `Finish` of each copy that ran.
+    fn execute(
+        &mut self,
+        batch: &Batch,
+        sequence: Option<u64>,
+        queued: Duration,
+    ) -> Result<(BatchOutput, Vec<Request>)> {
         let index = self.runner_of(batch.phase)?;
         let step = batch.id.0;
         let started = Instant::now();
@@ -710,9 +1006,16 @@ impl Thread {
         }
         self.renew()?;
 
+        self.write_tables()?;
+        let (copies, copied) = if sequence.is_some() && alone(batch)?.is_none() {
+            self.start_copies(index)
+        } else {
+            (Vec::new(), true)
+        };
+
         // The step's range markers are launched by the graphs, around the forward itself.
         self.runners[index].graphs().mark_step(step, stage);
-        let mut output = self.runners[index].execute(batch)?;
+        let mut output = self.runners[index].execute(batch, &self.tables)?;
 
         if self
             .session
@@ -720,6 +1023,21 @@ impl Thread {
             .is_some_and(|session| session.end(step))
         {
             self.apply_session()?;
+        }
+
+        // The batch ended, and the copies with it: each copy's `Finish` is applied to the
+        // tables, as every `Finish` is, and stamped with this batch, which covers it.
+        let group = self.tables.group();
+        let mut finished = Vec::with_capacity(copies.len());
+        for copy in copies {
+            let mut finish = Request::Finish {
+                copy,
+                ok: copied,
+                after: Vec::new(),
+            };
+            self.tables.apply(&finish)?;
+            add_stamp(&mut finish, group, self.launched);
+            finished.push(finish);
         }
 
         // The runner states the step's device and host time; the wait in the queue is the
@@ -733,17 +1051,57 @@ impl Thread {
 
         // A media call is seconds of work a few times per request, so one line each is the
         // request's timeline; a token batch's would be the log.
-        if let Some(media) = &batch.media {
+        if !batch.media.is_empty() {
             tracing::info!(
                 device = ?self.device,
-                call = ?media.computation.call,
+                phase = ?batch.phase,
                 batch = step,
                 queued_ms = queued.as_millis() as u64,
                 total_ms = started.elapsed().as_millis() as u64,
                 "a media batch was executed"
             );
         }
-        Ok(output)
+        Ok((output, finished))
+    }
+
+    /// Hands every runner the tables' changes since the last batch, each change once.
+    fn write_tables(&mut self) -> Result<()> {
+        let changes = self.tables.take_changes();
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        for runner in &mut self.runners {
+            runner.write_tables(&changes)?;
+        }
+        Ok(())
+    }
+
+    /// Starts every copy no batch has started on the runner `index`, for the batch it runs next.
+    /// Returns the requests the copies are for, and whether the runner issued them: a copy the
+    /// runner cannot issue is reported failed, and the batch still runs.
+    fn start_copies(&mut self, index: usize) -> (Vec<RequestId>, bool) {
+        let mut copies = Vec::new();
+        while let Some(copy) = self.tables.start_copy() {
+            copies.push(copy);
+        }
+        if copies.is_empty() {
+            return (Vec::new(), true);
+        }
+
+        let issued = self.runners[index].copy(&copies);
+        if let Err(error) = &issued {
+            tracing::warn!(
+                device = ?self.device,
+                %error,
+                copies = copies.len(),
+                "the copies that start with a batch were not issued and are reported failed"
+            );
+        }
+        (
+            copies.into_iter().map(|copy| copy.request).collect(),
+            issued.is_ok(),
+        )
     }
 
     /// One paired forward of the shadow batch `batch`, `compared` of whose changed operators
@@ -756,11 +1114,12 @@ impl Thread {
                 batch.id.0, batch.generation
             )));
         }
+        self.write_tables()?;
         let runner = &mut self.runners[index];
 
         // The inputs are prepared again for each paired forward, which issues them; a paired
         // forward writes scratch memory only, which the runner's shadow inputs state.
-        let bucket = runner.prepare_shadow_inputs(batch)?;
+        let bucket = runner.prepare_shadow_inputs(batch, &self.tables)?;
         let operators = runner.graphs().replaced(&bucket);
         let Some(operator) = operators.get(compared).copied() else {
             return Ok(false);
@@ -1047,15 +1406,12 @@ impl Thread {
     }
 
     /// The runner that serves `phase`.
-    fn runner_of(&self, phase: PhaseId) -> Result<usize> {
+    fn runner_of(&self, phase: Phase) -> Result<usize> {
         self.runners
             .iter()
             .position(|runner| runner.phases().contains(&phase))
             .ok_or_else(|| {
-                Error::Invariant(format!(
-                    "no runner of this executor serves phase {}",
-                    phase.0
-                ))
+                Error::Invariant(format!("no runner of this executor serves phase {phase:?}"))
             })
     }
 }

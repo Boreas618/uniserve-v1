@@ -17,9 +17,10 @@ mod support;
 
 use std::sync::{Arc, Mutex};
 
-use ipc::execution::{
-    Batch, BatchColumns, BatchId, BatchRow, BatchRows, CallId, FreshSlot, RowKind,
-    Shape as BatchShape, StateCopy, StateDirection, Variant,
+use ipc::RequestId;
+use ipc::batch::{
+    Batch, BatchId, Columns, DraftWork, NewSlot, Phase, Row, Rows, Shape as BatchShape, StateCopy,
+    StateDirection, Variant,
 };
 use ipc::philox::DrawAddress;
 use nn::capability::Drafter;
@@ -31,8 +32,10 @@ use ops::Generation;
 use platform::{DeviceAllocation, DeviceRange, Stream};
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::module::sampler::{PARAMETER_COLUMNS, TOP_P};
+use storage::runtime::GroupId;
 use uniserve_tensor::{DType, Tensor};
 use worker::buckets::Buckets;
+use worker::memory::tables::BlockTables;
 use worker::runners::causal_lm::speculation::DraftPool;
 use worker::runners::causal_lm::{CausalLmConfig, PageWork};
 use worker::{CausalLmRunner, Graphs, Runner};
@@ -231,7 +234,7 @@ const POOL: DraftPool = DraftPool {
 /// for a runner that verifies at most `drafts` drafts a row.
 fn config(drafts: u32) -> CausalLmConfig {
     CausalLmConfig {
-        phases: vec![ipc::PhaseId(0)],
+        phases: vec![Phase::Prefill, Phase::Decode, Phase::Verify],
         buckets: Buckets::causal_lm(&[2, 4], &[8], true),
         slots: SLOTS,
         page_size: PAGE,
@@ -340,17 +343,18 @@ fn greedy() -> Vec<f32> {
     row
 }
 
-/// The batch of one call of `kind` on `slot` over `columns`, which state its tokens.
-fn batch(kind: RowKind, variant: Variant, slot: u32, mut columns: BatchColumns) -> Batch {
+/// The batch of one call of `kind` on `slot` over `columns`, which state its tokens. The model
+/// keeps no cache, so no token writes one.
+fn batch(kind: Phase, variant: Variant, slot: u32, mut columns: Columns) -> Batch {
     let tokens = columns.input_ids.len() as u32;
 
-    columns.rows.calls = vec![BatchRow {
-        request: slot,
+    columns.rows.calls = vec![Row {
+        slot,
         kind,
         cache_group: 0,
         rows: 0..1,
     }];
-    columns.rows.slot_mapping = vec![-1; tokens as usize];
+    columns.rows.cache_positions = vec![-1; tokens as usize];
     columns.rows.query_offsets = vec![0, tokens as i32];
     columns.rows.logits_rows = vec![0];
     columns.slots = vec![slot as i32];
@@ -360,23 +364,31 @@ fn batch(kind: RowKind, variant: Variant, slot: u32, mut columns: BatchColumns) 
 
     Batch {
         id: BatchId(1),
-        phase: ipc::PhaseId(0),
-        group: "text".to_owned(),
-        calls: vec![CallId(1)],
-        shape: BatchShape::prefill(1, tokens, variant),
-        columns,
+        group: GroupId(0),
+        phase: kind,
         generation: 1,
-        cache_units: Vec::new(),
-        block_tables: Vec::new(),
-        page_loads: Vec::new(),
-        page_offloads: Vec::new(),
-        latent_restores: Vec::new(),
-        host_outputs: Vec::new(),
-        images: Vec::new(),
-        buffers: Vec::new(),
-        frees: Vec::new(),
-        media: None,
+        shape: BatchShape::prefill(1, tokens, variant),
+        requests: vec![RequestId(1)],
+        columns,
+        media: Vec::new(),
+        new_slots: Vec::new(),
     }
+}
+
+/// A request started on `slot` with `history`, as a batch states it.
+fn new_slot(slot: u32, history: Vec<u32>) -> NewSlot {
+    NewSlot {
+        slot,
+        history,
+        bias: Vec::new(),
+        allowed: None,
+        context: [0, 0],
+    }
+}
+
+/// The device block table of a rank whose requests hold no block: the model keeps no cache.
+fn tables() -> BlockTables {
+    BlockTables::new(GroupId(0), &[])
 }
 
 /// The one-row commit table of `slot` in `mode`, whose row samples task zero.
@@ -387,7 +399,7 @@ fn commit(slot: u32, mode: i64) -> Vec<i64> {
     table
 }
 
-/// A prompt of `ids` on `slot`, a fresh slot, whose last token ends the prompt.
+/// A prompt of `ids` on `slot`, a new slot, whose last token ends the prompt.
 fn prompt(slot: u32, ids: &[i32]) -> Batch {
     let tokens = ids.len() as i32;
 
@@ -396,31 +408,29 @@ fn prompt(slot: u32, ids: &[i32]) -> Batch {
     table[column::LOGICAL] = i64::from(tokens);
     table[column::SAMPLING] = 1;
 
-    let columns = BatchColumns {
-        rows: BatchRows {
+    let columns = Columns {
+        rows: Rows {
             positions: (0..tokens).collect(),
             seq_lens: vec![tokens],
-            ..BatchRows::default()
+            ..Rows::default()
         },
         input_ids: ids.to_vec(),
         draws: vec![DrawAddress::default()],
         commit: table,
-        fresh_slots: vec![FreshSlot {
-            slot,
-            history: Vec::new(),
-        }],
-        ..BatchColumns::default()
+        ..Columns::default()
     };
-    batch(RowKind::Prefill, Variant::PrefillGreedy, slot, columns)
+    let mut batch = batch(Phase::Prefill, Variant::PrefillGreedy, slot, columns);
+    batch.new_slots = vec![new_slot(slot, Vec::new())];
+    batch
 }
 
 /// One decode step of `slot` at `position`, whose input token the host states as `id`.
 fn step(slot: u32, id: i32, position: i32) -> Batch {
-    let columns = BatchColumns {
-        rows: BatchRows {
+    let columns = Columns {
+        rows: Rows {
             positions: vec![position],
             seq_lens: vec![position + 1],
-            ..BatchRows::default()
+            ..Rows::default()
         },
         input_ids: vec![id],
         draws: vec![DrawAddress {
@@ -428,9 +438,9 @@ fn step(slot: u32, id: i32, position: i32) -> Batch {
             position: 3,
         }],
         commit: commit(slot, mode::DECODE),
-        ..BatchColumns::default()
+        ..Columns::default()
     };
-    batch(RowKind::Decode, Variant::DecodeGreedy, slot, columns)
+    batch(Phase::Decode, Variant::DecodeGreedy, slot, columns)
 }
 
 #[test]
@@ -439,7 +449,7 @@ fn a_prefill_commits_its_first_token_and_a_decode_step_continues_from_it() -> Ou
     let mut bench = Bench::open()?;
 
     // The prompt's last token is 7, and the commit states the slot's positions.
-    let output = bench.runner.execute(&prompt(2, &[5, 6, 7]))?;
+    let output = bench.runner.execute(&prompt(2, &[5, 6, 7]), &tables())?;
     let first = &output.calls[0];
     assert_eq!(first.tokens, [next(7)]);
     assert_eq!((first.cache_computed_len, first.step_index), (3, 1));
@@ -451,13 +461,13 @@ fn a_prefill_commits_its_first_token_and_a_decode_step_continues_from_it() -> Ou
     assert!(scores[0].logprob < 0.0);
 
     // The decode reads the committed token from the slot: the id the host states is not it.
-    let output = bench.runner.execute(&step(2, 0, 3))?;
+    let output = bench.runner.execute(&step(2, 0, 3), &tables())?;
     let second = &output.calls[0];
     assert_eq!(second.tokens, [next(next(7))]);
     assert_eq!((second.cache_computed_len, second.step_index), (4, 2));
 
     // And the step after it continues from that one.
-    let output = bench.runner.execute(&step(2, 0, 4))?;
+    let output = bench.runner.execute(&step(2, 0, 4), &tables())?;
     assert_eq!(output.calls[0].tokens, [next(next(next(7)))]);
     assert!(output.timing.device_us > 0);
     Ok(())
@@ -471,12 +481,9 @@ fn a_slot_whose_first_step_is_a_decode_starts_from_its_batch_s_row() -> Outcome 
     // The request generated two tokens elsewhere: its slot starts at the row's input token,
     // position and draw position.
     let mut batch = step(4, 9, 6);
-    batch.columns.fresh_slots = vec![FreshSlot {
-        slot: 4,
-        history: vec![9, 9],
-    }];
+    batch.new_slots = vec![new_slot(4, vec![9, 9])];
 
-    let output = bench.runner.execute(&batch)?;
+    let output = bench.runner.execute(&batch, &tables())?;
     let call = &output.calls[0];
     assert_eq!(call.tokens, [next(9)]);
     assert_eq!((call.cache_computed_len, call.step_index), (7, 4));
@@ -490,27 +497,33 @@ fn a_batch_s_page_work_is_issued_before_and_after_its_replay() -> Outcome {
     let calls = Arc::new(Mutex::new(Vec::new()));
 
     let seen = Arc::clone(&calls);
-    bench.runner.set_page_work(Box::new(move |_, work| {
-        seen.lock().unwrap().push(work);
+    bench.runner.set_page_work(Box::new(move |work| {
+        let part = match work {
+            PageWork::BeforeReplay(..) => "before replay",
+            PageWork::AfterReplay => "after replay",
+            PageWork::Ended => "ended",
+            _ => "other",
+        };
+        seen.lock().unwrap().push(part);
         Ok(())
     }));
 
     let mut batch = prompt(2, &[5, 6, 7]);
     batch.columns.state_copies = vec![StateCopy {
         slot: 2,
-        units: vec![ipc::UnitId(0)],
+        position: 0,
         direction: StateDirection::Restore,
     }];
-    bench.runner.execute(&batch)?;
+    bench.runner.execute(&batch, &tables())?;
 
     assert_eq!(
         *calls.lock().unwrap(),
-        [PageWork::BeforeReplay, PageWork::AfterReplay]
+        ["before replay", "after replay", "ended"]
     );
     Ok(())
 }
 
-/// A verification of `slot`, a fresh slot: the committed token `ids[0]` at `position`, where
+/// A verification of `slot`, a new slot: the committed token `ids[0]` at `position`, where
 /// the request has drawn `position` tokens, followed by its drafts; the call proposes two
 /// drafts after the tokens it commits.
 fn verification(slot: u32, ids: &[i32], position: i32) -> Batch {
@@ -521,11 +534,11 @@ fn verification(slot: u32, ids: &[i32], position: i32) -> Batch {
     table[column::SAMPLING] = i64::from(position);
     table[column::VISIBLE] = i64::from(position);
 
-    let columns = BatchColumns {
-        rows: BatchRows {
+    let columns = Columns {
+        rows: Rows {
             positions: (position..position + tokens).collect(),
             seq_lens: vec![position + tokens],
-            ..BatchRows::default()
+            ..Rows::default()
         },
         input_ids: ids.to_vec(),
         draws: vec![DrawAddress {
@@ -533,17 +546,15 @@ fn verification(slot: u32, ids: &[i32], position: i32) -> Batch {
             position: (position + tokens) as u64,
         }],
         commit: table,
-        fresh_slots: vec![FreshSlot {
-            slot,
-            history: Vec::new(),
-        }],
-        drafts: vec![ipc::DraftWork {
+        drafts: vec![DraftWork {
             proposals: 2,
-            ..ipc::DraftWork::default()
+            ..DraftWork::default()
         }],
-        ..BatchColumns::default()
+        ..Columns::default()
     };
-    batch(RowKind::Verify, Variant::DecodeGreedy, slot, columns)
+    let mut batch = batch(Phase::Verify, Variant::DecodeGreedy, slot, columns);
+    batch.new_slots = vec![new_slot(slot, Vec::new())];
+    batch
 }
 
 #[test]
@@ -553,7 +564,9 @@ fn a_verification_commits_the_drafts_its_samples_agree_with_and_proposes_the_nex
 
     // The model continues 7 with 6 and 6 with 5: both drafts agree, and the sample after
     // them stands as well. The drafter proposes what follows the last committed token.
-    let output = bench.runner.execute(&verification(2, &[7, 6, 5], 3))?;
+    let output = bench
+        .runner
+        .execute(&verification(2, &[7, 6, 5], 3), &tables())?;
     let call = &output.calls[0];
     assert_eq!(call.tokens, [next(7), next(6), next(5)]);
     assert_eq!(call.token_logprobs.len(), 3);
@@ -564,14 +577,18 @@ fn a_verification_commits_the_drafts_its_samples_agree_with_and_proposes_the_nex
 
     // The second draft differs from the sample at its position: the first draft and that
     // sample are committed, and the drafts continue from the sample.
-    let output = bench.runner.execute(&verification(3, &[7, 6, 9], 3))?;
+    let output = bench
+        .runner
+        .execute(&verification(3, &[7, 6, 9], 3), &tables())?;
     let call = &output.calls[0];
     assert_eq!(call.tokens, [next(7), next(6)]);
     assert_eq!(call.draft_token_ids, [next(next(6)), next(next(next(6)))]);
     assert_eq!((call.cache_computed_len, call.step_index), (5, 5));
 
     // No draft agrees: the verification commits the token a decode at its position would.
-    let output = bench.runner.execute(&verification(4, &[7, 3, 2], 3))?;
+    let output = bench
+        .runner
+        .execute(&verification(4, &[7, 3, 2], 3), &tables())?;
     let call = &output.calls[0];
     assert_eq!(call.tokens, [next(7)]);
     assert_eq!(call.draft_token_ids, [next(next(7)), next(next(next(7)))]);
@@ -587,12 +604,12 @@ fn a_prompt_of_a_speculating_runner_proposes_the_drafts_after_its_first_token() 
     // The prompt samples the token after it, and the drafter continues from that token on
     // the device: nothing is read back between the two graphs.
     let mut batch = prompt(2, &[5, 6, 7]);
-    batch.columns.drafts = vec![ipc::DraftWork {
+    batch.columns.drafts = vec![DraftWork {
         proposals: 2,
-        ..ipc::DraftWork::default()
+        ..DraftWork::default()
     }];
 
-    let output = bench.runner.execute(&batch)?;
+    let output = bench.runner.execute(&batch, &tables())?;
     let call = &output.calls[0];
     assert_eq!(call.tokens, [next(7)]);
     assert_eq!(call.draft_token_ids, [next(next(7)), next(next(next(7)))]);
@@ -600,9 +617,9 @@ fn a_prompt_of_a_speculating_runner_proposes_the_drafts_after_its_first_token() 
     // The verification of those drafts accepts both.
     let drafts: Vec<i32> = call.draft_token_ids.iter().map(|id| *id as i32).collect();
     let mut verified = verification(2, &[next(7) as i32, drafts[0], drafts[1]], 3);
-    verified.columns.fresh_slots.clear();
+    verified.new_slots.clear();
 
-    let output = bench.runner.execute(&verified)?;
+    let output = bench.runner.execute(&verified, &tables())?;
     assert_eq!(output.calls[0].tokens.len(), 3);
     Ok(())
 }

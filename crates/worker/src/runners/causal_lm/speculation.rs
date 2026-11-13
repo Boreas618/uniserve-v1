@@ -54,8 +54,10 @@
 //! ## The draft cache
 //!
 //! The drafter's keys and values lie in the pool's draft group, which has no pooled page
-//! table: a row's table is stated per step, from the pages the scheduler installed for its
-//! request slot ([`DraftPool`], [`DraftPages`]).
+//! table: a row's table is stated per step, from the entries of its request slot in the draft
+//! group's class of the rank's device block table ([`DraftPool`]). The drafter reads every
+//! entry and writes only the writable ones: an entry at a position it would write that is
+//! missing or read-only is not written.
 //!
 //! ## What is refused
 //!
@@ -66,11 +68,8 @@
 
 use std::sync::Arc;
 
-use ipc::execution::{
-    Batch, BatchColumns, BatchRow, BatchRows, CallOutput, LogitAdjustments, RowKind,
-};
+use ipc::batch::{Batch, CallOutput, CallStatus, Columns, DraftWork, Phase, Row, Rows};
 use ipc::philox::DrawAddress;
-use ipc::{CallStatus, DraftWork};
 use nn::{KvCache, NO_SLOT, PhaseKind, RecurrentState, TokenBatch, functional};
 use platform::Stream;
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
@@ -82,6 +81,7 @@ use super::{CausalLmRunner, StateBuffers};
 use crate::buckets::Bucket;
 use crate::memory::allocation::Storage;
 use crate::memory::cache::CacheLayout;
+use crate::memory::tables::BlockTables;
 use crate::sampler::{self, Sampler};
 use crate::{Error, Result};
 
@@ -185,13 +185,52 @@ impl DraftPool {
     pub(crate) fn row(&self, first: u32, units: &[u32], width: u32, out: &mut Vec<u32>) {
         out.extend((0..width).map(|page| self.page_of(first, units, page * self.page).0));
     }
+
+    /// The draft pages request slot `slot` holds, from its entries in the draft group's class
+    /// of `tables` (the class of cache group `g` is class `g`): `(first, read, written)`, the
+    /// position of its first entry, the unit of each draft page from there on, and the unit of
+    /// each page the drafter may write ([`BlockTables::writable`]), unit 0, the padding unit,
+    /// where the slot holds no entry or one the drafter may not write. A slot that holds none
+    /// states no page.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for an entry whose block is not one unit: a draft page is one.
+    pub(crate) fn table(&self, tables: &BlockTables, slot: u32) -> Result<DraftTable> {
+        let class = u8::try_from(self.group)
+            .map_err(|_| Error::Invalid(format!("draft group {} names no class", self.group)))?;
+
+        let mut first = None;
+        let (mut read, mut written) = (Vec::new(), Vec::new());
+        for (position, (_, unit, units)) in tables.entries(slot, class) {
+            if units != 1 {
+                return Err(Error::Invalid(format!(
+                    "the draft block at position {position} of slot {slot} spans {units} units, \
+                     and a draft page is one"
+                )));
+            }
+
+            // The pages between two entries hold none.
+            let start = *first.get_or_insert(position);
+            let index = (position - start) as usize;
+            read.resize(index, 0);
+            written.resize(index, 0);
+
+            read.push(unit);
+            written.push(if tables.writable(slot, class, position) {
+                unit
+            } else {
+                0
+            });
+        }
+        Ok((first.unwrap_or(0), read, written))
+    }
 }
 
-/// What states the pages a request slot holds in the draft group, as the scheduler last
-/// installed them: its first draft page and the units of the pages from there on; `None` for a
-/// slot that holds none ([`CausalLmRunner::set_draft_pages`]). A table the batch being served
-/// carries is read from the batch itself.
-pub type DraftPages = Box<dyn FnMut(u32) -> Option<(u32, Vec<u32>)> + Send>;
+/// The draft pages of one drafter row ([`DraftPool::table`]): the position of its table's first
+/// entry, the unit of each draft page from there on, and the unit of each page the drafter may
+/// write, unit 0 where it may not.
+pub(crate) type DraftTable = (u32, Vec<u32>, Vec<u32>);
 
 /// What a target forward leaves for the drafter's forward and for the completion, in memory
 /// the runner owns: one tensor per entry of the sampling outputs, each verification's agreed
@@ -366,8 +405,6 @@ pub(crate) struct Speculation {
     pub(crate) draft: Option<KvCache>,
     /// The trail buffers of the recurrent state, for a model that keeps one.
     pub(crate) trail: Option<StateBuffers>,
-    /// What states a slot's installed draft pages.
-    pub(crate) pages: Option<DraftPages>,
 }
 
 /// The agreed length of each verification and the token that ends its accepted prefix:
@@ -410,8 +447,8 @@ pub(crate) fn accept(
 
 /// Whether `call` is a verification: a verification, or a decode, which a speculating runner
 /// serves as a verification of no draft.
-const fn verifying(call: &BatchRow) -> bool {
-    matches!(call.kind, RowKind::Verify | RowKind::Decode)
+const fn verifying(call: &Row) -> bool {
+    matches!(call.kind, Phase::Verify | Phase::Decode)
 }
 
 /// Whether `columns` verify: their calls are verifications ([`verifying`]).
@@ -420,7 +457,7 @@ const fn verifying(call: &BatchRow) -> bool {
 ///
 /// [`Error::Invalid`] for a batch that mixes prompt rows with verifications, a verification
 /// that is not one row, that samples nothing or that holds more than `drafts` drafts.
-pub(crate) fn verifies(columns: &BatchColumns, drafts: u32) -> Result<bool> {
+pub(crate) fn verifies(columns: &Columns, drafts: u32) -> Result<bool> {
     let rows = &columns.rows;
     let count = rows.calls.iter().filter(|call| verifying(call)).count();
     if count == 0 {
@@ -444,7 +481,7 @@ pub(crate) fn verifies(columns: &BatchColumns, drafts: u32) -> Result<bool> {
             return Err(Error::Invalid(format!(
                 "a verification of slot {} holds {} rows of {tokens} tokens: one row carries a \
                  committed token and its drafts, and samples each",
-                call.request,
+                call.slot,
                 call.rows.len()
             )));
         }
@@ -452,7 +489,7 @@ pub(crate) fn verifies(columns: &BatchColumns, drafts: u32) -> Result<bool> {
             return Err(Error::Invalid(format!(
                 "a verification of slot {} carries {} drafts, and the deployment verifies \
                  {drafts}",
-                call.request,
+                call.slot,
                 tokens - 1
             )));
         }
@@ -467,29 +504,28 @@ pub(crate) fn verifies(columns: &BatchColumns, drafts: u32) -> Result<bool> {
 /// `j` seeing `end - (n - 1 - j)` keys, on its row's slot, with its row's parameters and
 /// adjustments, and drawing at the address of the position after it in its request's stream.
 /// The calls keep their order and own their tokens' rows; the commit table stays one row per
-/// call.
-pub(crate) fn token_rows(columns: &BatchColumns) -> BatchColumns {
+/// call, and the tokens keep their order and cache positions.
+pub(crate) fn token_rows(columns: &Columns) -> Columns {
     let rows = &columns.rows;
     let tokens = rows.tokens();
     let width = PARAMETER_COLUMNS as usize;
 
-    let mut expanded = BatchColumns {
-        rows: BatchRows {
+    let mut expanded = Columns {
+        rows: Rows {
             positions: rows.positions.clone(),
-            slot_mapping: rows.slot_mapping.clone(),
+            cache_positions: rows.cache_positions.clone(),
             query_offsets: (0..=tokens as i32).collect(),
             logits_rows: (0..tokens as i32).collect(),
-            ..BatchRows::default()
+            ..Rows::default()
         },
         input_ids: columns.input_ids.clone(),
         commit: columns.commit.clone(),
         checkpoints: columns.checkpoints.clone(),
         page_size: columns.page_size,
         max_kv_len: columns.max_kv_len,
-        ..BatchColumns::default()
+        ..Columns::default()
     };
 
-    let adjustments = &columns.adjustments;
     let mut biased = Vec::new();
     let mut banned = Vec::new();
 
@@ -521,29 +557,23 @@ pub(crate) fn token_rows(columns: &BatchColumns) -> BatchColumns {
                 position: (start.max(0) + (token - first) + 1) as u64,
             });
 
-            biased.push(adjustments.biased.get(row).copied().unwrap_or(false));
-            banned.push(adjustments.banned.get(row).cloned().unwrap_or_default());
+            biased.push(columns.biased.get(row).copied().unwrap_or(false));
+            banned.push(columns.banned.get(row).cloned().unwrap_or_default());
         }
 
-        expanded.rows.calls.push(BatchRow {
+        expanded.rows.calls.push(Row {
             rows: first as u32..last as u32,
             ..call.clone()
         });
     }
 
-    expanded.adjustments = LogitAdjustments {
-        installs: Vec::new(),
-        biased: if biased.iter().any(|flag| *flag) {
-            biased
-        } else {
-            Vec::new()
-        },
-        banned: if banned.iter().any(|tokens| !tokens.is_empty()) {
-            banned
-        } else {
-            Vec::new()
-        },
-    };
+    // A batch whose rows adjust nothing states the optional columns empty.
+    if biased.iter().any(|flag| *flag) {
+        expanded.biased = biased;
+    }
+    if banned.iter().any(|tokens| !tokens.is_empty()) {
+        expanded.banned = banned;
+    }
     expanded
 }
 
@@ -554,23 +584,23 @@ pub(crate) fn idle_verification(
     drafts: u32,
     page_size: u32,
     max_kv_len: u32,
-) -> BatchColumns {
+) -> Columns {
     let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
     let width = drafts + 1;
 
-    let calls: Vec<BatchRow> = (0..bucket.rows)
-        .map(|row| BatchRow {
-            request: 0,
-            kind: RowKind::Verify,
+    let calls: Vec<Row> = (0..bucket.rows)
+        .map(|row| Row {
+            slot: 0,
+            kind: Phase::Verify,
             cache_group: 0,
             rows: row..row + 1,
         })
         .collect();
 
-    BatchColumns {
-        rows: BatchRows {
+    Columns {
+        rows: Rows {
             positions: vec![0; tokens],
-            slot_mapping: vec![-1; tokens],
+            cache_positions: vec![-1; tokens],
             seq_lens: vec![0; rows],
             query_offsets: (0..=bucket.rows).map(|row| (row * width) as i32).collect(),
             logits_rows: vec![-1; rows],
@@ -583,7 +613,7 @@ pub(crate) fn idle_verification(
         commit: sampler::inert_commit(calls.len()),
         page_size,
         max_kv_len,
-        ..BatchColumns::default()
+        ..Columns::default()
     }
 }
 
@@ -591,20 +621,28 @@ pub(crate) fn idle_verification(
 /// verification bucket (`columns` documents each).
 ///
 /// `expanded` is [`token_rows`] of `columns`: the generic columns are its rows, one per token.
-/// The commit table holds the batch's row per call, whose task is the call's own, then one
-/// count row per draft of each call, which counts when the device accepted the draft.
+/// `mapping` is the cache slot each token writes (`columns::slot_mapping`), empty for a step
+/// that writes none. The commit table holds the batch's row per call, whose task is the
+/// call's own, then one count row per draft of each call, which counts when the device
+/// accepted the draft.
 ///
 /// # Errors
 ///
 /// As `columns::fill`; [`Error::Invariant`] for a bucket that is no verification bucket of
 /// the layout's drafts.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the runner's shape, the batch in both forms, its bucket, its cache slots and the \
+              block"
+)]
 pub(crate) fn fill_verification(
     layout: &Layout,
     slots: u32,
     vocabulary: u32,
-    columns: &BatchColumns,
-    expanded: &BatchColumns,
+    columns: &Columns,
+    expanded: &Columns,
     bucket: &Bucket,
+    mapping: &[u32],
     block: &mut [u8],
 ) -> Result<()> {
     let drafts = layout.drafts();
@@ -623,7 +661,8 @@ pub(crate) fn fill_verification(
         vocabulary,
         expanded,
         &rows_of_tokens,
-        None,
+        mapping,
+        false,
         block,
     )?;
 
@@ -635,7 +674,7 @@ pub(crate) fn fill_verification(
             "{calls} verifications do not fit bucket {bucket}"
         )));
     }
-    let span = |call: &BatchRow| {
+    let span = |call: &Row| {
         let row = call.rows.start as usize;
         let offset = |index: usize| rows.query_offsets.get(index).map_or(0, |at| *at as usize);
 
@@ -736,7 +775,7 @@ pub(crate) fn fill_verification(
 /// The last entry of drafter row `row` that a prompt batch states, as a token of the batch:
 /// its last token when the batch samples the token after it or states it (`lookahead`), the
 /// token before it otherwise, and `None` for a row with no token whose next one is known.
-fn last_entry(rows: &BatchRows, row: usize, lookahead: Option<u32>) -> Option<usize> {
+fn last_entry(rows: &Rows, row: usize, lookahead: Option<u32>) -> Option<usize> {
     let offset = |index: usize| {
         rows.query_offsets
             .get(index)
@@ -752,7 +791,7 @@ fn last_entry(rows: &BatchRows, row: usize, lookahead: Option<u32>) -> Option<us
 
 /// The draft work of the call that owns row `row` of `columns`, when the row is the call's
 /// last: the row a call's lookahead and proposals belong to.
-fn row_work(columns: &BatchColumns, row: usize) -> DraftWork {
+fn row_work(columns: &Columns, row: usize) -> DraftWork {
     columns
         .rows
         .calls
@@ -768,8 +807,10 @@ fn row_work(columns: &BatchColumns, row: usize) -> DraftWork {
 /// The drafter rows of a verification batch are its calls, whose entries are bounded on the
 /// device by the length each call agreed; a prompt batch's drafter rows are its rows, each
 /// entry reading the prompt's next token, the last one the token the row sampled or its
-/// call's lookahead. `tables` is each drafter row's installed draft pages,
-/// `(first page, units)`, in row order.
+/// call's lookahead. `tables` is each drafter row's draft pages, in row order: the first draft
+/// page of its table, the unit of each page from there on, and the unit of each page the
+/// drafter may write, `0` where it may not ([`DraftPool::table`]). A position whose page the
+/// drafter may not write writes no entry.
 ///
 /// # Errors
 ///
@@ -778,8 +819,8 @@ pub(crate) fn fill_drafter(
     layout: &Layout,
     pool: &DraftPool,
     vocabulary: u32,
-    columns: &BatchColumns,
-    tables: &[(u32, Vec<u32>)],
+    columns: &Columns,
+    tables: &[DraftTable],
     bucket: &Bucket,
     block: &mut [u8],
 ) -> Result<()> {
@@ -810,7 +851,7 @@ pub(crate) fn fill_drafter(
             .get(index)
             .map_or(0, |at| (*at).max(0) as usize)
     };
-    let empty = (0, Vec::new());
+    let empty = (0, Vec::new(), Vec::new());
 
     // ---- The entries: one per token whose next token the step knows ----
 
@@ -845,7 +886,7 @@ pub(crate) fn fill_drafter(
 
     for row in 0..sequences {
         let (first, last) = (offset(row), offset(row + 1).min(tokens));
-        let (page, units) = tables.get(row).unwrap_or(&empty);
+        let (page, _, written) = tables.get(row).unwrap_or(&empty);
         let work = row_work(columns, row);
 
         state_offsets[row] = first as u32;
@@ -860,7 +901,7 @@ pub(crate) fn fill_drafter(
                 next_rows[token] = token as u32;
                 entry_rows[token] = row as u32;
                 entry_steps[token] = ahead as u32;
-                draft_slots[token] = pool.slot(*page, units, position(token)?);
+                draft_slots[token] = pool.slot(*page, written, position(token)?);
             }
             proposal_rows[row] = row as u32;
 
@@ -871,7 +912,7 @@ pub(crate) fn fill_drafter(
 
             for token in first..first + entries {
                 entry_steps[token] = 0;
-                draft_slots[token] = pool.slot(*page, units, position(token)?);
+                draft_slots[token] = pool.slot(*page, written, position(token)?);
 
                 // The prompt's next token, the token the row samples, or the call's lookahead.
                 if token + 1 < last {
@@ -892,7 +933,7 @@ pub(crate) fn fill_drafter(
         let start = position(base)?;
 
         for cell in 0..2 * drafts - 1 {
-            chain_slots[row * cells + cell] = pool.slot(*page, units, start + cell as u32 + 1);
+            chain_slots[row * cells + cell] = pool.slot(*page, written, start + cell as u32 + 1);
         }
         let proposals = work.proposals.min(drafts as u32) as usize;
         for step in 1..drafts {
@@ -908,8 +949,8 @@ pub(crate) fn fill_drafter(
     state_offsets[sequences..].fill(tokens as u32);
 
     for row in 0..bucket_rows {
-        let (page, units) = tables.get(row).unwrap_or(&empty);
-        pool.row(*page, units, layout.pages() as u32, &mut pages);
+        let (page, read, _) = tables.get(row).unwrap_or(&empty);
+        pool.row(*page, read, layout.pages() as u32, &mut pages);
     }
 
     let mut chain_offsets: Vec<u32> = (0..=sequences as u32).collect();

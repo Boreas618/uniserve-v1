@@ -73,7 +73,7 @@ pub enum Error {
     /// the state of a pool or an export that several owners consult. It
     /// reports and classifies as the failure it shares.
     #[error(transparent)]
-    Shared(std::sync::Arc<ipc::execution::Fault>),
+    Shared(std::sync::Arc<crate::completion::Fault>),
 }
 
 impl Error {
@@ -125,13 +125,13 @@ impl From<backend::Error> for Error {
 }
 
 /// A second outcome of a completion that already has one is the worker's state error.
-impl From<ipc::execution::Settled> for Error {
-    fn from(_: ipc::execution::Settled) -> Self {
+impl From<crate::completion::Settled> for Error {
+    fn from(_: crate::completion::Settled) -> Self {
         Self::State("operation has already completed")
     }
 }
 
-/// A batch the crossing's own checks refuse (`ipc::execution`) is a batch this worker cannot serve.
+/// A batch or a frame the protocol's own checks refuse (`ipc`) is one this worker cannot serve.
 impl From<ipc::ValidationError> for Error {
     fn from(error: ipc::ValidationError) -> Self {
         Self::Invalid(error.reason().to_owned())
@@ -265,8 +265,8 @@ fn driver_code(failure: &platform::Error) -> ErrorCode {
 /// The code an error's own kind maps to.
 fn kind_code(error: &Error) -> ErrorCode {
     match error {
-        // A shared failure is the worker's own whenever a worker raised it; one the crossing
-        // raised by itself (`ipc::execution::Refusal`) is a computation that did not complete.
+        // A shared failure is the worker's own whenever a worker raised it; any other is a
+        // computation that did not complete.
         Error::Shared(shared) => shared
             .downcast_ref::<Error>()
             .map_or(ErrorCode::ComputeError, kind_code),

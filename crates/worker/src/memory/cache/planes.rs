@@ -780,45 +780,42 @@ impl Planes {
         Ok(())
     }
 
-    /// Checks the `(source, destination)` unit copies of a leased prefix: both units inside the
+    /// Checks the `(source, destination)` unit copies of a block's copy: both units inside the
     /// pool, neither the padding unit, not the same unit, and no destination a read-only unit
     /// of the predecessor epoch. A refusal names the pair and the reason.
-    pub(crate) fn check_copies(&self, copies: &[(ipc::UnitId, ipc::UnitId)]) -> Result<()> {
+    pub(crate) fn check_copies(&self, copies: &[(u32, u32)]) -> Result<()> {
         let inherited = self.inherited();
 
         for &(from, to) in copies {
-            self.require_unit(from.0)?;
-            self.require_unit(to.0)?;
+            self.require_unit(from)?;
+            self.require_unit(to)?;
 
-            let reason = if from.0 == 0 {
+            let reason = if from == 0 {
                 Some("the source is unit 0, the padding unit")
-            } else if to.0 == 0 {
+            } else if to == 0 {
                 Some("the destination is unit 0, the padding unit")
             } else if from == to {
                 Some("the destination is the source")
-            } else if inherited.contains(&to.0) {
+            } else if inherited.contains(&to) {
                 Some("the destination is an inherited read-only unit of the predecessor epoch")
             } else {
                 None
             };
             if let Some(reason) = reason {
                 return Err(Error::Invalid(format!(
-                    "cache unit copy {} -> {} is refused: {reason}",
-                    from.0, to.0
+                    "cache unit copy {from} -> {to} is refused: {reason}"
                 )));
             }
         }
         Ok(())
     }
 
-    /// Copies whole units, their flags, FP8 scales and index keys included, into newly
-    /// allocated units on `stream`, in stream order. The copies were checked
-    /// ([`Self::check_copies`]).
-    pub(crate) fn copy_units(
-        &self,
-        copies: &[(ipc::UnitId, ipc::UnitId)],
-        stream: &Stream,
-    ) -> Result<()> {
+    /// Copies whole units on `stream`, in stream order: every field a unit holds, whatever
+    /// block it is part of, so a copy of an attention, draft or state block is the same copy.
+    /// That is the values of every column with their flags, an FP8 cache's scales, the index
+    /// keys of a cache that keeps them and the state planes of a cache with a state group. The
+    /// copies were checked ([`Self::check_copies`]).
+    pub(crate) fn copy_units(&self, copies: &[(u32, u32)], stream: &Stream) -> Result<()> {
         let device = self.device()?;
         let mut batch = CopyBatch::new(SourceOrder::Stream);
 
@@ -826,19 +823,19 @@ impl Planes {
             for column in 0..self.layout.columns {
                 for field in 0..2 {
                     batch.push(
-                        self.plane_address(field, column, to.0)?,
-                        self.plane_address(field, column, from.0)?,
+                        self.plane_address(field, column, to)?,
+                        self.plane_address(field, column, from)?,
                         self.layout.plane_bytes as usize,
                     );
                     batch.push(
-                        self.flag_address(field, column, to.0)?,
-                        self.flag_address(field, column, from.0)?,
+                        self.flag_address(field, column, to)?,
+                        self.flag_address(field, column, from)?,
                         1,
                     );
                     if device.scales.is_some() {
                         batch.push(
-                            self.scale_address(field, column, to.0)?,
-                            self.scale_address(field, column, from.0)?,
+                            self.scale_address(field, column, to)?,
+                            self.scale_address(field, column, from)?,
                             4,
                         );
                     }
@@ -846,17 +843,25 @@ impl Planes {
 
                 if device.index_keys.is_some() {
                     batch.push(
-                        self.index_address(column, to.0)?,
-                        self.index_address(column, from.0)?,
+                        self.index_address(column, to)?,
+                        self.index_address(column, from)?,
                         self.layout.index_bytes() as usize,
+                    );
+                }
+
+                for run in 0..device.state.len() {
+                    batch.push(
+                        self.state_plane_address(run, column, to)?,
+                        self.state_plane_address(run, column, from)?,
+                        self.layout.plane_bytes as usize,
                     );
                 }
             }
         }
 
-        // SAFETY: every range is a cell of a storage this value owns. The scheduler leases the
-        // sources, which nothing writes, and gives the destinations to one request, until the
-        // batch completes; the forward that reads and appends follows on this stream.
+        // SAFETY: every range is a cell of a storage this value owns. The buffer pool holds
+        // the sources, which nothing writes while they are shared, and gives the destinations
+        // to this copy alone until it is reported done, after the batch that runs it ended.
         unsafe { batch.submit(stream) }?;
         Ok(())
     }
@@ -1354,7 +1359,7 @@ mod tests {
         let planes = planes(PrefixCacheDtype::BFloat16);
         let refused = |from: u32, to: u32| {
             planes
-                .check_copies(&[(ipc::UnitId(from), ipc::UnitId(to))])
+                .check_copies(&[(from, to)])
                 .expect_err("this copy is refused")
                 .to_string()
         };
@@ -1364,11 +1369,7 @@ mod tests {
         assert!(padding.contains("padding unit"), "{padding}");
         assert!(refused(2, 2).contains("the destination is the source"));
         assert!(refused(1, 8).contains("outside the pool"));
-        assert!(
-            planes
-                .check_copies(&[(ipc::UnitId(1), ipc::UnitId(2))])
-                .is_ok()
-        );
+        assert!(planes.check_copies(&[(1, 2)]).is_ok());
     }
 
     /// Planes that hold no device map nothing, hold no segment and refuse device work.

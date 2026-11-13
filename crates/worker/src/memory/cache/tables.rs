@@ -1,43 +1,35 @@
-//! The rank's page tables: the scheduler's page assignments and the pooled tables a forward
-//! gathers its rows from.
+//! The rank's pooled page tables: the device copy of the attention groups' entries of the rank's
+//! device block table, which a forward gathers its rows from.
 //!
-//! The scheduler owns allocation and states each request slot's pages per cache group
-//! (`ipc::BlockTable`); this module mirrors them. For every group it keeps what each slot holds,
-//! and for every **attention** group it keeps one pooled table `[slots + 1, width]` of `u32`:
+//! The buffer pool's completions feed the rank's device block table (`memory::tables`), and its
+//! changes are written here, each once, before the batch that reads them. For every
+//! **attention** group the cache keeps one pooled table `[slots + 1, width]` of `u32`:
 //!
 //! - row `slot - 1` is request slot `slot`'s (slots count from one);
-//! - entry `p` of a row is the unit of the row's logical page `p`, so a forward addresses a
-//!   token at position `q` through entry `q / block_size`; a page the slot does not hold (one
-//!   before the table's first page, one past its last) names unit 0, the padding unit;
+//! - entry `p` of a row is the unit of the block at position `p` of the slot's table of the
+//!   group's class, which is the row's logical page `p`, so a forward addresses a token at
+//!   cache position `q` through entry `q / block_size`; a position that holds no entry names
+//!   unit 0, the padding unit;
 //! - the last row, row `slots`, names only the padding unit: a bucket's padding rows gather it.
 //!
 //! The pooled tables are on the host always and mirrored on the device of a cache that holds
-//! one. The state group's pages are addressed by the copies that name their units and the
-//! draft group's through the tables a speculative step builds from
-//! [`PageTables::installed`], so neither has a pooled table.
+//! one. The state group's and the draft group's blocks are addressed through the device block
+//! table itself, by the copies that name a checkpoint's position and by the tables a
+//! speculative step builds, so neither has a pooled table.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use ipc::BlockTable;
 use platform::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
 use uniserve_tensor::{DType, Tensor};
 
 use super::layout::CacheLayout;
 use crate::memory::allocation::Storage;
 use crate::memory::lend;
+use crate::memory::tables::Change;
 use crate::{Error, Result};
 
-/// One slot's pages in one cache group, as the scheduler last stated them.
-struct Installed {
-    /// The first logical page the units cover.
-    start_page: u32,
-    /// The units of pages `start_page..`, page-major.
-    units: Vec<u32>,
-}
-
-/// The host mirror of the scheduler's page tables and the pooled tables of the attention
-/// groups.
+/// The pooled tables of the attention groups.
 pub(crate) struct PageTables {
     layout: Arc<CacheLayout>,
     /// Request slots: slots `1..=slots` own rows.
@@ -46,8 +38,8 @@ pub(crate) struct PageTables {
     width: u32,
     /// Units of the pool, the padding unit included: the bound of every unit a table names.
     units: u32,
-    installed: HashMap<(u32, u32), Installed>,
-    /// Each attention group's pooled table on the host, `[slots + 1, width]` row-major.
+    /// Each attention group's pooled table on the host, `[slots + 1, width]` row-major, by the
+    /// group's index among the attention groups.
     rows: Vec<Vec<u32>>,
     /// The pooled tables on the device, group after group in one storage, each
     /// `[slots + 1, width]`; `None` for tables that hold no device.
@@ -83,7 +75,6 @@ impl PageTables {
             slots,
             width,
             units,
-            installed: HashMap::new(),
             rows,
             device: None,
         })
@@ -154,7 +145,7 @@ impl PageTables {
 
                 // SAFETY: the tables own the storage for as long as they live, and its holder
                 // keeps the tables for as long as a tensor over them is in use; only the
-                // installs and releases this value issues write it, in stream order.
+                // row writes this value issues write it, in stream order.
                 unsafe { storage.external(offset, shape.as_slice(), DType::U32) }
             }
             // SAFETY: a meta tensor has no data and its address is never read.
@@ -163,7 +154,7 @@ impl PageTables {
     }
 
     /// The pooled table of attention group `group` on the host, `[slots + 1, width]` row-major:
-    /// what the device table holds once the installs issued so far completed.
+    /// what the device table holds once the changes applied so far completed.
     pub(crate) fn host_table(&self, group: usize) -> Result<&[u32]> {
         self.rows
             .get(group)
@@ -171,210 +162,106 @@ impl PageTables {
             .ok_or_else(|| Error::Invalid(format!("the cache has no attention group {group}")))
     }
 
-    /// The pages `slot`'s installed table of `group` holds: its first logical page and the
-    /// units of the pages from there on, page-major. `None` when the slot holds no table of the
-    /// group.
-    pub(crate) fn installed(&self, slot: u32, group: u32) -> Option<(u32, &[u32])> {
-        self.installed
-            .get(&(slot, group))
-            .map(|table| (table.start_page, table.units.as_slice()))
-    }
-
-    /// Checks one of the scheduler's tables against the rank's own cache: a request slot, a
-    /// group the layout holds, whole pages within a row, units inside the pool, and allocated
-    /// tokens within its pages. The scheduler's allocator owns which units a table names; the
-    /// pool bound stays here because kernels address the planes by these ids.
-    fn check(&self, table: &BlockTable) -> Result<()> {
-        let refusal = |reason: String| {
-            Error::Invalid(format!(
-                "the block table of request slot {} in cache group {} is refused: {reason}",
-                table.request_pool_idx, table.group_id
-            ))
-        };
-
-        self.row(table.request_pool_idx)
-            .map_err(|error| refusal(error.to_string()))?;
-        let group = self
-            .layout
-            .groups
-            .get(table.group_id as usize)
-            .ok_or_else(|| refusal("the cache holds no such group".into()))?;
-
-        let per_page = group.units_per_page as usize;
-        if !table.unit_ids.len().is_multiple_of(per_page) {
-            return Err(refusal(format!(
-                "{} units are not whole pages of {per_page}",
-                table.unit_ids.len()
-            )));
-        }
-        if let Some(unit) = table.unit_ids.iter().find(|unit| unit.0 >= self.units) {
-            return Err(refusal(format!(
-                "unit {} is outside the pool of {} units",
-                unit.0, self.units
-            )));
-        }
-
-        // An attention row is indexed by logical page, so its pages lie inside the row from
-        // page zero; any other group's table is bounded by the pages it holds.
-        let pages = (table.unit_ids.len() / per_page) as u64;
-        let end_page = u64::from(table.start_page) + pages;
-        let extent = if group.attention() { end_page } else { pages };
-        if extent > u64::from(self.width) {
-            return Err(refusal(format!(
-                "its pages reach page {extent} of rows of {} pages",
-                self.width
-            )));
-        }
-        if u64::from(table.allocated_tokens) > end_page * u64::from(group.block_size) {
-            return Err(refusal(format!(
-                "{} allocated tokens exceed its {end_page} pages of {} tokens",
-                table.allocated_tokens, group.block_size
-            )));
-        }
-        if group.attention() && group.units_per_page != 1 {
-            return Err(refusal(
-                "an attention page of several units has no single unit a row names".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Installs the scheduler's tables of a batch: checks them all, then writes the changed
-    /// rows of the attention groups' pooled tables, on the host and, for tables on a device, in
-    /// one batched copy on `stream`, whose host source is read during the call. A row is
-    /// written at full width, which clears the tail a longer previous table left.
-    ///
-    /// Nothing changes when a table is refused or the copy fails.
+    /// Writes `changes`, the device block table's changes since the last batch, into the
+    /// pooled tables: each change of an attention group's class sets the entry at its position
+    /// of its slot's row to its run's unit, or to the padding unit where the position holds no
+    /// entry; a change of any other class has no pooled table and is skipped. The class of
+    /// cache group `g` is class `g`. Every change is checked first, and nothing changes when one
+    /// is refused. The rows that changed are written at full width, on the host and, for
+    /// tables on a device, in one batched copy on `stream`, whose host source is read during
+    /// the call.
     ///
     /// # Errors
     ///
-    /// A table the rank's cache refuses, by slot, group and reason; two tables of one slot and
-    /// group; tables on a device installed without a stream, or the reverse.
-    pub(crate) fn install(&mut self, tables: &[BlockTable], stream: Option<&Stream>) -> Result<()> {
+    /// A change of a slot outside the tables' slots, of a position past a row's pages, or of a
+    /// run that is not one unit of the pool; tables on a device written without a stream, or
+    /// the reverse.
+    pub(crate) fn apply(&mut self, changes: &[Change], stream: Option<&Stream>) -> Result<()> {
         if self.device.is_some() != stream.is_some() {
             return Err(Error::Invalid(
-                "page tables are installed on a stream exactly when they are on a device".into(),
+                "page tables are written on a stream exactly when they are on a device".into(),
             ));
         }
 
-        let mut seen = HashSet::new();
-        for table in tables {
-            self.check(table)?;
-            if !seen.insert((table.request_pool_idx, table.group_id)) {
-                return Err(Error::Invalid(format!(
-                    "a batch states two block tables of request slot {} in cache group {}",
-                    table.request_pool_idx, table.group_id
-                )));
+        // Each attention change as `(attention group, row, entry, unit)`.
+        let mut entries = Vec::new();
+        for change in changes {
+            let Some(group) = self.attention_index(change.class) else {
+                continue;
+            };
+            let refusal = |reason: String| {
+                Error::Invalid(format!(
+                    "the change of position {} of class {} of request slot {} is refused: \
+                     {reason}",
+                    change.position, change.class, change.slot
+                ))
+            };
+
+            let row = self
+                .row(change.slot)
+                .map_err(|error| refusal(error.to_string()))?;
+            if change.position >= self.width {
+                return Err(refusal(format!("a row holds {} pages", self.width)));
             }
+            let unit = match change.run {
+                None => 0,
+                Some((_, unit, 1)) if unit != 0 && unit < self.units => unit,
+                Some((_, first, count)) => {
+                    return Err(refusal(format!(
+                        "its run of {count} units from unit {first} is not one unit of the \
+                         pool's units 1..{}",
+                        self.units
+                    )));
+                }
+            };
+            entries.push((group, row as usize, change.position as usize, unit));
         }
 
-        // The rows that change, as `(group, row, first entry in `payload`)`.
         let width = self.width as usize;
-        let mut payload: Vec<u32> = Vec::new();
-        let mut changed = Vec::new();
-        for table in tables {
-            let group = table.group_id as usize;
-            if !self.layout.groups[group].attention() {
-                continue;
-            }
-            let row = self.row(table.request_pool_idx)? as usize;
-
-            let first = payload.len();
-            payload.resize(first + width, 0);
-            for (page, unit) in table.unit_ids.iter().enumerate() {
-                payload[first + table.start_page as usize + page] = unit.0;
-            }
-
-            if payload[first..] == self.rows[group][row * width..(row + 1) * width] {
-                payload.truncate(first);
-            } else {
-                changed.push((group, row, first));
-            }
+        let mut changed = BTreeSet::new();
+        for &(group, row, entry, unit) in &entries {
+            self.rows[group][row * width + entry] = unit;
+            changed.insert((group, row));
         }
 
         if let (Some(storage), Some(stream)) = (&self.device, stream) {
             let table_bytes = (self.slots as usize + 1) * width * 4;
             let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-            for &(group, row, first) in &changed {
+            for &(group, row) in &changed {
                 batch.push(
                     storage.address() + (group * table_bytes + row * width * 4) as u64,
-                    payload[first..].as_ptr() as u64,
+                    self.rows[group][row * width..].as_ptr() as u64,
                     width * 4,
                 );
             }
 
             // SAFETY: the destinations are distinct rows of the storage the tables own (one
-            // per slot and group, checked above), and the payload is read during the call.
+            // per slot and group), and the host rows are read during the call.
             unsafe { batch.submit(stream) }?;
-        }
-
-        for (group, row, first) in changed {
-            self.rows[group][row * width..(row + 1) * width]
-                .copy_from_slice(&payload[first..first + width]);
-        }
-        for table in tables {
-            self.installed.insert(
-                (table.request_pool_idx, table.group_id),
-                Installed {
-                    start_page: table.start_page,
-                    units: table.unit_ids.iter().map(|unit| unit.0).collect(),
-                },
-            );
         }
         Ok(())
     }
 
-    /// Forgets the tables of `slots` and names the padding unit in their rows again, on
-    /// `stream` for tables on a device, ordered behind every batch that reads those rows.
-    ///
-    /// # Errors
-    ///
-    /// A slot outside the tables; tables on a device released without a stream, or the reverse.
-    pub(crate) fn release(&mut self, slots: &[u32], stream: Option<&Stream>) -> Result<()> {
-        if self.device.is_some() != stream.is_some() {
-            return Err(Error::Invalid(
-                "page tables are released on a stream exactly when they are on a device".into(),
-            ));
-        }
-        let rows = slots
-            .iter()
-            .map(|slot| self.row(*slot).map(|row| row as usize))
-            .collect::<Result<Vec<_>>>()?;
-
-        let width = self.width as usize;
-        if let (Some(storage), Some(stream)) = (&self.device, stream) {
-            let table_bytes = (self.slots as usize + 1) * width * 4;
-            for group in 0..self.rows.len() {
-                for row in &rows {
-                    let address =
-                        storage.address() + (group * table_bytes + row * width * 4) as u64;
-
-                    // SAFETY: one row of the storage the tables own.
-                    unsafe { memset_d32(address, 0, width, stream) }?;
-                }
-            }
-        }
-
-        for (slot, row) in slots.iter().zip(rows) {
-            for table in &mut self.rows {
-                table[row * width..(row + 1) * width].fill(0);
-            }
-            for group in 0..self.layout.groups.len() as u32 {
-                self.installed.remove(&(*slot, group));
-            }
-        }
-        Ok(())
+    /// The index among the attention groups of the cache group whose class is `class`, when it
+    /// is an attention group: they come first in the layout.
+    fn attention_index(&self, class: u8) -> Option<usize> {
+        let group = self.layout.groups.get(class as usize)?;
+        (group.attention() && (class as usize) < self.rows.len()).then_some(class as usize)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use ipc::{CacheGroupKind, PrefixCacheDtype, UnitId};
+    use ipc::PrefixCacheDtype;
 
     use super::*;
 
+    /// The region of the units the changes name.
+    const UNITS: u8 = 0;
+
     /// Tables of two request slots and rows of four pages over sixteen units: a cache of two
-    /// attention layers of 4-token pages and a recurrent state of two layers.
+    /// attention layers of 4-token pages (class 0) and a recurrent state of two layers whose
+    /// pages span two units (class 1).
     fn tables() -> PageTables {
         let state = nn::family::StateShape {
             layers: 2,
@@ -392,126 +279,85 @@ mod tests {
         PageTables::meta(Arc::new(layout), 2, 4, 16).expect("page tables")
     }
 
-    fn table(slot: u32, group: u32, start_page: u32, units: &[u32], tokens: u32) -> BlockTable {
-        BlockTable {
-            request_pool_idx: slot,
-            group_id: group,
-            start_page,
-            unit_ids: units.iter().copied().map(UnitId).collect(),
-            allocated_tokens: tokens,
+    /// The change of `position` of `class` of `slot` to the block of `units` units from unit
+    /// `first`, or to no entry for `None`.
+    fn change(slot: u32, class: u8, position: u32, block: Option<(u32, u32)>) -> Change {
+        Change {
+            slot,
+            class,
+            position,
+            run: block.map(|(first, units)| (UNITS, first, units)),
+            reset: false,
         }
     }
 
-    /// An installed table is the row its slot's forward gathers: the units at their logical
-    /// pages, the padding unit everywhere else, and the last row padding alone.
+    /// A slot's row is the unit of each block its table holds at that position, the padding
+    /// unit everywhere else, and the last row padding alone.
     #[test]
-    fn an_installed_table_is_its_slots_row() -> Result<()> {
-        let mut tables = tables();
-        assert_eq!(tables.table(0)?.dims(), [3, 4]);
-        assert_eq!(tables.table(0)?.dtype(), DType::U32);
+    fn a_slots_row_is_the_units_of_its_entries() -> Result<()> {
+        let mut pooled = tables();
+        assert_eq!(pooled.table(0)?.dims(), [3, 4]);
+        assert_eq!(pooled.table(0)?.dtype(), DType::U32);
         assert_eq!(
-            (tables.row(1)?, tables.row(2)?, tables.padding_row()),
+            (pooled.row(1)?, pooled.row(2)?, pooled.padding_row()),
             (0, 1, 2)
         );
 
-        tables.install(&[table(2, 0, 0, &[5, 6, 7], 12)], None)?;
-        assert_eq!(tables.host_table(0)?, [0, 0, 0, 0, 5, 6, 7, 0, 0, 0, 0, 0]);
-        assert_eq!(tables.installed(2, 0), Some((0, &[5, 6, 7][..])));
-        assert_eq!(tables.installed(1, 0), None);
+        let held: Vec<Change> = (0..3)
+            .map(|position| change(2, 0, position, Some((5 + position, 1))))
+            .collect();
+        pooled.apply(&held, None)?;
+        assert_eq!(pooled.host_table(0)?, [0, 0, 0, 0, 5, 6, 7, 0, 0, 0, 0, 0]);
 
-        // A shorter table of the same slot clears the tail the longer one left.
-        tables.install(&[table(2, 0, 0, &[9], 4)], None)?;
-        assert_eq!(tables.host_table(0)?[4..8], [9, 0, 0, 0]);
-
-        // A table whose first pages were retired names its units at their logical pages.
-        tables.install(&[table(1, 0, 2, &[3, 4], 16)], None)?;
-        assert_eq!(tables.host_table(0)?[..4], [0, 0, 3, 4]);
-
-        // The padding row is never written.
-        assert_eq!(tables.host_table(0)?[8..], [0, 0, 0, 0]);
+        // Entries that left behind a window name the padding unit again, at their positions,
+        // and another slot's entries are its row's.
+        let changes = [
+            change(2, 0, 0, None),
+            change(2, 0, 1, None),
+            change(1, 0, 2, Some((3, 1))),
+            change(1, 0, 3, Some((4, 1))),
+        ];
+        pooled.apply(&changes, None)?;
+        assert_eq!(pooled.host_table(0)?, [0, 0, 3, 4, 0, 0, 7, 0, 0, 0, 0, 0]);
         Ok(())
     }
 
-    /// The state group's table is kept for the copies that name its pages, and has no pooled
-    /// table: a page that holds no checkpoint names the padding unit.
+    /// A state block spans two units and has no pooled table: its entries change no row.
     #[test]
-    fn a_state_table_is_mirrored_without_a_pooled_table() -> Result<()> {
-        let mut tables = tables();
+    fn a_state_entry_has_no_pooled_row() -> Result<()> {
+        let mut pooled = tables();
 
-        tables.install(&[table(1, 1, 1, &[0, 0, 8, 9], 12)], None)?;
-        assert_eq!(tables.installed(1, 1), Some((1, &[0, 0, 8, 9][..])));
-        assert!(tables.host_table(0)?.iter().all(|unit| *unit == 0));
-        assert!(tables.table(1).is_err());
+        pooled.apply(&[change(1, 1, 1, Some((8, 2)))], None)?;
+        assert!(pooled.host_table(0)?.iter().all(|unit| *unit == 0));
+        assert!(pooled.table(1).is_err());
         Ok(())
     }
 
-    /// A refused table names its slot, its group and the reason, and installs nothing, not even
-    /// the valid tables stated beside it.
+    /// A refused change names its slot, its class and its position, and writes nothing, not
+    /// even the valid changes beside it.
     #[test]
-    fn a_refused_table_installs_nothing() -> Result<()> {
-        let mut tables = tables();
-        let valid = table(1, 0, 0, &[1, 2], 8);
-        let refused = |tables: &mut PageTables, table: BlockTable| {
-            tables
-                .install(&[valid.clone(), table], None)
-                .expect_err("the table is refused")
+    fn a_refused_change_writes_nothing() -> Result<()> {
+        let mut pooled = tables();
+        let valid = change(1, 0, 0, Some((1, 1)));
+        let mut refused = |other: Change| {
+            pooled
+                .apply(&[valid, other], None)
+                .expect_err("the change is refused")
                 .to_string()
         };
 
         // Slot zero owns no row, and neither does a slot past the last.
-        let slot = refused(&mut tables, table(0, 0, 0, &[3], 4));
+        let slot = refused(change(0, 0, 0, Some((3, 1))));
         assert!(slot.contains("request slot 0"), "{slot}");
-        assert!(refused(&mut tables, table(3, 0, 0, &[3], 4)).contains("1..=2"));
-        // A group the cache does not hold.
-        assert!(refused(&mut tables, table(2, 5, 0, &[3], 4)).contains("no such group"));
-        // A unit outside the pool.
-        assert!(refused(&mut tables, table(2, 0, 0, &[16], 4)).contains("unit 16"));
-        // More pages than a row holds, counted from page zero.
-        assert!(refused(&mut tables, table(2, 0, 3, &[3, 4], 20)).contains("page 5"));
-        // Tokens its pages do not hold.
-        assert!(refused(&mut tables, table(2, 0, 0, &[3], 5)).contains("5 allocated tokens"));
-        // A state page of two units stated as one.
-        assert!(refused(&mut tables, table(2, 1, 0, &[3], 4)).contains("whole pages"));
-        // Two tables of one slot and group.
-        assert!(refused(&mut tables, valid.clone()).contains("two block tables"));
+        assert!(refused(change(3, 0, 0, Some((3, 1)))).contains("1..=2"));
+        // A position past a row's pages.
+        assert!(refused(change(2, 0, 4, Some((3, 1)))).contains("4 pages"));
+        // A unit outside the pool, the padding unit, and a block of two units.
+        assert!(refused(change(2, 0, 0, Some((16, 1)))).contains("unit 16"));
+        assert!(refused(change(2, 0, 0, Some((0, 1)))).contains("unit 0"));
+        assert!(refused(change(2, 0, 0, Some((3, 2)))).contains("2 units"));
 
-        assert_eq!(tables.installed(1, 0), None);
-        assert!(tables.host_table(0)?.iter().all(|unit| *unit == 0));
+        assert!(pooled.host_table(0)?.iter().all(|unit| *unit == 0));
         Ok(())
-    }
-
-    /// A released slot's rows name the padding unit again and its tables are forgotten.
-    #[test]
-    fn a_released_slot_holds_nothing() -> Result<()> {
-        let mut tables = tables();
-        tables.install(
-            &[
-                table(1, 0, 0, &[1, 2], 8),
-                table(1, 1, 0, &[4, 5], 4),
-                table(2, 0, 0, &[3], 4),
-            ],
-            None,
-        )?;
-
-        tables.release(&[1], None)?;
-        assert_eq!(tables.installed(1, 0), None);
-        assert_eq!(tables.installed(1, 1), None);
-        assert_eq!(tables.host_table(0)?, [0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]);
-        assert!(tables.release(&[3], None).is_err());
-        Ok(())
-    }
-
-    /// An attention group whose page spans several units has no row to state.
-    #[test]
-    fn an_attention_page_of_several_units_is_refused() {
-        let mut layout = CacheLayout::dense(4, 2, 1, 4, PrefixCacheDtype::BFloat16);
-        layout.groups[0].units_per_page = 2;
-        layout.groups[0].kind = CacheGroupKind::SlidingWindow { window: 8 };
-        let mut tables = PageTables::meta(Arc::new(layout), 2, 4, 16).expect("page tables");
-
-        let refused = tables
-            .install(&[table(1, 0, 0, &[1, 2], 4)], None)
-            .expect_err("a page of two units");
-        assert!(refused.to_string().contains("several units"), "{refused}");
     }
 }

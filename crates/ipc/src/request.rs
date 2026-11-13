@@ -4,10 +4,21 @@
 //! [`Frame`]. Each envelope's optional `message_id` is the
 //! request-response correlation identity: a rank responds to a request under the
 //! identity it carried, and a transport that matches a response to its request
-//! reads the identity from the decoded envelope, taking `None` as zero. It is
-//! unrelated to the prepared calls' [`CallId`] values inside a batch. The one
+//! reads the identity from the decoded envelope, taking `None` as zero. The one
 //! message a rank sends unasked, [`MainProcessResponse::Stalled`], responds to no
 //! request and carries no identity.
+//!
+//! Between the engine processes of an epoch these frames carry the jobs of a
+//! worker group whose ranks are on several hosts: its batches and shadow
+//! batches under the numbers the scheduler node gave them, the buffer pool's
+//! completions the ranks' device block tables are fed by, and the requests the
+//! ranks stamp. A request or a completion of the buffer pool travels as the
+//! record of its own encoding (`storage::runtime`), the one statement of its
+//! layout. Every [`MainProcessResponse::Result`] states the last numbered job
+//! the responding process's ranks of the group have ended, so the group's
+//! `completed` is the smallest over all of its ranks.
+
+use storage::runtime::{Completion, GroupId, Request, RequestId};
 
 use super::*;
 
@@ -21,6 +32,10 @@ pub enum RequestKind {
     Submit,
     /// Submits a shadow batch.
     Shadow,
+    /// Maps a completion of the buffer pool into the ranks' device block tables.
+    Map,
+    /// Applies requests to the ranks' device block tables and stamps them.
+    Stamp,
     /// Requests orderly worker shutdown.
     Close,
     /// Promotes a standby worker to serving.
@@ -40,21 +55,58 @@ pub enum MainProcessRequest {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
     },
-    /// Submits a batch.
+    /// Submits a batch to the process's ranks of its group. Responds with
+    /// [`MainProcessResponse::Result`]: the batch's output and the `Finish` of
+    /// each copy the ranks ran with it.
     Submit {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
-        /// Fully lowered batch.
-        batch: Box<crate::execution::Batch>,
+        /// The batch's number among the group's jobs that address its device
+        /// block tables, which the scheduler node gave it.
+        sequence: u64,
+        /// Whether the process's ranks only take the number: another rank of
+        /// the group runs the batch alone.
+        pass: bool,
+        /// The batch.
+        batch: Box<crate::batch::Batch>,
     },
-    /// Submits a shadow batch (§7.3 step 2): the paired forwards of the batch's generation
-    /// against the serving one, which a group's ranks run together as they run its serving
-    /// batches. Responds as [`Self::Submit`] is.
+    /// Submits a shadow batch: the paired forwards of the batch's generation
+    /// against the serving one, which a group's ranks run together as they run
+    /// its serving batches. Responds as [`Self::Submit`] is.
     Shadow {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
-        /// Fully lowered shadow batch.
-        batch: Box<crate::execution::Batch>,
+        /// The shadow batch's number among the group's jobs, as for a batch.
+        sequence: u64,
+        /// The shadow batch.
+        batch: Box<crate::batch::Batch>,
+    },
+    /// Maps a completion of the buffer pool, with the request it answers, into
+    /// the device block tables of the process's ranks of `group`, under
+    /// `slot`. Responds with an empty [`MainProcessResponse::Result`].
+    Map {
+        /// Optional request-response correlation identity.
+        message_id: Option<u64>,
+        group: GroupId,
+        /// The slot under which the request's entries are kept in the group.
+        slot: u32,
+        /// The request's record (`storage::runtime::Request::encode`), under
+        /// the request's number.
+        request: Vec<u8>,
+        /// The completion's record (`storage::runtime::Completion::encode`).
+        completion: Vec<u8>,
+    },
+    /// Applies requests to the device block tables of the process's ranks of
+    /// `group` and stamps them. Responds with a [`MainProcessResponse::Result`]
+    /// that returns the requests, each with the group's stamp as the process's
+    /// ranks state it.
+    Stamp {
+        /// Optional request-response correlation identity.
+        message_id: Option<u64>,
+        group: GroupId,
+        /// The requests' records (`storage::runtime::Request::encode`); their
+        /// numbers are not read.
+        requests: Vec<Vec<u8>>,
     },
     /// Requests orderly worker shutdown.
     Close {
@@ -88,6 +140,8 @@ impl MainProcessRequest {
             Self::Info { .. } => RequestKind::Info,
             Self::Submit { .. } => RequestKind::Submit,
             Self::Shadow { .. } => RequestKind::Shadow,
+            Self::Map { .. } => RequestKind::Map,
+            Self::Stamp { .. } => RequestKind::Stamp,
             Self::Close { .. } => RequestKind::Close,
             Self::Promote { .. } => RequestKind::Promote,
             Self::Hook { .. } => RequestKind::Hook,
@@ -100,6 +154,8 @@ impl MainProcessRequest {
             Self::Info { message_id }
             | Self::Submit { message_id, .. }
             | Self::Shadow { message_id, .. }
+            | Self::Map { message_id, .. }
+            | Self::Stamp { message_id, .. }
             | Self::Close { message_id }
             | Self::Promote { message_id }
             | Self::Hook { message_id, .. } => *message_id = value,
@@ -107,7 +163,7 @@ impl MainProcessRequest {
     }
 
     /// Returns the batch carried by this request, if any.
-    pub const fn batch(&self) -> Option<&crate::execution::Batch> {
+    pub const fn batch(&self) -> Option<&crate::batch::Batch> {
         match self {
             Self::Submit { batch, .. } | Self::Shadow { batch, .. } => Some(batch),
             _ => None,
@@ -119,19 +175,57 @@ impl MainProcessRequest {
         Self::Info { message_id: None }
     }
 
-    /// Constructs a batch-submission request.
-    pub fn submit(batch: crate::execution::Batch) -> Self {
+    /// Constructs a batch-submission request of the batch numbered
+    /// `sequence`, which the process's ranks only number when `pass` is set.
+    pub fn submit(sequence: u64, pass: bool, batch: crate::batch::Batch) -> Self {
         Self::Submit {
             message_id: None,
+            sequence,
+            pass,
             batch: Box::new(batch),
         }
     }
 
-    /// Constructs a shadow-batch request.
-    pub fn shadow(batch: crate::execution::Batch) -> Self {
+    /// Constructs a shadow-batch request of the shadow batch numbered
+    /// `sequence`.
+    pub fn shadow(sequence: u64, batch: crate::batch::Batch) -> Self {
         Self::Shadow {
             message_id: None,
+            sequence,
             batch: Box::new(batch),
+        }
+    }
+
+    /// Constructs the request that maps `completion`, the answer to
+    /// `request` numbered `id`, into the device block tables of `group` under
+    /// `slot`.
+    pub fn map(
+        group: GroupId,
+        slot: u32,
+        id: RequestId,
+        request: &Request,
+        completion: &Completion,
+    ) -> Self {
+        let (mut encoded, mut answer) = (Vec::new(), Vec::new());
+        request.encode(id, &mut encoded);
+        completion.encode(id, &mut answer);
+
+        Self::Map {
+            message_id: None,
+            group,
+            slot,
+            request: encoded,
+            completion: answer,
+        }
+    }
+
+    /// Constructs the request that has the ranks of `group` apply and stamp
+    /// `requests`.
+    pub fn stamp(group: GroupId, requests: &[Request]) -> Self {
+        Self::Stamp {
+            message_id: None,
+            group,
+            requests: records(requests),
         }
     }
 
@@ -222,12 +316,21 @@ pub enum MainProcessResponse {
         /// Loaded worker capabilities.
         info: MainProcessInfo,
     },
-    /// Returns partial or terminal batch progress.
+    /// Responds to a job of a worker group: a batch, a shadow batch, a
+    /// completion mapped, requests stamped.
     Result {
         /// Optional request-response correlation identity.
         message_id: Option<u64>,
-        /// Physical batch result.
-        result: crate::execution::BatchOutput,
+        /// A batch's output; empty for every other job.
+        result: crate::batch::BatchOutput,
+        /// The requests the job returns for the buffer pool's submission
+        /// queue, as records (`storage::runtime::Request::encode`) whose
+        /// numbers are not read: a stamp's requests, each stamped; the `Finish`
+        /// of each copy a batch ran.
+        requests: Vec<Vec<u8>>,
+        /// The last numbered job of the group every rank of the responding
+        /// process has ended, with every earlier one ended.
+        ended: u64,
     },
     /// Acknowledges a successful control request.
     Ok {
@@ -283,7 +386,7 @@ impl MainProcessResponse {
     }
 
     /// Returns the batch result carried by this response, if any.
-    pub const fn output(&self) -> Option<&crate::execution::BatchOutput> {
+    pub const fn output(&self) -> Option<&crate::batch::BatchOutput> {
         match self {
             Self::Result { result, .. } => Some(result),
             _ => None,
@@ -298,11 +401,15 @@ impl MainProcessResponse {
         }
     }
 
-    /// Constructs a batch-result response.
-    pub fn result(result: crate::execution::BatchOutput) -> Self {
+    /// Constructs the response to a job of a worker group that returns
+    /// `result` and `requests`, from a process whose ranks of the group have
+    /// ended every numbered job up to `ended`.
+    pub fn result(result: crate::batch::BatchOutput, requests: &[Request], ended: u64) -> Self {
         Self::Result {
             message_id: None,
             result,
+            requests: records(requests),
+            ended,
         }
     }
 
@@ -318,4 +425,31 @@ impl MainProcessResponse {
             error,
         }
     }
+}
+
+/// The records of `requests`, each under the number 0, which no reader of a
+/// [`MainProcessRequest::Stamp`] or a [`MainProcessResponse::Result`] reads.
+fn records(requests: &[Request]) -> Vec<Vec<u8>> {
+    requests
+        .iter()
+        .map(|request| {
+            let mut record = Vec::new();
+            request.encode(RequestId(0), &mut record);
+            record
+        })
+        .collect()
+}
+
+/// The requests of `records`, as [`MainProcessRequest::Stamp`] and
+/// [`MainProcessResponse::Result`] carry them.
+///
+/// # Errors
+///
+/// A record that is not a request of this version of the buffer pool's
+/// interface.
+pub fn decode_requests(records: &[Vec<u8>]) -> storage::Result<Vec<Request>> {
+    records
+        .iter()
+        .map(|record| Request::decode(record).map(|(_, request)| request))
+        .collect()
 }

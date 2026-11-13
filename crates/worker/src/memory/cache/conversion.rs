@@ -3,10 +3,11 @@
 //!
 //! A cache that admits converted loads ([`CacheLayout::with_conversion`]: an FP8 cache, from its
 //! groups' dense compute type) keeps, per attention group, a source buffer of host storage: an
-//! exclusive tensor its host's Storage Server retains, into which the scheduler has the host's
-//! Transfer Server read a peer's pages of the dense source layout (`ipc::PoolConversion`). A
-//! page read there is never committed to a host pool. A batch's load of it
-//! (`ipc::PageCopy::staged`) runs on the rank's copy stream, page by page:
+//! exclusive tensor its host's Storage Server retains, into which the host's Transfer Server
+//! reads a peer's pages of the dense source layout (`ipc::PoolConversion`). A page read there
+//! is never committed to a host pool. The buffer pool names a page of it as a run of the
+//! group's source region, whose unit `u` is slot `u` of the buffer, and a copy from there into
+//! units is a converted load, which runs on the rank's copy stream, page by page:
 //!
 //! 1. both fields of the source page are copied into the device scratch, keys at `[0, 8E)` and
 //!    values at `[8E, 16E)` (the scratch layout of `ops::prefix_cache`);
@@ -28,7 +29,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ::storage::Key;
-use ipc::{PageCopy, PoolConversion};
+use ipc::PoolConversion;
 use ops::prefix_cache::{
     CacheCopyRegion, ConversionArgs, ConversionDescriptor, CopyRegionArgs, CopyRegionDescriptor,
     Field, PageConversion, scratch_bytes,
@@ -36,7 +37,7 @@ use ops::prefix_cache::{
 use platform::{CopyBatch, DeviceId, DevicePtr, DeviceRange, SourceOrder, Stream};
 use uniserve_tensor::{DType, Tensor};
 
-use super::host;
+use super::host::{self, HostPage};
 use super::layout::{CacheLayout, GroupLayout};
 use super::planes::Planes;
 use crate::memory::allocation::Storage;
@@ -322,15 +323,16 @@ impl Conversion {
         self.context.set_kernels(kernels);
     }
 
-    /// Converts the source pages of `loads` into their units on `stream`, the copy stream the
-    /// conversion was opened on. The units are new units of the batch, reset before; the
-    /// scheduler pins the source pages until the batch's output is accepted.
+    /// Converts the source pages of `loads`, each a group, a slot of its source buffer and the
+    /// units of the block, into their units on `stream`, the copy stream the conversion was
+    /// opened on. The units are the destination of the copy alone until it is reported done;
+    /// the buffer pool holds the source pages until then.
     ///
     /// # Errors
     ///
     /// When a page names a group or a slot outside the rank's source buffers, a batch converts
     /// more pages than its unit table holds, or a launch fails.
-    pub(crate) fn load(&self, planes: &Planes, loads: &[&PageCopy], stream: &Stream) -> Result<()> {
+    pub(crate) fn load(&self, planes: &Planes, loads: &[HostPage], stream: &Stream) -> Result<()> {
         if loads.is_empty() {
             return Ok(());
         }
@@ -344,8 +346,8 @@ impl Conversion {
 
         // Every page is checked before anything is issued.
         let stride = self.units_per_page as usize;
-        for copy in loads {
-            let group = copy.group_id as usize;
+        for (group, slot, units) in loads {
+            let group = *group as usize;
             let (Some((_, slots, _)), Some(layout)) =
                 (self.buffers.get(group), self.layout.groups.get(group))
             else {
@@ -353,28 +355,25 @@ impl Conversion {
                     "a converted load names cache group {group}, which converts nothing"
                 )));
             };
-            if copy.host_page >= u64::from(*slots)
-                || copy.units.len() != layout.units_per_page as usize
-            {
+            if *slot >= u64::from(*slots) || units.len() != layout.units_per_page as usize {
                 return Err(Error::Invalid(format!(
-                    "a converted load of slot {} with {} units, of a source buffer of {slots} \
-                     slots and pages of {} units",
-                    copy.host_page,
-                    copy.units.len(),
+                    "a converted load of slot {slot} with {} units, of a source buffer of \
+                     {slots} slots and pages of {} units",
+                    units.len(),
                     layout.units_per_page
                 )));
             }
-            for unit in &copy.units {
-                planes.require_unit(unit.0)?;
+            for unit in units.clone() {
+                planes.require_unit(unit)?;
             }
         }
 
         // Every page's units, one row of the table each, written before the first launch.
         let mut table = vec![0_i32; loads.len() * stride];
-        for (row, copy) in loads.iter().enumerate() {
-            for (column, unit) in copy.units.iter().enumerate() {
-                table[row * stride + column] = i32::try_from(unit.0)
-                    .map_err(|_| Error::Invalid(format!("unit {} past i32", unit.0)))?;
+        for (row, (_, _, units)) in loads.iter().enumerate() {
+            for (column, unit) in units.clone().enumerate() {
+                table[row * stride + column] = i32::try_from(unit)
+                    .map_err(|_| Error::Invalid(format!("unit {unit} past i32")))?;
             }
         }
         let mut write = CopyBatch::new(SourceOrder::DuringCall);
@@ -389,15 +388,15 @@ impl Conversion {
         unsafe { write.submit(stream) }?;
 
         let _installed = self.context.enter();
-        for (row, copy) in loads.iter().enumerate() {
-            let group = &self.layout.groups[copy.group_id as usize];
-            let (buffer, _, page_bytes) = &self.buffers[copy.group_id as usize];
+        for (row, (group, slot, _)) in loads.iter().enumerate() {
+            let (buffer, _, page_bytes) = &self.buffers[*group as usize];
+            let group = &self.layout.groups[*group as usize];
             let elements = group.page_elements();
 
             // The source page is the host page encoding of the source: keys, then values, each
             // `elements` elements of the source type.
             let field_bytes = page_bytes / 2;
-            let page = buffer.address() + copy.host_page * page_bytes;
+            let page = buffer.address() + slot * page_bytes;
             let mut fields = CopyBatch::new(SourceOrder::Stream);
             for index in 0..FIELDS.len() as u64 {
                 fields.push(
@@ -408,8 +407,8 @@ impl Conversion {
             }
 
             // SAFETY: the scratch is this conversion's, and the previous page's kernels, which
-            // read it, precede this copy on the stream; the source page is pinned until the
-            // batch's output is accepted.
+            // read it, precede this copy on the stream; the buffer pool holds the source page
+            // until the copy is reported done.
             unsafe { fields.submit(stream) }?;
 
             // SAFETY: the three tensors are windows of the scratch and the unit table, which

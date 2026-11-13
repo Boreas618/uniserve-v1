@@ -32,20 +32,26 @@
 //!
 //! ## A step
 //!
-//! [`Runner::execute`] serves one batch:
+//! Before a batch, the executor hands the runner the changes of the rank's device block table
+//! ([`Runner::write_tables`]) and the copies that start with the batch ([`Runner::copy`]).
+//! [`Runner::execute`] then serves the batch over that table:
 //!
 //! 1. the batch is checked and the smallest captured bucket that holds it is chosen;
-//! 2. the batch's columns are padded to the bucket ([`columns`]);
-//! 3. the slots the batch starts a request on are started, and its ban masks copied
+//! 2. the cache slot each token writes is computed from its cache position through the table,
+//!    and a call that would write an entry that is missing or read-only is refused
+//!    (`columns::slot_mapping`);
+//! 3. the batch's columns are padded to the bucket ([`columns`]);
+//! 4. the slots the batch starts a request on are started, and its ban masks copied
 //!    ([`slots`]);
-//! 4. the batch's page work that precedes the forward is issued ([`PageWork::BeforeReplay`]);
-//! 5. the padded columns are written into the input block, with the host values the forward
+//! 5. the batch's page work that precedes the forward is issued ([`PageWork::BeforeReplay`]);
+//! 6. the padded columns are written into the input block, with the host values the forward
 //!    computes, and the bucket's graph is replayed;
-//! 6. the page work that follows the forward is issued ([`PageWork::AfterReplay`]);
-//! 7. the stream event behind the replay is waited for, the outputs are read and one
-//!    `CallOutput` per call is assembled.
+//! 7. the page work that follows the forward is issued ([`PageWork::AfterReplay`]);
+//! 8. the stream event behind the replay is waited for, and the copies the batch took
+//!    ([`PageWork::Ended`]); the outputs are read and one `CallOutput` per call is assembled,
+//!    in the batch's order, a refused call's as a failure.
 //!
-//! Steps 3 to 6 are issued on one stream in that order, which is the only synchronization
+//! Steps 4 to 7 are issued on one stream in that order, which is the only synchronization
 //! between them: the replay reads the slot state, the pooled page tables and the pages as the
 //! copies before it left them.
 //!
@@ -53,9 +59,9 @@
 //!
 //! The key/value cache and the recurrent state belong to the rank, which two runners of a
 //! device may share. The runner takes their tensors at construction and never copies a page:
-//! a batch's table installs, unit copies, page loads and offloads and state copies are issued
-//! by the rank's cache through the hook given to [`CausalLmRunner::set_page_work`]. A runner
-//! with no hook serves the batches that carry no page work and refuses one that carries some.
+//! the device block table's changes, the copies of blocks and the state copies are issued by
+//! the rank's cache through the hook given to [`CausalLmRunner::set_page_work`]. A runner with
+//! no hook serves the batches that carry no page work and refuses one that carries some.
 //! [`wiring`] builds the runner and the hook from the rank's cache and state modules.
 //!
 //! ## Paired forwards
@@ -102,8 +108,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ipc::execution::{Batch, BatchOutput, RowKind, Shape as BatchShape, Variant};
-use ipc::{PhaseId, TimingCounters};
+use ipc::batch::{Batch, BatchOutput, Phase, Shape as BatchShape, TimingCounters, Variant};
 use nn::family::TextModel;
 use nn::{KvCache, PhaseKind, RecurrentState, TokenBatch};
 use platform::Stream;
@@ -111,12 +116,13 @@ use proto::module::commit::COMMIT_FIELDS;
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
 use uniserve_tensor::{DType, Shape, Tensor};
 
-use self::columns::{Column, Layout};
+use self::columns::{Column, Layout, Refusal};
 use self::experts::Member;
 use self::slots::Slots;
-use self::speculation::{DraftPages, DraftPool, Kept, Speculation};
+use self::speculation::{DraftPool, DraftTable, Kept, Speculation};
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
+use crate::memory::tables::{BlockCopy, BlockTables, Change};
 use crate::runner::Runner;
 use crate::sampler::{self, Sampler, SamplerConfig};
 use crate::{Error, Result};
@@ -129,8 +135,8 @@ const SCORE_ROWS: usize = 64;
 /// What a deployment fixes of a causal runner. Immutable once the runner is built.
 #[derive(Clone, Debug)]
 pub struct CausalLmConfig {
-    /// The phases the runner serves, as the scheduler addresses them in a batch.
-    pub phases: Vec<PhaseId>,
+    /// The phases the runner serves, as the scheduler names them in a batch.
+    pub phases: Vec<Phase>,
     /// The buckets the runner captures (`Buckets::for_batch`, `Buckets::default_causal_lm`):
     /// their largest rows and tokens are the batch bound the rank admits.
     pub buckets: Buckets,
@@ -157,19 +163,30 @@ pub struct CausalLmConfig {
     pub draft_pool: Option<DraftPool>,
 }
 
-/// Which part of a batch's page work the rank's cache issues.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PageWork {
-    /// What the forward reads: the batch's rows of the pooled page tables are installed, its
-    /// new units reset and filled with the copies a reused prefix needs, its page loads are
-    /// issued, and each restored slot's recurrent state is copied into the live buffers.
-    BeforeReplay,
-    /// What the forward left: each kept checkpoint of the recurrent state is copied to its
-    /// page, and the batch's page offloads are waited for.
+/// Which part of a batch's page work the rank's cache issues, with what that part reads.
+#[derive(Clone, Copy)]
+pub enum PageWork<'a> {
+    /// The rank's device block table changed at these positions since the last batch
+    /// ([`BlockTables::take_changes`]): the units the buffer pool allocated are reset and the
+    /// pooled page tables' rows that changed are written, before the next forward reads them.
+    Tables(&'a [Change]),
+    /// The copies of blocks that start with the next batch ([`BlockTables::start_copy`]): each
+    /// from its first run to its second, ended before the batch is.
+    Copies(&'a [BlockCopy]),
+    /// What the forward of the batch reads: its state copies are resolved through the tables,
+    /// a checkpoint's position to the run of units its entry holds, and refused where an entry
+    /// is missing or a keep's is read-only; each restored slot's recurrent state is copied into
+    /// the live buffers.
+    BeforeReplay(&'a Batch, &'a BlockTables),
+    /// What the forward left: each kept checkpoint of the recurrent state is copied to the
+    /// block its position names.
     AfterReplay,
-    /// What a paired forward reads: the pages its rows have cached are copied into the rows'
-    /// scratch pages.
-    BeforeShadow,
+    /// The batch ended, or failed: the copies issued for it are waited for, so the device has
+    /// completed them when the runner returns.
+    Ended,
+    /// What a paired forward of the batch reads: the pages its rows have cached are copied into
+    /// the rows' scratch pages.
+    BeforeShadow(&'a Batch),
 }
 
 /// The buffers of a recurrent state, as `nn::RecurrentState` lays them out: one entry per
@@ -179,7 +196,7 @@ pub type StateBuffers = Vec<Vec<Tensor>>;
 
 /// The seam through which the rank's cache issues a batch's page work on the runner's stream
 /// ([`CausalLmRunner::set_page_work`]).
-pub type PageWorkHook = Box<dyn FnMut(&Batch, PageWork) -> Result<()> + Send>;
+pub type PageWorkHook = Box<dyn FnMut(PageWork<'_>) -> Result<()> + Send>;
 
 /// The runner of a causal language model (module documentation).
 pub struct CausalLmRunner {
@@ -377,7 +394,6 @@ impl CausalLmRunner {
                     verifier,
                     draft: None,
                     trail: None,
-                    pages: None,
                 })
             }
             _ => None,
@@ -479,27 +495,19 @@ impl CausalLmRunner {
         Ok(())
     }
 
-    /// Sets what states a request slot's installed pages of the draft group
-    /// ([`DraftPages`]): what each drafter row's page table is built from. A runner given
-    /// none reads the tables its batches carry alone. A runner that speculates nothing
-    /// ignores it.
-    pub fn set_draft_pages(&mut self, pages: DraftPages) {
-        if let Some(speculation) = self.speculation.as_mut() {
-            speculation.pages = Some(pages);
-        }
-    }
-
     /// Sets what issues a batch's page work on the runner's stream.
     ///
-    /// The runner calls `hook` on the executor thread, twice per batch that carries page work
-    /// (block tables, cache units, page loads or offloads, state copies): with
-    /// [`PageWork::BeforeReplay`] after the slot state's writes and before the replay, and
-    /// with [`PageWork::AfterReplay`] after the replay and before its stream event is waited
-    /// for. The hook issues on the stream the runner's graphs replay on and waits for
-    /// nothing: the stream's order places the table installs, unit copies, page loads and
+    /// The runner calls `hook` on the executor thread: with [`PageWork::Tables`] for the
+    /// changes of the device block table the executor hands it, with [`PageWork::Copies`] for
+    /// the copies that start with a batch, and for every batch it serves with
+    /// [`PageWork::BeforeReplay`] after the slot state's writes and before the replay, with
+    /// [`PageWork::AfterReplay`] after the replay and before its stream event is waited for,
+    /// and with [`PageWork::Ended`] once the batch ended or failed. The hook issues on the
+    /// stream the runner's graphs replay on, or on the rank's copy stream, and waits for
+    /// nothing but at the end: the stream's order places the table writes, unit resets and
     /// state restores ahead of the replay that reads the pooled tables, the planes and the
-    /// live state, and the state keeps and page offloads behind it. The step's outputs are
-    /// read after both, so a completion is behind every copy of its batch.
+    /// live state, and the state keeps behind it. The step's outputs are read after the end,
+    /// so a completion is behind every copy of its batch.
     ///
     /// A hook's error fails the batch.
     pub fn set_page_work(&mut self, hook: PageWorkHook) {
@@ -620,21 +628,13 @@ impl CausalLmRunner {
         let columns = &batch.columns;
         let shape = batch.shape;
 
-        if batch.media.is_some() {
+        if !batch.media.is_empty() || shape.variant.media() {
             return Err(Error::Invalid(format!(
                 "batch {} is a media computation, which a causal runner serves none of",
                 batch.id.0
             )));
         }
-        columns.check(&shape)?;
-        if batch.calls.len() != columns.calls() {
-            return Err(Error::Invalid(format!(
-                "batch {} names {} calls and states {} call rows",
-                batch.id.0,
-                batch.calls.len(),
-                columns.calls()
-            )));
-        }
+        batch.check()?;
 
         // The page size and the key bound are part of every captured launch.
         if columns.page_size != self.config.page_size || columns.max_kv_len > self.config.max_kv_len
@@ -651,7 +651,7 @@ impl CausalLmRunner {
         }
 
         // Work the runner states no bucket for is refused by its name, never served as text.
-        if !columns.vision.is_empty() || !batch.images.is_empty() {
+        if !columns.vision.is_empty() {
             return Err(Error::Unsupported(format!(
                 "batch {} carries image rows, and this runner places no image features",
                 batch.id.0
@@ -674,7 +674,7 @@ impl CausalLmRunner {
                     .rows
                     .calls
                     .iter()
-                    .any(|call| call.kind == RowKind::Verify);
+                    .any(|call| call.kind == Phase::Verify);
                 if verifies || !columns.drafts.is_empty() {
                     return Err(Error::Unsupported(format!(
                         "batch {} verifies or drafts tokens, and this runner's config states no \
@@ -686,7 +686,7 @@ impl CausalLmRunner {
             }
         };
 
-        refuse_drawn_rows(&shape.variant, &columns.parameters)?;
+        refuse_drawn_rows(shape.variant, &columns.parameters)?;
 
         // A verification is served from the verification bucket of its selection, whether its
         // batch states a decode's shape or a verification's.
@@ -739,57 +739,70 @@ impl CausalLmRunner {
             })
     }
 
-    /// The installed draft pages of each row of `batch`, `(first page, units)` in row order:
-    /// the table the batch itself carries for the row's slot, or the one the cache holds.
-    fn draft_tables(&mut self, batch: &Batch) -> Vec<(u32, Vec<u32>)> {
-        let Some(speculation) = self.speculation.as_mut() else {
-            return Vec::new();
-        };
-        let group = speculation.pool.group;
-
-        let mut tables = Vec::with_capacity(batch.columns.slots.len());
-        for held in &batch.columns.slots {
-            let Some(slot) = u32::try_from(*held).ok().filter(|slot| *slot > 0) else {
-                tables.push((0, Vec::new()));
-                continue;
-            };
-
-            let carried = batch
-                .block_tables
-                .iter()
-                .find(|table| table.request_pool_idx == slot && table.group_id == group)
-                .map(|table| {
-                    let units = table.unit_ids.iter().map(|unit| unit.0).collect();
-                    (table.start_page, units)
-                });
-            let installed = match (carried, speculation.pages.as_mut()) {
-                (Some(carried), _) => Some(carried),
-                (None, Some(pages)) => pages(slot),
-                (None, None) => None,
-            };
-
-            tables.push(installed.unwrap_or_default());
-        }
-        tables
+    /// The cache slot each token of `batch` writes through `tables`, and the calls refused for
+    /// a token whose entry may not be written (`columns::slot_mapping`). A call writes the
+    /// attention group it names: the model's attention groups come first among the cache
+    /// groups, in the order the runner is lent them.
+    fn slot_mapping(
+        &self,
+        batch: &Batch,
+        tables: &BlockTables,
+    ) -> Result<(Vec<u32>, Vec<Refusal>)> {
+        columns::slot_mapping(
+            &batch.columns.rows,
+            tables,
+            self.config.page_size,
+            self.cache.len() as u32,
+        )
+        .map_err(|error| Error::Invalid(format!("batch {}: {error}", batch.id.0)))
     }
 
-    /// Prepares the inputs of a step of `batch` in `bucket`: its padded columns, and the host
-    /// values the bucket's forward computes; `scratch` is a paired forward's slot mapping.
-    fn fill(&mut self, batch: &Batch, bucket: &Bucket, scratch: Option<&[u32]>) -> Result<()> {
-        self.stage(batch, bucket, scratch)?;
+    /// The draft pages of each row of `batch`, in row order, from its slot's entries of the
+    /// draft group's class of `tables` ([`DraftPool::table`]); a row on no slot states none.
+    /// Empty for a runner that speculates nothing.
+    fn draft_tables(&self, batch: &Batch, tables: &BlockTables) -> Result<Vec<DraftTable>> {
+        let Some(speculation) = &self.speculation else {
+            return Ok(Vec::new());
+        };
+
+        let mut drafted = Vec::with_capacity(batch.columns.slots.len());
+        for held in &batch.columns.slots {
+            match u32::try_from(*held).ok().filter(|slot| *slot > 0) {
+                Some(slot) => drafted.push(speculation.pool.table(tables, slot)?),
+                None => drafted.push((0, Vec::new(), Vec::new())),
+            }
+        }
+        Ok(drafted)
+    }
+
+    /// Prepares the inputs of a step of `batch` in `bucket` over `tables`: its padded columns,
+    /// with `mapping` the cache slot each token writes and `paired` for a paired forward
+    /// (`columns::fill`), and the host values the bucket's forward computes.
+    fn fill(
+        &mut self,
+        batch: &Batch,
+        bucket: &Bucket,
+        tables: &BlockTables,
+        mapping: &[u32],
+        paired: bool,
+    ) -> Result<()> {
+        self.stage(batch, bucket, tables, mapping, paired)?;
         self.prepare_staged(bucket)
     }
 
-    /// Pads `batch`'s columns to `bucket` in the runner's own bytes of the input block, and
-    /// returns the ban masks of the step's sampling rows (`sampler::adjustments`), empty for
-    /// a step that bans nothing. The columns of a bucket are those of every capacity class of
-    /// it. A runner that speculates also pads the columns of the drafter's forward behind the
-    /// bucket, which lie in the same block.
+    /// Pads `batch`'s columns to `bucket` in the runner's own bytes of the input block, with
+    /// `mapping` the cache slot each of its tokens writes and `paired` for a paired forward,
+    /// and returns the ban masks of the step's sampling rows (`sampler::adjustments`), empty
+    /// for a step that bans nothing. The columns of a bucket are those of every capacity class
+    /// of it. A runner that speculates also pads the columns of the drafter's forward behind
+    /// the bucket, which lie in the same block, with each row's draft pages from `tables`.
     fn stage(
         &mut self,
         batch: &Batch,
         bucket: &Bucket,
-        scratch: Option<&[u32]>,
+        tables: &BlockTables,
+        mapping: &[u32],
+        paired: bool,
     ) -> Result<Vec<u32>> {
         self.staged.resize(self.layout.bytes() as usize, 0);
         let vocabulary = self.model.vocabulary();
@@ -806,9 +819,16 @@ impl CausalLmRunner {
                 &batch.columns,
                 &rows,
                 bucket,
+                mapping,
                 &mut self.staged,
             )?;
-            sampler::adjustments(&rows.adjustments, bucket.tokens as usize, vocabulary)?.1
+            sampler::adjustments(
+                &rows.biased,
+                &rows.banned,
+                bucket.tokens as usize,
+                vocabulary,
+            )?
+            .1
         } else {
             columns::fill(
                 &self.layout,
@@ -816,20 +836,28 @@ impl CausalLmRunner {
                 vocabulary,
                 &batch.columns,
                 bucket,
-                scratch,
+                mapping,
+                paired,
                 &mut self.staged,
             )?;
-            sampler::adjustments(&batch.columns.adjustments, bucket.rows as usize, vocabulary)?.1
+            let columns = &batch.columns;
+            sampler::adjustments(
+                &columns.biased,
+                &columns.banned,
+                bucket.rows as usize,
+                vocabulary,
+            )?
+            .1
         };
 
-        let tables = self.draft_tables(batch);
+        let drafted = self.draft_tables(batch, tables)?;
         if let Some(speculation) = &self.speculation {
             speculation::fill_drafter(
                 &self.layout,
                 &speculation.pool,
                 vocabulary,
                 &batch.columns,
-                &tables,
+                &drafted,
                 bucket,
                 &mut self.staged,
             )?;
@@ -882,6 +910,151 @@ impl CausalLmRunner {
                 device_us: launched.elapsed().as_micros() as u64,
                 copy_us: 0,
                 host_us: launched.duration_since(started).as_micros() as u64,
+            },
+            forward_stats: None,
+        })
+    }
+
+    /// Serves one step of `batch` over `tables`: everything of [`Runner::execute`] but waiting
+    /// for the copies the batch took.
+    fn serve(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
+        let started = Instant::now();
+
+        // A join names no call: it is this member's part in a step of the union.
+        if batch.shape.variant == Variant::ExpertJoin {
+            return self.join_step(batch, started);
+        }
+
+        // Any other batch that names no call computes nothing: it carries copies alone.
+        if batch.requests.is_empty() && batch.columns.calls() == 0 {
+            return Ok(BatchOutput::default());
+        }
+        if self.union.as_ref().is_some_and(Member::experts_only) {
+            return Err(Error::Invalid(format!(
+                "batch {} reached a member of an expert union that holds experts alone and \
+                 serves no request",
+                batch.id.0
+            )));
+        }
+
+        if !batch.columns.state_copies.is_empty() && self.page_work.is_none() {
+            return Err(Error::Invalid(format!(
+                "batch {} carries state copies, and the runner was given nothing that issues \
+                 them",
+                batch.id.0
+            )));
+        }
+        // Everything that can refuse the batch comes first: the choice of a bucket, the cache
+        // slots its tokens write and the padding of the columns.
+        let base = self.choose(batch)?;
+        let verify = verifies(base.variant);
+
+        // A runner that speculates issues the drafter's graph behind the batch's own.
+        let drafter = match &self.speculation {
+            Some(_) => {
+                let drafter = Bucket::draft(base.rows, base.tokens);
+                if self.graphs.select(|held| *held == drafter).is_none() {
+                    return Err(Error::State(
+                        "the drafter's bucket behind the batch's is not captured",
+                    ));
+                }
+                Some(drafter)
+            }
+            None => None,
+        };
+
+        // A refused call writes nothing and fails alone; the others are served.
+        let (mapping, refused) = self.slot_mapping(batch, tables)?;
+        let masks = self.stage(batch, &base, tables, &mapping, false)?;
+
+        // The slot state's writes, ahead of the replay that reads them.
+        self.slots.begin()?;
+        self.slots.start(
+            &self.sampler,
+            &batch.columns,
+            &batch.new_slots,
+            base.variant.is_decode(),
+        )?;
+        if !masks.is_empty() {
+            self.slots.ban(&masks)?;
+        }
+
+        if let Some(hook) = self.page_work.as_mut() {
+            hook(PageWork::BeforeReplay(batch, tables))?;
+        }
+
+        // A member of an expert union agrees the step with the other members, which blocks
+        // until each has entered it, and runs the capacity class that holds it.
+        let bucket = match self.union.as_mut() {
+            Some(member) => {
+                let tokens = batch.columns.tokens() as u32;
+                let capacity = member.enter(tokens, batch.group, batch.phase, batch.generation)?;
+
+                let bucket = at_capacity(&self.graphs, &base, capacity)?;
+                if let Some(stream) = &self.stream {
+                    member.write(capacity, stream)?;
+                }
+                bucket
+            }
+            None => base,
+        };
+        self.prepare_staged(&bucket)?;
+
+        let launched = Instant::now();
+        let outputs = self.graphs.replay(&bucket)?;
+
+        // The drafter's columns lie in the block the batch's graph was issued with, and its
+        // graph reads what that graph kept: the stream's order is their synchronization.
+        let proposals = match &drafter {
+            Some(drafter) => {
+                self.prepare_staged(drafter)?;
+                Some(self.graphs.replay(drafter)?)
+            }
+            None => None,
+        };
+
+        if let Some(hook) = self.page_work.as_mut() {
+            hook(PageWork::AfterReplay)?;
+        }
+
+        self.graphs.wait()?;
+        let landed = Instant::now();
+        self.slots.settled();
+
+        // The read waits for the stream, and so for the copies issued behind the replay.
+        let calls = {
+            let _guard = self.graphs.enter()?;
+            let vocabulary = self.model.vocabulary();
+            let candidates = self.config.candidates;
+
+            let mut calls = if verify {
+                output::verification_output(
+                    &batch.columns,
+                    &bucket,
+                    vocabulary,
+                    candidates,
+                    &outputs,
+                )?
+            } else {
+                output::calls_output(&batch.columns, &bucket, vocabulary, candidates, &outputs)?
+            };
+            if let Some(proposals) = &proposals {
+                speculation::propose(batch, vocabulary, proposals, &mut calls)?;
+            }
+            output::refuse(&mut calls, &refused);
+            calls
+        };
+
+        let host = launched.duration_since(started) + landed.elapsed();
+        Ok(BatchOutput {
+            calls,
+            timing: TimingCounters {
+                // The executor states the wait it saw before it called the runner.
+                queued_us: 0,
+                device_us: landed.duration_since(launched).as_micros() as u64,
+                // Nothing is transferred for a completion: the scheduler reads it here.
+                copy_us: 0,
+                host_us: host.as_micros() as u64,
             },
             forward_stats: None,
         })
@@ -951,7 +1124,7 @@ impl CausalLmRunner {
 }
 
 impl Runner for CausalLmRunner {
-    fn phases(&self) -> &[PhaseId] {
+    fn phases(&self) -> &[Phase] {
         &self.config.phases
     }
 
@@ -1212,6 +1385,7 @@ impl Runner for CausalLmRunner {
                 &idle,
                 &speculation::token_rows(&idle),
                 bucket,
+                &[],
                 columns,
             );
         }
@@ -1229,7 +1403,8 @@ impl Runner for CausalLmRunner {
             vocabulary,
             &idle,
             &target,
-            None,
+            &[],
+            false,
             columns,
         )?;
 
@@ -1247,12 +1422,24 @@ impl Runner for CausalLmRunner {
         }
     }
 
-    fn prepare_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+    /// Prepares the inputs of a step of `batch` over `tables`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::prepare_inputs`]: a call one of whose tokens names a cache entry that is
+    /// missing or read-only refuses the batch here, since a preparation reports no call; a
+    /// served step fails that call alone ([`Runner::execute`]).
+    fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
         // Outside a step, a member of an expert union prepares the smallest capacity class of
         // the bucket: the class a step runs follows from its agreement (`execute`).
         let bucket = self.choose(batch)?;
 
-        self.fill(batch, &bucket, None)?;
+        let (mapping, refused) = self.slot_mapping(batch, tables)?;
+        if let Some((_, reason)) = refused.first() {
+            return Err(Error::Invalid(format!("batch {}: {reason}", batch.id.0)));
+        }
+
+        self.fill(batch, &bucket, tables, &mapping, false)?;
         Ok(bucket)
     }
 
@@ -1260,10 +1447,10 @@ impl Runner for CausalLmRunner {
     /// returns the bucket the executor passes to `Graphs::shadow`.
     ///
     /// The columns are the batch's own, padded as a serving step's, except that every token
-    /// writes its row's scratch pages, every row gathers its own row of the scratch set's
-    /// page table, and the commit table is inert (`columns`). No slot is started and none of
-    /// the batch's own page work is issued: the forward reads the slots' state as it stands
-    /// and writes none of it.
+    /// writes its row's scratch pages at its cache position, every row gathers its own row of
+    /// the scratch set's page table, and the commit table is inert (`columns`). No slot is
+    /// started and none of the batch's own page work is issued: the forward reads the slots'
+    /// state as it stands and writes none of it.
     ///
     /// # Errors
     ///
@@ -1272,7 +1459,7 @@ impl Runner for CausalLmRunner {
     /// union, whose exchange launches wait for the other members', for a verification, and
     /// for a runner that was lent no scratch page set; [`Error::Invalid`] for a row whose
     /// tokens lie past its scratch pages.
-    fn prepare_shadow_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+    fn prepare_shadow_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
         if self.union.is_some() {
             return Err(Error::Unsupported(
                 "a paired forward of a member of an expert union would wait on its device for \
@@ -1303,166 +1490,77 @@ impl Runner for CausalLmRunner {
 
         let rows = &batch.columns.rows;
         let scratch = columns::scratch_column(
-            &rows.positions,
+            &rows.cache_positions,
             &rows.query_offsets,
-            &rows.slot_mapping,
             bucket.tokens as usize,
             self.config.scratch_pages,
             self.config.page_size,
         )?;
 
-        self.fill(batch, &bucket, Some(&scratch))?;
+        self.fill(batch, &bucket, tables, &scratch, true)?;
 
         // The rows' cached history reaches their scratch pages ahead of the forward.
         if let Some(hook) = self.page_work.as_mut() {
-            hook(batch, PageWork::BeforeShadow)?;
+            hook(PageWork::BeforeShadow(batch))?;
         }
         self.paired.set(true);
         Ok(bucket)
     }
 
-    fn execute(&mut self, batch: &Batch) -> Result<BatchOutput> {
-        let started = Instant::now();
+    /// One step of `batch` over `tables` (module documentation). It returns once the device
+    /// completed the step and the copies [`Runner::copy`] issued for it, whether the step was
+    /// served or failed.
+    fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
+        let served = self.serve(batch, tables);
 
-        // A join names no call: it is this member's part in a step of the union.
-        if batch.shape.variant == Variant::ExpertJoin {
-            return self.join_step(batch, started);
-        }
-
-        // Any other batch that names no call computes nothing: it carries releases alone.
-        if batch.calls.is_empty() && batch.columns.calls() == 0 {
-            return Ok(BatchOutput::default());
-        }
-        if self.union.as_ref().is_some_and(Member::experts_only) {
-            return Err(Error::Invalid(format!(
-                "batch {} reached a member of an expert union that holds experts alone and \
-                 serves no request",
-                batch.id.0
-            )));
-        }
-
-        let work = carries_page_work(batch);
-        if work && self.page_work.is_none() {
-            return Err(Error::Invalid(format!(
-                "batch {} carries page work (block tables, cache units, page copies or state \
-                 copies), and the runner was given nothing that issues it",
-                batch.id.0
-            )));
-        }
-        // Everything that can refuse the batch comes first: the choice of a bucket and the
-        // padding of the columns.
-        let base = self.choose(batch)?;
-        let verify = verifies(base.variant);
-
-        // A runner that speculates issues the drafter's graph behind the batch's own.
-        let drafter = match &self.speculation {
-            Some(_) => {
-                let drafter = Bucket::draft(base.rows, base.tokens);
-                if self.graphs.select(|held| *held == drafter).is_none() {
-                    return Err(Error::State(
-                        "the drafter's bucket behind the batch's is not captured",
-                    ));
-                }
-                Some(drafter)
-            }
-            None => None,
+        // The copies the batch took end with it, also when it failed.
+        let ended = match self.page_work.as_mut() {
+            Some(hook) => hook(PageWork::Ended),
+            None => Ok(()),
         };
-        let masks = self.stage(batch, &base, None)?;
+        let output = served?;
+        ended?;
+        Ok(output)
+    }
 
-        // The slot state's writes, ahead of the replay that reads them.
-        self.slots.begin()?;
-        self.slots
-            .start(&self.sampler, &batch.columns, base.variant.is_decode())?;
-        if !masks.is_empty() {
-            self.slots.ban(&masks)?;
+    /// Writes the device block table's `changes` into the pooled page tables and resets the
+    /// units the buffer pool allocated, through the page-work hook ([`PageWork::Tables`]).
+    ///
+    /// # Errors
+    ///
+    /// What the hook refuses; [`Error::Invalid`] for changes given to a runner that was given
+    /// nothing that writes its tables.
+    fn write_tables(&mut self, changes: &[Change]) -> Result<()> {
+        match self.page_work.as_mut() {
+            Some(hook) => hook(PageWork::Tables(changes)),
+            None if changes.is_empty() => Ok(()),
+            None => Err(Error::Invalid(format!(
+                "{} changes of the device block table reach a runner that was given nothing \
+                 that writes its page tables",
+                changes.len()
+            ))),
         }
+    }
 
-        if let (true, Some(hook)) = (work, self.page_work.as_mut()) {
-            hook(batch, PageWork::BeforeReplay)?;
-        }
-
-        // A member of an expert union agrees the step with the other members, which blocks
-        // until each has entered it, and runs the capacity class that holds it.
-        let bucket = match self.union.as_mut() {
-            Some(member) => {
-                let tokens = batch.columns.tokens() as u32;
-                let capacity = member.enter(tokens, batch.phase, batch.generation)?;
-
-                let bucket = at_capacity(&self.graphs, &base, capacity)?;
-                if let Some(stream) = &self.stream {
-                    member.write(capacity, stream)?;
-                }
-                bucket
-            }
-            None => base,
-        };
-        self.prepare_staged(&bucket)?;
-
-        let launched = Instant::now();
-        let outputs = self.graphs.replay(&bucket)?;
-
-        // The drafter's columns lie in the block the batch's graph was issued with, and its
-        // graph reads what that graph kept: the stream's order is their synchronization.
-        let proposals = match &drafter {
-            Some(drafter) => {
-                self.prepare_staged(drafter)?;
-                Some(self.graphs.replay(drafter)?)
-            }
-            None => None,
-        };
-
-        if let (true, Some(hook)) = (work, self.page_work.as_mut()) {
-            hook(batch, PageWork::AfterReplay)?;
-        }
-
-        self.graphs.wait()?;
-        let landed = Instant::now();
-        self.slots.settled();
-
-        // The read waits for the stream, and so for the copies issued behind the replay.
-        let calls = {
-            let _guard = self.graphs.enter()?;
-            let vocabulary = self.model.vocabulary();
-            let candidates = self.config.candidates;
-
-            let mut calls = if verify {
-                output::verification_output(
-                    &batch.calls,
-                    &batch.columns,
-                    &bucket,
-                    vocabulary,
-                    candidates,
-                    &outputs,
-                )?
-            } else {
-                output::calls_output(
-                    &batch.calls,
-                    &batch.columns,
-                    &bucket,
-                    vocabulary,
-                    candidates,
-                    &outputs,
-                )?
-            };
-            if let Some(proposals) = &proposals {
-                speculation::propose(batch, vocabulary, proposals, &mut calls)?;
-            }
-            calls
-        };
-
-        let host = launched.duration_since(started) + landed.elapsed();
-        Ok(BatchOutput {
-            calls,
-            timing: TimingCounters {
-                // The executor states the wait it saw before it called the runner.
-                queued_us: 0,
-                device_us: landed.duration_since(launched).as_micros() as u64,
-                // Nothing is transferred for a completion: the scheduler reads it here.
-                copy_us: 0,
-                host_us: host.as_micros() as u64,
+    /// Issues `copies` through the page-work hook ([`PageWork::Copies`]); the next step's end
+    /// covers them ([`PageWork::Ended`]).
+    ///
+    /// # Errors
+    ///
+    /// What the hook refuses; [`Error::Unsupported`] for a copy with runs given to a runner
+    /// that was given nothing that issues copies.
+    fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
+        match self.page_work.as_mut() {
+            Some(hook) => hook(PageWork::Copies(copies)),
+            None => match copies.iter().find(|copy| !copy.runs.is_empty()) {
+                Some(copy) => Err(Error::Unsupported(format!(
+                    "the copies of request {} reach a runner that was given nothing that \
+                     issues them",
+                    copy.request.0
+                ))),
+                None => Ok(()),
             },
-            forward_stats: None,
-        })
+        }
     }
 
     fn graphs(&self) -> &Graphs {
@@ -1509,22 +1607,13 @@ fn at_capacity(graphs: &Graphs, bucket: &Bucket, capacity: u32) -> Result<Bucket
         })
 }
 
-/// Whether `batch` carries work on the cache's pages or the recurrent state's.
-fn carries_page_work(batch: &Batch) -> bool {
-    !(batch.block_tables.is_empty()
-        && batch.cache_units.is_empty()
-        && batch.page_loads.is_empty()
-        && batch.page_offloads.is_empty()
-        && batch.columns.state_copies.is_empty())
-}
-
 /// Refuses a greedy bucket a row that draws.
 ///
 /// A bucket's variant fixes the selection of every row. A drawing bucket serves a greedy row
 /// as well, as a draw over its one largest candidate (`sampler::parameters`). The converse is
 /// not so: an argmax is not what a row that states a temperature asked for, so a greedy
 /// variant holding one is refused by the row.
-fn refuse_drawn_rows(variant: &ipc::execution::Variant, parameters: &[f32]) -> Result<()> {
+fn refuse_drawn_rows(variant: Variant, parameters: &[f32]) -> Result<()> {
     if !variant.greedy() {
         return Ok(());
     }

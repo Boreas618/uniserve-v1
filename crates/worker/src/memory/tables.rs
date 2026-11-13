@@ -13,16 +13,24 @@
 //! handed the same pairs and requests in the same order, so their tables differ only in which
 //! run of a block each keeps.
 //!
+//! Every entry belongs to the owner whose request gave it. A slot holds the entries of the owner
+//! attached to the group there and, in a group that reads a class another group writes, the
+//! entries of that class's owner too; a request that takes entries away takes only its owner's.
+//!
 //! ## What feeds the table
 //!
 //! Only two things change it, and both come from the scheduler through the executor's queue:
 //!
-//! - [`BlockTables::map`]: a request with its completion. `(Attach, Attached)` gives an owner
-//!   its slot. `(Allocate, Allocated)`, `(Pin, Pinned)` and `(Transfer, Transferred)` put runs
-//!   at the positions the request named. A `Copy` that answers a `Load`, `Clone`, `Store`,
-//!   `Save` or `Restore` queues the copies the rank must run. The answer of a `Finish` to a
-//!   `Load` or a `Clone` (`Loaded`, `Duplicate`, `Cloned`) puts the destination runs at the
-//!   positions the `Load` or the `Clone` named. Any other pair gives the table nothing.
+//! - [`BlockTables::map`]: a request with its completion, and the slot the scheduler keeps the
+//!   request's entries under in this group: the slot row of the request's owner on the group, or,
+//!   for a group that reads a class it does not write (a decoder reading a media product), the
+//!   slot of the request's own owner there. `(Attach, Attached)` and `(Transfer, Transferred)`
+//!   attach an owner to the group in the slot they state. `(Allocate, Allocated)`, `(Pin,
+//!   Pinned)` and `(Transfer, Transferred)` put runs at the positions the request named. A `Copy`
+//!   that answers a `Load`, `Clone`, `Store`, `Save` or `Restore` queues the copies the rank must
+//!   run. The answer of a `Finish` to a `Load` or a `Clone` (`Loaded`, `Duplicate`, `Cloned`)
+//!   puts the destination runs at the positions the `Load` or the `Clone` named. Any other pair
+//!   gives the table nothing.
 //! - [`BlockTables::apply`]: a `Release`, `Detach`, `Commit`, `Transfer` or `Finish` on its way
 //!   to the submission queue, before the executor stamps it. Every `Finish` passes through it,
 //!   the executor's own that reports a copy run as well as the scheduler's give-up.
@@ -96,11 +104,12 @@ pub struct BlockTables {
     group: GroupId,
     /// The regions whose memory the rank maps.
     regions: Vec<u8>,
-    /// The slot of every owner attached to the group.
-    slots: HashMap<OwnerId, u32>,
-    /// By slot, class and position: the run, and whether a batch may write it. Every slot
-    /// named here is held by an owner of `slots`.
-    entries: BTreeMap<(u32, u8, u32), (Run, bool)>,
+    /// The slot under which each owner's entries are kept, and whether the owner is attached to
+    /// the group there; an owner of another group, whose class this group reads, is not.
+    slots: HashMap<OwnerId, (u32, bool)>,
+    /// By slot, class and position: the run, whether a batch may write it, and the owner whose
+    /// request gave it. Every owner named here is in `slots` under that slot.
+    entries: BTreeMap<(u32, u8, u32), (Run, bool, OwnerId)>,
     /// The positions that changed since the changes were last taken, each with whether its
     /// entry's units were given by `Allocated` since then. The latest change of a position
     /// replaces the earlier ones.
@@ -132,6 +141,17 @@ fn position(at: u32, index: usize) -> Result<u32> {
         })
 }
 
+/// Whether `slot`, under which a completion is mapped, is the slot the completion states.
+fn check_stated(slot: u32, stated: u32) -> Result<()> {
+    if slot != stated || slot == 0 {
+        return Err(Error::Invalid(format!(
+            "a completion that states slot {stated} is mapped under slot {slot}"
+        )));
+    }
+
+    Ok(())
+}
+
 impl BlockTables {
     /// The empty table of a rank of `group` that maps the memory of `regions`, by the numbers
     /// the answer to `Open` gave them: the group's slot rows, the device and host regions of
@@ -153,10 +173,11 @@ impl BlockTables {
         self.group
     }
 
-    /// The slot of `owner`, from the `Attached` or the `Transferred` that gave it; `None` for
-    /// an owner that is not attached to the group.
+    /// The slot under which the entries of `owner` are kept: the one its `Attached` or its
+    /// `Transferred` stated, or for an owner of another group the one its first completion here
+    /// was mapped under. `None` for an owner the table does not hold.
     pub fn slot(&self, owner: OwnerId) -> Option<u32> {
-        self.slots.get(&owner).copied()
+        self.slots.get(&owner).map(|(slot, _)| *slot)
     }
 
     /// The run of the block that `slot` holds at `position` of `class`, in the rank's memory;
@@ -164,7 +185,7 @@ impl BlockTables {
     pub fn run(&self, slot: u32, class: u8, position: u32) -> Option<Run> {
         self.entries
             .get(&(slot, class, position))
-            .map(|(run, _)| *run)
+            .map(|(run, ..)| *run)
     }
 
     /// The units of the block that `slot` holds at `position` of `class`: `first..first +
@@ -182,14 +203,14 @@ impl BlockTables {
     pub fn writable(&self, slot: u32, class: u8, position: u32) -> bool {
         self.entries
             .get(&(slot, class, position))
-            .is_some_and(|(_, writable)| *writable)
+            .is_some_and(|(_, writable, _)| *writable)
     }
 
     /// The entries of `slot` in `class`, in position order: each position with its run.
     pub fn entries(&self, slot: u32, class: u8) -> impl Iterator<Item = (u32, Run)> + '_ {
         self.entries
             .range((slot, class, 0)..=(slot, class, u32::MAX))
-            .map(|(&(_, _, position), &(run, _))| (position, run))
+            .map(|(&(_, _, position), &(run, ..))| (position, run))
     }
 
     /// Takes the changes since the last call, in slot, class and position order, one per
@@ -225,7 +246,11 @@ impl BlockTables {
     }
 
     /// Takes the completion of `request`, whose number is `id`, and changes the table by what
-    /// it gives: a slot, runs at the positions the request named, or copies to run.
+    /// it gives: an owner's slot, runs at the positions the request named, or copies to run.
+    /// `slot` is the slot under which the scheduler keeps the request's entries in this group
+    /// (module documentation): the slot an `Attached` or a `Transferred` states, and for any
+    /// other pair the slot of the owner the request names on this group, or of the request's own
+    /// owner here when this group reads a class it does not write.
     ///
     /// A pair that gives the table nothing (`Done`, `Refused`, `Full`, `Committed`, `Evicted`
     /// and the like, a `Load` or a `Store` answered at once, the answer of a `Finish` whose
@@ -237,18 +262,26 @@ impl BlockTables {
     /// # Errors
     ///
     /// Nothing changes when the pair is refused: a completion that carries a slot, runs or
-    /// copies and does not answer a request of its kind; a group that is not the table's; an
-    /// owner that is not attached, or one attached twice; a slot another owner holds; a
-    /// position that holds an entry already; runs that do not divide into the request's
-    /// blocks, or a block with two runs in the rank's regions; a load or a clone whose
-    /// destination the rank maps and whose source it does not.
-    pub fn map(&mut self, id: RequestId, request: &Request, completion: &Completion) -> Result<()> {
+    /// copies and does not answer a request of its kind; a group that is not the table's; slot
+    /// 0, which addresses nothing, or a slot other than the one the completion states or the
+    /// owner's entries are kept under; an owner attached twice; a slot another owner attached
+    /// to the group holds; a position that holds an entry already; runs that do not divide into
+    /// the request's blocks, or a block with two runs in the rank's regions; a load or a clone
+    /// whose destination the rank maps and whose source it does not.
+    pub fn map(
+        &mut self,
+        slot: u32,
+        id: RequestId,
+        request: &Request,
+        completion: &Completion,
+    ) -> Result<()> {
         match (request, completion) {
-            (Request::Attach { owner, group }, Completion::Attached { slot }) => {
+            (Request::Attach { owner, group }, Completion::Attached { slot: stated }) => {
                 self.check_group(*group)?;
-                self.check_attach(*owner, *slot)?;
+                check_stated(slot, *stated)?;
+                self.check_attach(*owner, slot)?;
 
-                self.slots.insert(*owner, *slot);
+                self.slots.insert(*owner, (slot, true));
                 Ok(())
             }
 
@@ -279,9 +312,9 @@ impl BlockTables {
                     }
                 }
 
-                let slot = self.attached(*owner)?;
+                self.check_held(*owner, slot)?;
                 self.check_vacant(slot, &entries)?;
-                self.put(slot, entries, true);
+                self.put(*owner, slot, entries, true);
                 Ok(())
             }
 
@@ -310,14 +343,18 @@ impl BlockTables {
                     }
                 }
 
-                let slot = self.attached(*owner)?;
+                self.check_held(*owner, slot)?;
                 self.check_vacant(slot, &entries)?;
-                self.put(slot, entries, false);
+                self.put(*owner, slot, entries, false);
                 Ok(())
             }
 
-            (Request::Transfer { owner, group, .. }, Completion::Transferred { slot, runs }) => {
+            (
+                Request::Transfer { owner, group, .. },
+                Completion::Transferred { slot: stated, runs },
+            ) => {
                 self.check_group(*group)?;
+                check_stated(slot, *stated)?;
 
                 // A block of several runs states one item per run under one class and
                 // position; the rank keeps the one in its regions.
@@ -338,13 +375,13 @@ impl BlockTables {
                     .map(|((class, position), (run, private))| (class, position, run, private))
                     .collect();
 
-                self.check_attach(*owner, *slot)?;
-                self.check_vacant(*slot, &entries)?;
+                self.check_attach(*owner, slot)?;
+                self.check_vacant(slot, &entries)?;
 
                 // The task of the transfer copied the blocks' content into the group's
                 // memory: nothing is reset.
-                self.slots.insert(*owner, *slot);
-                self.put(*slot, entries, false);
+                self.slots.insert(*owner, (slot, true));
+                self.put(*owner, slot, entries, false);
                 Ok(())
             }
 
@@ -365,7 +402,7 @@ impl BlockTables {
                 keys.len(),
                 from,
                 to,
-                Some((*owner, *class, *at, false)),
+                Some((*owner, slot, *class, *at, false)),
             ),
 
             (
@@ -385,7 +422,7 @@ impl BlockTables {
                 keys.len(),
                 from,
                 to,
-                Some((*owner, *class, *at, true)),
+                Some((*owner, slot, *class, *at, true)),
             ),
 
             (
@@ -402,7 +439,7 @@ impl BlockTables {
             (
                 Request::Finish { copy, ok: true, .. },
                 Completion::Loaded | Completion::Duplicate | Completion::Cloned,
-            ) => self.fill(*copy),
+            ) => self.fill(slot, *copy),
 
             (
                 _,
@@ -422,9 +459,10 @@ impl BlockTables {
 
     /// Applies a request that the executor stamps, before it is stamped and submitted:
     ///
-    /// - `Release`: the entries at the positions it names leave;
-    /// - `Detach`, `Transfer`: the owner leaves with its slot and every entry of it, and the
-    ///   destinations of a copy that was to fill a position of it are no longer awaited. Its
+    /// - `Release`: the owner's entries at the positions it names leave;
+    /// - `Detach`, `Transfer`: the owner leaves with every entry of it, and the destinations of
+    ///   a copy that was to fill a position of it are no longer awaited. The entries other
+    ///   owners keep in the same slot stay. Its
     ///   copies that no batch has started stay queued until their `Finish`: the buffer pool
     ///   holds what a copy reads and writes until then. An owner whose transfer fails holds no
     ///   entry here and takes only its `Detach`;
@@ -452,17 +490,16 @@ impl BlockTables {
                 count,
                 ..
             } => {
-                if let (Some(&slot), Some(further)) = (self.slots.get(owner), count.checked_sub(1))
-                {
+                if let (Some(slot), Some(further)) = (self.slot(*owner), count.checked_sub(1)) {
                     let last = at.saturating_add(further);
-                    self.remove((slot, *class, *at)..=(slot, *class, last));
+                    self.remove(*owner, (slot, *class, *at)..=(slot, *class, last));
                 }
                 Ok(())
             }
 
             Request::Detach { owner, .. } | Request::Transfer { owner, .. } => {
-                if let Some(slot) = self.slots.remove(owner) {
-                    self.remove((slot, 0, 0)..=(slot, u8::MAX, u32::MAX));
+                if let Some((slot, _)) = self.slots.remove(owner) {
+                    self.remove(*owner, (slot, 0, 0)..=(slot, u8::MAX, u32::MAX));
                 }
                 self.destinations.retain(|_, (holder, ..)| holder != owner);
                 Ok(())
@@ -472,10 +509,11 @@ impl BlockTables {
                 owner, class, at, ..
             } => {
                 let entry = self
-                    .slots
-                    .get(owner)
-                    .and_then(|slot| self.entries.get_mut(&(*slot, *class, *at)));
-                if let Some((_, writable)) = entry {
+                    .slot(*owner)
+                    .and_then(|slot| self.entries.get_mut(&(slot, *class, *at)));
+                if let Some((_, writable, holder)) = entry
+                    && holder == owner
+                {
                     *writable = false;
                 }
                 Ok(())
@@ -560,25 +598,46 @@ impl BlockTables {
         Ok(())
     }
 
-    /// The slot of an owner a completion gives entries to.
-    fn attached(&self, owner: OwnerId) -> Result<u32> {
-        self.slot(owner).ok_or_else(|| {
-            Error::Invalid(format!(
-                "a completion gives entries to owner {}, which is not attached to group {}",
-                owner.0, self.group.0
-            ))
-        })
-    }
-
-    /// Whether `owner` can take `slot`: the owner is not attached and no owner holds the slot.
-    fn check_attach(&self, owner: OwnerId, slot: u32) -> Result<()> {
-        if let Some(held) = self.slot(owner) {
+    /// Whether the entries `owner` is given may be kept under `slot`: a slot that addresses
+    /// something, and the one the owner's entries are kept under already, if any.
+    fn check_held(&self, owner: OwnerId, slot: u32) -> Result<()> {
+        if slot == 0 {
             return Err(Error::Invalid(format!(
-                "owner {} is given slot {slot} and holds slot {held}",
+                "the entries of owner {} are mapped under slot 0, which addresses nothing",
                 owner.0
             )));
         }
-        if let Some((holder, _)) = self.slots.iter().find(|(_, held)| **held == slot) {
+
+        match self.slot(owner) {
+            Some(held) if held != slot => Err(Error::Invalid(format!(
+                "the entries of owner {} are mapped under slot {slot} and kept under slot {held}",
+                owner.0
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether `owner` can attach to the group in `slot`: it is not attached already, its
+    /// entries are not kept under another slot, and no other owner attached to the group holds
+    /// the slot. Owners of other groups whose classes this group reads share the slot.
+    fn check_attach(&self, owner: OwnerId, slot: u32) -> Result<()> {
+        self.check_held(owner, slot)?;
+        if self
+            .slots
+            .get(&owner)
+            .is_some_and(|(_, attached)| *attached)
+        {
+            return Err(Error::Invalid(format!(
+                "owner {} is attached to group {} twice",
+                owner.0, self.group.0
+            )));
+        }
+
+        let holder = self
+            .slots
+            .iter()
+            .find(|(held, (at, attached))| *attached && *at == slot && **held != owner);
+        if let Some((holder, _)) = holder {
             return Err(Error::Invalid(format!(
                 "owner {} is given slot {slot}, which owner {} holds",
                 owner.0, holder.0
@@ -603,19 +662,27 @@ impl BlockTables {
         }
     }
 
-    /// Puts `entries` into `slot`'s tables and records the change of each; `allocated` states
-    /// that their units were given by `Allocated`.
-    fn put(&mut self, slot: u32, entries: Vec<Entry>, allocated: bool) {
+    /// Puts `entries` of `owner` into `slot`'s tables and records the change of each, keeping
+    /// the owner's entries under `slot` from here on; `allocated` states that their units were
+    /// given by `Allocated`.
+    fn put(&mut self, owner: OwnerId, slot: u32, entries: Vec<Entry>, allocated: bool) {
+        self.slots.entry(owner).or_insert((slot, false));
+
         for (class, position, run, writable) in entries {
             self.entries
-                .insert((slot, class, position), (run, writable));
+                .insert((slot, class, position), (run, writable, owner));
             self.changed.insert((slot, class, position), allocated);
         }
     }
 
-    /// Removes the entries of `range` and records the change of each.
-    fn remove(&mut self, range: RangeInclusive<(u32, u8, u32)>) {
-        let left: Vec<_> = self.entries.range(range).map(|(key, _)| *key).collect();
+    /// Removes the entries of `owner` in `range` and records the change of each.
+    fn remove(&mut self, owner: OwnerId, range: RangeInclusive<(u32, u8, u32)>) {
+        let left: Vec<_> = self
+            .entries
+            .range(range)
+            .filter(|(_, (.., holder))| *holder == owner)
+            .map(|(key, _)| *key)
+            .collect();
 
         for key in left {
             self.entries.remove(&key);
@@ -624,8 +691,9 @@ impl BlockTables {
     }
 
     /// Queues the copies of request `id`: for each of `keys` keys, from the run of `from` to
-    /// the run of `to`. `destination` is the owner, the class, the first position and whether
-    /// the request is a clone, for a request whose copies fill positions.
+    /// the run of `to`. `destination` is the owner, the slot its entries are kept under, the
+    /// class, the first position and whether the request is a clone, for a request whose copies
+    /// fill positions.
     fn queue(
         &mut self,
         id: RequestId,
@@ -633,7 +701,7 @@ impl BlockTables {
         keys: usize,
         from: &[Run],
         to: &[Run],
-        destination: Option<(OwnerId, u8, u32, bool)>,
+        destination: Option<(OwnerId, u32, u8, u32, bool)>,
     ) -> Result<()> {
         self.check_group(group)?;
         if from.len() != keys || to.len() != keys {
@@ -643,8 +711,8 @@ impl BlockTables {
                 to.len()
             )));
         }
-        if let Some((owner, ..)) = destination {
-            self.attached(owner)?;
+        if let Some((owner, slot, ..)) = destination {
+            self.check_held(owner, slot)?;
         }
 
         let mut runs = Vec::new();
@@ -667,33 +735,36 @@ impl BlockTables {
 
                 // Only a clone's block is its owner's to write; a loaded one is read-only
                 // whatever answers the `Finish`.
-                if let Some((_, class, at, cloned)) = destination {
+                if let Some((_, _, class, at, cloned)) = destination {
                     entries.push((class, position(at, index)?, target, cloned));
                 }
             }
         }
 
         self.queued.push_back(BlockCopy { request: id, runs });
-        if let Some((owner, ..)) = destination {
+        if let Some((owner, slot, ..)) = destination {
+            self.slots.entry(owner).or_insert((slot, false));
             self.destinations.insert(id, (owner, false, entries));
         }
         Ok(())
     }
 
     /// The answer of the `Finish` of `copy` reports the copies of a `Load` or of a `Clone`
-    /// done: their destinations become entries at the positions the request named.
-    fn fill(&mut self, copy: RequestId) -> Result<()> {
+    /// done: their destinations become entries at the positions the request named, under
+    /// `slot`, which is where the request's owner keeps its entries.
+    fn fill(&mut self, slot: u32, copy: RequestId) -> Result<()> {
         // A copy that fills no position here: a store, a save, a restore, or a copy that was
         // given up or whose owner left since.
         let Some((owner, _, entries)) = self.destinations.get(&copy) else {
             return Ok(());
         };
-        let slot = self.attached(*owner)?;
+        let owner = *owner;
+        self.check_held(owner, slot)?;
         self.check_vacant(slot, entries)?;
 
         // The copy wrote the blocks' content: nothing is reset.
         if let Some((_, _, entries)) = self.destinations.remove(&copy) {
-            self.put(slot, entries, false);
+            self.put(owner, slot, entries, false);
         }
         Ok(())
     }
@@ -723,6 +794,12 @@ mod tests {
         (0..count).map(|byte| Key([byte; 32])).collect()
     }
 
+    /// The slot under which the entries of `owner` are kept, as the scheduler names it: 0, which
+    /// addresses nothing, for an owner the table does not hold.
+    fn slot_of(tables: &BlockTables, owner: u64) -> u32 {
+        tables.slot(OwnerId(owner)).unwrap_or(0)
+    }
+
     fn attach(tables: &mut BlockTables, owner: u64, slot: u32) {
         let request = Request::Attach {
             owner: OwnerId(owner),
@@ -730,7 +807,7 @@ mod tests {
         };
 
         tables
-            .map(RequestId(0), &request, &Completion::Attached { slot })
+            .map(slot, RequestId(0), &request, &Completion::Attached { slot })
             .expect("an owner is attached");
     }
 
@@ -761,7 +838,8 @@ mod tests {
             evicted: vec![],
         };
 
-        tables.map(RequestId(0), &request, &completion)
+        let slot = slot_of(tables, owner);
+        tables.map(slot, RequestId(0), &request, &completion)
     }
 
     /// Hands the table a `Load` of one key per pair of runs with the `Copy` that answers it.
@@ -787,7 +865,8 @@ mod tests {
             evicted: vec![],
         };
 
-        tables.map(RequestId(id), &request, &completion)
+        let slot = slot_of(tables, owner);
+        tables.map(slot, RequestId(id), &request, &completion)
     }
 
     fn finish(copy: u64, ok: bool) -> Request {
@@ -822,7 +901,7 @@ mod tests {
                 cause: Cause::Position,
             },
         ] {
-            tables.map(RequestId(1), &request, &completion).unwrap();
+            tables.map(3, RequestId(1), &request, &completion).unwrap();
         }
         assert_eq!(entries(&tables, 3, 0), []);
 
@@ -837,9 +916,21 @@ mod tests {
         assert_eq!(tables.run(3, 1, 5), None);
         assert_eq!(tables.run(2, 0, 5), None);
 
-        // An owner that is not attached, a position that holds an entry and a completion
-        // that does not answer its request give nothing.
+        // Slot 0, a slot other than the one the owner's entries are kept under, a position
+        // that holds an entry and a completion that does not answer its request give nothing.
         assert!(allocate(&mut tables, 2, 0, 0, &[(DEVICE, 11, 1)]).is_err());
+        let elsewhere = Request::Allocate {
+            owner: OwnerId(1),
+            class: 0,
+            at: 0,
+            count: 1,
+            units: 0,
+        };
+        let one = Completion::Allocated {
+            runs: vec![(DEVICE, 11, 1)],
+            evicted: vec![],
+        };
+        assert!(tables.map(4, RequestId(2), &elsewhere, &one).is_err());
         assert!(allocate(&mut tables, 1, 0, 4, &[(DEVICE, 11, 1), (DEVICE, 12, 1)]).is_err());
         let unanswered = Request::Attach {
             owner: OwnerId(4),
@@ -849,7 +940,11 @@ mod tests {
             runs: vec![(DEVICE, 11, 1)],
             evicted: vec![],
         };
-        assert!(tables.map(RequestId(2), &unanswered, &allocated).is_err());
+        assert!(
+            tables
+                .map(3, RequestId(2), &unanswered, &allocated)
+                .is_err()
+        );
 
         assert_eq!(
             entries(&tables, 3, 0),
@@ -917,6 +1012,81 @@ mod tests {
     }
 
     #[test]
+    fn a_group_that_reads_a_class_keeps_its_entries_under_the_slot_of_its_own_owner() {
+        // Owner 1 is the request's attachment to this group, in slot 2; owner 7 is its
+        // attachment to the group that writes the product class 5, whose completions this
+        // group is handed under slot 2 too.
+        let mut tables = tables();
+        attach(&mut tables, 1, 2);
+        allocate(&mut tables, 1, 0, 0, &[(DEVICE, 7, 1)]).unwrap();
+
+        let products = Request::Allocate {
+            owner: OwnerId(7),
+            class: 5,
+            at: 0,
+            count: 2,
+            units: 3,
+        };
+        let allocated = Completion::Allocated {
+            runs: vec![(PRODUCTS, 0, 3), (PRODUCTS, 3, 3)],
+            evicted: vec![],
+        };
+        tables.map(2, RequestId(1), &products, &allocated).unwrap();
+        assert_eq!(tables.slot(OwnerId(7)), Some(2));
+        assert_eq!(
+            entries(&tables, 2, 5),
+            [(0, (PRODUCTS, 0, 3)), (1, (PRODUCTS, 3, 3))]
+        );
+
+        // The other group's owner does not hold the slot: a third owner cannot attach there,
+        // and owner 7's entries are kept under no other slot.
+        let attach_there = Request::Attach {
+            owner: OwnerId(9),
+            group: GROUP,
+        };
+        assert!(
+            tables
+                .map(
+                    2,
+                    RequestId(2),
+                    &attach_there,
+                    &Completion::Attached { slot: 2 }
+                )
+                .is_err()
+        );
+        let more = Request::Allocate {
+            owner: OwnerId(7),
+            class: 5,
+            at: 2,
+            count: 1,
+            units: 3,
+        };
+        let one = Completion::Allocated {
+            runs: vec![(PRODUCTS, 6, 3)],
+            evicted: vec![],
+        };
+        assert!(tables.map(3, RequestId(3), &more, &one).is_err());
+
+        // A request that takes entries away takes only its own owner's: the product owner's
+        // detach leaves owner 1's entries, and owner 1's release leaves the products.
+        let release = Request::Release {
+            owner: OwnerId(1),
+            class: 5,
+            at: 0,
+            count: 2,
+            after: vec![],
+        };
+        tables.apply(&release).unwrap();
+        assert_eq!(entries(&tables, 2, 5).len(), 2);
+
+        tables.apply(&detach(7)).unwrap();
+        assert_eq!(entries(&tables, 2, 5), []);
+        assert_eq!(entries(&tables, 2, 0), [(0, (DEVICE, 7, 1))]);
+        assert_eq!(tables.slot(OwnerId(7)), None);
+        assert_eq!(tables.slot(OwnerId(1)), Some(2));
+    }
+
+    #[test]
     fn a_committed_entry_is_read_only() {
         let mut tables = tables();
         attach(&mut tables, 1, 1);
@@ -941,7 +1111,7 @@ mod tests {
         // The block stays its owner's alone when the key is cached already, and is still
         // not written again.
         tables
-            .map(RequestId(9), &commit, &Completion::Duplicate)
+            .map(1, RequestId(9), &commit, &Completion::Duplicate)
             .unwrap();
         assert!(!tables.writable(1, 0, 0));
     }
@@ -962,7 +1132,7 @@ mod tests {
             runs: vec![(DEVICE, 20, 1), (DEVICE, 21, 1)],
             host: 1,
         };
-        tables.map(RequestId(1), &pin, &pinned).unwrap();
+        tables.map(1, RequestId(1), &pin, &pinned).unwrap();
         assert_eq!(
             entries(&tables, 1, 0),
             [(0, (DEVICE, 20, 1)), (1, (DEVICE, 21, 1))]
@@ -978,7 +1148,7 @@ mod tests {
             assert_eq!(tables.start_copy().map(|copy| copy.request.0), Some(copy));
             tables.apply(&finish(copy, true)).unwrap();
             tables
-                .map(RequestId(10), &finish(copy, true), &answer)
+                .map(1, RequestId(10), &finish(copy, true), &answer)
                 .unwrap();
         }
         assert_eq!(tables.run(1, 0, 2), Some((DEVICE, 22, 1)));
@@ -1007,7 +1177,7 @@ mod tests {
             to: vec![(DEVICE, 31, 1)],
             evicted: vec![],
         };
-        tables.map(RequestId(5), &clone, &copy).unwrap();
+        tables.map(1, RequestId(5), &clone, &copy).unwrap();
 
         // Until then only the copy writes the destination.
         let started = tables.start_copy().unwrap();
@@ -1020,7 +1190,7 @@ mod tests {
         tables.apply(&finish(5, false)).unwrap();
 
         tables
-            .map(RequestId(6), &finish(5, true), &Completion::Cloned)
+            .map(1, RequestId(6), &finish(5, true), &Completion::Cloned)
             .unwrap();
         assert_eq!(tables.run(1, 0, 6), Some((DEVICE, 31, 1)));
         assert!(tables.writable(1, 0, 6));
@@ -1043,7 +1213,7 @@ mod tests {
             to: vec![(HOST, 0, 1), (HOST, 1, 1)],
             evicted: vec![],
         };
-        tables.map(RequestId(10), &store, &copy).unwrap();
+        tables.map(0, RequestId(10), &store, &copy).unwrap();
         load(&mut tables, 11, 1, 0, &[(HOST, 2, 1)], &[(DEVICE, 7, 1)]).unwrap();
 
         let queued: Vec<u64> = tables.queued_copies().map(|copy| copy.request.0).collect();
@@ -1056,7 +1226,7 @@ mod tests {
         // The load is given up before a batch takes it: it is never run and fills nothing.
         tables.apply(&finish(11, false)).unwrap();
         tables
-            .map(RequestId(12), &finish(11, false), &Completion::Done)
+            .map(1, RequestId(12), &finish(11, false), &Completion::Done)
             .unwrap();
 
         let started = tables.start_copy().unwrap();
@@ -1076,7 +1246,7 @@ mod tests {
         tables.apply(&finish(10, true)).unwrap();
         let stored = Completion::Stored { keys: vec![] };
         tables
-            .map(RequestId(14), &finish(10, true), &stored)
+            .map(0, RequestId(14), &finish(10, true), &stored)
             .unwrap();
         assert_eq!(tables.start_copy(), None);
 
@@ -1089,7 +1259,7 @@ mod tests {
 
         tables.apply(&finish(15, true)).unwrap();
         tables
-            .map(RequestId(16), &finish(15, true), &Completion::Loaded)
+            .map(1, RequestId(16), &finish(15, true), &Completion::Loaded)
             .unwrap();
         assert_eq!(entries(&tables, 1, 0), []);
     }
@@ -1155,7 +1325,7 @@ mod tests {
             runs: vec![(DEVICE, 20, 1)],
             host: 0,
         };
-        tables.map(RequestId(3), &pin, &pinned).unwrap();
+        tables.map(2, RequestId(3), &pin, &pinned).unwrap();
         assert_eq!(
             tables.take_changes(),
             [
@@ -1188,7 +1358,7 @@ mod tests {
             ],
             evicted: vec![],
         };
-        tables.map(RequestId(1), &products, &allocated).unwrap();
+        tables.map(1, RequestId(1), &products, &allocated).unwrap();
         assert_eq!(
             entries(&tables, 1, 5),
             [(0, (PRODUCTS, 0, 3)), (1, (PRODUCTS, 3, 3))]
@@ -1213,14 +1383,14 @@ mod tests {
         };
         assert!(
             tables
-                .map(RequestId(2), &transfer(GroupId(1)), &transferred)
+                .map(4, RequestId(2), &transfer(GroupId(1)), &transferred)
                 .is_err()
         );
         assert_eq!(tables.slot(OwnerId(2)), None);
 
         tables.take_changes();
         tables
-            .map(RequestId(2), &transfer(GROUP), &transferred)
+            .map(4, RequestId(2), &transfer(GROUP), &transferred)
             .unwrap();
         assert_eq!(tables.slot(OwnerId(2)), Some(4));
         assert_eq!(
@@ -1248,7 +1418,7 @@ mod tests {
             to: vec![(OTHER_PRODUCTS, 20, 3)],
             evicted: vec![],
         };
-        tables.map(RequestId(3), &encoded, &loaded).unwrap();
+        tables.map(1, RequestId(3), &encoded, &loaded).unwrap();
         let store = Request::Store {
             group: GROUP,
             keys: keys(1),
@@ -1261,7 +1431,7 @@ mod tests {
             to: vec![(HOST, 3, 3)],
             evicted: vec![],
         };
-        tables.map(RequestId(4), &store, &stored).unwrap();
+        tables.map(0, RequestId(4), &store, &stored).unwrap();
 
         for request in [3, 4] {
             assert_eq!(
@@ -1275,7 +1445,7 @@ mod tests {
 
         tables.apply(&finish(3, true)).unwrap();
         tables
-            .map(RequestId(5), &finish(3, true), &Completion::Loaded)
+            .map(1, RequestId(5), &finish(3, true), &Completion::Loaded)
             .unwrap();
         assert_eq!(entries(&tables, 1, 6), []);
     }

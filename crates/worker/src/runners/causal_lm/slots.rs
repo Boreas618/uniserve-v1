@@ -25,8 +25,9 @@
 //!
 //! - at construction every table is zeroed;
 //! - a batch that starts a request on a slot ([`Slots::start`]) sets the slot's counts to the
-//!   request's own history, its bias row when the batch installs one, and, when the request's
-//!   first step here is a decode, the state the engine that sampled its last token committed;
+//!   request's own history, its bias row when the request states a bias or an allowed set,
+//!   and, when the request's first step here is a decode, the state the engine that sampled
+//!   its last token committed;
 //! - a batch whose rows ban tokens copies its masks to the head of `bans`
 //!   ([`Slots::ban`]).
 //!
@@ -42,7 +43,7 @@
 
 use std::sync::Arc;
 
-use ipc::execution::{BatchColumns, FreshSlot, SlotBias};
+use ipc::batch::{Columns, NewSlot};
 use ops::sampler::ban_words;
 use platform::{PinnedBuffer, Stream};
 use uniserve_tensor::{DType, Shape, Tensor};
@@ -308,14 +309,17 @@ impl Slots {
         }
     }
 
-    /// Starts the sampling state of the requests `columns` starts on their slots, ahead of the
-    /// step that reads it.
+    /// Starts the sampling state of the requests a batch starts on their slots, `new_slots`
+    /// (`ipc::batch::Batch::new_slots`), ahead of the step that reads it; `columns` are the
+    /// batch's.
     ///
-    /// - Each fresh slot's counts become its request's own history (`Sampler::count_row`):
-    ///   the slot's previous request counted its tokens there, and the request may have
-    ///   generated tokens before it reached this runner.
-    /// - Each bias row the batch installs is written (`Sampler::bias_row`).
-    /// - In a decode batch (`decode`), a fresh slot's request continues from a token another
+    /// - Each new slot's counts become its request's own history (`Sampler::count_row`): the
+    ///   slot's previous request counted its tokens there, and the request may have generated
+    ///   tokens before it reached this runner.
+    /// - A request that states a bias or an allowed set has its bias row written
+    ///   (`Sampler::bias_row`). A request that states neither leaves the row as it is: none of
+    ///   its rows is flagged to read it (`Columns::biased`).
+    /// - In a decode batch (`decode`), a new slot's request continues from a token another
     ///   engine sampled, so the slot's commit state starts as that engine's commit left it:
     ///   the row's input token as the next input token, the token's position as the logical
     ///   position, the row's draw position as the sampling position, the keys before the token
@@ -324,44 +328,38 @@ impl Slots {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for a slot the runner holds no state for, a fresh slot of a decode
+    /// [`Error::Invalid`] for a slot the runner holds no state for, a new slot of a decode
     /// batch that no row of the batch runs on, or a row whose values no slot state holds; the
     /// driver's refusal of a copy.
     pub(crate) fn start(
         &mut self,
         sampler: &Sampler,
-        columns: &BatchColumns,
+        columns: &Columns,
+        new_slots: &[NewSlot],
         decode: bool,
     ) -> Result<()> {
         let row_bytes = u64::from(self.vocabulary) * 4;
 
-        for fresh in &columns.fresh_slots {
-            let own = slot_row(fresh.slot, self.slots)?;
+        for new in new_slots {
+            let own = slot_row(new.slot, self.slots)?;
 
             // An empty history is a zeroed row, which the device fills without a copy. The
             // sampler states a row's values for the row of its tables the slot owns.
-            if fresh.history.is_empty() {
+            if new.history.is_empty() {
                 self.zero(COUNTS, u64::from(own) * row_bytes, self.vocabulary)?;
             } else {
-                let row = sampler.count_row(&FreshSlot {
-                    slot: own,
-                    history: fresh.history.clone(),
-                })?;
+                let row = sampler.count_row(own, &new.history)?;
                 self.write(COUNTS, u64::from(own) * row_bytes, &row)?;
             }
 
-            if decode {
-                self.start_decode(fresh.slot, columns)?;
+            if !new.bias.is_empty() || new.allowed.is_some() {
+                let row = sampler.bias_row(own, &new.bias, new.allowed.as_deref())?;
+                self.write(BIAS, u64::from(own) * row_bytes, &row)?;
             }
-        }
 
-        for install in &columns.adjustments.installs {
-            let own = slot_row(install.slot, self.slots)?;
-            let row = sampler.bias_row(&SlotBias {
-                slot: own,
-                ..install.clone()
-            })?;
-            self.write(BIAS, u64::from(own) * row_bytes, &row)?;
+            if decode {
+                self.start_decode(new.slot, columns)?;
+            }
         }
         Ok(())
     }
@@ -387,7 +385,7 @@ impl Slots {
     }
 
     /// Starts request slot `slot`'s commit state from its row of the decode batch `columns`.
-    fn start_decode(&mut self, slot: u32, columns: &BatchColumns) -> Result<()> {
+    fn start_decode(&mut self, slot: u32, columns: &Columns) -> Result<()> {
         let own = u64::from(slot_row(slot, self.slots)?);
         let rows = &columns.rows;
         let row = columns
@@ -395,7 +393,7 @@ impl Slots {
             .iter()
             .position(|held| u32::try_from(*held).ok() == Some(slot))
             .ok_or_else(|| {
-                Error::Invalid(format!("fresh slot {slot} has no row in its decode batch"))
+                Error::Invalid(format!("new slot {slot} has no row in its decode batch"))
             })?;
 
         // A decode row is one token: its query offset is the token's index.

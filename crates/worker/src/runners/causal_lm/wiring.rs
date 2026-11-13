@@ -9,26 +9,27 @@
 //!   pooled page table and workspace, the state's live and checkpoint buffers, and the scratch
 //!   page set when the cache opened one;
 //! - [`page_work`] builds the hook that issues a batch's page work on the runner's stream, in
-//!   the order the cache module documents;
-//! - [`draft_pages`] builds what states a request slot's installed draft pages for a runner
-//!   that speculates.
+//!   the order the cache module documents.
 //!
 //! Both work over owners that hold no device (`KvCacheMemory::meta`, `StateMemory::meta`): the
-//! runner then computes over meta tensors, and the hook keeps the cache's host mirror of the
-//! page tables and issues nothing.
+//! runner then computes over meta tensors, and the hook keeps the cache's host copy of the
+//! pooled tables and issues nothing.
 
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use ipc::execution::{Batch, StateDirection};
+use ipc::batch::{Batch, StateDirection};
 use nn::family::TextModel;
 use nn::{KvCache, NO_SLOT};
 use platform::{Event, Stream};
+use storage::runtime::Run;
 
-use super::speculation::{DraftPages, DraftPool};
+use super::speculation::DraftPool;
 use super::{CausalLmConfig, CausalLmRunner, PageWork, PageWorkHook};
 use crate::graphs::Graphs;
 use crate::memory::cache::KvCacheMemory;
 use crate::memory::state::StateMemory;
+use crate::memory::tables::BlockTables;
 use crate::{Error, Result, lock};
 
 impl CausalLmRunner {
@@ -145,13 +146,19 @@ fn attention_groups(cache: &KvCacheMemory) -> impl Iterator<Item = usize> + '_ {
 
 /// The hook that issues a batch's page work for a runner over `cache` and `state`
 /// ([`CausalLmRunner::set_page_work`]), on `stream`, the runner's; `None` for owners that hold
-/// no device, whose work is checked, kept in the cache's host mirror and not issued.
+/// no device, whose work is checked, kept in the cache's host copy of the pooled tables and
+/// not issued.
 ///
-/// - [`PageWork::BeforeReplay`]: the batch's rows of the pooled tables are installed, its new
-///   units reset and filled from a leased prefix, its pages loaded from and offloaded to the
-///   host tier, and its recurrent state restored, in that order.
-/// - [`PageWork::AfterReplay`]: the batch's recurrent state is kept, and the offloads issued
-///   before the replay are waited for, so the batch's completion is behind them.
+/// - [`PageWork::Tables`]: the cache applies the device block table's changes: the units the
+///   buffer pool allocated are reset, and the pooled rows that changed are written.
+/// - [`PageWork::Copies`]: the cache issues the copies of the blocks the batch takes; their
+///   events are kept for [`PageWork::Ended`].
+/// - [`PageWork::BeforeReplay`]: the batch's state copies are resolved through the tables,
+///   each checkpoint's position to the run of units it holds in the slot's table of the state
+///   group's class (the class of cache group `g` is class `g`), and refused unless every one
+///   names an entry and every keep a writable one; then every restore is issued.
+/// - [`PageWork::AfterReplay`]: the keeps resolved before the replay are issued.
+/// - [`PageWork::Ended`]: the copies issued for the batch are waited for.
 /// - [`PageWork::BeforeShadow`]: what the rows of a paired forward have cached is copied into
 ///   their scratch pages, `scratch_pages` pages a row, for every attention group.
 ///
@@ -162,44 +169,44 @@ pub fn page_work(
     stream: Option<Stream>,
     scratch_pages: u32,
 ) -> PageWorkHook {
-    // The event behind the offloads of the batch whose replay is issued.
-    let mut offloads: Option<Event> = None;
+    // The events behind the copies issued for the batch being served.
+    let mut copied: Vec<Event> = Vec::new();
+    // The keeps of the batch whose replay is issued, resolved before it.
+    let mut keeps: StateRuns = Vec::new();
 
-    Box::new(move |batch: &Batch, work: PageWork| {
+    Box::new(move |work: PageWork<'_>| {
         let mut cache = lock(&cache);
-        let copies = &batch.columns.state_copies;
 
         match work {
-            PageWork::BeforeReplay => {
-                cache.install(&batch.block_tables, stream.as_ref())?;
-                cache.apply_units(&batch.cache_units, stream.as_ref())?;
-
-                offloads = match &stream {
-                    Some(stream) => {
-                        cache.copy_pages(&batch.page_loads, &batch.page_offloads, stream)?
-                    }
-                    None if batch.page_loads.is_empty() && batch.page_offloads.is_empty() => None,
-                    None => {
-                        return Err(Error::Invalid(format!(
-                            "batch {} copies pages of a cache that holds no device",
-                            batch.id.0
-                        )));
-                    }
-                };
+            PageWork::Tables(changes) => cache.apply(changes, stream.as_ref())?,
+            PageWork::Copies(copies) => {
+                let runs: Vec<(Run, Run)> = copies
+                    .iter()
+                    .flat_map(|copy| copy.runs.iter().copied())
+                    .collect();
+                copied.extend(cache.copy(&runs, stream.as_ref())?);
+            }
+            PageWork::BeforeReplay(batch, tables) => {
+                let (restores, kept) = state_copies(&cache, batch, tables)?;
+                keeps = kept;
 
                 if let Some(state) = &state {
-                    lock(state).copy(&cache, copies, StateDirection::Restore)?;
+                    lock(state).copy(&cache, &restores, StateDirection::Restore)?;
                 }
             }
             PageWork::AfterReplay => {
+                let kept = std::mem::take(&mut keeps);
                 if let Some(state) = &state {
-                    lock(state).copy(&cache, copies, StateDirection::Keep)?;
+                    lock(state).copy(&cache, &kept, StateDirection::Keep)?;
                 }
-                if let Some(event) = offloads.take() {
+            }
+            PageWork::Ended => {
+                keeps.clear();
+                for event in copied.drain(..) {
                     event.synchronize()?;
                 }
             }
-            PageWork::BeforeShadow => {
+            PageWork::BeforeShadow(batch) => {
                 let Some(stream) = &stream else {
                     return Ok(());
                 };
@@ -229,17 +236,65 @@ pub fn page_work(
     })
 }
 
-/// What states a request slot's installed pages of the draft group of `cache`, for a runner
-/// that speculates ([`CausalLmRunner::set_draft_pages`]): the slot's first draft page and the
-/// units of its pages from there on, as the scheduler last installed them, and `None` for a
-/// slot that holds none or a cache that keeps no draft group.
-pub fn draft_pages(cache: Arc<Mutex<KvCacheMemory>>) -> DraftPages {
-    Box::new(move |slot: u32| {
-        let cache = lock(&cache);
-        let group = cache.layout().draft_group()? as u32;
+/// State copies resolved through the device block table: each a request slot and the units of
+/// the state block its checkpoint's position names.
+pub(crate) type StateRuns = Vec<(u32, Range<u32>)>;
 
-        cache
-            .installed_pages(slot, group)
-            .map(|(first, units)| (first, units.to_vec()))
-    })
+/// The state copies of `batch` resolved through `tables`: `(restores, keeps)`, each a request
+/// slot and the units of the state block its checkpoint's position names in the slot's table
+/// of the state group's class.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] for a batch that copies state over a cache without a state group, a
+/// checkpoint whose position holds no entry, and a keep into one a batch may not write: the
+/// batch is refused before anything of it is launched.
+pub(crate) fn state_copies(
+    cache: &KvCacheMemory,
+    batch: &Batch,
+    tables: &BlockTables,
+) -> Result<(StateRuns, StateRuns)> {
+    let copies = &batch.columns.state_copies;
+    if copies.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let class = cache
+        .layout()
+        .state_group()
+        .and_then(|group| u8::try_from(group).ok())
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "batch {} copies recurrent state, and the cache keeps no state group",
+                batch.id.0
+            ))
+        })?;
+
+    let (mut restores, mut keeps) = (Vec::new(), Vec::new());
+    for copy in copies {
+        let units = tables
+            .units(copy.slot, class, copy.position)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "batch {} copies the state of slot {} at position {} of class {class}, \
+                     which holds no entry",
+                    batch.id.0, copy.slot, copy.position
+                ))
+            })?;
+
+        match copy.direction {
+            StateDirection::Restore => restores.push((copy.slot, units)),
+            StateDirection::Keep if tables.writable(copy.slot, class, copy.position) => {
+                keeps.push((copy.slot, units));
+            }
+            StateDirection::Keep => {
+                return Err(Error::Invalid(format!(
+                    "batch {} keeps the state of slot {} at position {} of class {class}, \
+                     which is read-only",
+                    batch.id.0, copy.slot, copy.position
+                )));
+            }
+        }
+    }
+    Ok((restores, keeps))
 }

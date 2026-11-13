@@ -17,15 +17,17 @@ mod support;
 use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
-use ipc::execution::{Batch, BatchColumns, BatchId, BatchOutput, Shape as BatchShape, Variant};
+use ipc::batch::{Batch, BatchId, BatchOutput, Columns, Phase, Shape as BatchShape, Variant};
 use nn::functional::{WeightOrder, embedding, rms_norm};
 use nn::modules::Linear;
 use nn::{CausalLm, ExpertExchange, KvCache, PhaseKind, RecurrentState, TokenBatch};
 use ops::Generation;
 use platform::{Budget, DeviceAllocation, DeviceId, DeviceRange, PoolKind, Stream};
+use storage::runtime::GroupId;
 use uniserve_tensor::{DType, Device, Tensor};
 use worker::buckets::Bucket;
 use worker::graphs::Preparation;
+use worker::memory::tables::BlockTables;
 use worker::{Error, Graphs, Result, Runner};
 
 use support::{DEVICE, Kernels, Outcome};
@@ -217,8 +219,8 @@ impl TinyRunner {
 }
 
 impl Runner for TinyRunner {
-    fn phases(&self) -> &[ipc::PhaseId] {
-        &[ipc::PhaseId(0)]
+    fn phases(&self) -> &[Phase] {
+        &[Phase::Decode]
     }
 
     fn buckets(&self) -> Vec<Bucket> {
@@ -254,7 +256,7 @@ impl Runner for TinyRunner {
         Ok(())
     }
 
-    fn prepare_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+    fn prepare_inputs(&mut self, batch: &Batch, _tables: &BlockTables) -> Result<Bucket> {
         let bucket = self
             .graphs
             .select(|bucket| bucket.holds(&batch.shape))
@@ -272,7 +274,7 @@ impl Runner for TinyRunner {
         Ok(bucket)
     }
 
-    fn execute(&mut self, _batch: &Batch) -> Result<BatchOutput> {
+    fn execute(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<BatchOutput> {
         Err(Error::State("the cases drive the graphs themselves"))
     }
 
@@ -285,27 +287,24 @@ impl Runner for TinyRunner {
 fn batch(ids: &[u32], bound: u32) -> Batch {
     Batch {
         id: BatchId(1),
-        phase: ipc::PhaseId(0),
-        group: "decode".to_owned(),
-        calls: Vec::new(),
+        group: GroupId(0),
+        phase: Phase::Decode,
+        generation: 1,
         shape: BatchShape::decode(ids.len() as u32, Variant::DecodeGreedy),
-        columns: BatchColumns {
+        requests: Vec::new(),
+        columns: Columns {
             input_ids: ids.iter().map(|id| *id as i32).collect(),
             max_kv_len: bound,
-            ..BatchColumns::default()
+            ..Columns::default()
         },
-        generation: 1,
-        cache_units: Vec::new(),
-        block_tables: Vec::new(),
-        page_loads: Vec::new(),
-        page_offloads: Vec::new(),
-        latent_restores: Vec::new(),
-        host_outputs: Vec::new(),
-        images: Vec::new(),
-        buffers: Vec::new(),
-        frees: Vec::new(),
-        media: None,
+        media: Vec::new(),
+        new_slots: Vec::new(),
     }
+}
+
+/// The device block table of a rank whose requests hold nothing.
+fn tables() -> BlockTables {
+    BlockTables::new(GroupId(0), &[])
 }
 
 /// A runner on the device with both buckets captured, the Build Server its kernels come from
@@ -364,7 +363,7 @@ impl Bench {
 
     /// One replayed step of `ids` under `bound`: its logits.
     fn step(&mut self, ids: &[u32], bound: u32) -> Outcome<Vec<Vec<f32>>> {
-        let bucket = self.runner.prepare_inputs(&batch(ids, bound))?;
+        let bucket = self.runner.prepare_inputs(&batch(ids, bound), &tables())?;
         let outputs = self.runner.graphs.replay(&bucket)?;
         self.runner.read(&outputs, ids.len())
     }
@@ -388,8 +387,8 @@ struct Copies {
 }
 
 impl Runner for Copies {
-    fn phases(&self) -> &[ipc::PhaseId] {
-        &[ipc::PhaseId(0)]
+    fn phases(&self) -> &[Phase] {
+        &[Phase::Decode]
     }
 
     fn buckets(&self) -> Vec<Bucket> {
@@ -410,7 +409,7 @@ impl Runner for Copies {
         Ok(())
     }
 
-    fn prepare_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+    fn prepare_inputs(&mut self, batch: &Batch, _tables: &BlockTables) -> Result<Bucket> {
         let bucket = Bucket::decode(ROWS as u32, Variant::DecodeGreedy);
 
         self.value.set(batch.columns.max_kv_len as f32);
@@ -423,7 +422,7 @@ impl Runner for Copies {
         Ok(bucket)
     }
 
-    fn execute(&mut self, _batch: &Batch) -> Result<BatchOutput> {
+    fn execute(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<BatchOutput> {
         Err(Error::State("the cases drive the graphs themselves"))
     }
 
@@ -463,7 +462,7 @@ fn a_replay_copies_its_columns_and_its_host_values_to_the_device() -> Outcome {
 
     for step in 0..5_u32 {
         let ids: Vec<u32> = (0..ROWS as u32).map(|row| 10 * step + row).collect();
-        let prepared = runner.prepare_inputs(&batch(&ids, 100 + step))?;
+        let prepared = runner.prepare_inputs(&batch(&ids, 100 + step), &tables())?;
         let outputs = runner.graphs.replay(&prepared)?;
 
         runner.graphs.wait()?;
@@ -490,7 +489,9 @@ fn a_replay_computes_what_the_eager_forward_and_the_host_formula_compute() -> Ou
         let replayed = bench.step(&ids, bound)?;
 
         // The same step run eagerly, with no graph.
-        let bucket = bench.runner.prepare_inputs(&batch(&ids, bound))?;
+        let bucket = bench
+            .runner
+            .prepare_inputs(&batch(&ids, bound), &tables())?;
         let outputs = bench.runner.graphs.eager(&bench.runner, &bucket)?;
         let eager = bench.runner.read(&outputs, ids.len())?;
         assert_eq!(replayed, eager);
@@ -570,7 +571,9 @@ fn a_shadow_of_one_implementation_loaded_twice_compares_every_element() -> Outco
 
     // The normalization's two kernels are one implementation: every element of its output
     // agrees, and nothing is left uncompared.
-    let bucket = bench.runner.prepare_inputs(&batch(&[1, 2, 3, 4], 32))?;
+    let bucket = bench
+        .runner
+        .prepare_inputs(&batch(&[1, 2, 3, 4], 32), &tables())?;
     let compared = bench
         .runner
         .graphs

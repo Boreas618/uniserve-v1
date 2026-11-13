@@ -1,256 +1,282 @@
-//! `Executors`: the engine's `ipc::execution::Batches` over a node's executors and its peers.
+//! `Executors`: a node's executors and peer links by worker group, as the engine hands them a
+//! group's jobs.
 //!
-//! A scheduler addresses a batch by its worker group and phase, not by device. A node's devices
-//! are each a rank of one worker group and hold the runners of the stages placed on them; this
-//! is the one place a batch is routed to them, so a scheduler never needs to know how many
-//! devices it drives:
+//! A scheduler addresses a batch, a completion of the buffer pool and a request to stamp by
+//! worker group ([`GroupId`]), never by device. A node's devices are each a rank of one worker
+//! group, and a group may have ranks on other hosts, which the engine processes there serve
+//! through a peer link ([`Remote`]). This is the one place a group's jobs are handed to its
+//! ranks, so a scheduler never needs to know how many devices or processes it drives:
 //!
-//! - A phase one device of the group serves is that device's. A phase several devices serve is
-//!   a parallel group's: each runs its part of one batch, so each is submitted the batch, and
-//!   the submissions are joined into one that completes when every rank's did.
-//! - A group with ranks on other hosts runs its batches there too, through the peer link of
-//!   each engine process that holds them ([`Remote`]). A group whose ranks are all another
-//!   host's is served through its links alone.
-//! - A video decode or encode is one unit of a timeline and needs no other unit, so the devices
-//!   that serve the phase take the units in turn instead of each computing the same one.
-//!
-//! The scheduler's thread is the one thread that submits, so every executor's queue holds the
-//! group's batches in one order, which is the order their collectives need. The groups and
-//! phases are fixed when the executors start: the route holds no lock and makes no retry.
+//! - **Every job goes to every rank.** A batch, a shadow batch, a completion to map and requests
+//!   to stamp are handed to each of the group's executors on this node and to each peer link that
+//!   holds its other ranks, and their submissions are joined into one that completes when every
+//!   rank's did ([`Submission::joined`]): a stamp is the largest over the ranks, and a copy's
+//!   `Finish` failed when it failed on any rank.
+//! - **Numbers.** A batch and a shadow batch read and write the group's device block tables, so
+//!   the group numbers them, from 1, in the order it hands them to its ranks. The number is the
+//!   group's for every rank; a peer's ranks take the number the scheduler node sent. Each rank
+//!   states the numbers it has ended to the group's [`Sequences`], whose smallest over the ranks
+//!   is the group's `completed`.
+//! - **One order.** A group's jobs are handed under one lock, so every rank's queue holds them in
+//!   the same order: the order their collectives need, and the order in which a completion
+//!   mapped before a batch is seen by that batch on every rank.
+//! - **A rank alone.** A video decode round or its encode is one unit of a timeline and needs no
+//!   other rank: the batch names the rank that runs it ([`ipc::batch::MediaRow::rank`], among this
+//!   node's executors of the group), and every other rank, here or on a peer, passes its number.
+//!   A rank whose runners do not serve the batch's phase passes it too.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use ipc::PhaseId;
-use ipc::execution::{Batch, Batches, Computation, Extent, Fault, Inventory, Submission};
+use ipc::MainProcessRequest;
+use ipc::batch::{Batch, Phase};
+use storage::runtime::{Completion, GroupId, Request, RequestId};
 
 use super::peers::Remote;
-use super::{Executor, Operation};
-use crate::buckets::Bucket;
-use crate::{Error, Result};
+use super::{Executor, Operation, Sequences, alone};
+use crate::completion::Submission;
+use crate::{Error, Result, lock};
 
-/// A node's executors and peer links, as the scheduler submits batches to them.
+/// A node's executors and peer links, by worker group, as the engine hands them its jobs.
 pub struct Executors {
-    /// The executors, each with the worker group it is a rank of.
-    executors: Vec<(String, Arc<Executor>)>,
-    /// The engine processes of other hosts that hold ranks of these groups, each its peer link
-    /// with the groups it holds ranks of.
-    remotes: Vec<(Vec<String>, Arc<Remote>)>,
-    /// The pools this node serves, as the deployment launched them: what the scheduler builds
-    /// its view of the workers from. A scheduler refuses a node that states none.
-    inventory: Vec<Inventory>,
+    groups: Vec<Group>,
+}
+
+/// One worker group's ranks, as [`Executors`] hands them the group's jobs.
+struct Group {
+    sequences: Arc<Sequences>,
+    /// This node's executors of the group: executor `i` reports to `sequences` as rank `i`.
+    executors: Vec<Arc<Executor>>,
+    /// The links of the processes that hold the group's other ranks: link `j` reports as rank
+    /// `executors.len() + j`.
+    remotes: Vec<Arc<Remote>>,
+    /// The number of the group's last numbered job, held while any job is handed to the ranks:
+    /// every rank takes the group's jobs in the order they were handed.
+    next: Mutex<u64>,
 }
 
 impl Executors {
-    /// The route over `executors`, each with the worker group it is a rank of, and `remotes`,
-    /// each with the groups whose ranks its engine process holds; `inventory` states the pools
-    /// they serve.
+    /// The route over `executors`, this node's, and `remotes`, the links of the processes that
+    /// hold other ranks, each with the groups it holds ranks of, for the groups of `sequences`.
     ///
-    /// The executors are shared with the control thread, which reads their jobs in flight and
-    /// their counters through the same handles.
+    /// A group's ranks report to its sequences in this order: this node's executors of the group
+    /// in the order given, each spawned as its rank there, then the links that hold ranks of it,
+    /// in the order given. The executors are shared with the control thread, which reads their
+    /// jobs in flight and their counters through the same handles.
+    ///
+    /// # Errors
+    ///
+    /// Sequences of one group given twice, or of a group without ranks; sequences that count
+    /// other ranks than the group has; an executor of a group without sequences, or spawned as
+    /// another rank than its place.
     pub fn new(
-        executors: Vec<(String, Arc<Executor>)>,
-        remotes: Vec<(Vec<String>, Arc<Remote>)>,
-        inventory: Vec<Inventory>,
-    ) -> Self {
-        Self {
-            executors,
-            remotes,
-            inventory,
-        }
-    }
+        sequences: Vec<Arc<Sequences>>,
+        executors: Vec<Arc<Executor>>,
+        remotes: Vec<(Vec<GroupId>, Arc<Remote>)>,
+    ) -> Result<Self> {
+        let mut groups: Vec<Group> = Vec::with_capacity(sequences.len());
 
-    /// The executors of `group` whose runners serve `phase`, by their place among this node's.
-    fn serving(&self, group: &str, phase: PhaseId) -> Vec<(usize, &Arc<Executor>)> {
-        self.executors
-            .iter()
-            .enumerate()
-            .filter(|(_, (held, executor))| held == group && executor.serves(phase))
-            .map(|(index, (_, executor))| (index, executor))
-            .collect()
-    }
-
-    /// The peer links of the processes that hold ranks of `group`, by their place after this
-    /// node's executors.
-    fn remotes_of(&self, group: &str) -> Vec<(usize, &Arc<Remote>)> {
-        let executors = self.executors.len();
-
-        self.remotes
-            .iter()
-            .enumerate()
-            .filter(|(_, (groups, _))| groups.iter().any(|held| held == group))
-            .map(|(index, (_, remote))| (executors + index, remote))
-            .collect()
-    }
-
-    /// The refusal of `batch` when neither an executor of this node nor a peer serves it.
-    fn unrouted(&self, batch: &Batch) -> Error {
-        let served: Vec<PhaseId> = self
-            .executors
-            .iter()
-            .filter(|(group, _)| *group == batch.group)
-            .flat_map(|(_, executor)| executor.phases().iter().copied())
-            .collect();
-
-        route_refusal(&batch.group, batch.phase, &served)
-    }
-
-    /// The one executor a unit-measured call runs on, when `batch` is one, with its place among
-    /// this node's executors.
-    ///
-    /// A video decode is one unit of the timeline, so the devices that serve the phase take the
-    /// units in turn. A video encode follows its unit: the device that decoded a clip encodes
-    /// it.
-    fn executor_of_unit(&self, batch: &Batch) -> Result<Option<(usize, &Arc<Executor>)>> {
-        let Some(media) = &batch.media else {
-            return Ok(None);
-        };
-        if !matches!(
-            media.computation.call,
-            ipc::MediaCall::VideoDecoding | ipc::MediaCall::VideoEncoding
-        ) {
-            return Ok(None);
-        }
-
-        let serving = self.serving(&batch.group, batch.phase);
-        if serving.is_empty() {
-            return Err(self.unrouted(batch));
-        }
-        let unit = media.request(0)?.unit as usize;
-        Ok(Some(serving[unit % serving.len()]))
-    }
-
-    /// Submits `batch` to every executor of its group that serves its phase (`submit`) and to
-    /// the group's ranks on other hosts (`remote`), as one submission.
-    fn on_every_rank(
-        &self,
-        batch: Batch,
-        submit: impl Fn(usize, &Executor, Batch) -> Result<Submission>,
-        remote: impl Fn(&Remote, Batch) -> Result<Submission>,
-    ) -> Result<Submission> {
-        let executors = self.serving(&batch.group, batch.phase);
-        let peers = self.remotes_of(&batch.group);
-        if executors.is_empty() && peers.is_empty() {
-            return Err(self.unrouted(&batch));
-        }
-
-        // The other hosts' ranks take the batch first: it travels while this node's executors
-        // prepare their inputs, and the ranks' collectives meet in the batch's forward.
-        let mut parts = Vec::with_capacity(executors.len() + peers.len());
-        for (_, peer) in peers {
-            parts.push(remote(peer, batch.clone())?);
-        }
-        for (index, executor) in executors {
-            parts.push(submit(index, executor, batch.clone())?);
-        }
-
-        // The last part is the submission the others join: this node's last executor, or the
-        // last peer of a group whose ranks are all another host's.
-        let last = parts.pop().ok_or_else(|| self.unrouted(&batch))?;
-        Ok(last.joined(parts))
-    }
-
-    /// The bucket the executor serving `phase` would serve `computation` in, or `None` when it
-    /// states no bucket for it. A media deployment's devices are one group, so the first
-    /// executor that serves the phase is asked.
-    ///
-    /// # Errors
-    ///
-    /// When no executor of this node serves `phase`.
-    pub fn media(&self, phase: PhaseId, computation: &Computation) -> Result<Option<Bucket>> {
-        let executor = self
-            .executors
-            .iter()
-            .map(|(_, executor)| executor)
-            .find(|executor| executor.serves(phase))
-            .ok_or_else(|| route_refusal("", phase, &[]))?;
-
-        Ok(executor.media(computation))
-    }
-
-    /// The executors `batch` runs on, by their place among this node's executors and, after
-    /// them, its peer links: a group whose ranks are all another host's runs on its links.
-    ///
-    /// # Errors
-    ///
-    /// When nothing here serves the batch's group and phase.
-    pub fn devices(&self, batch: &Batch) -> Result<Vec<usize>> {
-        // The same two routes `submit` takes.
-        if let Some((index, _)) = self.executor_of_unit(batch)? {
-            return Ok(vec![index]);
-        }
-
-        let mut devices: Vec<usize> = self
-            .serving(&batch.group, batch.phase)
-            .into_iter()
-            .map(|(index, _)| index)
-            .collect();
-        if devices.is_empty() {
-            devices = self
-                .remotes_of(&batch.group)
-                .into_iter()
-                .map(|(index, _)| index)
+        for sequences in sequences {
+            let group = sequences.group();
+            let ranks: Vec<Arc<Executor>> = executors
+                .iter()
+                .filter(|executor| executor.group() == group)
+                .map(Arc::clone)
                 .collect();
+            let links: Vec<Arc<Remote>> = remotes
+                .iter()
+                .filter(|(held, _)| held.contains(&group))
+                .map(|(_, remote)| Arc::clone(remote))
+                .collect();
+
+            let count = ranks.len() + links.len();
+            let twice = groups.iter().any(|route| route.sequences.group() == group);
+            if twice || count == 0 || sequences.ranks() != count {
+                return Err(Error::Invalid(format!(
+                    "group {} is routed to {} executors and {} peer links, with sequences of {} \
+                     ranks, or more than once",
+                    group.0,
+                    ranks.len(),
+                    links.len(),
+                    sequences.ranks()
+                )));
+            }
+
+            let misplaced = ranks
+                .iter()
+                .enumerate()
+                .find(|(place, executor)| executor.rank() != *place);
+            if let Some((place, executor)) = misplaced {
+                return Err(Error::Invalid(format!(
+                    "the executor in place {place} of group {} was spawned as rank {}",
+                    group.0,
+                    executor.rank()
+                )));
+            }
+
+            groups.push(Group {
+                sequences,
+                executors: ranks,
+                remotes: links,
+                next: Mutex::new(0),
+            });
         }
-        if devices.is_empty() {
-            return Err(self.unrouted(batch));
+
+        if let Some(stray) = executors.iter().find(|executor| {
+            !groups
+                .iter()
+                .any(|route| route.sequences.group() == executor.group())
+        }) {
+            return Err(Error::Invalid(format!(
+                "an executor of group {} is routed without the group's sequences",
+                stray.group().0
+            )));
         }
-        Ok(devices)
+
+        Ok(Self { groups })
     }
 
-    /// How many executors and peer links run this node's batches, one queue each.
-    pub fn device_count(&self) -> usize {
-        self.executors.len() + self.remotes.len()
+    /// The route of `group`.
+    fn group(&self, group: GroupId) -> Result<&Group> {
+        self.groups
+            .iter()
+            .find(|route| route.sequences.group() == group)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "no executor of this node and no peer link serves worker group {}",
+                    group.0
+                ))
+            })
     }
 
-    /// Submits `batch` to the executors of its group and phase and to the group's ranks on
-    /// other hosts, or to its unit's one executor.
+    /// Hands `batch` to every rank of its group under the group's next number: the ranks that
+    /// run it run it, the others pass its number. The submission completes with the batch's
+    /// output and the `Finish` of each copy that ran with it, stamped by the group.
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] when nothing here serves the batch's group and phase, or what a queue
-    /// or a peer link refuses.
+    /// [`Error::Invalid`] when nothing here serves the batch's group and phase, or a rank it
+    /// names; what a queue or a peer link refuses.
     pub fn submit(&self, batch: Batch) -> Result<Submission> {
-        if let Some((_, executor)) = self.executor_of_unit(&batch)? {
-            return executor.submit(batch);
-        }
-
-        self.on_every_rank(
-            batch,
-            |index, executor, mut batch| {
-                // A page copy names the rank that makes it: its place among the group's ranks on
-                // this node.
-                let group = &self.executors[index].0;
-                let rank = self.executors[..index]
-                    .iter()
-                    .filter(|(held, _)| held == group)
-                    .count();
-                batch.page_loads.retain(|copy| copy.rank as usize == rank);
-                batch
-                    .page_offloads
-                    .retain(|copy| copy.rank as usize == rank);
-
-                executor.submit(batch)
-            },
-            Remote::submit,
-        )
+        self.numbered(batch, false)
     }
 
-    /// Submits the shadow batch `batch` to every rank of its group and phase.
+    /// Hands the shadow batch `batch` to every rank of its group under the group's next number,
+    /// as [`Executors::submit`] hands a batch.
     ///
     /// # Errors
     ///
     /// As [`Executors::submit`].
     pub fn shadow(&self, batch: Batch) -> Result<Submission> {
-        self.on_every_rank(
-            batch,
-            |_, executor, batch| executor.shadow(batch),
-            Remote::shadow,
-        )
+        self.numbered(batch, true)
+    }
+
+    /// Numbers `batch` for its group and hands it to the group's ranks, as a shadow batch when
+    /// `shadow` is set.
+    fn numbered(&self, batch: Batch, shadow: bool) -> Result<Submission> {
+        let group = self.group(batch.group)?;
+        let mut next = lock(&group.next);
+
+        // A batch refused before any rank took it takes no number.
+        group.check(&batch, false, shadow)?;
+        *next += 1;
+        group.hand(*next, batch, false, shadow)
+    }
+
+    /// Hands `batch`, which the scheduler node numbered `sequence`, to this process's ranks of
+    /// its group, as a peer link's far end does: each runs it, or only takes its number when
+    /// `pass` is set or its runners do not serve the batch's phase.
+    pub(super) fn run(
+        &self,
+        sequence: u64,
+        batch: Batch,
+        pass: bool,
+        shadow: bool,
+    ) -> Result<Submission> {
+        let group = self.group(batch.group)?;
+        let mut next = lock(&group.next);
+
+        group.check(&batch, pass, shadow)?;
+        *next = (*next).max(sequence);
+        group.hand(sequence, batch, pass, shadow)
+    }
+
+    /// Maps `completion`, the buffer pool's answer to `request` numbered `id`, into the device
+    /// block tables of every rank of `group`, under `slot`: the slot row of the request's owner on
+    /// the group, or for a group that reads a class it does not write, the slot of the request's
+    /// own owner there. Every job handed to the group after it sees its entries. The submission
+    /// fails when a rank's tables refuse the pair.
+    ///
+    /// # Errors
+    ///
+    /// A group nothing here serves, or what a queue or a peer link refuses.
+    pub fn map(
+        &self,
+        group: GroupId,
+        slot: u32,
+        id: RequestId,
+        request: Request,
+        completion: Completion,
+    ) -> Result<Submission> {
+        let route = self.group(group)?;
+        let _order = lock(&route.next);
+
+        let mut parts = Vec::with_capacity(route.executors.len() + route.remotes.len());
+        for (index, remote) in route.remotes.iter().enumerate() {
+            let frame = MainProcessRequest::map(group, slot, id, &request, &completion);
+            parts.push(remote.send(frame, &route.sequences, route.executors.len() + index)?);
+        }
+        for executor in &route.executors {
+            parts.push(executor.map(slot, id, request.clone(), completion.clone())?);
+        }
+
+        joined(parts)
+    }
+
+    /// Applies `requests` to the device block tables of every rank of `group` and stamps them:
+    /// the submission completes with the requests, each with the group's stamp, the largest over
+    /// its ranks of the number of the last job each had launched when it applied them. The
+    /// requests are those the executors stamp: `Release`, `Detach`, `Commit`, `Transfer`, and the
+    /// `Finish { ok: false }` that gives a copy up.
+    ///
+    /// # Errors
+    ///
+    /// A request the executors do not stamp, a group nothing here serves, or what a queue or a
+    /// peer link refuses. Nothing is handed to any rank when a request is refused.
+    pub fn stamp(&self, group: GroupId, requests: Vec<Request>) -> Result<Submission> {
+        if let Some(request) = requests.iter().find(|request| !stamped(request)) {
+            return Err(Error::Invalid(format!(
+                "{request:?} is not a request the executors stamp"
+            )));
+        }
+
+        let route = self.group(group)?;
+        let _order = lock(&route.next);
+
+        let mut parts = Vec::with_capacity(route.executors.len() + route.remotes.len());
+        for (index, remote) in route.remotes.iter().enumerate() {
+            let frame = MainProcessRequest::stamp(group, &requests);
+            parts.push(remote.send(frame, &route.sequences, route.executors.len() + index)?);
+        }
+        for executor in &route.executors {
+            parts.push(executor.stamp(requests.clone())?);
+        }
+
+        joined(parts)
+    }
+
+    /// The `completed` of `group` as this node knows it: the smallest ended sequence over the
+    /// group's ranks here and on peers.
+    ///
+    /// # Errors
+    ///
+    /// A group nothing here serves.
+    pub fn completed(&self, group: GroupId) -> Result<u64> {
+        Ok(self.group(group)?.sequences.completed())
     }
 
     /// Submits one control operation to every executor of this node, as one submission:
-    /// `operation` makes each executor's from its place among the node's executors, which is
-    /// the rank a page copy or a storage operation names.
+    /// `operation` makes each executor's from its place among the node's executors, group by
+    /// group in the order the route was given them.
     ///
     /// # Errors
     ///
@@ -260,80 +286,140 @@ impl Executors {
         label: &str,
         operation: impl Fn(usize) -> Operation,
     ) -> Result<Submission> {
-        let mut submissions = self
-            .executors
+        let parts = self
+            .groups
             .iter()
+            .flat_map(|group| &group.executors)
             .enumerate()
-            .map(|(rank, (_, executor))| executor.control(label, operation(rank)))
+            .map(|(place, executor)| executor.control(label, operation(place)))
             .collect::<Result<Vec<_>>>()?;
 
-        let last = submissions
-            .pop()
-            .ok_or_else(|| Error::Invalid("this node holds no executor".to_owned()))?;
-        Ok(last.joined(submissions))
+        joined(parts)
     }
 }
 
-/// The refusal of a batch whose group and phase no executor of this node serves.
+impl Group {
+    /// Whether the group's ranks can take `batch`: a rank it names is one of this node's
+    /// executors and serves its phase, and a batch that is not passed has a rank to run it.
+    fn check(&self, batch: &Batch, pass: bool, shadow: bool) -> Result<()> {
+        if pass {
+            return Ok(());
+        }
+        let serving = || {
+            self.executors
+                .iter()
+                .any(|executor| executor.serves(batch.phase))
+        };
+
+        match (alone(batch)?, shadow) {
+            (Some(rank), false) => {
+                let named = self.executors.get(rank as usize);
+                if named.is_some_and(|executor| executor.serves(batch.phase)) {
+                    return Ok(());
+                }
+                Err(Error::Invalid(format!(
+                    "batch {} names rank {rank} of group {}, which no executor of this node that \
+                     serves phase {:?} is",
+                    batch.id.0,
+                    self.sequences.group().0,
+                    batch.phase
+                )))
+            }
+            _ if serving() || !self.remotes.is_empty() => Ok(()),
+            _ => Err(route_refusal(self, batch.phase)),
+        }
+    }
+
+    /// Hands `batch`, numbered `sequence`, to every rank of the group, which `check` accepted:
+    /// the ranks that run it run it, and the others pass its number. The peers take it first: it
+    /// travels while this node's executors prepare their inputs, and the ranks' collectives meet
+    /// in the batch's forward.
+    fn hand(&self, sequence: u64, batch: Batch, pass: bool, shadow: bool) -> Result<Submission> {
+        let named = if pass || shadow { None } else { alone(&batch)? };
+        let peers_pass = pass || named.is_some();
+
+        // The parts whose output counts come first, this node's before the peers': the joined
+        // submission's output is its first part's.
+        let mut running = Vec::new();
+        let mut remote = Vec::new();
+        let mut passing = Vec::new();
+
+        for (index, link) in self.remotes.iter().enumerate() {
+            let frame = if shadow {
+                MainProcessRequest::shadow(sequence, batch.clone())
+            } else {
+                MainProcessRequest::submit(sequence, peers_pass, batch.clone())
+            };
+            let part = link.send(frame, &self.sequences, self.executors.len() + index)?;
+
+            if peers_pass {
+                passing.push(part);
+            } else {
+                remote.push(part);
+            }
+        }
+
+        for (index, executor) in self.executors.iter().enumerate() {
+            let runs = !pass
+                && named.is_none_or(|rank| rank as usize == index)
+                && executor.serves(batch.phase);
+
+            match (runs, shadow) {
+                (true, true) => running.push(executor.shadow(sequence, batch.clone())?),
+                (true, false) => running.push(executor.submit(sequence, batch.clone())?),
+                (false, _) => passing.push(executor.pass(sequence)?),
+            }
+        }
+
+        running.extend(remote);
+        running.extend(passing);
+        joined(running)
+    }
+}
+
+/// `parts`, the same job's submissions on the ranks of a group, as one submission: the first
+/// part's outcome, unless another failed, with the requests of every part joined.
+fn joined(mut parts: Vec<Submission>) -> Result<Submission> {
+    if parts.is_empty() {
+        return Err(Error::Invalid(
+            "a job was handed to no executor and no peer link".to_owned(),
+        ));
+    }
+
+    let first = parts.remove(0);
+    Ok(first.joined(parts))
+}
+
+/// Whether the executors stamp `request`: it takes entries away from a device block table or
+/// marks one read-only, or it gives a copy up.
+fn stamped(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Release { .. }
+            | Request::Detach { .. }
+            | Request::Commit { .. }
+            | Request::Transfer { .. }
+            | Request::Finish { ok: false, .. }
+    )
+}
+
+/// The refusal of a batch whose phase no rank of `group` serves.
 ///
-/// The scheduler numbers the phases of its batches and the deployment places stages by the
-/// same numbers; when the two disagree the batch arrives here and nothing can serve it. Both
-/// are named, the phase asked for and the phases this node's executors of the group serve,
-/// because one figure alone cannot show the disagreement. The refusal is `Invalid`: the batch
-/// is not servable here, which is not a broken device.
-fn route_refusal(group: &str, phase: PhaseId, served: &[PhaseId]) -> Error {
+/// The scheduler places a request's phases on groups by the phases their ranks state; when the
+/// two disagree the batch arrives here and nothing can serve it. Both are named, the phase asked
+/// for and the phases this node's executors of the group serve, because one figure alone cannot
+/// show the disagreement. The refusal is `Invalid`: the batch is not servable here, which is not
+/// a broken device.
+fn route_refusal(group: &Group, phase: Phase) -> Error {
+    let served: Vec<Phase> = group
+        .executors
+        .iter()
+        .flat_map(|executor| executor.phases().iter().copied())
+        .collect();
+
     Error::Invalid(format!(
-        "no executor of this node in worker group {group:?} serves phase {}; its executors of \
-         the group serve {:?}",
-        phase.0,
-        served.iter().map(|served| served.0).collect::<Vec<_>>()
+        "no executor of this node in worker group {} serves phase {phase:?}; its executors of the \
+         group serve {served:?}",
+        group.sequences.group().0
     ))
-}
-
-impl Batches for Executors {
-    fn submit(&self, batch: Batch) -> std::result::Result<Submission, Box<Fault>> {
-        Ok(Executors::submit(self, batch)?)
-    }
-
-    fn shadow(&self, batch: Batch) -> std::result::Result<Submission, Box<Fault>> {
-        Ok(Executors::shadow(self, batch)?)
-    }
-
-    fn media(
-        &self,
-        phase: PhaseId,
-        computation: &Computation,
-    ) -> std::result::Result<Option<Extent>, Box<Fault>> {
-        // The scheduler reads the extent the bucket states, and nothing else of the bucket.
-        Ok(Executors::media(self, phase, computation)?.map(|bucket| bucket.extent))
-    }
-
-    fn devices(&self, batch: &Batch) -> std::result::Result<Vec<usize>, Box<Fault>> {
-        Ok(Executors::devices(self, batch)?)
-    }
-
-    fn device_count(&self) -> usize {
-        Executors::device_count(self)
-    }
-
-    fn inventory(&self) -> &[Inventory] {
-        &self.inventory
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_phase_no_executor_serves_is_refused_by_both_numbers() {
-        let refusal = route_refusal("decode", PhaseId(3), &[PhaseId(0), PhaseId(1)]);
-        assert!(matches!(refusal, Error::Invalid(_)), "{refusal:?}");
-
-        let text = refusal.to_string();
-        assert!(
-            text.contains("phase 3") && text.contains("[0, 1]") && text.contains("decode"),
-            "{text}"
-        );
-    }
 }

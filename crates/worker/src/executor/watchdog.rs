@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use ipc::Stall;
-use ipc::execution::BatchId;
+use ipc::batch::BatchId;
 
 use crate::{Error, Result};
 

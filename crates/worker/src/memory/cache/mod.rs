@@ -7,11 +7,10 @@
 //! - the **planes** ([`planes`]): the unit pool's exclusive storage at the host's Storage
 //!   Server, with each plane's initialization flag and, for an FP8 cache, its scale, and the
 //!   index keys of a model whose attention reads the tokens an indexer selects;
-//! - the **page tables** ([`tables`]): the scheduler's page assignments per request slot and
-//!   cache group, and one pooled table per attention group that a forward gathers its rows
-//!   from;
+//! - the **pooled page tables** ([`tables`]): one per attention group, the device copy of the
+//!   group's entries of the rank's device block table, which a forward gathers its rows from;
 //! - the **attention workspace**, which the paged-attention kernel uses during a forward;
-//! - the **host tier** ([`host`]): the host page pools pages are loaded from and offloaded to
+//! - the **host tier** ([`host`]): the host page pools pages are loaded from and stored to
 //!   on the rank's copy stream, with the converted loads ([`conversion`]) of a cache that
 //!   admits them;
 //! - the **scratch pages** ([`scratch`]) a shadow forward writes.
@@ -28,17 +27,22 @@
 //!
 //! ## A batch's cache work
 //!
-//! The runner that holds the cache issues a batch's cache work on the batch's stream, on the
-//! executor thread, before the batch's forward, in this order:
+//! The buffer pool's completions reach the rank's device block table
+//! ([`BlockTables`](crate::memory::tables::BlockTables)), whose runs name the cache's memory by
+//! region ([`CacheRegions`]). The runner that holds the cache issues a batch's cache work on
+//! the executor thread, before the batch's forward, in this order:
 //!
-//! 1. [`KvCacheMemory::install`]: the batch's rows of the pooled tables;
-//! 2. [`KvCacheMemory::apply_units`]: the reset of the units the scheduler allocated for the
-//!    batch, then the copies of a leased prefix into them;
-//! 3. [`KvCacheMemory::copy_pages`]: the loads from the host tier into those units, which the
-//!    stream waits for, and the offloads, whose event the batch's output waits for;
-//! 4. the restores of recurrent state
+//! 1. [`KvCacheMemory::apply`]: the block table's changes since the last batch, on the batch's
+//!    stream: the units the buffer pool allocated are reset, and the pooled tables' rows that
+//!    changed are written;
+//! 2. [`KvCacheMemory::copy`]: the copies the batch takes, between runs of the units and of
+//!    the host tier, whose event the batch's end waits for;
+//! 3. the restores of recurrent state
 //!    ([`StateMemory::copy`](crate::memory::state::StateMemory::copy)), then the forward, then
 //!    the keeps.
+//!
+//! The class of cache group `g` is class `g` of the buffer pool, and the classes past the
+//! cache groups are no cache's.
 //!
 //! ## Index tensors
 //!
@@ -58,13 +62,14 @@ mod tables;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use ipc::{BlockTable, CacheUnitAllocation, HostPoolInfo, PageCopy, PrefixCacheInfo};
+use ipc::{HostPoolInfo, PrefixCacheInfo};
 use nn::{KvCache, KvPlanes};
 use platform::{DeviceId, Event, Stream};
+use storage::runtime::Run;
 use uniserve_tensor::{DType, Device, Tensor};
 
 use self::conversion::Conversion;
-use self::host::HostTier;
+use self::host::{HostPage, HostTier};
 pub use self::layout::{CacheLayout, Checkpoint, GroupLayout};
 use self::planes::Planes;
 use self::scratch::ScratchPages;
@@ -74,6 +79,7 @@ use crate::memory::allocation::Storage;
 use crate::memory::client::StorageClient;
 use crate::memory::exclusive::ExclusiveStorage;
 use crate::memory::lend;
+use crate::memory::tables::Change;
 use crate::{Error, Result};
 
 /// The bytes the trtllm-gen paged-attention kernel takes as its workspace: what
@@ -149,11 +155,29 @@ impl KvCacheConfig {
     }
 }
 
+/// The numbers the buffer pool gave the regions the cache's memory is (the answer to `Open`):
+/// what tells a run a completion states, `(region, first unit, count)`, as units of the pool,
+/// pages of the host tier or slots of a converted-load source buffer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheRegions {
+    /// The region of the pool's units on the device: unit `u` of it is the pool's unit `u`.
+    pub units: u8,
+    /// Per cache group, the host region of the group's pages: unit `u` of it is page `u` of the
+    /// group's host page pool. `None` for a group whose pages have no host copy.
+    pub host: Vec<Option<u8>>,
+    /// Per cache group, the region of the group's converted-load source buffer: unit `u` of it
+    /// is slot `u` of the buffer. `None` for a group that converts none.
+    pub sources: Vec<Option<u8>>,
+}
+
 /// The KV cache of one rank: its planes, page tables, workspace, host tier and scratch pages.
 pub struct KvCacheMemory {
     config: KvCacheConfig,
     planes: Planes,
     tables: PageTables,
+    /// The regions of the cache's memory, once the buffer pool numbered them
+    /// ([`Self::set_regions`]).
+    regions: Option<CacheRegions>,
     /// The attention workspace on the device; `None` for a cache that holds no device.
     workspace: Option<Arc<Storage>>,
     /// The host tier, once the engine sized it ([`Self::map_host_tier`]).
@@ -182,6 +206,7 @@ impl KvCacheMemory {
                 config.units,
             )?,
             workspace: None,
+            regions: None,
             host: None,
             scratch: None,
             config,
@@ -228,6 +253,7 @@ impl KvCacheMemory {
             planes,
             tables,
             workspace: Some(workspace),
+            regions: None,
             host: None,
             scratch: None,
         })
@@ -335,7 +361,7 @@ impl KvCacheMemory {
     }
 
     /// The pooled page table of attention group `group` as the host holds it,
-    /// `[slots + 1, width]` row-major: what the device's table holds once the installs issued
+    /// `[slots + 1, width]` row-major: what the device's table holds once the changes applied
     /// so far completed.
     ///
     /// # Errors
@@ -343,13 +369,6 @@ impl KvCacheMemory {
     /// A group that is no attention group of the cache.
     pub fn host_table(&self, group: usize) -> Result<&[u32]> {
         self.tables.host_table(group)
-    }
-
-    /// The pages request slot `slot` holds in cache group `group`, of any kind, as the
-    /// scheduler last stated them: its first logical page and the units of the pages from
-    /// there on, page-major. `None` when the slot holds no table of the group.
-    pub fn installed_pages(&self, slot: u32, group: u32) -> Option<(u32, &[u32])> {
-        self.tables.installed(slot, group)
     }
 
     /// The attention workspace, `[workspace_bytes]` U8.
@@ -381,8 +400,8 @@ impl KvCacheMemory {
     }
 
     /// The draft cache as a drafter's forward is lent it: `block_tables` names, per row, the
-    /// drafter's pages ([`Self::draft_planes`]), which a speculative step states from
-    /// [`Self::installed_pages`].
+    /// drafter's pages ([`Self::draft_planes`]), which a speculative step states from the
+    /// draft group's entries of the rank's device block table.
     ///
     /// # Errors
     ///
@@ -438,114 +457,79 @@ impl KvCacheMemory {
         self.planes.mapped_bytes()
     }
 
-    /// Installs the scheduler's page tables of a batch ([`ipc::BlockTable`]) into the mirror
-    /// and the pooled tables, on `stream` for a cache on a device and with `None` for one that
-    /// holds none. Every table is checked first, and nothing changes when one is refused.
+    /// States the regions of the cache's memory, as the buffer pool numbered them in its
+    /// answer to `Open`: what [`Self::copy`] tells the runs of a copy by. They are the same
+    /// for the life of the session.
     ///
     /// # Errors
     ///
-    /// A table of a slot or group the cache does not hold, of units outside the pool, of more
-    /// pages than a row or of more tokens than its pages, by slot, group and reason.
-    pub fn install(&mut self, tables: &[BlockTable], stream: Option<&Stream>) -> Result<()> {
-        self.tables.install(tables, stream)
+    /// Regions stated for another number of cache groups than the layout's.
+    pub fn set_regions(&mut self, regions: CacheRegions) -> Result<()> {
+        let groups = self.config.layout.groups.len();
+        if regions.host.len() != groups || regions.sources.len() != groups {
+            return Err(Error::Invalid(format!(
+                "regions stated for {} and {} cache groups of a cache of {groups}",
+                regions.host.len(),
+                regions.sources.len()
+            )));
+        }
+
+        self.regions = Some(regions);
+        Ok(())
     }
 
-    /// Forgets the page tables of `slots` and names the padding unit in their rows again, on
-    /// `stream` for a cache on a device, ordered behind every batch that reads those rows.
+    /// Applies `changes`, the rank's device block table's changes since the last batch
+    /// (`BlockTables::take_changes`), on `stream` for a cache on a device and with `None` for
+    /// one that holds none: the units of each entry the buffer pool allocated since are reset
+    /// (flags cleared, scales set to one, values left: a block is written before it is read),
+    /// and the attention groups' pooled rows that changed are written. A change of a class
+    /// past the cache groups is no cache's and is skipped. Every change is checked before
+    /// anything is issued.
+    ///
+    /// The order is the one a batch needs: the forward that follows on `stream` reads the
+    /// pooled rows and writes the reset units.
     ///
     /// # Errors
     ///
-    /// A slot outside the cache's request slots.
-    pub fn release_slots(&mut self, slots: &[u32], stream: Option<&Stream>) -> Result<()> {
-        self.tables.release(slots, stream)
-    }
-
-    /// Applies what the scheduler allocated for a batch's pages ([`ipc::CacheUnitAllocation`]),
-    /// on `stream` for a cache on a device: the new units' flags are cleared and their scales
-    /// set to one, then the units of a leased prefix are copied into them. Their values are
-    /// left as they are: a page is written before it is read.
-    ///
-    /// The order is the only correct one: a destination is reset first, which is what makes
-    /// the page new, and the copies follow. They read sources the scheduler still leases, and
-    /// the forward that reads the destinations follows on the same stream.
-    ///
-    /// Every allocation is checked before anything is issued.
-    ///
-    /// # Errors
-    ///
-    /// A group the cache does not hold; a unit that is the padding unit or outside the pool; a
-    /// copy whose destination the allocation did not name, whose destination is its source, or
-    /// which writes a read-only unit of the predecessor epoch; a copy in a cache with a state
-    /// group, whose state planes a unit copy does not move.
-    pub fn apply_units(
-        &mut self,
-        units: &[CacheUnitAllocation],
-        stream: Option<&Stream>,
-    ) -> Result<()> {
+    /// A change the pooled tables refuse, a reset of units outside the pool or of the padding
+    /// unit, or a stream stated for a cache that holds no device, or the reverse.
+    pub fn apply(&mut self, changes: &[Change], stream: Option<&Stream>) -> Result<()> {
         if self.planes.device_id().is_some() != stream.is_some() {
             return Err(Error::Invalid(
-                "cache units are applied on a stream exactly when the cache is on a device".into(),
+                "a cache's changes are applied on a stream exactly when it is on a device".into(),
             ));
         }
 
         let groups = self.config.layout.groups.len();
-        let pool = self.config.units;
-        for allocation in units {
-            let group = allocation.group_id as usize;
-            if group >= groups {
+        let mut resets = Vec::new();
+        for change in changes {
+            let Some((_, first, count)) = change.run.filter(|_| change.reset) else {
+                continue;
+            };
+            if usize::from(change.class) >= groups {
+                continue;
+            }
+            if first == 0 || u64::from(first) + u64::from(count) > u64::from(self.config.units) {
                 return Err(Error::Invalid(format!(
-                    "the scheduler allocated units of cache group {group}, and the cache has \
-                     {groups} group(s)"
+                    "the block at position {} of class {} of request slot {} takes units \
+                     {first}..{} of a pool of units 1..{}",
+                    change.position,
+                    change.class,
+                    change.slot,
+                    u64::from(first) + u64::from(count),
+                    self.config.units
                 )));
             }
-
-            let held = |unit: ipc::UnitId, what: &str| -> Result<()> {
-                if unit.0 == 0 || unit.0 >= pool {
-                    return Err(Error::Invalid(format!(
-                        "the scheduler named cache unit {} of group {group} as {what}, outside \
-                         the pool's units 1..{pool} (unit 0 is the padding unit)",
-                        unit.0
-                    )));
-                }
-                Ok(())
-            };
-            for &unit in &allocation.unit_ids {
-                held(unit, "a new unit")?;
-            }
-            for &(source, destination) in &allocation.copies {
-                held(source, "a copy's source")?;
-                held(destination, "a copy's destination")?;
-
-                if !allocation.unit_ids.contains(&destination) {
-                    return Err(Error::Invalid(format!(
-                        "the scheduler copies into cache unit {} of group {group}, which the \
-                         allocation did not name among its new units",
-                        destination.0
-                    )));
-                }
-            }
-            self.planes.check_copies(&allocation.copies)?;
-
-            // A page of a cache with a state group holds its layers' checkpoints in planes of
-            // their own, which a unit copy does not move: the destination would look
-            // initialized while its state planes hold another page's.
-            if !allocation.copies.is_empty() && self.config.layout.state_fields() > 0 {
-                return Err(Error::Unsupported(
-                    "a unit copy in a cache with a state group does not move the state planes"
-                        .into(),
-                ));
-            }
+            resets.push((first, count));
         }
 
-        let Some(stream) = stream else {
-            return Ok(());
-        };
-        for allocation in units {
-            let acquired: Vec<u32> = allocation.unit_ids.iter().map(|unit| unit.0).collect();
-            for (first, count) in planes::unit_runs(&acquired) {
+        // The pooled tables check every change before they write a row.
+        self.tables.apply(changes, stream)?;
+
+        if let Some(stream) = stream {
+            for (first, count) in resets {
                 self.planes.reset_units(first, count, false, stream)?;
             }
-            self.planes.copy_units(&allocation.copies, stream)?;
         }
         Ok(())
     }
@@ -608,49 +592,177 @@ impl KvCacheMemory {
     /// The host tier, or the refusal of a cache that maps none.
     fn host(&self) -> Result<&HostTier> {
         self.host.as_ref().ok_or_else(|| {
-            Error::Invalid("a batch copies pages and the cache maps no host tier".into())
+            Error::Invalid(
+                "a copy reads or writes host pages and the cache maps no host tier".into(),
+            )
         })
     }
 
-    /// Issues a batch's page copies ([`ipc::PageCopy`]) on the copy stream: loads the units of
-    /// `loads` from the host tier, converting the pages of a conversion source, and offloads
-    /// the published units of `offloads` into it.
+    /// Issues `copies`, the copies of the blocks a batch runs, each from a run to a run as the
+    /// buffer pool's `Copy` states them (`BlockTables::start_copy`), on `stream` for a cache on
+    /// a device and with `None` for one that holds none, whose copies are checked and issue
+    /// nothing. Returns the events recorded behind them on each stream they were issued on,
+    /// which the batch's end waits on.
     ///
-    /// `stream` is the batch's stream, on which [`Self::apply_units`] reset the loaded units:
-    /// the loads start behind that reset and `stream` waits for them, so the forward issued
-    /// next reads the loaded pages. Returns the event recorded behind the offloads, which the
-    /// batch's output waits on; `None` for a batch that offloads nothing.
+    /// The regions of the runs ([`CacheRegions`]) tell each copy:
+    ///
+    /// - units to units, a clone: every field of each unit is copied, in order, on `stream`
+    ///   ([`Planes::copy_units`]);
+    /// - a group's host page to units, a load, and units to a group's host page, a store: on
+    ///   the copy stream, through the host tier;
+    /// - a slot of a group's converted-load source to units, a converted load: on the copy
+    ///   stream.
+    ///
+    /// A copy writes only its destination, which no table entry names until the copy is
+    /// reported done, and reads a source the buffer pool holds until then: nothing orders it
+    /// against the forwards of the batch. Every copy is checked before anything is issued, and
+    /// when an issue fails after others were issued, the streams are waited for before the
+    /// failure returns.
     ///
     /// # Errors
     ///
-    /// A batch that copies pages on a cache that maps no host tier; a page of another pool or
-    /// shape than its group's; a page of a conversion source on a cache that converts none.
-    pub fn copy_pages(
-        &mut self,
-        loads: &[PageCopy],
-        offloads: &[PageCopy],
-        stream: &Stream,
-    ) -> Result<Option<Event>> {
-        if loads.is_empty() && offloads.is_empty() {
-            return Ok(None);
+    /// A cache whose regions are not stated; a copy between regions that are no cache memory,
+    /// of runs of different units or a host run of more than one page; units outside the pool
+    /// or the padding unit; a host copy on a cache that maps no host tier; a stream stated for
+    /// a cache that holds no device, or the reverse; the driver's refusal.
+    pub fn copy(&self, copies: &[(Run, Run)], stream: Option<&Stream>) -> Result<Vec<Event>> {
+        if copies.is_empty() {
+            return Ok(Vec::new());
         }
-        self.host()?
-            .copy(&self.config.layout, &self.planes, loads, offloads, stream)
-    }
+        if self.planes.device_id().is_some() != stream.is_some() {
+            return Err(Error::Invalid(
+                "a cache's copies are issued on a stream exactly when it is on a device".into(),
+            ));
+        }
+        let regions = self.regions.as_ref().ok_or(Error::State(
+            "the regions of the cache's memory are not stated: no copy names its runs",
+        ))?;
 
-    /// Copies the published units of `offloads` to the host tier and waits for the copies on
-    /// the copy stream, with no batch to order them behind: the scheduler holds the units
-    /// meanwhile. The executor runs it as a job.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::copy_pages`].
-    pub fn offload_pages(&mut self, offloads: &[PageCopy]) -> Result<()> {
-        if offloads.is_empty() {
-            return Ok(());
+        // The group whose host pages, or whose source slots, `region` holds.
+        let group_of = |regions: &[Option<u8>], region: u8| {
+            regions
+                .iter()
+                .position(|held| *held == Some(region))
+                .map(|group| group as u32)
+        };
+        let page = |run: Run| -> Result<u64> {
+            match run {
+                (_, page, 1) => Ok(u64::from(page)),
+                (region, first, count) => Err(Error::Invalid(format!(
+                    "a host copy names {count} pages from page {first} of region {region}, and \
+                     a block's host copy is one page"
+                ))),
+            }
+        };
+
+        let (mut units, mut loads, mut converted, mut stores) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for &(from, to) in copies {
+            let (source, destination) = (from.0 == regions.units, to.0 == regions.units);
+
+            match (source, destination) {
+                (true, true) if from.2 == to.2 => {
+                    units.extend((0..from.2).map(|unit| (from.1 + unit, to.1 + unit)));
+                }
+                (true, true) => {
+                    return Err(Error::Invalid(format!(
+                        "a copy of {} units into {}",
+                        from.2, to.2
+                    )));
+                }
+                (false, true) => {
+                    let block = to.1..to.1 + to.2;
+                    if let Some(group) = group_of(&regions.host, from.0) {
+                        loads.push((group, page(from)?, block));
+                    } else if let Some(group) = group_of(&regions.sources, from.0) {
+                        converted.push((group, page(from)?, block));
+                    } else {
+                        return Err(Error::Invalid(format!(
+                            "a copy into the cache's units reads region {}, which is none of \
+                             its host pages or source buffers",
+                            from.0
+                        )));
+                    }
+                }
+                (true, false) => {
+                    let group = group_of(&regions.host, to.0).ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "a copy of the cache's units writes region {}, which is none of its \
+                             host pages",
+                            to.0
+                        ))
+                    })?;
+                    stores.push((group, page(to)?, from.1..from.1 + from.2));
+                }
+                (false, false) => {
+                    return Err(Error::Invalid(format!(
+                        "a copy from region {} to region {} touches none of the cache's units",
+                        from.0, to.0
+                    )));
+                }
+            }
         }
-        self.host()?
-            .offload_now(&self.config.layout, &self.planes, offloads)
+
+        // Every unit is checked before anything is issued.
+        self.planes.check_copies(&units)?;
+        let paged: Vec<&HostPage> = loads.iter().chain(&converted).chain(&stores).collect();
+        for (_, _, block) in &paged {
+            if block.start == 0 || block.end > self.config.units {
+                return Err(Error::Invalid(format!(
+                    "a host copy names units {}..{} of a pool of units 1..{}",
+                    block.start, block.end, self.config.units
+                )));
+            }
+        }
+        let host = if paged.is_empty() {
+            None
+        } else {
+            Some(self.host()?)
+        };
+
+        let Some(stream) = stream else {
+            return Ok(Vec::new());
+        };
+        let mut events = Vec::with_capacity(2);
+        if !units.is_empty() {
+            let cloned = Event::new(platform::EventFlags::default());
+            let issued = (|| -> Result<()> {
+                self.planes.copy_units(&units, stream)?;
+                cloned.record(stream)?;
+                Ok(())
+            })();
+            if let Err(error) = issued {
+                // The clones issued before the failure end before it is reported.
+                if let Err(waited) = stream.synchronize() {
+                    tracing::error!(%waited, "the batch's stream failed after a copy failed");
+                }
+                return Err(error);
+            }
+            events.push(cloned);
+        }
+
+        if let Some(host) = host {
+            match host.copy(
+                &self.config.layout,
+                &self.planes,
+                &loads,
+                &converted,
+                &stores,
+            ) {
+                Ok(copied) => events.extend(copied),
+                Err(error) => {
+                    // The host copies settled their own stream; the clones end too before the
+                    // failure is reported.
+                    for event in &events {
+                        if let Err(waited) = event.synchronize() {
+                            tracing::error!(%waited, "a clone failed after a copy failed");
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(events)
     }
 
     /// The generation the cache's own kernels launch from, from the next converted load on:
@@ -837,7 +949,7 @@ impl KvCacheMemory {
     /// # Errors
     ///
     /// A cache that holds no device or whose scratch pages are not open; a row whose slot
-    /// holds no table of the group, or whose keys need more than `pages` pages.
+    /// holds no entry of the group, or whose keys need more than `pages` pages.
     pub fn copy_history(
         &self,
         group: usize,
@@ -864,12 +976,6 @@ impl KvCacheMemory {
                 history.push(Vec::new());
                 continue;
             }
-            if self.tables.installed(*slot, group as u32).is_none() {
-                return Err(Error::Invalid(format!(
-                    "request slot {slot} holds no page table of cache group {group}"
-                )));
-            }
-
             let held = length.div_ceil(layout.block_size) as usize;
             if held > pages as usize || held > width {
                 return Err(Error::Invalid(format!(
@@ -878,7 +984,13 @@ impl KvCacheMemory {
                 )));
             }
             let row = self.tables.row(*slot)? as usize;
-            history.push(table[row * width..row * width + held].to_vec());
+            let units = &table[row * width..row * width + held];
+            if units.iter().all(|unit| *unit == 0) {
+                return Err(Error::Invalid(format!(
+                    "request slot {slot} holds no entry of cache group {group}"
+                )));
+            }
+            history.push(units.to_vec());
         }
 
         scratch.copy_history(&self.planes, layout, &history, pages, stream)
@@ -895,10 +1007,15 @@ impl KvCacheMemory {
 
 #[cfg(test)]
 mod tests {
-    use ipc::{PrefixCacheDtype, UnitId};
+    use ipc::PrefixCacheDtype;
     use nn::family::{StateField, StateShape};
 
     use super::*;
+
+    /// The regions the tests number the cache's memory by: its units, and the host pages of
+    /// each of up to three groups.
+    const UNITS: u8 = 0;
+    const HOST: [u8; 3] = [4, 5, 6];
 
     /// A model of two attention layers of 4-token pages of one 4-wide head, a recurrent state
     /// of two layers and a drafter of one layer, over sixteen units, two request slots and
@@ -946,13 +1063,28 @@ mod tests {
         }
     }
 
-    fn table(slot: u32, group: u32, units: &[u32], tokens: u32) -> BlockTable {
-        BlockTable {
-            request_pool_idx: slot,
-            group_id: group,
-            start_page: 0,
-            unit_ids: units.iter().copied().map(UnitId).collect(),
-            allocated_tokens: tokens,
+    /// The changes that give `slot` the blocks of `units` in `class` from position 0, one unit
+    /// each, allocated and so reset.
+    fn allocated(slot: u32, class: u8, units: &[u32]) -> Vec<Change> {
+        units
+            .iter()
+            .enumerate()
+            .map(|(position, unit)| Change {
+                slot,
+                class,
+                position: position as u32,
+                run: Some((UNITS, *unit, 1)),
+                reset: true,
+            })
+            .collect()
+    }
+
+    /// The regions of a cache of `groups` cache groups whose pages have host copies.
+    fn regions(groups: usize) -> CacheRegions {
+        CacheRegions {
+            units: UNITS,
+            host: HOST[..groups].iter().copied().map(Some).collect(),
+            sources: vec![None; groups],
         }
     }
 
@@ -1021,14 +1153,15 @@ mod tests {
         assert!(cache.draft_planes().is_err());
 
         // The groups' rows are apart: slot 1 holds other units in each.
-        cache.install(&[table(1, 0, &[3, 4], 8), table(1, 1, &[9], 4)], None)?;
+        let changes = [allocated(1, 0, &[3, 4]), allocated(1, 1, &[9])].concat();
+        cache.apply(&changes, None)?;
         assert_eq!(cache.host_table(0)?[..4], [3, 4, 0, 0]);
         assert_eq!(cache.host_table(1)?[..4], [9, 0, 0, 0]);
         Ok(())
     }
 
-    /// The pooled table's last row names only the padding unit, whatever is installed, and an
-    /// installed table is the row its slot gathers.
+    /// The pooled table's last row names only the padding unit, whatever the slots hold, and
+    /// a slot's entries are the row its slot gathers.
     #[test]
     fn the_padding_row_names_only_the_padding_unit() -> Result<()> {
         let mut cache = KvCacheMemory::meta(config())?;
@@ -1036,7 +1169,8 @@ mod tests {
         assert_eq!((cache.table_row(1)?, cache.table_row(2)?), (0, 1));
         assert!(cache.table_row(0).is_err() && cache.table_row(3).is_err());
 
-        cache.install(&[table(1, 0, &[5, 6, 7], 12), table(2, 0, &[8], 4)], None)?;
+        let changes = [allocated(1, 0, &[5, 6, 7]), allocated(2, 0, &[8])].concat();
+        cache.apply(&changes, None)?;
 
         let rows = cache.host_table(0)?;
         let row = |row: u32| &rows[row as usize * 4..(row as usize + 1) * 4];
@@ -1045,50 +1179,90 @@ mod tests {
         assert_eq!(row(cache.padding_row()), [0, 0, 0, 0]);
         assert!(rows.iter().all(|unit| *unit != nn::NO_SLOT));
 
-        assert_eq!(cache.installed_pages(1, 0), Some((0, &[5, 6, 7][..])));
-        cache.release_slots(&[1], None)?;
-        assert_eq!(cache.installed_pages(1, 0), None);
+        // Entries that left name the padding unit again.
+        let left: Vec<Change> = (0..3)
+            .map(|position| Change {
+                slot: 1,
+                class: 0,
+                position,
+                run: None,
+                reset: false,
+            })
+            .collect();
+        cache.apply(&left, None)?;
         assert_eq!(cache.host_table(0)?[..4], [0, 0, 0, 0]);
         Ok(())
     }
 
-    /// A unit allocation is checked whole before anything is applied, and each refusal names
-    /// the unit and the reason.
+    /// A reset is checked before anything is applied: an allocated block of the padding unit
+    /// or past the pool changes nothing. A change of a class past the cache groups is none of
+    /// the cache's.
     #[test]
-    fn a_unit_allocation_is_refused_by_unit_and_reason() -> Result<()> {
+    fn a_reset_of_units_outside_the_pool_is_refused() -> Result<()> {
         let mut cache = KvCacheMemory::meta(two_groups())?;
-        let allocation = |group: u32, units: &[u32], copies: &[(u32, u32)]| CacheUnitAllocation {
-            request_pool_idx: 1,
-            group_id: group,
-            unit_ids: units.iter().copied().map(UnitId).collect(),
-            copies: copies
-                .iter()
-                .map(|(from, to)| (UnitId(*from), UnitId(*to)))
-                .collect(),
+        let reset = |unit: u32, count: u32| Change {
+            slot: 1,
+            class: 0,
+            position: 0,
+            run: Some((UNITS, unit, count)),
+            reset: true,
         };
-        let mut refused = |allocation: CacheUnitAllocation| {
+
+        for refused in [reset(0, 1), reset(16, 1), reset(15, 2)] {
+            let message = cache
+                .apply(&[refused], None)
+                .expect_err("the reset is refused")
+                .to_string();
+            assert!(message.contains("units 1..16"), "{message}");
+        }
+        assert!(cache.host_table(0)?.iter().all(|unit| *unit == 0));
+
+        let product = Change {
+            class: 9,
+            ..reset(40, 3)
+        };
+        cache.apply(&[product], None)?;
+        Ok(())
+    }
+
+    /// A copy is told by the regions of its runs, and refused whole, naming its regions or
+    /// units and the reason, when one of them is no copy of the cache's memory.
+    #[test]
+    fn a_copy_is_refused_by_its_regions_and_units() -> Result<()> {
+        let mut cache = KvCacheMemory::meta(config())?;
+        let clone = ((UNITS, 3, 1), (UNITS, 4, 1));
+
+        // Runs mean nothing before the regions are stated.
+        let unstated = cache.copy(&[clone], None).err().expect("no regions");
+        assert!(matches!(unstated, Error::State(_)), "{unstated}");
+        assert!(cache.set_regions(regions(2)).is_err());
+        cache.set_regions(regions(3))?;
+
+        let refused = |copy: (Run, Run)| {
             cache
-                .apply_units(&[allocation], None)
-                .expect_err("the allocation is refused")
+                .copy(&[clone, copy], None)
+                .err()
+                .expect("the copy is refused")
                 .to_string()
         };
+        assert!(refused(((UNITS, 3, 1), (UNITS, 0, 1))).contains("padding unit"));
+        assert!(refused(((UNITS, 3, 1), (UNITS, 3, 1))).contains("the destination is the source"));
+        assert!(refused(((UNITS, 3, 1), (UNITS, 16, 1))).contains("outside the pool"));
+        assert!(refused(((UNITS, 3, 2), (UNITS, 6, 1))).contains("2 units into 1"));
+        assert!(refused(((9, 3, 1), (UNITS, 6, 1))).contains("region 9"));
+        assert!(refused(((UNITS, 3, 1), (9, 6, 1))).contains("region 9"));
+        assert!(refused(((HOST[0], 3, 1), (HOST[1], 6, 1))).contains("none of the cache's"));
+        assert!(refused(((HOST[0], 3, 2), (UNITS, 6, 1))).contains("one page"));
 
-        assert!(refused(allocation(2, &[1], &[])).contains("cache group 2"));
-        assert!(refused(allocation(0, &[0], &[])).contains("padding unit"));
-        assert!(refused(allocation(0, &[16], &[])).contains("cache unit 16"));
-        assert!(refused(allocation(0, &[2], &[(1, 3)])).contains("did not name"));
-        assert!(refused(allocation(0, &[2], &[(2, 2)])).contains("the destination is the source"));
+        // A clone of a state block moves its state planes with every other field.
+        cache.copy(&[clone, ((UNITS, 5, 2), (UNITS, 8, 2))], None)?;
 
-        // A valid allocation applies; with no device nothing is issued.
-        cache.apply_units(&[allocation(0, &[2, 3], &[(1, 2)])], None)?;
-
-        // A unit copy does not move a state group's planes.
-        let mut hybrid = KvCacheMemory::meta(config())?;
-        let copy = hybrid
-            .apply_units(&[allocation(0, &[2], &[(1, 2)])], None)
-            .expect_err("a unit copy beside a state group");
-        assert!(copy.to_string().contains("state planes"), "{copy}");
-        hybrid.apply_units(&[allocation(0, &[2], &[])], None)?;
+        // A copy through the host tier needs one.
+        let load = cache
+            .copy(&[((HOST[2], 0, 1), (UNITS, 6, 2))], None)
+            .err()
+            .expect("no host tier");
+        assert!(load.to_string().contains("no host tier"), "{load}");
         Ok(())
     }
 
@@ -1101,22 +1275,16 @@ mod tests {
 
         assert_eq!(cache.mapped_bytes(), 0);
         assert!(cache.segments().is_none());
-        assert!(cache.offload_pages(&[]).is_ok());
         assert!(cache.release_segments(0, &local).is_err());
         // A sleep of planes that are not split gives back nothing.
         cache.sleep(&local)?;
 
-        let copy = PageCopy {
-            rank: 0,
-            pool: 1,
-            group_id: 0,
-            host_page: 0,
-            units: vec![UnitId(1)],
-            staged: false,
-        };
+        cache.set_regions(regions(3))?;
+        assert!(cache.copy(&[], None)?.is_empty());
         let refused = cache
-            .offload_pages(&[copy])
-            .expect_err("no host tier is mapped");
+            .copy(&[((UNITS, 1, 1), (HOST[0], 0, 1))], None)
+            .err()
+            .expect("no host tier is mapped");
         assert!(refused.to_string().contains("no host tier"), "{refused}");
 
         // The report states the layout and no storage.
@@ -1195,11 +1363,12 @@ mod tests {
         assert_eq!(config.fixed_bytes(), 2 * 3 * 4 * 4 + (1 << 10));
     }
 
-    /// A cache on a device takes its planes from the owner, lends tensors on its GPU and
-    /// mirrors an installed row on the device.
+    /// A cache on a device takes its planes from the owner, lends tensors on its GPU, copies a
+    /// unit's bytes into the unit a clone names, mirrors a slot's row on the device and resets
+    /// the units the buffer pool allocated: their flags read as empty.
     #[test]
     #[ignore = "requires a GPU"]
-    fn a_cache_on_a_device_lends_its_planes_and_installs_rows() -> Result<()> {
+    fn a_cache_on_a_device_lends_its_planes_and_resets_what_it_is_given() -> Result<()> {
         let device = DeviceId(0);
         let stream = Stream::new(device)?;
         let mut cache = KvCacheMemory::open(
@@ -1212,23 +1381,34 @@ mod tests {
         assert!(cache.mapped_bytes() > 0);
         assert_eq!(cache.planes(0)?[1].key.dims(), [16, 4, 1, 4]);
 
-        cache.install(&[table(1, 0, &[3, 4], 8)], Some(&stream))?;
-        cache.apply_units(
-            &[CacheUnitAllocation {
-                request_pool_idx: 1,
-                group_id: 0,
-                unit_ids: vec![UnitId(3), UnitId(4)],
-                copies: vec![(UnitId(1), UnitId(3))],
-            }],
-            Some(&stream),
-        )?;
+        cache.set_regions(regions(2))?;
+        cache.apply(&allocated(1, 0, &[3, 4]), Some(&stream))?;
+
+        // A clone moves a unit's bytes into the unit its copy names.
+        let pattern: Vec<u8> = (0..64).collect();
+        let (source, destination) = (
+            cache.planes.plane_address(0, 0, 1)?,
+            cache.planes.plane_address(0, 0, 5)?,
+        );
+        // SAFETY: 64 bytes of the key plane of unit 1 in column 0, which the cache owns and
+        // nothing else writes; the host pattern is read before the stream is synchronized.
+        unsafe { platform::memcpy_async(source, pattern.as_ptr() as u64, 64, &stream)? };
         stream.synchronize()?;
+        for cloned in cache.copy(&[((UNITS, 1, 1), (UNITS, 5, 1))], Some(&stream))? {
+            cloned.synchronize()?;
+        }
+        let mut moved = vec![0_u8; 64];
+        // SAFETY: as above, the same bytes of unit 5, read behind the copy; the host buffer
+        // holds them.
+        unsafe { platform::memcpy_async(moved.as_mut_ptr() as u64, destination, 64, &stream)? };
+        stream.synchronize()?;
+        assert_eq!(moved, pattern);
 
         // The device row is the host mirror's.
         let table = cache.page_table(0)?;
         let mut device_row = [0_u32; 4];
         // SAFETY: the row is the first four entries of the pooled table, which the cache owns
-        // and nothing writes after the synchronized install; the host array holds four.
+        // and nothing writes after the synchronized change; the host array holds four.
         unsafe {
             platform::memcpy_async(
                 device_row.as_mut_ptr() as u64,
@@ -1239,6 +1419,28 @@ mod tests {
         }
         stream.synchronize()?;
         assert_eq!(device_row, cache.host_table(0)?[..4]);
+
+        // A unit a forward initialized is reset when the buffer pool gives it again.
+        let flags = cache.planes(0)?[0].key_initialized.clone();
+        let unit = |unit: u64| -> Result<u8> {
+            let mut flag = [0_u8; 1];
+            // SAFETY: the flag of `unit` in column 0 is one byte of the cache's flag storage,
+            // read behind every write on the stream; the host array holds one.
+            unsafe {
+                platform::memcpy_async(
+                    flag.as_mut_ptr() as u64,
+                    backend::operand(&flags)?.ptr.address() + unit,
+                    1,
+                    &stream,
+                )?;
+            }
+            stream.synchronize()?;
+            Ok(flag[0])
+        };
+        cache.planes.mark_initialized(&[6], &stream)?;
+        assert_eq!(unit(6)?, 1);
+        cache.apply(&allocated(2, 0, &[6]), Some(&stream))?;
+        assert_eq!(unit(6)?, 0);
         Ok(())
     }
 

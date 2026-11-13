@@ -1,5 +1,5 @@
-//! The peer channel: the batches a scheduler node's engine process submits to the other engine
-//! processes of its epoch, and their outputs.
+//! The peer channel: a worker group's jobs that a scheduler node's engine process hands to the
+//! other engine processes of its epoch, and what they return.
 //!
 //! An epoch whose worker group has ranks on several hosts runs one engine process per host. The
 //! scheduler node's process holds the schedulers; every other process (a peer) holds only ranks.
@@ -7,12 +7,16 @@
 //! ([`ipc::PeerRegistration`]); the scheduler node accepts every peer its launch counts before
 //! its ranks load ([`accept`]), so a peer that never arrives fails the start by name.
 //!
-//! From then on each connection carries batches: the scheduler node sends
-//! [`ipc::MainProcessRequest::Submit`] (and `Shadow`) with the [`ipc::execution::Batch`] its
-//! scheduler formed, and the peer responds with [`ipc::MainProcessResponse::Result`] carrying the
-//! [`ipc::execution::BatchOutput`] its ranks produced, or with `Error`, under the request's
-//! `message_id`. The ranks of one group run every batch together, so the scheduler's submission
-//! of a batch is joined with the peer's ([`ipc::execution::Submission::joined`]). The scheduler
+//! From then on each connection carries the jobs of the groups whose ranks the peer holds, as
+//! [`Executors`] hands them to every rank: [`ipc::MainProcessRequest::Submit`] and `Shadow` with
+//! a batch and the number the scheduler node gave it, `Map` with a completion of the buffer pool
+//! for the ranks' device block tables, and `Stamp` with requests to apply and stamp. The peer
+//! hands each to its own ranks of the group and responds with
+//! [`ipc::MainProcessResponse::Result`] (the batch's output and the requests its ranks returned,
+//! each stamped with the largest stamp among them) or with `Error`, under the request's
+//! `message_id`. Every `Result` states the last number the peer's ranks of the group have ended,
+//! which the scheduler node takes into the group's [`Sequences`] before it completes the
+//! submission, so the group's `completed` is the smallest over all of its ranks. The scheduler
 //! node asks [`ipc::MainProcessRequest::Info`] once the ranks loaded, and the peer responds with
 //! its first rank's report, which the scheduler sizes a worker group that starts on the peer's
 //! host by ([`Remote::info`]).
@@ -30,12 +34,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use ipc::execution::{Batch, Batches, Outcome, Submission, SubmissionId, SubmissionState};
 use ipc::{
     Channel, Listener, MainProcessRequest, MainProcessResponse, MainProcessResponseError,
     PeerAccepted, PeerRegistration,
 };
+use storage::runtime::{Completion, GroupId, Request};
 
+use super::{Executors, Sequences};
+use crate::completion::{Fault, Outcome, Submission, SubmissionId, SubmissionState};
 use crate::{Error, Result, lock};
 
 /// The longest a link thread waits for its connection before it looks at its queue unasked.
@@ -257,15 +263,16 @@ pub fn register(address: &str, rank: u32, engine: u64, timeout: Duration) -> Res
     }
 }
 
-/// The submissions a peer has not completed yet, by the `message_id` they were sent under.
-type Pending = Mutex<HashMap<u64, Arc<SubmissionState>>>;
+/// The submissions a peer has not completed yet, by the `message_id` they were sent under: each
+/// with the sequences of its group and the rank the peer reports there as.
+type Pending = Mutex<HashMap<u64, (Arc<SubmissionState>, Arc<Sequences>, usize)>>;
 
 /// The `Info` requests a peer has not responded to yet, by their `message_id`: each takes the
 /// peer's report, or its refusal.
 type Infos = Mutex<HashMap<u64, Sender<std::result::Result<ipc::MainProcessInfo, String>>>>;
 
-/// The scheduler node's link to one peer engine process: where its scheduler's batches for the
-/// peer's ranks go, and how their outputs come back.
+/// The scheduler node's link to one peer engine process: where a group's jobs for the peer's
+/// ranks go, and how what they return comes back.
 pub struct Remote {
     /// The first rank the peer's process serves, which its registration stated.
     rank: u32,
@@ -328,24 +335,6 @@ impl Remote {
         self.rank
     }
 
-    /// Sends `batch` to the peer's ranks; the submission completes with their output.
-    ///
-    /// # Errors
-    ///
-    /// Once the link is lost: the group cannot run the batch without the peer's ranks.
-    pub fn submit(&self, batch: Batch) -> Result<Submission> {
-        self.send(MainProcessRequest::submit(batch))
-    }
-
-    /// Sends the shadow batch `batch` to the peer's ranks, as [`Self::submit`] sends a batch.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::submit`].
-    pub fn shadow(&self, batch: Batch) -> Result<Submission> {
-        self.send(MainProcessRequest::shadow(batch))
-    }
-
     /// What the peer's first rank reports of itself, which the scheduler sizes a worker group
     /// by: the peer responds once its ranks loaded, within `timeout`.
     ///
@@ -393,13 +382,25 @@ impl Remote {
         }
     }
 
-    fn send(&self, mut request: MainProcessRequest) -> Result<Submission> {
+    /// Sends `request`, a job of the group whose sequences are `sequences`, to the peer's ranks,
+    /// which report there as rank `rank`; the submission completes with what they return, once
+    /// their ended sequence is stated.
+    ///
+    /// # Errors
+    ///
+    /// Once the link is lost: the group cannot run its jobs without the peer's ranks.
+    pub(super) fn send(
+        &self,
+        mut request: MainProcessRequest,
+        sequences: &Arc<Sequences>,
+        rank: usize,
+    ) -> Result<Submission> {
         self.live()?;
 
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         request.set_message_id(Some(id));
         let (submission, state) = Submission::pending(SubmissionId(id));
-        lock(&self.pending).insert(id, state);
+        lock(&self.pending).insert(id, (state, Arc::clone(sequences), rank));
 
         self.outbox
             .send(request)
@@ -511,16 +512,33 @@ fn settle(rank: u32, pending: &Pending, infos: &Infos, response: MainProcessResp
         return;
     }
 
-    let (id, status) = match response {
-        MainProcessResponse::Result { message_id, result } => {
-            (message_id, Outcome::Success(result))
-        }
+    let (id, status, ended) = match response {
+        MainProcessResponse::Result {
+            message_id,
+            result,
+            requests,
+            ended,
+        } => match ipc::decode_requests(&requests) {
+            Ok(requests) => (
+                message_id,
+                Outcome::Success((result, requests)),
+                Some(ended),
+            ),
+            Err(error) => (
+                message_id,
+                Outcome::Failed(fault(format!(
+                    "rank {rank}'s engine process returned a request that is not one: {error}"
+                ))),
+                None,
+            ),
+        },
         MainProcessResponse::Error { message_id, error } => (
             message_id,
             Outcome::Failed(fault(format!(
-                "rank {rank}'s engine process failed the batch: {}",
+                "rank {rank}'s engine process failed the job: {}",
                 error.message
             ))),
+            None,
         ),
         MainProcessResponse::Stalled { stall } => {
             // The peer's own watchdog fails its rank on a stall; its close follows.
@@ -540,7 +558,14 @@ fn settle(rank: u32, pending: &Pending, infos: &Infos, response: MainProcessResp
 
     let state = id.and_then(|id| lock(pending).remove(&id));
     match state {
-        Some(state) => state.finish(status),
+        Some((state, sequences, reporting)) => {
+            // The group's word covers what the peer's ranks ended before anyone reads the job's
+            // output.
+            if let Some(ended) = ended {
+                sequences.ended(reporting, ended);
+            }
+            state.finish(status);
+        }
         None => tracing::warn!(
             rank,
             ?id,
@@ -551,7 +576,7 @@ fn settle(rank: u32, pending: &Pending, infos: &Infos, response: MainProcessResp
 
 /// Fails every submission and report request the peer left open with `reason`.
 fn fail_open(pending: &Pending, infos: &Infos, reason: &str) {
-    for (_, state) in lock(pending).drain() {
+    for (_, (state, ..)) in lock(pending).drain() {
         state.finish(Outcome::Failed(fault(reason.to_owned())));
     }
     for (_, asked) in lock(infos).drain() {
@@ -560,12 +585,12 @@ fn fail_open(pending: &Pending, infos: &Infos, reason: &str) {
 }
 
 /// A failure of the peer channel, as a failed submission carries it.
-fn fault(reason: String) -> Arc<ipc::execution::Fault> {
+fn fault(reason: String) -> Arc<Fault> {
     Arc::new(Error::transport(reason))
 }
 
-/// A peer's side of its connection to the scheduler node: runs every batch the scheduler node
-/// sends on this process's ranks, and responds to each once its ranks completed it.
+/// A peer's side of its connection to the scheduler node: hands every job the scheduler node
+/// sends to this process's ranks, and responds to each once its ranks completed it.
 pub struct Upstream {
     closing: Arc<AtomicBool>,
     wake: ipc::Wake,
@@ -573,42 +598,47 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    /// Serves the scheduler node's requests arriving on `channel` with `batches`, this process's
-    /// ranks, responding to a report request with `info`, its first rank's report; a close of
-    /// the connection marks `liveness` lost.
+    /// Serves the scheduler node's requests arriving on `channel` with `executors`, this
+    /// process's ranks, responding to a report request with `info`, its first rank's report; a
+    /// close of the connection marks `liveness` lost.
     ///
     /// Two threads: the link, which owns the connection, and the responder, which waits for each
-    /// submission in the order it was made (each executor runs its batches in that order) and
-    /// gives its response to the link.
+    /// submission in the order it was made (each executor takes its jobs in that order) and gives
+    /// its response to the link, with the group's ended sequence as this process knows it then.
     ///
     /// # Errors
     ///
     /// When a thread cannot start.
     pub fn serve(
         channel: Channel,
-        batches: Arc<dyn Batches>,
+        executors: Arc<Executors>,
         info: ipc::MainProcessInfo,
         liveness: Arc<Liveness>,
     ) -> Result<Self> {
         let (responses, responded) = crossbeam_channel::unbounded::<MainProcessResponse>();
-        let (waiting, awaited) = crossbeam_channel::unbounded::<(u64, Submission)>();
+        let (waiting, awaited) = crossbeam_channel::unbounded::<(u64, GroupId, Submission)>();
         let closing = Arc::new(AtomicBool::new(false));
         let wake = channel.wake();
 
         let responder = {
             let wake = wake.clone();
+            let executors = Arc::clone(&executors);
 
             std::thread::Builder::new()
                 .name("peer-responder".into())
                 .spawn(move || {
-                    for (id, submission) in awaited {
-                        let response = match submission.wait() {
-                            Outcome::Success(output) => MainProcessResponse::Result {
-                                message_id: Some(id),
-                                result: output,
-                            },
-                            Outcome::Failed(error) => refusal(id, error.to_string()),
-                            Outcome::Cancelled => refusal(id, "the batch was cancelled".into()),
+                    for (id, group, submission) in awaited {
+                        // Each rank stated its ended sequence before its part completed.
+                        let response = match (submission.wait(), executors.completed(group)) {
+                            (Outcome::Success((output, requests)), Ok(ended)) => {
+                                let mut response =
+                                    MainProcessResponse::result(output, &requests, ended);
+                                response.set_message_id(Some(id));
+                                response
+                            }
+                            (Outcome::Success(_), Err(error)) => refusal(id, error.to_string()),
+                            (Outcome::Failed(error), _) => refusal(id, error.to_string()),
+                            (Outcome::Cancelled, _) => refusal(id, "the job was cancelled".into()),
                         };
                         if responses.send(response).is_err() {
                             return;
@@ -627,7 +657,7 @@ impl Upstream {
                 .spawn(move || {
                     upstream_link(
                         channel,
-                        batches.as_ref(),
+                        executors.as_ref(),
                         &info,
                         &waiting,
                         &responded,
@@ -664,13 +694,13 @@ impl Drop for Upstream {
     }
 }
 
-/// A peer's side of its connection: submits each batch the scheduler node sends, and sends each
-/// response the responder queued.
+/// A peer's side of its connection: hands each job the scheduler node sends to this process's
+/// ranks, and sends each response the responder queued.
 fn upstream_link(
     mut channel: Channel,
-    batches: &dyn Batches,
+    executors: &Executors,
     info: &ipc::MainProcessInfo,
-    waiting: &Sender<(u64, Submission)>,
+    waiting: &Sender<(u64, GroupId, Submission)>,
     responded: &Receiver<MainProcessResponse>,
     liveness: &Liveness,
     closing: &AtomicBool,
@@ -703,13 +733,50 @@ fn upstream_link(
                 }
             };
 
-            let (id, submitted) = match request {
-                MainProcessRequest::Submit { message_id, batch } => {
-                    (message_id.unwrap_or(0), batches.submit(*batch))
-                }
-                MainProcessRequest::Shadow { message_id, batch } => {
-                    (message_id.unwrap_or(0), batches.shadow(*batch))
-                }
+            let (id, group, submitted) = match request {
+                MainProcessRequest::Submit {
+                    message_id,
+                    sequence,
+                    pass,
+                    batch,
+                } => (
+                    message_id.unwrap_or(0),
+                    batch.group,
+                    executors.run(sequence, *batch, pass, false),
+                ),
+                MainProcessRequest::Shadow {
+                    message_id,
+                    sequence,
+                    batch,
+                } => (
+                    message_id.unwrap_or(0),
+                    batch.group,
+                    executors.run(sequence, *batch, false, true),
+                ),
+                MainProcessRequest::Map {
+                    message_id,
+                    group,
+                    slot,
+                    request,
+                    completion,
+                } => (
+                    message_id.unwrap_or(0),
+                    group,
+                    mapped(executors, group, slot, &request, &completion),
+                ),
+                MainProcessRequest::Stamp {
+                    message_id,
+                    group,
+                    requests,
+                } => (
+                    message_id.unwrap_or(0),
+                    group,
+                    ipc::decode_requests(&requests)
+                        .map_err(|error| {
+                            Error::transport_source("reading the requests of a stamp", error)
+                        })
+                        .and_then(|requests| executors.stamp(group, requests)),
+                ),
                 MainProcessRequest::Close { .. } => {
                     failed = Some("the scheduler node closed the epoch's peer links".into());
                     break;
@@ -729,7 +796,7 @@ fn upstream_link(
                 }
                 other => {
                     // The daemon commands this process over its own process interface (its
-                    // modules, a promotion, a shutdown); the peer channel carries batches.
+                    // modules, a promotion, a shutdown); the peer channel carries a group's jobs.
                     let id = match &other {
                         MainProcessRequest::Promote { message_id }
                         | MainProcessRequest::Hook { message_id, .. } => message_id.unwrap_or(0),
@@ -737,7 +804,10 @@ fn upstream_link(
                     };
                     let refused = refusal(
                         id,
-                        format!("the peer channel serves batches, not {:?}", other.kind()),
+                        format!(
+                            "the peer channel serves a group's jobs, not {:?}",
+                            other.kind()
+                        ),
                     );
                     if let Err(error) = channel.send(&refused) {
                         failed = Some(format!("responding to the scheduler node: {error}"));
@@ -749,7 +819,7 @@ fn upstream_link(
 
             match submitted {
                 Ok(submission) => {
-                    if waiting.send((id, submission)).is_err() {
+                    if waiting.send((id, group, submission)).is_err() {
                         failed = Some("the peer responder ended".into());
                         break;
                     }
@@ -774,6 +844,28 @@ fn upstream_link(
     if !closing.load(Ordering::Acquire) {
         liveness.lose(failure);
     }
+}
+
+/// Maps the completion of a `Map` frame, with the request it answers, into this process's
+/// ranks of `group` under `slot`.
+fn mapped(
+    executors: &Executors,
+    group: GroupId,
+    slot: u32,
+    request: &[u8],
+    completion: &[u8],
+) -> Result<Submission> {
+    let read = |error| Error::transport_source("reading the records of a map", error);
+    let (id, request) = Request::decode(request).map_err(read)?;
+    let (answered, completion) = Completion::decode(completion).map_err(read)?;
+    if answered != id {
+        return Err(Error::transport(format!(
+            "a map carries request {} with the completion of request {}",
+            id.0, answered.0
+        )));
+    }
+
+    executors.map(group, slot, id, request, completion)
 }
 
 /// The response to request `id` that failed for `message`.
@@ -807,27 +899,22 @@ mod tests {
         )
     }
 
-    /// A decode batch of one row, which the tests send.
-    fn batch() -> Batch {
-        Batch {
-            id: ipc::execution::BatchId(1),
-            phase: ipc::PhaseId(0),
-            group: "model".to_owned(),
-            calls: Vec::new(),
-            shape: ipc::execution::Shape::decode(1, ipc::execution::Variant::DecodeGreedy),
-            columns: ipc::execution::BatchColumns::default(),
+    /// The submission of a decode batch of one row of group 0, numbered 1, which the tests
+    /// send.
+    fn submit() -> MainProcessRequest {
+        let batch = ipc::batch::Batch {
+            id: ipc::batch::BatchId(1),
+            group: GroupId(0),
+            phase: ipc::batch::Phase::Decode,
             generation: 0,
-            cache_units: Vec::new(),
-            block_tables: Vec::new(),
-            page_loads: Vec::new(),
-            page_offloads: Vec::new(),
-            latent_restores: Vec::new(),
-            host_outputs: Vec::new(),
-            images: Vec::new(),
-            buffers: Vec::new(),
-            frees: Vec::new(),
-            media: None,
-        }
+            shape: ipc::batch::Shape::decode(1, ipc::batch::Variant::DecodeGreedy),
+            requests: Vec::new(),
+            columns: ipc::batch::Columns::default(),
+            media: Vec::new(),
+            new_slots: Vec::new(),
+        };
+
+        MainProcessRequest::submit(1, false, batch)
     }
 
     /// The next request the scheduler node sends on `channel`.
@@ -957,7 +1044,10 @@ mod tests {
             channel.shutdown();
         });
 
-        let submission = remote.submit(batch()).expect("the batch is sent");
+        let sequences = Sequences::new(GroupId(0), 1, Vec::new());
+        let submission = remote
+            .send(submit(), &sequences, 0)
+            .expect("the batch is sent");
         assert!(matches!(submission.wait(), Outcome::Failed(_)));
         peer.join().expect("the peer");
 
@@ -967,6 +1057,9 @@ mod tests {
         let woken = unsafe { libc::poll(wake.as_mut_ptr(), 1, 30_000) };
         assert_eq!(woken, 1, "the lost link did not wake the control thread");
         assert!(liveness.lost().is_some());
-        assert!(remote.submit(batch()).is_err());
+        assert!(remote.send(submit(), &sequences, 0).is_err());
+
+        // Nothing the peer ran is counted as ended.
+        assert_eq!(sequences.completed(), 0);
     }
 }

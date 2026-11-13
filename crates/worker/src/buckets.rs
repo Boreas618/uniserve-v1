@@ -3,8 +3,9 @@
 //! A captured graph addresses fixed buffers, so a forward may only be served by a graph captured
 //! for a size that holds it, and each batch runs in the smallest captured bucket that holds it.
 //! This module is the arithmetic of that rule and nothing else: a [`Shape`] states the rows and
-//! tokens of one kind of work, a [`Bucket`] is a captured size, and [`Buckets`] selects the
-//! captured bucket that serves a shape and states the order in which the buckets are captured.
+//! tokens of one kind of work and, for a media computation, the extent it is captured for, a
+//! [`Bucket`] is a captured size, and [`Buckets`] selects the captured bucket that serves a shape
+//! and states the order in which the buckets are captured.
 //!
 //! The ordering rules:
 //!
@@ -15,13 +16,13 @@
 //!
 //! Everything here is host arithmetic on plain integers, so it is testable without a device and
 //! runs on the scheduler's critical path without allocating: [`Buckets::select`] scans a sorted
-//! vector and [`Bucket::holds`] compares three pairs of integers.
+//! vector and [`Bucket::holds`] compares a few integers.
 
 use std::collections::BTreeSet;
 
 use std::fmt;
 
-use ipc::execution::{Computation, Extent, Shape, Variant};
+use ipc::batch::{Extent, Shape, Variant};
 
 use crate::error::{Error, Result};
 
@@ -132,21 +133,19 @@ impl Bucket {
         }
     }
 
-    /// Whether this bucket serves `computation`.
+    /// Whether a forward of `shape` is served by this bucket: the same variant, room for its
+    /// rows and tokens, and, for a media computation, the extent the bucket was captured for.
     ///
-    /// This is the one statement of the rule, which the selection of a media bucket
-    /// ([`Buckets::select_media`]) and the executor's routing of a media batch to its runner both
-    /// read.
+    /// This is the one statement of the rule, which the selection of a bucket
+    /// ([`Buckets::select`]) and the executor's routing of a batch to its runner both read.
     ///
-    /// A stated extent is matched exactly; `Extent::None` on the caller's side is a caller that does
-    /// not know the shape, and the bucket's own extent then decides; and a host bucket holds every
-    /// computation of its call, whatever its rows, tokens or resolution, because it captures no
-    /// graph and so no size narrows it.
-    pub fn holds_computation(&self, computation: &Computation) -> bool {
-        let Some(variant) = computation.variant() else {
-            return false;
-        };
-        if self.variant != variant {
+    /// A stated extent is matched exactly; `Extent::None` on a media computation's side is a
+    /// caller that does not know the shape, and the bucket's own extent then decides; and a host
+    /// bucket holds every computation of its variant, whatever its rows, tokens or resolution,
+    /// because it captures no graph and so no size narrows it. A token forward states no extent
+    /// and is held by a bucket of its variant, which states none either.
+    pub fn holds(&self, shape: &Shape) -> bool {
+        if self.variant != shape.variant {
             return false;
         }
         // A host call's bucket states which device serves the call and no bound at all: the stage
@@ -156,9 +155,9 @@ impl Bucket {
         if self.variant.host() {
             return true;
         }
-        self.rows >= computation.rows
-            && self.tokens >= computation.tokens
-            && match computation.extent {
+        self.rows >= shape.rows
+            && self.tokens >= shape.tokens
+            && match shape.extent {
                 Extent::None => true,
                 Extent::Request {
                     frames,
@@ -216,7 +215,7 @@ impl Bucket {
     /// The three host calls of a media output are served by the engine on the host, so their
     /// runner states them without capturing anything: the bucket says which device serves the
     /// call, and one row is the shape of one request rather than a bound, which is why
-    /// [`Bucket::holds_computation`] measures no computation against it. It carries no extent
+    /// [`Bucket::holds`] measures no computation against it. It carries no extent
     /// because there is no resolution to state: an audio track's samples come from the decoder's
     /// window and a mux reads what the encodes already wrote.
     pub const fn host(variant: Variant) -> Self {
@@ -270,18 +269,8 @@ impl Bucket {
             rows: self.rows,
             tokens: self.tokens,
             variant: self.variant,
+            extent: self.extent,
         }
-    }
-
-    /// Whether a forward of `shape` is served by this bucket: the same variant, and room for its
-    /// rows and tokens.
-    pub const fn holds(self, shape: &Shape) -> bool {
-        // A media computation is selected by its extent rather than by a `Shape`, and a graph
-        // captured for one extent holds no other, so no shape is served by a media bucket.
-        matches!(self.extent, Extent::None)
-            && self.variant as u8 == shape.variant as u8
-            && self.rows >= shape.rows
-            && self.tokens >= shape.tokens
     }
 }
 
@@ -500,8 +489,7 @@ impl Buckets {
             // A media computation and an expert join have no token the drafter reads.
             let drafted = target.extent == Extent::None
                 && !target.variant.media()
-                && target.variant != Variant::ExpertJoin
-                && target.variant != Variant::TokenDenoise;
+                && target.variant != Variant::ExpertJoin;
             if drafted {
                 buckets.push(Bucket::draft(target.rows, target.tokens));
             }
@@ -522,7 +510,7 @@ impl Buckets {
         let mut rows = 0;
         let mut tokens = 0;
         for bucket in self.iter() {
-            // A media computation is admitted by its own selection (`select_media`), and its rows
+            // A media computation is admitted by its extent as well as its size, and its rows
             // and tokens are not a language-model batch size: counting one here would let a decode
             // clip's single row or a denoising step's zero tokens move the admission bound a
             // scheduler states for the token path. **A host call's bucket states no extent either**
@@ -551,7 +539,15 @@ impl Buckets {
         self.ascending.is_empty()
     }
 
-    /// The smallest bucket that holds `shape`, if the set has one.
+    /// The smallest bucket that holds `shape`, if the set has one ([`Bucket::holds`]).
+    ///
+    /// A media computation is selected by what it is: the variant says which kind of graph it
+    /// needs, and rows and tokens are room to spare. **An extent a caller states narrows the
+    /// search; one it cannot state does not.** A caller that states a `Latents` layout or a
+    /// `Clip` is matched to the graph captured for exactly that, so a 25-frame step cannot run in
+    /// a 13-frame graph; `Extent::None` is the caller saying it does not know, and the bucket's
+    /// own extent, returned with it, decides what the runner does with the batch. No bucket
+    /// serving a computation is the worker stating it does not serve it.
     pub fn select(&self, shape: &Shape) -> Option<Bucket> {
         self.ascending
             .iter()
@@ -583,28 +579,6 @@ impl Buckets {
                  no capture is made in the serving path"
             ))
         })
-    }
-
-    /// The one bucket a media computation runs in, or `None` when this rank has none for it.
-    ///
-    /// A media computation is selected by what it is, not by a `Shape`: the variant says which kind
-    /// of graph it needs, and rows and tokens are room to spare.
-    ///
-    /// **An extent a caller states narrows the search; one it cannot state does not.** A caller
-    /// that states a `Latents` layout or a `Clip` is matched to the graph captured for exactly
-    /// that, so a 25-frame step cannot run in a 13-frame graph. `Extent::None` is the caller saying
-    /// it does not know: a denoising step's extent is its latent layout and a decode's is its clip,
-    /// and the engine that forms the computation knows neither until the runner that states the
-    /// bucket has reported it, so requiring agreement would refuse every bucket the runners state.
-    /// The bucket's own extent is still what decides what the runner does with the batch, and it is
-    /// returned with the bucket.
-    ///
-    /// No bucket serving the computation is the worker stating it does not serve it.
-    pub fn select_media(&self, computation: &Computation) -> Option<Bucket> {
-        self.ascending
-            .iter()
-            .copied()
-            .find(|bucket| bucket.holds_computation(computation))
     }
 
     /// The buckets in capture order: largest first, so smaller captures reuse the allocator blocks
@@ -658,8 +632,8 @@ mod tests {
         let wide = Bucket::denoise(1, layout(37, 2048)).serving(124, 1344, 768);
         let long = Bucket::denoise(1, layout(57, 1024)).serving(192, 1344, 768);
         let buckets = Buckets::new([short, wide, long]);
-        let request = |frames, text_rows| Computation {
-            call: ipc::MediaCall::Denoising,
+        let request = |frames, text_rows| Shape {
+            variant: Variant::Denoise,
             rows: 1,
             tokens: 0,
             extent: Extent::Request {
@@ -670,10 +644,10 @@ mod tests {
                 condition_rows: 0,
             },
         };
-        assert_eq!(buckets.select_media(&request(124, 537)), Some(short));
-        assert_eq!(buckets.select_media(&request(124, 1500)), Some(wide));
-        assert_eq!(buckets.select_media(&request(192, 537)), Some(long));
-        assert_eq!(buckets.select_media(&request(141, 537)), None);
+        assert_eq!(buckets.select(&request(124, 537)), Some(short));
+        assert_eq!(buckets.select(&request(124, 1500)), Some(wide));
+        assert_eq!(buckets.select(&request(192, 537)), Some(long));
+        assert_eq!(buckets.select(&request(141, 537)), None);
     }
 
     /// A request without conditions finds the layout that holds none, and one with conditions the
@@ -697,8 +671,8 @@ mod tests {
         let low = Bucket::denoise(1, layout(2048)).serving(124, 1344, 768);
         let high = Bucket::denoise(1, layout(8192)).serving(124, 1344, 768);
         let buckets = Buckets::new([high, low, plain]);
-        let request = |condition_rows| Computation {
-            call: ipc::MediaCall::Denoising,
+        let request = |condition_rows| Shape {
+            variant: Variant::Denoise,
             rows: 1,
             tokens: 0,
             extent: Extent::Request {
@@ -709,12 +683,12 @@ mod tests {
                 condition_rows,
             },
         };
-        assert_eq!(buckets.select_media(&request(0)), Some(plain));
-        assert_eq!(buckets.select_media(&request(1024)), Some(low));
-        assert_eq!(buckets.select_media(&request(2048)), Some(low));
-        assert_eq!(buckets.select_media(&request(2176)), Some(high));
-        assert_eq!(buckets.select_media(&request(8192)), Some(high));
-        assert_eq!(buckets.select_media(&request(8320)), None);
+        assert_eq!(buckets.select(&request(0)), Some(plain));
+        assert_eq!(buckets.select(&request(1024)), Some(low));
+        assert_eq!(buckets.select(&request(2048)), Some(low));
+        assert_eq!(buckets.select(&request(2176)), Some(high));
+        assert_eq!(buckets.select(&request(8192)), Some(high));
+        assert_eq!(buckets.select(&request(8320)), None);
     }
 
     /// A host call's bucket serves its call whatever the batch holds, because it states no bound.
@@ -731,30 +705,25 @@ mod tests {
             Bucket::clip(48, 768, 1344),
         ]);
 
-        for (call, variant) in [
-            (ipc::MediaCall::VideoEncoding, Variant::VideoEncode),
-            (ipc::MediaCall::AudioEncoding, Variant::AudioEncode),
-            (ipc::MediaCall::Muxing, Variant::Mux),
-        ] {
+        for variant in [Variant::VideoEncode, Variant::AudioEncode, Variant::Mux] {
             for rows in [1, 2, 4] {
-                let batch = Computation {
-                    call,
+                let batch = Shape {
+                    variant,
                     rows,
                     tokens: 0,
                     extent: Extent::None,
                 };
-                assert_eq!(batch.variant(), Some(variant));
                 assert_eq!(
-                    buckets.select_media(&batch),
+                    buckets.select(&batch),
                     Some(Bucket::host(variant)),
-                    "a {call:?} batch of {rows} request(s)"
+                    "a {variant} batch of {rows} request(s)"
                 );
             }
         }
 
         // A device computation is still measured against its bucket: two clips are not one capture.
-        let two_clips = Computation {
-            call: ipc::MediaCall::VideoDecoding,
+        let two_clips = Shape {
+            variant: Variant::Decode,
             rows: 2,
             tokens: 0,
             extent: Extent::Clip {
@@ -763,7 +732,7 @@ mod tests {
                 width: 1344,
             },
         };
-        assert_eq!(buckets.select_media(&two_clips), None);
+        assert_eq!(buckets.select(&two_clips), None);
     }
 
     /// The worker states which media computations its buckets serve, and the scheduler forms a
@@ -791,20 +760,16 @@ mod tests {
             Bucket::prefill(1, 512, Variant::Encode),
         ]);
 
-        let denoise = Computation {
-            call: ipc::MediaCall::Denoising,
+        let denoise = Shape {
+            variant: Variant::Denoise,
             rows: 1,
             tokens: 0,
             extent: Extent::Latents(layout),
         };
-        assert_eq!(denoise.variant(), Some(Variant::Denoise));
-        assert_eq!(
-            buckets.select_media(&denoise),
-            Some(Bucket::denoise(1, layout))
-        );
+        assert_eq!(buckets.select(&denoise), Some(Bucket::denoise(1, layout)));
 
         // One frame more is another graph, and no capture is made in the serving path.
-        let other = Computation {
+        let other = Shape {
             extent: Extent::Latents(proto::video::Layout {
                 video: proto::video::LatentShape {
                     channels: 16,
@@ -816,23 +781,23 @@ mod tests {
             }),
             ..denoise
         };
-        assert_eq!(buckets.select_media(&other), None);
+        assert_eq!(buckets.select(&other), None);
 
         // The engine forms every media computation with `Extent::None`: a step's layout is the
         // model's and a clip is the request's, and the scheduler knows neither until the runner that
         // states the bucket reports it. The bucket's own extent decides then.
-        let from_engine = Computation {
+        let from_engine = Shape {
             extent: Extent::None,
             ..denoise
         };
         assert_eq!(
-            buckets.select_media(&from_engine),
+            buckets.select(&from_engine),
             Some(Bucket::denoise(1, layout)),
             "a computation that cannot state its extent is served by the bucket that states one"
         );
 
-        let clip = Computation {
-            call: ipc::MediaCall::VideoDecoding,
+        let clip = Shape {
+            variant: Variant::Decode,
             rows: 1,
             tokens: 0,
             extent: Extent::Clip {
@@ -841,33 +806,28 @@ mod tests {
                 width: 1344,
             },
         };
-        assert_eq!(clip.variant(), Some(Variant::Decode));
-        assert_eq!(
-            buckets.select_media(&clip),
-            Some(Bucket::clip(48, 768, 1344))
-        );
+        assert_eq!(buckets.select(&clip), Some(Bucket::clip(48, 768, 1344)));
 
         // The same for a decode: the engine states `Extent::None` and the clip's bucket serves it.
-        let clip_from_engine = Computation {
+        let clip_from_engine = Shape {
             extent: Extent::None,
             ..clip
         };
         assert_eq!(
-            buckets.select_media(&clip_from_engine),
+            buckets.select(&clip_from_engine),
             Some(Bucket::clip(48, 768, 1344))
         );
 
         // An encode is sized by rows and tokens like a prefill, so it is the one media computation
         // whose extent says nothing.
-        let encode = Computation {
-            call: ipc::MediaCall::TextEncoding,
+        let encode = Shape {
+            variant: Variant::Encode,
             rows: 1,
             tokens: 300,
             extent: Extent::None,
         };
-        assert_eq!(encode.variant(), Some(Variant::Encode));
         assert_eq!(
-            buckets.select_media(&encode),
+            buckets.select(&encode),
             Some(Bucket::prefill(1, 512, Variant::Encode))
         );
 
@@ -902,15 +862,14 @@ mod tests {
             },
         );
         let tracks = Buckets::new([track]);
-        let decode = Computation {
-            call: ipc::MediaCall::AudioDecoding,
+        let decode = Shape {
+            variant: Variant::AudioDecode,
             rows: 1,
             tokens: 0,
             extent: Extent::None,
         };
-        assert_eq!(decode.variant(), Some(Variant::AudioDecode));
         assert_eq!(
-            tracks.select_media(&decode),
+            tracks.select(&decode),
             Some(track),
             "a track's decode is served by the bucket that states its layout"
         );
@@ -918,29 +877,24 @@ mod tests {
         // The clip's decode is not served by the track's bucket, though both name a layout in some
         // form: the variant is what keeps them apart, and that is the whole reason the track could
         // reuse `Extent::Latents` instead of putting a second shape in the extent.
-        let clip_decode = Computation {
-            call: ipc::MediaCall::VideoDecoding,
+        let clip_decode = Shape {
+            variant: Variant::Decode,
             ..decode
         };
-        assert_eq!(tracks.select_media(&clip_decode), None);
+        assert_eq!(tracks.select(&clip_decode), None);
 
         // The three host calls of a media output are computations of their own - the engine
         // encodes and muxes them on the host - and no device bucket serves one: they state a variant
         // so a batch reaches the runner that does, and they select no graph.
-        for (call, variant) in [
-            (ipc::MediaCall::VideoEncoding, Variant::VideoEncode),
-            (ipc::MediaCall::AudioEncoding, Variant::AudioEncode),
-            (ipc::MediaCall::Muxing, Variant::Mux),
-        ] {
-            let host = Computation {
-                call,
+        for variant in [Variant::VideoEncode, Variant::AudioEncode, Variant::Mux] {
+            let host = Shape {
+                variant,
                 rows: 1,
                 tokens: 0,
                 extent: Extent::None,
             };
-            assert_eq!(host.variant(), Some(variant));
             assert!(variant.media());
-            assert_eq!(tracks.select_media(&host), None);
+            assert_eq!(tracks.select(&host), None);
         }
 
         // A host bucket captures no graph, so no resolution narrows it: a video encode states the
@@ -948,8 +902,8 @@ mod tests {
         // for a clip still holds that one and no other, which is the half of the rule that keeps a
         // 25-frame step out of a 13-frame graph.
         let host = Buckets::new([Bucket::host(Variant::VideoEncode)]);
-        let clip_encode = Computation {
-            call: ipc::MediaCall::VideoEncoding,
+        let clip_encode = Shape {
+            variant: Variant::VideoEncode,
             rows: 1,
             tokens: 0,
             extent: Extent::Clip {
@@ -959,12 +913,12 @@ mod tests {
             },
         };
         assert_eq!(
-            host.select_media(&clip_encode),
+            host.select(&clip_encode),
             Some(Bucket::host(Variant::VideoEncode)),
             "a call performed on the host is served whatever resolution it names"
         );
         assert_eq!(
-            buckets.select_media(&Computation {
+            buckets.select(&Shape {
                 extent: Extent::Clip {
                     frames: 25,
                     height: 768,
@@ -978,15 +932,14 @@ mod tests {
 
         // A media read is host work: a bucket set that states no host bucket for it serves it
         // nowhere, and the scheduler reads that as the capability it is.
-        let read = Computation {
-            call: ipc::MediaCall::MediaReading,
+        let read = Shape {
+            variant: Variant::MediaRead,
             rows: 1,
             tokens: 0,
             extent: Extent::None,
         };
-        assert!(read.stated(), "a media read is a computation");
-        assert_eq!(buckets.select_media(&read), None);
-        assert_eq!(tracks.select_media(&read), None);
+        assert_eq!(buckets.select(&read), None);
+        assert_eq!(tracks.select(&read), None);
     }
 
     /// The two families are refused by name rather than served from one another's graphs: a media
@@ -1089,6 +1042,7 @@ mod tests {
                         rows,
                         tokens,
                         variant,
+                        extent: Extent::None,
                     };
                     // Brute force: the smallest holder by rows and then tokens, computed from the
                     // captured set rather than taken from the code under test.
@@ -1286,6 +1240,7 @@ mod tests {
                 rows: 1,
                 tokens: 1,
                 variant: bucket.variant,
+                extent: Extent::None,
             }));
         }
     }
@@ -1361,6 +1316,7 @@ mod tests {
             rows: 8,
             tokens: 64,
             variant: Variant::PrefillWrite,
+            extent: Extent::None,
         };
         assert!(
             buckets.select(&full).is_some(),
@@ -1372,6 +1328,7 @@ mod tests {
                 rows,
                 tokens: rows,
                 variant: Variant::DecodeGreedy,
+                extent: Extent::None,
             };
             assert_eq!(
                 buckets.select(&shape).map(|bucket| bucket.rows),
@@ -1426,6 +1383,7 @@ mod tests {
             rows: 4,
             tokens: 4,
             variant: Variant::DecodeGreedy,
+            extent: Extent::None,
         };
         assert_eq!(greedy.select(&shape), sampled.select(&shape));
     }

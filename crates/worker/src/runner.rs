@@ -9,13 +9,49 @@
 //! reaches a runner through this trait alone: [`Runner::buckets`] states what warm-up captures
 //! and [`Runner::forward`] is the one function that is run on the meta device, captured, and run
 //! again before each replay.
+//!
+//! ## What the executor hands a runner
+//!
+//! The executor thread owns the rank's device block tables ([`BlockTables`]): the buffer pool's
+//! completions the scheduler maps and the requests it has the executor stamp change them, as jobs
+//! of the executor's queue, so the tables a batch sees are those of every job before it. The
+//! runners read them and keep none of their own. For every batch, and for every turn of a shadow
+//! batch, the executor calls in this order:
+//!
+//! 1. [`Runner::write_tables`] on every runner of the rank, with the positions whose entries
+//!    changed since the last call ([`BlockTables::take_changes`]), each change once. A runner
+//!    that keeps a device block table writes them into it before its next forward reads it, and
+//!    resets the per-unit state of the units a change marks `reset`.
+//! 2. [`Runner::copy`] on the runner that serves the batch, with the copies that start with it
+//!    ([`BlockTables::start_copy`]), when there are any. Copies start only with a batch the engine
+//!    numbered and that every rank of the group runs; never with a shadow batch, an expert join,
+//!    or a batch one rank runs alone.
+//! 3. [`Runner::execute`] with the batch and the tables, or for a shadow turn
+//!    [`Runner::prepare_shadow_inputs`] with the batch and the tables.
+//!
+//! What a runner must keep, for the buffer pool's guarantees to hold (the obligations of the
+//! control plane in the buffer pool's design):
+//!
+//! - Every address a forward reads or writes in a request's memory comes from the tables: a
+//!   token's cache position, a recurrent-state checkpoint's position, an encoder output's or a
+//!   media product's position, each turned into units by [`BlockTables::units`] under the row's
+//!   slot. A position without an entry is refused before anything is launched.
+//! - A batch writes only entries [`BlockTables::writable`] states writable; a row that would write
+//!   a read-only entry, or a position without an entry, is refused before anything is launched.
+//! - [`Runner::copy`] issues each copy from its first run to its second on the rank's copy stream,
+//!   and writes nothing but the second run. The end of the batch that follows covers the copies:
+//!   [`Runner::execute`] returns only once the device has completed the copies as well as the
+//!   batch, also when `copy` failed after issuing part of them.
+//! - [`Runner::execute`] returns only once the device has completed the batch: the executor counts
+//!   the batch as ended, and lets the buffer pool reuse what it addressed, on its return.
 
-use ipc::execution::{Batch, BatchOutput};
+use ipc::batch::{Batch, BatchOutput, Phase};
 use uniserve_tensor::Tensor;
 
 use crate::Result;
 use crate::buckets::Bucket;
 use crate::graphs::Graphs;
+use crate::memory::tables::{BlockCopy, BlockTables, Change};
 
 /// The executor's name for one runner of its device.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -23,8 +59,8 @@ pub struct RunnerId(pub u32);
 
 /// One stage a rank holds, as the executor and [`Graphs`] drive it.
 pub trait Runner: Send {
-    /// The phases this runner serves, as the scheduler addresses them in a batch.
-    fn phases(&self) -> &[ipc::PhaseId];
+    /// The phases this runner serves, as the scheduler names them in a batch.
+    fn phases(&self) -> &[Phase];
 
     /// The buckets warm-up captures, largest first.
     ///
@@ -57,13 +93,15 @@ pub trait Runner: Send {
     fn idle_inputs(&self, bucket: &Bucket, columns: &mut [u8]) -> Result<()>;
 
     /// Chooses the smallest bucket that holds `batch`, fills the input tensors from the batch's
-    /// columns and writes the host values the bucket's forward computes into the input buffer
+    /// columns, with every address of a request's memory taken from `tables`, and writes the
+    /// host values the bucket's forward computes into the input buffer
     /// ([`Graphs::prepare_inputs`]).
     ///
     /// # Errors
     ///
-    /// A batch no bucket holds, or columns the runner refuses.
-    fn prepare_inputs(&mut self, batch: &Batch) -> Result<Bucket>;
+    /// A batch no bucket holds, columns the runner refuses, or a position the tables hold no
+    /// entry for, or a writable one for, where the batch writes.
+    fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket>;
 
     /// As [`Runner::prepare_inputs`], for a shadow batch of the generation being prepared: the
     /// inputs of a paired forward ([`Graphs::shadow`]), which must write no state a serving
@@ -72,19 +110,21 @@ pub trait Runner: Send {
     /// # Errors
     ///
     /// The default refuses: a runner that states no scratch memory shadows nothing.
-    fn prepare_shadow_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
-        let _ = batch;
+    fn prepare_shadow_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
+        let _ = (batch, tables);
         Err(crate::Error::Unsupported(
             "this runner prepares no inputs for a paired forward".to_owned(),
         ))
     }
 
-    /// One step: prepare the inputs, run the bucket's graph, read the outputs.
+    /// One step: prepare the inputs from `batch` and `tables`, run the bucket's graph, read the
+    /// outputs. It returns once the device has completed the step and the copies
+    /// [`Runner::copy`] issued for it.
     ///
     /// # Errors
     ///
     /// As [`Runner::prepare_inputs`], or the device's failure.
-    fn execute(&mut self, batch: &Batch) -> Result<BatchOutput>;
+    fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput>;
 
     /// The runner's graphs: what the executor captures, switches and releases at a batch
     /// boundary, and what a profile run of the runner is recorded in.
@@ -109,17 +149,38 @@ pub trait Runner: Send {
         let _ = warming;
     }
 
-    /// Writes the trajectories of preempted requests from their slots into the host latent
-    /// pools, the `ipc::LatentPageCopy` entries of this runner's rank. It runs on the executor
-    /// thread with nothing in flight, as a control operation (`Batches::offload_latents`).
+    /// The rank's device block tables changed at `changes` since the last call, in slot, class
+    /// and position order: each states the run a position holds now, or none, and whether the
+    /// run's units are new to their owner and must be reset before a forward reads them. Called
+    /// on every runner of the rank before the forward of every batch and every shadow turn,
+    /// with every change exactly once.
     ///
     /// # Errors
     ///
-    /// The default refuses: a runner that holds no trajectory offloads none.
-    fn offload_latents(&mut self, offloads: &[ipc::LatentOffload]) -> Result<()> {
-        let _ = offloads;
-        Err(crate::Error::Unsupported(
-            "this runner holds no trajectory to offload".to_owned(),
-        ))
+    /// What writing the device's table fails with; the batch then fails. The default keeps no
+    /// device table and accepts every change.
+    fn write_tables(&mut self, changes: &[Change]) -> Result<()> {
+        let _ = changes;
+        Ok(())
+    }
+
+    /// Issues `copies` on the rank's copy stream, each from its first run to its second, ahead of
+    /// the batch [`Runner::execute`] runs next, whose end covers them. A copy without runs lies
+    /// in other ranks' memory and asks nothing of this one.
+    ///
+    /// # Errors
+    ///
+    /// When a copy cannot be issued. The executor then reports every one of `copies` failed
+    /// (`Finish { ok: false }`) and still runs the batch, whose end covers whatever was issued.
+    /// The default refuses any copy with runs: a runner that holds no request memory copies
+    /// none.
+    fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
+        match copies.iter().find(|copy| !copy.runs.is_empty()) {
+            Some(copy) => Err(crate::Error::Unsupported(format!(
+                "this runner holds no request memory to run the copies of request {}",
+                copy.request.0
+            ))),
+            None => Ok(()),
+        }
     }
 }

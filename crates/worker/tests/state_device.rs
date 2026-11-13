@@ -15,8 +15,8 @@ mod support;
 
 use std::sync::Arc;
 
-use ipc::execution::{StateCopy, StateDirection};
-use ipc::{PrefixCacheDtype, UnitId};
+use ipc::PrefixCacheDtype;
+use ipc::batch::StateDirection;
 use nn::family::{StateField, StateShape};
 use ops::Generation;
 use platform::{Budget, DeviceId, PoolKind, Stream};
@@ -160,21 +160,8 @@ fn a_keep_and_a_restore_move_a_checkpoint_through_a_state_page() -> Outcome {
     let pattern: Vec<f32> = (0..10).map(|value| value as f32).collect();
     write_row(&stream, &state.checkpoint()?[0][1], 0, &pattern)?;
 
-    let page = |slot: u32, direction| StateCopy {
-        slot,
-        units: vec![UnitId(5), UnitId(6)],
-        direction,
-    };
-    state.copy(
-        &cache,
-        &[page(1, StateDirection::Keep)],
-        StateDirection::Keep,
-    )?;
-    state.copy(
-        &cache,
-        &[page(3, StateDirection::Restore)],
-        StateDirection::Restore,
-    )?;
+    state.copy(&cache, &[(1, 5..7)], StateDirection::Keep)?;
+    state.copy(&cache, &[(3, 5..7)], StateDirection::Restore)?;
 
     assert_eq!(read_row(&stream, &state.live()?[0][1], 2)?, pattern);
     Ok(())

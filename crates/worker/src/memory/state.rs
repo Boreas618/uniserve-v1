@@ -27,7 +27,9 @@
 //! slot's checkpoint row into the snapshot and scatters it into a page's planes after the
 //! forward, and a restore gathers a page's planes into the snapshot and scatters them into the
 //! slot's live row before it. Which rows copy what is the scheduler's decision, stated in the
-//! batch (`ipc::execution::StateCopy`).
+//! batch by the checkpoint's position in the request's state table (`ipc::batch::StateCopy`);
+//! the runner finds the page's run of units through the rank's device block table, and a
+//! keep writes only a block the table states writable.
 //!
 //! A checkpoint lays each layer's fields out in field order from plane boundaries
 //! ([`CacheLayout::state_planes`]); plane `p` of a state page is column `q % columns` of the
@@ -45,9 +47,10 @@
 //! tensors are meta tensors and its copies are checked and issue nothing.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::Arc;
 
-use ipc::execution::{StateCopy, StateDirection};
+use ipc::batch::StateDirection;
 use nn::RecurrentState;
 use nn::family::{StateField, StateShape};
 use ops::block_copy::{
@@ -426,9 +429,9 @@ impl StateMemory {
         })
     }
 
-    /// The rows of the cache's state runs a state page's planes lie in, in plane order: each
-    /// plane's field run and its row there, `column · units + unit`.
-    fn cells(&self, units: &[ipc::UnitId]) -> Result<Vec<(usize, i64)>> {
+    /// The rows of the cache's state runs the planes of the state page in `units` lie in, in
+    /// plane order: each plane's field run and its row there, `column · units + unit`.
+    fn cells(&self, units: Range<u32>) -> Result<Vec<(usize, i64)>> {
         if units.len() != self.units_per_page as usize {
             return Err(Error::Invalid(format!(
                 "a state page of {} units, and the cache's state pages span {}",
@@ -436,13 +439,10 @@ impl StateMemory {
                 self.units_per_page
             )));
         }
-        if let Some(unit) = units
-            .iter()
-            .find(|unit| unit.0 == 0 || unit.0 >= self.units)
-        {
+        if units.start == 0 || units.end > self.units {
             return Err(Error::Invalid(format!(
-                "a state page names unit {} of a pool of units 1..{}",
-                unit.0, self.units
+                "a state page names units {}..{} of a pool of units 1..{}",
+                units.start, units.end, self.units
             )));
         }
 
@@ -451,7 +451,7 @@ impl StateMemory {
             .map(|plane| {
                 let position = plane % run;
                 let column = position % u64::from(self.columns);
-                let unit = units[(position / u64::from(self.columns)) as usize].0;
+                let unit = units.start + (position / u64::from(self.columns)) as u32;
 
                 (
                     (plane / run) as usize,
@@ -598,8 +598,7 @@ impl StateMemory {
             .collect::<Result<Vec<_>>>()?;
         let buffers = vec![fields; self.config.shape.layers as usize];
 
-        let units: Vec<ipc::UnitId> = (1..=self.units_per_page).map(ipc::UnitId).collect();
-        let page = self.cells(&units)?;
+        let page = self.cells(1..1 + self.units_per_page)?;
 
         let context = backend::Context::meta(None);
         context.record_launches();
@@ -636,9 +635,11 @@ impl StateMemory {
 
     /// Issues a batch's copies of `direction` between the slots' buffers and the state pages
     /// of `cache`, on the stream the state was opened on: every restore before the batch's
-    /// forward, every keep after it. A restore moves a page's planes into its slot's live row;
-    /// a keep moves its slot's checkpoint row into a page's planes. Every copy is checked
-    /// before anything is issued, and a state that holds no device issues nothing.
+    /// forward, every keep after it. Each copy is a request slot and the units of its state
+    /// page, the run the slot's checkpoint entry names. A restore moves a page's planes into
+    /// its slot's live row; a keep moves its slot's checkpoint row into a page's planes. Every
+    /// copy is checked before anything is issued, and a state that holds no device issues
+    /// nothing.
     ///
     /// # Errors
     ///
@@ -648,12 +649,12 @@ impl StateMemory {
     pub fn copy(
         &mut self,
         cache: &KvCacheMemory,
-        copies: &[StateCopy],
+        copies: &[(u32, Range<u32>)],
         direction: StateDirection,
     ) -> Result<()> {
         let mut pages = Vec::new();
-        for copy in copies.iter().filter(|copy| copy.direction == direction) {
-            pages.push((self.row(copy.slot)?, self.cells(&copy.units)?));
+        for (slot, units) in copies {
+            pages.push((self.row(*slot)?, self.cells(units.clone())?));
         }
         if pages.len() > 2 * self.config.rows as usize {
             return Err(Error::Invalid(format!(
@@ -793,7 +794,7 @@ impl StateMemory {
 
 #[cfg(test)]
 mod tests {
-    use ipc::{PrefixCacheDtype, UnitId};
+    use ipc::PrefixCacheDtype;
     use ops::Op;
 
     use super::*;
@@ -844,14 +845,6 @@ mod tests {
             slots: 3,
             rows: 2,
             trail,
-        }
-    }
-
-    fn copy(slot: u32, units: &[u32], direction: StateDirection) -> StateCopy {
-        StateCopy {
-            slot,
-            units: units.iter().copied().map(UnitId).collect(),
-            direction,
         }
     }
 
@@ -943,25 +936,19 @@ mod tests {
         let cache = KvCacheMemory::meta(config_of_cache.clone())?;
         let mut state = StateMemory::meta(config(0), &config_of_cache)?;
         let mut restore =
-            |copies: &[StateCopy]| state.copy(&cache, copies, StateDirection::Restore);
-        let one = |slot: u32, units: &[u32]| [copy(slot, units, StateDirection::Restore)];
+            |copies: &[(u32, Range<u32>)]| state.copy(&cache, copies, StateDirection::Restore);
 
-        restore(&one(2, &[5, 6]))?;
-        assert!(restore(&one(4, &[5, 6])).is_err());
+        restore(&[(2, 5..7)])?;
+        assert!(restore(&[(4, 5..7)]).is_err());
 
         // A state page spans two units, none of them the padding unit or outside the pool.
-        let short = restore(&one(1, &[5])).expect_err("a page of one unit");
+        let short = restore(&[(1, 5..6)]).expect_err("a page of one unit");
         assert!(short.to_string().contains("span 2"), "{short}");
-        assert!(restore(&one(1, &[0, 6])).is_err());
-        assert!(restore(&one(1, &[5, 16])).is_err());
-
-        // A copy of the other direction is not this call's.
-        restore(&[copy(9, &[5], StateDirection::Keep)])?;
+        assert!(restore(&[(1, 0..2)]).is_err());
+        assert!(restore(&[(1, 15..17)]).is_err());
 
         // A batch of two rows carries at most a restore and a keep per row.
-        let many: Vec<StateCopy> = (0..5)
-            .map(|_| copy(1, &[5, 6], StateDirection::Restore))
-            .collect();
+        let many: Vec<(u32, Range<u32>)> = (0..5).map(|_| (1, 5..7)).collect();
         let refused = restore(&many).expect_err("five copies of a batch of two rows");
         assert!(refused.to_string().contains("allow 4"), "{refused}");
         Ok(())

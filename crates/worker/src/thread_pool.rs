@@ -21,9 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use ipc::execution::Waker;
-
-use crate::completion::{Completion, Outcome};
+use crate::completion::{Completion, Outcome, Waker};
 use crate::{Error, Result, lock};
 
 /// Work a thread pool runs.

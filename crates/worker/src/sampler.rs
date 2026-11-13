@@ -103,7 +103,6 @@
 //! [`inert_commit`]. [`scored`] is the other direction: a row of a forward's scores as a
 //! completion reports it.
 
-use ipc::execution::{FreshSlot, LogitAdjustments, SlotBias};
 use ipc::philox::DrawAddress;
 use nn::{DType, NO_SLOT, Tensor, functional};
 use ops::sampler::ban_words;
@@ -379,17 +378,17 @@ impl Sampler {
     /// These are the counts the commits of those tokens leave on a slot that held the request
     /// from its first token, so a request that generated tokens elsewhere, before a transfer,
     /// a migration or a preemption, is penalized as if it had not moved. A token outside the
-    /// vocabulary counts nothing. The runner copies the row over row `fresh.slot` of the count
-    /// table before the step that reads it; a request with no history starts at zeros.
+    /// vocabulary counts nothing. The runner copies the row over row `slot` of the count table
+    /// before the step that reads it; a request with no history starts at zeros.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for a slot the tables hold no row for.
-    pub fn count_row(&self, fresh: &FreshSlot) -> Result<Vec<i32>> {
-        self.check_slot("a fresh slot", fresh.slot)?;
+    pub fn count_row(&self, slot: u32, history: &[u32]) -> Result<Vec<i32>> {
+        self.check_slot("a new slot", slot)?;
 
         let mut row = vec![0_i32; self.config.vocabulary as usize];
-        for &token in &fresh.history {
+        for &token in history {
             if let Some(count) = row.get_mut(token as usize) {
                 *count += 1;
             }
@@ -401,18 +400,23 @@ impl Sampler {
     /// biased token, `-inf` at every token outside its allowed set, and zero elsewhere.
     ///
     /// An allowed set outranks a bias: a token the request may not sample stays `-inf`
-    /// whatever bias it states. A token outside the vocabulary is ignored. The runner copies
-    /// the row over row `install.slot` of the bias table before the step whose rows are
-    /// flagged to read it.
+    /// whatever bias it states. A token outside the vocabulary is ignored. `bias` and
+    /// `allowed` are the request's (`ipc::batch::NewSlot`); the runner copies the row over row
+    /// `slot` of the bias table before the step whose rows are flagged to read it.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for a slot the tables hold no row for.
-    pub fn bias_row(&self, install: &SlotBias) -> Result<Vec<f32>> {
-        self.check_slot("a bias row", install.slot)?;
+    pub fn bias_row(
+        &self,
+        slot: u32,
+        bias: &[(u32, f32)],
+        allowed: Option<&[u32]>,
+    ) -> Result<Vec<f32>> {
+        self.check_slot("a bias row", slot)?;
 
         let vocabulary = self.config.vocabulary as usize;
-        let mut row = match &install.allowed {
+        let mut row = match allowed {
             Some(allowed) => {
                 let mut row = vec![f32::NEG_INFINITY; vocabulary];
                 for &token in allowed {
@@ -425,7 +429,7 @@ impl Sampler {
             None => vec![0.0; vocabulary],
         };
 
-        for &(token, bias) in &install.bias {
+        for &(token, bias) in bias {
             if let Some(entry) = row.get_mut(token as usize)
                 && *entry != f32::NEG_INFINITY
             {
@@ -479,7 +483,7 @@ impl Sampler {
 }
 
 /// The parameter column of a bucket of `bucket_rows` rows: `[bucket_rows,
-/// PARAMETER_COLUMNS]` FP32, row-major, from a batch's `columns` (`BatchColumns::parameters`),
+/// PARAMETER_COLUMNS]` FP32, row-major, from a batch's `columns` (`ipc::batch::Columns::parameters`),
 /// one row of [`PARAMETER_COLUMNS`] per row of the batch.
 ///
 /// A greedy row, one whose temperature is zero, is given a top-k width of one: a greedy
@@ -539,7 +543,8 @@ pub fn draws(addresses: &[DrawAddress], bucket_rows: usize) -> Result<Vec<f32>> 
 
 /// The adjustment columns of a bucket of `bucket_rows` rows over a `vocabulary`-wide row:
 /// `(rows, masks)`, `[bucket_rows, 2]` U32 and `[masks, ceil(vocabulary / 32)]` U32, both
-/// row-major.
+/// row-major, from a batch's `biased` and `banned` columns (`ipc::batch::Columns`), each empty
+/// or one entry per row.
 ///
 /// A row's two entries are its bias flag, `1` when the row adds its slot's bias row, and the
 /// index of its ban mask, [`NO_SLOT`] for a row that bans nothing. The masks are one per row
@@ -554,15 +559,16 @@ pub fn draws(addresses: &[DrawAddress], bucket_rows: usize) -> Result<Vec<f32>> 
 /// [`Error::Invalid`] when the batch states flags or banned tokens for more rows than the
 /// bucket has.
 pub fn adjustments(
-    adjustments: &LogitAdjustments,
+    biased: &[bool],
+    banned: &[Vec<u32>],
     bucket_rows: usize,
     vocabulary: u32,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
-    if adjustments.biased.len() > bucket_rows || adjustments.banned.len() > bucket_rows {
+    if biased.len() > bucket_rows || banned.len() > bucket_rows {
         return Err(Error::Invalid(format!(
             "adjustments of {} flagged and {} banning rows for a bucket of {bucket_rows} rows",
-            adjustments.biased.len(),
-            adjustments.banned.len()
+            biased.len(),
+            banned.len()
         )));
     }
     let words = ban_words(vocabulary) as usize;
@@ -570,11 +576,11 @@ pub fn adjustments(
     let mut rows = Vec::with_capacity(2 * bucket_rows);
     let mut masks = Vec::new();
     for row in 0..bucket_rows {
-        let biased = adjustments.biased.get(row).copied().unwrap_or(false);
-        rows.push(u32::from(biased));
+        let flagged = biased.get(row).copied().unwrap_or(false);
+        rows.push(u32::from(flagged));
 
-        let banned = adjustments.banned.get(row).map_or(&[][..], Vec::as_slice);
-        if banned.is_empty() {
+        let tokens = banned.get(row).map_or(&[][..], Vec::as_slice);
+        if tokens.is_empty() {
             rows.push(NO_SLOT);
             continue;
         }
@@ -583,7 +589,7 @@ pub fn adjustments(
         rows.push(index as u32);
         masks.resize(masks.len() + words, 0_u32);
         let mask = &mut masks[index * words..];
-        for &token in banned.iter().filter(|token| **token < vocabulary) {
+        for &token in tokens.iter().filter(|token| **token < vocabulary) {
             mask[(token / 32) as usize] |= 1 << (token % 32);
         }
     }
@@ -592,7 +598,7 @@ pub fn adjustments(
 
 /// The commit table of a runner whose table holds `capacity` rows: `[COMMIT_FIELDS, capacity]`
 /// I32, field-major, from a batch's `[COMMIT_FIELDS, rows]` I64 table
-/// (`BatchColumns::commit`).
+/// (`ipc::batch::Columns::commit`).
 ///
 /// The batch's rows fill the table's leading rows and every row past them is inert, slot and
 /// task `-1`, rather than zero: a zero slot is slot 0, a real destination, so a commit over
@@ -773,18 +779,20 @@ mod tests {
         requests: &[[f32; PARAMETER_COLUMNS as usize]],
         vocabulary: usize,
     ) -> (Tensor, Tensor, Tensor) {
-        columns_adjusted(requests, vocabulary, &LogitAdjustments::default())
+        columns_adjusted(requests, vocabulary, &[], &[])
     }
 
-    /// [`columns`] for a batch that states `adjusted`.
+    /// [`columns`] for a batch whose rows state the bias flags `biased` and the banned tokens
+    /// `banned`.
     fn columns_adjusted(
         requests: &[[f32; PARAMETER_COLUMNS as usize]],
         vocabulary: usize,
-        adjusted: &LogitAdjustments,
+        biased: &[bool],
+        banned: &[Vec<u32>],
     ) -> (Tensor, Tensor, Tensor) {
         let rows = requests.len();
         let encoded = parameters(&requests.concat(), rows).unwrap();
-        let (flags, masks) = adjustments(adjusted, rows, vocabulary as u32).unwrap();
+        let (flags, masks) = adjustments(biased, banned, rows, vocabulary as u32).unwrap();
 
         // The runner's mask tensor holds a mask per row; the batch's masks are its head.
         let words = ban_words(vocabulary as u32) as usize;
@@ -1118,11 +1126,7 @@ mod tests {
         let sampler = sampler(&tables, 0);
 
         // Slot 1's request arrives with a history; slot 0's has generated nothing.
-        let history = FreshSlot {
-            slot: 1,
-            history: vec![2, 2, 5],
-        };
-        let counts = sampler.count_row(&history).unwrap();
+        let counts = sampler.count_row(1, &[2, 2, 5]).unwrap();
         assert_eq!(counts, [0, 0, 2, 0, 0, 1]);
         install(&tables.0, 1, &counts);
 
@@ -1225,22 +1229,13 @@ mod tests {
         let tables = tables(6, 2);
         let sampler = sampler(&tables, 0);
 
-        let install_bias = SlotBias {
-            slot: 1,
-            bias: vec![(2, -4.0), (3, 3.0)],
-            allowed: None,
-        };
-        let row = sampler.bias_row(&install_bias).unwrap();
+        let row = sampler.bias_row(1, &[(2, -4.0), (3, 3.0)], None).unwrap();
         assert_eq!(row, [0.0, 0.0, -4.0, 3.0, 0.0, 0.0]);
         install(&tables.1, 1, &row);
 
         // Slot 1 flagged, slot 1 not flagged, and slot 0 flagged, whose row is zeros.
-        let adjusted = LogitAdjustments {
-            installs: vec![install_bias],
-            biased: vec![true, false, true],
-            banned: Vec::new(),
-        };
-        let (parameters, adjustments, bans) = columns_adjusted(&[request(0.0); 3], 6, &adjusted);
+        let (parameters, adjustments, bans) =
+            columns_adjusted(&[request(0.0); 3], 6, &[true, false, true], &[]);
         let logits = tensor(&[LOGITS; 3].concat(), (3, 6));
 
         let tokens = sampler
@@ -1281,25 +1276,15 @@ mod tests {
         let tables = tables(6, 1);
         let sampler = sampler(&tables, 0);
 
-        let seen = FreshSlot {
-            slot: 0,
-            history: vec![3],
-        };
-        install(&tables.0, 0, &sampler.count_row(&seen).unwrap());
-        let bias = SlotBias {
-            slot: 0,
-            bias: vec![(3, 3.5)],
-            allowed: None,
-        };
-        install(&tables.1, 0, &sampler.bias_row(&bias).unwrap());
+        install(&tables.0, 0, &sampler.count_row(0, &[3]).unwrap());
+        install(
+            &tables.1,
+            0,
+            &sampler.bias_row(0, &[(3, 3.5)], None).unwrap(),
+        );
 
-        let adjusted = LogitAdjustments {
-            installs: Vec::new(),
-            biased: vec![true],
-            banned: Vec::new(),
-        };
         let repeated = with(request(0.0), PENALTIES[0], 2.0);
-        let (parameters, adjustments, bans) = columns_adjusted(&[repeated], 6, &adjusted);
+        let (parameters, adjustments, bans) = columns_adjusted(&[repeated], 6, &[true], &[]);
 
         let tokens = sampler
             .greedy(
@@ -1323,23 +1308,16 @@ mod tests {
         let sampler = sampler(&tables, 0);
 
         // Tokens 1 and 2 are allowed; token 4's bias is of a token the request may not sample.
-        let restricted = SlotBias {
-            slot: 0,
-            bias: vec![(1, 2.0), (4, 9.0)],
-            allowed: Some(vec![1, 2]),
-        };
-        let row = sampler.bias_row(&restricted).unwrap();
+        let row = sampler
+            .bias_row(0, &[(1, 2.0), (4, 9.0)], Some(&[1, 2]))
+            .unwrap();
         let outside = f32::NEG_INFINITY;
         assert_eq!(row, [outside, 2.0, 0.0, outside, outside, outside]);
         install(&tables.1, 0, &row);
 
         let uniforms = [0.0_f32, 0.1, 0.7, 0.999];
-        let adjusted = LogitAdjustments {
-            installs: Vec::new(),
-            biased: vec![true; 4],
-            banned: Vec::new(),
-        };
-        let (parameters, adjustments, bans) = columns_adjusted(&[request(1.0); 4], 6, &adjusted);
+        let (parameters, adjustments, bans) =
+            columns_adjusted(&[request(1.0); 4], 6, &[true; 4], &[]);
         let logits = tensor(&[LOGITS; 4].concat(), (4, 6));
         let slots = tensor(&[0_u32; 4], 4);
 
@@ -1391,13 +1369,9 @@ mod tests {
         logits[3] = 4.0;
         logits[20] = 3.0;
 
-        let adjusted = LogitAdjustments {
-            installs: Vec::new(),
-            biased: Vec::new(),
-            banned: vec![vec![3, 35], Vec::new(), vec![35]],
-        };
+        let banned = [vec![3, 35], Vec::new(), vec![35]];
         let (parameters, adjustments, bans) =
-            columns_adjusted(&[request(0.0); 3], VOCABULARY, &adjusted);
+            columns_adjusted(&[request(0.0); 3], VOCABULARY, &[], &banned);
         let rows = tensor(&logits.repeat(3), (3, VOCABULARY));
         let slots = tensor(&[0_u32; 3], 3);
 
@@ -1409,7 +1383,7 @@ mod tests {
         // Drawn, a row under the first mask draws from its logits without the two banned
         // tokens: every row here adds no bias row and names mask 0.
         let uniforms = [0.0_f32, 0.5, 0.9999];
-        let (parameters, _, _) = columns_adjusted(&[request(1.0); 3], VOCABULARY, &adjusted);
+        let (parameters, _, _) = columns_adjusted(&[request(1.0); 3], VOCABULARY, &[], &banned);
         let banning = tensor(&[0_u32; 6], (3, 2));
         let (tokens, _) = sampler
             .forward(
@@ -1595,21 +1569,12 @@ mod tests {
         let sampler = sampler(&tables, 0);
 
         // Slot 1's request may sample nothing at all.
-        let nothing = SlotBias {
-            slot: 1,
-            bias: Vec::new(),
-            allowed: Some(Vec::new()),
-        };
-        install(&tables.1, 1, &sampler.bias_row(&nothing).unwrap());
+        install(&tables.1, 1, &sampler.bias_row(1, &[], Some(&[])).unwrap());
 
-        let adjusted = LogitAdjustments {
-            installs: Vec::new(),
-            biased: vec![false, false, true],
-            banned: Vec::new(),
-        };
         // A min-p above one keeps no candidate; the second row is an ordinary one.
         let requests = [with(request(1.0), MIN_P, 2.0), request(1.0), request(1.0)];
-        let (parameters, adjustments, bans) = columns_adjusted(&requests, 6, &adjusted);
+        let (parameters, adjustments, bans) =
+            columns_adjusted(&requests, 6, &[false, false, true], &[]);
         let logits = tensor(&[LOGITS; 3].concat(), (3, 6));
         let slots = tensor(&[0_u32, 0, 1], 3);
 
@@ -1893,16 +1858,8 @@ mod tests {
         assert!(Sampler::new(config, bias, counts).is_err());
 
         // A slot outside the tables starts no row.
-        let outside = FreshSlot {
-            slot: 2,
-            history: Vec::new(),
-        };
-        assert!(built.count_row(&outside).is_err());
-        let outside = SlotBias {
-            slot: 2,
-            ..SlotBias::default()
-        };
-        assert!(built.bias_row(&outside).is_err());
+        assert!(built.count_row(2, &[]).is_err());
+        assert!(built.bias_row(2, &[], None).is_err());
     }
 
     #[test]
@@ -1911,24 +1868,20 @@ mod tests {
         let sampler = sampler(&tables, 0);
 
         // One count per occurrence, and nothing for a token outside the vocabulary.
-        let seen = FreshSlot {
-            slot: 0,
-            history: vec![3, 1, 3, 9, 3],
-        };
-        assert_eq!(sampler.count_row(&seen).unwrap(), [0, 1, 0, 3, 0, 0, 0, 0]);
-        assert_eq!(sampler.count_row(&FreshSlot::default()).unwrap(), [0; 8]);
+        assert_eq!(
+            sampler.count_row(0, &[3, 1, 3, 9, 3]).unwrap(),
+            [0, 1, 0, 3, 0, 0, 0, 0]
+        );
+        assert_eq!(sampler.count_row(0, &[]).unwrap(), [0; 8]);
 
         // A bias without an allowed set leaves every other token as it is.
-        let biased = SlotBias {
-            slot: 0,
-            bias: vec![(2, -1.5), (7, 4.0), (8, 1.0)],
-            allowed: None,
-        };
         assert_eq!(
-            sampler.bias_row(&biased).unwrap(),
+            sampler
+                .bias_row(0, &[(2, -1.5), (7, 4.0), (8, 1.0)], None)
+                .unwrap(),
             [0.0, 0.0, -1.5, 0.0, 0.0, 0.0, 0.0, 4.0]
         );
-        assert_eq!(sampler.bias_row(&SlotBias::default()).unwrap(), [0.0; 8]);
+        assert_eq!(sampler.bias_row(0, &[], None).unwrap(), [0.0; 8]);
     }
 
     #[test]
@@ -1959,13 +1912,10 @@ mod tests {
     /// that bans nothing set nothing.
     #[test]
     fn a_batch_encodes_one_ban_mask_per_banning_row() {
-        let batch = LogitAdjustments {
-            installs: Vec::new(),
-            biased: vec![true, false, true],
-            banned: vec![vec![0, 31, 99, 100], Vec::new(), vec![32]],
-        };
+        let biased = [true, false, true];
+        let banned = [vec![0, 31, 99, 100], Vec::new(), vec![32]];
 
-        let (rows, masks) = adjustments(&batch, 4, 100).unwrap();
+        let (rows, masks) = adjustments(&biased, &banned, 4, 100).unwrap();
 
         assert_eq!(rows, [1, 0, 0, NO_SLOT, 1, 1, 0, NO_SLOT]);
         // Tokens 0 and 31 share word 0, token 99 is bit 3 of word 3 and 100 is outside; token
@@ -1973,12 +1923,12 @@ mod tests {
         assert_eq!(masks, [1 | 1 << 31, 0, 0, 1 << 3, 0, 1, 0, 0]);
 
         // A batch that adjusts nothing encodes no mask and flags no row.
-        let (rows, masks) = adjustments(&LogitAdjustments::default(), 4, 100).unwrap();
+        let (rows, masks) = adjustments(&[], &[], 4, 100).unwrap();
         assert!(masks.is_empty());
         assert_eq!(rows, [0, NO_SLOT].repeat(4));
 
         // A batch of more rows than the bucket is refused.
-        assert!(adjustments(&batch, 2, 100).is_err());
+        assert!(adjustments(&biased, &banned, 2, 100).is_err());
     }
 
     #[test]

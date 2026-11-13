@@ -2,9 +2,10 @@
 //!
 //! Each cache group copies its pages through a page pool of the host's Storage Server: a memfd
 //! of equal pages shared by every rank of the host whose pages have the same shape. The rank
-//! maps each pool writable and registers it for device copies; the scheduler decides which
-//! pages to copy and states them in batches (`ipc::PageCopy`), and the copies run on the rank's
-//! copy stream.
+//! maps each pool writable and registers it for device copies. The buffer pool names a host
+//! copy of a block as a run of the group's host region, whose unit `u` is page `u` of the pool;
+//! the copies a completion queues ([`HostPage`]) run on the rank's copy stream with the batch
+//! that takes them.
 //!
 //! A host page is one page of one group on this rank, plane by plane: the key planes of every
 //! unit and column of the page, in unit then column order, the value planes in the same order,
@@ -20,11 +21,12 @@
 //! plane of each field run, in unit then column order, and no key, value or scale.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use ::storage::Key;
 use ::storage::protocol::PageShape;
-use ipc::{HostPoolInfo, PageCopy};
+use ipc::HostPoolInfo;
 use platform::{CopyBatch, DeviceId, Event, EventFlags, SourceOrder, Stream};
 use uniserve_tensor::DType;
 
@@ -39,7 +41,7 @@ use crate::{Error, Result};
 const PAGE_ENCODING: u32 = 1;
 
 /// The pages of the state group's block size between the checkpoints the host tier keeps of a
-/// long prompt: the scheduler offloads a state group's checkpoint before every aligned
+/// long prompt: the scheduler stores a state group's checkpoint before every aligned
 /// boundary, those of the default `kv_cache_config.boundary_interval`, and before a prompt's
 /// last ones.
 const STATE_SPACING: u64 = 64;
@@ -188,6 +190,11 @@ pub fn page_identities(layout: &CacheLayout, fingerprint: &str) -> Vec<String> {
         .collect()
 }
 
+/// One page's copy between the host tier and the units of the pool: the cache group, the page
+/// of the group's host page pool (or of its converted-load source buffer), and the units of the
+/// block on the device.
+pub(crate) type HostPage = (u32, u64, Range<u32>);
+
 /// The rank's host page pools, by cache group, the stream its page copies run on, and the
 /// converted loads of a cache that admits them.
 pub(crate) struct HostTier {
@@ -196,12 +203,6 @@ pub(crate) struct HostTier {
     /// The copy stream: page copies run on it beside the forwards on a batch's stream.
     stream: Stream,
     conversion: Option<Conversion>,
-    /// Recorded on a batch's stream behind its unit resets; the copy stream starts the batch's
-    /// loads behind it, so a reset never clears a page a load wrote.
-    reset: Event,
-    /// Recorded on the copy stream behind a batch's loads; the batch's stream waits on it, so
-    /// its forward reads the loaded pages.
-    loaded: Event,
 }
 
 impl HostTier {
@@ -263,8 +264,6 @@ impl HostTier {
                 pools,
                 stream,
                 conversion,
-                reset: Event::new(EventFlags::default()),
-                loaded: Event::new(EventFlags::default()),
             },
             reports,
         ))
@@ -277,73 +276,67 @@ impl HostTier {
         }
     }
 
-    /// Issues a batch's page copies on the copy stream: loads the units of `loads` from their
-    /// host pages, converting the pages of the conversion source (`PageCopy::staged`), and
-    /// offloads the published units of `offloads` into theirs.
+    /// Issues the copies a batch runs between the host tier and the units on the copy stream:
+    /// `loads` from their host pages into their units, `converted` from the conversion
+    /// source's pages, and `stores` from their units into their host pages. Returns the event
+    /// recorded behind them, which the batch's end waits on; `None` when there is none.
     ///
-    /// The loads fill new units of the batch, which the batch reset on `stream`, the batch's
-    /// own: the copy stream starts them behind that reset, and `stream` waits for them before
-    /// the batch's forward. The offloads copy pages the scheduler published once it accepted
-    /// the result that computed them, and it holds their units until the batch's output commits
-    /// them; that output waits on the returned event, recorded behind the offloads, and nothing
-    /// else does. `None` for a batch that offloads nothing.
+    /// No forward reads or writes what these copies write before they end: a loaded block
+    /// becomes an entry of its owner's table only once the copy is reported done, and a stored
+    /// block is shared, which no batch writes. Their sources are held by the buffer pool until
+    /// then. So the copy stream waits for nothing of the batch's stream.
+    ///
+    /// Every page is checked before anything is issued. When an issue fails after others were
+    /// issued, the copy stream is waited for before the failure returns, so whatever was issued
+    /// has ended.
     ///
     /// # Errors
     ///
-    /// A page of another pool or shape than its group's, or a page of the conversion source on
-    /// a cache that converts none.
+    /// A page of a group that has no pool or of another shape than its group's, or a page of
+    /// the conversion source on a cache that converts none; the driver's refusal.
     pub(crate) fn copy(
         &self,
         layout: &CacheLayout,
         planes: &Planes,
-        loads: &[PageCopy],
-        offloads: &[PageCopy],
-        stream: &Stream,
+        loads: &[HostPage],
+        converted: &[HostPage],
+        stores: &[HostPage],
     ) -> Result<Option<Event>> {
-        if !loads.is_empty() {
-            let (converted, pooled): (Vec<&PageCopy>, Vec<&PageCopy>) =
-                loads.iter().partition(|copy| copy.staged);
-            if !converted.is_empty() && self.conversion.is_none() {
-                return Err(Error::Invalid(
-                    "a batch loads a page of a conversion source and the cache converts none"
-                        .into(),
-                ));
-            }
-
-            self.reset.record(stream)?;
-            self.stream.wait_event(&self.reset)?;
-
-            self.load(layout, planes, &pooled, &self.stream)?;
-            if let Some(conversion) = &self.conversion {
-                conversion.load(planes, &converted, &self.stream)?;
-            }
-
-            self.loaded.record(&self.stream)?;
-            stream.wait_event(&self.loaded)?;
-        }
-
-        if offloads.is_empty() {
+        if loads.is_empty() && converted.is_empty() && stores.is_empty() {
             return Ok(None);
         }
-        self.offload(layout, planes, offloads, &self.stream)?;
+        if !converted.is_empty() && self.conversion.is_none() {
+            return Err(Error::Invalid(
+                "a copy reads a page of a conversion source and the cache converts none".into(),
+            ));
+        }
+        for copy in loads.iter().chain(stores) {
+            self.runs(layout, planes, copy)?;
+        }
 
-        let offloaded = Event::new(EventFlags::default());
-        offloaded.record(&self.stream)?;
-        Ok(Some(offloaded))
-    }
+        let issued = || -> Result<Event> {
+            self.load(layout, planes, loads, &self.stream)?;
+            if let Some(conversion) = &self.conversion {
+                conversion.load(planes, converted, &self.stream)?;
+            }
+            self.store(layout, planes, stores, &self.stream)?;
 
-    /// Copies `offloads` to their host pages and waits for the copies, with no batch to order
-    /// them behind: what the scheduler published has been computed, and it holds the units
-    /// meanwhile.
-    pub(crate) fn offload_now(
-        &self,
-        layout: &CacheLayout,
-        planes: &Planes,
-        offloads: &[PageCopy],
-    ) -> Result<()> {
-        self.offload(layout, planes, offloads, &self.stream)?;
-        self.stream.synchronize()?;
-        Ok(())
+            let copied = Event::new(EventFlags::default());
+            copied.record(&self.stream)?;
+            Ok(copied)
+        };
+
+        match issued() {
+            Ok(copied) => Ok(Some(copied)),
+            Err(error) => {
+                // The copies issued before the failure end before it is reported; a stream
+                // that cannot be waited for has failed with the device.
+                if let Err(waited) = self.stream.synchronize() {
+                    tracing::error!(%waited, "the copy stream failed after a copy failed");
+                }
+                Err(error)
+            }
+        }
     }
 
     /// One page's copies between its host page and its units, as `(device, host, bytes)`: every
@@ -352,37 +345,32 @@ impl HostTier {
         &self,
         layout: &CacheLayout,
         planes: &Planes,
-        copy: &PageCopy,
+        copy: &HostPage,
     ) -> Result<Vec<(u64, u64, usize)>> {
+        let (group, page, units) = copy;
         let (pool, page_planes) = self
             .pools
-            .get(&copy.group_id)
-            .filter(|(pool, _)| pool.pool() == copy.pool)
-            .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "page pool {} is not the pool of cache group {}",
-                    copy.pool, copy.group_id
-                ))
-            })?;
+            .get(group)
+            .ok_or_else(|| Error::Invalid(format!("cache group {group} has no host page pool")))?;
         let page_planes = *page_planes;
 
         let columns = layout.columns;
-        if copy.units.len() as u32 * columns != page_planes {
+        if units.len() as u32 * columns != page_planes {
             return Err(Error::Invalid(format!(
                 "a page of {page_planes} planes spans {} units of {columns} columns, not {}",
                 page_planes.div_ceil(columns),
-                copy.units.len()
+                units.len()
             )));
         }
 
         let plane = layout.plane_bytes;
-        let host = pool.address(copy.host_page)?;
+        let host = pool.address(*page)?;
         let count = u64::from(page_planes);
-        let unit = |index: u32| copy.units[(index / columns) as usize].0;
+        let unit = |index: u32| units.start + index / columns;
 
         let state = layout
             .groups
-            .get(copy.group_id as usize)
+            .get(*group as usize)
             .is_some_and(GroupLayout::state);
         if state {
             // A state page is its checkpoints' planes, field run by field run.
@@ -431,18 +419,17 @@ impl HostTier {
         Ok(runs)
     }
 
-    /// Loads the units of `loads` from their host pages in `stream` order. The units are new
-    /// units of the batch, which the copies overwrite whole (every column of both fields, an
-    /// FP8 cache's scales and the index keys of a cache that keeps them); an FP8 cache then
-    /// raises their initialization flags.
+    /// Loads the units of `loads` from their host pages in `stream` order. The copies overwrite
+    /// every column of both fields, an FP8 cache's scales and the index keys of a cache that
+    /// keeps them; an FP8 cache then raises the units' initialization flags.
     pub(crate) fn load(
         &self,
         layout: &CacheLayout,
         planes: &Planes,
-        loads: &[&PageCopy],
+        loads: &[HostPage],
         stream: &Stream,
     ) -> Result<()> {
-        let Some(first) = loads.first() else {
+        let Some((_, first_page, first_units)) = loads.first() else {
             return Ok(());
         };
 
@@ -454,55 +441,52 @@ impl HostTier {
         }
         tracing::debug!(
             pages = loads.len(),
-            first_page = first.host_page,
-            first_unit = first.units.first().map(|unit| unit.0),
+            first_page,
+            first_unit = first_units.start,
             "loading pages from the host KV tier"
         );
 
-        // SAFETY: the scheduler pins the host pages until the batch's output arrives, and the
-        // units are the batch's new units, which nothing else reads or writes before the
-        // batch's forward, which waits for these copies.
+        // SAFETY: the buffer pool holds the host pages and gives the units to this copy alone
+        // until it is reported done, which is after the batch that runs it has ended.
         unsafe { batch.submit(stream) }?;
 
         if layout.quantized {
             let units: Vec<u32> = loads
                 .iter()
-                .flat_map(|copy| copy.units.iter().map(|unit| unit.0))
+                .flat_map(|(_, _, units)| units.clone())
                 .collect();
             planes.mark_initialized(&units, stream)?;
         }
         Ok(())
     }
 
-    /// Offloads the units of the published pages of `offloads` into their host pages in
-    /// `stream` order.
-    pub(crate) fn offload(
+    /// Stores the units of `stores` into their host pages in `stream` order.
+    pub(crate) fn store(
         &self,
         layout: &CacheLayout,
         planes: &Planes,
-        offloads: &[PageCopy],
+        stores: &[HostPage],
         stream: &Stream,
     ) -> Result<()> {
-        let Some(first) = offloads.first() else {
+        let Some((_, first_page, first_units)) = stores.first() else {
             return Ok(());
         };
 
         let mut batch = CopyBatch::new(SourceOrder::Stream);
-        for copy in offloads {
+        for copy in stores {
             for (device, host, bytes) in self.runs(layout, planes, copy)? {
                 batch.push(host, device, bytes);
             }
         }
         tracing::debug!(
-            pages = offloads.len(),
-            first_page = first.host_page,
-            first_unit = first.units.first().map(|unit| unit.0),
-            "offloading pages to the host KV tier"
+            pages = stores.len(),
+            first_page,
+            first_unit = first_units.start,
+            "storing pages to the host KV tier"
         );
 
-        // SAFETY: the host pages are reserved for this rank until the scheduler commits them
-        // after the batch's output, and it holds the published units, which no batch writes,
-        // until then.
+        // SAFETY: the buffer pool gives the host pages to this copy alone until it is reported
+        // done, and the units hold a shared block, which no batch writes.
         unsafe { batch.submit(stream) }?;
         Ok(())
     }

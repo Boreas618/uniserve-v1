@@ -1,7 +1,7 @@
 //! Execution: how an engine runs a batch on a device.
 //!
-//! A scheduler assembles an [`ipc::execution::Batch`]; this crate executes it on a device and
-//! returns its [`ipc::execution::BatchOutput`]. It sits above the numerical library
+//! A scheduler assembles an [`ipc::batch::Batch`]; this crate executes it on a device and
+//! returns its [`ipc::batch::BatchOutput`]. It sits above the numerical library
 //! (`worker → nn → backend → ops → platform`) and dispatches by capability: a runner holds a
 //! model through a trait of `nn::capability` and never names a concrete model.
 //!
@@ -21,7 +21,7 @@
 //!
 //! | Module | Holds |
 //! | --- | --- |
-//! | [`executor`] | [`Executor`]: the one thread per device that performs the device's jobs in submission order; its queue, the route of a batch to a node's executors and peers, the watchdog, and the control thread's and the peers' channels |
+//! | [`executor`] | [`Executor`]: the one thread per device that performs the device's jobs in submission order, with the rank's device block tables; its queue, the route of a worker group's jobs to a node's executors and peers with the group's sequences and `completed` word, the watchdog, and the control thread's and the peers' channels |
 //! | [`runner`] | The [`Runner`] interface a stage's runner implements |
 //! | [`graphs`] | [`Graphs`]: the profile run, capture, replay through the input buffer, the switch of generations and the shadow of a changed operator, for every runner |
 //! | [`buckets`] | [`Bucket`](buckets::Bucket), the key that fixes a graph's shapes, and the bucket sets a runner captures |
@@ -33,7 +33,7 @@
 //! | [`parallel`] | [`HostGroup`](parallel::host::HostGroup), the host collectives of a rank group over a TCP full mesh |
 //! | [`stream`] | [`EventPool`](stream::EventPool), the event leases storage owners defer their releases behind |
 //! | [`config`] | The devices a rank computes on, as an engine's launch names them |
-//! | [`completion`] | How an operation ended and the completion its waiters share, over the crate's error |
+//! | [`completion`] | How an operation ended, the completion its waiters share, and the submission of a job to an executor or to every rank of a group |
 //! | [`error`] | The crate's one error and its classification for the engine |
 //!
 //! ## Rules every module keeps

@@ -24,18 +24,17 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use ipc::PhaseId;
-use ipc::execution::{
-    BatchId, BatchOutput, Fault, Outcome, Submission, SubmissionId, SubmissionState,
-};
+use ipc::batch::{BatchId, BatchOutput, Phase};
+use storage::runtime::Request;
 
 use super::Job;
+use crate::completion::{Fault, Outcome, Submission, SubmissionId, SubmissionState};
 use crate::{Error, Result, lock};
 
 /// The jobs of one executor, in submission order.
 pub struct Queue {
     /// The phases the executor's runners serve: what a submitted batch is checked against.
-    phases: Vec<PhaseId>,
+    phases: Vec<Phase>,
     state: Mutex<State>,
     /// Signalled when a job is queued or the queue closes: what an idle executor blocks on.
     ready: Condvar,
@@ -70,7 +69,7 @@ struct InFlight {
 
 impl Queue {
     /// An open queue for an executor whose runners serve `phases`.
-    pub(super) fn new(phases: Vec<PhaseId>) -> Arc<Self> {
+    pub(super) fn new(phases: Vec<Phase>) -> Arc<Self> {
         Arc::new(Self {
             phases,
             state: Mutex::new(State {
@@ -84,27 +83,25 @@ impl Queue {
     }
 
     /// The phases the executor's runners serve, in the runners' order.
-    pub fn phases(&self) -> &[PhaseId] {
+    pub fn phases(&self) -> &[Phase] {
         &self.phases
     }
 
     /// Queues `job` behind every job submitted before it and returns the submission that
-    /// completes when the executor has issued the job's work: with the step's output for a batch,
-    /// and with an empty output for any other job.
+    /// completes when the executor has performed the job: with what the job returns
+    /// ([`Submission`]).
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for a batch whose phase no runner of the executor serves, and
     /// [`Error::State`] once the queue is closed.
-    pub fn submit(&self, job: Job) -> Result<Submission> {
+    pub(super) fn submit(&self, job: Job) -> Result<Submission> {
         if let Some(batch) = job.batch()
             && !self.phases.contains(&batch.phase)
         {
             return Err(Error::Invalid(format!(
-                "no runner of this executor serves phase {} of batch {}; its runners serve {:?}",
-                batch.phase.0,
-                batch.id.0,
-                self.phases.iter().map(|phase| phase.0).collect::<Vec<_>>()
+                "no runner of this executor serves phase {:?} of batch {}; its runners serve {:?}",
+                batch.phase, batch.id.0, self.phases
             )));
         }
 
@@ -179,14 +176,18 @@ impl Queue {
     /// Posts the completion of the job in flight, whose submission is `submission`. A failure is
     /// posted with the work that was in flight when it was taken, in the error and as the
     /// submission's failure label.
-    pub(super) fn complete(&self, submission: Arc<SubmissionState>, result: Result<BatchOutput>) {
+    pub(super) fn complete(
+        &self,
+        submission: Arc<SubmissionState>,
+        result: Result<(BatchOutput, Vec<Request>)>,
+    ) {
         let activity = lock(&self.state)
             .in_flight
             .take()
             .map(|in_flight| in_flight.activity);
 
         let status = match result {
-            Ok(output) => Outcome::Success(output),
+            Ok(returned) => Outcome::Success(returned),
             Err(error) => {
                 let error = match activity {
                     Some(activity) => {

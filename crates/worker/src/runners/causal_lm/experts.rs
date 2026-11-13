@@ -48,13 +48,13 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ipc::PhaseId;
-use ipc::execution::{Batch, BatchColumns, BatchId, Shape as BatchShape, Variant};
+use ipc::batch::{Batch, BatchId, Columns, Phase, Shape as BatchShape, Variant};
 use nn::ExpertExchange;
 use ops::Generation;
 use ops::moe::ExchangeTransport;
 use ops::moe::exchange::{Descriptor, Mode, Transport, TransportShape};
 use platform::Stream;
+use storage::runtime::GroupId;
 use uniserve_tensor::Tensor;
 
 use crate::buckets::{Bucket, Buckets};
@@ -330,14 +330,21 @@ impl Member {
     /// Enters the union's next step with `tokens` tokens of this member's own, and returns the
     /// step's capacity once every member has entered: the most tokens any member sends.
     ///
-    /// The member first asks the others to join, with a batch of `phase` and `generation`
-    /// numbered by the step. The call blocks the executor thread until the step is agreed.
+    /// The member first asks the others to join, with a batch of `group`, `phase` and
+    /// `generation`, the step's own, numbered by the step. The call blocks the executor thread
+    /// until the step is agreed.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for no token or more than the transport holds; what the hook or the
     /// host group fails with; [`Error::Invariant`] for a step no member sends a token in.
-    pub(crate) fn enter(&mut self, tokens: u32, phase: PhaseId, generation: u64) -> Result<u32> {
+    pub(crate) fn enter(
+        &mut self,
+        tokens: u32,
+        group: GroupId,
+        phase: Phase,
+        generation: u64,
+    ) -> Result<u32> {
         if tokens == 0 || tokens > self.shape.max_tokens {
             return Err(Error::Invalid(format!(
                 "a step of {tokens} tokens in a union whose members send at most {}",
@@ -347,22 +354,14 @@ impl Member {
 
         (self.join)(Batch {
             id: BatchId(self.round),
+            group,
             phase,
-            group: String::new(),
-            calls: Vec::new(),
-            shape: BatchShape::decode(1, Variant::ExpertJoin),
-            columns: BatchColumns::default(),
             generation,
-            cache_units: Vec::new(),
-            block_tables: Vec::new(),
-            page_loads: Vec::new(),
-            page_offloads: Vec::new(),
-            latent_restores: Vec::new(),
-            host_outputs: Vec::new(),
-            images: Vec::new(),
-            buffers: Vec::new(),
-            frees: Vec::new(),
-            media: None,
+            shape: BatchShape::decode(1, Variant::ExpertJoin),
+            requests: Vec::new(),
+            columns: Columns::default(),
+            media: Vec::new(),
+            new_slots: Vec::new(),
         })?;
         self.agree(tokens)
     }

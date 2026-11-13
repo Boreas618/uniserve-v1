@@ -405,14 +405,75 @@ fn batch_output() -> execution::BatchOutput {
     }
 }
 
+/// A decode batch of two requests on worker group 2, as the scheduler hands it to its executor.
+fn group_batch() -> batch::Batch {
+    batch::Batch {
+        id: batch::BatchId(7),
+        group: storage::runtime::GroupId(2),
+        phase: batch::Phase::Decode,
+        generation: 3,
+        shape: batch::Shape::decode(2, batch::Variant::DecodeSampled),
+        requests: vec![RequestId(1), RequestId(2)],
+        columns: batch::Columns {
+            input_ids: vec![17, 23],
+            slots: vec![1, 2],
+            ..batch::Columns::default()
+        },
+        media: Vec::new(),
+        new_slots: Vec::new(),
+    }
+}
+
+/// A release and the give-up of a copy, each stamped by worker group 2.
+fn stamped() -> Vec<storage::runtime::Request> {
+    use storage::runtime::{GroupId, OwnerId, Request};
+
+    vec![
+        Request::Release {
+            owner: OwnerId(5),
+            class: 1,
+            at: 4,
+            count: 2,
+            after: vec![(GroupId(2), 9)],
+        },
+        Request::Finish {
+            copy: storage::runtime::RequestId(31),
+            ok: false,
+            after: vec![(GroupId(2), 9)],
+        },
+    ]
+}
+
 /// One fixture per `RequestKind`, plus call-id coverage on the submit frame.
 fn request_fixtures() -> Vec<MainProcessRequest> {
-    let mut submit = MainProcessRequest::submit(token_batch());
+    use storage::runtime::{Completion, GroupId, OwnerId, Request};
+
+    let mut submit = MainProcessRequest::submit(12, false, group_batch());
     submit.set_message_id(Some(91));
+    let allocate = Request::Allocate {
+        owner: OwnerId(5),
+        class: 1,
+        at: 4,
+        count: 1,
+        units: 0,
+    };
+    let allocated = Completion::Allocated {
+        runs: vec![(0, 70, 1)],
+        evicted: Vec::new(),
+    };
     vec![
         MainProcessRequest::info(),
         submit,
-        MainProcessRequest::shadow(token_batch()),
+        MainProcessRequest::submit(13, true, group_batch()),
+        MainProcessRequest::shadow(14, group_batch()),
+        MainProcessRequest::map(
+            GroupId(2),
+            3,
+            storage::runtime::RequestId(30),
+            &allocate,
+            &allocated,
+        ),
+        MainProcessRequest::stamp(GroupId(2), &stamped()),
         MainProcessRequest::close(),
     ]
 }
@@ -429,8 +490,19 @@ fn response_fixtures() -> Vec<MainProcessResponse> {
         },
         MainProcessResponse::Result {
             message_id: Some(17),
-            result: batch_output(),
+            result: batch::BatchOutput {
+                timing: TimingCounters {
+                    queued_us: 3,
+                    device_us: 40,
+                    copy_us: 0,
+                    host_us: 2,
+                },
+                ..batch::BatchOutput::default()
+            },
+            requests: Vec::new(),
+            ended: 12,
         },
+        MainProcessResponse::result(batch::BatchOutput::default(), &stamped(), 14),
         MainProcessResponse::Ok {
             message_id: Some(17),
         },
@@ -527,6 +599,8 @@ fn every_request_kind_round_trips_through_ipc() {
         RequestKind::Info,
         RequestKind::Submit,
         RequestKind::Shadow,
+        RequestKind::Map,
+        RequestKind::Stamp,
         RequestKind::Close,
     ] {
         assert!(
@@ -567,6 +641,34 @@ fn every_response_kind_round_trips_through_ipc() {
             response.kind()
         );
     }
+}
+
+#[test]
+fn the_buffer_pool_s_requests_read_back_from_the_frames_that_carry_them() {
+    let MainProcessRequest::Stamp { requests, .. } = round_trip(&MainProcessRequest::stamp(
+        storage::runtime::GroupId(2),
+        &stamped(),
+    )) else {
+        panic!("a stamp frame reads back as a stamp frame");
+    };
+    assert_eq!(decode_requests(&requests).unwrap(), stamped());
+
+    let response = round_trip(&MainProcessResponse::result(
+        batch::BatchOutput::default(),
+        &stamped(),
+        14,
+    ));
+    let MainProcessResponse::Result {
+        requests, ended, ..
+    } = response
+    else {
+        panic!("a result frame reads back as a result frame");
+    };
+    assert_eq!(decode_requests(&requests).unwrap(), stamped());
+    assert_eq!(ended, 14);
+
+    // A record that is not a request of the buffer pool's interface is an error to its reader.
+    assert!(decode_requests(&[vec![0; 4]]).is_err());
 }
 
 #[test]

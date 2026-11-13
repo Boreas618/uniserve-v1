@@ -1,7 +1,8 @@
 //! `CausalLmRunner` without a device: the bucket set, the profile run and the meta capture of
-//! every bucket, the bytes of the input tensors, the refusals, the page-work seam, the paired
-//! forward's inputs, the completion and the step agreement of an expert union, over a small
-//! causal language model of `nn` operators on meta weights.
+//! every bucket, the bytes of the input tensors, the cache slots a batch writes through the
+//! rank's device block table, the refusals, the page-work seam, the paired forward's inputs,
+//! the completion and the step agreement of an expert union, over a small causal language
+//! model of `nn` operators on meta weights.
 //!
 //! The model exercises the cache through the modules a served model uses: its one layer
 //! writes its keys and values (`kv_write_`) and attends over them (`paged_attention`) through
@@ -11,12 +12,12 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ipc::execution::{
-    Batch, BatchColumns, BatchId, BatchRow, BatchRows, CallId, CallOutput, FreshSlot,
-    LogitAdjustments, RowKind, RowState, Shape as BatchShape, StateCopy, StateDirection, Variant,
+use ipc::batch::{
+    Batch, BatchId, BatchOutput, CallOutput, CallStatus, Columns, ErrorCode, NewSlot, Phase, Row,
+    Rows, Shape as BatchShape, StateCopy, StateDirection, Variant,
 };
 use ipc::philox::{DrawAddress, sampling_uniform};
-use ipc::{CallStatus, ErrorCode, TokenLogprob};
+use ipc::{RequestId, TokenLogprob};
 use nn::capability::Drafter;
 use nn::family::{CacheShape, ExpertShape, StateField, StateShape, TextModel};
 use nn::functional::{
@@ -28,18 +29,21 @@ use ops::Generation;
 use ops::moe::exchange::{Mode, TransportShape};
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE, TOP_K, TOP_P};
+use storage::Key;
+use storage::runtime::{Completion, GroupId, OwnerId, Request, Run};
 use uniserve_tensor::{DType, Device, Tensor, WithDType};
 
 use super::columns::{self, Column, Layout};
 use super::experts::{self, JoinHook, Member};
-use super::output::calls_output;
+use super::output::{calls_output, refuse};
 use super::wiring;
 use super::{CausalLmConfig, CausalLmRunner, PageWork};
 use crate::Error;
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
-use crate::memory::cache::{CacheLayout, KvCacheConfig, KvCacheMemory};
+use crate::memory::cache::{CacheLayout, CacheRegions, KvCacheConfig, KvCacheMemory};
 use crate::memory::state::{StateConfig, StateMemory};
+use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::parallel::host::HostGroup;
 use crate::runner::Runner;
 
@@ -332,7 +336,7 @@ fn group(pages: usize, table: Tensor) -> KvCache {
 /// over eight and eighty tokens in the four prefill variants.
 fn config() -> CausalLmConfig {
     CausalLmConfig {
-        phases: vec![ipc::PhaseId(0)],
+        phases: vec![Phase::Prefill, Phase::Decode],
         buckets: Buckets::causal_lm(&[2, 4], &[8, 80], true),
         slots: SLOTS,
         page_size: PAGE,
@@ -399,28 +403,27 @@ fn commit(rows: &[(i64, i64, i64)]) -> Vec<i64> {
     table
 }
 
-/// The batch of `columns` in `shape`, one call id per call from 100 on.
-fn batch(shape: BatchShape, columns: BatchColumns) -> Batch {
+/// The batch of `columns` in `shape`, of the phase of its first call, advancing one request per
+/// call from request 100 on.
+fn batch(shape: BatchShape, columns: Columns) -> Batch {
+    let phase = columns
+        .rows
+        .calls
+        .first()
+        .map_or(Phase::Prefill, |call| call.kind);
+
     Batch {
         id: BatchId(7),
-        phase: ipc::PhaseId(0),
-        group: "text".to_owned(),
-        calls: (0..columns.calls() as u64)
-            .map(|call| CallId(100 + call))
-            .collect(),
-        shape,
-        columns,
+        group: GroupId(0),
+        phase,
         generation: 1,
-        cache_units: Vec::new(),
-        block_tables: Vec::new(),
-        page_loads: Vec::new(),
-        page_offloads: Vec::new(),
-        latent_restores: Vec::new(),
-        host_outputs: Vec::new(),
-        images: Vec::new(),
-        buffers: Vec::new(),
-        frees: Vec::new(),
-        media: None,
+        shape,
+        requests: (0..columns.calls() as u64)
+            .map(|call| RequestId(100 + call))
+            .collect(),
+        columns,
+        media: Vec::new(),
+        new_slots: Vec::new(),
     }
 }
 
@@ -435,20 +438,18 @@ fn decode(slots: &[i32], temperatures: &[f32]) -> Batch {
         Variant::DecodeSampled
     };
 
-    let columns = BatchColumns {
-        rows: BatchRows {
+    let columns = Columns {
+        rows: Rows {
             calls: (0..rows as u32)
-                .map(|row| BatchRow {
-                    request: slots[row as usize] as u32,
-                    kind: RowKind::Decode,
+                .map(|row| Row {
+                    slot: slots[row as usize] as u32,
+                    kind: Phase::Decode,
                     cache_group: 0,
                     rows: row..row + 1,
                 })
                 .collect(),
             positions: (0..rows as i32).map(|row| 10 + row).collect(),
-            slot_mapping: (0..rows as i32)
-                .map(|row| row * PAGE as i32 + 10 + row)
-                .collect(),
+            cache_positions: (0..rows as i32).map(|row| 10 + row).collect(),
             seq_lens: (0..rows as i32).map(|row| 11 + row).collect(),
             query_offsets: (0..=rows as i32).collect(),
             logits_rows: (0..rows as i32).collect(),
@@ -474,7 +475,7 @@ fn decode(slots: &[i32], temperatures: &[f32]) -> Batch {
         ),
         page_size: PAGE,
         max_kv_len: MAX_KV_LEN,
-        ..BatchColumns::default()
+        ..Columns::default()
     };
 
     batch(BatchShape::decode(rows as u32, variant), columns)
@@ -483,9 +484,9 @@ fn decode(slots: &[i32], temperatures: &[f32]) -> Batch {
 /// A prefill batch of two calls: slot 2's three tokens, which end its prompt, and slot 4's
 /// two, which end none.
 fn prefill(variant: Variant) -> Batch {
-    let call = |request: u32, rows: std::ops::Range<u32>| BatchRow {
-        request,
-        kind: RowKind::Prefill,
+    let call = |slot: u32, rows: std::ops::Range<u32>| Row {
+        slot,
+        kind: Phase::Prefill,
         cache_group: 0,
         rows,
     };
@@ -495,11 +496,11 @@ fn prefill(variant: Variant) -> Batch {
     table[column::LOGICAL * 2] = 3;
     table[column::SAMPLING * 2] = 1;
 
-    let columns = BatchColumns {
-        rows: BatchRows {
+    let columns = Columns {
+        rows: Rows {
             calls: vec![call(2, 0..1), call(4, 1..2)],
             positions: vec![0, 1, 2, 0, 1],
-            slot_mapping: vec![0, 1, 2, 16, 17],
+            cache_positions: vec![0, 1, 2, 0, 1],
             seq_lens: vec![3, 2],
             query_offsets: vec![0, 3, 5],
             logits_rows: vec![0, -1],
@@ -511,7 +512,7 @@ fn prefill(variant: Variant) -> Batch {
         commit: table,
         page_size: PAGE,
         max_kv_len: MAX_KV_LEN,
-        ..BatchColumns::default()
+        ..Columns::default()
     };
 
     batch(BatchShape::prefill(2, 5, variant), columns)
@@ -524,20 +525,31 @@ fn completion(
     vocabulary: u32,
     candidates: u32,
     outputs: &[Tensor],
-) -> crate::Result<Vec<ipc::execution::CallOutput>> {
-    calls_output(
-        &batch.calls,
-        &batch.columns,
-        bucket,
-        vocabulary,
-        candidates,
-        outputs,
-    )
+) -> crate::Result<Vec<CallOutput>> {
+    calls_output(&batch.columns, bucket, vocabulary, candidates, outputs)
+}
+
+/// A performed call's output of `tokens`, with no score, and the slot's positions after it.
+fn performed(tokens: Vec<u32>, step_index: u32, computed: u32, visible: u32) -> CallOutput {
+    CallOutput {
+        status: CallStatus::Ok,
+        error_code: None,
+        error_message: None,
+        tokens,
+        step_index,
+        cache_computed_len: computed,
+        cache_visible_len: visible,
+        token_logprobs: Vec::new(),
+        prompt_logprobs: Vec::new(),
+        media_output: None,
+        draft_token_ids: Vec::new(),
+    }
 }
 
 /// The input block `columns::fill` writes for `batch` in `bucket`, over bytes that held
-/// something else, with the layout its columns are read by.
-fn filled(batch: &Batch, bucket: &Bucket, scratch: Option<&[u32]>) -> (Layout, Vec<u8>) {
+/// something else, with the layout its columns are read by: `mapping` is the cache slot each
+/// token writes, and `paired` states a paired forward.
+fn filled(batch: &Batch, bucket: &Bucket, mapping: &[u32], paired: bool) -> (Layout, Vec<u8>) {
     let layout = Layout::of(config().buckets.iter(), 0, 0).unwrap();
     let mut block = vec![0xA5_u8; layout.bytes() as usize];
 
@@ -547,11 +559,102 @@ fn filled(batch: &Batch, bucket: &Bucket, scratch: Option<&[u32]>) -> (Layout, V
         VOCABULARY as u32,
         &batch.columns,
         bucket,
-        scratch,
+        mapping,
+        paired,
         &mut block,
     )
     .unwrap();
     (layout, block)
+}
+
+// ---- The rank's device block table ---------------------------------------------------------------
+
+/// The region the test tables' runs lie in: the cache's units.
+const UNITS: u8 = 0;
+
+/// The unit the test tables give the attention block at `position` of request slot `slot`:
+/// each slot's blocks apart from every other's, none of them the padding unit.
+fn unit(slot: u32, position: u32) -> u32 {
+    slot * TABLE_WIDTH as u32 + position + 1
+}
+
+/// Hands `tables` the `Attach` of the owner of slot `slot`, numbered by its slot, with its
+/// `Attached`.
+fn attach(tables: &mut BlockTables, slot: u32) {
+    let request = Request::Attach {
+        owner: OwnerId(u64::from(slot)),
+        group: GroupId(0),
+    };
+    tables
+        .map(
+            slot,
+            storage::runtime::RequestId(0),
+            &request,
+            &Completion::Attached { slot },
+        )
+        .unwrap();
+}
+
+/// Hands `tables` an `Allocate` of one block per run of `runs` at `at` of `class` for the owner
+/// of slot `slot`, with its `Allocated`.
+fn allocate(tables: &mut BlockTables, slot: u32, class: u8, at: u32, runs: &[Run]) {
+    let request = Request::Allocate {
+        owner: OwnerId(u64::from(slot)),
+        class,
+        at,
+        count: runs.len() as u32,
+        units: 0,
+    };
+    let completion = Completion::Allocated {
+        runs: runs.to_vec(),
+        evicted: vec![],
+    };
+    tables
+        .map(slot, storage::runtime::RequestId(1), &request, &completion)
+        .unwrap();
+}
+
+/// Applies to `tables` the `Commit` of the block at `at` of `class` of the owner of slot
+/// `slot`: the entry becomes read-only.
+fn commit_entry(tables: &mut BlockTables, slot: u32, class: u8, at: u32) {
+    tables
+        .apply(&Request::Commit {
+            owner: OwnerId(u64::from(slot)),
+            class,
+            at,
+            key: Key([7; 32]),
+            tokens: PAGE as u16,
+            after: vec![],
+        })
+        .unwrap();
+}
+
+/// The device block table of a rank on which each of `slots` is attached and holds a
+/// writable attention block at every position of a row, in [`unit`].
+fn held(slots: &[u32]) -> BlockTables {
+    let mut tables = BlockTables::new(GroupId(0), &[UNITS]);
+    for &slot in slots {
+        attach(&mut tables, slot);
+        let runs: Vec<Run> = (0..TABLE_WIDTH as u32)
+            .map(|position| (UNITS, unit(slot, position), 1))
+            .collect();
+        allocate(&mut tables, slot, 0, 0, &runs);
+    }
+    tables
+}
+
+/// The cache slot a token at cache position `position` of slot `slot` writes in [`held`]'s
+/// tables.
+fn written(slot: u32, position: u32) -> u32 {
+    unit(slot, position / PAGE) * PAGE + position % PAGE
+}
+
+/// The cache slot each token of `batch` writes through `tables`, of a batch none of whose calls
+/// is refused.
+fn mapping(batch: &Batch, tables: &BlockTables) -> Vec<u32> {
+    let (mapping, refused) = columns::slot_mapping(&batch.columns.rows, tables, PAGE, 1).unwrap();
+    assert_eq!(refused, []);
+    mapping
 }
 
 /// The operators of `bucket`'s launch table, in launch order.
@@ -691,14 +794,19 @@ fn a_decode_batch_is_padded_with_rows_that_address_nothing() {
     // The scheduler numbers request slots from one: the last row runs on the last slot.
     let batch = decode(&[3, 1, SLOTS as i32], &[0.0, 0.7, 1.0]);
     let bucket = Bucket::decode(4, Variant::DecodeSampled);
-    let (layout, block) = filled(&batch, &bucket, None);
+    let tables = held(&[3, 1, SLOTS]);
+    let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &tables), false);
 
     let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
     let i32s = |column, elements| layout.read::<i32>(&block, column, elements);
 
-    // The batch's tokens write their slots and the padding token writes none.
+    // The batch's tokens write the slots their entries name at their cache positions, and
+    // the padding token writes none.
     assert_eq!(i32s(Column::Positions, 4), [10, 11, 12, 0]);
-    assert_eq!(u32s(Column::SlotMapping, 4), [10, 27, 44, NO_SLOT]);
+    assert_eq!(
+        u32s(Column::SlotMapping, 4),
+        [written(3, 10), written(1, 11), written(SLOTS, 12), NO_SLOT]
+    );
     assert_eq!(u32s(Column::LiveTokens, 1), [3]);
 
     // The padding row is an empty sequence past the batch's tokens.
@@ -747,14 +855,23 @@ fn a_prefill_batch_is_padded_with_tokens_no_row_holds() {
     let mut batch = prefill(Variant::PrefillScored);
     batch.columns.targets = vec![6, 7, -1, 9, -1];
     let bucket = Bucket::prefill(4, 8, Variant::PrefillScored);
-    let (layout, block) = filled(&batch, &bucket, None);
+    let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &held(&[2, 4])), false);
 
     let u32s = |column, elements| layout.read::<u32>(&block, column, elements);
 
     assert_eq!(u32s(Column::InputIds, 8), [5, 6, 7, 8, 9, 0, 0, 0]);
     assert_eq!(
         u32s(Column::SlotMapping, 8),
-        [0, 1, 2, 16, 17, NO_SLOT, NO_SLOT, NO_SLOT]
+        [
+            written(2, 0),
+            written(2, 1),
+            written(2, 2),
+            written(4, 0),
+            written(4, 1),
+            NO_SLOT,
+            NO_SLOT,
+            NO_SLOT
+        ]
     );
     assert_eq!(
         u32s(Column::Targets, 8),
@@ -783,12 +900,14 @@ fn a_prefill_batch_is_padded_with_tokens_no_row_holds() {
 #[test]
 fn a_row_s_adjustments_are_its_bias_flag_and_its_ban_mask() {
     let mut batch = decode(&[1, 2], &[0.0, 0.0]);
-    batch.columns.adjustments = LogitAdjustments {
-        installs: Vec::new(),
-        biased: vec![true, false],
-        banned: vec![Vec::new(), vec![3, 40]],
-    };
-    let (layout, block) = filled(&batch, &Bucket::decode(2, Variant::DecodeGreedy), None);
+    batch.columns.biased = vec![true, false];
+    batch.columns.banned = vec![Vec::new(), vec![3, 40]];
+    let (layout, block) = filled(
+        &batch,
+        &Bucket::decode(2, Variant::DecodeGreedy),
+        &[],
+        false,
+    );
 
     // The second row is the first that bans, so its mask is mask zero.
     assert_eq!(
@@ -852,24 +971,176 @@ fn the_idle_inputs_of_every_bucket_write_and_commit_nothing() {
     assert!(runner.forward(&unstated).is_err());
 }
 
+// ---- The cache slots a batch writes ----------------------------------------------------------
+
+/// A prefill of `cache_positions` on slot 2: one call of one row whose tokens are an image's
+/// rows, which share one rotary position.
+fn chunk(cache_positions: &[i32]) -> Batch {
+    let tokens = cache_positions.len();
+    let mut batch = prefill(Variant::PrefillWrite);
+
+    batch.columns.rows = Rows {
+        calls: vec![Row {
+            slot: 2,
+            kind: Phase::Prefill,
+            cache_group: 0,
+            rows: 0..1,
+        }],
+        positions: vec![3; tokens],
+        cache_positions: cache_positions.to_vec(),
+        seq_lens: vec![cache_positions.iter().max().map_or(0, |last| last + 1)],
+        query_offsets: vec![0, tokens as i32],
+        logits_rows: vec![-1],
+    };
+    batch.columns.input_ids = vec![5; tokens];
+    batch.columns.slots = vec![2];
+    batch.columns.parameters = request(0.0).to_vec();
+    batch.columns.draws = vec![DrawAddress::default()];
+    batch.columns.commit = commit(&[(2, mode::CACHE, -1)]);
+    batch.requests.truncate(1);
+    batch.shape = BatchShape::prefill(1, tokens as u32, Variant::PrefillWrite);
+    batch
+}
+
+/// The cache slots the runner wrote into its input block for the step it prepared last.
+fn prepared_mapping(runner: &CausalLmRunner, tokens: usize) -> Vec<u32> {
+    runner
+        .layout
+        .read::<u32>(&runner.staged, Column::SlotMapping, tokens)
+}
+
+#[test]
+fn a_token_writes_the_cache_slot_its_entry_names_at_its_cache_position() {
+    let mut runner = captured();
+
+    // Slot 2's blocks at positions 0 and 1 are units 9 and 4: a token's slot is the unit of
+    // the block its cache position lies in, whatever its rotary position, and a token at a
+    // negative position writes nothing.
+    let mut tables = held(&[]);
+    attach(&mut tables, 2);
+    allocate(&mut tables, 2, 0, 0, &[(UNITS, 9, 1), (UNITS, 4, 1)]);
+
+    let batch = chunk(&[14, 15, 16, -1, 17]);
+    let bucket = runner.prepare_inputs(&batch, &tables).unwrap();
+    assert_eq!(bucket, Bucket::prefill(4, 8, Variant::PrefillWrite));
+    assert_eq!(
+        prepared_mapping(&runner, 8),
+        [
+            9 * PAGE + 14,
+            9 * PAGE + 15,
+            4 * PAGE,
+            NO_SLOT,
+            4 * PAGE + 1,
+            NO_SLOT,
+            NO_SLOT,
+            NO_SLOT
+        ]
+    );
+}
+
+#[test]
+fn a_token_whose_entry_is_read_only_or_missing_writes_nothing_and_fails_its_call() {
+    let mut runner = captured();
+    let batch = prefill(Variant::PrefillGreedy);
+
+    // Slot 4's first block was committed: it is read-only, and the call that writes into it
+    // is refused while slot 2's call writes its tokens.
+    let mut tables = held(&[2, 4]);
+    commit_entry(&mut tables, 4, 0, 0);
+    let (mapping, refused) = columns::slot_mapping(&batch.columns.rows, &tables, PAGE, 1).unwrap();
+    assert_eq!(
+        mapping,
+        [
+            written(2, 0),
+            written(2, 1),
+            written(2, 2),
+            NO_SLOT,
+            NO_SLOT
+        ]
+    );
+    assert_eq!(refused.len(), 1);
+    let (call, reason) = &refused[0];
+    assert_eq!(*call, 1);
+    assert!(
+        reason.contains("slot 4") && reason.contains("read-only"),
+        "{reason}"
+    );
+
+    // A preparation reports no call, so it refuses the batch, naming the entry.
+    let message = runner
+        .prepare_inputs(&batch, &tables)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("read-only"), "{message}");
+
+    // A slot whose table holds no entry at a position its call writes is refused alike.
+    let missing = held(&[2]);
+    let (mapping, refused) = columns::slot_mapping(&batch.columns.rows, &missing, PAGE, 1).unwrap();
+    assert_eq!(mapping[3..], [NO_SLOT, NO_SLOT]);
+    assert!(refused[0].1.contains("holds no entry"), "{}", refused[0].1);
+    let message = runner
+        .prepare_inputs(&batch, &missing)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("holds no entry"), "{message}");
+
+    // A served step fails the refused call alone, as an invariant violation, which the
+    // control plane's scheduling of a row outside its writable entries is.
+    let outputs = vec![
+        tensor(&[11_u32, 22, 0, 0], 4),
+        tensor(&[-0.5_f32, -2.0, 0.0, 0.0], 4),
+        tensor(&[1_i32, 1, 0, 0], 4),
+        tensor(&[3_i32, 2, 0, 0], 4),
+        tensor(&[1_i32, 0, 0, 0], 4),
+    ];
+    let bucket = Bucket::prefill(4, 8, Variant::PrefillGreedy);
+    let mut calls = completion(&batch, &bucket, 64, 0, &outputs).unwrap();
+    refuse(&mut calls, &refused);
+
+    assert_eq!(calls[0].status, CallStatus::Ok);
+    assert_eq!(calls[0].tokens, [11]);
+    assert_eq!(calls[1].status, CallStatus::Error);
+    assert_eq!(calls[1].error_code, Some(ErrorCode::InvariantViolation));
+    assert_eq!(calls[1].cache_computed_len, 0);
+    let output = BatchOutput {
+        calls,
+        ..BatchOutput::default()
+    };
+    output.check(&batch).unwrap();
+}
+
+#[test]
+fn a_call_writes_only_the_attention_groups_the_runner_is_lent() {
+    let mut runner = captured();
+    let mut batch = prefill(Variant::PrefillGreedy);
+    batch.columns.rows.calls[1].cache_group = 1;
+
+    let message = runner
+        .prepare_inputs(&batch, &held(&[2, 4]))
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("cache group 1"), "{message}");
+}
+
 // ---- The choice of a bucket and the refusals ----------------------------------------------------
 
 #[test]
 fn a_step_runs_the_smallest_captured_bucket_that_holds_it() {
     let mut runner = captured();
+    let tables = held(&[1, 2, 3]);
 
     let small = runner
-        .prepare_inputs(&decode(&[1, 2], &[0.0, 0.0]))
+        .prepare_inputs(&decode(&[1, 2], &[0.0, 0.0]), &tables)
         .unwrap();
     assert_eq!(small, Bucket::decode(2, Variant::DecodeGreedy));
 
     let wide = runner
-        .prepare_inputs(&decode(&[1, 2, 3], &[0.0, 0.5, 0.0]))
+        .prepare_inputs(&decode(&[1, 2, 3], &[0.0, 0.5, 0.0]), &tables)
         .unwrap();
     assert_eq!(wide, Bucket::decode(4, Variant::DecodeSampled));
 
     let prompt = runner
-        .prepare_inputs(&prefill(Variant::PrefillGreedy))
+        .prepare_inputs(&prefill(Variant::PrefillGreedy), &held(&[2, 4]))
         .unwrap();
     assert_eq!(prompt, Bucket::prefill(4, 8, Variant::PrefillGreedy));
 }
@@ -877,36 +1148,36 @@ fn a_step_runs_the_smallest_captured_bucket_that_holds_it() {
 #[test]
 fn the_last_request_slot_serves_and_gathers_its_own_rows() {
     let mut runner = captured();
+    let tables = held(&[SLOTS]);
 
     // Every per-slot buffer holds rows `0..SLOTS` for the slots `1..=SLOTS`: the last slot's
     // batch is prepared, and starts its request on the last row.
     let mut batch = decode(&[SLOTS as i32], &[0.0]);
-    batch.columns.fresh_slots = vec![FreshSlot {
+    batch.new_slots = vec![NewSlot {
         slot: SLOTS,
         history: vec![3, 3],
-    }];
-    batch.columns.adjustments.installs = vec![ipc::execution::SlotBias {
-        slot: SLOTS,
         bias: vec![(3, 1.5)],
         allowed: None,
+        context: [0, 0],
     }];
-    runner.prepare_inputs(&batch).unwrap();
+    runner.prepare_inputs(&batch, &tables).unwrap();
 
     // The slot's writes are made, and the step reaches the replay graphs with no device
     // refuse.
-    let refused = runner.execute(&batch).unwrap_err();
+    let refused = runner.execute(&batch, &tables).unwrap_err();
     assert!(matches!(refused, Error::State(_)), "{refused}");
 
     // Its rows gather row `SLOTS - 1` of the page tables and of the slot state, and its call
     // commits into that row; the padding row is the one after it.
     let bucket = Bucket::decode(2, Variant::DecodeGreedy);
-    let (layout, block) = filled(&batch, &bucket, None);
+    let (layout, block) = filled(&batch, &bucket, &mapping(&batch, &tables), false);
     let u32s = |column| layout.read::<u32>(&block, column, 2);
 
     assert_eq!(u32s(Column::Slots), [SLOTS - 1, NO_SLOT]);
     assert_eq!(u32s(Column::TableRows), [SLOTS - 1, SLOTS]);
     assert_eq!(u32s(Column::SlotRows), [SLOTS - 1, SLOTS]);
     assert_eq!(u32s(Column::CallSlots), [SLOTS - 1, SLOTS]);
+    assert_eq!(u32s(Column::SlotMapping), [written(SLOTS, 10), NO_SLOT]);
 
     let table = layout.read::<i32>(&block, Column::Commit, COMMIT_FIELDS * 4);
     assert_eq!(table[column::SLOT * 4..][..2], [SLOTS as i32 - 1, -1]);
@@ -917,7 +1188,10 @@ fn a_batch_no_bucket_holds_is_refused_by_its_shape_and_the_bound() {
     let mut runner = captured();
 
     let refused = runner
-        .prepare_inputs(&decode(&[0, 1, 2, 3, 4], &[0.0; 5]))
+        .prepare_inputs(
+            &decode(&[5, 1, 2, 3, 4], &[0.0; 5]),
+            &held(&[1, 2, 3, 4, 5]),
+        )
         .unwrap_err();
     let message = refused.to_string();
 
@@ -934,7 +1208,7 @@ fn a_bucket_that_is_not_captured_serves_nothing() {
     let mut runner = runner(false);
 
     let refused = runner
-        .prepare_inputs(&decode(&[1, 2], &[0.0, 0.0]))
+        .prepare_inputs(&decode(&[1, 2], &[0.0, 0.0]), &held(&[1, 2]))
         .unwrap_err();
     assert!(matches!(refused, Error::State(_)), "{refused}");
 }
@@ -947,7 +1221,10 @@ fn a_drawn_row_in_a_greedy_bucket_is_refused_by_the_row() {
     let mut batch = decode(&[1, 2], &[0.0, 0.0]);
     batch.columns.parameters[PARAMETER_COLUMNS as usize + TEMPERATURE as usize] = 0.8;
 
-    let message = runner.prepare_inputs(&batch).unwrap_err().to_string();
+    let message = runner
+        .prepare_inputs(&batch, &held(&[1, 2]))
+        .unwrap_err()
+        .to_string();
     assert!(message.contains("row 1"), "{message}");
     assert!(message.contains("temperature 0.8"), "{message}");
 }
@@ -955,30 +1232,37 @@ fn a_drawn_row_in_a_greedy_bucket_is_refused_by_the_row() {
 #[test]
 fn a_batch_the_runner_s_graphs_were_not_captured_for_is_refused() {
     let mut runner = captured();
+    let tables = held(&[1, 2, SLOTS]);
 
     // Another page size than the cache's.
     let mut paged = decode(&[1, 2], &[0.0, 0.0]);
     paged.columns.page_size = 2 * PAGE;
     assert!(matches!(
-        runner.prepare_inputs(&paged),
+        runner.prepare_inputs(&paged, &tables),
         Err(Error::Invalid(_))
     ));
 
-    // A row on a slot the runner holds no state for.
+    // A row on a slot the runner holds no state for, whose table holds nothing either.
     let slotted = decode(&[1, SLOTS as i32 + 1], &[0.0, 0.0]);
-    let message = runner.prepare_inputs(&slotted).unwrap_err().to_string();
-    assert!(message.contains("request slot 7"), "{message}");
+    let message = runner
+        .prepare_inputs(&slotted, &tables)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("slot 7"), "{message}");
 
     // Slot zero is no request slot: the scheduler numbers them from one.
     let zeroth = decode(&[0, 1], &[0.0, 0.0]);
-    let message = runner.prepare_inputs(&zeroth).unwrap_err().to_string();
-    assert!(message.contains("request slot 0"), "{message}");
+    let message = runner
+        .prepare_inputs(&zeroth, &tables)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("slot 0"), "{message}");
 
     // A verification, which a runner whose config states no drafts serves none of.
     let mut verified = decode(&[1, 2], &[0.0, 0.0]);
-    verified.columns.rows.calls[0].kind = RowKind::Verify;
+    verified.columns.rows.calls[0].kind = Phase::Verify;
     assert!(matches!(
-        runner.prepare_inputs(&verified),
+        runner.prepare_inputs(&verified, &tables),
         Err(Error::Unsupported(_))
     ));
 
@@ -986,7 +1270,7 @@ fn a_batch_the_runner_s_graphs_were_not_captured_for_is_refused() {
     let mut short = decode(&[1, 2], &[0.0, 0.0]);
     short.columns.slots.pop();
     assert!(matches!(
-        runner.prepare_inputs(&short),
+        runner.prepare_inputs(&short, &tables),
         Err(Error::Invalid(_))
     ));
 }
@@ -1055,89 +1339,115 @@ fn a_model_that_keeps_a_recurrent_state_is_lent_it_by_every_forward() {
 
 // ---- Page work ----------------------------------------------------------------------------------
 
-/// `batch` with one recurrent-state restore: page work of the cache's.
+/// `batch` with one recurrent-state restore of slot 1's checkpoint at position 0: page work
+/// of the cache's.
 fn with_page_work(mut batch: Batch) -> Batch {
     batch.columns.state_copies = vec![StateCopy {
         slot: 1,
-        units: vec![ipc::UnitId(0)],
+        position: 0,
         direction: StateDirection::Restore,
     }];
     batch
 }
 
+/// Which part of a batch's page work `work` is, as a test records it.
+fn part(work: &PageWork<'_>) -> &'static str {
+    match work {
+        PageWork::Tables(_) => "tables",
+        PageWork::Copies(_) => "copies",
+        PageWork::BeforeReplay(..) => "before replay",
+        PageWork::AfterReplay => "after replay",
+        PageWork::Ended => "ended",
+        PageWork::BeforeShadow(_) => "before shadow",
+    }
+}
+
 #[test]
-fn a_batch_s_page_work_is_issued_through_the_hook_before_the_replay() {
+fn a_batch_s_page_work_is_issued_through_the_hook_around_the_replay() {
     let mut runner = captured();
     let calls = Arc::new(Mutex::new(Vec::new()));
+    let tables = held(&[1, 2]);
 
     let seen = Arc::clone(&calls);
-    runner.set_page_work(Box::new(move |batch, work| {
-        seen.lock().unwrap().push((batch.id, work));
+    runner.set_page_work(Box::new(move |work| {
+        seen.lock().unwrap().push(part(&work));
         Ok(())
     }));
 
-    // A batch that carries no page work calls nothing.
-    let plain = decode(&[1, 2], &[0.0, 0.0]);
-    assert!(runner.execute(&plain).is_err());
-    assert!(calls.lock().unwrap().is_empty());
-
-    // A refused batch issues nothing.
-    let mut refused = with_page_work(decode(&[1, 2], &[0.0, 0.0]));
+    // A refused batch issues nothing; the copies taken for it end all the same.
+    let mut refused = decode(&[1, 2], &[0.0, 0.0]);
     refused.columns.page_size = 2 * PAGE;
-    assert!(runner.execute(&refused).is_err());
-    assert!(calls.lock().unwrap().is_empty());
+    assert!(runner.execute(&refused, &tables).is_err());
+    assert_eq!(*calls.lock().unwrap(), ["ended"]);
+    calls.lock().unwrap().clear();
 
     // The work that precedes the forward is issued once the inputs are prepared and before
     // the replay, which graphs that hold no device refuse; nothing follows a replay that was
-    // not issued.
+    // not issued, but the end.
     let batch = with_page_work(decode(&[1, 2], &[0.0, 0.0]));
-    let refused = runner.execute(&batch).unwrap_err();
+    let refused = runner.execute(&batch, &tables).unwrap_err();
     assert!(matches!(refused, Error::State(_)), "{refused}");
-    assert_eq!(
-        *calls.lock().unwrap(),
-        [(BatchId(7), PageWork::BeforeReplay)]
-    );
+    assert_eq!(*calls.lock().unwrap(), ["before replay", "ended"]);
+    calls.lock().unwrap().clear();
+
+    // The table's changes and the copies reach the hook as the executor hands them.
+    runner.write_tables(&[]).unwrap();
+    runner.copy(&[]).unwrap();
+    assert_eq!(*calls.lock().unwrap(), ["tables", "copies"]);
 }
 
 #[test]
 fn a_hook_s_refusal_fails_the_batch_before_its_replay() {
     let mut runner = captured();
-    runner.set_page_work(Box::new(|_, _| {
-        Err(Error::Resource("the cache holds no page for the batch"))
+    runner.set_page_work(Box::new(|work| match work {
+        PageWork::BeforeReplay(..) => Err(Error::Resource("the cache holds no page for the batch")),
+        _ => Ok(()),
     }));
 
     let batch = with_page_work(decode(&[1, 2], &[0.0, 0.0]));
-    assert!(matches!(runner.execute(&batch), Err(Error::Resource(_))));
+    assert!(matches!(
+        runner.execute(&batch, &held(&[1, 2])),
+        Err(Error::Resource(_))
+    ));
 }
 
 #[test]
-fn a_runner_with_no_hook_refuses_a_batch_that_carries_page_work() {
+fn a_runner_with_no_hook_refuses_the_page_work_it_is_handed() {
     let mut runner = captured();
+    let mut tables = held(&[1, 2]);
 
     let batch = with_page_work(decode(&[1, 2], &[0.0, 0.0]));
-    let message = runner.execute(&batch).unwrap_err().to_string();
-    assert!(message.contains("carries page work"), "{message}");
+    let message = runner.execute(&batch, &tables).unwrap_err().to_string();
+    assert!(message.contains("state copies"), "{message}");
+
+    // Changes of the device block table and copies with runs reach nothing that writes them.
+    assert!(runner.write_tables(&tables.take_changes()).is_err());
+    let copy = BlockCopy {
+        request: storage::runtime::RequestId(3),
+        runs: vec![((UNITS, 1, 1), (UNITS, 2, 1))],
+    };
+    assert!(matches!(runner.copy(&[copy]), Err(Error::Unsupported(_))));
 }
 
 #[test]
 fn a_slot_the_runner_does_not_hold_is_not_started() {
     let mut runner = captured();
+    let tables = held(&[1, 2]);
+    let new = |slot: u32| NewSlot {
+        slot,
+        context: [0, 0],
+        ..NewSlot::default()
+    };
 
     let mut batch = decode(&[1, 2], &[0.0, 0.0]);
-    batch.columns.fresh_slots = vec![FreshSlot {
-        slot: SLOTS + 1,
-        history: vec![1, 2],
-    }];
-    let message = runner.execute(&batch).unwrap_err().to_string();
+    batch.new_slots = vec![new(SLOTS + 1)];
+    let message = runner.execute(&batch, &tables).unwrap_err().to_string();
     assert!(message.contains("request slot 7"), "{message}");
 
-    // A fresh slot of a decode batch starts from its own row of the batch.
+    // A new slot of a decode batch starts from its own row of the batch.
     let mut batch = decode(&[1, 2], &[0.0, 0.0]);
-    batch.columns.fresh_slots = vec![FreshSlot {
-        slot: 4,
-        history: Vec::new(),
-    }];
-    let message = runner.execute(&batch).unwrap_err().to_string();
+    batch.new_slots = vec![new(4)];
+    let message = runner.execute(&batch, &tables).unwrap_err().to_string();
     assert!(message.contains("no row in its decode batch"), "{message}");
 }
 
@@ -1150,20 +1460,19 @@ fn a_paired_forward_writes_its_rows_scratch_pages_and_commits_nothing() {
 
     let rows = &batch.columns.rows;
     let scratch = columns::scratch_column(
-        &rows.positions,
+        &rows.cache_positions,
         &rows.query_offsets,
-        &rows.slot_mapping,
         8,
         SCRATCH_PAGES,
         PAGE,
     )
     .unwrap();
 
-    // Row `r` owns the pages `2r..2r + 2` of the set: its tokens at positions 0, 1 and 2
-    // write slots of page `2r`, and the tokens the batch does not hold write nothing.
+    // Row `r` owns the pages `2r..2r + 2` of the set: its tokens at cache positions 0, 1 and
+    // 2 write slots of page `2r`, and the tokens the batch does not hold write nothing.
     assert_eq!(scratch, [0, 1, 2, 32, 33, NO_SLOT, NO_SLOT, NO_SLOT]);
 
-    let (layout, block) = filled(&batch, &bucket, Some(&scratch));
+    let (layout, block) = filled(&batch, &bucket, &scratch, true);
     assert_eq!(layout.read::<u32>(&block, Column::SlotMapping, 8), scratch);
 
     // Every row gathers its own row of the scratch set's table, and reads its slot's state.
@@ -1185,31 +1494,30 @@ fn a_paired_forward_writes_its_rows_scratch_pages_and_commits_nothing() {
 fn a_scratch_slot_lies_in_its_row_s_pages_or_is_refused() {
     // Two rows of two tokens around a page boundary; the second row's last token is not
     // written by the served batch.
-    let mapping =
-        columns::scratch_slot_mapping(&[15, 16, 30, 31], &[0, 2, 4], &[15, 16, 62, -1], 2, PAGE)
-            .unwrap();
+    let mapping = columns::scratch_slot_mapping(&[15, 16, 30, -1], &[0, 2, 4], 2, PAGE).unwrap();
     assert_eq!(mapping, [15, 16, 2 * PAGE + 30, NO_SLOT]);
 
     // A position past the row's scratch pages, and columns of different token counts.
     assert!(matches!(
-        columns::scratch_slot_mapping(&[32], &[0, 1], &[32], 2, PAGE),
+        columns::scratch_slot_mapping(&[32], &[0, 1], 2, PAGE),
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        columns::scratch_slot_mapping(&[0, 1], &[0, 1], &[0, 1], 2, PAGE),
+        columns::scratch_slot_mapping(&[0, 1], &[0, 1], 2, PAGE),
         Err(Error::Invariant(_))
     ));
-    assert!(columns::scratch_slot_mapping(&[0], &[0, 1], &[0], 0, PAGE).is_err());
+    assert!(columns::scratch_slot_mapping(&[0], &[0, 1], 0, PAGE).is_err());
 }
 
 #[test]
 fn a_paired_forward_is_prepared_over_a_scratch_set_the_cache_lends() {
     let mut runner = captured();
     let batch = decode(&[1, 2], &[0.0, 0.0]);
+    let tables = held(&[1, 2]);
 
     // No scratch set was lent.
     assert!(matches!(
-        runner.prepare_shadow_inputs(&batch),
+        runner.prepare_shadow_inputs(&batch, &tables),
         Err(Error::Unsupported(_))
     ));
 
@@ -1218,7 +1526,7 @@ fn a_paired_forward_is_prepared_over_a_scratch_set_the_cache_lends() {
     assert!(runner.set_scratch(vec![group(8, table(2))]).is_err());
     runner.set_scratch(vec![group(8, table(4))]).unwrap();
 
-    let bucket = runner.prepare_shadow_inputs(&batch).unwrap();
+    let bucket = runner.prepare_shadow_inputs(&batch, &tables).unwrap();
     assert_eq!(bucket, Bucket::decode(2, Variant::DecodeGreedy));
 
     // The forward over the scratch set makes the launches of the serving forward.
@@ -1236,11 +1544,11 @@ fn a_paired_forward_is_prepared_over_a_scratch_set_the_cache_lends() {
         .collect();
     assert_eq!(paired, serving);
 
-    // A row whose position lies past its scratch pages is refused.
+    // A row whose cache position lies past its scratch pages is refused.
     let mut far = decode(&[1, 2], &[0.0, 0.0]);
-    far.columns.rows.positions[1] = (SCRATCH_PAGES * PAGE) as i32;
+    far.columns.rows.cache_positions[1] = (SCRATCH_PAGES * PAGE) as i32;
     assert!(matches!(
-        runner.prepare_shadow_inputs(&far),
+        runner.prepare_shadow_inputs(&far, &tables),
         Err(Error::Invalid(_))
     ));
 }
@@ -1250,7 +1558,7 @@ fn a_model_that_keeps_a_recurrent_state_has_no_paired_forward() {
     let mut runner = runner(true);
 
     let refused = runner
-        .prepare_shadow_inputs(&decode(&[1, 2], &[0.0, 0.0]))
+        .prepare_shadow_inputs(&decode(&[1, 2], &[0.0, 0.0]), &held(&[1, 2]))
         .unwrap_err();
     assert!(refused.to_string().contains("recurrent state"), "{refused}");
 }
@@ -1291,15 +1599,8 @@ fn a_call_s_tokens_carry_their_rows_scores_and_its_slot_s_positions() {
 
     let output = completion(&batch, &bucket, 64, 2, &greedy_outputs([11, 22])).unwrap();
 
-    let mut first = CallOutput::completed(
-        CallId(100),
-        vec![11],
-        RowState {
-            step_index: 5,
-            cache_computed_len: 41,
-            cache_visible_len: 5,
-        },
-    );
+    // The outputs answer the batch's requests in its order.
+    let mut first = performed(vec![11], 5, 41, 5);
     // The token itself, then its row's candidates, the largest first.
     first.token_logprobs = vec![vec![
         entry(11, -0.5, 2),
@@ -1308,7 +1609,6 @@ fn a_call_s_tokens_carry_their_rows_scores_and_its_slot_s_positions() {
     ]];
     assert_eq!(output[0], first);
 
-    assert_eq!(output[1].call, CallId(101));
     assert_eq!(output[1].tokens, [22]);
     assert_eq!(
         (output[1].step_index, output[1].cache_computed_len),
@@ -1343,31 +1643,20 @@ fn a_row_that_samples_nothing_gives_its_call_no_token() {
     assert_eq!(output.len(), 2);
     assert_eq!(output[0].tokens, [11]);
     assert_eq!(output[0].token_logprobs, [vec![entry(11, -0.5, 1)]]);
-    assert_eq!(
-        output[1],
-        CallOutput::completed(
-            CallId(101),
-            Vec::new(),
-            RowState {
-                step_index: 0,
-                cache_computed_len: 2,
-                cache_visible_len: 0
-            }
-        )
-    );
+    assert_eq!(output[1], performed(Vec::new(), 0, 2, 0));
 }
 
 #[test]
 fn a_call_of_several_rows_reports_one_state_and_its_rows_tokens_in_order() {
     // One call owns both rows, on one slot.
     let mut batch = decode(&[2, 2], &[0.0, 0.0]);
-    batch.columns.rows.calls = vec![BatchRow {
-        request: 2,
-        kind: RowKind::Decode,
+    batch.columns.rows.calls = vec![Row {
+        slot: 2,
+        kind: Phase::Decode,
         cache_group: 0,
         rows: 0..2,
     }];
-    batch.calls = vec![CallId(9)];
+    batch.requests = vec![RequestId(9)];
     let bucket = Bucket::decode(2, Variant::DecodeGreedy);
 
     let output = completion(&batch, &bucket, 64, 2, &greedy_outputs([11, 22])).unwrap();
@@ -1399,7 +1688,11 @@ fn a_row_that_could_not_be_sampled_fails_its_call_alone() {
     assert!(output[0].tokens.is_empty() && output[0].token_logprobs.is_empty());
     assert_eq!(output[1].status, CallStatus::Ok);
     assert_eq!(output[1].tokens, [22]);
-    output[0].validate().unwrap();
+    let answered = BatchOutput {
+        calls: output,
+        ..BatchOutput::default()
+    };
+    answered.check(&batch).unwrap();
 
     // A drawn row whose candidates formed no distribution states it by its flag.
     let batch = decode(&[3, 1], &[0.7, 0.7]);
@@ -1457,23 +1750,18 @@ fn outputs_that_are_not_the_bucket_s_are_refused() {
     // A row whose logits the batch asked for and no call owns.
     let mut orphan = decode(&[3, 1], &[0.0, 0.0]);
     orphan.columns.rows.calls.pop();
-    orphan.calls.pop();
+    orphan.requests.pop();
     assert!(matches!(
         completion(&orphan, &bucket, 64, 2, &greedy_outputs([11, 22])),
         Err(Error::Invariant(_))
     ));
-
-    // Another number of call ids than calls.
-    let mut unnamed = decode(&[3, 1], &[0.0, 0.0]);
-    unnamed.calls.pop();
-    assert!(completion(&unnamed, &bucket, 64, 2, &greedy_outputs([11, 22])).is_err());
 }
 
 #[test]
 fn the_runner_serves_the_phases_of_its_config() {
     let runner = runner(false);
 
-    assert_eq!(runner.phases(), [ipc::PhaseId(0)]);
+    assert_eq!(runner.phases(), [Phase::Prefill, Phase::Decode]);
     assert_eq!(runner.config().slots, SLOTS);
 }
 
@@ -1609,7 +1897,7 @@ fn the_members_of_a_step_agree_on_the_most_tokens_any_of_them_sends() {
     let (to_second, second_inbox) = crossbeam_channel::unbounded();
     let mut first = member(&groups[0], 0, deliver(to_second));
     let mut second = member(&groups[1], 1, deliver(to_first));
-    let phase = ipc::PhaseId(0);
+    let (group, phase) = (GroupId(0), Phase::Decode);
 
     // The first member has a batch of three tokens and the second none: its executor takes
     // the join batch, and both leave the step at the first member's tokens.
@@ -1617,21 +1905,22 @@ fn the_members_of_a_step_agree_on_the_most_tokens_any_of_them_sends() {
         let idle = scope.spawn(|| {
             let join = second_inbox.recv().unwrap();
             assert_eq!(join.shape.variant, Variant::ExpertJoin);
-            assert!(join.calls.is_empty());
+            assert_eq!((join.group, join.phase), (group, phase));
+            assert!(join.requests.is_empty());
 
             second.join(&join).unwrap()
         });
 
-        assert_eq!(first.enter(3, phase, 1).unwrap(), 3);
+        assert_eq!(first.enter(3, group, phase, 1).unwrap(), 3);
         assert_eq!(idle.join().unwrap(), Some(3));
     });
 
     // Both members have a batch: the step holds the larger, and the join each asked of the
     // other finds its step closed.
     std::thread::scope(|scope| {
-        let other = scope.spawn(|| second.enter(9, phase, 1).unwrap());
+        let other = scope.spawn(|| second.enter(9, group, phase, 1).unwrap());
 
-        assert_eq!(first.enter(5, phase, 1).unwrap(), 9);
+        assert_eq!(first.enter(5, group, phase, 1).unwrap(), 9);
         assert_eq!(other.join().unwrap(), 9);
     });
     let late = first_inbox.recv().unwrap();
@@ -1641,9 +1930,12 @@ fn the_members_of_a_step_agree_on_the_most_tokens_any_of_them_sends() {
 
     // A member enters with tokens of its own, no more than the transport holds, and joins no
     // step past the union's next.
-    assert!(matches!(first.enter(0, phase, 1), Err(Error::Invalid(_))));
     assert!(matches!(
-        first.enter(UNION_ROWS + 1, phase, 1),
+        first.enter(0, group, phase, 1),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        first.enter(UNION_ROWS + 1, group, phase, 1),
         Err(Error::Invalid(_))
     ));
     let mut ahead = late;
@@ -1677,13 +1969,14 @@ fn a_member_with_no_batch_is_driven_into_the_step_by_a_join_batch() {
     // The first member's batch blocks in the agreement until the second member's executor
     // takes the join batch. Both then reach the replay of a captured class, which graphs
     // that hold no device refuse.
+    let tables = held(&[1, 2, 3]);
     std::thread::scope(|scope| {
         let idle = scope.spawn(|| {
             let join = second_inbox.recv().unwrap();
-            second.execute(&join)
+            second.execute(&join, &held(&[]))
         });
 
-        let served = first.execute(&decode(&[1, 2, 3], &[0.0; 3]));
+        let served = first.execute(&decode(&[1, 2, 3], &[0.0; 3]), &tables);
         assert!(matches!(served, Err(Error::State(_))), "{served:?}");
 
         let joined = idle.join().unwrap();
@@ -1692,7 +1985,7 @@ fn a_member_with_no_batch_is_driven_into_the_step_by_a_join_batch() {
 
     // A member computes no paired forward: its exchange launches wait for the others'.
     assert!(matches!(
-        first.prepare_shadow_inputs(&decode(&[1, 2], &[0.0, 0.0])),
+        first.prepare_shadow_inputs(&decode(&[1, 2], &[0.0, 0.0]), &tables),
         Err(Error::Unsupported(_))
     ));
 }
@@ -1727,7 +2020,10 @@ fn a_union_is_joined_by_a_runner_whose_model_routes_experts() {
     // A join batch reaches a runner outside a union.
     let mut join = decode(&[1], &[0.0]);
     join.shape = BatchShape::decode(1, Variant::ExpertJoin);
-    assert!(matches!(runner.execute(&join), Err(Error::Invalid(_))));
+    assert!(matches!(
+        runner.execute(&join, &held(&[1])),
+        Err(Error::Invalid(_))
+    ));
 
     // A member that is not the group's.
     let other = TransportShape {
@@ -1792,17 +2088,6 @@ fn over(cache: &KvCacheMemory, state: Option<&StateMemory>) -> CausalLmRunner {
     runner
 }
 
-/// The scheduler's page table of `slot` in the attention group: `units` from page zero.
-fn block_table(slot: u32, units: &[u32]) -> ipc::BlockTable {
-    ipc::BlockTable {
-        request_pool_idx: slot,
-        group_id: 0,
-        start_page: 0,
-        unit_ids: units.iter().copied().map(ipc::UnitId).collect(),
-        allocated_tokens: units.len() as u32 * PAGE,
-    }
-}
-
 #[test]
 fn a_runner_over_the_rank_s_cache_and_state_profiles_and_captures_every_bucket() {
     // A model that attends over the cache alone, and one that keeps a recurrent state.
@@ -1835,69 +2120,219 @@ fn a_runner_over_the_rank_s_cache_and_state_profiles_and_captures_every_bucket()
     assert!(CausalLmRunner::over(model, self::config(), graphs, None, &fewer, None).is_err());
 }
 
-#[test]
-fn the_hook_issues_a_batch_s_page_work_on_the_cache_before_its_replay() {
-    let cache = Arc::new(Mutex::new(
-        KvCacheMemory::meta(cache_config(false)).unwrap(),
-    ));
-    let mut runner = over(&cache.lock().unwrap(), None);
+/// The regions a test cache's memory is numbered by: its units, and the host pages of each
+/// of its groups.
+fn regions(cache: &KvCacheMemory) -> CacheRegions {
+    let groups = cache.layout().groups.len();
+
+    CacheRegions {
+        units: UNITS,
+        host: (0..groups).map(|group| Some(4 + group as u8)).collect(),
+        sources: vec![None; groups],
+    }
+}
+
+/// A runner over the rank's `cache` and `state`, with the hook that issues its page work on
+/// them.
+fn wired(
+    cache: &Arc<Mutex<KvCacheMemory>>,
+    state: Option<&Arc<Mutex<StateMemory>>>,
+) -> CausalLmRunner {
+    let held = state.map(|state| lock(state));
+    let mut runner = over(&lock(cache), held.as_deref());
+    drop(held);
+
     runner.set_page_work(wiring::page_work(
-        Arc::clone(&cache),
-        None,
+        Arc::clone(cache),
+        state.map(Arc::clone),
         None,
         SCRATCH_PAGES,
     ));
+    runner
+}
 
-    // Every row of the pooled table names the padding unit before a request holds pages.
+#[test]
+fn the_tables_changes_are_written_into_the_pooled_rows_a_forward_gathers() {
+    let cache = Arc::new(Mutex::new(
+        KvCacheMemory::meta(cache_config(false)).unwrap(),
+    ));
+    let mut runner = wired(&cache, None);
+
+    // Every row of the pooled table names the padding unit before a request holds a block.
     let width = TABLE_WIDTH;
     assert!(
-        cache
-            .lock()
-            .unwrap()
+        lock(&cache)
             .host_table(0)
             .unwrap()
             .iter()
             .all(|unit| *unit == 0)
     );
 
-    // A batch on the last slot and the first, with the pages the scheduler gave them. The
-    // tables are installed ahead of the replay, which graphs that hold no device refuse.
-    let mut batch = decode(&[SLOTS as i32, 1], &[0.0, 0.0]);
-    batch.block_tables = vec![block_table(SLOTS, &[3, 5]), block_table(1, &[7])];
-    let refused = runner.execute(&batch).unwrap_err();
-    assert!(matches!(refused, Error::State(_)), "{refused}");
+    // The last slot and the first get blocks from the buffer pool; the executor hands the
+    // runner the table's changes before the batch that reads them.
+    let mut tables = held(&[]);
+    for (slot, units) in [(SLOTS, [3, 5]), (1, [7, 8])] {
+        attach(&mut tables, slot);
+        allocate(
+            &mut tables,
+            slot,
+            0,
+            0,
+            &[(UNITS, units[0], 1), (UNITS, units[1], 1)],
+        );
+    }
+    runner.write_tables(&tables.take_changes()).unwrap();
 
     {
-        let cache = cache.lock().unwrap();
+        let cache = lock(&cache);
         let table = cache.host_table(0).unwrap();
 
         // Slot `s` owns row `s - 1`, the row the runner's forward gathers for it, and the
         // padding row past the last slot's still names the padding unit.
-        assert_eq!(table[..width], [7, 0, 0, 0]);
+        assert_eq!(table[..width], [7, 8, 0, 0]);
         assert_eq!(table[(SLOTS as usize - 1) * width..][..width], [3, 5, 0, 0]);
         assert_eq!(table[SLOTS as usize * width..], [0; TABLE_WIDTH]);
-        assert_eq!(cache.installed_pages(SLOTS, 0), Some((0, &[3, 5][..])));
-        assert_eq!(cache.installed_pages(2, 0), None);
     }
 
-    // A table the cache refuses fails the batch before anything of it is installed.
-    let mut outside = decode(&[2, 1], &[0.0, 0.0]);
-    outside.block_tables = vec![block_table(2, &[9]), block_table(SLOTS + 1, &[4])];
-    let refused = runner.execute(&outside).unwrap_err();
+    // Entries that leave name the padding unit again.
+    tables
+        .apply(&Request::Release {
+            owner: OwnerId(u64::from(SLOTS)),
+            class: 0,
+            at: 0,
+            count: 1,
+            after: vec![],
+        })
+        .unwrap();
+    runner.write_tables(&tables.take_changes()).unwrap();
+    let row = lock(&cache).host_table(0).unwrap()[(SLOTS as usize - 1) * width..][..width].to_vec();
+    assert_eq!(row, [0, 5, 0, 0]);
+
+    // A change the cache refuses fails, and writes nothing: a unit past the pool.
+    let mut outside = held(&[]);
+    attach(&mut outside, 2);
+    allocate(&mut outside, 2, 0, 0, &[(UNITS, PAGES as u32, 1)]);
+    let refused = runner.write_tables(&outside.take_changes()).unwrap_err();
     assert!(matches!(refused, Error::Invalid(_)), "{refused}");
-    assert_eq!(cache.lock().unwrap().installed_pages(2, 0), None);
+    assert!(
+        lock(&cache).host_table(0).unwrap()[width..2 * width]
+            .iter()
+            .all(|unit| *unit == 0)
+    );
+}
+
+#[test]
+fn a_copy_between_two_runs_is_issued_on_the_cache_and_ends_with_the_batch() {
+    let cache = Arc::new(Mutex::new(
+        KvCacheMemory::meta(cache_config(false)).unwrap(),
+    ));
+    let mut runner = wired(&cache, None);
+    let clone = |runs: Vec<(Run, Run)>| BlockCopy {
+        request: storage::runtime::RequestId(5),
+        runs,
+    };
+
+    // A copy names its runs by the regions the buffer pool numbered: before they are stated,
+    // none is issued.
+    let units = clone(vec![((UNITS, 3, 1), (UNITS, 4, 1))]);
+    let unstated = runner.copy(std::slice::from_ref(&units)).unwrap_err();
+    assert!(matches!(unstated, Error::State(_)), "{unstated}");
+
+    let stated = regions(&lock(&cache));
+    lock(&cache).set_regions(stated).unwrap();
+    runner.copy(&[units, clone(Vec::new())]).unwrap();
+
+    // A copy from memory that is no cache's, or into the padding unit, is refused whole.
+    let foreign = clone(vec![((9, 3, 1), (UNITS, 4, 1))]);
+    assert!(runner.copy(&[foreign]).is_err());
+    let padding = clone(vec![((UNITS, 3, 1), (UNITS, 0, 1))]);
+    assert!(runner.copy(&[padding]).is_err());
+
+    // A batch's end waits for the copies taken with it, also when the step failed.
+    let tables = held(&[1, 2]);
+    let refused = runner
+        .execute(&decode(&[1, 2], &[0.0, 0.0]), &tables)
+        .unwrap_err();
+    assert!(matches!(refused, Error::State(_)), "{refused}");
+}
+
+#[test]
+fn a_state_checkpoint_is_read_and_written_at_the_run_its_position_names() {
+    let config = cache_config(true);
+    let state_class = config.layout.state_group().unwrap() as u8;
+    let span = config.layout.groups[state_class as usize].units_per_page;
+    let cache = KvCacheMemory::meta(config.clone()).unwrap();
+    let state = StateMemory::meta(
+        StateConfig {
+            shape: state_shape(),
+            slots: SLOTS,
+            rows: 4,
+            trail: 0,
+        },
+        &config,
+    )
+    .unwrap();
+    let (cache, state) = (Arc::new(Mutex::new(cache)), Arc::new(Mutex::new(state)));
+    let mut runner = wired(&cache, Some(&state));
+
+    // Slot 1 holds a checkpoint at position 2 of its state table and slot 2 one at position
+    // 0, each a run of the units a state block spans.
+    let mut tables = held(&[1, 2]);
+    allocate(&mut tables, 1, state_class, 2, &[(UNITS, 20, span)]);
+    allocate(&mut tables, 2, state_class, 0, &[(UNITS, 24, span)]);
+    let copy = |slot, position, direction| StateCopy {
+        slot,
+        position,
+        direction,
+    };
+
+    // The restore reads slot 1's checkpoint at its position and the keep writes slot 2's;
+    // both lie in the tables, so the step reaches the replay, which graphs that hold no
+    // device refuse.
+    let mut batch = prefill(Variant::PrefillWrite);
+    batch.columns.rows.calls[0].slot = 1;
+    batch.columns.rows.calls[1].slot = 2;
+    batch.columns.slots = vec![1, 2];
+    batch.columns.commit = commit(&[(1, mode::CACHE, -1), (2, mode::CACHE, -1)]);
+    batch.columns.rows.logits_rows = vec![-1, -1];
+    batch.columns.checkpoints = vec![0, 2];
+    batch.columns.state_copies = vec![
+        copy(1, 2, StateDirection::Restore),
+        copy(2, 0, StateDirection::Keep),
+    ];
+    let reached = runner.execute(&batch, &tables).unwrap_err();
+    assert!(matches!(reached, Error::State(_)), "{reached}");
+
+    let (restores, keeps) = wiring::state_copies(&lock(&cache), &batch, &tables).unwrap();
+    assert_eq!(restores, [(1, 20..20 + span)]);
+    assert_eq!(keeps, [(2, 24..24 + span)]);
+
+    // A checkpoint at a position without an entry is refused before anything is launched.
+    let mut missing = batch.clone();
+    missing.columns.state_copies[0].position = 3;
+    let message = runner.execute(&missing, &tables).unwrap_err().to_string();
+    assert!(
+        message.contains("position 3") && message.contains("holds no entry"),
+        "{message}"
+    );
+
+    // A keep into a checkpoint a commit made read-only writes nothing: the batch is refused.
+    commit_entry(&mut tables, 2, state_class, 0);
+    let message = runner.execute(&batch, &tables).unwrap_err().to_string();
+    assert!(message.contains("read-only"), "{message}");
 }
 
 #[test]
 fn a_paired_forward_computes_over_the_scratch_pages_the_cache_opened() {
     let mut cache = KvCacheMemory::meta(cache_config(false)).unwrap();
+    let tables = held(&[1, SLOTS]);
 
     // A cache with no scratch pages lends none, and one whose set is too small for the rows
     // of the largest bucket is refused.
     let mut unlent = over(&cache, None);
     assert!(unlent.lend_scratch(&cache).is_err());
     assert!(matches!(
-        unlent.prepare_shadow_inputs(&decode(&[1, 2], &[0.0, 0.0])),
+        unlent.prepare_shadow_inputs(&decode(&[1, 2], &[0.0, 0.0]), &tables),
         Err(Error::Unsupported(_))
     ));
 
@@ -1905,7 +2340,7 @@ fn a_paired_forward_computes_over_the_scratch_pages_the_cache_opened() {
     cache.open_scratch(4 * SCRATCH_PAGES, None).unwrap();
     let mut runner = over(&cache, None);
     let bucket = runner
-        .prepare_shadow_inputs(&decode(&[1, SLOTS as i32], &[0.0, 0.0]))
+        .prepare_shadow_inputs(&decode(&[1, SLOTS as i32], &[0.0, 0.0]), &tables)
         .unwrap();
     assert_eq!(bucket, Bucket::decode(2, Variant::DecodeGreedy));
 
@@ -1927,7 +2362,7 @@ fn a_paired_forward_computes_over_the_scratch_pages_the_cache_opened() {
 
 // ---- Speculation --------------------------------------------------------------------------------
 
-use ipc::DraftWork;
+use ipc::batch::DraftWork;
 
 use super::output::verification_output;
 use super::speculation::{self, DraftPool};
@@ -2011,9 +2446,9 @@ fn speculating(stateful: bool) -> CausalLmRunner {
 /// token 8 and the draft 9 from position 20. The first call proposes two drafts and the
 /// second one, and the first counts its tokens in its penalties.
 fn verification(temperature: f32) -> Batch {
-    let call = |request: u32, row: u32| BatchRow {
-        request,
-        kind: RowKind::Verify,
+    let call = |slot: u32, row: u32| Row {
+        slot,
+        kind: Phase::Verify,
         cache_group: 0,
         rows: row..row + 1,
     };
@@ -2024,11 +2459,11 @@ fn verification(temperature: f32) -> Batch {
     table[column::VISIBLE * 2..][..2].copy_from_slice(&[10, 20]);
     table[column::PENALTIES * 2] = 1;
 
-    let columns = BatchColumns {
-        rows: BatchRows {
+    let columns = Columns {
+        rows: Rows {
             calls: vec![call(2, 0), call(4, 1)],
             positions: vec![10, 11, 12, 20, 21],
-            slot_mapping: vec![26, 27, 28, 52, 53],
+            cache_positions: vec![10, 11, 12, 20, 21],
             seq_lens: vec![13, 22],
             query_offsets: vec![0, 3, 5],
             logits_rows: vec![0, 1],
@@ -2059,7 +2494,7 @@ fn verification(temperature: f32) -> Batch {
                 ..DraftWork::default()
             },
         ],
-        ..BatchColumns::default()
+        ..Columns::default()
     };
 
     let variant = if temperature == 0.0 {
@@ -2229,6 +2664,7 @@ fn a_verification_batch_is_one_row_per_token_and_one_sequence_per_call() {
     let bucket = Bucket::verify(4, DRAFTS, Variant::VerifySampled);
     let (layout, mut block) = speculating_block();
 
+    let mapping = mapping(&batch, &held(&[2, 4]));
     speculation::fill_verification(
         &layout,
         SLOTS,
@@ -2236,6 +2672,7 @@ fn a_verification_batch_is_one_row_per_token_and_one_sequence_per_call() {
         &batch.columns,
         &speculation::token_rows(&batch.columns),
         &bucket,
+        &mapping,
         &mut block,
     )
     .unwrap();
@@ -2248,6 +2685,19 @@ fn a_verification_batch_is_one_row_per_token_and_one_sequence_per_call() {
 
     assert_eq!(u32s(Column::InputIds, 6), [5, 6, 7, 8, 9, 0]);
     assert_eq!(i32s(Column::Positions, 6), [10, 11, 12, 20, 21, 0]);
+
+    // Each token writes the cache slot its request's entry names at its cache position.
+    assert_eq!(
+        u32s(Column::SlotMapping, 6),
+        [
+            written(2, 10),
+            written(2, 11),
+            written(2, 12),
+            written(4, 20),
+            written(4, 21),
+            none
+        ]
+    );
     assert_eq!(u32s(Column::SeqLens, 6), [11, 12, 13, 21, 22, 0]);
     assert_eq!(
         u32s(Column::QueryOffsets, 13),
@@ -2336,7 +2786,7 @@ fn the_drafter_s_columns_follow_a_verification_and_a_prompt() {
 
     // Slot 2 holds the draft pages 0 and 1 in units 3 and 5; slot 4 holds none.
     let batch = verification(0.0);
-    let tables = [(0, vec![3, 5]), (0, Vec::new())];
+    let tables = [(0, vec![3, 5], vec![3, 5]), (0, Vec::new(), Vec::new())];
     let bucket = Bucket::draft(4, 12);
     speculation::fill_drafter(
         &layout,
@@ -2543,7 +2993,6 @@ fn a_verification_s_call_reports_its_accepted_prefix_and_its_proposals() {
     };
     let completion = |tokens: &[u32]| {
         verification_output(
-            &batch.calls,
             &batch.columns,
             &bucket,
             VOCABULARY as u32,
@@ -2598,7 +3047,7 @@ fn a_verification_s_call_reports_its_accepted_prefix_and_its_proposals() {
     // token after its prompt, and the second states no token after its own.
     let prompt = prefill(Variant::PrefillGreedy);
     let mut prompt = Batch {
-        columns: BatchColumns {
+        columns: Columns {
             drafts: vec![
                 DraftWork {
                     proposals: 1,
@@ -2612,13 +3061,10 @@ fn a_verification_s_call_reports_its_accepted_prefix_and_its_proposals() {
     };
     prompt.columns.rows.query_offsets = vec![0, 3, 4];
     prompt.columns.rows.positions.truncate(4);
-    prompt.columns.rows.slot_mapping.truncate(4);
+    prompt.columns.rows.cache_positions.truncate(4);
     prompt.columns.input_ids.truncate(4);
 
-    let mut calls = vec![
-        ipc::execution::CallOutput::completed(CallId(100), vec![11], RowState::default()),
-        ipc::execution::CallOutput::completed(CallId(101), Vec::new(), RowState::default()),
-    ];
+    let mut calls = vec![performed(vec![11], 0, 0, 0), performed(Vec::new(), 0, 0, 0)];
     speculation::propose(&prompt, VOCABULARY as u32, &proposals, &mut calls).unwrap();
     assert_eq!(calls[0].draft_token_ids, [50]);
     assert!(calls[1].draft_token_ids.is_empty());
@@ -2634,20 +3080,21 @@ fn a_speculating_runner_serves_a_verification_from_its_verification_bucket() {
 
     // A batch in a decode's shape whose calls verify takes the verification bucket of its
     // selection, the smallest that holds its calls.
-    let bucket = runner.prepare_inputs(&verification(0.0)).unwrap();
+    let tables = held(&[1, 2, 3, 4]);
+    let bucket = runner.prepare_inputs(&verification(0.0), &tables).unwrap();
     assert_eq!(bucket, Bucket::verify(2, DRAFTS, Variant::VerifyGreedy));
-    let bucket = runner.prepare_inputs(&verification(0.7)).unwrap();
+    let bucket = runner.prepare_inputs(&verification(0.7), &tables).unwrap();
     assert_eq!(bucket, Bucket::verify(2, DRAFTS, Variant::VerifySampled));
 
     // A decode is a verification of no draft.
     let mut decoded = decode(&[1, 2, 3], &[0.0; 3]);
     decoded.columns.input_ids = vec![4, 5, 6];
-    let bucket = runner.prepare_inputs(&decoded).unwrap();
+    let bucket = runner.prepare_inputs(&decoded, &tables).unwrap();
     assert_eq!(bucket, Bucket::verify(4, DRAFTS, Variant::VerifyGreedy));
 
     // A prompt is served from its prefill bucket.
     let bucket = runner
-        .prepare_inputs(&prefill(Variant::PrefillGreedy))
+        .prepare_inputs(&prefill(Variant::PrefillGreedy), &tables)
         .unwrap();
     assert_eq!(bucket, Bucket::prefill(4, 8, Variant::PrefillGreedy));
 
@@ -2662,24 +3109,30 @@ fn a_speculating_runner_serves_a_verification_from_its_verification_bucket() {
     long.columns.draws.truncate(1);
     long.columns.commit = commit(&[(2, mode::VERIFY, 0)]);
     long.columns.drafts.truncate(1);
-    long.calls.truncate(1);
-    let message = runner.prepare_inputs(&long).unwrap_err().to_string();
+    long.requests.truncate(1);
+    let message = runner
+        .prepare_inputs(&long, &tables)
+        .unwrap_err()
+        .to_string();
     assert!(message.contains("carries 4 drafts"), "{message}");
 
     let mut mixed = verification(0.0);
-    mixed.columns.rows.calls[1].kind = RowKind::Prefill;
-    let message = runner.prepare_inputs(&mixed).unwrap_err().to_string();
+    mixed.columns.rows.calls[1].kind = Phase::Prefill;
+    let message = runner
+        .prepare_inputs(&mixed, &tables)
+        .unwrap_err()
+        .to_string();
     assert!(message.contains("mixes prompt rows"), "{message}");
 
     // A verification's token rows share their request's pages: it has no paired forward.
     assert!(matches!(
-        runner.prepare_shadow_inputs(&verification(0.0)),
+        runner.prepare_shadow_inputs(&verification(0.0), &tables),
         Err(Error::Unsupported(_))
     ));
 
     // Graphs that hold no device replay nothing: the step is refused at its replay, after
     // both graphs' columns were padded.
-    let refused = runner.execute(&verification(0.0)).unwrap_err();
+    let refused = runner.execute(&verification(0.0), &tables).unwrap_err();
     assert!(matches!(refused, Error::State(_)), "{refused}");
 }
 
@@ -2743,7 +3196,9 @@ fn speculation_is_refused_where_the_runner_does_not_serve_it() {
         },
         DraftWork::default(),
     ];
-    let refused = stateful.prepare_inputs(&refill).unwrap_err();
+    let refused = stateful
+        .prepare_inputs(&refill, &held(&[2, 4]))
+        .unwrap_err();
     assert!(matches!(refused, Error::Unsupported(_)), "{refused}");
 }
 
@@ -2774,6 +3229,27 @@ fn a_draft_page_is_read_as_runs_of_the_pool_s_pages() {
     pool.row(2, &units, 18, &mut row);
     assert_eq!(row[16..18], [7, 100 + 7]);
     assert_eq!(row[..2], [0, 100]);
+
+    // A slot's draft pages are its entries of the draft group's class: those from its first
+    // on, a page between two entries holding none, and the drafter writes only the writable
+    // ones.
+    let mut tables = held(&[]);
+    attach(&mut tables, 2);
+    let class = pool.group as u8;
+    allocate(&mut tables, 2, class, 2, &[(UNITS, 7, 1)]);
+    allocate(&mut tables, 2, class, 4, &[(UNITS, 9, 1)]);
+    assert_eq!(
+        pool.table(&tables, 2).unwrap(),
+        (2, vec![7, 0, 9], vec![7, 0, 9])
+    );
+    assert_eq!(pool.table(&tables, 3).unwrap(), (0, Vec::new(), Vec::new()));
+
+    commit_entry(&mut tables, 2, class, 2);
+    let (first, read, writable) = pool.table(&tables, 2).unwrap();
+    assert_eq!((first, &read[..]), (2, &[7, 0, 9][..]));
+    assert_eq!(writable, [0, 0, 9]);
+    assert_eq!(pool.slot(first, &writable, 1100), NO_SLOT);
+    assert_eq!(pool.slot(first, &read, 1100), 107 * 64 + 12);
 }
 
 #[test]
@@ -2844,18 +3320,10 @@ fn a_speculating_runner_is_built_over_the_rank_s_draft_group_and_trail() {
     };
     assert!(over(moved, &state(12)).is_err());
 
-    // A slot's draft pages are the ones the scheduler installed for it.
-    let mut pages = wiring::draft_pages(Arc::clone(&cache));
-    assert_eq!(pages(2), None);
-
-    let installed = ipc::BlockTable {
-        request_pool_idx: 2,
-        group_id: pool.group,
-        start_page: 0,
-        unit_ids: vec![ipc::UnitId(3)],
-        allocated_tokens: pool.page * pool.span,
-    };
-    lock(&cache).install(&[installed], None).unwrap();
-    assert_eq!(pages(2), Some((0, vec![3])));
-    runner.set_draft_pages(pages);
+    // The drafter's rows read their slots' entries of the draft group's class: a batch whose
+    // slot holds a draft page reaches the replay with its drafter's table stated.
+    let mut tables = held(&[2, 4]);
+    allocate(&mut tables, 2, pool.group as u8, 0, &[(UNITS, 30, 1)]);
+    let refused = runner.execute(&verification(0.0), &tables).unwrap_err();
+    assert!(matches!(refused, Error::State(_)), "{refused}");
 }

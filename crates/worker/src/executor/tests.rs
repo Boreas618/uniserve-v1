@@ -1,27 +1,32 @@
 //! Executors without a device: runners over [`Graphs::meta`], which run the profile run, the
 //! capture and the whole generation state machine with every device step left out, driven
-//! through the executor's queue.
+//! through the executor's queue, and worker groups of such executors driven through
+//! [`Executors`] with the buffer pool's requests and completions.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use ipc::PhaseId;
-use ipc::execution::{
-    Batch, BatchColumns, BatchId, BatchOutput, Batches, CallId, CallOutput, Computation, Extent,
-    Outcome, RowState, Shape as BatchShape, Submission, Variant,
+use ipc::RequestId;
+use ipc::batch::{
+    Batch, BatchId, BatchOutput, CallOutput, CallStatus, Columns, MediaRow, Phase,
+    Shape as BatchShape, Variant,
 };
 use nn::functional::{embedding, rms_norm};
 use ops::{Generation, Kernel, KernelEntry};
 use platform::NativeLibrary;
+use storage::QueuePair;
+use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run, Tier};
 use uniserve_tensor::{DType, Tensor};
 
 use super::peers::{Liveness, Remote, Upstream, accept, register};
 use super::watchdog::{CONTEXT_CHECK, Watchdog};
-use super::{Executor, Executors, Job};
+use super::{Executor, Executors, Sequences};
 use crate::buckets::Bucket;
+use crate::completion::{Outcome, Submission};
 use crate::graphs::Graphs;
+use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::runner::Runner;
 use crate::{Error, Result, lock};
 
@@ -37,14 +42,25 @@ const INPUTS: u64 = 256;
 /// The batch a runner refuses.
 const REFUSED: u64 = 13;
 
+/// The worker group of the tests' executors, and the regions its ranks map: the KV units on the
+/// device and the host pool of their copies.
+const GROUP: GroupId = GroupId(3);
+const DEVICE: u8 = 0;
+const HOST: u8 = 1;
+
+/// The phase the `index`-th runner of a test executor serves, and one no runner serves.
+const PHASES: [Phase; 2] = [Phase::Decode, Phase::Prefill];
+const UNSERVED: Phase = Phase::Denoise;
+
 /// What the runners of one test did, in the order they did it.
 type Log = Arc<Mutex<Vec<String>>>;
 
 /// A runner of a model of two operators over meta weights. It states what it is asked to do in
-/// the test's log and returns one output per call of a batch.
+/// the test's log, with the device block table entries of class 0 each slot its batch reads
+/// holds, and returns one output per request of a batch.
 struct LoggingRunner {
     name: &'static str,
-    phases: Vec<PhaseId>,
+    phases: Vec<Phase>,
     buckets: Vec<Bucket>,
     graphs: Graphs,
     table: Tensor,
@@ -58,14 +74,14 @@ struct LoggingRunner {
 }
 
 impl LoggingRunner {
-    fn new(name: &'static str, phase: u16, kernels: Arc<Generation>, log: &Log) -> Self {
+    fn new(name: &'static str, phase: Phase, kernels: Arc<Generation>, log: &Log) -> Self {
         let weight = |address: u64, dims: &[usize]| {
             backend::retained(address, dims, DType::BF16, &backend::meta()).unwrap()
         };
 
         Self {
             name,
-            phases: vec![PhaseId(phase)],
+            phases: vec![phase],
             buckets: vec![
                 Bucket::decode(8, Variant::DecodeGreedy),
                 Bucket::decode(4, Variant::DecodeGreedy),
@@ -86,7 +102,7 @@ impl LoggingRunner {
 }
 
 impl Runner for LoggingRunner {
-    fn phases(&self) -> &[PhaseId] {
+    fn phases(&self) -> &[Phase] {
         &self.phases
     }
 
@@ -117,7 +133,8 @@ impl Runner for LoggingRunner {
         Ok(())
     }
 
-    fn prepare_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+    fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
+        let _ = tables;
         let bucket = self
             .graphs
             .select(|bucket| bucket.holds(&batch.shape))
@@ -128,12 +145,12 @@ impl Runner for LoggingRunner {
         Ok(bucket)
     }
 
-    fn prepare_shadow_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+    fn prepare_shadow_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
         // The runner's forward writes no state, so a paired forward's inputs are a step's.
-        self.prepare_inputs(batch)
+        self.prepare_inputs(batch, tables)
     }
 
-    fn execute(&mut self, batch: &Batch) -> Result<BatchOutput> {
+    fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
         if let Some((held, entered, released)) = &self.held
             && held.contains(&batch.id.0)
         {
@@ -144,25 +161,31 @@ impl Runner for LoggingRunner {
             return Err(Error::Invalid("the runner refuses this batch".into()));
         }
 
-        let loads: Vec<u32> = batch.page_loads.iter().map(|copy| copy.rank).collect();
         let warming = if self.warming.load(Ordering::Acquire) {
             " during a warm-up"
         } else {
             ""
         };
+        let read: String = batch
+            .columns
+            .slots
+            .iter()
+            .map(|&slot| {
+                let entries: Vec<(u32, Run)> = tables.entries(slot as u32, 0).collect();
+                format!(" reading slot {slot} at {entries:?}")
+            })
+            .collect();
         self.state(format!(
-            "execute {} at generation {} with the page loads of ranks {loads:?}{warming}",
+            "execute {} at generation {}{read}{warming}",
             batch.id.0,
             self.graphs.generation()
         ));
 
         Ok(BatchOutput {
             calls: batch
-                .calls
+                .requests
                 .iter()
-                .map(|call| {
-                    CallOutput::completed(*call, vec![batch.id.0 as u32], RowState::default())
-                })
+                .map(|_| completed(batch.id.0))
                 .collect(),
             ..BatchOutput::default()
         })
@@ -180,6 +203,32 @@ impl Runner for LoggingRunner {
         self.state("weights changed".to_owned());
         Ok(())
     }
+
+    fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
+        let copies: Vec<(u64, Vec<(Run, Run)>)> = copies
+            .iter()
+            .map(|copy| (copy.request.0, copy.runs.clone()))
+            .collect();
+        self.state(format!("copy {copies:?}"));
+        Ok(())
+    }
+}
+
+/// A call's output that sampled `token`.
+fn completed(token: u64) -> CallOutput {
+    CallOutput {
+        status: CallStatus::Ok,
+        error_code: None,
+        error_message: None,
+        tokens: vec![token as u32],
+        step_index: 1,
+        cache_computed_len: 1,
+        cache_visible_len: 1,
+        token_logprobs: Vec::new(),
+        prompt_logprobs: Vec::new(),
+        media_output: None,
+        draft_token_ids: Vec::new(),
+    }
 }
 
 /// A kernel no test launches: an entry of the C library stands in for a package's.
@@ -192,7 +241,7 @@ fn kernel() -> Arc<Kernel> {
 fn serving() -> Arc<Generation> {
     let profiled = LoggingRunner::new(
         "profiled",
-        0,
+        Phase::Decode,
         Arc::new(Generation::new(0, [])),
         &Log::default(),
     );
@@ -223,48 +272,62 @@ fn replacing(serving: &Generation, number: u64, operator: &'static str) -> Arc<G
     )
 }
 
-/// An executor with no device over one runner per name, the `index`-th serving phase `index`,
-/// with the generation they serve.
+/// The executor with no device of rank `rank` of `sequences`' group over `runners`.
+fn spawn(
+    runners: Vec<Box<dyn Runner>>,
+    kernels: &Arc<Generation>,
+    sequences: &Arc<Sequences>,
+    rank: usize,
+) -> Executor {
+    let tables = BlockTables::new(sequences.group(), &[DEVICE, HOST]);
+    Executor::spawn(
+        None,
+        runners,
+        Arc::clone(kernels),
+        tables,
+        Arc::clone(sequences),
+        rank,
+    )
+    .unwrap()
+}
+
+/// An executor with no device, the one rank of group `GROUP`, over one runner per name, the
+/// `index`-th serving `PHASES[index]`, with the generation they serve.
 fn executor(names: &[&'static str], log: &Log) -> (Executor, Arc<Generation>) {
     let kernels = serving();
     let runners = names
         .iter()
-        .enumerate()
-        .map(|(phase, name)| {
-            Box::new(LoggingRunner::new(
-                name,
-                phase as u16,
-                Arc::clone(&kernels),
-                log,
-            )) as Box<dyn Runner>
+        .zip(PHASES)
+        .map(|(name, phase)| {
+            Box::new(LoggingRunner::new(name, phase, Arc::clone(&kernels), log)) as Box<dyn Runner>
         })
         .collect();
 
-    let executor = Executor::spawn(None, runners, Arc::clone(&kernels)).unwrap();
+    let sequences = Sequences::new(GROUP, 1, Vec::new());
+    let executor = spawn(runners, &kernels, &sequences, 0);
     (executor, kernels)
 }
 
-/// A decode batch `id` of `rows` rows and one call for `phase` of group `decode`.
-fn batch(id: u64, phase: u16, rows: u32) -> Batch {
+/// A decode batch `id` of group `GROUP` and `phase`, of `rows` rows and one request.
+fn batch(id: u64, phase: Phase, rows: u32) -> Batch {
     Batch {
         id: BatchId(id),
-        phase: PhaseId(phase),
-        group: "decode".to_owned(),
-        calls: vec![CallId(id)],
-        shape: BatchShape::decode(rows, Variant::DecodeGreedy),
-        columns: BatchColumns::default(),
+        group: GROUP,
+        phase,
         generation: 1,
-        cache_units: Vec::new(),
-        block_tables: Vec::new(),
-        page_loads: Vec::new(),
-        page_offloads: Vec::new(),
-        latent_restores: Vec::new(),
-        host_outputs: Vec::new(),
-        images: Vec::new(),
-        buffers: Vec::new(),
-        frees: Vec::new(),
-        media: None,
+        shape: BatchShape::decode(rows, Variant::DecodeGreedy),
+        requests: vec![RequestId(id)],
+        columns: Columns::default(),
+        media: Vec::new(),
+        new_slots: Vec::new(),
     }
+}
+
+/// As [`batch`], of phase `Decode`, with a row reading `slot`.
+fn reading(id: u64, slot: i32) -> Batch {
+    let mut batch = batch(id, Phase::Decode, 1);
+    batch.columns.slots = vec![slot];
+    batch
 }
 
 /// Holds `executor` inside a control operation until the returned sender is dropped, and
@@ -289,14 +352,19 @@ fn hold(executor: &Executor) -> (Sender<()>, Submission) {
     (release, submission)
 }
 
-/// The output of `submission`, which succeeds.
-fn output_of(submission: &Submission) -> BatchOutput {
+/// What `submission`, which succeeds, returned.
+fn returned_by(submission: &Submission) -> (BatchOutput, Vec<Request>) {
     match submission.wait_timeout(LONG) {
-        Some(Outcome::Success(output)) => output,
+        Some(Outcome::Success(returned)) => returned,
         Some(Outcome::Failed(error)) => panic!("the job failed: {error}"),
         Some(Outcome::Cancelled) => panic!("the job was cancelled"),
         None => panic!("the job did not complete"),
     }
+}
+
+/// The output of `submission`, which succeeds.
+fn output_of(submission: &Submission) -> BatchOutput {
+    returned_by(submission).0
 }
 
 /// The error of `submission`, which fails.
@@ -330,7 +398,7 @@ fn jobs_run_in_submission_order_and_a_control_operation_runs_between_two_batches
 
     let (release, held) = hold(&executor);
     let before = Instant::now();
-    let first = executor.submit(batch(1, 0, 2)).unwrap();
+    let first = executor.submit(1, batch(1, Phase::Decode, 2)).unwrap();
     let submitted = Instant::now();
     let control = executor
         .control(
@@ -342,7 +410,7 @@ fn jobs_run_in_submission_order_and_a_control_operation_runs_between_two_batches
             }),
         )
         .unwrap();
-    let second = executor.submit(batch(2, 0, 2)).unwrap();
+    let second = executor.submit(2, batch(2, Phase::Decode, 2)).unwrap();
 
     // Nothing behind the job in flight has run.
     assert!(first.outcome().is_none());
@@ -359,9 +427,9 @@ fn jobs_run_in_submission_order_and_a_control_operation_runs_between_two_batches
     assert_eq!(
         entries(&log),
         [
-            "a: execute 1 at generation 1 with the page loads of ranks []",
+            "a: execute 1 at generation 1",
             "a: weights changed",
-            "a: execute 2 at generation 1 with the page loads of ranks []",
+            "a: execute 2 at generation 1",
         ]
     );
 
@@ -369,7 +437,6 @@ fn jobs_run_in_submission_order_and_a_control_operation_runs_between_two_batches
     // least the time it was held behind the operation, and no more than the time from before
     // its submission to its completion.
     assert_eq!(output.calls.len(), 1);
-    assert_eq!(output.calls[0].call, CallId(1));
     assert_eq!(output.calls[0].tokens, [1]);
     let queued = u128::from(output.timing.queued_us);
     assert!(queued >= (released - submitted).as_micros(), "{queued}");
@@ -385,7 +452,7 @@ fn a_waiter_on_a_submission_is_woken_by_its_completion() {
     let (executor, _) = executor(&["a"], &log);
 
     let (release, held) = hold(&executor);
-    let submission = executor.submit(batch(1, 0, 2)).unwrap();
+    let submission = executor.submit(1, batch(1, Phase::Decode, 2)).unwrap();
 
     let (woken, woke) = crossbeam_channel::bounded(1);
     let waiter = std::thread::spawn(move || {
@@ -410,34 +477,33 @@ fn a_waiter_on_a_submission_is_woken_by_its_completion() {
 fn a_batch_goes_to_the_runner_of_its_phase_and_one_no_runner_serves_is_refused() {
     let log = Log::default();
     let (executor, _) = executor(&["a", "b"], &log);
-    assert_eq!(executor.phases(), [PhaseId(0), PhaseId(1)]);
+    assert_eq!(executor.phases(), PHASES);
 
-    output_of(&executor.submit(batch(1, 1, 2)).unwrap());
-    output_of(&executor.submit(batch(2, 0, 2)).unwrap());
+    output_of(&executor.submit(1, batch(1, Phase::Prefill, 2)).unwrap());
+    output_of(&executor.submit(2, batch(2, Phase::Decode, 2)).unwrap());
     assert_eq!(
         entries(&log),
         [
-            "b: execute 1 at generation 1 with the page loads of ranks []",
-            "a: execute 2 at generation 1 with the page loads of ranks []",
+            "b: execute 1 at generation 1",
+            "a: execute 2 at generation 1",
         ]
     );
 
     // The refusal is made where the batch is submitted and names both sides.
-    let refused = executor.submit(batch(3, 7, 2)).unwrap_err();
+    let refused = executor.submit(3, batch(3, UNSERVED, 2)).unwrap_err();
     assert!(matches!(refused, Error::Invalid(_)), "{refused}");
     let refused = refused.to_string();
     assert!(
-        refused.contains("phase 7") && refused.contains("[0, 1]"),
+        refused.contains("Denoise") && refused.contains("[Decode, Prefill]"),
         "{refused}"
     );
 
-    // So is a join a peer submits through the queue for a phase nothing here serves.
-    assert!(
-        executor
-            .queue()
-            .submit(Job::Execute(Box::new(batch(4, 9, 1))))
-            .is_err()
-    );
+    // An expert join takes no number and is refused for a phase nothing here serves, and a
+    // batch of any other variant is never taken as one.
+    let mut join = batch(4, UNSERVED, 1);
+    join.shape = BatchShape::decode(1, Variant::ExpertJoin);
+    assert!(executor.join(join).is_err());
+    assert!(executor.join(batch(5, Phase::Decode, 1)).is_err());
 }
 
 #[test]
@@ -448,7 +514,7 @@ fn warm_up_captures_every_bucket_largest_first_and_batches_run_between_captures(
     // The warm-up and a batch are queued behind the job in flight, in that order.
     let (release, held) = hold(&executor);
     let warm_up = executor.warm_up().unwrap();
-    let served = executor.submit(batch(1, 0, 2)).unwrap();
+    let served = executor.submit(1, batch(1, Phase::Decode, 2)).unwrap();
     drop(release);
 
     output_of(&held);
@@ -461,7 +527,7 @@ fn warm_up_captures_every_bucket_largest_first_and_batches_run_between_captures(
         entries(&log),
         [
             "a: capture decode_greedy/8 rows/8 tokens",
-            "a: execute 1 at generation 1 with the page loads of ranks [] during a warm-up",
+            "a: execute 1 at generation 1 during a warm-up",
             "a: capture decode_greedy/4 rows/4 tokens",
             "a: capture decode_greedy/2 rows/2 tokens",
             "b: capture decode_greedy/8 rows/8 tokens",
@@ -485,10 +551,10 @@ fn warm_up_captures_every_bucket_largest_first_and_batches_run_between_captures(
     assert_eq!(entries(&log).len(), 7);
 
     // The warm-up ended: a batch after it is no warm-up's.
-    output_of(&executor.submit(batch(2, 0, 2)).unwrap());
+    output_of(&executor.submit(2, batch(2, Phase::Decode, 2)).unwrap());
     assert_eq!(
         entries(&log).last().map(String::as_str),
-        Some("a: execute 2 at generation 1 with the page loads of ranks []")
+        Some("a: execute 2 at generation 1")
     );
 }
 
@@ -507,9 +573,9 @@ fn a_generation_is_prepared_switched_to_and_committed_on_every_runner_between_ba
 
     // The switch takes effect between the batch submitted before it and the one after it.
     let (release, held) = hold(&executor);
-    let before = executor.submit(batch(1, 0, 2)).unwrap();
+    let before = executor.submit(1, batch(1, Phase::Decode, 2)).unwrap();
     let switch = executor.switch(2).unwrap();
-    let after = executor.submit(batch(2, 1, 2)).unwrap();
+    let after = executor.submit(2, batch(2, Phase::Prefill, 2)).unwrap();
     drop(release);
     for submission in [&held, &before, &switch, &after] {
         output_of(submission);
@@ -518,8 +584,8 @@ fn a_generation_is_prepared_switched_to_and_committed_on_every_runner_between_ba
     assert_eq!(
         entries(&log),
         [
-            "a: execute 1 at generation 1 with the page loads of ranks []",
-            "b: execute 2 at generation 2 with the page loads of ranks []",
+            "a: execute 1 at generation 1",
+            "b: execute 2 at generation 2",
         ]
     );
     assert_eq!(generations(&executor), [2, 2]);
@@ -605,14 +671,16 @@ fn a_failed_job_states_the_work_in_flight_and_the_jobs_behind_it_run() {
     let (executor, _) = executor(&["a"], &log);
 
     let (release, held) = hold(&executor);
-    let refused = executor.submit(batch(REFUSED, 0, 2)).unwrap();
+    let refused = executor
+        .submit(1, batch(REFUSED, Phase::Decode, 2))
+        .unwrap();
     let broken = executor
         .control(
             "giving the cache's segments back",
             Box::new(|_| Err(Error::Resource("the storage refused"))),
         )
         .unwrap();
-    let served = executor.submit(batch(2, 0, 2)).unwrap();
+    let served = executor.submit(2, batch(2, Phase::Decode, 2)).unwrap();
     drop(release);
     output_of(&held);
 
@@ -620,12 +688,12 @@ fn a_failed_job_states_the_work_in_flight_and_the_jobs_behind_it_run() {
     let error = failure_of(&refused);
     assert!(error.contains("the runner refuses this batch"), "{error}");
     assert!(
-        error.contains("in flight: executing batch 13 of phase 0"),
+        error.contains("in flight: executing batch 13 of phase Decode"),
         "{error}"
     );
     assert_eq!(
         refused.failure_label().as_deref(),
-        Some("executing batch 13 of phase 0 (decode_greedy/2 rows/2 tokens)")
+        Some("executing batch 13 of phase Decode (decode_greedy/2 rows/2 tokens)")
     );
 
     let error = failure_of(&broken);
@@ -654,13 +722,14 @@ fn the_watchdog_reads_the_job_in_flight_longest_with_its_batch() {
     // control operation it took later.
     let (entered, in_flight) = crossbeam_channel::bounded(1);
     let (release_batch, released) = crossbeam_channel::bounded::<()>(1);
-    let mut runner = LoggingRunner::new("a", 0, Arc::clone(&kernels), &log);
+    let mut runner = LoggingRunner::new("a", Phase::Decode, Arc::clone(&kernels), &log);
     runner.held = Some((vec![5], entered, released));
-    let first = Executor::spawn(None, vec![Box::new(runner)], Arc::clone(&kernels)).unwrap();
+    let sequences = Sequences::new(GROUP, 1, Vec::new());
+    let first = spawn(vec![Box::new(runner)], &kernels, &sequences, 0);
     let (second, _) = executor(&["b"], &log);
 
     assert_eq!(first.in_flight(), None);
-    let stuck = first.submit(batch(5, 0, 2)).unwrap();
+    let stuck = first.submit(1, batch(5, Phase::Decode, 2)).unwrap();
     assert_eq!(in_flight.recv_timeout(LONG), Ok(5));
     let (release, held) = hold(&second);
 
@@ -672,7 +741,7 @@ fn the_watchdog_reads_the_job_in_flight_longest_with_its_batch() {
     assert!(since <= later);
     assert_eq!(
         first.performing().as_deref(),
-        Some("executing batch 5 of phase 0 (decode_greedy/2 rows/2 tokens)")
+        Some("executing batch 5 of phase Decode (decode_greedy/2 rows/2 tokens)")
     );
     assert_eq!(
         second.performing().as_deref(),
@@ -709,7 +778,7 @@ fn a_closed_queue_cancels_its_queued_jobs_and_takes_no_other() {
     let (executor, _) = executor(&["a"], &log);
 
     let (release, held) = hold(&executor);
-    let queued = executor.submit(batch(1, 0, 2)).unwrap();
+    let queued = executor.submit(1, batch(1, Phase::Decode, 2)).unwrap();
     executor.queue().close();
 
     // The queued job's waiter is woken with the cancellation; the job in flight ends.
@@ -718,7 +787,7 @@ fn a_closed_queue_cancels_its_queued_jobs_and_takes_no_other() {
         Some(Outcome::Cancelled)
     ));
     assert!(matches!(
-        executor.submit(batch(2, 0, 2)),
+        executor.submit(2, batch(2, Phase::Decode, 2)),
         Err(Error::State(_))
     ));
 
@@ -734,10 +803,12 @@ fn a_shadow_batch_compares_the_replaced_operators_its_bucket_launches() {
     let (executor, kernels) = executor(&["a"], &log);
     output_of(&executor.warm_up().unwrap());
 
-    let shadow = |generation: u64| {
-        let mut batch = batch(20, 0, 3);
+    let mut sequence = 0;
+    let mut shadow = |generation: u64| {
+        let mut batch = batch(20, Phase::Decode, 3);
         batch.generation = generation;
-        executor.shadow(batch).unwrap()
+        sequence += 1;
+        executor.shadow(sequence, batch).unwrap()
     };
 
     // A generation nobody prepares has nothing to be compared with.
@@ -801,88 +872,382 @@ fn an_executor_with_no_device_records_no_profiling_session() {
     assert!(refused.to_string().contains("no device"), "{refused}");
 }
 
-/// Three executors of one node: two ranks of group `decode` and one of group `prefill`, each
-/// with one runner serving phase 0.
-fn node(log: &Log) -> Executors {
-    let executors = [
-        ("decode", "decode-0"),
-        ("decode", "decode-1"),
-        ("prefill", "prefill-0"),
-    ]
-    .into_iter()
-    .map(|(group, name)| (group.to_owned(), Arc::new(executor(&[name], log).0)))
-    .collect();
+/// The buffer pool's end of a queue pair of `registers` registers, and the engine's mapping of
+/// it that a group's sequences write the `completed` word into.
+fn queue_pair(registers: usize) -> (QueuePair, QueuePair) {
+    let pool = QueuePair::create(64, registers).unwrap();
+    let engine = QueuePair::open(pool.descriptor().try_clone_to_owned().unwrap(), true).unwrap();
+    (pool, engine)
+}
 
-    Executors::new(executors, Vec::new(), Vec::new())
+/// The runners of `ranks` ranks of a group, one each, serving `Decode` and named after their
+/// rank, with the generation they serve.
+fn ranks(ranks: usize, log: &Log) -> (Vec<LoggingRunner>, Arc<Generation>) {
+    const NAMES: [&str; 3] = ["rank-0", "rank-1", "rank-2"];
+    let kernels = serving();
+
+    let runners = NAMES[..ranks]
+        .iter()
+        .map(|name| LoggingRunner::new(name, Phase::Decode, Arc::clone(&kernels), log))
+        .collect();
+    (runners, kernels)
+}
+
+/// A group of this node's executors of `GROUP`, one per runner given, whose `completed` word
+/// is held by `registers`. Returns the route, the executors and the group's sequences.
+fn group(
+    (runners, kernels): (Vec<LoggingRunner>, Arc<Generation>),
+    registers: Vec<(QueuePair, usize)>,
+) -> (Executors, Vec<Arc<Executor>>, Arc<Sequences>) {
+    let sequences = Sequences::new(GROUP, runners.len(), registers);
+    let executors: Vec<Arc<Executor>> = runners
+        .into_iter()
+        .enumerate()
+        .map(|(rank, runner)| Arc::new(spawn(vec![Box::new(runner)], &kernels, &sequences, rank)))
+        .collect();
+
+    let route =
+        Executors::new(vec![Arc::clone(&sequences)], executors.clone(), Vec::new()).unwrap();
+    (route, executors, sequences)
+}
+
+/// Maps `completion`, the answer to `request` numbered `id`, into every rank of `GROUP` under
+/// `slot`, and waits for it.
+fn map(route: &Executors, slot: u32, id: u64, request: Request, completion: Completion) {
+    returned_by(
+        &route
+            .map(GROUP, slot, runtime::RequestId(id), request, completion)
+            .unwrap(),
+    );
+}
+
+/// Attaches owner 1 in slot 2 and gives it blocks at positions 0 and 1 of class 0, on every
+/// rank of `route`'s group.
+fn attach_and_allocate(route: &Executors) {
+    let attach = Request::Attach {
+        owner: OwnerId(1),
+        group: GROUP,
+    };
+    map(route, 2, 1, attach, Completion::Attached { slot: 2 });
+
+    let allocate = Request::Allocate {
+        owner: OwnerId(1),
+        class: 0,
+        at: 0,
+        count: 2,
+        units: 0,
+    };
+    let allocated = Completion::Allocated {
+        runs: vec![(DEVICE, 7, 1), (DEVICE, 9, 1)],
+        evicted: Vec::new(),
+    };
+    map(route, 2, 2, allocate, allocated);
 }
 
 #[test]
-fn a_batch_is_submitted_to_every_executor_of_its_group_and_joined() {
+fn a_completion_mapped_before_a_batch_is_seen_by_the_batch_on_every_rank() {
     let log = Log::default();
-    let node = node(&log);
-    assert_eq!(node.device_count(), 3);
+    let (route, _, _) = group(ranks(2, &log), Vec::new());
 
-    // Each rank of the group gets the batch, with the page copies that name it.
-    let mut decode = batch(1, 0, 2);
-    decode.page_loads = [1, 0, 1]
-        .into_iter()
-        .map(|rank| ipc::PageCopy {
-            rank,
-            pool: 0,
-            group_id: 0,
-            host_page: 0,
-            units: Vec::new(),
-            staged: false,
-        })
-        .collect();
-    assert_eq!(node.devices(&decode).unwrap(), [0, 1]);
-
-    let output = output_of(&Batches::submit(&node, decode).unwrap());
-    assert_eq!(output.calls[0].call, CallId(1));
+    // The map is a job: a batch submitted after it sees its entries, on each rank.
+    attach_and_allocate(&route);
+    output_of(&route.submit(reading(1, 2)).unwrap());
 
     let mut executed = entries(&log);
     executed.sort();
+    let seen = "execute 1 at generation 1 reading slot 2 at [(0, (0, 7, 1)), (1, (0, 9, 1))]";
     assert_eq!(
         executed,
+        [format!("rank-0: {seen}"), format!("rank-1: {seen}")]
+    );
+
+    // A pair the tables refuse fails the map, and gives no rank anything: an owner given a
+    // block at a position it holds.
+    let again = Request::Allocate {
+        owner: OwnerId(1),
+        class: 0,
+        at: 1,
+        count: 1,
+        units: 0,
+    };
+    let allocated = Completion::Allocated {
+        runs: vec![(DEVICE, 11, 1)],
+        evicted: Vec::new(),
+    };
+    let refused = route
+        .map(GROUP, 2, runtime::RequestId(3), again, allocated)
+        .unwrap();
+    assert!(failure_of(&refused).contains("holds an entry"));
+
+    output_of(&route.submit(reading(2, 2)).unwrap());
+    assert!(
+        entries(&log)
+            .last()
+            .unwrap()
+            .ends_with("reading slot 2 at [(0, (0, 7, 1)), (1, (0, 9, 1))]")
+    );
+
+    // A group nothing here serves is refused by name.
+    let stray = route.map(
+        GroupId(9),
+        2,
+        runtime::RequestId(4),
+        Request::List,
+        Completion::Done,
+    );
+    assert!(stray.unwrap_err().to_string().contains("worker group 9"));
+}
+
+#[test]
+fn a_stamped_release_removes_its_entries_and_carries_the_last_batch_launched_before_it() {
+    let log = Log::default();
+    let (route, executors, _) = group(ranks(2, &log), Vec::new());
+    attach_and_allocate(&route);
+
+    let release = |at| Request::Release {
+        owner: OwnerId(1),
+        class: 0,
+        at,
+        count: 1,
+        after: Vec::new(),
+    };
+    let stamped = |at, sequence| Request::Release {
+        owner: OwnerId(1),
+        class: 0,
+        at,
+        count: 1,
+        after: vec![(GROUP, sequence)],
+    };
+
+    // Before any batch, nothing a batch addresses can hold the entry: the stamp is 0.
+    let (_, requests) = returned_by(&route.stamp(GROUP, vec![release(0)]).unwrap());
+    assert_eq!(requests, [stamped(0, 0)]);
+
+    // A stamp is the number of the last batch each rank launched when it applied the request:
+    // the batch queued ahead of it on every rank, which has not run yet when it is submitted.
+    let (first, held) = hold(&executors[0]);
+    let (second, also_held) = hold(&executors[1]);
+    let ahead = route.submit(reading(1, 2)).unwrap();
+    let stamping = route.stamp(GROUP, vec![release(1)]).unwrap();
+    assert!(stamping.outcome().is_none());
+    drop((first, second));
+    output_of(&held);
+    output_of(&also_held);
+
+    output_of(&ahead);
+    let (_, requests) = returned_by(&stamping);
+    assert_eq!(requests, [stamped(1, 1)]);
+
+    // The entries left every rank's tables before the stamp was returned: the next batch reads
+    // none, and the batch before the stamp read both.
+    output_of(&route.submit(reading(2, 2)).unwrap());
+    let read: Vec<String> = entries(&log)
+        .into_iter()
+        .filter(|line| line.starts_with("rank-0"))
+        .collect();
+    assert_eq!(
+        read,
         [
-            "decode-0: execute 1 at generation 1 with the page loads of ranks [0]",
-            "decode-1: execute 1 at generation 1 with the page loads of ranks [1, 1]",
+            "rank-0: execute 1 at generation 1 reading slot 2 at [(1, (0, 9, 1))]",
+            "rank-0: execute 2 at generation 1 reading slot 2 at []",
         ]
     );
 
-    // Another group's batch goes to that group's executor alone.
-    let mut prefill = batch(2, 0, 2);
-    prefill.group = "prefill".to_owned();
-    assert_eq!(node.devices(&prefill).unwrap(), [2]);
-    output_of(&node.submit(prefill).unwrap());
-    assert_eq!(
-        entries(&log).last().map(String::as_str),
-        Some("prefill-0: execute 2 at generation 1 with the page loads of ranks []")
-    );
+    // Only a request the executors stamp is taken, and none is applied when one is refused.
+    let attach = Request::Attach {
+        owner: OwnerId(2),
+        group: GROUP,
+    };
+    assert!(route.stamp(GROUP, vec![release(5), attach]).is_err());
+}
 
-    // A group or a phase nothing here serves is refused by name.
-    let mut stray = batch(3, 0, 2);
-    stray.group = "encode".to_owned();
-    let refused = node.submit(stray).unwrap_err().to_string();
-    assert!(refused.contains("\"encode\""), "{refused}");
+#[test]
+fn completed_is_the_smallest_ended_sequence_over_the_ranks_and_passes_no_batch_running() {
+    let log = Log::default();
+    let (pool, engine) = queue_pair(4);
+    let (entered, in_flight) = crossbeam_channel::bounded(1);
+    let (release, released) = crossbeam_channel::bounded::<()>(1);
+    let (mut runners, kernels) = ranks(2, &log);
+    runners[1].held = Some((vec![2], entered, released));
+    let (route, _, sequences) = group((runners, kernels), vec![(engine, 2)]);
+    let word = || pool.register(2).load(Ordering::Acquire);
+    assert_eq!(word(), 0);
 
-    let refused = node.submit(batch(4, 5, 2)).unwrap_err().to_string();
+    output_of(&route.submit(reading(1, 2)).unwrap());
+    assert_eq!(word(), 1);
+
+    // Rank 1 is inside batch 2, which rank 0 has ended: the group's word stays at 1.
+    let second = route.submit(reading(2, 2)).unwrap();
+    assert_eq!(in_flight.recv_timeout(LONG), Ok(2));
+    let third = route.submit(reading(3, 2)).unwrap();
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline {
+        assert_eq!(word(), 1, "completed passed a batch that has not ended");
+        assert_eq!(sequences.completed(), 1);
+    }
+
+    // Once every rank ended the batches, the word covers them, before their outputs are read.
+    drop(release);
+    let (second, third) = (second.wait(), third.wait());
+    assert!(matches!(second, Outcome::Success(_)) && matches!(third, Outcome::Success(_)));
+    assert_eq!(word(), 3);
+    assert_eq!(sequences.completed(), 3);
+}
+
+#[test]
+fn a_copy_runs_once_with_the_next_batch_and_its_finish_carries_that_batch_s_stamp() {
+    let log = Log::default();
+    let (route, _, _) = group(ranks(2, &log), Vec::new());
+    attach_and_allocate(&route);
+    output_of(&route.submit(reading(1, 2)).unwrap());
+
+    // A store of the block at position 0 to the host, which every rank runs.
+    let store = Request::Store {
+        group: GROUP,
+        keys: vec![storage::Key([4; 32])],
+        tier: Tier::Host,
+    };
+    let copy = Completion::Copy {
+        group: GROUP,
+        keys: vec![storage::Key([4; 32])],
+        from: vec![(DEVICE, 7, 1)],
+        to: vec![(HOST, 3, 1)],
+        evicted: Vec::new(),
+    };
+    map(&route, 0, 10, store, copy);
+
+    // The next batch, number 2, runs it on each rank and returns its `Finish` with its stamp.
+    let (_, requests) = returned_by(&route.submit(reading(2, 2)).unwrap());
+    let finish = Request::Finish {
+        copy: runtime::RequestId(10),
+        ok: true,
+        after: vec![(GROUP, 2)],
+    };
+    assert_eq!(requests, [finish]);
+
+    // The batch after it runs no copy and returns no `Finish`.
+    let (_, requests) = returned_by(&route.submit(reading(3, 2)).unwrap());
+    assert!(requests.is_empty());
+
+    let copies: Vec<String> = entries(&log)
+        .into_iter()
+        .filter(|line| line.contains("copy"))
+        .collect();
+    assert_eq!(copies.len(), 2, "{copies:?}");
+    for rank in ["rank-0", "rank-1"] {
+        assert!(
+            copies.contains(&format!("{rank}: copy [(10, [((0, 7, 1), (1, 3, 1))])]")),
+            "{copies:?}"
+        );
+    }
+}
+
+#[test]
+fn a_copy_given_up_before_a_batch_started_it_never_runs_and_returns_no_finish() {
+    let log = Log::default();
+    let (route, _, _) = group(ranks(2, &log), Vec::new());
+    attach_and_allocate(&route);
+
+    // A load into position 2, given up before any batch took it.
+    let load = Request::Load {
+        owner: OwnerId(1),
+        class: 0,
+        at: 2,
+        keys: vec![storage::Key([5; 32])],
+    };
+    let copy = Completion::Copy {
+        group: GROUP,
+        keys: vec![storage::Key([5; 32])],
+        from: vec![(HOST, 0, 1)],
+        to: vec![(DEVICE, 12, 1)],
+        evicted: Vec::new(),
+    };
+    map(&route, 2, 20, load, copy);
+
+    let give_up = Request::Finish {
+        copy: runtime::RequestId(20),
+        ok: false,
+        after: Vec::new(),
+    };
+    let (_, requests) = returned_by(&route.stamp(GROUP, vec![give_up]).unwrap());
+    let stamped = Request::Finish {
+        copy: runtime::RequestId(20),
+        ok: false,
+        after: vec![(GROUP, 0)],
+    };
+    assert_eq!(requests, [stamped]);
+
+    // No batch runs it, none returns a `Finish` for it, and its position stays empty.
+    for id in 1..=2 {
+        let (_, requests) = returned_by(&route.submit(reading(id, 2)).unwrap());
+        assert!(requests.is_empty());
+    }
+    let log = entries(&log);
+    assert!(log.iter().all(|line| !line.contains("copy")), "{log:?}");
     assert!(
-        refused.contains("phase 5") && refused.contains("[0, 0]"),
-        "{refused}"
+        log.last()
+            .unwrap()
+            .ends_with("reading slot 2 at [(0, (0, 7, 1)), (1, (0, 9, 1))]")
     );
+}
+
+#[test]
+fn a_batch_a_rank_runs_alone_is_passed_by_the_others_and_ends_on_every_rank() {
+    let log = Log::default();
+    let (pool, engine) = queue_pair(1);
+    let (route, _, sequences) = group(ranks(3, &log), vec![(engine, 0)]);
+
+    // A video decode round named for rank 1 of three.
+    let mut alone = batch(1, Phase::Decode, 1);
+    alone.media = vec![MediaRow {
+        request: RequestId(1),
+        slot: 1,
+        conditioning: Vec::new(),
+        step: 0,
+        steps: 1,
+        seed: 0,
+        width: 832,
+        height: 480,
+        frames: 25,
+        rounds: 1,
+        unit: 0,
+        rank: Some(1),
+        image: None,
+        results: Vec::new(),
+        reads: 0,
+    }];
+    let output = output_of(&route.submit(alone.clone()).unwrap());
+    assert_eq!(output.calls[0].tokens, [1]);
+    assert_eq!(entries(&log), ["rank-1: execute 1 at generation 1"]);
+
+    // Every rank took its number, so the group's word covers it.
+    assert_eq!(sequences.completed(), 1);
+    assert_eq!(pool.register(0).load(Ordering::Acquire), 1);
+
+    // A rank that is not this node's is refused before any rank takes a number.
+    alone.media[0].rank = Some(3);
+    assert!(route.submit(alone).is_err());
+    output_of(&route.submit(batch(2, Phase::Decode, 1)).unwrap());
+    assert_eq!(sequences.completed(), 2);
 }
 
 #[test]
 fn a_joined_submission_fails_with_the_rank_that_failed() {
     let log = Log::default();
-    let node = node(&log);
+    let (route, _, _) = group(ranks(2, &log), Vec::new());
 
     // Both ranks refuse the batch; the group's submission is the failure.
-    let submission = node.submit(batch(REFUSED, 0, 2)).unwrap();
+    let submission = route.submit(batch(REFUSED, Phase::Decode, 2)).unwrap();
     let refused = failure_of(&submission);
     assert!(
         refused.contains("the runner refuses this batch"),
+        "{refused}"
+    );
+
+    // A phase no rank of the group serves is refused by name, and takes no number.
+    let refused = route.submit(batch(4, UNSERVED, 2)).unwrap_err().to_string();
+    assert!(
+        refused.contains("Denoise") && refused.contains("[Decode, Decode]"),
         "{refused}"
     );
 }
@@ -890,10 +1255,10 @@ fn a_joined_submission_fails_with_the_rank_that_failed() {
 #[test]
 fn a_control_operation_is_submitted_to_every_executor_of_a_node() {
     let log = Log::default();
-    let node = node(&log);
+    let (route, _, _) = group(ranks(3, &log), Vec::new());
 
     let ranks = Arc::new(Mutex::new(Vec::new()));
-    let submission = node
+    let submission = route
         .control("copying each rank's pages", |rank| {
             let ranks = Arc::clone(&ranks);
             Box::new(move |runners| {
@@ -910,75 +1275,20 @@ fn a_control_operation_is_submitted_to_every_executor_of_a_node() {
 }
 
 #[test]
-fn the_media_query_is_served_from_the_buckets_the_runners_state() {
-    let log = Log::default();
-    let kernels = serving();
-
-    let mut runner = LoggingRunner::new("media", 0, Arc::clone(&kernels), &log);
-    runner.buckets = vec![
-        Bucket::host(Variant::Mux),
-        Bucket::clip(25, 480, 832),
-        Bucket::clip(13, 480, 832),
-    ];
-    let executor = Executor::spawn(None, vec![Box::new(runner)], kernels).unwrap();
-    let node = Executors::new(
-        vec![("media".to_owned(), Arc::new(executor))],
-        Vec::new(),
-        Vec::new(),
-    );
-
-    let computation = |call, extent| Computation {
-        call,
-        rows: 1,
-        tokens: 0,
-        extent,
-    };
-    let clip = |frames| Extent::Clip {
-        frames,
-        height: 480,
-        width: 832,
-    };
-
-    // A stated extent is served by the bucket of exactly that extent, or not at all.
-    let decode = computation(ipc::MediaCall::VideoDecoding, clip(25));
-    assert_eq!(
-        node.media(PhaseId(0), &decode).unwrap(),
-        Some(Bucket::clip(25, 480, 832))
-    );
-    let other = computation(ipc::MediaCall::VideoDecoding, clip(49));
-    assert_eq!(Batches::media(&node, PhaseId(0), &other).unwrap(), None);
-
-    // A host call's bucket holds every computation of its call; a call no bucket states is not
-    // served, and a phase no executor serves is refused.
-    let mux = computation(ipc::MediaCall::Muxing, Extent::None);
-    assert_eq!(
-        node.media(PhaseId(0), &mux).unwrap(),
-        Some(Bucket::host(Variant::Mux))
-    );
-    let denoise = computation(ipc::MediaCall::Denoising, Extent::None);
-    assert_eq!(node.media(PhaseId(0), &denoise).unwrap(), None);
-    assert!(node.media(PhaseId(4), &mux).is_err());
-}
-
-#[test]
-fn a_batch_of_ranks_on_another_host_runs_there_and_its_output_returns() {
+fn a_group_s_ranks_on_another_host_take_its_jobs_and_state_what_they_ended() {
     let log = Log::default();
     let listener = ipc::Listener::bind(&["127.0.0.1:0"]).unwrap();
     let address = listener.addresses()[0].clone();
 
     // The peer: an engine process holding the group's one rank, serving the scheduler node's
-    // batches until the test closes the link.
+    // jobs until the test closes the link.
     let (release, released) = crossbeam_channel::bounded::<()>(1);
     let peer = {
         let log = Arc::clone(&log);
 
         std::thread::spawn(move || {
             let channel = register(&address, 0, 7, LONG).unwrap();
-            let ranks = Executors::new(
-                vec![("decode".to_owned(), Arc::new(executor(&["peer"], &log).0))],
-                Vec::new(),
-                Vec::new(),
-            );
+            let (ranks, _, _) = group(ranks(1, &log), Vec::new());
             let waker = ipc::Waker::new().unwrap();
             let liveness = Liveness::new(waker.wake(), Duration::from_secs(3600));
             let upstream = Upstream::serve(
@@ -994,34 +1304,60 @@ fn a_batch_of_ranks_on_another_host_runs_there_and_its_output_returns() {
         })
     };
 
-    // The scheduler node: it holds no rank of the group, only the link to the peer.
+    // The scheduler node: it holds no rank of the group, only the link to the peer, whose
+    // ended sequence its register holds.
     let (rank, channel) = accept(&listener, 1, 7, LONG).unwrap().pop().unwrap();
     let waker = ipc::Waker::new().unwrap();
     let liveness = Liveness::new(waker.wake(), Duration::from_secs(3600));
     let remote = Remote::spawn(rank, channel, Arc::clone(&liveness)).unwrap();
+    let (pool, engine) = queue_pair(1);
+    let sequences = Sequences::new(GROUP, 1, vec![(engine, 0)]);
     let node = Executors::new(
+        vec![Arc::clone(&sequences)],
         Vec::new(),
-        vec![(vec!["decode".to_owned()], Arc::clone(&remote))],
-        Vec::new(),
-    );
+        vec![(vec![GROUP], Arc::clone(&remote))],
+    )
+    .unwrap();
 
-    let sent = batch(1, 0, 2);
-    assert_eq!(node.devices(&sent).unwrap(), [0]);
-    let output = output_of(&node.submit(sent).unwrap());
+    // The completions and the batch reach the peer's rank in order, and the batch's output and
+    // the peer's ended sequence come back.
+    attach_and_allocate(&node);
+    let output = output_of(&node.submit(reading(1, 2)).unwrap());
     assert_eq!(output.calls[0].tokens, [1]);
     assert_eq!(
         entries(&log),
-        ["peer: execute 1 at generation 1 with the page loads of ranks []"]
+        ["rank-0: execute 1 at generation 1 reading slot 2 at [(0, (0, 7, 1)), (1, (0, 9, 1))]"]
+    );
+    assert_eq!(pool.register(0).load(Ordering::Acquire), 1);
+
+    // A stamp is the peer's.
+    let release_entry = Request::Release {
+        owner: OwnerId(1),
+        class: 0,
+        at: 0,
+        count: 1,
+        after: Vec::new(),
+    };
+    let (_, requests) = returned_by(&node.stamp(GROUP, vec![release_entry]).unwrap());
+    assert_eq!(
+        requests,
+        [Request::Release {
+            owner: OwnerId(1),
+            class: 0,
+            at: 0,
+            count: 1,
+            after: vec![(GROUP, 1)],
+        }]
     );
 
     // A batch the peer's ranks refuse fails the scheduler's submission with the peer's reason.
-    let refused = failure_of(&node.submit(batch(REFUSED, 0, 2)).unwrap());
+    let refused = failure_of(&node.submit(batch(REFUSED, Phase::Decode, 2)).unwrap());
     assert!(
         refused.contains("the runner refuses this batch"),
         "{refused}"
     );
-    let refused = failure_of(&node.submit(batch(2, 6, 2)).unwrap());
-    assert!(refused.contains("phase 6"), "{refused}");
+    let refused = failure_of(&node.submit(batch(3, UNSERVED, 2)).unwrap());
+    assert!(refused.contains("Denoise"), "{refused}");
 
     // A close the scheduler node asked for is not the loss of its peer.
     remote.close();
@@ -1036,8 +1372,18 @@ fn an_executor_of_a_device_waits_for_events_recorded_on_its_streams() {
     let log = Log::default();
     let kernels = serving();
     let device = platform::DeviceId(0);
-    let runner = LoggingRunner::new("a", 0, Arc::clone(&kernels), &log);
-    let executor = Executor::spawn(Some(device), vec![Box::new(runner)], kernels).unwrap();
+    let runner = LoggingRunner::new("a", Phase::Decode, Arc::clone(&kernels), &log);
+    let sequences = Sequences::new(GROUP, 1, Vec::new());
+    let tables = BlockTables::new(GROUP, &[DEVICE, HOST]);
+    let executor = Executor::spawn(
+        Some(device),
+        vec![Box::new(runner)],
+        kernels,
+        tables,
+        sequences,
+        0,
+    )
+    .unwrap();
 
     // A storage owner's work is issued by the executor: an event recorded on a stream in one
     // job is waited for in a later one.
@@ -1061,6 +1407,6 @@ fn an_executor_of_a_device_waits_for_events_recorded_on_its_streams() {
     assert!(matches!(executor.sticky_error(), Ok(None)));
 
     // A batch's output carries what the rank observed, once something observes it.
-    let output = output_of(&executor.submit(batch(1, 0, 2)).unwrap());
+    let output = output_of(&executor.submit(1, batch(1, Phase::Decode, 2)).unwrap());
     assert_eq!(output.calls.len(), 1);
 }

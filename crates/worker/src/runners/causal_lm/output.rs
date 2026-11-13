@@ -40,16 +40,19 @@
 //!   target's scores, in token order;
 //! - a call one of whose rows could not be sampled (no candidate formed a distribution, or the
 //!   greedy choice is no token of the vocabulary) fails alone, as a numerical fault: the other
-//!   calls of the batch complete.
+//!   calls of the batch complete;
+//! - a call whose tokens name a cache entry the batch may not write (`columns::slot_mapping`)
+//!   wrote nothing and fails alone, as an invariant violation ([`refuse`]): the control plane
+//!   scheduled a row outside the entries its owner may write.
 //!
 //! [`verification_output`] names the same for a verification batch: a call's tokens are its
 //! accepted prefix, the drafts its own samples agreed with and the sample after them, each
 //! with its scores. The drafts a call proposes are added by `speculation::propose`.
 
-use ipc::execution::{BatchColumns, CallId, CallOutput, RowState};
-use ipc::{CallStatus, ErrorCode};
+use ipc::batch::{CallOutput, CallStatus, Columns, ErrorCode};
 use uniserve_tensor::{Tensor, WithDType};
 
+use super::columns::Refusal;
 use super::speculation::token_rows;
 use crate::buckets::Bucket;
 use crate::sampler::scored;
@@ -71,21 +74,37 @@ fn position(column: &[i32], index: usize) -> u32 {
     length(column.get(index).copied().unwrap_or(0))
 }
 
-/// The completion of the step that served the batch of `calls` and `columns` from `bucket`,
-/// from the forward's `outputs` in their order (module documentation).
+/// A call's output before anything is known of it: performed, with no token and the default
+/// state.
+fn performed() -> CallOutput {
+    CallOutput {
+        status: CallStatus::Ok,
+        error_code: None,
+        error_message: None,
+        tokens: Vec::new(),
+        step_index: 0,
+        cache_computed_len: 0,
+        cache_visible_len: 0,
+        token_logprobs: Vec::new(),
+        prompt_logprobs: Vec::new(),
+        media_output: None,
+        draft_token_ids: Vec::new(),
+    }
+}
+
+/// The completion of the step that served the batch of `columns` from `bucket`, from the
+/// forward's `outputs` in their order (module documentation): one output per call of
+/// `columns`, in their order, which is the order of the batch's requests.
 ///
-/// `calls` names each call of `columns` in their order. `vocabulary` is the width of a logit
-/// row and `candidates` the most likely tokens a scored row reports, as the runner's sampler
-/// is configured.
+/// `vocabulary` is the width of a logit row and `candidates` the most likely tokens a scored
+/// row reports, as the runner's sampler is configured.
 ///
 /// # Errors
 ///
-/// [`Error::Invariant`] when the outputs are not the ones the bucket's forward returns, when
-/// the batch names another number of call ids than calls, or when a row whose logits the batch
-/// asked for belongs to no call.
+/// [`Error::Invariant`] when the outputs are not the ones the bucket's forward returns, or when
+/// a row whose logits the batch asked for belongs to no call.
 pub(crate) fn calls_output(
-    calls: &[CallId],
-    columns: &BatchColumns,
+    columns: &Columns,
     bucket: &Bucket,
     vocabulary: u32,
     candidates: u32,
@@ -137,13 +156,6 @@ pub(crate) fn calls_output(
 
     // ---- One completion per call, with its slot's state ----
 
-    if calls.len() != rows.calls.len() {
-        return Err(Error::Invariant(format!(
-            "the batch names {} call ids for its {} calls",
-            calls.len(),
-            rows.calls.len()
-        )));
-    }
     if rows.logits_rows.len() > tokens.len() || rows.calls.len() > logical.len() {
         return Err(Error::Invariant(format!(
             "the bucket chose {} tokens and the batch holds {} rows in {} calls",
@@ -154,21 +166,19 @@ pub(crate) fn calls_output(
     }
 
     let mut output: Vec<CallOutput> = Vec::with_capacity(rows.calls.len());
-    for (index, (id, call)) in calls.iter().zip(&rows.calls).enumerate() {
+    for (index, call) in rows.calls.iter().enumerate() {
         // The commit table is one row per call, and the sampler's slots one per row: a call
-        // reads the slot its rows share through the first row it owns.
+        // reads the slot its rows share through the first row it owns. A call on no slot
+        // reports the default state.
+        let mut entry = performed();
         let slot = columns.slots.get(call.rows.start as usize);
-        let state = if slot.is_some_and(|slot| *slot > 0) {
-            RowState {
-                step_index: position(&sampling, index),
-                cache_computed_len: position(&logical, index),
-                cache_visible_len: position(&sampling, index),
-            }
-        } else {
-            RowState::default()
-        };
+        if slot.is_some_and(|slot| *slot > 0) {
+            entry.step_index = position(&sampling, index);
+            entry.cache_computed_len = position(&logical, index);
+            entry.cache_visible_len = position(&sampling, index);
+        }
 
-        output.push(CallOutput::completed(*id, Vec::new(), state));
+        output.push(entry);
     }
 
     // ---- Each asked row's token, to the call that owns the row ----
@@ -279,8 +289,8 @@ pub(crate) fn calls_output(
     Ok(output)
 }
 
-/// The completion of the step that served the verification batch of `calls` and `columns`
-/// from `bucket`, from the forward's `outputs` in their order (module documentation).
+/// The completion of the step that served the verification batch of `columns` from `bucket`,
+/// from the forward's `outputs` in their order (module documentation).
 ///
 /// Each token of a verification sampled the position after it, so the batch's completion is
 /// that of its rows of one token ([`token_rows`]), of which a call keeps its accepted prefix:
@@ -292,15 +302,14 @@ pub(crate) fn calls_output(
 /// As [`calls_output`]; [`Error::Invariant`] for outputs that state no agreed length for a
 /// call.
 pub(crate) fn verification_output(
-    calls: &[CallId],
-    columns: &BatchColumns,
+    columns: &Columns,
     bucket: &Bucket,
     vocabulary: u32,
     candidates: u32,
     outputs: &[Tensor],
 ) -> Result<Vec<CallOutput>> {
     let rows = token_rows(columns);
-    let mut output = calls_output(calls, &rows, bucket, vocabulary, candidates, outputs)?;
+    let mut output = calls_output(&rows, bucket, vocabulary, candidates, outputs)?;
 
     // The agreed lengths are the forward's last output, one per verification.
     let agreed: Vec<u32> = match outputs.last() {
@@ -322,4 +331,23 @@ pub(crate) fn verification_output(
         entry.token_logprobs.truncate(accepted);
     }
     Ok(output)
+}
+
+/// Fails each call of `refused`, by its index among `calls` with the reason it was refused
+/// (`columns::slot_mapping`): its tokens wrote no cache entry, so it reports no token and no
+/// state, as an invariant violation of the control plane, which scheduled a row outside the
+/// entries its owner may write. The reason is logged: a failed call states a message only for a
+/// refused input.
+pub(crate) fn refuse(calls: &mut [CallOutput], refused: &[Refusal]) {
+    for (index, reason) in refused {
+        tracing::error!(call = index, %reason, "a call writes a cache entry it may not");
+
+        if let Some(entry) = calls.get_mut(*index) {
+            *entry = CallOutput {
+                status: CallStatus::Error,
+                error_code: Some(ErrorCode::InvariantViolation),
+                ..performed()
+            };
+        }
+    }
 }

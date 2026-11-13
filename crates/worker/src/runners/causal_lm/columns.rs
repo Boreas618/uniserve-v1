@@ -15,7 +15,7 @@
 //! | --- | --- | --- | --- |
 //! | [`Column::InputIds`] | U32 `[T]` | the token ids a prefill embeds | `0` |
 //! | [`Column::Positions`] | I32 `[T]` | rotary positions | `0` |
-//! | [`Column::SlotMapping`] | U32 `[T]` | the cache slot each token writes | [`NO_SLOT`] |
+//! | [`Column::SlotMapping`] | U32 `[T]` | the cache slot each token writes ([`slot_mapping`]) | [`NO_SLOT`] |
 //! | [`Column::Targets`] | U32 `[T]` | the prompt token each token's logits score | [`NO_SLOT`] |
 //! | [`Column::SeqLens`] | U32 `[R]` | keys visible to each row's last query | `0` |
 //! | [`Column::QueryOffsets`] | U32 `[R + 1]` | packed query offsets | the batch's token count |
@@ -86,6 +86,16 @@
 //! The commit table keeps the scheduler's signed form, because the commit kernel defines a
 //! negative slot and a negative task as a row that commits nothing.
 //!
+//! ## Cache slots
+//!
+//! A batch names the cache position each token writes its key and value at, `-1` for none
+//! (`Rows::cache_positions`), never a unit. The cache slot is computed here through the rank's
+//! device block table ([`slot_mapping`]): position `p` of a call on slot `s` lies in the block
+//! at position `p / page_size` of the slot's table of the call's cache group, whose run's unit
+//! `u` gives the slot `u · page_size + p % page_size`. A token is written only into an entry
+//! the table states writable: a call one of whose tokens names a position whose entry is
+//! missing or read-only is refused, and none of its tokens writes.
+//!
 //! ## Request slots
 //!
 //! The scheduler numbers request slots from one: slot `s` of `1..=slots`. On the device a
@@ -110,11 +120,11 @@
 //!
 //! A paired forward computes a served batch again beside the kernels of another generation,
 //! and must write nothing a serving request reads. Its columns are the batch's with three
-//! differences ([`fill`] with a scratch slot mapping): the tokens write the scratch page set
-//! in its own numbering ([`scratch_column`]), row `r` gathers row `r` of the scratch set's
-//! page table, and the commit table is inert.
+//! differences ([`fill`] of a paired forward): the tokens write the scratch page set in its own
+//! numbering ([`scratch_column`]), row `r` gathers row `r` of the scratch set's page table, and
+//! the commit table is inert.
 
-use ipc::execution::{BatchColumns, BatchRow, BatchRows, RowKind, Variant};
+use ipc::batch::{Columns, Phase, Row, Rows, Variant};
 use ipc::philox::DrawAddress;
 use nn::NO_SLOT;
 use proto::module::commit::{COMMIT_FIELDS, column};
@@ -122,6 +132,7 @@ use proto::module::sampler::PARAMETER_COLUMNS;
 use uniserve_tensor::DType;
 
 use crate::buckets::Bucket;
+use crate::memory::tables::BlockTables;
 use crate::sampler;
 use crate::{Error, Result};
 
@@ -466,26 +477,157 @@ fn count(name: &str, value: i32) -> Result<u32> {
         .map_err(|_| Error::Invalid(format!("the batch states a negative {name} of {value}")))
 }
 
+/// A call [`slot_mapping`] refused: its index among the batch's calls, and why.
+pub(crate) type Refusal = (usize, String);
+
+/// The cache slot each token of `rows` writes, as [`Column::SlotMapping`] holds it, and the
+/// calls refused for a token whose entry may not be written (module documentation).
+///
+/// `tables` is the rank's device block table and `page_size` the tokens of a block of the
+/// calls' cache groups, of which a call may write the first `groups`, the attention groups;
+/// the class of cache group `g` is class `g`. A token at a negative cache
+/// position writes nothing ([`NO_SLOT`]). A token at position `p` of a call on slot `s` writes
+/// `u · page_size + p % page_size`, `u` the unit of the entry at position `p / page_size` of
+/// the slot's table of the call's class, when that entry is writable
+/// ([`BlockTables::writable`]). A call one of whose tokens names an entry that is missing or
+/// read-only is returned among the refusals, with its index and the reason, and none of its
+/// tokens writes.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] for rows whose offsets or calls do not describe its tokens, a call that
+/// writes a cache group past `groups`, or an entry whose block is not one unit: a token's cache
+/// slot names one.
+pub(crate) fn slot_mapping(
+    rows: &Rows,
+    tables: &BlockTables,
+    page_size: u32,
+    groups: u32,
+) -> Result<(Vec<u32>, Vec<Refusal>)> {
+    let tokens = rows.tokens();
+    if page_size == 0 || rows.cache_positions.len() != tokens {
+        return Err(Error::Invalid(format!(
+            "a batch of {tokens} tokens states {} cache positions over pages of {page_size} \
+             tokens",
+            rows.cache_positions.len()
+        )));
+    }
+
+    let offset = |row: u32| -> Result<usize> {
+        rows.query_offsets
+            .get(row as usize)
+            .and_then(|offset| usize::try_from(*offset).ok())
+            .filter(|offset| *offset <= tokens)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "row {row}'s query offset is none of the batch's {tokens} tokens"
+                ))
+            })
+    };
+
+    let mut mapping = vec![NO_SLOT; tokens];
+    let mut refused = Vec::new();
+    for (index, call) in rows.calls.iter().enumerate() {
+        let (first, last) = (offset(call.rows.start)?, offset(call.rows.end)?);
+        let class = u8::try_from(call.cache_group).map_err(|_| {
+            Error::Invalid(format!(
+                "call {index} writes cache group {}, which names no class",
+                call.cache_group
+            ))
+        })?;
+
+        // The call's slots, written only once every token of it is known to be writable.
+        let mut written = Vec::with_capacity(last.saturating_sub(first));
+        let mut refusal = None;
+        for token in first..last {
+            let Ok(position) = u32::try_from(rows.cache_positions[token]) else {
+                continue;
+            };
+            if call.cache_group >= groups {
+                return Err(Error::Invalid(format!(
+                    "call {index} on slot {} writes cache group {}, and the forward writes {groups} \
+                     attention groups",
+                    call.slot, call.cache_group
+                )));
+            }
+            let block = position / page_size;
+
+            let reason = match tables.run(call.slot, class, block) {
+                None => Some("holds no entry"),
+                Some(_) if !tables.writable(call.slot, class, block) => Some("is read-only"),
+                Some((_, unit, 1)) => {
+                    let slot =
+                        u64::from(unit) * u64::from(page_size) + u64::from(position % page_size);
+                    let slot = u32::try_from(slot)
+                        .ok()
+                        .filter(|slot| *slot != NO_SLOT)
+                        .ok_or_else(|| {
+                            Error::Invalid(format!(
+                                "cache slot {slot} lies outside the slots a cache column \
+                                 addresses"
+                            ))
+                        })?;
+                    written.push((token, slot));
+                    None
+                }
+                Some((_, _, units)) => {
+                    return Err(Error::Invalid(format!(
+                        "the block at position {block} of class {class} of slot {} spans \
+                         {units} units, and a token's cache slot names one",
+                        call.slot
+                    )));
+                }
+            };
+
+            if let Some(reason) = reason {
+                refusal = Some(format!(
+                    "call {index} on slot {} writes cache position {position}, whose block at \
+                     position {block} of class {class} {reason}",
+                    call.slot
+                ));
+                break;
+            }
+        }
+
+        match refusal {
+            Some(reason) => refused.push((index, reason)),
+            None => {
+                for (token, slot) in written {
+                    mapping[token] = slot;
+                }
+            }
+        }
+    }
+    Ok((mapping, refused))
+}
+
 /// Writes into `block`, the bytes of the input block, the columns of `columns` padded to
 /// `bucket` (module documentation).
 ///
 /// `slots` is the runner's request slots, whose count is also the padding row of the pooled
-/// page tables and of the slot state; `vocabulary` is the width of a logit row. `scratch` is
-/// the scratch slot mapping of a paired forward over the bucket's tokens ([`scratch_column`]),
-/// and `None` for a serving step.
+/// page tables and of the slot state; `vocabulary` is the width of a logit row. `mapping` is
+/// the cache slot each of the batch's tokens writes: [`slot_mapping`] for a serving step,
+/// [`scratch_column`] for a paired forward (`paired`), and empty for a step that writes none;
+/// the bucket's tokens past it write nothing.
 ///
 /// # Errors
 ///
 /// [`Error::Invalid`] for a batch the bucket does not hold, a row whose slot the runner holds
 /// no state for, a negative token id, length or offset, or columns the sampler's encoders
-/// refuse; [`Error::Invariant`] for a commit table that is not one row per call.
+/// refuse; [`Error::Invariant`] for a commit table that is not one row per call or a mapping
+/// of more tokens than the bucket's.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the runner's shape, the batch, its bucket, the cache slots it writes and the block"
+)]
 pub(crate) fn fill(
     layout: &Layout,
     slots: u32,
     vocabulary: u32,
-    columns: &BatchColumns,
+    columns: &Columns,
     bucket: &Bucket,
-    scratch: Option<&[u32]>,
+    mapping: &[u32],
+    paired: bool,
     block: &mut [u8],
 ) -> Result<()> {
     let rows = &columns.rows;
@@ -524,22 +666,15 @@ pub(crate) fn fill(
     positions[..tokens].copy_from_slice(&rows.positions);
     layout.put(block, Column::Positions, &positions)?;
 
-    let mut mapping = vec![NO_SLOT; bucket_tokens];
-    match scratch {
-        Some(scratch) if scratch.len() == bucket_tokens => mapping.copy_from_slice(scratch),
-        Some(scratch) => {
-            return Err(Error::Invariant(format!(
-                "a scratch slot mapping of {} tokens for bucket {bucket}",
-                scratch.len()
-            )));
-        }
-        None => {
-            for (slot, held) in mapping.iter_mut().zip(&rows.slot_mapping) {
-                *slot = index(*held, NO_SLOT);
-            }
-        }
+    if mapping.len() > bucket_tokens {
+        return Err(Error::Invariant(format!(
+            "a slot mapping of {} tokens for bucket {bucket}",
+            mapping.len()
+        )));
     }
-    layout.put(block, Column::SlotMapping, &mapping)?;
+    let mut padded = vec![NO_SLOT; bucket_tokens];
+    padded[..mapping.len()].copy_from_slice(mapping);
+    layout.put(block, Column::SlotMapping, &padded)?;
 
     let mut targets = vec![NO_SLOT; bucket_tokens];
     for (target, held) in targets.iter_mut().zip(&columns.targets) {
@@ -601,12 +736,11 @@ pub(crate) fn fill(
 
     // A serving row's pages are its slot's row of the pooled tables; a paired forward's are
     // its own row of the scratch set's table.
-    match scratch {
-        Some(_) => {
-            let own: Vec<u32> = (0..bucket.rows).collect();
-            layout.put(block, Column::TableRows, &own)?;
-        }
-        None => layout.put(block, Column::TableRows, &slot_rows)?,
+    if paired {
+        let own: Vec<u32> = (0..bucket.rows).collect();
+        layout.put(block, Column::TableRows, &own)?;
+    } else {
+        layout.put(block, Column::TableRows, &slot_rows)?;
     }
 
     // A call's state is its slot's, which its rows share: the slot of the first row it owns.
@@ -626,7 +760,8 @@ pub(crate) fn fill(
     layout.put(block, Column::Draws, &draws)?;
 
     // The ban masks themselves are the slot state's: a batch that bans nothing copies none.
-    let (adjustments, _) = sampler::adjustments(&columns.adjustments, bucket_rows, vocabulary)?;
+    let (adjustments, _) =
+        sampler::adjustments(&columns.biased, &columns.banned, bucket_rows, vocabulary)?;
     layout.put(block, Column::Adjustments, &adjustments)?;
 
     let mut checkpoints = vec![0_u32; bucket_rows];
@@ -638,9 +773,10 @@ pub(crate) fn fill(
     // ---- The commit: one row per call, the rest of the table inert ----
 
     // A paired forward commits nothing: the slots' state is the serving requests'.
-    let mut table = match scratch {
-        Some(_) => sampler::commit_table(&sampler::inert_commit(calls), calls, layout.rows)?,
-        None => sampler::commit_table(&columns.commit, calls, layout.rows)?,
+    let mut table = if paired {
+        sampler::commit_table(&sampler::inert_commit(calls), calls, layout.rows)?
+    } else {
+        sampler::commit_table(&columns.commit, calls, layout.rows)?
     };
 
     // The commit kernel indexes the slots' state by the table's slot field: a call's request
@@ -671,25 +807,25 @@ pub(crate) fn fill(
 /// full batch of the bucket has: a decode row holds its own token, and a prefill's first row
 /// holds the bucket's whole run. A forward over these makes the launches of a serving step of
 /// the bucket and changes no request's state.
-pub(crate) fn idle(bucket: &Bucket, page_size: u32, max_kv_len: u32) -> BatchColumns {
+pub(crate) fn idle(bucket: &Bucket, page_size: u32, max_kv_len: u32) -> Columns {
     let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
     let decode = bucket.variant.is_decode();
 
     // One call per row for a decode, whose row is one request's one token; one call over the
-    // run for a prefill.
-    let calls: Vec<BatchRow> = if decode {
+    // run for a prefill. Slot zero is no request slot: the calls name none.
+    let calls: Vec<Row> = if decode {
         (0..bucket.rows)
-            .map(|row| BatchRow {
-                request: 0,
-                kind: RowKind::Decode,
+            .map(|row| Row {
+                slot: 0,
+                kind: Phase::Decode,
                 cache_group: 0,
                 rows: row..row + 1,
             })
             .collect()
     } else {
-        vec![BatchRow {
-            request: 0,
-            kind: RowKind::Prefill,
+        vec![Row {
+            slot: 0,
+            kind: Phase::Prefill,
             cache_group: 0,
             rows: 0..bucket.rows,
         }]
@@ -703,10 +839,10 @@ pub(crate) fn idle(bucket: &Bucket, page_size: u32, max_kv_len: u32) -> BatchCol
         offsets
     };
 
-    BatchColumns {
-        rows: BatchRows {
+    Columns {
+        rows: Rows {
             positions: vec![0; tokens],
-            slot_mapping: vec![-1; tokens],
+            cache_positions: vec![-1; tokens],
             seq_lens: vec![0; rows],
             query_offsets,
             logits_rows: vec![-1; rows],
@@ -719,7 +855,7 @@ pub(crate) fn idle(bucket: &Bucket, page_size: u32, max_kv_len: u32) -> BatchCol
         commit: sampler::inert_commit(calls.len()),
         page_size,
         max_kv_len,
-        ..BatchColumns::default()
+        ..Columns::default()
     }
 }
 
@@ -728,22 +864,21 @@ pub(crate) fn idle(bucket: &Bucket, page_size: u32, max_kv_len: u32) -> BatchCol
 ///
 /// A slot is flat over one plane's pages, `page · page_size + offset`, and the scratch set
 /// gives row `r` the pages `r · pages .. (r + 1) · pages`, which is what its page table
-/// states. Token `t` of row `r` at position `p` therefore writes
+/// states. Token `t` of row `r` at cache position `p` therefore writes
 /// `(r · pages + p / page_size) · page_size + p % page_size`: a slot of the row's own scratch
 /// pages, and never one a serving request reads. A token the batch does not write (a negative
-/// slot) writes nothing here either and holds [`NO_SLOT`].
+/// cache position) writes nothing here either and holds [`NO_SLOT`].
 ///
-/// `positions` and `slots` are the batch's `[tokens]` columns and `query_offsets` its
-/// `[rows + 1]` packed offsets.
+/// `cache_positions` is the batch's `[tokens]` column and `query_offsets` its `[rows + 1]`
+/// packed offsets.
 ///
 /// # Errors
 ///
 /// [`Error::Invariant`] for a scratch set of no page or columns that describe different token
 /// counts; [`Error::Invalid`] for a token whose position lies past the row's scratch pages.
 pub(crate) fn scratch_slot_mapping(
-    positions: &[i32],
+    cache_positions: &[i32],
     query_offsets: &[i32],
-    slots: &[i32],
     pages: u32,
     page_size: u32,
 ) -> Result<Vec<u32>> {
@@ -753,13 +888,13 @@ pub(crate) fn scratch_slot_mapping(
         ));
     }
 
-    let tokens = positions.len();
+    let tokens = cache_positions.len();
     let closes = query_offsets
         .last()
         .is_some_and(|end| usize::try_from(*end).is_ok_and(|end| end == tokens));
-    if query_offsets.len() < 2 || !closes || slots.len() != tokens {
+    if query_offsets.len() < 2 || !closes {
         return Err(Error::Invariant(
-            "the batch's offsets, positions and slots describe different token counts".into(),
+            "the batch's offsets and cache positions describe different token counts".into(),
         ));
     }
 
@@ -773,16 +908,9 @@ pub(crate) fn scratch_slot_mapping(
         }
 
         for token in start as usize..end as usize {
-            if slots[token] < 0 {
+            let Ok(position) = u32::try_from(cache_positions[token]) else {
                 continue;
-            }
-
-            let position = u32::try_from(positions[token]).map_err(|_| {
-                Error::Invariant(format!(
-                    "token {token} writes the cache at position {}, which is no position",
-                    positions[token]
-                ))
-            })?;
+            };
             let (page, offset) = (position / page_size, position % page_size);
             if page >= pages {
                 return Err(Error::Invalid(format!(
@@ -819,24 +947,23 @@ pub(crate) fn scratch_slot_mapping(
 /// As [`scratch_slot_mapping`], or [`Error::Invariant`] for a batch of more tokens than the
 /// bucket.
 pub(crate) fn scratch_column(
-    positions: &[i32],
+    cache_positions: &[i32],
     query_offsets: &[i32],
-    slots: &[i32],
     tokens: usize,
     pages: u32,
     page_size: u32,
 ) -> Result<Vec<u32>> {
-    if positions.len() > tokens {
+    if cache_positions.len() > tokens {
         return Err(Error::Invariant(format!(
             "a batch of {} tokens in a bucket of {tokens}",
-            positions.len()
+            cache_positions.len()
         )));
     }
 
-    let mut mapping = if positions.is_empty() {
+    let mut mapping = if cache_positions.is_empty() {
         Vec::new()
     } else {
-        scratch_slot_mapping(positions, query_offsets, slots, pages, page_size)?
+        scratch_slot_mapping(cache_positions, query_offsets, pages, page_size)?
     };
     mapping.resize(tokens, NO_SLOT);
     Ok(mapping)

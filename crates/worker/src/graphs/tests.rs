@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
-use ipc::execution::{Batch, BatchColumns, BatchId, BatchOutput, Shape as BatchShape, Variant};
+use ipc::batch::{Batch, BatchId, BatchOutput, Columns, Phase, Shape as BatchShape, Variant};
 use nn::functional::{WeightOrder, embedding, rms_norm};
 use nn::modules::Linear;
 use nn::{CausalLm, ExpertExchange, KvCache, PhaseKind, RecurrentState, TokenBatch};
@@ -13,8 +13,11 @@ use ops::{Generation, Kernel, KernelEntry};
 use platform::NativeLibrary;
 use uniserve_tensor::{DType, Device, Tensor};
 
+use storage::runtime::GroupId;
+
 use super::{Graphs, Preparation};
 use crate::buckets::Bucket;
+use crate::memory::tables::BlockTables;
 use crate::runner::Runner;
 use crate::{Error, Result};
 
@@ -121,8 +124,8 @@ impl TinyRunner {
 }
 
 impl Runner for TinyRunner {
-    fn phases(&self) -> &[ipc::PhaseId] {
-        &[ipc::PhaseId(0)]
+    fn phases(&self) -> &[Phase] {
+        &[Phase::Decode]
     }
 
     fn buckets(&self) -> Vec<Bucket> {
@@ -163,7 +166,7 @@ impl Runner for TinyRunner {
         Ok(())
     }
 
-    fn prepare_inputs(&mut self, batch: &Batch) -> Result<Bucket> {
+    fn prepare_inputs(&mut self, batch: &Batch, _tables: &BlockTables) -> Result<Bucket> {
         let bucket = self
             .graphs
             .select(|bucket| bucket.holds(&batch.shape))
@@ -180,7 +183,7 @@ impl Runner for TinyRunner {
         Ok(bucket)
     }
 
-    fn execute(&mut self, _batch: &Batch) -> Result<BatchOutput> {
+    fn execute(&mut self, _batch: &Batch, _tables: &BlockTables) -> Result<BatchOutput> {
         Err(Error::State("a runner with no device executes nothing"))
     }
 
@@ -193,27 +196,24 @@ impl Runner for TinyRunner {
 fn batch(ids: &[i32], bound: u32) -> Batch {
     Batch {
         id: BatchId(1),
-        phase: ipc::PhaseId(0),
-        group: "decode".to_owned(),
-        calls: Vec::new(),
+        group: GroupId(0),
+        phase: Phase::Decode,
+        generation: 1,
         shape: BatchShape::decode(ids.len() as u32, Variant::DecodeGreedy),
-        columns: BatchColumns {
+        requests: Vec::new(),
+        columns: Columns {
             input_ids: ids.to_vec(),
             max_kv_len: bound,
-            ..BatchColumns::default()
+            ..Columns::default()
         },
-        generation: 1,
-        cache_units: Vec::new(),
-        block_tables: Vec::new(),
-        page_loads: Vec::new(),
-        page_offloads: Vec::new(),
-        latent_restores: Vec::new(),
-        host_outputs: Vec::new(),
-        images: Vec::new(),
-        buffers: Vec::new(),
-        frees: Vec::new(),
-        media: None,
+        media: Vec::new(),
+        new_slots: Vec::new(),
     }
+}
+
+/// The device block table of a rank whose requests hold nothing.
+fn tables() -> BlockTables {
+    BlockTables::new(GroupId(0), &[])
 }
 
 /// A kernel no test launches: an entry of the C library stands in for a package's.
@@ -366,7 +366,9 @@ fn prepare_inputs_writes_each_replay_s_host_values_where_the_input_copies_read()
     assert_eq!(offset, 0);
 
     for bound in [32_u32, 48] {
-        let chosen = runner.prepare_inputs(&batch(&[5, 6, 7], bound)).unwrap();
+        let chosen = runner
+            .prepare_inputs(&batch(&[5, 6, 7], bound), &tables())
+            .unwrap();
         assert_eq!(chosen, bucket);
 
         // The forward's host value for this replay: the step's bound, once per token of the
@@ -382,14 +384,22 @@ fn prepare_inputs_writes_each_replay_s_host_values_where_the_input_copies_read()
 fn a_step_runs_the_smallest_bucket_that_holds_it() {
     let (mut runner, _) = captured();
 
-    let small = runner.prepare_inputs(&batch(&[1, 2], 16)).unwrap();
+    let small = runner
+        .prepare_inputs(&batch(&[1, 2], 16), &tables())
+        .unwrap();
     assert_eq!(small, Bucket::decode(2, Variant::DecodeGreedy));
 
-    let large = runner.prepare_inputs(&batch(&[1, 2, 3], 16)).unwrap();
+    let large = runner
+        .prepare_inputs(&batch(&[1, 2, 3], 16), &tables())
+        .unwrap();
     assert_eq!(large, Bucket::decode(4, Variant::DecodeGreedy));
 
     // A batch no bucket holds is an error, and so is another computation's.
-    assert!(runner.prepare_inputs(&batch(&[1, 2, 3, 4, 5], 16)).is_err());
+    assert!(
+        runner
+            .prepare_inputs(&batch(&[1, 2, 3, 4, 5], 16), &tables())
+            .is_err()
+    );
     let sampled = BatchShape::decode(2, Variant::DecodeSampled);
     assert_eq!(runner.graphs.select(|bucket| bucket.holds(&sampled)), None);
 }
@@ -397,7 +407,9 @@ fn a_step_runs_the_smallest_bucket_that_holds_it() {
 #[test]
 fn graphs_with_no_device_replay_nothing() {
     let (mut runner, _) = captured();
-    let bucket = runner.prepare_inputs(&batch(&[1, 2], 16)).unwrap();
+    let bucket = runner
+        .prepare_inputs(&batch(&[1, 2], 16), &tables())
+        .unwrap();
 
     assert!(matches!(
         runner.graphs.replay(&bucket),
