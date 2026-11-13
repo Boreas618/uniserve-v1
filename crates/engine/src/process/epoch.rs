@@ -6,30 +6,31 @@
 //! A drain to an epoch of another layout gives the device memory back as its requests end: each
 //! scheduler shrinks its device regions by `Resize` and reports each shrink (`Output::Shrunk`);
 //! the engine then releases the segments of the KV planes the region no longer covers
-//! ([`release`]), and reports the release to its daemon, which has the engines of the other
-//! epoch on the host grow into it ([`grow`]). Memory moves between the epochs' regions one
-//! segment at a time, and only through the GPU's quota (`specs/buffer-pool.md` §14.1).
+//! ([`release`]) on every rank of the region, its peers' included, and reports the release to its
+//! daemon once per host the ranks lie on ([`by_host`]); the daemon has the scheduler node of each
+//! engine of the other epoch with ranks on that host grow into it on every rank it holds
+//! ([`grow`]). Memory moves between the epochs' regions one segment at a time, and only through
+//! the GPU's quota (`specs/buffer-pool.md` §14.1).
 //!
 //! The session's layout states which memory each region is: the head's view of it
 //! ([`StorageClient::session`]) is where these jobs read a region's name, its reserved units,
 //! its units, its segment table and the worker groups whose ranks map it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::memory::cache::info::CacheTable;
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender};
+use proto::config::ParallelConfig;
 use proto::request::MigrationCause;
 use service::lock;
 use storage::Segment;
 use storage::runtime::{GroupId, Open, Opened, Tier};
 
-use crate::worker::Worker;
-
 use super::operations::{resume, stopped};
 use crate::memory::client::StorageClient;
-use crate::process::binding::WeightBinding;
+use crate::process::binding::{Released, WeightBinding};
 use crate::scheduler::Message;
 
 /// Starts the drain of every scheduler (`specs/scheduler-design.md` §3.8): each admits nothing
@@ -68,9 +69,11 @@ pub(crate) fn drain(
 
 /// Releases what a shrink of device region `region` to `units` units gave back
 /// (`Output::Shrunk`): the head withdraws the segments of the KV planes the region no longer
-/// covers, the last first, and the ranks of the worker groups that map the region release them.
-/// Returns the devices of those ranks and the bytes released on each, which the daemon is told
-/// (`Shrunk`); no device and no byte when nothing was released.
+/// covers, the last first, and the ranks of the worker groups that map the region release them,
+/// here and on the peers. Returns, for this process (`None`) and each peer that holds such
+/// ranks (by its first rank), the CUDA ordinals of the devices whose ranks gave segments back,
+/// and the bytes released on each, which the daemon is told per host (`Shrunk`, [`by_host`]);
+/// no process and no byte when nothing was released.
 ///
 /// The region holds `units` units from its reserved ones on, the lowest first, so a segment none
 /// of whose units past the reserved ones lies below `reserved + units` holds none of the region's.
@@ -84,10 +87,9 @@ pub(crate) fn drain(
 pub(crate) fn release(
     head: &Mutex<StorageClient>,
     binding: &WeightBinding,
-    workers: &[Arc<Worker>],
     region: u8,
     units: u32,
-) -> Result<(Vec<u32>, u64)> {
+) -> Result<(Released, u64)> {
     let (from, released, part_bytes, groups) = {
         let mut head = lock(head);
         let (open, opened) = session(&head)?;
@@ -126,14 +128,46 @@ pub(crate) fn release(
         return Ok((Vec::new(), 0));
     }
 
-    binding.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
-    let devices = workers
-        .iter()
-        .filter(|worker| groups.contains(&worker.group()))
-        .filter_map(|worker| worker.device())
-        .filter_map(|device| u32::try_from(device.0).ok())
-        .collect();
+    let devices = binding.release_segments(&groups, u32::try_from(from).unwrap_or(u32::MAX))?;
     Ok((devices, released.saturating_mul(part_bytes)))
+}
+
+/// The devices a release freed ([`release`]) by host, each host once, as the daemon is told them
+/// (`Shrunk`, one per host): this process's on `here`, its host, and a peer's on the host
+/// `parallel` places the peer's first rank on (the deployment numbers its ranks over its groups
+/// in their order). A host where no released rank holds a device is left out: no quota there
+/// changed.
+pub(crate) fn by_host(
+    parallel: &ParallelConfig,
+    here: &str,
+    released: Released,
+) -> Vec<(String, Vec<u32>)> {
+    let mut hosts: Vec<(String, Vec<u32>)> = Vec::new();
+    for (first, devices) in released {
+        if devices.is_empty() {
+            continue;
+        }
+        let host = match first {
+            None => here,
+            Some(first) => {
+                let placed = parallel
+                    .worker_groups
+                    .iter()
+                    .flat_map(|group| &group.ranks)
+                    .nth(usize::try_from(first).unwrap_or(usize::MAX));
+                let Some(placed) = placed else {
+                    tracing::warn!(first, "a peer's first rank is placed on no host");
+                    continue;
+                };
+                placed.host.as_str()
+            }
+        };
+        match hosts.iter_mut().find(|(known, _)| known == host) {
+            Some((_, known)) => known.extend(devices),
+            None => hosts.push((host.to_owned(), devices)),
+        }
+    }
+    hosts
 }
 
 /// Grows the engine's regions into the memory its GPUs' quotas hold now (`specs/updates.md`

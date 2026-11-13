@@ -410,12 +410,22 @@ impl Leader {
                 .ok()
                 .and_then(|config| crate::engine::control::world_hosts(&config).ok())
                 .unwrap_or_default();
-            for process in client.processes() {
-                let rank = ranks
+            let first_of = |host: &str| {
+                ranks
                     .iter()
-                    .find(|ranks| ranks.host == process.host)
-                    .map_or(0, |ranks| ranks.first);
-                nodes.push(Node::new(process.host, rank, process.engine));
+                    .find(|ranks| ranks.host == host)
+                    .map_or(0, |ranks| ranks.first)
+            };
+            // The scheduler node's process holds the world's first rank.
+            let processes = client.processes();
+            let head = processes
+                .iter()
+                .find(|process| first_of(&process.host) == 0)
+                .map(|process| process.engine);
+            for process in processes {
+                let rank = first_of(&process.host);
+                let head = head.unwrap_or(process.engine);
+                nodes.push(Node::new(process.host, rank, process.engine, head));
             }
         }
         nodes

@@ -837,6 +837,15 @@ impl Server {
                 self.peer_hold(id, deployment, keys)
             }
             (Request::PeerRelease { deployment }, Role::Peer) => self.peer_release(id, deployment),
+            (
+                Request::Pages {
+                    region,
+                    part,
+                    pages,
+                    upload,
+                },
+                Role::Head { deployment, .. },
+            ) => self.pages_for(id, &deployment, (region, *part), pages, *upload),
             (Request::Retire { deployment }, Role::Operator) => self.retire(deployment),
             (Request::Restart { executable }, Role::Operator) => self
                 .begin_restart(executable.as_deref())
@@ -2278,12 +2287,13 @@ impl Server {
     }
 
     /// Hand `task` to the connector; without one, the task fails at once.
-    fn assign(&mut self, task: Task) {
-        let Some(connector) = self.kv_storage.client else {
-            self.fail(task);
-            return;
-        };
+    /// Returns the task's number.
+    fn assign(&mut self, task: Task) -> u64 {
         let id = self.kv_storage.next_task();
+        let Some(connector) = self.kv_storage.client else {
+            self.complete(id, task, &[]);
+            return id;
+        };
         let (pool, pages) = (task.pool, wide(&task.pages));
         let event = if task.upload {
             Event::Upload {
@@ -2300,46 +2310,60 @@ impl Server {
         };
         self.kv_storage.tasks.insert(id, task);
         self.events.push((connector, event, Vec::new()));
+        id
     }
 
     /// The connector reported the results of `task`.
     fn finished(&mut self, task: u64, results: &[bool]) {
-        let Some(task) = self.kv_storage.tasks.remove(&task) else {
+        let Some(entry) = self.kv_storage.tasks.remove(&task) else {
             return;
         };
-        self.complete(task, results);
+        self.complete(task, entry, results);
     }
 
-    /// End `task` as if the connector reported every page failed.
-    fn fail(&mut self, task: Task) {
-        self.complete(task, &[]);
-    }
-
-    /// End `task` with the connector's `results`, one per page of the task;
-    /// a page without a result failed.
-    fn complete(&mut self, task: Task, results: &[bool]) {
-        let moved: Vec<bool> = (0..task.keys.len())
+    /// End `task`, numbered `id`, with the connector's `results`, one per
+    /// page of the task; a page without a result failed.
+    fn complete(&mut self, id: u64, task: Task, results: &[bool]) {
+        let moved: Vec<bool> = (0..task.pages.len())
             .map(|index| results.get(index).copied().unwrap_or(false))
             .collect();
-        self.pool_pages_moved(task.number, &task.keys, &moved);
+        match task.owner {
+            kv_storage::Owner::Pool { number, keys } => {
+                self.pool_pages_moved(number, &keys, &moved);
+            }
+            kv_storage::Owner::Client(client) => {
+                let event = Event::PagesMoved {
+                    task: id,
+                    results: moved,
+                };
+                self.events.push((client, event, Vec::new()));
+            }
+        }
     }
 
     /// The connector's connection closed: its tasks are lost, and the next
-    /// connector maps every pool again.
+    /// connector maps every pool again. Each ends as failed once the
+    /// connector's process has exited, since it may move pages until then.
     fn connector_gone(&mut self) {
         tracing::warn!("the Mooncake connector disconnected");
         self.kv_storage.client = None;
         self.kv_storage.offered.clear();
-        let tasks: Vec<Task> = self
-            .kv_storage
-            .tasks
-            .drain()
-            .map(|(_, task)| task)
-            .collect();
+        let tasks: Vec<(u64, Task)> = self.kv_storage.tasks.drain().collect();
         let pid = self.kv_storage.process.pid();
-        for task in tasks {
-            // The connector may still move pages until its process has exited.
-            self.pool_task_lost(task.number, pid);
+        for (id, task) in tasks {
+            match (task.owner, pid) {
+                (kv_storage::Owner::Pool { number, .. }, _) => self.pool_task_lost(number, pid),
+                (kv_storage::Owner::Client(client), Some(pid)) => {
+                    self.kv_storage
+                        .lost
+                        .push((pid, client, id, task.pages.len()));
+                }
+                (kv_storage::Owner::Client(client), None) => {
+                    let results = vec![false; task.pages.len()];
+                    let event = Event::PagesMoved { task: id, results };
+                    self.events.push((client, event, Vec::new()));
+                }
+            }
         }
     }
 }
@@ -2500,6 +2524,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::HostPart { .. } => "host_part",
         Request::PeerHold { .. } => "peer hold",
         Request::PeerRelease { .. } => "peer release",
+        Request::Pages { .. } => "pages",
     }
 }
 

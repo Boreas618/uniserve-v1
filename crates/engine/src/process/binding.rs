@@ -146,6 +146,11 @@ pub(crate) trait ModelLoad: Send + Sync {
     fn expert_layers(&self) -> BTreeMap<String, u32>;
 }
 
+/// The devices a release of segments freed memory on ([`WeightBinding::release_segments`]), per
+/// process that holds ranks of its groups: this process's (`None`) and each peer's by its first
+/// rank, as the CUDA ordinals of the devices of the ranks that gave segments back.
+pub(crate) type Released = Vec<(Option<u32>, Vec<u32>)>;
+
 /// What the weight binding holds of one rank: the owners of its device's storage, which the rank's
 /// start opened, and the worker every change of them goes through.
 pub(crate) struct Rank {
@@ -901,15 +906,27 @@ impl WeightBinding {
     }
 
     /// Waits until every peer's own preparation of generation `generation` ended, which its
-    /// daemon commands (`docs/architecture.md`, "Generations"), and returns the operators its
-    /// ranks have no comparison for: no shadow batch of the generation reaches a peer's ranks
-    /// before they hold it.
+    /// daemon commands (`docs/architecture.md`, "Generations"): no shadow batch of the generation
+    /// reaches a peer's ranks before they hold it.
     ///
     /// # Errors
     ///
     /// A peer whose preparation failed, or did not end within its bound.
-    pub(crate) fn prepared(&self, generation: u64) -> Result<Vec<String>> {
+    pub(crate) fn prepared(&self, generation: u64) -> Result<()> {
         let answers = self.ask_peers(None, || DataOperation::Prepared { generation })?;
+        answered::<()>(answers).map(drop)
+    }
+
+    /// The operators every peer's ranks have no comparison for in the generation update in
+    /// flight, in rank order: those their preparation added, and those the shadow batches that
+    /// reached them could not compare, so the caller asks once its shadow pass ended. None on an
+    /// epoch of one process.
+    ///
+    /// # Errors
+    ///
+    /// A peer's failure.
+    pub(crate) fn uncompared_by_peers(&self) -> Result<Vec<String>> {
+        let answers = self.ask_peers(None, || DataOperation::Uncompared)?;
         Ok(answered::<Vec<String>>(answers)?
             .into_iter()
             .flatten()
@@ -1461,26 +1478,38 @@ impl WeightBinding {
     /// of the worker groups `groups`, which state the region, unmaps the segments of its KV
     /// planes from `first` on and ends its retention of them. The head has withdrawn them, so no
     /// region holds a unit of them and no job addresses them. Segments given back already are
-    /// not given back twice. Returns each such rank's segment table; none for a rank that keeps
-    /// no cache or whose planes are not split, which has nothing to release.
+    /// not given back twice. Returns, for this process (`None`) and each peer that holds such
+    /// ranks (by its first rank), the CUDA ordinals of the devices of its ranks that gave
+    /// segments back; a rank that keeps no cache, whose planes are not split or that holds no
+    /// device names none.
     ///
     /// # Errors
     ///
     /// When the Storage Server refuses, here or on a peer's host.
-    pub(crate) fn release_segments(
-        &self,
-        groups: &[GroupId],
-        first: u32,
-    ) -> Result<Vec<Option<CacheTable>>> {
+    pub(crate) fn release_segments(&self, groups: &[GroupId], first: u32) -> Result<Released> {
         let answers = self.ask_peers(Some(groups), || DataOperation::ReleaseSegments {
             groups: groups.to_vec(),
             from: first,
         })?;
-        let here = self.release_of(Some(groups), first);
-        joined_tables(here, answers)
+        let peers: Vec<u32> = answers.iter().map(|(rank, _)| *rank).collect();
+        let here = self.release_of(Some(groups), first).map(|tables| {
+            // A rank whose planes are split gave segments back.
+            tables
+                .iter()
+                .zip(self.devices_of(groups))
+                .filter_map(|(table, device)| table.as_ref().and(device))
+                .collect::<Vec<u32>>()
+        });
+        let (here, theirs) = both(here, answered::<Vec<u32>>(answers))?;
+
+        let mut released = vec![(None, here)];
+        released.extend(peers.into_iter().map(Some).zip(theirs));
+        Ok(released)
     }
 
-    /// [`Self::release_segments`] on the ranks of `groups`, or on every rank for `None`.
+    /// [`Self::release_segments`] on the ranks of `groups`, or on every rank for `None`: each
+    /// such rank's segment table; none for a rank that keeps no cache or whose planes are not
+    /// split, which has nothing to release.
     fn release_of(
         &self,
         groups: Option<&[GroupId]>,
@@ -1505,6 +1534,20 @@ impl WeightBinding {
                 Ok(segment_table(&cache))
             })
         })
+    }
+
+    /// The CUDA ordinal of the device of each of this process's ranks of `groups`, in the order
+    /// [`Self::each_of`] runs them; none for a rank of no device.
+    fn devices_of(&self, groups: &[GroupId]) -> Vec<Option<u32>> {
+        self.ranks
+            .iter()
+            .map(|rank| lock(rank))
+            .filter(|rank| rank.of(groups))
+            .map(|rank| {
+                let worker = rank.worker.upgrade()?;
+                u32::try_from(worker.device()?.0).ok()
+            })
+            .collect()
     }
 
     /// The ranks' side of creating given-back segments (module documentation): every rank of the
@@ -2145,6 +2188,7 @@ mod tests {
     use crate::executor::peers::messages::{MainProcessRequest, MainProcessResponse};
     use crate::executor::peers::{Liveness, accept, register};
     use crate::memory::cache::info::CacheSegment;
+    use crate::process::generation;
     use std::thread::JoinHandle;
     use std::time::Duration;
 
@@ -2319,6 +2363,51 @@ mod tests {
             },
         );
         assert_eq!(operated, [[DataOperation::Sleep], [DataOperation::Sleep]]);
+    }
+
+    #[test]
+    fn a_preparation_reports_what_peers_ranks_did_not_compare_once_the_shadow_pass_ended() {
+        const GENERATION: u64 = 3;
+        let entry = "operator `softmax` is new in generation 3".to_owned();
+        // A peer's preparation answers once it ended; what its ranks could not compare, the shadow
+        // batches that reached them included, it states when asked.
+        let answer = {
+            let entry = entry.clone();
+            move |operation: &DataOperation| match operation {
+                DataOperation::Prepared {
+                    generation: GENERATION,
+                } => json(&()),
+                DataOperation::Uncompared => json(&vec![entry.clone()]),
+                other => panic!("the peer was sent {other:?}"),
+            }
+        };
+
+        let operated = over(
+            vec![
+                peer(1, vec![GroupId(0)], answer.clone()),
+                peer(2, vec![GroupId(1)], answer),
+            ],
+            |binding| {
+                // An update that replaced an operator: every peer's ranks are asked once the pass
+                // ended, and each entry is reported once.
+                let changed = ["softmax".to_owned()];
+                let uncompared =
+                    generation::compare(&[], &[], binding, GENERATION, &changed, LONG).unwrap();
+                assert_eq!(uncompared, [entry.as_str()]);
+
+                // An update that replaced none compares nothing.
+                let none = generation::compare(&[], &[], binding, GENERATION, &[], LONG).unwrap();
+                assert!(none.is_empty());
+            },
+        );
+
+        // Each peer held the generation before any shadow batch, and was asked what its ranks did
+        // not compare only after the pass.
+        let prepared = DataOperation::Prepared {
+            generation: GENERATION,
+        };
+        let asked = vec![prepared.clone(), DataOperation::Uncompared, prepared];
+        assert_eq!(operated, [asked.clone(), asked]);
     }
 
     #[test]

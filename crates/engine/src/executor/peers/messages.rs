@@ -245,7 +245,7 @@ impl MainProcessRequest {
 #[serde(rename_all = "snake_case")]
 pub enum DataOperation {
     /// Releases the KV planes' segments from segment `from` on, on every rank of `groups`.
-    /// Answers each such rank's segment table.
+    /// Answers the CUDA ordinals of the devices of the ranks that gave segments back.
     ReleaseSegments { groups: Vec<GroupId>, from: u32 },
     /// Creates again the first `count` segments the ranks of `groups` gave back, or all of them.
     /// Answers each such rank's segment table.
@@ -300,9 +300,13 @@ pub enum DataOperation {
     /// Answers the names of the weights every rank serves, in rank order and each rank's load
     /// order: what the identity of the deployment's weights is the digest of.
     ServingOrder,
-    /// Answers once the process's own preparation of generation `generation` ended: the
-    /// operators its ranks have no comparison for, or the preparation's failure.
+    /// Answers once the process's own preparation of generation `generation` ended, or the
+    /// preparation's failure: no shadow batch of the generation reaches its ranks before.
     Prepared { generation: u64 },
+    /// Answers the operators the process's ranks have no comparison for in the generation update
+    /// in flight, each with the reason: those their preparation added and those the shadow
+    /// batches that reached them could not compare. Asked once the shadow pass ended.
+    Uncompared,
     /// Runs the operation the daemon names `name` with the JSON `payload` beside the batches:
     /// an expert redistribution's stages, a LoRA adapter's load and unload, a profiling
     /// session's changes, the fence probes' switch. Answers each rank's result.

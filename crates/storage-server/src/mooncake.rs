@@ -194,6 +194,7 @@ pub fn run(socket: &Path, settings: &Settings) -> Result<(), Error> {
                 // The events of heads, workers and the Transfer Server.
                 Event::TaskProgress { .. }
                 | Event::TaskEnded { .. }
+                | Event::PagesMoved { .. }
                 | Event::Allocation { .. }
                 | Event::AllocationReleased { .. }
                 | Event::Task { .. }

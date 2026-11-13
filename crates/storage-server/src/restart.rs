@@ -236,11 +236,13 @@ impl Server {
 
     /// Whether nothing is in flight: no request waits or is held, no
     /// shoot-down runs, neither the connector nor the Transfer Server runs a
-    /// task, the buffer pools have no task outstanding, and every reply was
+    /// task (nor a lost connector may still run one), the buffer pools have
+    /// no task outstanding, and every reply was
     /// written. The processes followed for a session pass over.
     pub(crate) fn quiescent(&self) -> bool {
         !self.shootdowns.killing()
             && self.kv_storage.tasks.is_empty()
+            && self.kv_storage.lost.is_empty()
             && self.transfers.tasks.is_empty()
             && self.events.is_empty()
             && self.clients.values().all(|client| {

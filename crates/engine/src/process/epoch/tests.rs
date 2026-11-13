@@ -1,9 +1,13 @@
 //! The epoch's jobs over the parts of a serving engine on the meta device
 //! (`operations::tests::Node`).
 
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-use super::{drain, release};
+use proto::config::{ParallelConfig, WorkerGroupConfig, WorkerGroupId, WorkerRank};
+
+use super::{by_host, drain, release};
 use crate::process::operations::ask;
 use crate::process::operations::tests::{LONG, Node, SEGMENT_UNITS, UNIT_BYTES, segment};
 use crate::scheduler::Message;
@@ -35,15 +39,61 @@ fn a_release_after_a_shrink_withdraws_only_the_segments_past_the_units() {
     let reached = ask(&node.schedulers, |reply| Message::Resize(kv, 31, reply)).unwrap();
     assert_eq!(reached, [31]);
 
-    let (devices, bytes) = release(&node.head, &node.binding, &node.workers, kv, 31).unwrap();
-    assert!(devices.is_empty(), "a rank of the meta device has no GPU");
+    let (released, bytes) = release(&node.head, &node.binding, kv, 31).unwrap();
+    assert!(
+        released.iter().all(|(_, devices)| devices.is_empty()),
+        "a rank of the meta device has no GPU"
+    );
     assert_eq!(bytes, 2 * u64::from(SEGMENT_UNITS) * UNIT_BYTES);
     assert_eq!(node.segments_seen(2), [segment(0), segment(1)]);
 
     // A region of no unit covers none of segment 0's units past the reserved one either.
     let reached = ask(&node.schedulers, |reply| Message::Resize(kv, 0, reply)).unwrap();
     assert_eq!(reached, [0]);
-    let (_, bytes) = release(&node.head, &node.binding, &node.workers, kv, 0).unwrap();
+    let (_, bytes) = release(&node.head, &node.binding, kv, 0).unwrap();
     assert_eq!(bytes, 2 * u64::from(SEGMENT_UNITS) * UNIT_BYTES);
     assert!(node.segments_seen(3).is_empty());
+}
+
+/// The daemon is told of a release once per host whose devices gave memory back: this
+/// process's devices on its own host, a peer's on the host its first rank is placed on, and a
+/// peer whose ranks hold no device not at all.
+#[test]
+fn a_release_is_reported_once_per_host_its_ranks_gave_memory_back_on() {
+    // The deployment numbers its ranks over its groups in order: ranks 0 and 1 on host a, ranks
+    // 2 and 3 on host b, rank 4 on host c.
+    let group = |id: &str, hosts: &[&str]| WorkerGroupConfig {
+        id: WorkerGroupId(id.to_owned()),
+        role: Default::default(),
+        replicas: 1,
+        ranks: hosts
+            .iter()
+            .map(|host| WorkerRank {
+                host: (*host).to_owned(),
+                device: "cuda:0".to_owned(),
+            })
+            .collect(),
+        blocks: BTreeMap::new(),
+        queue_depth: 2,
+        mem_fraction_static: None,
+    };
+    let parallel = ParallelConfig {
+        tensor_parallel_size: NonZeroUsize::MIN,
+        data_parallel_size: NonZeroUsize::MIN,
+        engine_host: "a".to_owned(),
+        worker_groups: vec![
+            group("prefill", &["a", "a", "b"]),
+            group("decode", &["b", "c"]),
+        ],
+    };
+
+    let released = vec![
+        (None, vec![0, 1]),
+        (Some(2), vec![0, 1]),
+        (Some(4), Vec::new()),
+    ];
+    assert_eq!(
+        by_host(&parallel, "a", released),
+        [("a".to_owned(), vec![0, 1]), ("b".to_owned(), vec![0, 1])]
+    );
 }

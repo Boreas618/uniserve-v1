@@ -179,6 +179,7 @@ fn operations() -> Vec<DataOperation> {
         DataOperation::CommitExperts { order },
         DataOperation::ServingOrder,
         DataOperation::Prepared { generation: 4 },
+        DataOperation::Uncompared,
         DataOperation::Hook {
             name: "load_lora_adapter".to_owned(),
             payload: r#"{"adapter": 1, "lora_path": "/adapters/a"}"#.to_owned(),

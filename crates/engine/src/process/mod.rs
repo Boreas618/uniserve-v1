@@ -764,20 +764,12 @@ impl MainProcess {
             let prepared = generation::kernels(&workers, &build, &named, &serving, generation)
                 .and_then(|kernels| {
                     let (module, parameters) = generation::policy(&build.0, &policy, &ceilings)?;
-                    // Every peer prepares the generation from its own daemon's command: no
-                    // shadow batch reaches its ranks before they hold it.
-                    let mut uncompared = binding.prepared(generation)?;
                     // Only an operator whose package changed has an old kernel to compare with.
+                    // Every peer prepares the generation from its own daemon's command.
                     let changed = changed_operators(&kernels, &serving);
-                    if !changed.is_empty() {
-                        let shadowed =
-                            generation::shadow(&shadows, &workers, generation, &changed, bound)?;
-                        for entry in shadowed {
-                            if !uncompared.contains(&entry) {
-                                uncompared.push(entry);
-                            }
-                        }
-                    }
+                    let uncompared = generation::compare(
+                        &shadows, &workers, &binding, generation, &changed, bound,
+                    )?;
                     let mut packages = kernels;
                     packages.insert(policy_slot(), policy);
                     Ok(((packages, module, parameters), uncompared))
@@ -802,7 +794,7 @@ impl MainProcess {
             .and_then(|engine| engine.prepared.as_ref())
         {
             let outcome = match &prepared {
-                Ok((_, uncompared)) => Ok(uncompared.clone()),
+                Ok(_) => Ok(()),
                 Err(error) => Err(format!("{error:#}")),
             };
             let _ = told.send((generation, outcome));
@@ -1095,7 +1087,8 @@ impl MainProcess {
     }
 
     /// A scheduler's region `region` shrank to `units`: the segments it no longer covers are
-    /// withdrawn and released on the operations thread, and the daemon is told.
+    /// withdrawn and released on the operations thread on every rank that maps it, the peers'
+    /// included, and the daemon is told once per host whose devices gave memory back.
     fn shrunk(&mut self, region: u8, units: u32) {
         // An engine with no session head of its own holds no segment to release.
         let Some((engine, head)) = self
@@ -1105,15 +1098,27 @@ impl MainProcess {
         else {
             return;
         };
-        let workers = engine.workers.clone();
         let binding = Arc::clone(&engine.binding);
         self.serial(Box::new(move || {
-            let released = epoch::release(&head, &binding, &workers, region, units);
+            let released = epoch::release(&head, &binding, region, units);
             done(move |main| match released {
-                Ok((devices, _)) if devices.is_empty() => {}
-                Ok((devices, bytes)) => main.report(lifecycle::report(
-                    proto::process::report::Kind::Shrunk(proto::process::Shrunk { devices, bytes }),
-                )),
+                // One report per host whose quotas the release freed memory in: the daemon has
+                // the target engines with ranks there grow into it.
+                Ok((devices, bytes)) => {
+                    let launch = &main.launch;
+                    let hosts =
+                        epoch::by_host(&launch.engine_config.parallel, &launch.host, devices);
+                    for (host, devices) in hosts {
+                        let shrunk = proto::process::Shrunk {
+                            devices,
+                            bytes,
+                            host,
+                        };
+                        main.report(lifecycle::report(proto::process::report::Kind::Shrunk(
+                            shrunk,
+                        )));
+                    }
+                }
                 Err(error) => {
                     let reason = format!("releasing region {region} past unit {units}: {error:#}");
                     main.fail(reason.clone(), lifecycle::fault("release", reason, 0));

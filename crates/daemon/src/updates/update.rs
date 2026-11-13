@@ -91,6 +91,10 @@ pub(crate) struct Node {
     rank: u32,
     /// Its launch generation, which commands address it by.
     launch: u64,
+    /// The launch generation of the scheduler node's main process of its
+    /// world (its own on that node): the process that holds the world's
+    /// schedulers and session, and acts on every rank of the world.
+    head: u64,
     /// The generation of modules it numbered: what a serving engine
     /// prepared, or what a target holds.
     generation: Option<u64>,
@@ -98,12 +102,14 @@ pub(crate) struct Node {
 
 impl Node {
     /// The engine of launch generation `launch` on `host`, whose first rank
-    /// is group rank `rank`.
-    pub(crate) fn new(host: String, rank: u32, launch: u64) -> Self {
+    /// is group rank `rank`, of the world whose scheduler node's main
+    /// process is of launch generation `head`.
+    pub(crate) fn new(host: String, rank: u32, launch: u64, head: u64) -> Self {
         Self {
             host,
             rank,
             launch,
+            head,
             generation: None,
         }
     }
@@ -567,9 +573,15 @@ impl Update {
                 return self.abandon(processes, failure("spawn_failed", reason));
             }
             if let Form::Epoch(trial) = &mut self.form {
-                trial
-                    .targets
-                    .push(Node::new(launch.host.clone(), launch.rank, launch.engine));
+                trial.targets.push(Node::new(
+                    launch.host.clone(),
+                    launch.rank,
+                    launch.engine,
+                    launch
+                        .world
+                        .as_ref()
+                        .map_or(launch.engine, |world| world.scheduler),
+                ));
             }
         }
 
@@ -747,9 +759,9 @@ impl Update {
                 trial.target_left.insert(target);
             }
             // On the way back the targets drain beside the previous epoch, which grows into what
-            // they give back on their host.
-            (Phase::Switching, true, Some(report::Kind::Shrunk(_))) if trial.switch.shrink => {
-                grow_on(processes, &trial.targets[target].host, &self.nodes);
+            // they give back on the host the release names.
+            (Phase::Switching, true, Some(report::Kind::Shrunk(shrunk))) if trial.switch.shrink => {
+                grow_on(processes, &shrunk.host, &self.nodes);
             }
             // A target that fails while the switch runs back is stopped: it
             // drains nothing more.
@@ -786,12 +798,12 @@ impl Update {
             (Phase::Switching, true, Some(report::Kind::Serving(_))) => {
                 self.previous_serves(processes, node);
             }
-            // A serving engine draining across layouts gave device memory back: the targets on
-            // its host grow into it, one release at a time.
-            (Phase::Switching | Phase::Trial, false, Some(report::Kind::Shrunk(_)))
+            // A serving engine draining across layouts gave device memory back on the host the
+            // release names: the targets with ranks there grow into it, one release at a time.
+            (Phase::Switching | Phase::Trial, false, Some(report::Kind::Shrunk(shrunk)))
                 if trial.switch.shrink =>
             {
-                grow_on(processes, &self.nodes[node].host, &trial.targets);
+                grow_on(processes, &shrunk.host, &trial.targets);
             }
             _ => {}
         }
@@ -1275,14 +1287,26 @@ fn command(kind: command::Kind) -> process::Command {
     process::Command { kind: Some(kind) }
 }
 
-/// Sends `Grow` to each of `engines` on `host`: an engine draining there across layouts gave its
-/// device memory back to the GPUs' quotas, and these grow their regions into it
-/// (`specs/updates.md` §3.7). An engine on another host shares no quota with it.
+/// Sends `Grow` to the scheduler node of each world of `engines` with an engine on `host`, once
+/// per world: an engine draining across layouts gave device memory back to the quotas of GPUs on
+/// that host, and the scheduler node grows its regions into it on every rank it holds, the
+/// peers' included (`specs/updates.md` §3.7). A world with no engine on that host shares no
+/// quota with it.
 fn grow_on(processes: &mut Processes, host: &str, engines: &[Node]) {
+    let mut heads: Vec<u64> = Vec::new();
     for engine in engines.iter().filter(|engine| engine.host == host) {
+        if !heads.contains(&engine.head) {
+            heads.push(engine.head);
+        }
+    }
+    for head in heads {
+        let Some(scheduler) = engines.iter().find(|engine| engine.launch == head) else {
+            tracing::warn!(head, "a world's scheduler node is no engine of the update");
+            continue;
+        };
         processes.command(
-            &engine.host,
-            engine.launch,
+            &scheduler.host,
+            head,
             command(command::Kind::Grow(process::Grow {})),
         );
     }

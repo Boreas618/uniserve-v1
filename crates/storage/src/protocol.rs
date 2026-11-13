@@ -93,7 +93,12 @@
 //! ([`Request::Withdraw`]). The server reads the host copies of other hosts
 //! that serve the deployment for a prefetch from the peers; another host's
 //! Storage Server holds the host copies it reads ([`Request::PeerHold`],
-//! [`Request::PeerRelease`]).
+//! [`Request::PeerRelease`]). A rank of another host has its part of a host
+//! region on its own host, so a put or a prefetch of the session's that
+//! touches it runs on that host: its Transfer Server copies into the part
+//! ([`Request::Submit`]) and its connector moves the part's pages
+//! ([`Request::Pages`]), each asked by this server as a head of the
+//! deployment.
 //!
 //! A span's source may lie on another host ([`Region::Remote`]): the
 //! destination host's Transfer Server READs it through NIXL. It asks the
@@ -119,7 +124,7 @@ use crate::runtime::{Open, Opened};
 /// (`proto::ENGINE_INTERFACE_VERSION`, through `proto::STORAGE_PROTOCOL`, which
 /// a change of this version changes with it), so an engine built for another
 /// storage protocol is refused at its hello to the daemon as well.
-pub const VERSION: u32 = 25;
+pub const VERSION: u32 = 26;
 
 /// The most bytes a [`Request::Read`] responds with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -879,12 +884,16 @@ pub struct HostCopy {
 }
 
 /// One rank's part of a host region: unit `u` lies at byte `u × bytes` of
-/// the part, which a transfer names as [`Region::Part`].
+/// the part, which a transfer names as [`Region::Part`]. The part lies on
+/// the host whose Storage Server listens at `endpoint` when that is another
+/// host than the answering server's: the part of a rank of another host of
+/// the deployment's engine, which lies on that rank's host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegionPart {
     pub region: String,
     pub rank: u32,
     pub bytes: u64,
+    pub endpoint: Option<String>,
 }
 
 /// The device storage the Transfer Server's CUDA context takes on one GPU,
@@ -1257,6 +1266,23 @@ pub enum Request {
     /// connection holds nothing there; the reading host commits what it
     /// read only on `Valid`.
     PeerRelease { deployment: String },
+    /// From a head of the deployment, which is another host's Storage
+    /// Server running a task of its buffer pool that touches the part of a
+    /// rank of this host (`specs/buffer-pool.md` §15): have this host's
+    /// connector write `pages` of part `part` of the host region `region` to
+    /// the KV storage (`upload`), or read them from it into their units, each
+    /// page a key and the unit that holds it. Responded with
+    /// [`Response::Submitted`] and the task's number at once;
+    /// [`Event::PagesMoved`] follows once the connector ran the task, or once
+    /// a connector lost meanwhile has exited. Refused when this host holds no
+    /// such part, when a unit lies past the region's numbering, or when no
+    /// connector is connected.
+    Pages {
+        region: String,
+        part: u32,
+        pages: Vec<(Key, u32)>,
+        upload: bool,
+    },
 }
 
 /// Why a request failed.
@@ -1323,7 +1349,7 @@ pub enum Response {
     Finished,
     /// What a [`Request::Quota`] or a [`Request::Usage`] names.
     Usage(Usage),
-    /// The task a [`Request::Submit`] submitted.
+    /// The task a [`Request::Submit`] or a [`Request::Pages`] submitted.
     Submitted {
         task: u64,
     },
@@ -1371,7 +1397,8 @@ pub enum Response {
         units: u32,
     },
     /// The host copies a [`Request::PeerHold`] holds, and every part of
-    /// the host regions they lie in.
+    /// the host regions they lie in that this server knows: its own host's,
+    /// and those of the ranks of other hosts its sessions' heads stated.
     PeerHeld {
         copies: Vec<HostCopy>,
         parts: Vec<RegionPart>,
@@ -1682,6 +1709,11 @@ pub enum Event {
         pool: u64,
         pages: Vec<(Key, u64)>,
     },
+    /// To the head that asked for task `task` ([`Request::Pages`]): one
+    /// result per page, in the order the request named them; a page whose
+    /// result is false did not move. From then on the connector touches
+    /// none of the task's units.
+    PagesMoved { task: u64, results: Vec<bool> },
 }
 
 /// A message from a client.

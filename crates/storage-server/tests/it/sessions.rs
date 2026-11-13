@@ -663,7 +663,64 @@ pub(crate) fn host_copy(server: &Running) -> (Client, Vec<Scheduler>, Opened, Ve
     let parts = host_parts(&server.socket, claim);
 
     let mut schedulers = Scheduler::all(&opened, descriptors);
-    let prefill = &mut schedulers[0];
+    store_on_host(&mut schedulers[0]);
+    (engine, schedulers, opened, parts)
+}
+
+/// An engine of epoch 0 whose prefill group has a rank on each of two
+/// hosts, with its schedulers. Its head opens the session on `here`, naming
+/// `peers`, where rank 0 takes part 0 of the host region; rank 1 takes part
+/// 1 on `there`, at whose server the engine's peer opened the session's
+/// host regions alone, and the head states where that rank's units lie.
+/// Returns the head, the peer's session, the schedulers, the answer, and
+/// the memfds of the parts here and there.
+pub(crate) fn split_host_region(
+    here: &Running,
+    there: &Running,
+    peers: Vec<String>,
+) -> (Client, Client, Vec<Scheduler>, Opened, [OwnedFd; 2]) {
+    let mut open = layout(0);
+    open.peers = peers;
+    let claim = head(&here.socket)
+        .claim(0, vec![scope("prefill", 0)], Vec::new())
+        .unwrap();
+    let mut engine = engine_head(&here.socket, 0);
+    let (opened, descriptors) = engine.open_pool(open.clone()).unwrap();
+    let mut first = rank(&here.socket, "prefill", 0, claim);
+    let (_, here_part) = first.host_part("host".into(), 0, 16, None).unwrap();
+
+    // The peer's session states the layout's host regions alone, with no
+    // group and no scheduler.
+    let mut hosts = open;
+    hosts.regions.retain(|region| region.tier == Tier::Host);
+    hosts.classes.clear();
+    hosts.groups.clear();
+    hosts.schedulers.clear();
+    hosts.peers.clear();
+    let there_claim = head(&there.socket)
+        .claim(0, vec![scope("prefill", 1)], Vec::new())
+        .unwrap();
+    let mut peer = engine_head(&there.socket, 0);
+    peer.open_pool(hosts).unwrap();
+    let mut second = rank(&there.socket, "prefill", 1, there_claim);
+    let (_, there_part) = second.host_part("host".into(), 1, 16, None).unwrap();
+    engine
+        .place_remote(
+            "units".into(),
+            "gpu0".into(),
+            1,
+            there.tcp.clone(),
+            values(key(11)),
+        )
+        .unwrap();
+
+    let schedulers = Scheduler::all(&opened, descriptors);
+    (engine, peer, schedulers, opened, [here_part, there_part])
+}
+
+/// The prefill scheduler caches key 7 on the device and stores it on the
+/// host, in unit 0 of the host region, the test running the store's copy.
+pub(crate) fn store_on_host(prefill: &mut Scheduler) {
     let attach = Request::Attach {
         owner: OwnerId(1),
         group: PREFILL,
@@ -699,7 +756,6 @@ pub(crate) fn host_copy(server: &Running) -> (Client, Vec<Scheduler>, Opened, Ve
     };
     let stored = Completion::Stored { keys: Vec::new() };
     assert_eq!(prefill.ask(finish), stored);
-    (engine, schedulers, opened, parts)
 }
 
 /// The memfds of the host region's parts, of 16 bytes a unit, that the two
@@ -912,6 +968,84 @@ fn a_put_and_a_prefetch_move_host_copies_through_the_connector_part_by_part() {
     assert_eq!(prefill.ask(peers), Completion::Prefetched { found: 0 });
 }
 
+/// Answers the connector's next task, an upload when `upload` and a
+/// download otherwise, which must move `pages`, with `results`.
+fn run_pages(connector: &mut Client, upload: bool, pages: &[(Key, u64)], results: Vec<bool>) {
+    let (task, moved) = match connector_event(connector) {
+        Event::Upload { task, pages, .. } if upload => (task, pages),
+        Event::Download { task, pages, .. } if !upload => (task, pages),
+        other => panic!("the connector got {other:?}"),
+    };
+    assert_eq!(moved, pages);
+    let finished = ::storage::protocol::Request::Finished { task, results };
+    assert!(connector.call(&finished, &[]).is_ok());
+}
+
+/// A host region whose parts lie on two hosts: a put and a prefetch of the
+/// scheduler's host move each part's pages through the connector of the
+/// host it lies on, the other host's asked by this one's server, and a key
+/// counts only once every part of it moved.
+#[test]
+fn a_put_and_a_prefetch_move_each_part_through_the_connector_of_its_host() {
+    let here = Running::with_transfer(|_| None);
+    let there = Running::with_transfer(|_| None);
+    // The test plays each server's connector, which is given its host's
+    // part.
+    let mut connectors =
+        [&here, &there].map(|server| Client::connect(&server.socket, Role::Connector).unwrap());
+    let (_engine, _peer, mut schedulers, _opened, _parts) =
+        split_host_region(&here, &there, Vec::new());
+    store_on_host(&mut schedulers[0]);
+    for connector in &mut connectors {
+        assert!(matches!(
+            connector_event(connector),
+            Event::Pool { slots: 4, .. }
+        ));
+    }
+    let prefill = &mut schedulers[0];
+
+    // A put: the block's page of each part, written by its host's
+    // connector.
+    let put = prefill.submit(Request::Store {
+        group: PREFILL,
+        keys: vec![key(7)],
+        tier: Tier::Remote,
+    });
+    for connector in &mut connectors {
+        run_pages(connector, true, &[(key(7), 0)], vec![true]);
+    }
+    let stored = Completion::Stored { keys: vec![key(7)] };
+    assert_eq!(prefill.next(), (put, stored));
+
+    // A prefetch of two keys: the second's page fails on the other host's
+    // part, so the first alone is found.
+    let prefetch = prefill.submit(Request::Prefetch {
+        class: KV,
+        units: 0,
+        keys: vec![key(8), key(9)],
+        source: Source::Remote,
+        deadline: u64::MAX / 2,
+    });
+    let pages = [(key(8), 1), (key(9), 2)];
+    run_pages(&mut connectors[0], false, &pages, vec![true, true]);
+    run_pages(&mut connectors[1], false, &pages, vec![true, false]);
+    assert_eq!(
+        prefill.next(),
+        (prefetch, Completion::Prefetched { found: 1 })
+    );
+
+    // A put the other host's connector fails stores nothing.
+    let put = prefill.submit(Request::Store {
+        group: PREFILL,
+        keys: vec![key(8)],
+        tier: Tier::Remote,
+    });
+    run_pages(&mut connectors[0], true, &[(key(8), 1)], vec![true]);
+    run_pages(&mut connectors[1], true, &[(key(8), 1)], vec![false]);
+    let stored = Completion::Stored { keys: Vec::new() };
+    assert_eq!(prefill.next(), (put, stored));
+}
+
 #[test]
 fn a_peer_holds_the_host_copies_it_reads_until_it_releases_them() {
     let server = Running::with_transfer(|_| None);
@@ -939,6 +1073,7 @@ fn a_peer_holds_the_host_copies_it_reads_until_it_releases_them() {
         region: "host".into(),
         rank,
         bytes: 16,
+        endpoint: None,
     };
     assert_eq!(parts, [part(0), part(1)]);
     prefill.await_capacity(host, (3, 0, 0));

@@ -526,7 +526,8 @@ impl TransferServer {
             | Event::Pool { .. }
             | Event::PoolReleased { .. }
             | Event::Upload { .. }
-            | Event::Download { .. } => {}
+            | Event::Download { .. }
+            | Event::PagesMoved { .. } => {}
         }
     }
 

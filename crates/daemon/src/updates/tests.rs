@@ -96,10 +96,10 @@ impl Deployment {
 
     /// The serving engines a generation update moves: one, or two.
     fn nodes(&mut self, engines: usize) -> Vec<Node> {
-        let mut nodes = vec![Node::new(HOST.to_owned(), 0, PREVIOUS)];
+        let mut nodes = vec![Node::new(HOST.to_owned(), 0, PREVIOUS, PREVIOUS)];
         if engines == 2 {
             self.engines.serve(SECOND);
-            nodes.push(Node::new(HOST.to_owned(), 1, SECOND));
+            nodes.push(Node::new(HOST.to_owned(), 1, SECOND, SECOND));
         }
         nodes
     }
@@ -123,7 +123,7 @@ impl Deployment {
     fn epoch(&self, number: u64, keeps: PreviousEpoch, deadline: Option<Instant>) -> Update {
         let mut switch = self.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
         switch.keeps = keeps;
-        let nodes = vec![Node::new(HOST.to_owned(), 0, PREVIOUS)];
+        let nodes = vec![Node::new(HOST.to_owned(), 0, PREVIOUS, PREVIOUS)];
         self.epoch_over(number, nodes, switch, deadline)
     }
 
@@ -686,18 +686,22 @@ fn the_drain_states_its_deadline_and_shrinks_across_layouts() {
     );
 }
 
+/// A release of `bytes` on device 0 of `host`, as a draining engine reports it.
+fn shrunk(host: &str) -> process::Report {
+    process::Report {
+        kind: Some(process::report::Kind::Shrunk(process::Shrunk {
+            devices: vec![0],
+            bytes: 1 << 30,
+            host: host.to_owned(),
+        })),
+    }
+}
+
 /// A serving engine that gives its device memory back as it drains across layouts reports
 /// each release, and the target engines on its host are sent `Grow` for it; without `shrink`
 /// nothing is relayed.
 #[test]
 fn a_release_of_a_draining_engine_grows_the_targets_on_its_host() {
-    let shrunk = || process::Report {
-        kind: Some(process::report::Kind::Shrunk(process::Shrunk {
-            devices: vec![0],
-            bytes: 1 << 30,
-        })),
-    };
-
     for shrink in [true, false] {
         let mut deployment = Deployment::new(Refusals::default());
         let mut switch = deployment.switch(vec![(target_launch(HOST, 0, SPAWNED), Vec::new())]);
@@ -706,7 +710,7 @@ fn a_release_of_a_draining_engine_grows_the_targets_on_its_host() {
         let update = deployment.epoch_over(1, nodes, switch, None);
         deployment.apply(update);
 
-        deployment.engines.report(PREVIOUS, shrunk());
+        deployment.engines.report(PREVIOUS, shrunk(HOST));
         deployment.run();
         let expected: &[&str] = if shrink {
             &["promote", "grow"]
@@ -715,6 +719,44 @@ fn a_release_of_a_draining_engine_grows_the_targets_on_its_host() {
         };
         assert_eq!(names(&deployment.engines.received(SPAWNED)), expected);
     }
+}
+
+/// A release names the host whose quotas it freed memory in, and the daemon sends `Grow` to the
+/// scheduler node of each target world with an engine on that host, once: that node grows on
+/// every rank it holds, its peers' on other hosts included, so a peer is never sent `Grow`, and
+/// a release on a host where no target has an engine grows nothing.
+#[test]
+fn a_release_grows_the_scheduler_node_of_each_target_world_with_an_engine_on_its_host() {
+    let mut deployment = Deployment::new(Refusals::default());
+    let world = proto::config::World {
+        scheduler: SPAWNED,
+        channel: "rank-0:7000".to_owned(),
+        store: "rank-0:7001".to_owned(),
+        peers: 1,
+        inherited: None,
+    };
+    let mut head = target_launch(HOST, 0, SPAWNED);
+    head.world = Some(world.clone());
+    let mut peer = target_launch(OTHER, 2, SPAWNED_PEER);
+    peer.world = Some(world);
+    let mut switch = deployment.switch(vec![(head, vec![1, 2]), (peer, Vec::new())]);
+    switch.shrink = true;
+    let nodes = deployment.nodes(1);
+    let update = deployment.epoch_over(1, nodes, switch, None);
+    deployment.apply(update);
+
+    for host in [OTHER, HOST, "rank-9"] {
+        deployment.engines.report(PREVIOUS, shrunk(host));
+        deployment.run();
+    }
+    assert_eq!(
+        names(&deployment.engines.received(SPAWNED)),
+        ["promote", "grow", "grow"]
+    );
+    assert_eq!(
+        names(&deployment.engines.received(SPAWNED_PEER)),
+        ["promote"]
+    );
 }
 
 /// The epoch form covers every node of both epochs: a target whose world
@@ -726,8 +768,8 @@ fn an_epoch_update_covers_every_node_of_both_epochs() {
     let mut deployment = Deployment::new(Refusals::default());
     deployment.engines.serve(SECOND);
     let nodes = vec![
-        Node::new(HOST.to_owned(), 0, PREVIOUS),
-        Node::new(OTHER.to_owned(), 2, SECOND),
+        Node::new(HOST.to_owned(), 0, PREVIOUS, PREVIOUS),
+        Node::new(OTHER.to_owned(), 2, SECOND, PREVIOUS),
     ];
     let switch = deployment.switch(vec![
         (target_launch(HOST, 0, SPAWNED), vec![1, 2]),

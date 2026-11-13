@@ -419,11 +419,12 @@ message Command {
     // To a frontend process: epoch `epoch` serves from now on, and requests
     // are submitted at `requests`.
     Serve serve = 8;
-    // A serving engine of this host gave device memory back (`Shrunk`):
-    // the engine creates the segments of its regions its devices' quotas
-    // now hold, its head grants them, and its schedulers grow their regions
-    // into them. Answered by nothing; a target promoted with `grow` takes
-    // each one as it comes.
+    // A serving engine gave device memory back on a host this engine has
+    // ranks on (`Shrunk`): sent to the scheduler node's main process, which
+    // has every rank it holds, on its host and on its peers' hosts, create
+    // the segments of its regions their devices' quotas now hold, grants
+    // them, and has its schedulers grow their regions into them. Answered
+    // by nothing; a target promoted with `grow` takes each one as it comes.
     Grow grow = 9;
   }
 }
@@ -530,8 +531,9 @@ message Report {
     // A draining engine released segments of its KV planes that its
     // regions, shrunk by `Drain`'s `shrink`, no longer cover: the head
     // withdrew them from the buffer pool and every rank of the region gave
-    // them back to its device's quota. The daemon sends `Grow` to the
-    // target engines of this host.
+    // them back to its device's quota. One per host the ranks lie on, from
+    // the scheduler node's main process. The daemon sends `Grow` to the
+    // scheduler node of each target engine with ranks on that host.
     Shrunk shrunk = 14;
   }
 }
@@ -630,10 +632,14 @@ message NonFiniteLogits {
 }
 
 message Shrunk {
-  // The CUDA ordinals of the devices whose quota the release freed.
+  // The CUDA ordinals of the devices whose quota the release freed, on
+  // `host`.
   repeated uint32 devices = 1;
   // The bytes the release freed on each of those devices.
   uint64 bytes = 2;
+  // The host identity of the node those devices are on, as rank layouts
+  // name it.
+  string host = 3;
 }
 
 // A supervised process exited.

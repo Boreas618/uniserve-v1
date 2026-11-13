@@ -824,7 +824,7 @@ fn start_peer(
         .watchdog_timeout()
         .unwrap_or(launch.engine_config.worker.watchdog_timeout);
     let bound = 2 * crate::worker::watchdog::stall_bound(timeout);
-    let operate = operations::operator(Arc::clone(&binding), preparations, bound);
+    let operate = operations::operator(Arc::clone(&binding), workers.clone(), preparations, bound);
     let upstream = Upstream::serve(channel, Arc::clone(&route), Arc::clone(&liveness), operate)?;
 
     let hosts = Mutex::new(hosts);

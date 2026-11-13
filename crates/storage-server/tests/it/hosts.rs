@@ -29,7 +29,8 @@ use storage_server::Launch;
 
 use crate::server::{FORKING, Running, engine_head, head, host, key, memfd, scope, tensor};
 use crate::sessions::{
-    DECODE, HOST, KV, PREFILL, Scheduler, UNITS, host_copy, host_parts, layout, rank, values,
+    DECODE, HOST, KV, PREFILL, Scheduler, UNITS, host_copy, host_parts, layout, rank,
+    split_host_region, store_on_host, values,
 };
 use crate::transfer::{pattern, read, transfer_pid};
 
@@ -297,6 +298,59 @@ fn a_prefetch_from_the_peers_reads_the_host_copies_a_peer_held_throughout() {
 
     // The peer's holds ended with the read: its copy is evictable again.
     peer_schedulers[0].await_capacity(peer_opened.regions[HOST].0, (3, 0, 1));
+}
+
+/// Both the reading engine and the peer's have a rank on each of two hosts:
+/// each part of the read copy is read from the host the peer's part of its
+/// index lies on, by the Transfer Server of the host the reader's part lies
+/// on.
+#[test]
+fn a_prefetch_from_the_peers_reads_each_part_on_the_host_it_lies_on() {
+    let network = tempfile::tempdir().unwrap();
+
+    // The peer's engine cached key 7 on the host, in unit 0 of its part
+    // on its scheduler's host and of its part on its other host.
+    let peer = Running::with_transfer(|_| None);
+    let peer_other = Running::with_transfer(|_| None);
+    let (_peer_engine, _peer_peer, mut peer_schedulers, _, peer_parts) =
+        split_host_region(&peer, &peer_other, Vec::new());
+    store_on_host(&mut peer_schedulers[0]);
+    let peer_parts = files(peer_parts.into());
+    let written = [pattern(16, 3), pattern(16, 4)];
+    for (rank, (part, endpoint)) in peer_parts
+        .iter()
+        .zip([&peer.tcp, &peer_other.tcp])
+        .enumerate()
+    {
+        part.write_all_at(&written[rank], 0).unwrap();
+        let region = Region::Part {
+            region: "host".into(),
+            rank: rank as u32,
+        };
+        link(network.path(), endpoint, &region, part);
+    }
+
+    // The reading engine names the peer.
+    let reading = network_server(network.path(), None, None);
+    let reading_other = network_server(network.path(), None, None);
+    let (_engine, _peer, mut schedulers, _, parts) =
+        split_host_region(&reading, &reading_other, vec![peer.tcp.clone()]);
+    let parts = files(parts.into());
+    let prefill = &mut schedulers[0];
+
+    // Key 7 is read into unit 0 of each part, the part on the other host
+    // by that host's Transfer Server; key 9 is held by no peer.
+    assert_eq!(
+        prefill.ask(from_peers()),
+        Completion::Prefetched { found: 1 }
+    );
+    for (part, bytes) in parts.iter().zip(&written) {
+        assert_eq!(read(part, 0, 16), *bytes);
+    }
+    let listed = Completion::Listing {
+        keys: vec![(key(7), KV, 64, 0b010, 0)],
+    };
+    assert_eq!(prefill.ask(Request::List), listed);
 }
 
 #[test]

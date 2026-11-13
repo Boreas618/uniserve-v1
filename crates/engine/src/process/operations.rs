@@ -43,6 +43,7 @@ use super::epoch;
 use crate::memory::client::StorageClient;
 use crate::process::binding::{Target, WeightBinding};
 use crate::scheduler::{self, Message};
+use crate::worker::Worker;
 
 /// How long a release that makes room waits before it asks a region again for units its requests
 /// still hold: the requests that hold the tail run on, and the release takes it once they let it
@@ -499,35 +500,38 @@ pub(crate) fn hook(binding: &Arc<WeightBinding>, name: &str, payload: &str) -> R
 }
 
 /// The end of a process's own preparation of a generation, as its control thread states it: the
-/// generation, and the operators its ranks have no comparison for, or the preparation's failure.
-pub(crate) type Preparation = (u64, std::result::Result<Vec<String>, String>);
+/// generation, and whether the preparation failed, with why.
+pub(crate) type Preparation = (u64, std::result::Result<(), String>);
 
 /// What a peer runs each operation of the scheduler node's data plane with
-/// (`crate::executor::peers::Upstream::serve`): [`operate`] on `binding`, this process's, keeping
-/// a weight load's replacement between the operations that pair, load, stage and discard it, and
-/// reading the ends of this process's own preparations from `preparations`, which it waits for
-/// at most `bound`.
+/// (`crate::executor::peers::Upstream::serve`): [`operate`] on `binding` and `workers`, this
+/// process's, keeping a weight load's replacement between the operations that pair, load, stage
+/// and discard it, and reading the ends of this process's own preparations from `preparations`,
+/// which it waits for at most `bound`.
 pub(crate) fn operator(
     binding: Arc<WeightBinding>,
+    workers: Vec<Arc<Worker>>,
     preparations: Receiver<Preparation>,
     bound: Duration,
 ) -> Operate {
     let mut held: Option<Replacement> = None;
     Box::new(move |operation| {
-        operate(&binding, &mut held, (&preparations, bound), operation)
+        let preparations = (&preparations, bound);
+        operate(&binding, &workers, &mut held, preparations, operation)
             .map_err(|error| format!("{error:#}"))
     })
 }
 
-/// Runs `operation`, which the scheduler node relayed, on this peer's `binding`, and returns the
-/// JSON of its value, as the scheduler node's binding reads it. `held` is the weight load's
-/// replacement this process keeps from the pairing to the stage or discard that ends it.
+/// Runs `operation`, which the scheduler node relayed, on this peer's `binding` and `workers`, and
+/// returns the JSON of its value, as the scheduler node's binding reads it. `held` is the weight
+/// load's replacement this process keeps from the pairing to the stage or discard that ends it.
 ///
 /// # Errors
 ///
 /// What the operation fails with; a load or a stage with nothing paired.
 fn operate(
     binding: &Arc<WeightBinding>,
+    workers: &[Arc<Worker>],
     held: &mut Option<Replacement>,
     preparations: (&Receiver<Preparation>, Duration),
     operation: DataOperation,
@@ -536,7 +540,12 @@ fn operate(
 
     let reply = match operation {
         Operation::ReleaseSegments { groups, from } => {
-            encoded(&binding.release_segments(&groups, from)?)
+            let released = binding.release_segments(&groups, from)?;
+            let devices: Vec<u32> = released
+                .into_iter()
+                .flat_map(|(_, devices)| devices)
+                .collect();
+            encoded(&devices)
         }
         Operation::CreateSegments { groups, count } => {
             encoded(&binding.create_segments(&groups, count)?)
@@ -591,6 +600,7 @@ fn operate(
             let (preparations, bound) = preparations;
             encoded(&prepared(preparations, generation, bound)?)
         }
+        Operation::Uncompared => encoded(&super::generation::uncompared(workers)),
         Operation::Hook { name, payload } => encoded(&hook(binding, &name, &payload)?),
     };
     reply.context("encoding the operation's value")
@@ -602,17 +612,13 @@ fn encoded(value: &impl serde::Serialize) -> serde_json::Result<String> {
 }
 
 /// The end of this process's own preparation of generation `generation`, which its control
-/// thread states on `preparations` as each ends: the operators it has no comparison for. An
-/// earlier generation's end, whose preparation was abandoned, is passed over.
+/// thread states on `preparations` as each ends. An earlier generation's end, whose preparation
+/// was abandoned, is passed over.
 ///
 /// # Errors
 ///
 /// A preparation that failed, or that did not end within `bound`.
-fn prepared(
-    preparations: &Receiver<Preparation>,
-    generation: u64,
-    bound: Duration,
-) -> Result<Vec<String>> {
+fn prepared(preparations: &Receiver<Preparation>, generation: u64, bound: Duration) -> Result<()> {
     let deadline = Instant::now() + bound;
     loop {
         match preparations.recv_deadline(deadline) {

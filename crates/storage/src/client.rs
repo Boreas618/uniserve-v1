@@ -698,6 +698,46 @@ impl Client {
             other => Err(unexpected("peer release", &other)),
         }
     }
+
+    /// See [`Request::Pages`]: have the connector of this connection's host
+    /// move `pages` of part `part` of the host region `region`, to the KV
+    /// storage when `upload` and from it otherwise. Returns the task, whose
+    /// results arrive as an event ([`Client::poll_pages`]).
+    pub fn pages(
+        &mut self,
+        region: String,
+        part: u32,
+        pages: Vec<(Key, u32)>,
+        upload: bool,
+    ) -> Result<u64> {
+        let request = Request::Pages {
+            region,
+            part,
+            pages,
+            upload,
+        };
+        match self.request(&request, &[])?.0 {
+            Response::Submitted { task } => Ok(task),
+            other => Err(unexpected("pages", &other)),
+        }
+    }
+
+    /// Consume the results of the [`Request::Pages`] task `task` without
+    /// waiting: one per page, in the order the request named them. Other
+    /// events stay queued for their owners. Returns `None` while the task
+    /// runs or after its results were consumed.
+    pub fn poll_pages(&mut self, task: u64) -> Result<Option<Vec<bool>>> {
+        self.pump()?;
+        let at = self.events.iter().position(
+            |(event, _)| matches!(event, Event::PagesMoved { task: found, .. } if *found == task),
+        );
+        Ok(at
+            .and_then(|at| self.events.remove(at))
+            .and_then(|(event, _)| match event {
+                Event::PagesMoved { results, .. } => Some(results),
+                _ => None,
+            }))
+    }
 }
 
 /// The tensors of a response to a `Get`, with one descriptor per storage.

@@ -10,9 +10,9 @@
 //! - **Prepare**: [`named`] reads the packages the daemon's `Prepare` names; [`kernels`] selects and installs the kernels of every key the devices launch and
 //!   has every worker rebind or recapture its graphs; [`policy`] resolves the policy package and
 //!   instantiates it once against the ceilings, so that a policy that faults fails the
-//!   preparation and not the switch; [`shadow`] compares each changed kernel with the serving one
-//!   on the batches the schedulers serve. Serving is untouched, and [`discard`] gives back what a
-//!   preparation built.
+//!   preparation and not the switch; [`compare`] compares each changed kernel with the serving one
+//!   on the batches the schedulers serve ([`shadow`]) and collects what no rank could compare.
+//!   Serving is untouched, and [`discard`] gives back what a preparation built.
 //! - **Switch**: [`switch`], at one boundary of every scheduler.
 //! - **Trial**: [`commit`] releases the kept generation after its last batch; [`rollback`] serves
 //!   the kept generation again from one boundary.
@@ -23,7 +23,9 @@
 //! The ranks of the epoch's peers switch, commit and roll back with this process's, in the order
 //! of every group's jobs, through the node's route (`Route::switch`); each peer prepares from its
 //! own daemon's command and its own host's Build Server, and a shadow pass waits for every
-//! peer's preparation before its shadow batches reach them (`WeightBinding::prepared`).
+//! peer's preparation before its shadow batches reach them (`WeightBinding::prepared`); what a
+//! peer's ranks could not compare is asked once the pass ended, so it covers the shadow batches
+//! that reached them (`WeightBinding::uncompared_by_peers`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -255,12 +257,60 @@ pub(crate) fn policy(
     Ok((module, parameters))
 }
 
-/// Compares each changed kernel of generation `generation`, which every worker has prepared,
-/// with the serving one on the batches the schedulers serve: a pass of every scheduler's
+/// Compares the kernels of generation `generation` that changed (`changed`, the operators whose
+/// package changed) with the serving ones on every rank, this process's and its peers': waits
+/// until every peer's own preparation of the generation ended, runs the shadow pass when an
+/// operator changed ([`shadow`]), and returns what the ranks could not compare once the pass
+/// ended, this process's workers' then every peer's in rank order, without repeats. Nothing is
+/// uncompared when no operator changed.
+///
+/// # Errors
+///
+/// A peer whose preparation failed or did not end within its bound, the shadow pass's failure,
+/// or a peer's failure to answer.
+pub(crate) fn compare(
+    shadows: &[Arc<Mutex<Shadow>>],
+    workers: &[Arc<Worker>],
+    binding: &WeightBinding,
+    generation: u64,
+    changed: &[String],
+    bound: Duration,
+) -> Result<Vec<String>> {
+    // No shadow batch of the generation reaches a peer's ranks before they hold it.
+    binding.prepared(generation)?;
+    if changed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    shadow(shadows, generation, changed, bound)?;
+    let mut uncompared = self::uncompared(workers);
+    for entry in binding.uncompared_by_peers()? {
+        if !uncompared.contains(&entry) {
+            uncompared.push(entry);
+        }
+    }
+    Ok(uncompared)
+}
+
+/// What `workers` have no comparison for in the generation update in flight, each with the
+/// reason, in the workers' order and without repeats ([`Worker::uncompared`]).
+pub(crate) fn uncompared(workers: &[Arc<Worker>]) -> Vec<String> {
+    let mut uncompared: Vec<String> = Vec::new();
+    for worker in workers {
+        for entry in worker.uncompared() {
+            if !uncompared.contains(&entry) {
+                uncompared.push(entry);
+            }
+        }
+    }
+    uncompared
+}
+
+/// Compares each changed kernel of generation `generation`, which every rank has prepared, with
+/// the serving one on the batches the schedulers serve: a pass of every scheduler's
 /// [`Shadow`] runs each batch of a group and shape it has not shadowed as a shadow batch of the
-/// generation, whose paired forwards compare the pairs within their tolerances. Returns the
-/// operators the workers could not compare, each with the reason, without repeats; empty states
-/// that every replaced operator a shadow batch reached was compared.
+/// generation, whose paired forwards compare the pairs within their tolerances. What a rank could
+/// not compare its worker states once the pass ended ([`uncompared`]).
 ///
 /// A pass answers once a batch of its scheduler ran, so an engine whose running requests run no
 /// step within `bound` (twice the stall bound) compares nothing: the update is abandoned, naming
@@ -272,11 +322,10 @@ pub(crate) fn policy(
 /// `bound`; every pass is ended then.
 pub(crate) fn shadow(
     shadows: &[Arc<Mutex<Shadow>>],
-    workers: &[Arc<Worker>],
     generation: u64,
     changed: &[String],
     bound: Duration,
-) -> Result<Vec<String>> {
+) -> Result<()> {
     let mut replies = Vec::with_capacity(shadows.len());
     for shadow in shadows {
         let (reply, replied) = crossbeam_channel::bounded(1);
@@ -310,16 +359,7 @@ pub(crate) fn shadow(
         }
         return Err(failure);
     }
-
-    let mut uncompared: Vec<String> = Vec::new();
-    for worker in workers {
-        for entry in worker.uncompared() {
-            if !uncompared.contains(&entry) {
-                uncompared.push(entry);
-            }
-        }
-    }
-    Ok(uncompared)
+    Ok(())
 }
 
 /// Switches every scheduler and every worker to generation `generation` at one batch boundary

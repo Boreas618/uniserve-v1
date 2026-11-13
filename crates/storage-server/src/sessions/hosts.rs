@@ -20,10 +20,14 @@
 //!   head of the deployment, its sources on this host named as regions of
 //!   another host ([`Region::Remote`]) at the address the connection leaves
 //!   this host from, and waits for its end, which it reports. The main
-//!   loop's stop cancels it there.
+//!   loop's stop cancels it there. The pages of a put or a prefetch that lie
+//!   in such a rank's part of a host region are moved by that host's
+//!   connector: the helper asks it there as a head of the deployment, one
+//!   task per part ([`Request::Pages`]), and reports each part's results.
 //!
 //! [`Request::PeerHold`]: storage::protocol::Request::PeerHold
 //! [`Request::PeerRelease`]: storage::protocol::Request::PeerRelease
+//! [`Request::Pages`]: storage::protocol::Request::Pages
 
 use std::io;
 use std::sync::mpsc;
@@ -32,6 +36,7 @@ use std::time::{Duration, Instant};
 use storage::protocol::{HostCopy, Key, Priority, Region, RegionPart, Role, Span, TaskStatus};
 use storage::{Client, Error, Result};
 
+use super::Pages;
 use super::polling::Notifier;
 use crate::Server;
 
@@ -232,6 +237,113 @@ fn transfer(
             return Err(Error::Protocol(format!(
                 "{endpoint} reported no end of a cancelled transfer"
             )));
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// The pages of a put (`upload`) or a prefetch of the pool task `number` of
+/// `session` that lie in parts of a host region on the host whose Storage
+/// Server listens at `endpoint`, each part named by its region and index:
+/// that host's connector moves them, asked there as a head of the
+/// deployment's epoch, one task per part. Notices the main loop of each
+/// part's results ([`Server::pool_pages_moved`]). A part that could not be
+/// asked moved nothing, as did one whose end is not heard within `limit`
+/// once `stop` received or closed: the task was stopped, and nothing more
+/// is heard of that host.
+///
+/// # Errors
+///
+/// Fails when the helper thread cannot be started.
+pub(super) fn pages_at(
+    notifier: Notifier,
+    number: u64,
+    endpoint: String,
+    (session, upload): ((String, u64), bool),
+    parts: Vec<(String, u32, Pages)>,
+    (stop, limit): (mpsc::Receiver<()>, Duration),
+) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("remote-pages".into())
+        .spawn(move || {
+            let results = pages_there(&endpoint, session, upload, &parts, (&stop, limit))
+                .unwrap_or_else(|error| {
+                    tracing::warn!(endpoint, %error, "pages of a rank of another host failed");
+                    Vec::new()
+                });
+            notifier.send(Box::new(move |server: &mut Server| {
+                for (index, (.., (_, keys))) in parts.iter().enumerate() {
+                    let moved = results.get(index).cloned().flatten().unwrap_or_default();
+                    server.pool_pages_moved(number, keys, &moved);
+                }
+            }));
+        })?;
+    Ok(())
+}
+
+/// Has the connector of another host's Storage Server move pages
+/// ([`pages_at`]). Returns per part the results its connector reported,
+/// `None` for one it refused or did not report on: once the task was
+/// stopped and `limit` passed, or once the connection failed.
+///
+/// # Errors
+///
+/// When that host's server cannot be reached.
+fn pages_there(
+    endpoint: &str,
+    (deployment, epoch): (String, u64),
+    upload: bool,
+    parts: &[(String, u32, Pages)],
+    (stop, limit): (&mpsc::Receiver<()>, Duration),
+) -> Result<Vec<Option<Vec<bool>>>> {
+    let role = Role::Head {
+        deployment,
+        epoch,
+        generation: 0,
+    };
+    let mut client = Client::connect_remote(endpoint, role, REMOTE_TIMEOUT)?;
+    let mut tasks = Vec::with_capacity(parts.len());
+    for (region, part, (pages, _)) in parts {
+        let asked = client.pages(region.clone(), *part, pages.clone(), upload);
+        tasks.push(asked.map_err(|error| {
+            tracing::warn!(endpoint, region, part, %error, "another host's connector refused pages");
+        }));
+    }
+
+    let mut results: Vec<Option<Vec<bool>>> = vec![None; parts.len()];
+    let mut deadline = None;
+    loop {
+        for (task, result) in tasks.iter().zip(&mut results) {
+            let Ok(task) = task else {
+                continue;
+            };
+            if result.is_none() {
+                match client.poll_pages(*task) {
+                    Ok(polled) => *result = polled,
+                    Err(error) => {
+                        tracing::warn!(endpoint, %error, "a host moving pages was lost");
+                        return Ok(results);
+                    }
+                }
+            }
+        }
+        let waiting = tasks
+            .iter()
+            .zip(&results)
+            .any(|(task, result)| task.is_ok() && result.is_none());
+        if !waiting {
+            return Ok(results);
+        }
+
+        if deadline.is_none() && !matches!(stop.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+            deadline = Some(Instant::now() + limit);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            tracing::warn!(
+                endpoint,
+                "another host reported no end of a stopped task's pages"
+            );
+            return Ok(results);
         }
         std::thread::sleep(POLL);
     }
