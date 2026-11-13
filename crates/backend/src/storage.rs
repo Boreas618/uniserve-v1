@@ -29,8 +29,8 @@ use std::sync::Arc;
 
 use ops::platform::{CaptureStatus, Stream, copy_to_host};
 use ops::{DevicePtr, MAX_RANK, Operand, Strides};
-use uniserve_tensor::backend::{BackendDevice, BackendStorage};
-use uniserve_tensor::{CpuStorage, DType, Device, Layout, Shape, Storage, Tensor};
+use tensor::backend::{BackendDevice, BackendStorage};
+use tensor::{CpuStorage, DType, Device, Layout, Shape, Storage, Tensor};
 
 use crate::allocator::Allocator;
 use crate::device::{self, CudaDevice, MetaDevice};

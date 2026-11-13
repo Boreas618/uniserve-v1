@@ -1,10 +1,8 @@
 use crate::backend::BackendStorage;
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
-use crate::custom_op::{all_distinct, InplaceOpN, Src};
 use crate::op::{BinaryOp, CmpOp, ReduceOp, UnaryOp};
 use crate::scalar::Scalar;
-use crate::{CpuStorage, DType, Device, Error, Layout, Result, Shape};
-use crate::{CustomOp1, CustomOp2, CustomOp3};
+use crate::{CpuStorage, DType, Device, Error, Layout, Result};
 use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 
 /// The elements of a tensor: host memory of the built-in CPU backend, or the storage of a
@@ -141,124 +139,6 @@ impl Storage {
         match self {
             Self::Cpu(storage) => Ok(Self::Cpu(storage.view(dtype)?)),
             Self::Backend(storage) => Ok(Self::Backend(storage.view(dtype)?)),
-        }
-    }
-
-    pub(crate) fn apply_op1(&self, l: &Layout, c: &dyn CustomOp1) -> Result<(Self, Shape)> {
-        match self {
-            Self::Cpu(storage) => {
-                let (storage, shape) = c.cpu_fwd(storage, l)?;
-                Ok((Self::Cpu(storage), shape))
-            }
-            Self::Backend(storage) => {
-                let (storage, shape) = c.backend_fwd(storage.as_ref(), l)?;
-                Ok((Self::Backend(storage), shape))
-            }
-        }
-    }
-
-    pub(crate) fn apply_op2(
-        &self,
-        l1: &Layout,
-        t2: &Self,
-        l2: &Layout,
-        c: &dyn CustomOp2,
-    ) -> Result<(Self, Shape)> {
-        self.same_device(t2, c.name())?;
-        match (self, t2) {
-            (Self::Cpu(s1), Self::Cpu(s2)) => {
-                let (s, shape) = c.cpu_fwd(s1, l1, s2, l2)?;
-                Ok((Self::Cpu(s), shape))
-            }
-            (Self::Backend(s1), Self::Backend(s2)) => {
-                let (s, shape) = c.backend_fwd(s1.as_ref(), l1, s2.as_ref(), l2)?;
-                Ok((Self::Backend(s), shape))
-            }
-            (lhs, rhs) => Err(lhs.device_mismatch(rhs, c.name())),
-        }
-    }
-
-    pub(crate) fn apply_op3(
-        &self,
-        l1: &Layout,
-        t2: &Self,
-        l2: &Layout,
-        t3: &Self,
-        l3: &Layout,
-        c: &dyn CustomOp3,
-    ) -> Result<(Self, Shape)> {
-        self.same_device(t2, c.name())?;
-        self.same_device(t3, c.name())?;
-        match (self, t2, t3) {
-            (Self::Cpu(s1), Self::Cpu(s2), Self::Cpu(s3)) => {
-                let (s, shape) = c.cpu_fwd(s1, l1, s2, l2, s3, l3)?;
-                Ok((Self::Cpu(s), shape))
-            }
-            (Self::Backend(s1), Self::Backend(s2), Self::Backend(s3)) => {
-                let (s, shape) =
-                    c.backend_fwd(s1.as_ref(), l1, s2.as_ref(), l2, s3.as_ref(), l3)?;
-                Ok((Self::Backend(s), shape))
-            }
-            (lhs, rhs, _) => Err(lhs.device_mismatch(rhs, c.name())),
-        }
-    }
-
-    /// Applies an custom in-place op for the `self` tensor.
-    ///
-    /// [`Src::Aliased`] use the same underlying storage as `self`, while [`Src::Distinct`] does not.
-    /// If there are aliases present the aliased forward function on `InplaceOpN` is called. Otherwise
-    /// the normal forward function can be used.
-    pub(crate) fn inplace_op<const N: usize, C: InplaceOpN<N>>(
-        &mut self,
-        dst_l: &Layout,
-        srcs: [(Src<'_, Storage>, &Layout); N],
-        c: &C,
-    ) -> Result<()> {
-        // Aliased sources are `self`. Only distinct needs checking.
-        for (s, _) in srcs.iter() {
-            if let Src::Distinct(s) = s {
-                self.same_device(s, c.name())?;
-            }
-        }
-
-        match self {
-            Self::Cpu(dst) => {
-                let operands: [(Src<'_, CpuStorage>, &Layout); N] = std::array::from_fn(|i| {
-                    let (s, l) = srcs[i];
-                    let s = match s {
-                        Src::Distinct(Self::Cpu(s)) => Src::Distinct(s),
-                        Src::Aliased(rel) => Src::Aliased(rel),
-                        Src::Distinct(Self::Backend(_)) => {
-                            unreachable!("same_device above rejects a backend source")
-                        }
-                    };
-                    (s, l)
-                });
-
-                match all_distinct(&operands) {
-                    Some(distinct) => c.cpu_fwd(dst, dst_l, distinct),
-                    None => c.cpu_fwd_aliased(dst, dst_l, operands),
-                }
-            }
-            Self::Backend(dst) => {
-                let operands: [(Src<'_, dyn BackendStorage>, &Layout); N] =
-                    std::array::from_fn(|i| {
-                        let (s, l) = srcs[i];
-                        let s = match s {
-                            Src::Distinct(Self::Backend(s)) => Src::Distinct(s.as_ref()),
-                            Src::Aliased(rel) => Src::Aliased(rel),
-                            Src::Distinct(Self::Cpu(_)) => {
-                                unreachable!("same_device above rejects a cpu source")
-                            }
-                        };
-                        (s, l)
-                    });
-
-                match all_distinct(&operands) {
-                    Some(distinct) => c.backend_fwd(dst.as_mut(), dst_l, distinct),
-                    None => c.backend_fwd_aliased(dst.as_mut(), dst_l, operands),
-                }
-            }
         }
     }
 

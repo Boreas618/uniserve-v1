@@ -22,7 +22,7 @@ use ops::activation::{
     ActAndMul, ActAndMulArgs, ActAndMulDescriptor, Swiglu, SwigluArgs, SwigluDescriptor,
     ValueFirstSwiglu, ValueFirstSwigluArgs, ValueFirstSwigluDescriptor,
 };
-use uniserve_tensor::{D, DType, Tensor};
+use tensor::{D, DType, Tensor};
 
 use super::{PDL, as_rows, columns, like_rows, on_cpu, same_rows, vector};
 use crate::error::{Error, Result};

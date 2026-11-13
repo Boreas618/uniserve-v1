@@ -34,7 +34,7 @@
 
 use proto::module::PhaseKind;
 use proto::video::{ConditionRole, LatentShape, Layout};
-use uniserve_tensor::{DType, Shape, Tensor};
+use tensor::{DType, Shape, Tensor};
 
 use crate::error::{Error, Result};
 
@@ -1405,7 +1405,7 @@ pub trait Vision {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_tensor::{DType, Device, Tensor};
+    use tensor::{DType, Device, Tensor};
 
     use super::*;
 

@@ -23,7 +23,7 @@ use ops::attention::{
     IndexScores, IndexScoresArgs, IndexScoresDescriptor, IndexedAttention, IndexedAttentionArgs,
     IndexedAttentionDescriptor,
 };
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use super::{ACCUMULATE, on_cpu};
 use crate::capability::KvCache;

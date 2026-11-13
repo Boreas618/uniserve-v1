@@ -4,7 +4,7 @@ use crate::op::{BinaryOp, CmpOp, ReduceOp, UnaryOp};
 use crate::scalar::TensorOrScalar;
 use crate::shape::{Dim, Dims, ShapeWithOneHole};
 use crate::storage::{StorageMutRef, StorageRef};
-use crate::{bail, storage::Storage, DType, Device, Error, Layout, Result, Shape};
+use crate::{DType, Device, Error, Layout, Result, Shape, bail, storage::Storage};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
@@ -51,13 +51,13 @@ impl AsRef<Tensor> for Tensor {
 /// The core struct for manipulating tensors.
 ///
 /// ```rust
-/// use uniserve_tensor::{Tensor, DType, Device};
+/// use tensor::{Tensor, DType, Device};
 ///
 /// let a = Tensor::arange(0f32, 6f32, &Device::Cpu)?.reshape((2, 3))?;
 /// let b = Tensor::arange(0f32, 12f32, &Device::Cpu)?.reshape((3, 4))?;
 ///
 /// let c = a.matmul(&b)?;
-/// # Ok::<(), uniserve_tensor::Error>(())
+/// # Ok::<(), tensor::Error>(())
 /// ```
 ///
 /// Tensors are reference counted with [`Arc`] so cloning them is cheap.
@@ -166,14 +166,15 @@ impl Tensor {
     /// Creates a new tensor filled with ones.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, DType, Device};
+    /// use tensor::{Tensor, DType, Device};
     /// let a = Tensor::ones((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = Tensor::from_slice(&[1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0], (2, 3), &Device::Cpu)?;
     /// // a == b
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn ones<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
         let shape = shape.into();
+        // SAFETY: `const_set` below writes every element before the storage is read.
         let mut storage = unsafe { device.alloc_uninit(&shape, dtype)? };
         let layout = Layout::contiguous(shape.clone());
         storage.const_set(crate::scalar::Scalar::one(dtype), &layout)?;
@@ -195,11 +196,11 @@ impl Tensor {
     /// Creates a new tensor filled with ones with same shape, dtype, and device as the other tensor.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, DType, Device};
+    /// use tensor::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = a.ones_like()?;
     /// // b == a + 1
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn ones_like(&self) -> Result<Self> {
         Tensor::ones(self.shape(), self.dtype(), self.device())
@@ -208,11 +209,11 @@ impl Tensor {
     /// Creates a new tensor filled with zeros.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, DType, Device};
+    /// use tensor::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = Tensor::from_slice(&[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0], (2, 3), &Device::Cpu)?;
     /// // a == b
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn zeros<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
         let shape = shape.into();
@@ -224,11 +225,11 @@ impl Tensor {
     /// tensor.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, DType, Device};
+    /// use tensor::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = a.zeros_like()?;
     /// // b is on CPU f32.
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn zeros_like(&self) -> Result<Self> {
         Tensor::zeros(self.shape(), self.dtype(), self.device())
@@ -240,15 +241,18 @@ impl Tensor {
     /// This returns uninitialized memory.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, DType, Device};
+    /// use tensor::{Tensor, DType, Device};
     /// let a = unsafe { Tensor::empty((2, 3), DType::F32, &Device::Cpu)? };
     /// // a == b
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub unsafe fn empty<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
-        let shape = shape.into();
-        let storage = device.alloc_uninit(&shape, dtype)?;
-        Ok(from_storage(storage, shape))
+        // SAFETY: the caller writes every element before it reads one, as this function requires.
+        unsafe {
+            let shape = shape.into();
+            let storage = device.alloc_uninit(&shape, dtype)?;
+            Ok(from_storage(storage, shape))
+        }
     }
 
     /// Creates a new tensor filled with uninitialized memory of the same shape, dtype, and device as the other
@@ -258,13 +262,14 @@ impl Tensor {
     /// This returns uninitialized memory.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, DType, Device};
+    /// use tensor::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = unsafe { a.empty_like()? };
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub unsafe fn empty_like(&self) -> Result<Self> {
-        Tensor::empty(self.shape(), self.dtype(), self.device())
+        // SAFETY: the caller writes every element before it reads one, as this function requires.
+        unsafe { Tensor::empty(self.shape(), self.dtype(), self.device()) }
     }
 
     /// Creates a new tensor on the specified device using the content and shape of the input.
@@ -276,20 +281,21 @@ impl Tensor {
 
     /// Returns a new tensor with all the elements having the same specified value.
     ///```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let a = Tensor::full(3.5, (2, 4), &Device::Cpu)?;
     ///
     /// assert_eq!(a.to_vec2::<f64>()?, &[
     ///     [3.5, 3.5, 3.5, 3.5],
     ///     [3.5, 3.5, 3.5, 3.5],
     /// ]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     pub fn full<D: crate::WithDType, S: Into<Shape>>(
         value: D,
         shape: S,
         device: &Device,
     ) -> Result<Self> {
         let shape = shape.into();
+        // SAFETY: `const_set` below writes every element before the storage is read.
         let mut storage = unsafe { device.alloc_uninit(&shape, D::DTYPE)? };
         let layout = Layout::contiguous(shape.clone());
         storage.const_set(value.to_scalar(), &layout)?;
@@ -298,11 +304,11 @@ impl Tensor {
 
     /// Creates a new 1D tensor from an iterator.
     ///```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let a = Tensor::from_iter( [1.0, 2.0, 3.0, 4.0].into_iter(), &Device::Cpu)?;
     ///
     /// assert_eq!(a.to_vec1::<f64>()?, &[1.0, 2.0, 3.0, 4.0]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn from_iter<D: crate::WithDType>(
         iter: impl IntoIterator<Item = D>,
@@ -316,11 +322,11 @@ impl Tensor {
     /// Creates a new 1D tensor with values from the interval `[start, end)` taken with a common
     /// difference `1` from `start`.
     ///```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let a = Tensor::arange(2., 5., &Device::Cpu)?;
     ///
     /// assert_eq!(a.to_vec1::<f64>()?, &[2., 3., 4.]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn arange<D: crate::WithDType>(start: D, end: D, device: &Device) -> Result<Self> {
         Self::arange_step(start, end, D::one(), device)
@@ -329,11 +335,11 @@ impl Tensor {
     /// Creates a new 1D tensor with values from the interval `[start, end)` taken with a common
     /// difference `step` from `start`.
     ///```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let a = Tensor::arange_step(2.0, 4.0, 0.5, &Device::Cpu)?;
     ///
     /// assert_eq!(a.to_vec1::<f64>()?, &[2.0, 2.5, 3.0, 3.5]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn arange_step<D: crate::WithDType>(
         start: D,
@@ -365,14 +371,14 @@ impl Tensor {
     /// in this vector must be the same as the number of elements defined by the shape.
     /// If the device is cpu, no data copy is made.
     ///```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let a = Tensor::from_vec(vec!{1., 2., 3., 4., 5., 6.}, (2, 3), &Device::Cpu)?;
     ///
     /// assert_eq!(a.to_vec2::<f64>()?, &[
     ///     [1., 2., 3.],
     ///     [4., 5., 6.]
     /// ]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn from_vec<S: ShapeWithOneHole, D: crate::WithDType>(
         data: Vec<D>,
@@ -387,7 +393,7 @@ impl Tensor {
     /// Creates a new tensor initialized with values from the input slice. The number of elements
     /// in this vector must be the same as the number of elements defined by the shape.
     ///```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let values = vec![1., 2., 3., 4., 5., 6., 7., 8.];
     /// let a = Tensor::from_slice(&values[1..7], (2, 3), &Device::Cpu)?;
     ///
@@ -395,7 +401,7 @@ impl Tensor {
     ///     [2., 3., 4.],
     ///     [5., 6., 7.]
     /// ]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn from_slice<S: ShapeWithOneHole, D: crate::WithDType>(
         array: &[D],
@@ -593,7 +599,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device, Shape};
+    /// use tensor::{Tensor, Device, Shape};
     /// let x = Tensor::new(&[1f32, 2., 3.], &Device::Cpu)?;
     /// let y = Tensor::new(&[4f32, 5., 6.], &Device::Cpu)?;
     ///
@@ -609,7 +615,7 @@ impl Tensor {
     ///
     /// assert_eq!(grids_ij[0].to_vec2::<f32>()?, &[[1., 1., 1.], [2., 2., 2.], [3., 3., 3.]]);
     /// assert_eq!(grids_ij[1].to_vec2::<f32>()?, &[[4., 5., 6.], [4., 5., 6.], [4., 5., 6.]]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     ///
     /// # Errors
@@ -652,11 +658,11 @@ impl Tensor {
     /// be performed.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let a = Tensor::new(&[[0f32, 1.], [2., 3.]], &Device::Cpu)?;
     /// let a = a.affine(4., -2.)?;
     /// assert_eq!(a.to_vec2::<f32>()?, &[[-2.0, 2.0], [6.0, 10.0]]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn affine(&self, mul: f64, add: f64) -> Result<Self> {
         if self.elem_count() == 0 {
@@ -726,7 +732,7 @@ impl Tensor {
     /// Returns a new tensor that is a narrowed version of the input, the dimension `dim`
     /// ranges from `start` to `start + len`.
     /// ```
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let a = Tensor::new(&[
     ///     [0f32, 1., 2.],
     ///     [3.  , 4., 5.],
@@ -747,7 +753,7 @@ impl Tensor {
     ///     [4.],
     ///     [7.]
     /// ]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn narrow<D: Dim>(&self, dim: D, start: usize, len: usize) -> Result<Self> {
         let dims = self.dims();
@@ -776,7 +782,7 @@ impl Tensor {
             let layout = self.layout().narrow(dim, start, len)?;
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
-                storage: self.storage.clone(),
+                storage: Arc::clone(&self.storage),
                 layout,
                 dtype: self.dtype,
                 device: self.device.clone(),
@@ -841,14 +847,14 @@ impl Tensor {
     /// Elements that are shifted beyond the last position are re-introduced at the first position.
     ///
     /// ```rust
-    /// # use uniserve_tensor::{Tensor, Device};
+    /// # use tensor::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.roll(1, 0)?;
     /// assert_eq!(tensor.to_vec2::<f32>()?, &[[4., 5.], [0., 1.], [2., 3.]]);
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.roll(-1, 0)?;
     /// assert_eq!(tensor.to_vec2::<f32>()?, &[[2., 3.], [4., 5.], [0., 1.]]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn roll<D>(&self, shift: i32, dim: D) -> Result<Self>
     where
@@ -873,7 +879,7 @@ impl Tensor {
     /// that the number of elements for each dimension index in `sum_dims` is 1.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let a = Tensor::new(&[[0f32, 1.], [2., 3.]], &Device::Cpu)?;
     /// let s = a.sum_keepdim(0)?;
     /// assert_eq!(s.to_vec2::<f32>()?, &[[2., 4.]]);
@@ -881,7 +887,7 @@ impl Tensor {
     /// assert_eq!(s.to_vec2::<f32>()?, &[[1.], [5.]]);
     /// let s = a.sum_keepdim((0, 1))?;
     /// assert_eq!(s.to_vec2::<f32>()?, &[[6.]]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn sum_keepdim<D: Dims>(&self, sum_dims: D) -> Result<Self> {
         self.sum_impl(sum_dims, true)
@@ -901,7 +907,7 @@ impl Tensor {
     /// that the number of elements for each dimension index in `mean_dims` is 1.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let a = Tensor::new(&[[0f32, 1.], [2., 3.]], &Device::Cpu)?;
     /// let s = a.mean_keepdim(0)?;
     /// assert_eq!(s.to_vec2::<f32>()?, &[[1., 2.]]);
@@ -909,7 +915,7 @@ impl Tensor {
     /// assert_eq!(s.to_vec2::<f32>()?, &[[0.5], [2.5]]);
     /// let s = a.mean_keepdim((0, 1))?;
     /// assert_eq!(s.to_vec2::<f32>()?, &[[1.5]]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn mean_keepdim<D: Dims>(&self, mean_dims: D) -> Result<Self> {
         let mean_dims = mean_dims.to_indexes(self.shape(), "mean-keepdim")?;
@@ -1090,8 +1096,8 @@ impl Tensor {
     /// # Example
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
-    /// # fn main() -> uniserve_tensor::Result<()> {
+    /// use tensor::{Tensor, Device};
+    /// # fn main() -> tensor::Result<()> {
     /// let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
     /// let upsampled = t.upsample_bilinear2d(8, 8, false)?;
     /// assert_eq!(upsampled.dims(), &[1, 1, 8, 8]);
@@ -1131,8 +1137,8 @@ impl Tensor {
     /// # Example
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
-    /// # fn main() -> uniserve_tensor::Result<()> {
+    /// use tensor::{Tensor, Device};
+    /// # fn main() -> tensor::Result<()> {
     /// let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
     /// // Scale by 2x in both dimensions
     /// let upsampled = t.upsample_bilinear2d_with_scale(2.0, 2.0, false)?;
@@ -1244,12 +1250,12 @@ impl Tensor {
     ///
     /// # Example (vectors)
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let t1 = Tensor::new(&[1.0, 2.0, 3.0], &Device::Cpu)?;
     /// let t2 = Tensor::new(&[4.0, 5.0, 6.0], &Device::Cpu)?;
     /// let res = t1.dot(&t2)?;
     /// assert_eq!(res.to_scalar::<f64>()?, 32.);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn dot(&self, rhs: &Self) -> Result<Self> {
         if self.dims().len() != 1 || rhs.dims().len() != 1 {
@@ -1269,11 +1275,11 @@ impl Tensor {
     ///
     /// # Example
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let t = Tensor::new(&[[3., 4.], [0., 0.]], &Device::Cpu)?;
     /// let norm = t.norm()?;
     /// assert_eq!(norm.to_scalar::<f64>()?, 5.);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn norm(&self) -> Result<Self> {
         if self.dtype().is_int() {
@@ -1290,12 +1296,12 @@ impl Tensor {
     ///
     /// # Example
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let mat = Tensor::new(&[[1., 2., 3.], [4., 5., 6.]], &Device::Cpu)?;
     /// let vec = Tensor::new(&[1., 1., 1.], &Device::Cpu)?;
     /// let res = mat.mv(&vec)?;
     /// assert_eq!(res.to_vec1::<f64>()?, [6., 15.]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn mv(&self, rhs: &Self) -> Result<Self> {
         // Strict shape checks
@@ -1438,12 +1444,12 @@ impl Tensor {
     /// vocabulary size, and `h` the hidden size.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let values = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let ids = Tensor::new(&[2u32, 1u32, 2u32], &Device::Cpu)?;
     /// let emb = values.embedding(&ids)?;
     /// assert_eq!(emb.to_vec2::<f32>()?, &[[4., 5.], [2., 3.], [4., 5.]]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn embedding(&self, ids: &Self) -> Result<Self> {
         if self.rank() != 2 || ids.rank() != 1 {
@@ -1495,6 +1501,8 @@ impl Tensor {
         let dim = dim.to_index(self.shape(), "scatter")?;
         self.scatter_checks(indexes, source, dim)?;
         let shape = self.shape();
+        // SAFETY: `copy_strided_src` below writes every element of the storage, which has the
+        // element count of the tensor it copies, before the storage is read.
         let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
@@ -1534,6 +1542,8 @@ impl Tensor {
         let dim = dim.to_index(self.shape(), "scatter-add")?;
         self.scatter_checks(indexes, source, dim)?;
         let shape = self.shape();
+        // SAFETY: `copy_strided_src` below writes every element of the storage, which has the
+        // element count of the tensor it copies, before the storage is read.
         let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
@@ -1628,6 +1638,8 @@ impl Tensor {
             }
             .bt())?
         }
+        // SAFETY: `copy_strided_src` below writes every element of the storage, which has the
+        // element count of the tensor it copies, before the storage is read.
         let mut storage = unsafe { self.device().alloc_uninit(self.shape(), self.dtype())? };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
@@ -1810,6 +1822,10 @@ impl Tensor {
                 None => {
                     let mut src_index = self.strided_index();
                     for _idx_row in 0..dim1 {
+                        #[expect(
+                            clippy::unwrap_used,
+                            reason = "the strided index yields one offset per element, `dim1 * dim2` of them"
+                        )]
                         let row = (0..dim2).map(|_| data[src_index.next().unwrap()]).collect();
                         rows.push(row)
                     }
@@ -1848,6 +1864,11 @@ impl Tensor {
                     for _idx in 0..dim1 {
                         let mut rows = vec![];
                         for _jdx in 0..dim2 {
+                            #[expect(
+                                clippy::unwrap_used,
+                                reason = "the strided index yields one offset per element, \
+                                          `dim1 * dim2 * dim3` of them"
+                            )]
                             let row = (0..dim3).map(|_| data[src_index.next().unwrap()]).collect();
                             rows.push(row)
                         }
@@ -1919,11 +1940,11 @@ impl Tensor {
     /// scalar with zero dimensions.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.max_all()?;
     /// assert_eq!(tensor.to_scalar::<f32>()?, 5.);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn max_all(&self) -> Result<Tensor> {
         if self.rank() == 0 {
@@ -1937,11 +1958,11 @@ impl Tensor {
     /// scalar with zero dimensions.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.min_all()?;
     /// assert_eq!(tensor.to_scalar::<f32>()?, 0.);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn min_all(&self) -> Result<Tensor> {
         if self.rank() == 0 {
@@ -1955,11 +1976,11 @@ impl Tensor {
     /// scalar with zero dimensions.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.sum_all()?;
     /// assert_eq!(tensor.to_scalar::<f32>()?, 15.);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn sum_all(&self) -> Result<Tensor> {
         let dims: Vec<_> = (0..self.rank()).collect();
@@ -2020,11 +2041,11 @@ impl Tensor {
     /// Flattens the input tensor by reshaping it into a one dimension tensor.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.flatten_all()?;
     /// assert_eq!(tensor.to_vec1::<f32>()?, &[0., 1., 2., 3., 4., 5.]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn flatten_all(&self) -> Result<Tensor> {
         self.flatten_(None::<usize>, None::<usize>)
@@ -2033,13 +2054,13 @@ impl Tensor {
     /// Returns the sub-tensor fixing the index at `i` on the first dimension.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let t = tensor.get(0)?;
     /// assert_eq!(t.to_vec1::<f32>()?, &[0., 1.]);
     /// let t = tensor.get(1)?;
     /// assert_eq!(t.to_vec1::<f32>()?, &[2., 3.]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn get(&self, i: usize) -> Result<Tensor> {
         let dims = self.dims();
@@ -2053,7 +2074,7 @@ impl Tensor {
     /// Returns the sub-tensor fixing the index at `index` on the dimension `dim`.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let t = tensor.get_on_dim(1, 0)?;
     /// assert_eq!(t.to_vec1::<f32>()?, &[0., 2., 4.]);
@@ -2061,7 +2082,7 @@ impl Tensor {
     /// assert_eq!(t.to_vec1::<f32>()?, &[1., 3., 5.]);
     /// let t = tensor.get_on_dim(0, 1)?;
     /// assert_eq!(t.to_vec1::<f32>()?, &[2., 3.]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn get_on_dim<D: Dim>(&self, dim: D, index: usize) -> Result<Tensor> {
         let dim = dim.to_index(self.shape(), "get_on_dim")?;
@@ -2072,11 +2093,11 @@ impl Tensor {
     /// input are swapped.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let tensor = Tensor::new(&[[0f32, 1.], [2., 3.], [4., 5.]], &Device::Cpu)?;
     /// let tensor = tensor.t()?;
     /// assert_eq!(tensor.to_vec2::<f32>()?, &[[0.0, 2.0, 4.0], [1.0, 3.0, 5.0]]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn t(&self) -> Result<Tensor> {
         let rank = self.rank();
@@ -2101,7 +2122,7 @@ impl Tensor {
         }
         let tensor_ = Tensor_ {
             id: TensorId::new(),
-            storage: self.storage.clone(),
+            storage: Arc::clone(&self.storage),
             layout: self.layout.transpose(dim1, dim2)?,
             dtype: self.dtype,
             device: self.device.clone(),
@@ -2113,12 +2134,12 @@ impl Tensor {
     /// dims must be a permutation, i.e. include each dimension index exactly once.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let tensor = Tensor::arange(0u32, 120u32, &Device::Cpu)?.reshape((2, 3, 4, 5))?;
     /// assert_eq!(tensor.dims(), &[2, 3, 4, 5]);
     /// let tensor = tensor.permute((2, 3, 1, 0))?;
     /// assert_eq!(tensor.dims(), &[4, 5, 3, 2]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn permute<D: Dims>(&self, dims: D) -> Result<Tensor> {
         let dims = dims.to_indexes(self.shape(), "permute")?;
@@ -2134,7 +2155,7 @@ impl Tensor {
         }
         let tensor_ = Tensor_ {
             id: TensorId::new(),
-            storage: self.storage.clone(),
+            storage: Arc::clone(&self.storage),
             layout: self.layout.permute(&dims)?,
             dtype: self.dtype,
             device: self.device.clone(),
@@ -2221,7 +2242,7 @@ impl Tensor {
     pub fn broadcast_as<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
         let tensor_ = Tensor_ {
             id: TensorId::new(),
-            storage: self.storage.clone(),
+            storage: Arc::clone(&self.storage),
             layout: self.layout.broadcast_as(shape)?,
             dtype: self.dtype,
             device: self.device.clone(),
@@ -2237,12 +2258,12 @@ impl Tensor {
     /// Casts the input tensor to the target `dtype`.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, Device};
+    /// use tensor::{Tensor, Device};
     /// let tensor = Tensor::new(3.14159265358979f64, &Device::Cpu)?;
     /// assert_eq!(tensor.to_scalar::<f64>()?, 3.14159265358979);
-    /// let tensor = tensor.to_dtype(uniserve_tensor::DType::F32)?;
+    /// let tensor = tensor.to_dtype(tensor::DType::F32)?;
     /// assert_eq!(tensor.to_scalar::<f32>()?, 3.1415927);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn to_dtype(&self, dtype: DType) -> Result<Self> {
         if self.dtype() == dtype {
@@ -2268,11 +2289,11 @@ impl Tensor {
     /// An element type of another size is an error, as is one narrower than a byte.
     ///
     /// ```rust
-    /// use uniserve_tensor::{Tensor, DType, Device};
+    /// use tensor::{Tensor, DType, Device};
     /// let a = Tensor::new(&[1f32, -2.], &Device::Cpu)?;
     /// let bits = a.view(DType::U32)?;
     /// assert_eq!(bits.to_vec1::<u32>()?, [1f32.to_bits(), (-2f32).to_bits()]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn view(&self, dtype: DType) -> Result<Self> {
         if self.dtype() == dtype {
@@ -2298,6 +2319,8 @@ impl Tensor {
             Ok(self.clone())
         } else {
             let shape = self.shape();
+            // SAFETY: `copy_strided_src` below writes every element of the storage, which has the
+            // element count of the tensor it copies, before the storage is read.
             let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
             self.storage()
                 .copy_strided_src(&mut storage, 0, self.layout())?;
@@ -2308,6 +2331,8 @@ impl Tensor {
     /// Returns a tensor that is in row major order. This always makes a copy.
     pub fn force_contiguous(&self) -> Result<Tensor> {
         let shape = self.shape();
+        // SAFETY: `copy_strided_src` below writes every element of the storage, which has the
+        // element count of the tensor it copies, before the storage is read.
         let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
@@ -2324,7 +2349,7 @@ impl Tensor {
     /// as to match the number of elements in the tensor.
     ///
     /// ```rust
-    /// # use uniserve_tensor::{Tensor, DType, Device, D};
+    /// # use tensor::{Tensor, DType, Device, D};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     ///
     /// let c = a.reshape((1, 6))?;
@@ -2336,7 +2361,7 @@ impl Tensor {
     /// let c = a.reshape((2, (), 1))?;
     /// assert_eq!(c.shape().dims(), &[2, 3, 1]);
     ///
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn reshape<S: ShapeWithOneHole>(&self, s: S) -> Result<Tensor> {
         let shape = s.into_shape(self.elem_count())?;
@@ -2351,13 +2376,15 @@ impl Tensor {
         if self.is_contiguous() {
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
-                storage: self.storage.clone(),
+                storage: Arc::clone(&self.storage),
                 layout: Layout::contiguous_with_offset(shape, self.layout.start_offset()),
                 dtype: self.dtype,
                 device: self.device.clone(),
             };
             Ok(Tensor(Arc::new(tensor_)))
         } else {
+            // SAFETY: `copy_strided_src` below writes every element of the storage, which has the
+            // element count of the tensor it copies, before the storage is read.
             let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
             self.storage()
                 .copy_strided_src(&mut storage, 0, self.layout())?;
@@ -2368,7 +2395,7 @@ impl Tensor {
     /// Creates a new tensor with the specified dimension removed if its size was one.
     ///
     /// ```rust
-    /// # use uniserve_tensor::{Tensor, DType, Device, D};
+    /// # use tensor::{Tensor, DType, Device, D};
     /// let a = Tensor::zeros((2, 3, 1), DType::F32, &Device::Cpu)?;
     ///
     /// let c = a.squeeze(2)?;
@@ -2376,7 +2403,7 @@ impl Tensor {
     ///
     /// let c = a.squeeze(D::Minus1)?;
     /// assert_eq!(c.shape().dims(), &[2, 3]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn squeeze<D: Dim>(&self, dim: D) -> Result<Self> {
         // The PyTorch semantics are to return the same tensor if the target dimension
@@ -2390,7 +2417,7 @@ impl Tensor {
             strides.remove(dim);
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
-                storage: self.storage.clone(),
+                storage: Arc::clone(&self.storage),
                 layout: Layout::new(dims.into(), strides, self.layout.start_offset()),
                 dtype: self.dtype,
                 device: self.device.clone(),
@@ -2404,7 +2431,7 @@ impl Tensor {
     /// Creates a new tensor with a dimension of size one inserted at the specified position.
     ///
     /// ```rust
-    /// # use uniserve_tensor::{Tensor, DType, Device, D};
+    /// # use tensor::{Tensor, DType, Device, D};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     ///
     /// let c = a.unsqueeze(0)?;
@@ -2412,7 +2439,7 @@ impl Tensor {
     ///
     /// let c = a.unsqueeze(D::Minus1)?;
     /// assert_eq!(c.shape().dims(), &[2, 3, 1]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn unsqueeze<D: Dim>(&self, dim: D) -> Result<Self> {
         let mut dims = self.dims().to_vec();
@@ -2426,7 +2453,7 @@ impl Tensor {
         strides.insert(dim, stride);
         let tensor_ = Tensor_ {
             id: TensorId::new(),
-            storage: self.storage.clone(),
+            storage: Arc::clone(&self.storage),
             layout: Layout::new(dims.into(), strides, self.layout.start_offset()),
             dtype: self.dtype,
             device: self.device.clone(),
@@ -2439,7 +2466,7 @@ impl Tensor {
     /// All tensors must have the same rank, and the output has one additional rank
     ///
     /// ```rust
-    /// # use uniserve_tensor::{Tensor, DType, Device};
+    /// # use tensor::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     ///
@@ -2448,7 +2475,7 @@ impl Tensor {
     ///
     /// let c = Tensor::stack(&[&a, &b], 2)?;
     /// assert_eq!(c.shape().dims(), &[2, 3, 2]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn stack<A: AsRef<Tensor>, D: Dim>(args: &[A], dim: D) -> Result<Self> {
         if args.is_empty() {
@@ -2686,7 +2713,8 @@ impl Tensor {
             }
             if end_excluded - start_included != src_dims[i] {
                 bail!(
-                    "slice-assign: the range for dim {i} ({start_included}..{end_excluded}) does not match the size of src {}", src_dims[i]
+                    "slice-assign: the range for dim {i} ({start_included}..{end_excluded}) does not match the size of src {}",
+                    src_dims[i]
                 )
             }
             src = src.pad_with_zeros(i, start_included, self_dims[i] - end_excluded)?;
@@ -2726,12 +2754,12 @@ impl Tensor {
     /// This function makes a copy of the tensor’s data.
     ///
     /// ```rust
-    /// # use uniserve_tensor::{Tensor, Device};
+    /// # use tensor::{Tensor, Device};
     /// let t = Tensor::arange(0., 6., &Device::Cpu)?.reshape((2, 3))?;
     /// assert_eq!(t.to_vec2::<f64>()?, &[[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]);
     /// let t_flipped = t.flip(&[0])?;
     /// assert_eq!(t_flipped.to_vec2::<f64>()?, &[[3.0, 4.0, 5.0], [0.0, 1.0, 2.0]]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn flip(&self, dims: &[usize]) -> Result<Tensor> {
         let mut result = self.clone();
@@ -2777,7 +2805,7 @@ impl Tensor {
 
         let tensor_ = Tensor_ {
             id: TensorId::new(),
-            storage: self.storage.clone(),
+            storage: Arc::clone(&self.storage),
             layout: Layout::new(sizes.into(), strides, self.layout.start_offset()),
             dtype: self.dtype,
             device: self.device.clone(),

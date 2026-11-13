@@ -30,14 +30,12 @@ libc.workspace = true
 media.workspace = true
 mimalloc.workspace = true
 # The model families the executable loads.
-minimax-h3.workspace = true
-qwen3.workspace = true
-qwen4-exp.workspace = true
+models.workspace = true
 service.workspace = true
 nn.workspace = true
 ops.workspace = true
 # The element type of a kernel operand (`DType`).
-uniserve-tensor.workspace = true
+tensor.workspace = true
 platform.workspace = true
 build-server.workspace = true
 proto.workspace = true

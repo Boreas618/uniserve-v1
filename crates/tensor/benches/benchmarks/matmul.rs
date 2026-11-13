@@ -1,8 +1,8 @@
 use crate::benchmarks::bench_name;
-use criterion::{criterion_group, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group};
 use std::hint::black_box;
 use std::time::Instant;
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 /// Matmul benchmark shapes covering common GEMM scenarios
 const MATMUL_SHAPES: &[(&str, &[usize], &[usize])] = &[

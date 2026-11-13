@@ -24,7 +24,7 @@
 //! `dt_bias`, and its columns of `out_proj`, whose partial products the group sums. The state
 //! is the rank's heads' own.
 
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use crate::capability::{RecurrentState, TokenBatch};
 use crate::collective::Split;

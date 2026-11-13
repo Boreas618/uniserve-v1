@@ -15,7 +15,7 @@
 
 use ipc::{CacheGroup, CacheGroupKind, PrefixCacheDtype, PrefixCacheInfo};
 use nn::family::{IndexKeys, StateField, StateShape};
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::memory::state::layer_fields;
 use crate::{Error, Result};

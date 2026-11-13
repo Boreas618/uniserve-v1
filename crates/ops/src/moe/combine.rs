@@ -20,7 +20,7 @@
 use std::ffi::c_void;
 use std::fmt;
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;

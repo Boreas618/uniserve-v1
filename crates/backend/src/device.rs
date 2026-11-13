@@ -14,8 +14,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use uniserve_tensor::backend::{BackendDevice, BackendStorage};
-use uniserve_tensor::{CpuStorage, DType, Device, DeviceLocation, Layout, Shape};
+use tensor::backend::{BackendDevice, BackendStorage};
+use tensor::{CpuStorage, DType, Device, DeviceLocation, Layout, Shape};
 
 use crate::primitives;
 use crate::storage::CudaStorage;
@@ -91,11 +91,7 @@ impl BackendDevice for CudaDevice {
             || other.is::<MetaDevice>()
     }
 
-    fn zeros(
-        &self,
-        shape: &Shape,
-        dtype: DType,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    fn zeros(&self, shape: &Shape, dtype: DType) -> tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(zeros(shape, dtype, Some(self.ordinal))?))
     }
 
@@ -103,7 +99,7 @@ impl BackendDevice for CudaDevice {
         &self,
         shape: &Shape,
         dtype: DType,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         let storage = CudaStorage::of_elements(shape.elem_count(), dtype, Some(self.ordinal))?;
         Ok(Box::new(storage))
     }
@@ -111,11 +107,11 @@ impl BackendDevice for CudaDevice {
     fn storage_from_cpu_storage(
         &self,
         storage: &CpuStorage,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(from_host(storage, Some(self.ordinal))?))
     }
 
-    fn synchronize(&self) -> uniserve_tensor::Result<()> {
+    fn synchronize(&self) -> tensor::Result<()> {
         Ok(synchronize()?)
     }
 }
@@ -138,11 +134,7 @@ impl BackendDevice for MetaDevice {
         other.is::<Self>() || other.is::<CudaDevice>()
     }
 
-    fn zeros(
-        &self,
-        shape: &Shape,
-        dtype: DType,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    fn zeros(&self, shape: &Shape, dtype: DType) -> tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(zeros(shape, dtype, None)?))
     }
 
@@ -150,7 +142,7 @@ impl BackendDevice for MetaDevice {
         &self,
         shape: &Shape,
         dtype: DType,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         let storage = CudaStorage::of_elements(shape.elem_count(), dtype, None)?;
         Ok(Box::new(storage))
     }
@@ -158,11 +150,11 @@ impl BackendDevice for MetaDevice {
     fn storage_from_cpu_storage(
         &self,
         storage: &CpuStorage,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(from_host(storage, None)?))
     }
 
-    fn synchronize(&self) -> uniserve_tensor::Result<()> {
+    fn synchronize(&self) -> tensor::Result<()> {
         Ok(synchronize()?)
     }
 }
@@ -249,7 +241,7 @@ fn synchronize() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_tensor::{Device, DeviceLocation};
+    use tensor::{Device, DeviceLocation};
 
     use super::{cuda, meta};
 

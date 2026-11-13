@@ -33,7 +33,13 @@ struct BarrierPoolInner {
     panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
 }
 
+// SAFETY: `work`, the one field that is not `Sync`, is written by `execute` under `call_lock`
+// before it signals the roots' `go` (`Release`); a worker reads it only after its `Acquire` load of
+// `go`, which that write happens before, directly or through its leader; and `execute` does not
+// write it again before every worker has signalled `done`. Every other field is `Sync`.
 unsafe impl Sync for BarrierPoolInner {}
+// SAFETY: the raw pointer in `work` is dereferenced only under the protocol stated for `Sync`;
+// every other field is `Send`.
 unsafe impl Send for BarrierPoolInner {}
 
 /// Two-level tree barrier pool.
@@ -51,7 +57,9 @@ pub struct BarrierPool {
     call_lock: Mutex<usize>,
 }
 
+// SAFETY: every field is `Sync`, `BarrierPoolInner` by the impl above.
 unsafe impl Sync for BarrierPool {}
+// SAFETY: every field is `Send`, `BarrierPoolInner` by the impl above.
 unsafe impl Send for BarrierPool {}
 
 thread_local! {
@@ -59,7 +67,11 @@ thread_local! {
 }
 
 unsafe fn call_trampoline<F: Fn(usize)>(data: *const (), tid: usize) {
-    (*(data as *const F))(tid);
+    // SAFETY: `data` points to the `F` that `execute` stored with this trampoline, which it keeps
+    // alive until every worker has signalled `done`.
+    unsafe {
+        (*(data as *const F))(tid);
+    }
 }
 
 /// Build the two-level fan-out tree. First worker in each cluster is leader.
@@ -112,6 +124,11 @@ fn barrier_pool_spin_limit() -> u32 {
 }
 
 impl BarrierPool {
+    #[expect(
+        clippy::expect_used,
+        reason = "a CPU backend without its worker threads cannot compute, and the pool is built on \
+                  first use by element-wise operations, which return no error"
+    )]
     fn new(n_workers: usize) -> Self {
         let inner = Box::new(BarrierPoolInner {
             slots: (0..n_workers)
@@ -143,17 +160,20 @@ impl BarrierPool {
                     .spawn(move || {
                         IN_BARRIER_POOL.with(|f| f.set(true));
                         set_thread_affinity();
+                        // SAFETY: `inner_ptr` is the address of the pool's boxed
+                        // `BarrierPoolInner`, which stays in place until `Drop for BarrierPool` has
+                        // joined this thread.
                         let inner = unsafe { &*(inner_ptr as *const BarrierPoolInner) };
                         let slot = &inner.slots[tid];
-                        let mut gen = 0usize;
+                        let mut generation = 0usize;
 
                         loop {
                             // Spin briefly then park, waiting for next work item.
                             let mut spins = 0u32;
                             loop {
                                 let g = slot.go.load(Ordering::Acquire);
-                                if g != gen {
-                                    gen = g;
+                                if g != generation {
+                                    generation = g;
                                     break;
                                 }
                                 if inner.stop.load(Ordering::Relaxed) {
@@ -173,19 +193,36 @@ impl BarrierPool {
                             }
 
                             // Fan work out to children.
+                            #[expect(
+                                clippy::unwrap_used,
+                                reason = "`new` sets the handles before it returns, and work \
+                                          reaches a worker only through `execute` on the pool"
+                            )]
                             let handles = inner.handles.get().unwrap();
                             for &child in &children {
-                                inner.slots[child].go.store(gen, Ordering::Release);
+                                inner.slots[child].go.store(generation, Ordering::Release);
                                 handles[child].unpark();
                             }
 
                             // Execute own work, catching panics so done is always signalled.
                             if let Err(payload) =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    // SAFETY: `execute` wrote `work` before signalling `go`, which
+                                    // this worker's `Acquire` load observed, directly or through
+                                    // its leader, and does not write it again before every worker
+                                    // has signalled `done`.
                                     let work = unsafe { &*inner.work.get() };
+                                    // SAFETY: `trampoline` is `call_trampoline::<F>` for the
+                                    // closure `data` points to, which `execute` keeps alive until
+                                    // every worker has signalled `done`.
                                     unsafe { (work.trampoline)(work.data, tid) };
                                 }))
                             {
+                                #[expect(
+                                    clippy::unwrap_used,
+                                    reason = "the payload lock is held only to read or replace \
+                                              an `Option`, which cannot panic"
+                                )]
                                 let mut p = inner.panic_payload.lock().unwrap();
                                 if p.is_none() {
                                     *p = Some(payload);
@@ -194,13 +231,14 @@ impl BarrierPool {
 
                             // Reduce: wait for all children before signalling parent.
                             for &child in &children {
-                                while inner.slots[child].done.load(Ordering::Acquire) != gen {
+                                while inner.slots[child].done.load(Ordering::Acquire) != generation
+                                {
                                     spin_loop();
                                 }
                             }
 
                             // Signal done unconditionally so main/parent never deadlocks.
-                            slot.done.store(gen, Ordering::Release);
+                            slot.done.store(generation, Ordering::Release);
                         }
                     })
                     .expect("failed to spawn barrier pool worker")
@@ -235,22 +273,27 @@ impl BarrierPool {
 struct BarrierGuard<'a> {
     inner: &'a BarrierPoolInner,
     roots: &'a [usize],
-    gen: usize,
+    generation: usize,
 }
 
 impl Drop for BarrierGuard<'_> {
     fn drop(&mut self) {
         for &root in self.roots {
-            while self.inner.slots[root].done.load(Ordering::Acquire) != self.gen {
+            while self.inner.slots[root].done.load(Ordering::Acquire) != self.generation {
                 spin_loop();
             }
         }
         // Always clear any stored panic. Propagate unless main is not already unwinding.
+        #[expect(
+            clippy::unwrap_used,
+            reason = "the payload lock is held only to read or replace an `Option`, which cannot \
+                      panic"
+        )]
         let payload = self.inner.panic_payload.lock().unwrap().take();
-        if !std::thread::panicking() {
-            if let Some(p) = payload {
-                std::panic::resume_unwind(p);
-            }
+        if !std::thread::panicking()
+            && let Some(p) = payload
+        {
+            std::panic::resume_unwind(p);
         }
     }
 }
@@ -263,19 +306,33 @@ impl BarrierPool {
             return;
         }
 
+        #[expect(
+            clippy::unwrap_used,
+            reason = "the lock is poisoned only when an earlier operation on the pool panicked, \
+                      which is not recovered from"
+        )]
         let mut guard = self.call_lock.lock().unwrap();
-        let new_gen = guard.wrapping_add(1);
-        *guard = new_gen;
+        let new_generation = guard.wrapping_add(1);
+        *guard = new_generation;
 
+        // SAFETY: `call_lock` serializes the callers of `execute`, and the previous call returned
+        // only after every worker signalled `done` (`BarrierGuard`), so no worker reads `work`
+        // while it is written.
         unsafe {
             let work = &mut *self.inner.work.get();
             work.trampoline = call_trampoline::<F>;
             work.data = &f as *const F as *const ();
         }
 
+        #[expect(
+            clippy::unwrap_used,
+            reason = "`new` sets the handles before it returns"
+        )]
         let handles = self.inner.handles.get().unwrap();
         for &root in &self.root_workers {
-            self.inner.slots[root].go.store(new_gen, Ordering::Release);
+            self.inner.slots[root]
+                .go
+                .store(new_generation, Ordering::Release);
             handles[root].unpark();
         }
 
@@ -283,7 +340,7 @@ impl BarrierPool {
         let _guard = BarrierGuard {
             inner: &self.inner,
             roots: &self.root_workers,
-            gen: new_gen,
+            generation: new_generation,
         };
 
         // Main thread participates as worker n (workers are 0..n-1).
@@ -306,12 +363,14 @@ impl BarrierPool {
         // ~8 grabs per thread amortizes cursor contention while keeping tail imbalance small
         let chunk = n_items.div_ceil(n_threads * 8).max(1);
         let cursor = AtomicUsize::new(0);
-        self.execute(|_| loop {
-            let start = cursor.fetch_add(chunk, Ordering::Relaxed);
-            if start >= n_items {
-                break;
+        self.execute(|_| {
+            loop {
+                let start = cursor.fetch_add(chunk, Ordering::Relaxed);
+                if start >= n_items {
+                    break;
+                }
+                f(start..n_items.min(start + chunk));
             }
-            f(start..n_items.min(start + chunk));
         });
     }
 }
@@ -322,11 +381,16 @@ impl Drop for BarrierPool {
             return;
         }
         self.inner.stop.store(true, Ordering::Relaxed);
-        let new_gen = self.call_lock.lock().unwrap().wrapping_add(1);
+        #[expect(
+            clippy::unwrap_used,
+            reason = "the lock is poisoned only when an earlier operation on the pool panicked, \
+                      which is not recovered from"
+        )]
+        let new_generation = self.call_lock.lock().unwrap().wrapping_add(1);
         let handles = self.inner.handles.get();
         // Signal ALL slots and unpark them so parked workers wake immediately.
         for (i, slot) in self.inner.slots.iter().enumerate() {
-            slot.go.store(new_gen, Ordering::Release);
+            slot.go.store(new_generation, Ordering::Release);
             if let Some(hs) = handles {
                 hs[i].unpark();
             }
@@ -405,6 +469,8 @@ fn perf_core_count() -> Option<usize> {
     use std::os::raw::c_void;
     let mut count: u32 = 0;
     let mut size = std::mem::size_of::<u32>();
+    // SAFETY: `sysctlbyname` reads the NUL-terminated name and writes at most `size` bytes to
+    // `count`, which holds `size` bytes.
     let ret = unsafe {
         libc::sysctlbyname(
             c"hw.perflevel0.logicalcpu".as_ptr().cast(),
@@ -521,6 +587,11 @@ fn linux_detect_preferred_cpus() -> Option<Vec<usize>> {
 
 static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
+#[expect(
+    clippy::expect_used,
+    reason = "a CPU backend without its worker threads cannot compute, and the pool is built on \
+              first use by operations that return no error"
+)]
 pub(crate) fn thread_pool() -> &'static rayon::ThreadPool {
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
@@ -535,6 +606,7 @@ pub(crate) fn thread_pool() -> &'static rayon::ThreadPool {
 /// Elevate the thread QoS so macOS prefers running on Performance (P) cores.
 pub fn set_thread_affinity() {
     use libc::{pthread_set_qos_class_self_np, qos_class_t::QOS_CLASS_USER_INTERACTIVE};
+    // SAFETY: `pthread_set_qos_class_self_np` changes the QoS class of the calling thread only.
     unsafe {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }
@@ -545,6 +617,8 @@ pub fn set_thread_affinity() {
 pub fn set_thread_affinity() {
     #[cfg(target_os = "linux")]
     if let Some(cpus) = linux_affinity_cpus() {
+        // SAFETY: `cpu_set_t` is plain data whose all-zero bytes are the empty set, and
+        // `pthread_setaffinity_np` reads its `size_of::<cpu_set_t>()` bytes for the calling thread.
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
             libc::CPU_ZERO(&mut set);

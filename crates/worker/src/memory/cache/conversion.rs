@@ -35,7 +35,7 @@ use ops::prefix_cache::{
     Field, PageConversion, scratch_bytes,
 };
 use platform::{CopyBatch, DeviceId, DevicePtr, DeviceRange, SourceOrder, Stream};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::host::{self, HostPage};
 use super::layout::{CacheLayout, GroupLayout};

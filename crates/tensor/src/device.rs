@@ -279,10 +279,18 @@ impl Device {
         }
     }
 
+    /// A storage of `shape.elem_count()` elements of `dtype` whose content is unspecified.
+    ///
+    /// # Safety
+    ///
+    /// The caller writes every element before it reads one.
     pub(crate) unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Storage> {
-        match self {
-            Self::Cpu => Ok(Storage::Cpu(CpuDevice.alloc_uninit(shape, dtype)?)),
-            Self::Backend(device) => Ok(Storage::Backend(device.alloc_uninit(shape, dtype)?)),
+        // SAFETY: the caller writes every element before it reads one, as this function requires.
+        unsafe {
+            match self {
+                Self::Cpu => Ok(Storage::Cpu(CpuDevice.alloc_uninit(shape, dtype)?)),
+                Self::Backend(device) => Ok(Storage::Backend(device.alloc_uninit(shape, dtype)?)),
+            }
         }
     }
 

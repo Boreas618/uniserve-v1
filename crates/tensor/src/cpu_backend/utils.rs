@@ -170,6 +170,8 @@ pub fn binary_map_vec<
 ) -> Vec<T> {
     let el_count = lhs_l.shape().elem_count();
     let mut ys: Vec<T> = Vec::with_capacity(el_count);
+    // SAFETY: the spare capacity is `el_count` elements of `T`, a plain numeric type; the loop
+    // below writes each of them before `set_len` exposes them.
     let ys_to_set = unsafe {
         let s = ys.spare_capacity_mut();
         std::mem::transmute::<&mut [std::mem::MaybeUninit<T>], &mut [T]>(s)
@@ -237,6 +239,8 @@ pub fn unary_map<T: Copy, U: Copy, F: FnMut(T) -> U>(
             let mut result = Vec::with_capacity(count * block_len);
             if block_len == 1 {
                 for i in 0..count {
+                    // SAFETY: the strided blocks of `layout` address elements of `vs`, the storage
+                    // it describes.
                     let v = unsafe { vs.get_unchecked(start_offset + i * src_stride) };
                     result.push(f(*v))
                 }
@@ -244,6 +248,8 @@ pub fn unary_map<T: Copy, U: Copy, F: FnMut(T) -> U>(
                 for i in 0..count {
                     let src_start = start_offset + i * src_stride;
                     for offset in 0..block_len {
+                        // SAFETY: the strided blocks of `layout` address elements of `vs`, the
+                        // storage it describes.
                         let v = unsafe { vs.get_unchecked(src_start + offset) };
                         result.push(f(*v))
                     }
@@ -259,12 +265,16 @@ pub fn unary_map<T: Copy, U: Copy, F: FnMut(T) -> U>(
             // Specialize the case where block_len is one to avoid the second loop.
             if block_len == 1 {
                 for index in block_start_index {
+                    // SAFETY: the strided blocks of `layout` address elements of `vs`, the storage
+                    // it describes.
                     let v = unsafe { vs.get_unchecked(index) };
                     result.push(f(*v))
                 }
             } else {
                 for index in block_start_index {
                     for offset in 0..block_len {
+                        // SAFETY: the strided blocks of `layout` address elements of `vs`, the
+                        // storage it describes.
                         let v = unsafe { vs.get_unchecked(index + offset) };
                         result.push(f(*v))
                     }
@@ -285,6 +295,8 @@ pub fn unary_map_vec<T: Copy, U: Copy, F: FnMut(T) -> U, FV: FnMut(&[T], &mut [U
         crate::StridedBlocks::SingleBlock { start_offset, len } => {
             let mut ys: Vec<U> = Vec::with_capacity(len);
             let ys_to_set = ys.spare_capacity_mut();
+            // SAFETY: the spare capacity is `len` elements of `U`, a plain value type; `f_vec`
+            // writes each of them before `set_len` exposes them.
             let ys_to_set = unsafe {
                 std::mem::transmute::<&mut [std::mem::MaybeUninit<U>], &mut [U]>(ys_to_set)
             };
@@ -303,6 +315,8 @@ pub fn unary_map_vec<T: Copy, U: Copy, F: FnMut(T) -> U, FV: FnMut(&[T], &mut [U
             if block_len == 1 {
                 let mut result = Vec::with_capacity(count);
                 for i in 0..count {
+                    // SAFETY: the strided blocks of `layout` address elements of `vs`, the storage
+                    // it describes.
                     let v = unsafe { vs.get_unchecked(start_offset + i * src_stride) };
                     result.push(f(*v))
                 }
@@ -310,6 +324,8 @@ pub fn unary_map_vec<T: Copy, U: Copy, F: FnMut(T) -> U, FV: FnMut(&[T], &mut [U
             } else {
                 let mut ys: Vec<U> = Vec::with_capacity(el_count);
                 let ys_to_set = ys.spare_capacity_mut();
+                // SAFETY: the spare capacity is `el_count` elements of `U`, a plain value type; the
+                // calls of `f_vec` below write each of them before `set_len` exposes them.
                 let ys_to_set = unsafe {
                     std::mem::transmute::<&mut [std::mem::MaybeUninit<U>], &mut [U]>(ys_to_set)
                 };
@@ -336,6 +352,8 @@ pub fn unary_map_vec<T: Copy, U: Copy, F: FnMut(T) -> U, FV: FnMut(&[T], &mut [U
             if block_len == 1 {
                 let mut result = Vec::with_capacity(el_count);
                 for index in block_start_index {
+                    // SAFETY: the strided blocks of `layout` address elements of `vs`, the storage
+                    // it describes.
                     let v = unsafe { vs.get_unchecked(index) };
                     result.push(f(*v))
                 }
@@ -343,6 +361,8 @@ pub fn unary_map_vec<T: Copy, U: Copy, F: FnMut(T) -> U, FV: FnMut(&[T], &mut [U
             } else {
                 let mut ys: Vec<U> = Vec::with_capacity(el_count);
                 let ys_to_set = ys.spare_capacity_mut();
+                // SAFETY: the spare capacity is `el_count` elements of `U`, a plain value type; the
+                // calls of `f_vec` below write each of them before `set_len` exposes them.
                 let ys_to_set = unsafe {
                     std::mem::transmute::<&mut [std::mem::MaybeUninit<U>], &mut [U]>(ys_to_set)
                 };
@@ -377,30 +397,37 @@ pub fn unary_map_vec_par<
     f: F,
     f_vec: FV,
 ) -> Vec<U> {
-    if let crate::StridedBlocks::SingleBlock { start_offset, len } = layout.strided_blocks() {
-        if len >= PAR_ELEMWISE_MIN {
-            let src = &vs[start_offset..start_offset + len];
-            let mut ys: Vec<U> = Vec::with_capacity(len);
-            let ys_ptr = ys.as_mut_ptr() as usize;
-            let n_units = len.div_ceil(PAR_ELEMWISE_CHUNK);
-            crate::utils::barrier_pool().execute_chunked(n_units, |range| {
-                let ys_ptr = ys_ptr as *mut U;
-                for unit in range {
-                    let lo = unit * PAR_ELEMWISE_CHUNK;
-                    let hi = len.min(lo + PAR_ELEMWISE_CHUNK);
-                    let dst = unsafe { std::slice::from_raw_parts_mut(ys_ptr.add(lo), hi - lo) };
-                    f_vec(&src[lo..hi], dst);
-                }
-            });
-            // SAFETY: every element is written by exactly one unit.
-            unsafe { ys.set_len(len) };
-            return ys;
-        }
+    if let crate::StridedBlocks::SingleBlock { start_offset, len } = layout.strided_blocks()
+        && len >= PAR_ELEMWISE_MIN
+    {
+        let src = &vs[start_offset..start_offset + len];
+        let mut ys: Vec<U> = Vec::with_capacity(len);
+        let ys_ptr = ys.as_mut_ptr() as usize;
+        let n_units = len.div_ceil(PAR_ELEMWISE_CHUNK);
+        crate::utils::barrier_pool().execute_chunked(n_units, |range| {
+            let ys_ptr = ys_ptr as *mut U;
+            for unit in range {
+                let lo = unit * PAR_ELEMWISE_CHUNK;
+                let hi = len.min(lo + PAR_ELEMWISE_CHUNK);
+                // SAFETY: `lo..hi` lies within the capacity `len`, and each work unit owns its
+                // disjoint range of the output, which it writes before `set_len`.
+                let dst = unsafe { std::slice::from_raw_parts_mut(ys_ptr.add(lo), hi - lo) };
+                f_vec(&src[lo..hi], dst);
+            }
+        });
+        // SAFETY: every element is written by exactly one unit.
+        unsafe { ys.set_len(len) };
+        return ys;
     }
     unary_map_vec(vs, layout, f, f_vec)
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::expect_used,
+    reason = "a unit's offsets are below `el_count`, which the `NdIter` of the same layouts walks \
+              in blocks of `inner_size`"
+)]
 pub fn binary_map_vec_par<
     T: Copy + Send + Sync,
     F: Fn(T, T) -> T + Sync,

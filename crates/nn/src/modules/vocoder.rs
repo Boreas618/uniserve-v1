@@ -20,7 +20,7 @@
 //! some values, and the served outputs are this product's, so it is kept. The final `tanh` or
 //! clamp is the caller's: a PCM step clamps as it quantizes.
 
-use uniserve_tensor::{DType, Module, Tensor};
+use tensor::{DType, Module, Tensor};
 
 use crate::error::{Error, Result};
 use crate::functional;
@@ -103,7 +103,7 @@ impl Activation1d {
 }
 
 impl Module for Activation1d {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }
@@ -216,7 +216,7 @@ impl AmpBlock {
 }
 
 impl Module for AmpBlock {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }
@@ -417,7 +417,7 @@ impl BigVgan {
 }
 
 impl Module for BigVgan {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }

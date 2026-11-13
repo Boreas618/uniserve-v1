@@ -16,9 +16,7 @@ members = [
     "crates/ipc",
     "crates/manager",
     "crates/media",
-    "crates/models/qwen3",
-    "crates/models/qwen4-exp",
-    "crates/models/minimax-h3",
+    "crates/models",
     "crates/nixl",
     "crates/nn",
     "crates/ops",
@@ -33,6 +31,7 @@ members = [
     "crates/service",
     "crates/storage",
     "crates/storage-server",
+    "crates/tensor",
     "crates/testkit",
 ]
 
@@ -79,9 +78,7 @@ readme = "README.md"
 [workspace.dependencies]
 platform = { path = "crates/platform" }
 backend = { path = "crates/backend" }
-# The tensor library (github.com/Boreas618/uniserve-tensor). The local checkout stands in for
-# the pinned revision until the repository holds it (specs/tasks.md, T14).
-uniserve-tensor = { path = "/workspace/dev/uniserve-tensor-work" }
+tensor = { path = "crates/tensor" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 worker = { path = "crates/worker" }
@@ -90,9 +87,7 @@ ipc = { path = "crates/ipc" }
 media = { path = "crates/media" }
 nn = { path = "crates/nn" }
 ops = { path = "crates/ops" }
-qwen3 = { path = "crates/models/qwen3" }
-qwen4-exp = { path = "crates/models/qwen4-exp" }
-minimax-h3 = { path = "crates/models/minimax-h3" }
+models = { path = "crates/models" }
 nixl = { path = "crates/nixl" }
 processing = { path = "crates/processing" }
 build-server = { path = "crates/build-server" }

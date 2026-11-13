@@ -19,7 +19,7 @@ use ops::descriptor::Key;
 use ops::kernel::{CubinMetadata, LaunchGrid};
 use ops::tolerance::{accumulate, unit_roundoff};
 use ops::{Error, Float, Tolerance, abi};
-use uniserve_tensor::DType;
+use tensor::DType;
 
 /// A descriptor of the test's own, shaped like the real ones: fields in a fixed order.
 struct TestDescriptor {
@@ -321,7 +321,7 @@ fn a_generation_reports_a_missing_kernel_with_what_was_asked_for() {
 fn modulation_keys_separate_every_compiled_variant() {
     use ops::Float;
     use ops::modulation::{GatedResidualDescriptor, ModulatedRmsNormDescriptor};
-    use uniserve_tensor::DType;
+    use tensor::DType;
 
     let norm = ModulatedRmsNormDescriptor {
         dtype: DType::BF16,
@@ -455,8 +455,8 @@ fn an_operator_is_found_by_the_name_its_programs_are_filed_under() {
 #[test]
 fn a_sectioned_rotation_names_its_axes_in_its_key() {
     let plain = ops::rope::FactorsDescriptor {
-        dtype: uniserve_tensor::DType::F32,
-        positions: uniserve_tensor::DType::I32,
+        dtype: tensor::DType::F32,
+        positions: tensor::DType::I32,
         columns: 64,
         block: 1024,
         scale: ops::Float::from(1_000_000.0_f32),

@@ -9,7 +9,7 @@
 //! computes them, summed in FP32 and rounded once.
 
 use ops::adaptive_pool::{AdaptivePool, Args, Descriptor};
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use super::{PDL, on_cpu};
 use crate::error::{Error, Result};

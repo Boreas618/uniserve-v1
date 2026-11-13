@@ -4,6 +4,15 @@ pub mod erf;
 pub(crate) mod features;
 pub mod kernels;
 
+/// The vector instructions of one instruction set over `f32` lanes, in which the dot products
+/// and sums of this module are written.
+///
+/// # Safety
+///
+/// Every method executes instructions of its implementation's instruction set, so the caller runs
+/// it on a CPU that has them (`features::get`). `load` reads and `vec_store` writes `EPR`
+/// consecutive elements at `mem_addr`, and `vec_reduce` writes one value to `y`: the caller passes
+/// pointers valid for these accesses.
 #[allow(unused)]
 trait Cpu {
     type Unit;
@@ -22,6 +31,7 @@ trait Cpu {
     unsafe fn vec_store(mem_addr: *mut f32, a: Self::Unit);
 }
 
+/// [`Cpu`] over F16 elements in memory, with the same safety requirements.
 #[allow(unused)]
 trait CpuF16 {
     type Unit;
@@ -43,6 +53,7 @@ trait CpuF16 {
     unsafe fn vec_store(mem_addr: *mut f16, a: Self::Unit);
 }
 
+/// [`Cpu`] over BF16 elements in memory, with the same safety requirements.
 #[allow(unused)]
 trait CpuBF16 {
     type Unit;
@@ -79,67 +90,96 @@ pub mod neon;
 #[inline(always)]
 #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 unsafe fn scalar_vec_dot_f32(a_row: *const f32, b_row: *const f32, c: *mut f32, k: usize) {
-    for i in 0..k {
-        *c += *a_row.add(i) * (*b_row.add(i));
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for one
+    // write.
+    unsafe {
+        for i in 0..k {
+            *c += *a_row.add(i) * (*b_row.add(i));
+        }
     }
 }
 
 #[inline(always)]
 #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 unsafe fn scalar_vec_sum(row: *const f32, b: *mut f32, k: usize) {
-    *b = 0f32;
-    for i in 0..k {
-        *b += *row.add(i)
+    // SAFETY: the caller passes `row` valid for `k` reads and `b` valid for one write.
+    unsafe {
+        *b = 0f32;
+        for i in 0..k {
+            *b += *row.add(i)
+        }
     }
 }
 
 #[inline(always)]
 unsafe fn scalar_vec_dot_f16(a_row: *const f16, b_row: *const f16, c: *mut f32, k: usize) {
-    let mut sum = 0.0;
-    for i in 0..k {
-        sum += (*a_row.add(i)).to_f32() * (*b_row.add(i)).to_f32();
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for one
+    // write.
+    unsafe {
+        let mut sum = 0.0;
+        for i in 0..k {
+            sum += (*a_row.add(i)).to_f32() * (*b_row.add(i)).to_f32();
+        }
+        *c = sum;
     }
-    *c = sum;
 }
 
 #[inline(always)]
 unsafe fn scalar_vec_dot_bf16(a_row: *const bf16, b_row: *const bf16, c: *mut f32, k: usize) {
-    let mut sum = 0.0;
-    for i in 0..k {
-        sum += (*a_row.add(i)).to_f32() * (*b_row.add(i)).to_f32();
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for one
+    // write.
+    unsafe {
+        let mut sum = 0.0;
+        for i in 0..k {
+            sum += (*a_row.add(i)).to_f32() * (*b_row.add(i)).to_f32();
+        }
+        *c = sum;
     }
-    *c = sum;
 }
 
 #[inline(always)]
 #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 unsafe fn scalar_vec_add_f16(a_row: *const f16, b_row: *const f16, c: *mut f16, k: usize) {
-    for i in 0..k {
-        *c.add(i) = *a_row.add(i) + *b_row.add(i);
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for `k`
+    // writes.
+    unsafe {
+        for i in 0..k {
+            *c.add(i) = *a_row.add(i) + *b_row.add(i);
+        }
     }
 }
 
 #[inline(always)]
 #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 unsafe fn scalar_vec_add_bf16(a_row: *const bf16, b_row: *const bf16, c: *mut bf16, k: usize) {
-    for i in 0..k {
-        *c.add(i) = *a_row.add(i) + *b_row.add(i);
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for `k`
+    // writes.
+    unsafe {
+        for i in 0..k {
+            *c.add(i) = *a_row.add(i) + *b_row.add(i);
+        }
     }
 }
 
 #[inline(always)]
 #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 unsafe fn scalar_vec_scalar_add_f16(scalar: f16, xs: *const f16, ys: *mut f16, k: usize) {
-    for i in 0..k {
-        *ys.add(i) = *xs.add(i) + scalar;
+    // SAFETY: the caller passes `xs` valid for `k` reads and `ys` valid for `k` writes.
+    unsafe {
+        for i in 0..k {
+            *ys.add(i) = *xs.add(i) + scalar;
+        }
     }
 }
 
 #[inline(always)]
 #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 unsafe fn scalar_vec_scalar_add_bf16(scalar: bf16, xs: *const bf16, ys: *mut bf16, k: usize) {
-    for i in 0..k {
-        *ys.add(i) = *xs.add(i) + scalar;
+    // SAFETY: the caller passes `xs` valid for `k` reads and `ys` valid for `k` writes.
+    unsafe {
+        for i in 0..k {
+            *ys.add(i) = *xs.add(i) + scalar;
+        }
     }
 }
 
@@ -187,184 +227,220 @@ fn use_neon_bf16() -> bool {
 
 #[inline(always)]
 pub(crate) unsafe fn vec_dot_f32(a_row: *const f32, b_row: *const f32, c: *mut f32, k: usize) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if use_avx2() {
-        return avx::vec_dot_f32(a_row, b_row, c, k);
-    }
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon")
-    ))]
-    if use_neon() {
-        return neon::vec_dot_f32(a_row, b_row, c, k);
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        simd128::vec_dot_f32(a_row, b_row, c, k)
-    }
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-    {
-        scalar_vec_dot_f32(a_row, b_row, c, k)
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for one
+    // write; each instruction set runs only where `features::get` reports it.
+    unsafe {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if use_avx2() {
+            return avx::vec_dot_f32(a_row, b_row, c, k);
+        }
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "arm", target_feature = "neon")
+        ))]
+        if use_neon() {
+            return neon::vec_dot_f32(a_row, b_row, c, k);
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            simd128::vec_dot_f32(a_row, b_row, c, k)
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        {
+            scalar_vec_dot_f32(a_row, b_row, c, k)
+        }
     }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn vec_sum(row: *const f32, b: *mut f32, k: usize) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if use_avx2() {
-        return avx::vec_sum(row, b, k);
-    }
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon")
-    ))]
-    if use_neon() {
-        return neon::vec_sum(row, b, k);
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        simd128::vec_sum(row, b, k)
-    }
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-    {
-        scalar_vec_sum(row, b, k)
+    // SAFETY: the caller passes `row` valid for `k` reads and `b` valid for one write; each
+    // instruction set runs only where `features::get` reports it.
+    unsafe {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if use_avx2() {
+            return avx::vec_sum(row, b, k);
+        }
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "arm", target_feature = "neon")
+        ))]
+        if use_neon() {
+            return neon::vec_sum(row, b, k);
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            simd128::vec_sum(row, b, k)
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        {
+            scalar_vec_sum(row, b, k)
+        }
     }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn vec_dot_f16(a_row: *const f16, b_row: *const f16, c: *mut f32, k: usize) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if use_avx2_f16() {
-        return avx::vec_dot_f16(a_row, b_row, c, k);
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for one
+    // write; each instruction set runs only where `features::get` reports it.
+    unsafe {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if use_avx2_f16() {
+            return avx::vec_dot_f16(a_row, b_row, c, k);
+        }
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "arm", target_feature = "neon")
+        ))]
+        if use_neon_f16() {
+            return neon::vec_dot_f16(a_row, b_row, c, k);
+        }
+        scalar_vec_dot_f16(a_row, b_row, c, k)
     }
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon")
-    ))]
-    if use_neon_f16() {
-        return neon::vec_dot_f16(a_row, b_row, c, k);
-    }
-    scalar_vec_dot_f16(a_row, b_row, c, k)
 }
 
 #[inline(always)]
 pub(crate) unsafe fn vec_dot_bf16(a_row: *const bf16, b_row: *const bf16, c: *mut f32, k: usize) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if use_avx2() {
-        return avx::vec_dot_bf16(a_row, b_row, c, k);
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for one
+    // write; each instruction set runs only where `features::get` reports it.
+    unsafe {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if use_avx2() {
+            return avx::vec_dot_bf16(a_row, b_row, c, k);
+        }
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "arm", target_feature = "neon")
+        ))]
+        if use_neon_bf16() {
+            return neon::vec_dot_bf16(a_row, b_row, c, k);
+        }
+        scalar_vec_dot_bf16(a_row, b_row, c, k)
     }
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon")
-    ))]
-    if use_neon_bf16() {
-        return neon::vec_dot_bf16(a_row, b_row, c, k);
-    }
-    scalar_vec_dot_bf16(a_row, b_row, c, k)
 }
 
 #[inline(always)]
 pub(crate) unsafe fn vec_add_f16(a_row: *const f16, b_row: *const f16, c: *mut f16, k: usize) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if use_avx2_f16() {
-        return avx::vec_add_f16(a_row, b_row, c, k);
-    }
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon")
-    ))]
-    if use_neon_f16() {
-        return neon::vec_add_f16(a_row, b_row, c, k);
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        simd128::vec_add_f16(a_row, b_row, c, k)
-    }
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-    {
-        scalar_vec_add_f16(a_row, b_row, c, k)
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for `k`
+    // writes; each instruction set runs only where `features::get` reports it.
+    unsafe {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if use_avx2_f16() {
+            return avx::vec_add_f16(a_row, b_row, c, k);
+        }
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "arm", target_feature = "neon")
+        ))]
+        if use_neon_f16() {
+            return neon::vec_add_f16(a_row, b_row, c, k);
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            simd128::vec_add_f16(a_row, b_row, c, k)
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        {
+            scalar_vec_add_f16(a_row, b_row, c, k)
+        }
     }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn vec_add_bf16(a_row: *const bf16, b_row: *const bf16, c: *mut bf16, k: usize) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if use_avx2() {
-        return avx::vec_add_bf16(a_row, b_row, c, k);
-    }
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon")
-    ))]
-    if use_neon_bf16() {
-        return neon::vec_add_bf16(a_row, b_row, c, k);
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        simd128::vec_add_bf16(a_row, b_row, c, k)
-    }
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-    {
-        scalar_vec_add_bf16(a_row, b_row, c, k)
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for `k`
+    // writes; each instruction set runs only where `features::get` reports it.
+    unsafe {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if use_avx2() {
+            return avx::vec_add_bf16(a_row, b_row, c, k);
+        }
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "arm", target_feature = "neon")
+        ))]
+        if use_neon_bf16() {
+            return neon::vec_add_bf16(a_row, b_row, c, k);
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            simd128::vec_add_bf16(a_row, b_row, c, k)
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        {
+            scalar_vec_add_bf16(a_row, b_row, c, k)
+        }
     }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn vec_scalar_add_f16(scalar: f16, xs: *const f16, ys: *mut f16, k: usize) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if use_avx2_f16() {
-        return avx::vec_scalar_add_f16(scalar, xs, ys, k);
-    }
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon")
-    ))]
-    if use_neon_f16() {
-        return neon::vec_scalar_add_f16(scalar, xs, ys, k);
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        simd128::vec_scalar_add_f16(scalar, xs, ys, k)
-    }
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-    {
-        scalar_vec_scalar_add_f16(scalar, xs, ys, k)
+    // SAFETY: the caller passes `xs` valid for `k` reads and `ys` valid for `k` writes; each
+    // instruction set runs only where `features::get` reports it.
+    unsafe {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if use_avx2_f16() {
+            return avx::vec_scalar_add_f16(scalar, xs, ys, k);
+        }
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "arm", target_feature = "neon")
+        ))]
+        if use_neon_f16() {
+            return neon::vec_scalar_add_f16(scalar, xs, ys, k);
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            simd128::vec_scalar_add_f16(scalar, xs, ys, k)
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        {
+            scalar_vec_scalar_add_f16(scalar, xs, ys, k)
+        }
     }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn vec_mul_bf16(a_row: *const bf16, b_row: *const bf16, c: *mut bf16, k: usize) {
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon")
-    ))]
-    if use_neon_bf16() {
-        return neon::vec_mul_bf16(a_row, b_row, c, k);
-    }
-    for j in 0..k {
-        *c.add(j) = *a_row.add(j) * *b_row.add(j);
+    // SAFETY: the caller passes `a_row` and `b_row` valid for `k` reads and `c` valid for `k`
+    // writes; each instruction set runs only where `features::get` reports it.
+    unsafe {
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "arm", target_feature = "neon")
+        ))]
+        if use_neon_bf16() {
+            return neon::vec_mul_bf16(a_row, b_row, c, k);
+        }
+        for j in 0..k {
+            *c.add(j) = *a_row.add(j) * *b_row.add(j);
+        }
     }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn vec_scalar_add_bf16(scalar: bf16, xs: *const bf16, ys: *mut bf16, k: usize) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if use_avx2() {
-        return avx::vec_scalar_add_bf16(scalar, xs, ys, k);
-    }
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon")
-    ))]
-    if use_neon_bf16() {
-        return neon::vec_scalar_add_bf16(scalar, xs, ys, k);
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        simd128::vec_scalar_add_bf16(scalar, xs, ys, k)
-    }
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-    {
-        scalar_vec_scalar_add_bf16(scalar, xs, ys, k)
+    // SAFETY: the caller passes `xs` valid for `k` reads and `ys` valid for `k` writes; each
+    // instruction set runs only where `features::get` reports it.
+    unsafe {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if use_avx2() {
+            return avx::vec_scalar_add_bf16(scalar, xs, ys, k);
+        }
+        #[cfg(any(
+            target_arch = "aarch64",
+            all(target_arch = "arm", target_feature = "neon")
+        ))]
+        if use_neon_bf16() {
+            return neon::vec_scalar_add_bf16(scalar, xs, ys, k);
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            simd128::vec_scalar_add_bf16(scalar, xs, ys, k)
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+        {
+            scalar_vec_scalar_add_bf16(scalar, xs, ys, k)
+        }
     }
 }

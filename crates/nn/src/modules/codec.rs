@@ -18,7 +18,7 @@
 //! of the strides: the caller right-pads a track to a whole number of hops, as the reference
 //! does before it convolves.
 
-use uniserve_tensor::{Module, Tensor};
+use tensor::{Module, Tensor};
 
 use crate::error::{Error, Result};
 use crate::functional;
@@ -195,7 +195,7 @@ impl DacEncoder {
 }
 
 impl Module for DacEncoder {
-    fn forward(&self, samples: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, samples: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, samples)?)
     }
 }

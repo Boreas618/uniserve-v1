@@ -1,8 +1,10 @@
+#![cfg(test)]
+
 #[macro_use]
 mod common;
 
 use anyhow::Result;
-use uniserve_tensor::{test_utils, Device, IndexOp, Tensor};
+use tensor::{Device, IndexOp, Tensor};
 
 /* This test is based on the following script.
 import torch
@@ -46,15 +48,17 @@ fn conv1d(dev: &Device) -> Result<()> {
     let res = t.conv1d(&w, 0, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 2, 3]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
         [2.6357, -1.3336, 4.1393, -1.1784, 3.5675, 0.5069]
     );
     let res = t.conv1d(&w, /*padding*/ 1, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 2, 5]);
     // Same as pytorch default padding: use zeros.
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
-        [2.4509, 2.6357, -1.3336, 4.1393, 0.5657, 1.8091, -1.1784, 3.5675, 0.5069, 3.3352]
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
+        [
+            2.4509, 2.6357, -1.3336, 4.1393, 0.5657, 1.8091, -1.1784, 3.5675, 0.5069, 3.3352
+        ]
     );
     let res = {
         let t = Tensor::cat(&[&t.zeros_like()?, &t, &t.zeros_like()?], 0)?;
@@ -63,12 +67,14 @@ fn conv1d(dev: &Device) -> Result<()> {
     assert_eq!(res.dims(), [3, 2, 5]);
     // Same as pytorch default padding: use zeros.
     assert_eq!(
-        test_utils::to_vec1_round(&res.i(0)?.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.i(0)?.flatten_all()?, 4)?,
         [0., 0., 0., 0., 0., 0., 0., 0., 0., 0.]
     );
     assert_eq!(
-        test_utils::to_vec1_round(&res.i(1)?.flatten_all()?, 4)?,
-        [2.4509, 2.6357, -1.3336, 4.1393, 0.5657, 1.8091, -1.1784, 3.5675, 0.5069, 3.3352]
+        common::to_vec1_round(&res.i(1)?.flatten_all()?, 4)?,
+        [
+            2.4509, 2.6357, -1.3336, 4.1393, 0.5657, 1.8091, -1.1784, 3.5675, 0.5069, 3.3352
+        ]
     );
 
     let w = w.transpose(0, 1)?;
@@ -77,7 +83,7 @@ fn conv1d(dev: &Device) -> Result<()> {
         let res = t.conv_transpose1d(&w, 0, 0, 1, 1, 1)?;
         assert_eq!(res.dims(), [1, 2, 7]);
         assert_eq!(
-            test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+            common::to_vec1_round(&res.flatten_all()?, 4)?,
             [
                 0.0699, -1.2899, 8.3018, 5.5873, 2.4572, -2.6143, -0.0706, 1.8765, 4.8318, 1.1538,
                 4.7076, -5.9745, -0.8276, 1.621
@@ -86,7 +92,7 @@ fn conv1d(dev: &Device) -> Result<()> {
         let res = t.conv_transpose1d(&w, 0, 0, 1, 1, 2)?;
         assert_eq!(res.dims(), [1, 4, 7]);
         assert_eq!(
-            test_utils::to_vec2_round(&res.squeeze(0)?, 4)?,
+            common::to_vec2_round(&res.squeeze(0)?, 4)?,
             [
                 [-1.5596, -1.8099, 2.0407, 4.8764, -0.1743, -0.735, -0.7819],
                 [0.7816, 3.8152, -0.5926, 2.2515, -5.1844, -0.3157, 1.4721],
@@ -104,13 +110,13 @@ fn conv1d_small(dev: &Device) -> Result<()> {
     let res = t.conv1d(&w, 0, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 1, 2]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
         [0.4056, -0.8689]
     );
     let res = t.conv1d(&w, /*padding*/ 1, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 1, 4]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
         [0.0, 0.4056, -0.8689, -0.0773],
     );
     Ok(())
@@ -174,7 +180,7 @@ fn conv2d(dev: &Device) -> Result<()> {
     let res = t.conv2d(&w, 0, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 2, 3, 3]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
         [
             -4.2812, 2.0923, 5.2187, 7.5184, 0.752, -14.9426, 10.0087, 4.391, 0.2918, 1.6715,
             10.389, 3.6023, -4.2808, 0.2672, 5.3646, -5.2023, -2.1955, -9.4075
@@ -186,11 +192,13 @@ fn conv2d(dev: &Device) -> Result<()> {
     };
     assert_eq!(res.dims(), [3, 2, 3, 3]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.i(0)?.flatten_all()?, 4)?,
-        [0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.]
+        common::to_vec1_round(&res.i(0)?.flatten_all()?, 4)?,
+        [
+            0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.
+        ]
     );
     assert_eq!(
-        test_utils::to_vec1_round(&res.i(1)?.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.i(1)?.flatten_all()?, 4)?,
         [
             -4.2812, 2.0923, 5.2187, 7.5184, 0.752, -14.9426, 10.0087, 4.391, 0.2918, 1.6715,
             10.389, 3.6023, -4.2808, 0.2672, 5.3646, -5.2023, -2.1955, -9.4075
@@ -201,7 +209,7 @@ fn conv2d(dev: &Device) -> Result<()> {
 
     assert_eq!(res.dims(), [1, 2, 7, 7]);
     assert_eq!(
-        test_utils::to_vec3_round(&res.i(0)?, 4)?,
+        common::to_vec3_round(&res.i(0)?, 4)?,
         [
             [
                 [-1.9918, 2.6797, -0.4599, -1.6037, 1.4131, -2.4012, 2.9277],
@@ -209,7 +217,9 @@ fn conv2d(dev: &Device) -> Result<()> {
                 [0.8243, 1.8675, 7.8929, -4.0746, -6.4415, 5.1139, 1.6889],
                 [0.2722, 8.9679, 3.3477, 1.8514, -4.2896, -3.8228, -7.5632],
                 [-8.5412, -5.8142, -7.1587, -1.6095, 0.4651, 0.2748, -2.0985],
-                [2.0833, -0.6482, -12.1692, -4.1284, -2.9765, -0.0656, -4.5114],
+                [
+                    2.0833, -0.6482, -12.1692, -4.1284, -2.9765, -0.0656, -4.5114
+                ],
                 [5.307, 2.6957, 2.3087, 1.0478, 0.7808, -1.1519, -0.9579]
             ],
             [
@@ -228,7 +238,7 @@ fn conv2d(dev: &Device) -> Result<()> {
     let res = t.conv2d(&w, 0, 1, 2, 1)?;
     assert_eq!(res.dims(), [1, 2, 1, 1]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
         [2.45, -2.3504],
     );
 
@@ -236,29 +246,65 @@ fn conv2d(dev: &Device) -> Result<()> {
     let res = t.conv_transpose2d(&w.transpose(0, 1)?, 0, 0, 1, 2)?;
     assert_eq!(res.dims(), [1, 2, 9, 9]);
     assert_eq!(
-        test_utils::to_vec3_round(&res.i(0)?, 4)?,
+        common::to_vec3_round(&res.i(0)?, 4)?,
         [
             [
-                [-1.9918, 3.1652, -0.6778, -4.3442, 4.4351, 0.6652, -3.0124, -0.6031, 2.9277],
-                [2.7036, -1.7156, -0.3969, 1.0516, 1.6381, -2.8886, -0.205, 2.4682, -1.0499],
-                [-0.9459, 3.1631, 3.707, -4.8369, -8.5166, -1.4496, -2.7559, -3.2698, 1.4376],
-                [-0.2157, 3.7786, -2.0252, -4.2633, 3.6731, -1.5142, 5.9391, -0.2622, -0.141],
-                [-6.8121, -3.1744, 1.5945, 3.0637, -9.6088, 1.4446, 2.9489, -3.0082, -7.3822],
-                [0.2371, 3.3303, 0.3861, 2.2646, -4.6784, 4.1235, -0.0109, 0.3176, -0.03],
-                [-2.5339, -2.9564, -3.4518, -4.4594, -9.1873, -1.9709, -0.4676, 0.51, -3.5024],
-                [4.007, 0.3067, -2.2954, 1.1105, -0.1992, 1.6372, -2.9268, 0.2807, -1.2787],
-                [5.307, 1.1317, 1.3518, 0.9049, 3.8116, -0.4075, -0.8874, -0.2241, -0.9579]
+                [
+                    -1.9918, 3.1652, -0.6778, -4.3442, 4.4351, 0.6652, -3.0124, -0.6031, 2.9277
+                ],
+                [
+                    2.7036, -1.7156, -0.3969, 1.0516, 1.6381, -2.8886, -0.205, 2.4682, -1.0499
+                ],
+                [
+                    -0.9459, 3.1631, 3.707, -4.8369, -8.5166, -1.4496, -2.7559, -3.2698, 1.4376
+                ],
+                [
+                    -0.2157, 3.7786, -2.0252, -4.2633, 3.6731, -1.5142, 5.9391, -0.2622, -0.141
+                ],
+                [
+                    -6.8121, -3.1744, 1.5945, 3.0637, -9.6088, 1.4446, 2.9489, -3.0082, -7.3822
+                ],
+                [
+                    0.2371, 3.3303, 0.3861, 2.2646, -4.6784, 4.1235, -0.0109, 0.3176, -0.03
+                ],
+                [
+                    -2.5339, -2.9564, -3.4518, -4.4594, -9.1873, -1.9709, -0.4676, 0.51, -3.5024
+                ],
+                [
+                    4.007, 0.3067, -2.2954, 1.1105, -0.1992, 1.6372, -2.9268, 0.2807, -1.2787
+                ],
+                [
+                    5.307, 1.1317, 1.3518, 0.9049, 3.8116, -0.4075, -0.8874, -0.2241, -0.9579
+                ]
             ],
             [
-                [1.089, -0.6483, 0.0726, -0.4752, -1.3283, 1.7103, 1.0703, 0.1076, -0.9211],
-                [-0.8629, 0.1376, 0.3202, 2.0955, 0.9696, 2.8988, -1.0012, 1.5049, -0.1278],
-                [1.9286, -1.5255, -2.9563, 2.4589, 3.3611, -0.6951, 0.3525, -1.7724, -5.9861],
-                [1.1226, 2.1561, 3.6417, 4.7546, -0.692, 4.4126, -5.1902, 6.0805, 2.3185],
-                [1.0111, 0.3604, 0.6432, -3.6605, 7.9517, -9.2955, -5.2988, -3.7803, -2.0642],
-                [3.3172, -1.7967, -3.6576, -2.0942, 1.3158, 0.112, -1.7405, 2.9167, 0.7957],
-                [5.1001, 1.8995, -1.8639, 1.1262, 9.9629, 2.683, -3.6319, -1.1607, 0.5856],
-                [-4.8445, -0.5642, 4.2317, 0.0856, 1.2267, -0.5712, 1.736, 1.0997, 0.6908],
-                [-5.5423, -1.1831, -1.2176, 0.0843, 0.0446, -0.7545, -2.4798, -0.0827, 1.0171]
+                [
+                    1.089, -0.6483, 0.0726, -0.4752, -1.3283, 1.7103, 1.0703, 0.1076, -0.9211
+                ],
+                [
+                    -0.8629, 0.1376, 0.3202, 2.0955, 0.9696, 2.8988, -1.0012, 1.5049, -0.1278
+                ],
+                [
+                    1.9286, -1.5255, -2.9563, 2.4589, 3.3611, -0.6951, 0.3525, -1.7724, -5.9861
+                ],
+                [
+                    1.1226, 2.1561, 3.6417, 4.7546, -0.692, 4.4126, -5.1902, 6.0805, 2.3185
+                ],
+                [
+                    1.0111, 0.3604, 0.6432, -3.6605, 7.9517, -9.2955, -5.2988, -3.7803, -2.0642
+                ],
+                [
+                    3.3172, -1.7967, -3.6576, -2.0942, 1.3158, 0.112, -1.7405, 2.9167, 0.7957
+                ],
+                [
+                    5.1001, 1.8995, -1.8639, 1.1262, 9.9629, 2.683, -3.6319, -1.1607, 0.5856
+                ],
+                [
+                    -4.8445, -0.5642, 4.2317, 0.0856, 1.2267, -0.5712, 1.736, 1.0997, 0.6908
+                ],
+                [
+                    -5.5423, -1.1831, -1.2176, 0.0843, 0.0446, -0.7545, -2.4798, -0.0827, 1.0171
+                ]
             ]
         ]
     );
@@ -301,13 +347,15 @@ fn conv2d_small(dev: &Device) -> Result<()> {
     let res = t.conv2d(&w, 0, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 1, 3, 3]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
-        [0.164, -0.0111, -0.1742, 2.6437, -2.0268, 1.1823, 3.2855, -1.0324, 0.2539]
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
+        [
+            0.164, -0.0111, -0.1742, 2.6437, -2.0268, 1.1823, 3.2855, -1.0324, 0.2539
+        ]
     );
     let res = t.conv2d(&w, 2, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 1, 7, 7]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
         [
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1640,
             -0.0111, -0.1742, 0.0, 0.0, 0.0, 0.0, 2.6437, -2.0268, 1.1823, 0.0, 0.0, 0.0, 0.0,
@@ -319,13 +367,15 @@ fn conv2d_small(dev: &Device) -> Result<()> {
     let res = t.conv_transpose2d(&w.transpose(0, 1)?, 0, 0, 1, 1)?;
     assert_eq!(res.dims(), [1, 1, 3, 3]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
-        [0.164, -0.0111, -0.1742, 2.6437, -2.0268, 1.1823, 3.2855, -1.0324, 0.2539],
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
+        [
+            0.164, -0.0111, -0.1742, 2.6437, -2.0268, 1.1823, 3.2855, -1.0324, 0.2539
+        ],
     );
     let res = t.transpose(0, 1)?.conv_transpose2d(&w, 0, 0, 1, 1)?;
     assert_eq!(res.dims(), [2, 2, 3, 3]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
         [
             -0.3755, 0.8045, -0.6336, -0.2218, -1.1369, 0.8599, 1.5768, -0.1268, -0.1728, 0.528,
             -1.131, 0.8908, 0.3118, 1.5984, -1.2089, -2.2168, 0.1783, 0.2429, -0.3838, 0.5802,
@@ -348,10 +398,7 @@ fn conv2d_smaller(dev: &Device) -> Result<()> {
     let w = w.reshape((1, 1, 3, 3))?;
     let res = t.conv2d(&w, 0, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 1, 1, 1]);
-    assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
-        [-0.6197]
-    );
+    assert_eq!(common::to_vec1_round(&res.flatten_all()?, 4)?, [-0.6197]);
     Ok(())
 }
 
@@ -380,8 +427,10 @@ fn conv2d_non_square(dev: &Device) -> Result<()> {
     let res = t.conv2d(&w, 0, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 1, 4, 2]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
-        [0.2312, 5.2238, 2.3772, 1.9076, 2.0256, -0.5776, -1.6028, -1.467]
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
+        [
+            0.2312, 5.2238, 2.3772, 1.9076, 2.0256, -0.5776, -1.6028, -1.467
+        ]
     );
     Ok(())
 }
@@ -437,17 +486,17 @@ fn conv2d_sum_of_squares(dev: &Device) -> Result<()> {
     )?;
     let res = t.conv2d(&w, 0, 1, 1, 1)?;
     let loss = res.sqr()?.sum_all()?;
-    assert_eq!(test_utils::to_vec0_round(&loss, 2)?, 741.12f32);
+    assert_eq!(common::to_vec0_round(&loss, 2)?, 741.12f32);
 
     // Same as before but with stride.
     let res = t.conv2d(&w, 0, 2, 1, 1)?;
     let loss = res.sqr()?.sum_all()?;
-    assert_eq!(test_utils::to_vec0_round(&loss, 2)?, 277.16f32);
+    assert_eq!(common::to_vec0_round(&loss, 2)?, 277.16f32);
 
     // Replicate the issue from https://github.com/huggingface/candle/issues/1212
     let res = t.i((.., .., 0..4, 0..4))?.conv2d(&w, 0, 2, 1, 1)?;
     let loss = res.sqr()?.sum_all()?;
-    assert_eq!(test_utils::to_vec0_round(&loss, 2)?, 21.12f32);
+    assert_eq!(common::to_vec0_round(&loss, 2)?, 21.12f32);
 
     // Conv Transpose 2d Test
     //tested against following python
@@ -522,7 +571,7 @@ fn conv2d_sum_of_squares(dev: &Device) -> Result<()> {
     )?;
     let res = t.conv_transpose2d(&w, padding, outpadding, stride, dilation)?;
     let loss = res.sqr()?.sum_all()?;
-    assert_eq!(test_utils::to_vec0_round(&loss, 0)?, 2904.0);
+    assert_eq!(common::to_vec0_round(&loss, 0)?, 2904.0);
 
     // Test the same, but then with the following properties, t & w are unmodified.
     let padding = 1;
@@ -532,7 +581,7 @@ fn conv2d_sum_of_squares(dev: &Device) -> Result<()> {
 
     let res = t.conv_transpose2d(&w, padding, outpadding, stride, dilation)?;
     let loss = res.sqr()?.sum_all()?;
-    assert_eq!(test_utils::to_vec0_round(&loss, 0)?, 3627.0); // torch gives 3626.8560
+    assert_eq!(common::to_vec0_round(&loss, 0)?, 3627.0); // torch gives 3626.8560
 
     Ok(())
 }
@@ -571,7 +620,7 @@ fn conv2d_c_eq_h_eq_w(dev: &Device) -> Result<()> {
     let t = t.reshape((1, 4, 4, 4))?;
 
     // Use a simple weight: all ones kernel for easy verification
-    let w = Tensor::ones((2, 4, 3, 3), uniserve_tensor::DType::F32, dev)?;
+    let w = Tensor::ones((2, 4, 3, 3), tensor::DType::F32, dev)?;
     let res = t.conv2d(&w, 1, 1, 1, 1)?;
     assert_eq!(res.dims(), [1, 2, 4, 4]);
 
@@ -627,8 +676,8 @@ fn conv2d_noncontiguous_kernel(dev: &Device) -> Result<()> {
 
     assert_eq!(res.dims(), [1, 3, 2, 2]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
-        test_utils::to_vec1_round(&res_ref.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
+        common::to_vec1_round(&res_ref.flatten_all()?, 4)?,
     );
     Ok(())
 }
@@ -651,8 +700,8 @@ fn conv1d_noncontiguous_kernel(dev: &Device) -> Result<()> {
 
     assert_eq!(res.dims(), [1, 3, 4]);
     assert_eq!(
-        test_utils::to_vec1_round(&res.flatten_all()?, 4)?,
-        test_utils::to_vec1_round(&res_ref.flatten_all()?, 4)?,
+        common::to_vec1_round(&res.flatten_all()?, 4)?,
+        common::to_vec1_round(&res_ref.flatten_all()?, 4)?,
     );
     Ok(())
 }
@@ -660,7 +709,7 @@ fn conv1d_noncontiguous_kernel(dev: &Device) -> Result<()> {
 // The 16-bit floats convolve like F32. Every value here is a small integer, so the F32 result is
 // exact in both 16-bit types, for the 1x1 kernel and for the general kernel alike.
 fn conv2d_16bit_floats(dev: &Device) -> Result<()> {
-    use uniserve_tensor::DType;
+    use tensor::DType;
 
     let input_data: Vec<f32> = (0..32).map(|v| (v % 4) as f32).collect();
     let input = Tensor::from_slice(&input_data, (1, 2, 4, 4), dev)?;

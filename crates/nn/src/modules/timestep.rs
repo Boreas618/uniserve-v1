@@ -1,7 +1,7 @@
 //! Diffusion timestep conditioning: the MLP that projects a time's sinusoidal embedding, and a
 //! fixed schedule's modulation precomputed at each distinct noise level.
 
-use uniserve_tensor::{DType, Device, Module, Tensor};
+use tensor::{DType, Device, Module, Tensor};
 
 use crate::diffusion::sinusoidal;
 use crate::error::{Error, Result};
@@ -74,7 +74,7 @@ impl TimestepEmbedding {
 }
 
 impl Module for TimestepEmbedding {
-    fn forward(&self, embedding: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, embedding: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, embedding)?)
     }
 }

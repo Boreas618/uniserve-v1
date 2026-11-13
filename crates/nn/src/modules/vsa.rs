@@ -19,7 +19,7 @@
 
 use std::ops::Range;
 
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use crate::error::{Error, Result};
 use crate::functional;

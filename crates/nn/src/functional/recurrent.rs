@@ -51,7 +51,7 @@ use ops::recurrent::{
     GatedDeltaRuleArgs, GatedDeltaRuleDescriptor, RequestSlots, RowColumns, Trail,
 };
 use proto::module::PhaseKind;
-use uniserve_tensor::{D, DType, Device, Tensor};
+use tensor::{D, DType, Device, Tensor};
 
 use super::{ACCUMULATE, on_cpu, vector};
 use crate::capability::{NO_SLOT, RecurrentState, TokenBatch, VerifySlots};

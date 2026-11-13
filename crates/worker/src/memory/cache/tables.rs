@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use platform::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::layout::CacheLayout;
 use crate::memory::allocation::Storage;

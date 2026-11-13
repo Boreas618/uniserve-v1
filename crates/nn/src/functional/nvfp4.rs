@@ -21,7 +21,7 @@
 //! compares the two under the consuming product's tolerance.
 
 use ops::fp4::{BLOCK_ELEMENTS, Nvfp4Quantize, QuantizeArgs, QuantizeDescriptor, ScaleLayout};
-use uniserve_tensor::{D, DType, Device, Tensor};
+use tensor::{D, DType, Device, Tensor};
 
 use super::{ACCUMULATE, PDL, as_rows, columns, on_cpu};
 use crate::error::{Error, Result};

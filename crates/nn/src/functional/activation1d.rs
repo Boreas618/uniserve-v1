@@ -16,7 +16,7 @@
 //! keeps the upsampled signal inside the kernel that produced it.
 
 use ops::activation1d::{Activation1d, Args, BETA_FLOOR, Descriptor};
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use super::{PDL, on_cpu};
 use crate::error::{Error, Result};

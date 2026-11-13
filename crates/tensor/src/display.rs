@@ -107,16 +107,26 @@ pub fn print_options() -> &'static std::sync::Mutex<PrinterOptions> {
     &PRINT_OPTS
 }
 
+/// The print options, locked for reading or writing.
+#[expect(
+    clippy::unwrap_used,
+    reason = "the options are poisoned only by a panic while they were held, which is not \
+              recovered from"
+)]
+fn locked_options() -> std::sync::MutexGuard<'static, PrinterOptions> {
+    PRINT_OPTS.lock().unwrap()
+}
+
 pub fn set_print_options(options: PrinterOptions) {
-    *PRINT_OPTS.lock().unwrap() = options
+    *locked_options() = options
 }
 
 pub fn set_print_options_default() {
-    *PRINT_OPTS.lock().unwrap() = PrinterOptions::const_default()
+    *locked_options() = PrinterOptions::const_default()
 }
 
 pub fn set_print_options_short() {
-    *PRINT_OPTS.lock().unwrap() = PrinterOptions {
+    *locked_options() = PrinterOptions {
         precision: 2,
         threshold: 1000,
         edge_items: 2,
@@ -126,7 +136,7 @@ pub fn set_print_options_short() {
 }
 
 pub fn set_print_options_full() {
-    *PRINT_OPTS.lock().unwrap() = PrinterOptions {
+    *locked_options() = PrinterOptions {
         precision: 4,
         threshold: usize::MAX,
         edge_items: 3,
@@ -136,23 +146,23 @@ pub fn set_print_options_full() {
 }
 
 pub fn set_line_width(line_width: usize) {
-    PRINT_OPTS.lock().unwrap().line_width = line_width
+    locked_options().line_width = line_width
 }
 
 pub fn set_precision(precision: usize) {
-    PRINT_OPTS.lock().unwrap().precision = precision
+    locked_options().precision = precision
 }
 
 pub fn set_edge_items(edge_items: usize) {
-    PRINT_OPTS.lock().unwrap().edge_items = edge_items
+    locked_options().edge_items = edge_items
 }
 
 pub fn set_threshold(threshold: usize) {
-    PRINT_OPTS.lock().unwrap().threshold = threshold
+    locked_options().threshold = threshold
 }
 
 pub fn set_sci_mode(sci_mode: Option<bool>) {
-    PRINT_OPTS.lock().unwrap().sci_mode = sci_mode
+    locked_options().sci_mode = sci_mode
 }
 
 struct FmtSize {
@@ -339,14 +349,13 @@ where
                     break;
                 }
             }
-            if let Some(v1) = S::from(1000.) {
-                if let Some(v2) = S::from(1e8) {
-                    if let Some(v3) = S::from(1e-4) {
-                        sci_mode = nonzero_finite_max / nonzero_finite_min > v1
-                            || nonzero_finite_max > v2
-                            || nonzero_finite_min < v3
-                    }
-                }
+            if let Some(v1) = S::from(1000.)
+                && let Some(v2) = S::from(1e8)
+                && let Some(v3) = S::from(1e-4)
+            {
+                sci_mode = nonzero_finite_max / nonzero_finite_min > v1
+                    || nonzero_finite_max > v2
+                    || nonzero_finite_min < v3
             }
         }
 
@@ -453,7 +462,7 @@ fn get_summarized_data(t: &Tensor, edge_items: usize) -> Result<Tensor> {
 
 impl std::fmt::Display for Tensor {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let po = PRINT_OPTS.lock().unwrap();
+        let po = locked_options();
         let summarize = self.elem_count() > po.threshold;
         let to_display = if summarize {
             match get_summarized_data(self, po.edge_items) {

@@ -102,7 +102,7 @@ use nn::{KvCache, NO_SLOT, PhaseKind, RecurrentState, TokenBatch, functional};
 use platform::Stream;
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::module::sampler::PARAMETER_COLUMNS;
-use uniserve_tensor::{DType, Shape, Tensor};
+use tensor::{DType, Shape, Tensor};
 
 use super::columns::{self, Column, Layout, slot_row};
 use super::{CausalLmRunner, StateBuffers, history_ids, write_rows};

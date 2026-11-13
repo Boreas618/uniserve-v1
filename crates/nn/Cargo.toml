@@ -7,11 +7,11 @@ license.workspace = true
 publish = false
 
 # The neural-network library: `nn → backend → ops → platform`, beside the tensor library. A model
-# crate depends on `nn`, `uniserve-tensor` and `processing` only; what it may name of the crates
+# crate depends on `nn`, `tensor` and `processing` only; what it may name of the crates
 # below is re-exported here.
 [dependencies]
 # Tensors, views and the CPU device every fused operator states its formula on.
-uniserve-tensor.workspace = true
+tensor.workspace = true
 # Tensors over retained and allocated device storage, the one dispatch point, collectives and
 # profiler ranges.
 backend.workspace = true

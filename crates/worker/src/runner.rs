@@ -69,7 +69,7 @@
 //!   the batch as ended, and lets the buffer pool reuse what it addressed, on its return.
 
 use ipc::batch::{Batch, BatchOutput, Phase};
-use uniserve_tensor::Tensor;
+use tensor::Tensor;
 
 use crate::Result;
 use crate::buckets::Bucket;

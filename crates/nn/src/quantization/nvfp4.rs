@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::fmt;
 
 use ops::fp4::ScaleLayout;
-use uniserve_tensor::{DType, Shape, Tensor};
+use tensor::{DType, Shape, Tensor};
 
 use crate::error::{Error, Result};
 use crate::weights::{

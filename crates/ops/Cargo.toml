@@ -13,7 +13,7 @@ publish = false
 serde = { workspace = true, features = ["derive"] }
 platform = { path = "../platform" }
 # The element type of an operand (`DType`); `ops::abi` states its number and spelling for packages.
-uniserve-tensor.workspace = true
+tensor.workspace = true
 # The operator names and phases the kernel library keys its generations by.
 proto.workspace = true
 thiserror.workspace = true

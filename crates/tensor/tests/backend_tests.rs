@@ -2,13 +2,13 @@
 //! on a backend device, which operands may meet, and how a backend reaches the storage under a
 //! tensor.
 
+#![cfg(test)]
+
 #[macro_use]
 mod common;
 
-use common::{host_device, HostStorage};
-use uniserve_tensor::{
-    CpuStorage, DType, Device, DeviceLocation, IndexOp, Result, Storage, Tensor,
-};
+use common::{HostStorage, host_device};
+use tensor::{CpuStorage, DType, Device, DeviceLocation, IndexOp, Result, Storage, Tensor};
 
 #[test]
 fn location_names_the_backend_kind_and_ordinal() {

@@ -29,7 +29,7 @@ pub mod vision;
 
 use ipc::batch::{CallOutput, CallStatus, ErrorCode};
 use platform::Stream;
-use uniserve_tensor::Tensor;
+use tensor::Tensor;
 
 pub use causal_lm::CausalLmRunner;
 pub use decoder::{DecoderConfig, DecoderRunner};
@@ -76,7 +76,7 @@ pub(crate) fn refused(message: String) -> CallOutput {
 /// # Errors
 ///
 /// [`crate::Error::Invalid`] for an element type with no whole-byte layout.
-pub(crate) fn element_bytes(dtype: uniserve_tensor::DType) -> Result<u64> {
+pub(crate) fn element_bytes(dtype: tensor::DType) -> Result<u64> {
     ops::abi::bytes(dtype).ok_or_else(|| {
         crate::Error::Invalid(format!(
             "{} has no whole-byte element",

@@ -18,7 +18,7 @@ use ops::{Generation, Kernel, KernelEntry};
 use platform::NativeLibrary;
 use storage::QueuePair;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run, Tier};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::peers::{Liveness, Remote, Upstream, accept, register};
 use super::watchdog::{CONTEXT_CHECK, Watchdog};

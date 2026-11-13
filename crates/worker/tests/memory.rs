@@ -21,7 +21,7 @@ use nn::{Checkpoint, DType, RetainedWeights, Shape, Tensor, WeightKey, WeightLoa
 use platform::DeviceId;
 use storage::{Claim, Client, Role, Scope};
 use storage_server::Server;
-use uniserve_tensor::DeviceLocation;
+use tensor::DeviceLocation;
 use worker::memory::cache::{CacheLayout, KvCacheConfig, KvCacheMemory, segments};
 use worker::memory::client::StorageClient;
 use worker::memory::reload::{MetaWeights, Reload, paired};

@@ -24,7 +24,7 @@
 //! over a sequence-parallel group, so the block exposes its two modulated stages beside the
 //! whole forward.
 
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use crate::error::{Error, Result};
 use crate::functional;

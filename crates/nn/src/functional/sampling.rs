@@ -46,7 +46,7 @@ use ops::sampler::{
     TopLogprobsArgs, TopLogprobsDescriptor, ban_words, top_k_workspace, top_logprobs_chunks,
 };
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE, TOP_K, TOP_P};
-use uniserve_tensor::{D, DType, Device, Tensor};
+use tensor::{D, DType, Device, Tensor};
 
 use super::nvfp4::integer;
 use super::{ACCUMULATE, PDL, as_rows, like_rows, on_cpu, row_tile};
@@ -1093,8 +1093,8 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
 
 #[cfg(test)]
 mod tests {
-    use uniserve_tensor::WithDType;
-    use uniserve_tensor::shape::ShapeWithOneHole;
+    use tensor::WithDType;
+    use tensor::shape::ShapeWithOneHole;
 
     use super::*;
 
@@ -1147,7 +1147,7 @@ mod tests {
     }
 
     /// A meta tensor of `shape` elements of `dtype`: an input of a profile run.
-    fn meta(shape: impl Into<uniserve_tensor::Shape>, dtype: DType) -> Tensor {
+    fn meta(shape: impl Into<tensor::Shape>, dtype: DType) -> Tensor {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static NEXT: AtomicU64 = AtomicU64::new(1 << 40);

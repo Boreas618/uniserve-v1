@@ -40,7 +40,7 @@ use platform::{DeviceId, Stream};
 use proto::config::{
     DEFAULT_BLOCK, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig, WorkerGroupRole,
 };
-use uniserve_tensor::DType;
+use tensor::DType;
 use worker::buckets::{Bucket, Buckets};
 use worker::graphs::Graphs;
 use worker::memory::buffers::BufferMemory;

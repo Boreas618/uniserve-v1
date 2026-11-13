@@ -261,17 +261,17 @@ fn every_key_is_covered(packages: &[PathBuf], keys: &Path) -> Result<(), String>
 /// descriptor value that carries an element type must come from.
 fn element_type_names() -> Vec<String> {
     [
-        uniserve_tensor::DType::U8,
-        uniserve_tensor::DType::U32,
-        uniserve_tensor::DType::I16,
-        uniserve_tensor::DType::I32,
-        uniserve_tensor::DType::I64,
-        uniserve_tensor::DType::F16,
-        uniserve_tensor::DType::BF16,
-        uniserve_tensor::DType::F32,
-        uniserve_tensor::DType::F64,
-        uniserve_tensor::DType::F8E4M3,
-        uniserve_tensor::DType::F4,
+        tensor::DType::U8,
+        tensor::DType::U32,
+        tensor::DType::I16,
+        tensor::DType::I32,
+        tensor::DType::I64,
+        tensor::DType::F16,
+        tensor::DType::BF16,
+        tensor::DType::F32,
+        tensor::DType::F64,
+        tensor::DType::F8E4M3,
+        tensor::DType::F4,
     ]
     .iter()
     .map(|dtype| ops::abi::name(*dtype).to_owned())

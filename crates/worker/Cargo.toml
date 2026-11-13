@@ -25,7 +25,7 @@ nvtx.workspace = true
 nn.workspace = true
 ops.workspace = true
 # Tensors: a runner's inputs and a forward's outputs.
-uniserve-tensor.workspace = true
+tensor.workspace = true
 proto.workspace = true
 rusqlite.workspace = true
 rustix = { workspace = true, features = ["fs", "pipe", "system"] }

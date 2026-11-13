@@ -5,7 +5,7 @@
 //! error to [`Error`].
 
 use ops::platform::PlatformError;
-use uniserve_tensor::{DType, DeviceLocation};
+use tensor::{DType, DeviceLocation};
 
 /// A failure of the device backend.
 #[derive(Debug, thiserror::Error)]
@@ -169,7 +169,7 @@ pub enum Error {
     Platform(#[from] PlatformError),
 }
 
-impl From<Error> for uniserve_tensor::Error {
+impl From<Error> for tensor::Error {
     /// The backend's failure as the tensor library carries it across its backend traits.
     fn from(error: Error) -> Self {
         Self::Backend(Box::new(error))

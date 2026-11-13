@@ -79,7 +79,7 @@ pub(crate) fn require_u32_vector(
     operator: &'static str,
     view: &crate::tensor::Operand,
 ) -> crate::Result<()> {
-    if view.dtype != uniserve_tensor::DType::U32 {
+    if view.dtype != tensor::DType::U32 {
         return Err(crate::Error::argument(
             operator,
             format!(
@@ -114,7 +114,7 @@ pub(crate) fn to_i64(operator: &'static str, value: u64) -> crate::Result<i64> {
 mod tests {
     use super::*;
     use crate::tensor::{DevicePtr, Operand, Shape};
-    use uniserve_tensor::DType;
+    use tensor::DType;
 
     /// A C++ entry's dtype numbers are the operator crate's, or the build says so here.
     ///

@@ -1,5 +1,7 @@
+#![cfg(test)]
+
 use anyhow::Result;
-use uniserve_tensor::{Device, IndexOp, Tensor};
+use tensor::{Device, IndexOp, Tensor};
 
 #[test]
 fn integer_index() -> Result<()> {

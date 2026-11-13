@@ -80,7 +80,9 @@ pub enum Error {
         op: &'static str,
     },
 
-    #[error("shape mismatch in cat for dim {dim}, shape for arg 1: {first_shape:?} shape for arg {n}: {nth_shape:?}")]
+    #[error(
+        "shape mismatch in cat for dim {dim}, shape for arg 1: {first_shape:?} shape for arg {n}: {nth_shape:?}"
+    )]
     ShapeMismatchCat {
         dim: usize,
         first_shape: Shape,
@@ -119,7 +121,9 @@ pub enum Error {
         msg: &'static str,
     },
 
-    #[error("conv1d invalid args {msg}: inp: {inp_shape:?}, k: {k_shape:?}, pad: {padding}, stride: {stride}")]
+    #[error(
+        "conv1d invalid args {msg}: inp: {inp_shape:?}, k: {k_shape:?}, pad: {padding}, stride: {stride}"
+    )]
     Conv1dInvalidArgs {
         inp_shape: Shape,
         k_shape: Shape,
@@ -166,13 +170,6 @@ pub enum Error {
     /// I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-
-    /// SafeTensor error.
-    #[error(transparent)]
-    SafeTensor(#[from] safetensors::SafeTensorError),
-
-    #[error("unsupported safetensor dtype {0:?}")]
-    UnsupportedSafeTensorDtype(safetensors::Dtype),
 
     /// Arbitrary errors wrapping.
     #[error("{0}")]

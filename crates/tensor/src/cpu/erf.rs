@@ -16,7 +16,7 @@ mod evaluate {
     /// # Remarks
     ///
     /// Returns 0 for a 0 length coefficient slice
-    pub fn polynomial(z: f64, coeff: &[f64]) -> f64 {
+    pub(super) fn polynomial(z: f64, coeff: &[f64]) -> f64 {
         match coeff {
             [] => 0.0,
             [.., sum] => coeff.iter().rev().skip(1).fold(*sum, |sum, c| c + z * sum),

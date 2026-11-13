@@ -45,7 +45,7 @@ use ops::moe::grouped::{
 use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
 use ops::residual::{SigmoidGatedAdd, SigmoidGatedAddArgs, SigmoidGatedAddDescriptor};
-use uniserve_tensor::{D, DType, Device, Tensor};
+use tensor::{D, DType, Device, Tensor};
 
 use super::activation::activate;
 use super::nvfp4::{decoded, encoded, integer, launch_quantize, remainder};

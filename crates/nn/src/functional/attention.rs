@@ -36,7 +36,7 @@ use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
 use ops::fp8::E4M3_MAX;
 use ops::kv::{self, KvWrite, KvWriteScaled};
 use proto::module::PhaseKind;
-use uniserve_tensor::{D, DType, Device, Shape, Tensor};
+use tensor::{D, DType, Device, Shape, Tensor};
 
 use super::nvfp4::{integer, remainder};
 use super::rotary::heads_of;

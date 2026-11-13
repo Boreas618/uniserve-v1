@@ -15,7 +15,7 @@ use platform::PitchedBatch;
 use proto::module::operator::{PCM_INTERLEAVE, RGB_BYTES};
 use storage::Key;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::{DecoderConfig, DecoderRunner, RoundConfig};
 use crate::Error;

@@ -36,7 +36,7 @@ use ops::vsa::{
     VsaPrepareTiles, VsaScores, VsaSelectTiles, VsaZeroPadding, ZeroPaddingArgs,
     ZeroPaddingDescriptor,
 };
-use uniserve_tensor::{D, DType, Device, Tensor};
+use tensor::{D, DType, Device, Tensor};
 
 use super::on_cpu;
 use crate::error::{Error, Result};

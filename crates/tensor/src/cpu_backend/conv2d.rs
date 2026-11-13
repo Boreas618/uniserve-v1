@@ -3,10 +3,10 @@ use std::borrow::Cow;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
-    conv::ParamsConv2D,
-    cpu_backend::{copy_strided_src_, Im2Col, Map1, Map2, MatMul},
-    shape::dims4,
     Layout, Result, WithDType,
+    conv::ParamsConv2D,
+    cpu_backend::{Im2Col, Map1, Map2, MatMul, copy_strided_src_},
+    shape::dims4,
 };
 
 pub(super) struct Conv2D<'a>(pub(super) &'a crate::conv::ParamsConv2D);
@@ -109,6 +109,9 @@ fn conv2d_1x1<T: WithDType + num_traits::Num + Copy + 'static>(
         // Copy result to output
         let out_offset = b_idx * p.c_out * spatial_size;
         for (i, r) in result.iter().enumerate() {
+            // SAFETY: `dst` holds `b_size * c_out * spatial_size` elements and `result` `c_out *
+            // spatial_size`, so the write is in bounds; the task of batch item `b_idx` alone writes
+            // these elements.
             unsafe {
                 let ptr = dst.as_ptr().add(out_offset + i) as *mut T;
                 *ptr = *r;
@@ -349,6 +352,10 @@ fn conv2d_direct<T: WithDType + num_traits::Num + Copy + 'static>(
                             let inp_idx_2 = (inp_idx_1 + p.c_in).min(inp_cont_len);
                             let inp_cont = &inp_cont[inp_idx_1..inp_idx_2];
                             let mut d = T::zero();
+                            // SAFETY: `inp_cont` and `k_cont` hold `c_in` elements each, a pixel's
+                            // channels and a kernel tap's, and `dst_idx` is an element of `dst`;
+                            // the tasks run over `dst_c_idx`, and each writes the outputs of its
+                            // own channel only.
                             unsafe {
                                 T::vec_dot(inp_cont.as_ptr(), k_cont.as_ptr(), &mut d, p.c_in);
                                 let ptr = dst.as_ptr().add(dst_idx) as *mut T;
@@ -367,6 +374,8 @@ fn conv2d_direct<T: WithDType + num_traits::Num + Copy + 'static>(
 #[allow(clippy::uninit_vec)]
 fn alloc_uninit_vec<T: WithDType + Copy + 'static>(size: usize) -> Vec<T> {
     let mut v = Vec::with_capacity(size);
+    // SAFETY: the capacity is `size` elements of `T`, a plain numeric type for which any bits are a
+    // value; every caller writes each element before it reads one.
     unsafe { v.set_len(size) };
     v
 }

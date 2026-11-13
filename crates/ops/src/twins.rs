@@ -19,7 +19,7 @@
 //! there. A region that is too small therefore cannot turn into a comparison of a buffer against
 //! itself.
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::abi;
 use crate::platform::{Allocator, Buffer, PoolKind, Stream};

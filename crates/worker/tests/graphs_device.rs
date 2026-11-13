@@ -24,7 +24,7 @@ use nn::{CausalLm, ExpertExchange, KvCache, PhaseKind, RecurrentState, TokenBatc
 use ops::Generation;
 use platform::{Budget, DeviceAllocation, DeviceId, DeviceRange, PoolKind, Stream};
 use storage::runtime::GroupId;
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 use worker::buckets::Bucket;
 use worker::graphs::Preparation;
 use worker::memory::tables::BlockTables;

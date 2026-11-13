@@ -42,7 +42,7 @@
 use std::ops::Range;
 
 use ops::moe::routing::{MAX_EXPERTS, MAX_TOP};
-use uniserve_tensor::{DType, Device, Shape, Tensor};
+use tensor::{DType, Device, Shape, Tensor};
 
 use crate::capability::ExpertExchange;
 use crate::collective::{self, Split};

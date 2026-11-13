@@ -21,7 +21,7 @@
 use std::fmt;
 use std::mem::{offset_of, size_of};
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;

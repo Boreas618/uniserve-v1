@@ -38,7 +38,7 @@
 //! [q_h | g_h] = q_proj(x)_h;   o_h = attention(q, k, v)_h · sigmoid(g_h);   out = o_proj(o)
 //! ```
 
-use uniserve_tensor::Tensor;
+use tensor::Tensor;
 
 use crate::capability::{KvCache, TokenBatch};
 use crate::error::{Error, Result};

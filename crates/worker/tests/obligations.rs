@@ -70,7 +70,7 @@ use ipc::batch::{Batch, BatchId, BatchOutput, Columns, Phase, Shape, Variant};
 use ops::Generation;
 use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Run, Stamps, Tier};
 use storage::{Key, QueuePair};
-use uniserve_tensor::Tensor;
+use tensor::Tensor;
 use worker::buckets::Bucket;
 use worker::completion::{Outcome, Submission};
 use worker::executor::peers::{Liveness, Remote, Upstream, accept, register};

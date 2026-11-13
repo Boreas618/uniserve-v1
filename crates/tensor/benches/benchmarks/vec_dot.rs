@@ -1,6 +1,6 @@
-use criterion::{criterion_group, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group};
 use half::{bf16, f16};
-use uniserve_tensor::cpu::kernels::VecOps;
+use tensor::cpu::kernels::VecOps;
 
 fn bench_vec_dot_f32(c: &mut Criterion, k: usize) {
     let a: Vec<f32> = (0..k).map(|i| i as f32).collect();
@@ -12,6 +12,7 @@ fn bench_vec_dot_f32(c: &mut Criterion, k: usize) {
     group.bench_function("iter", |bench| {
         bench.iter_batched(
             || (),
+            // SAFETY: `a`, `b` and `out` hold `k` elements each.
             |_| unsafe {
                 f32::vec_dot(
                     std::hint::black_box(a.as_ptr()),
@@ -35,6 +36,7 @@ fn bench_vec_dot_f16(c: &mut Criterion, k: usize) {
     group.bench_function("iter", |bench| {
         bench.iter_batched(
             || f16::ZERO,
+            // SAFETY: `a` and `b` hold `k` elements each, and `out` is one element.
             |mut out| unsafe {
                 f16::vec_dot(a.as_ptr(), b.as_ptr(), &mut out, k);
                 out
@@ -54,6 +56,7 @@ fn bench_vec_dot_bf16(c: &mut Criterion, k: usize) {
     group.bench_function("iter", |bench| {
         bench.iter_batched(
             || bf16::ZERO,
+            // SAFETY: `a` and `b` hold `k` elements each, and `out` is one element.
             |mut out| unsafe {
                 bf16::vec_dot(a.as_ptr(), b.as_ptr(), &mut out, k);
                 out

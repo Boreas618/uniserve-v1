@@ -1,9 +1,9 @@
 use crate::benchmarks::{bench_name, uniform};
-use criterion::{criterion_group, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group};
 use half::{bf16, f16};
 use std::hint::black_box;
 use std::time::Instant;
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 fn run_sum(a: &Tensor) {
     a.sum_keepdim(2).unwrap();
@@ -32,7 +32,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     run_arg_reduce(c, &device, (bf16::from_f32(lo), bf16::from_f32(up)), true);
 }
 
-fn run_reduce<T: uniserve_tensor::FloatDType>(
+fn run_reduce<T: tensor::FloatDType>(
     c: &mut Criterion,
     device: &Device,
     (lo, up): (T, T),
@@ -91,7 +91,7 @@ fn run_reduce<T: uniserve_tensor::FloatDType>(
     group.finish();
 }
 
-fn run_arg_reduce<T: uniserve_tensor::FloatDType>(
+fn run_arg_reduce<T: tensor::FloatDType>(
     c: &mut Criterion,
     device: &Device,
     (lo, up): (T, T),

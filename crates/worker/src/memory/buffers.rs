@@ -110,7 +110,7 @@ use std::time::{Duration, Instant};
 
 use platform::{Allocator, Buffer, DeviceId, Event, EventFlags, PoolKind, Stream};
 use storage::runtime::{RequestId, Run};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use crate::memory::allocation::Storage;
 use crate::memory::client::StorageClient;

@@ -1,7 +1,9 @@
+#![cfg(test)]
+
 #[macro_use]
 mod common;
 
-use uniserve_tensor::{DType, Device, IndexOp, Result, Tensor};
+use tensor::{DType, Device, IndexOp, Result, Tensor};
 
 fn matmul(device: &Device) -> Result<()> {
     let data = vec![1.0f32, 2.0, 3.0, 4.0];
@@ -226,7 +228,7 @@ fn tensor_dot() -> Result<()> {
     let rhs = Tensor::new(&[4., 5., 6.], &Device::Cpu)?;
     let expected = Tensor::new(32., &Device::Cpu)?;
     let dot_ret = lhs.dot(&rhs)?;
-    uniserve_tensor::test_utils::assert_tensor_eq(&dot_ret, &expected)?;
+    common::assert_tensor_eq(&dot_ret, &expected)?;
     Ok(())
 }
 
@@ -236,7 +238,7 @@ fn tensor_mv() -> Result<()> {
     let vec = Tensor::new(&[1., 1., 1.], &Device::Cpu)?;
     let expected = Tensor::new(&[6., 15.], &Device::Cpu)?;
     let mv_ret = mat.mv(&vec)?;
-    uniserve_tensor::test_utils::assert_tensor_eq(&mv_ret, &expected)?;
+    common::assert_tensor_eq(&mv_ret, &expected)?;
     Ok(())
 }
 

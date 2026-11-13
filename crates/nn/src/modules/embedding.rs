@@ -4,7 +4,7 @@
 //! embeds to zeros here, every rank contributes its own rows, and the module all-reduces the
 //! result when the table is sharded: the sum over the ranks is the token's embedding.
 
-use uniserve_tensor::{Module, Tensor};
+use tensor::{Module, Tensor};
 
 use crate::collective::{self, Split};
 use crate::error::{Error, Result};
@@ -99,7 +99,7 @@ impl Embedding {
 }
 
 impl Module for Embedding {
-    fn forward(&self, ids: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, ids: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, ids)?)
     }
 }

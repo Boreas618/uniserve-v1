@@ -5,7 +5,7 @@
 //! all-gather the shards, and the padding the shards hold is removed. Selecting the rows is the
 //! caller's (a row gather before the head), so the head reads `[rows, hidden]`.
 
-use uniserve_tensor::{Module, Tensor};
+use tensor::{Module, Tensor};
 
 use crate::collective::{self, Split};
 use crate::error::{Error, Result};
@@ -116,7 +116,7 @@ impl LmHead {
 }
 
 impl Module for LmHead {
-    fn forward(&self, hidden: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, hidden: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, hidden)?)
     }
 }

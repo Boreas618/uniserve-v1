@@ -37,9 +37,13 @@ pub trait VecOps: num_traits::NumAssign + Copy {
     /// element.
     #[inline(always)]
     unsafe fn vec_dot(lhs: *const Self, rhs: *const Self, res: *mut Self, len: usize) {
-        *res = Self::zero();
-        for i in 0..len {
-            *res += *lhs.add(i) * *rhs.add(i)
+        // SAFETY: the caller passes `lhs` and `rhs` valid for `len` reads and `res` valid for one
+        // write, as this method requires.
+        unsafe {
+            *res = Self::zero();
+            for i in 0..len {
+                *res += *lhs.add(i) * *rhs.add(i)
+            }
         }
     }
 
@@ -51,9 +55,13 @@ pub trait VecOps: num_traits::NumAssign + Copy {
     /// element.
     #[inline(always)]
     unsafe fn vec_reduce_sum(xs: *const Self, res: *mut Self, len: usize) {
-        *res = Self::zero();
-        for i in 0..len {
-            *res += *xs.add(i)
+        // SAFETY: the caller passes `xs` valid for `len` reads and `res` valid for one write, as
+        // this method requires.
+        unsafe {
+            *res = Self::zero();
+            for i in 0..len {
+                *res += *xs.add(i)
+            }
         }
     }
 
@@ -65,9 +73,13 @@ pub trait VecOps: num_traits::NumAssign + Copy {
     /// element.
     #[inline(always)]
     unsafe fn vec_reduce_max(xs: *const Self, res: *mut Self, len: usize) {
-        *res = *xs;
-        for i in 1..len {
-            *res = (*res).max(*xs.add(i))
+        // SAFETY: the caller passes `xs` valid for `len` reads, `len` positive, and `res` valid for
+        // one write, as this method requires.
+        unsafe {
+            *res = *xs;
+            for i in 1..len {
+                *res = (*res).max(*xs.add(i))
+            }
         }
     }
 
@@ -79,9 +91,13 @@ pub trait VecOps: num_traits::NumAssign + Copy {
     /// element.
     #[inline(always)]
     unsafe fn vec_reduce_min(xs: *const Self, res: *mut Self, len: usize) {
-        *res = *xs;
-        for i in 1..len {
-            *res = (*res).min(*xs.add(i))
+        // SAFETY: the caller passes `xs` valid for `len` reads, `len` positive, and `res` valid for
+        // one write, as this method requires.
+        unsafe {
+            *res = *xs;
+            for i in 1..len {
+                *res = (*res).min(*xs.add(i))
+            }
         }
     }
 }
@@ -99,12 +115,16 @@ impl VecOps for f32 {
 
     #[inline(always)]
     unsafe fn vec_dot(lhs: *const Self, rhs: *const Self, res: *mut Self, len: usize) {
-        super::vec_dot_f32(lhs, rhs, res, len)
+        // SAFETY: the caller passes `lhs` and `rhs` valid for `len` reads and `res` valid for one
+        // write, as this method requires.
+        unsafe { super::vec_dot_f32(lhs, rhs, res, len) }
     }
 
     #[inline(always)]
     unsafe fn vec_reduce_sum(xs: *const Self, res: *mut Self, len: usize) {
-        super::vec_sum(xs, res, len)
+        // SAFETY: the caller passes `xs` valid for `len` reads and `res` valid for one write, as
+        // this method requires.
+        unsafe { super::vec_sum(xs, res, len) }
     }
 }
 
@@ -120,19 +140,27 @@ impl VecOps for half::f16 {
     }
 
     fn vec_add(lhs: &[Self], rhs: &[Self], res: &mut [Self]) {
+        // SAFETY: `rhs` and `res` hold `lhs.len()` elements: the element-wise kernels of
+        // `binary_map_vec`, the callers, pass three slices of one length.
         unsafe { super::vec_add_f16(lhs.as_ptr(), rhs.as_ptr(), res.as_mut_ptr(), lhs.len()) }
     }
 
     #[inline(always)]
     fn scalar_add(scalar: Self, xs: &[Self], ys: &mut [Self]) {
+        // SAFETY: `ys` holds `xs.len()` elements: the element-wise kernels of `binary_map_vec`,
+        // the callers, pass two slices of one length.
         unsafe { super::vec_scalar_add_f16(scalar, xs.as_ptr(), ys.as_mut_ptr(), xs.len()) }
     }
 
     #[inline(always)]
     unsafe fn vec_dot(lhs: *const Self, rhs: *const Self, res: *mut Self, len: usize) {
-        let mut res_f32 = 0f32;
-        super::vec_dot_f16(lhs, rhs, &mut res_f32, len);
-        *res = half::f16::from_f32(res_f32);
+        // SAFETY: the caller passes `lhs` and `rhs` valid for `len` reads and `res` valid for one
+        // write, as this method requires.
+        unsafe {
+            let mut res_f32 = 0f32;
+            super::vec_dot_f16(lhs, rhs, &mut res_f32, len);
+            *res = half::f16::from_f32(res_f32);
+        }
     }
 }
 
@@ -161,23 +189,33 @@ impl VecOps for half::bf16 {
 
     #[inline(always)]
     fn vec_add(lhs: &[Self], rhs: &[Self], res: &mut [Self]) {
+        // SAFETY: `rhs` and `res` hold `lhs.len()` elements: the element-wise kernels of
+        // `binary_map_vec`, the callers, pass three slices of one length.
         unsafe { super::vec_add_bf16(lhs.as_ptr(), rhs.as_ptr(), res.as_mut_ptr(), lhs.len()) }
     }
 
     fn vec_mul(lhs: &[Self], rhs: &[Self], res: &mut [Self]) {
+        // SAFETY: `rhs` and `res` hold `lhs.len()` elements: the element-wise kernels of
+        // `binary_map_vec`, the callers, pass three slices of one length.
         unsafe { super::vec_mul_bf16(lhs.as_ptr(), rhs.as_ptr(), res.as_mut_ptr(), lhs.len()) }
     }
 
     #[inline(always)]
     fn scalar_add(scalar: Self, xs: &[Self], ys: &mut [Self]) {
+        // SAFETY: `ys` holds `xs.len()` elements: the element-wise kernels of `binary_map_vec`,
+        // the callers, pass two slices of one length.
         unsafe { super::vec_scalar_add_bf16(scalar, xs.as_ptr(), ys.as_mut_ptr(), xs.len()) }
     }
 
     #[inline(always)]
     unsafe fn vec_dot(lhs: *const Self, rhs: *const Self, res: *mut Self, len: usize) {
-        let mut res_f32 = 0f32;
-        super::vec_dot_bf16(lhs, rhs, &mut res_f32, len);
-        *res = half::bf16::from_f32(res_f32);
+        // SAFETY: the caller passes `lhs` and `rhs` valid for `len` reads and `res` valid for one
+        // write, as this method requires.
+        unsafe {
+            let mut res_f32 = 0f32;
+            super::vec_dot_bf16(lhs, rhs, &mut res_f32, len);
+            *res = half::bf16::from_f32(res_f32);
+        }
     }
 }
 impl VecOps for u8 {

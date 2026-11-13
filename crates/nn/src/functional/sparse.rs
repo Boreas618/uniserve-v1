@@ -16,7 +16,7 @@
 //! selection of the same shape.
 
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use super::on_cpu;
 use crate::error::{Error, Result};

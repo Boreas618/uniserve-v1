@@ -39,7 +39,7 @@ use memmap2::Mmap;
 use safetensors::Dtype as FormatDtype;
 use safetensors::SafeTensors;
 use safetensors::tensor::Metadata;
-use uniserve_tensor::{DType, Shape};
+use tensor::{DType, Shape};
 
 use crate::adapter::{Adapter, Fusion};
 use crate::error::{Error, Result};

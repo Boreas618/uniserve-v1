@@ -24,7 +24,7 @@
 //! The numbers never move: a stored module was compiled against them. An element type added to
 //! the ABI takes the next number.
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::{Error, Result};
 

@@ -27,7 +27,7 @@
 //! The extent of slot 0 does not travel: only an outermost axis can sit there, and a row-major
 //! index needs no modulus on its outermost axis.
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::kernel::Arguments;
 use crate::platform::Stream;

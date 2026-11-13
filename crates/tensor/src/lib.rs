@@ -2,8 +2,8 @@
 //! the operations on them.
 //!
 //! ```rust
-//! use uniserve_tensor::{Tensor, DType, Device};
-//! # use uniserve_tensor::Error;
+//! use tensor::{Tensor, DType, Device};
+//! # use tensor::Error;
 //! # fn main() -> Result<(), Error>{
 //!
 //! let a = Tensor::arange(0f32, 6f32, &Device::Cpu)?.reshape((2, 3))?;
@@ -25,14 +25,10 @@
 //! The operands of one operation are on the same device, and [`Tensor::to_device`] moves a
 //! tensor between the CPU and a backend device.
 //!
-//! ## Custom operators
+//! ## Storage access
 //!
-//! An operator that is not a composition of tensor operations implements [`CustomOp1`],
-//! [`CustomOp2`] or [`CustomOp3`] (or their in-place counterparts) with one forward for CPU
-//! storage and one for backend storage, and is applied with [`Tensor::apply_op1`] and its
-//! siblings. [`Tensor::from_storage`], [`Tensor::storage_and_layout`] and
-//! [`Tensor::storage_mut_and_layout`] give a backend and such operators access to the storage
-//! under a tensor.
+//! [`Tensor::from_storage`], [`Tensor::storage_and_layout`] and
+//! [`Tensor::storage_mut_and_layout`] give a backend access to the storage under a tensor.
 //!
 //! ## Origin
 //!
@@ -44,7 +40,6 @@ pub mod conv;
 mod convert;
 pub mod cpu;
 pub mod cpu_backend;
-mod custom_op;
 mod device;
 pub mod display;
 mod dtype;
@@ -54,7 +49,6 @@ mod indexer;
 pub mod layout;
 pub mod nditer;
 pub mod op;
-pub mod safetensors;
 pub mod scalar;
 pub mod shape;
 mod sort;
@@ -62,14 +56,9 @@ mod storage;
 mod strided_index;
 mod tensor;
 mod tensor_cat;
-pub mod test_utils;
 pub mod utils;
 
 pub use cpu_backend::{CpuStorage, CpuStorageRef};
-pub use custom_op::{
-    AccessPattern, CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3, InplaceOpN,
-    Src,
-};
 pub use device::{Device, DeviceLocation, NdArray};
 pub use dtype::{DType, DTypeParseError, FloatDType, IntDType, WithDType};
 pub use dummy_dtype::{F4, F6E2M3, F6E3M2, F8E8M0};
@@ -77,7 +66,7 @@ pub use error::{Context, Error, Result};
 pub use indexer::{IndexOp, TensorIndexer};
 pub use layout::{Layout, LayoutRelation};
 pub use nditer::NdIter;
-pub use shape::{Shape, D};
+pub use shape::{D, Shape};
 pub use storage::{Storage, StorageMutRef, StorageRef};
 pub use strided_index::{StridedBlocks, StridedIndex};
 pub use tensor::{Tensor, TensorId};

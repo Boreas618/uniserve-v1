@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use nn::KvPlanes;
 use platform::{CopyBatch, DeviceId, SourceOrder, Stream, memset_2d_d8, memset_2d_d32};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::layout::{CacheLayout, GroupLayout};
 use super::segments::{self, PlaneSegment};

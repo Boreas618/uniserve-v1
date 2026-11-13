@@ -82,7 +82,7 @@ pub(crate) fn workspace() -> PathBuf {
 /// limits the deployment pins to what those buckets serve.
 pub(crate) fn launch() -> EngineArgs {
     let checkpoint = workspace()
-        .join("crates/models/qwen3/tests/data/qwen3_moe/model")
+        .join("crates/models/tests/it/qwen3/data/qwen3_moe/model")
         .to_string_lossy()
         .into_owned();
     let group = WorkerGroupConfig::placed(

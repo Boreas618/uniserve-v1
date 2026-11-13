@@ -1,7 +1,9 @@
+#![cfg(test)]
+
 #[macro_use]
 mod common;
 
-use uniserve_tensor::{test_utils, Device, IndexOp, Result, Tensor};
+use tensor::{Device, IndexOp, Result, Tensor};
 
 // https://github.com/huggingface/candle/issues/364
 fn avg_pool2d(dev: &Device) -> Result<()> {
@@ -58,22 +60,19 @@ fn avg_pool2d_pytorch(dev: &Device) -> Result<()> {
     .reshape((1, 2, 4, 4))?;
     let pool = t.avg_pool2d(2)?.squeeze(0)?;
     assert_eq!(
-        test_utils::to_vec3_round(&pool, 4)?,
+        common::to_vec3_round(&pool, 4)?,
         [
             [[-1.1926, -0.0395], [0.2688, 0.1871]],
             [[0.1835, -0.1606], [0.6249, 0.3217]]
         ]
     );
     let pool = t.avg_pool2d(3)?.squeeze(0)?;
-    assert_eq!(
-        test_utils::to_vec3_round(&pool, 4)?,
-        [[[0.085]], [[0.0078]]]
-    );
+    assert_eq!(common::to_vec3_round(&pool, 4)?, [[[0.085]], [[0.0078]]]);
 
     let t = t.reshape((1, 1, 4, 8))?;
     let pool = t.avg_pool2d(2)?.squeeze(0)?.squeeze(0)?;
     assert_eq!(
-        test_utils::to_vec2_round(&pool, 4)?,
+        common::to_vec2_round(&pool, 4)?,
         [
             [0.7745, 0.0276, -1.6983, 0.12],
             [0.3542, 0.1625, 0.4542, -0.0014]

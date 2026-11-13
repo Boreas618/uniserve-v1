@@ -1,8 +1,10 @@
+#![cfg(test)]
+
 #[macro_use]
 mod common;
 
 use float8::F8E4M3;
-use uniserve_tensor::{test_utils, DType, Device, IndexOp, Result, Tensor, D};
+use tensor::{D, DType, Device, IndexOp, Result, Tensor};
 
 fn zeros(device: &Device) -> Result<()> {
     let tensor = Tensor::zeros((5, 2), DType::F32, device)?;
@@ -250,7 +252,7 @@ fn unary_op(device: &Device) -> Result<()> {
     let data = &[[-3f32, 1., 4., -0.1, 0.5], [2.7, -1.8, -0.28, 1.8, 2.8]];
     let tensor = Tensor::new(data, device)?;
     assert_eq!(
-        test_utils::to_vec2_round(&tensor.gelu()?, 4)?,
+        common::to_vec2_round(&tensor.gelu()?, 4)?,
         [
             [-0.0036, 0.8412, 3.9999, -0.046, 0.3457],
             [2.6911, -0.0647, -0.1091, 1.7353, 2.7933]
@@ -260,45 +262,45 @@ fn unary_op(device: &Device) -> Result<()> {
     let max_diff = (tensor.gelu()? - t_f16)?.flatten_all()?.max(0)?;
     assert!(max_diff.to_vec0::<f32>()? < 5e-3);
     assert_eq!(
-        test_utils::to_vec2_round(&tensor.gelu_erf()?, 4)?,
+        common::to_vec2_round(&tensor.gelu_erf()?, 4)?,
         [
             [-0.004, 0.8413, 3.9999, -0.046, 0.3457],
             [2.6906, -0.0647, -0.1091, 1.7353, 2.7928]
         ]
     );
     assert_eq!(
-        test_utils::to_vec2_round(&tensor.erf()?, 4)?,
+        common::to_vec2_round(&tensor.erf()?, 4)?,
         [
             [-1.0, 0.8427, 1.0, -0.1125, 0.5205],
             [0.9999, -0.9891, -0.3079, 0.9891, 0.9999]
         ]
     );
     assert_eq!(
-        test_utils::to_vec2_round(&tensor.silu()?, 4)?,
+        common::to_vec2_round(&tensor.silu()?, 4)?,
         [
             [-0.1423, 0.7311, 3.9281, -0.0475, 0.3112],
             [2.53, -0.2553, -0.1205, 1.5447, 2.6395]
         ]
     );
     assert_eq!(
-        test_utils::to_vec2_round(&tensor.ceil()?, 4)?,
+        common::to_vec2_round(&tensor.ceil()?, 4)?,
         [[-3.0, 1.0, 4.0, -0.0, 1.0], [3.0, -1.0, -0.0, 2.0, 3.0]]
     );
     assert_eq!(
-        test_utils::to_vec2_round(&tensor.floor()?, 4)?,
+        common::to_vec2_round(&tensor.floor()?, 4)?,
         [[-3.0, 1.0, 4.0, -1.0, 0.0], [2.0, -2.0, -1.0, 1.0, 2.0]]
     );
     assert_eq!(
-        test_utils::to_vec2_round(&tensor.round()?, 4)?,
+        common::to_vec2_round(&tensor.round()?, 4)?,
         [[-3.0, 1.0, 4.0, -0.0, 1.0], [3.0, -2.0, -0.0, 2.0, 3.0]]
     );
     let tensor = Tensor::new(&[2997.9246, 314.15926f32], device)?;
     assert_eq!(
-        test_utils::to_vec1_round(&tensor.round_to(2)?, 4)?,
+        common::to_vec1_round(&tensor.round_to(2)?, 4)?,
         [2997.92, 314.16]
     );
     assert_eq!(
-        test_utils::to_vec1_round(&tensor.round_to(-2)?, 4)?,
+        common::to_vec1_round(&tensor.round_to(-2)?, 4)?,
         [3000.0, 300.]
     );
     let tensor = Tensor::new(
@@ -312,13 +314,13 @@ fn unary_op(device: &Device) -> Result<()> {
     let tensor = Tensor::new(&[-1.0f32, 0., -2., 3.], device)?;
     let y = tensor.elu(2.)?;
     assert_eq!(
-        test_utils::to_vec1_round(&y, 4)?,
+        common::to_vec1_round(&y, 4)?,
         [-1.2642, 0.0000, -1.7293, 3.0000]
     );
     // The same on a strided input.
     let y = tensor.reshape((2, 2))?.t()?.elu(2.)?.flatten_all()?;
     assert_eq!(
-        test_utils::to_vec1_round(&y, 4)?,
+        common::to_vec1_round(&y, 4)?,
         [-1.2642, -1.7293, 0.0000, 3.0000]
     );
     Ok(())
@@ -480,7 +482,7 @@ fn var(device: &Device) -> Result<()> {
     ];
     let tensor = Tensor::new(data, device)?;
     assert_eq!(
-        test_utils::to_vec2_round(&tensor.var_keepdim(1)?, 4)?,
+        common::to_vec2_round(&tensor.var_keepdim(1)?, 4)?,
         &[[1.0631], [0.559], [1.4893], [0.8258]]
     );
     Ok(())
@@ -1823,7 +1825,7 @@ fn sigmoid(device: &Device) -> Result<()> {
     let data = [-3f32, 0., 1., 4.];
     let tensor = Tensor::new(&data, device)?;
     assert_eq!(
-        test_utils::to_vec1_round(&tensor.sigmoid()?, 4)?,
+        common::to_vec1_round(&tensor.sigmoid()?, 4)?,
         [0.0474, 0.5, 0.7311, 0.982]
     );
 
@@ -1844,7 +1846,7 @@ fn sigmoid(device: &Device) -> Result<()> {
     // The same on a strided input.
     let strided = tensor.reshape((2, 2))?.t()?.sigmoid()?.flatten_all()?;
     assert_eq!(
-        test_utils::to_vec1_round(&strided, 4)?,
+        common::to_vec1_round(&strided, 4)?,
         [0.0474, 0.7311, 0.5, 0.982]
     );
 
@@ -2043,7 +2045,7 @@ fn pad_with_same() -> Result<()> {
 #[test]
 fn a_shape_hashes_by_its_dimensions() {
     use std::collections::HashSet;
-    use uniserve_tensor::Shape;
+    use tensor::Shape;
 
     let shapes: HashSet<Shape> = [
         Shape::from((2, 3)),
@@ -2177,7 +2179,7 @@ fn pow() -> Result<()> {
     let rhs = (&lhs - 2.)?;
     let res = lhs.pow(&rhs)?;
     assert_eq!(
-        test_utils::to_vec2_round(&res, 3)?,
+        common::to_vec2_round(&res, 3)?,
         [[1.0, 1.0, 3.0], [16.0, 125.0, 1296.0]]
     );
     Ok(())
@@ -2190,7 +2192,7 @@ fn test_flip_1d() -> Result<()> {
     let flipped = t.flip(&[0])?;
     // Expected: [4, 3, 2, 1, 0]
     let expected = Tensor::from_vec(vec![4.0, 3.0, 2.0, 1.0, 0.0], (5,), &Device::Cpu)?;
-    uniserve_tensor::test_utils::assert_tensor_eq(&flipped, &expected)?;
+    common::assert_tensor_eq(&flipped, &expected)?;
     Ok(())
 }
 
@@ -2205,7 +2207,7 @@ fn test_flip_2d() -> Result<()> {
     // [[5, 4, 3],
     //  [2, 1, 0]]
     let expected = Tensor::from_vec(vec![5.0, 4.0, 3.0, 2.0, 1.0, 0.0], (2, 3), &Device::Cpu)?;
-    uniserve_tensor::test_utils::assert_tensor_eq(&flipped, &expected)?;
+    common::assert_tensor_eq(&flipped, &expected)?;
     Ok(())
 }
 
@@ -2230,7 +2232,7 @@ fn test_flip_3d_channels() -> Result<()> {
         (2, 2, 3),
         &Device::Cpu,
     )?;
-    uniserve_tensor::test_utils::assert_tensor_eq(&flipped, &expected)?;
+    common::assert_tensor_eq(&flipped, &expected)?;
     Ok(())
 }
 

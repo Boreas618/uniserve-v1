@@ -244,8 +244,8 @@ name = "backend"
 version = "2.0.0"
 dependencies = [
  "ops",
+ "tensor",
  "thiserror 2.0.18",
- "uniserve-tensor",
 ]
 
 [[package]]
@@ -357,10 +357,10 @@ dependencies = [
  "service",
  "sha2",
  "tempfile",
+ "tensor",
  "thiserror 2.0.18",
  "toml",
  "tracing",
- "uniserve-tensor",
 ]
 
 [[package]]
@@ -1226,14 +1226,12 @@ dependencies = [
  "libc",
  "media",
  "mimalloc",
- "minimax-h3",
+ "models",
  "nn",
  "ops",
  "platform",
  "processing",
  "proto",
- "qwen3",
- "qwen4-exp",
  "scheduling",
  "scheduling-guest",
  "serde_json",
@@ -1241,10 +1239,10 @@ dependencies = [
  "storage",
  "storage-server",
  "tempfile",
+ "tensor",
  "tokio",
  "toml",
  "tracing",
- "uniserve-tensor",
  "wasmtime",
  "worker",
 ]
@@ -2606,7 +2604,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
 dependencies = [
  "libc",
- "stable_deref_trait",
 ]
 
 [[package]]
@@ -2681,21 +2678,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "minimax-h3"
-version = "2.0.0"
-dependencies = [
- "backend",
- "nn",
- "processing",
- "qwen3",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "uniserve-tensor",
-]
-
-[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2714,6 +2696,20 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "models"
+version = "2.0.0"
+dependencies = [
+ "backend",
+ "nn",
+ "processing",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tensor",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2819,8 +2815,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tensor",
  "thiserror 2.0.18",
- "uniserve-tensor",
 ]
 
 [[package]]
@@ -2984,8 +2980,8 @@ dependencies = [
  "platform",
  "proto",
  "serde",
+ "tensor",
  "thiserror 2.0.18",
- "uniserve-tensor",
 ]
 
 [[package]]
@@ -3511,31 +3507,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
-]
-
-[[package]]
-name = "qwen3"
-version = "2.0.0"
-dependencies = [
- "backend",
- "nn",
- "processing",
- "serde_json",
- "thiserror 2.0.18",
- "uniserve-tensor",
-]
-
-[[package]]
-name = "qwen4-exp"
-version = "2.0.0"
-dependencies = [
- "backend",
- "nn",
- "processing",
- "qwen3",
- "serde_json",
- "thiserror 2.0.18",
- "uniserve-tensor",
 ]
 
 [[package]]
@@ -4460,6 +4431,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tensor"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "criterion",
+ "float8",
+ "gemm",
+ "half",
+ "libc",
+ "libm",
+ "num-traits",
+ "num_cpus",
+ "parking_lot",
+ "rayon",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4975,26 +4965,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "uniserve-tensor"
-version = "0.1.0"
-dependencies = [
- "byteorder",
- "float8",
- "gemm",
- "half",
- "libc",
- "libm",
- "memmap2",
- "num-traits",
- "num_cpus",
- "parking_lot",
- "rayon",
- "safetensors",
- "thiserror 2.0.18",
- "yoke",
 ]
 
 [[package]]
@@ -5991,10 +5961,10 @@ dependencies = [
  "storage",
  "storage-server",
  "tempfile",
+ "tensor",
  "thiserror 2.0.18",
  "time",
  "tracing",
- "uniserve-tensor",
 ]
 
 [[package]]

@@ -81,7 +81,7 @@ use nn::capability::MediaFormat;
 use ops::Generation;
 use platform::Stream;
 use storage::runtime::Run;
-use uniserve_tensor::Tensor;
+use tensor::Tensor;
 
 use crate::buckets::{Bucket, Buckets};
 use crate::completion::{Outcome, Waker};

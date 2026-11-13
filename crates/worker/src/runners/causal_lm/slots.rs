@@ -59,7 +59,7 @@ use std::sync::Arc;
 use ipc::batch::{Columns, NewSlot, StateCopy, StateDirection};
 use ops::sampler::ban_words;
 use platform::{PinnedBuffer, Stream};
-use uniserve_tensor::{DType, Shape, Tensor};
+use tensor::{DType, Shape, Tensor};
 
 use super::columns::slot_row;
 use crate::memory::allocation::Storage;

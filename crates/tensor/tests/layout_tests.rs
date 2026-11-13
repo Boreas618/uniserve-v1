@@ -1,7 +1,9 @@
+#![cfg(test)]
+
 #[macro_use]
 mod common;
 
-use uniserve_tensor::{Device, IndexOp, Result, Tensor};
+use tensor::{Device, IndexOp, Result, Tensor};
 
 fn contiguous(device: &Device) -> Result<()> {
     let tensor = Tensor::arange(0u32, 24u32, device)?.reshape((2, 3, 4))?;
@@ -29,7 +31,9 @@ fn contiguous(device: &Device) -> Result<()> {
     );
     assert_eq!(
         tensor.transpose(0, 1)?.flatten_all()?.to_vec1::<u32>()?,
-        &[0, 1, 2, 3, 12, 13, 14, 15, 4, 5, 6, 7, 16, 17, 18, 19, 8, 9, 10, 11, 20, 21, 22, 23]
+        &[
+            0, 1, 2, 3, 12, 13, 14, 15, 4, 5, 6, 7, 16, 17, 18, 19, 8, 9, 10, 11, 20, 21, 22, 23
+        ]
     );
     assert_eq!(
         tensor
@@ -55,10 +59,10 @@ test_device!(contiguous);
 
 #[test]
 fn strided_blocks() -> Result<()> {
-    use uniserve_tensor::Device::Cpu;
+    use tensor::Device::Cpu;
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     match tensor.strided_blocks() {
-        uniserve_tensor::StridedBlocks::SingleBlock { start_offset, len } => {
+        tensor::StridedBlocks::SingleBlock { start_offset, len } => {
             assert_eq!(start_offset, 0);
             assert_eq!(len, 24);
         }
@@ -68,7 +72,7 @@ fn strided_blocks() -> Result<()> {
         .i(2..)?
         .reshape((2, 3, 4))?;
     match tensor.strided_blocks() {
-        uniserve_tensor::StridedBlocks::SingleBlock { start_offset, len } => {
+        tensor::StridedBlocks::SingleBlock { start_offset, len } => {
             assert_eq!(start_offset, 2);
             assert_eq!(len, 24);
         }
@@ -77,7 +81,7 @@ fn strided_blocks() -> Result<()> {
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     let tensor = tensor.i(1)?;
     match tensor.strided_blocks() {
-        uniserve_tensor::StridedBlocks::SingleBlock { start_offset, len } => {
+        tensor::StridedBlocks::SingleBlock { start_offset, len } => {
             assert_eq!(start_offset, 12);
             assert_eq!(len, 12);
         }
@@ -86,7 +90,7 @@ fn strided_blocks() -> Result<()> {
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     let tensor = tensor.i((.., 1))?.contiguous()?;
     match tensor.strided_blocks() {
-        uniserve_tensor::StridedBlocks::SingleBlock { start_offset, len } => {
+        tensor::StridedBlocks::SingleBlock { start_offset, len } => {
             assert_eq!(start_offset, 0);
             assert_eq!(len, 8);
             assert_eq!(tensor.to_vec2::<u32>()?, &[[4, 5, 6, 7], [16, 17, 18, 19]]);
@@ -96,7 +100,7 @@ fn strided_blocks() -> Result<()> {
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     let tensor = tensor.i((.., 1))?;
     match tensor.strided_blocks() {
-        uniserve_tensor::StridedBlocks::UniformBlocks {
+        tensor::StridedBlocks::UniformBlocks {
             start_offset,
             block_len,
             count,
@@ -111,7 +115,7 @@ fn strided_blocks() -> Result<()> {
     };
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     match tensor.t()?.strided_blocks() {
-        uniserve_tensor::StridedBlocks::MultipleBlocks {
+        tensor::StridedBlocks::MultipleBlocks {
             block_start_index,
             block_len,
         } => {
@@ -128,7 +132,7 @@ fn strided_blocks() -> Result<()> {
     };
     let tensor = Tensor::arange(0u32, 24u32, &Cpu)?.reshape((2, 3, 4))?;
     match tensor.transpose(0, 1)?.strided_blocks() {
-        uniserve_tensor::StridedBlocks::MultipleBlocks {
+        tensor::StridedBlocks::MultipleBlocks {
             block_start_index,
             block_len,
         } => {

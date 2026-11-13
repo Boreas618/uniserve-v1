@@ -31,7 +31,7 @@ use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE, TOP_K, TOP_P};
 use storage::Key;
 use storage::runtime::{Completion, GroupId, OwnerId, Request, Run};
-use uniserve_tensor::{DType, Device, Tensor, WithDType};
+use tensor::{DType, Device, Tensor, WithDType};
 
 use super::columns::{self, Column, Layout};
 use super::experts::{self, JoinHook, Member};
@@ -67,7 +67,7 @@ const SCRATCH_PAGES: u32 = 2;
 const CANDIDATES: u32 = 3;
 
 /// A meta tensor: a shape and an element type at an address nothing reads.
-fn meta(shape: impl Into<uniserve_tensor::Shape>, dtype: DType) -> Tensor {
+fn meta(shape: impl Into<tensor::Shape>, dtype: DType) -> Tensor {
     backend::retained(0x1_0000, shape, dtype, &backend::meta()).unwrap()
 }
 
@@ -1691,7 +1691,7 @@ fn a_model_that_keeps_a_recurrent_state_has_no_paired_forward() {
 // ---- The completion -----------------------------------------------------------------------------
 
 /// The CPU tensor of `values` in `shape`.
-fn tensor<T: WithDType>(values: &[T], shape: impl Into<uniserve_tensor::Shape>) -> Tensor {
+fn tensor<T: WithDType>(values: &[T], shape: impl Into<tensor::Shape>) -> Tensor {
     Tensor::from_slice(values, shape.into(), &Device::Cpu).unwrap()
 }
 

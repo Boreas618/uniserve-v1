@@ -7,8 +7,8 @@ use rayon::prelude::*;
 
 mod utils;
 pub use utils::{
-    binary_map, binary_map_vec, binary_map_vec_par, unary_map, unary_map_vec, unary_map_vec_par,
-    Map1, Map1Any, Map2, Map2InPlace, Map2U8,
+    Map1, Map1Any, Map2, Map2InPlace, Map2U8, binary_map, binary_map_vec, binary_map_vec_par,
+    unary_map, unary_map_vec, unary_map_vec_par,
 };
 mod conv2d;
 use conv2d::Conv2D;
@@ -140,6 +140,8 @@ impl<I: IntDType> Map2 for WCond<'_, I> {
                 let el_count = self.1.shape().elem_count();
 
                 let mut ys: Vec<T> = Vec::with_capacity(el_count);
+                // SAFETY: the spare capacity is `el_count` elements of `T`, a plain numeric type;
+                // the dispatch below writes each of them before `set_len` exposes them.
                 let ys_to_set = unsafe {
                     let s = ys.spare_capacity_mut();
                     std::mem::transmute::<&mut [std::mem::MaybeUninit<T>], &mut [T]>(s)
@@ -212,6 +214,8 @@ impl ReduceIndex {
         let dst_len = src_l.shape().elem_count() / reduce_dim_size;
         let mut dst: Vec<U> = Vec::with_capacity(dst_len);
         let dst_to_set = dst.spare_capacity_mut();
+        // SAFETY: the spare capacity is `dst_len` elements of `U`, a plain value type; the loops
+        // below write each of them before `set_len` exposes them.
         let dst_to_set =
             unsafe { std::mem::transmute::<&mut [std::mem::MaybeUninit<U>], &mut [U]>(dst_to_set) };
         match src_l.contiguous_offsets() {
@@ -270,6 +274,7 @@ impl ReduceIndex {
                 }
             }
         }
+        // SAFETY: the loops above wrote all `dst_len` elements of the spare capacity.
         unsafe { dst.set_len(dst_len) };
         Ok(dst)
     }
@@ -333,6 +338,8 @@ impl ReduceSum<'_> {
                         .product::<usize>();
                     for (dst_i, dst_v) in dst.iter_mut().enumerate() {
                         let src_i = dst_i * reduce_sz;
+                        // SAFETY: the slice holds `reduce_sz` elements and `dst_v` is one element
+                        // of `dst`.
                         unsafe {
                             T::vec_reduce_sum(
                                 src[src_i..src_i + reduce_sz].as_ptr(),
@@ -1081,6 +1088,7 @@ impl Map2 for Conv1D<'_> {
                         assert!(inp_cont.len() >= p.c_in);
                         assert!(k_cont.len() >= p.c_in);
                         let mut d = T::zero();
+                        // SAFETY: the assertions above state that both slices hold `c_in` elements.
                         unsafe { T::vec_dot(inp_cont.as_ptr(), k_cont.as_ptr(), &mut d, p.c_in) }
                         let dst_p = dst.as_ptr();
                         // Safety: dst_idx are uniques per dst_c_idx which is used to parallelise
@@ -1309,6 +1317,8 @@ impl Map2 for ConvTranspose1D<'_> {
                             let inp_cont = &inp_cont[b_idx * cont_s0 + l_idx * cont_s1..];
                             let dst_idx = b_idx * dst_s0 + out_idx * dst_s2 + dst_c_idx * dst_s1;
                             let mut d = T::zero();
+                            // SAFETY: `inp_cont` starts at an input position's `c_in` contiguous
+                            // channels and `k_cont` holds `c_in` elements.
                             unsafe {
                                 T::vec_dot(inp_cont.as_ptr(), k_cont.as_ptr(), &mut d, p.c_in)
                             }
@@ -1392,6 +1402,8 @@ impl Map2 for ConvTranspose2D<'_> {
                                         + out_x * dst_s3
                                         + dst_c_idx * dst_s1;
                                     let mut d = T::zero();
+                                    // SAFETY: `inp_cont` starts at an input pixel's `c_in`
+                                    // contiguous channels and `k_cont` holds `c_in` elements.
                                     unsafe {
                                         T::vec_dot(
                                             inp_cont.as_ptr(),
@@ -1501,7 +1513,7 @@ impl Map2 for MatMul {
         rhs: &[T],
         rhs_l: &Layout,
     ) -> Result<Vec<T>> {
-        use gemm::{gemm, Parallelism};
+        use gemm::{Parallelism, gemm};
 
         match T::DTYPE {
             DType::F32 | DType::F64 => {}
@@ -1555,6 +1567,9 @@ impl Map2 for MatMul {
             let lhs_p = &lhs[step * a_skip..];
             let rhs_p = &rhs[step * b_skip..];
             let dst_p = &mut dst[step * c_skip..];
+            // SAFETY: the layouts address `b` matrices of `m x k` and `k x n` elements within `lhs`
+            // and `rhs` at the batch skips `ab_skip` derived from them, and `dst` holds `b`
+            // matrices of `m x n`; `gemm` reads and writes only the elements these strides address.
             unsafe {
                 gemm(
                     /* m: usize = */ m,
@@ -2569,7 +2584,7 @@ impl CpuStorage {
                 DType::F8E4M3 => Self::F8E4M3(elements_of(bytes)),
                 DType::F8E8M0 => Self::F8E8M0(elements_of(bytes)),
                 DType::F6E2M3 | DType::F6E3M2 | DType::F4 => {
-                    return Err(Error::UnsupportedDTypeForOp(dtype, "view").bt())
+                    return Err(Error::UnsupportedDTypeForOp(dtype, "view").bt());
                 }
             }
         };
@@ -2900,6 +2915,7 @@ impl CpuStorage {
         let (kernel, kernel_offset) = if kernel_l.is_contiguous() {
             (kernel, kernel_l.start_offset())
         } else {
+            // SAFETY: `copy_strided_src` below writes every element of the copy before it is read.
             let mut copy = unsafe { CpuDevice.alloc_uninit(kernel_l.shape(), kernel.dtype())? };
             kernel.copy_strided_src(&mut copy, 0, kernel_l)?;
             kernel_c = copy;
@@ -2910,6 +2926,7 @@ impl CpuStorage {
             .broadcast_as((b, k, n))?;
         let res = col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?;
         let res_l = Layout::contiguous((b, l_out, params.c_out)).transpose(1, 2)?;
+        // SAFETY: `copy_strided_src` below writes every element of the result before it is read.
         let mut res_t = unsafe { CpuDevice.alloc_uninit(res_l.shape(), res.dtype())? };
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
         Ok(res_t)
@@ -3181,67 +3198,72 @@ impl CpuDevice {
     /// The caller writes every element before it reads one.
     #[allow(clippy::uninit_vec)]
     pub unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<CpuStorage> {
-        let elem_count = shape.elem_count();
-        // The code below is highly unsafe but hopefully not directly unsound as we only consider
-        // types that are Copy, not Drop, and for which all bit patterns are proper values.
-        // It's still pretty risky, see the following for more details:
-        // https://github.com/rust-lang/rust-clippy/issues/4483
-        let storage = match dtype {
-            DType::U8 => {
-                let mut v = Vec::with_capacity(elem_count);
-                v.set_len(elem_count);
-                CpuStorage::U8(v)
-            }
-            DType::U32 => {
-                let mut v = Vec::with_capacity(elem_count);
-                v.set_len(elem_count);
-                CpuStorage::U32(v)
-            }
-            DType::I16 => {
-                let mut v = Vec::with_capacity(elem_count);
-                v.set_len(elem_count);
-                CpuStorage::I16(v)
-            }
-            DType::I32 => {
-                let mut v = Vec::with_capacity(elem_count);
-                v.set_len(elem_count);
-                CpuStorage::I32(v)
-            }
-            DType::I64 => {
-                let mut v = Vec::with_capacity(elem_count);
-                v.set_len(elem_count);
-                CpuStorage::I64(v)
-            }
-            DType::BF16 => {
-                let mut v = Vec::with_capacity(elem_count);
-                v.set_len(elem_count);
-                CpuStorage::BF16(v)
-            }
-            DType::F16 => {
-                let mut v = Vec::with_capacity(elem_count);
-                v.set_len(elem_count);
-                CpuStorage::F16(v)
-            }
-            DType::F32 => {
-                let mut v = Vec::with_capacity(elem_count);
-                v.set_len(elem_count);
-                CpuStorage::F32(v)
-            }
-            DType::F64 => {
-                let mut v = Vec::with_capacity(elem_count);
-                v.set_len(elem_count);
-                CpuStorage::F64(v)
-            }
-            DType::F8E4M3 => {
-                let mut v = Vec::with_capacity(elem_count);
-                v.set_len(elem_count);
-                CpuStorage::F8E4M3(v)
-            }
-            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                return Err(Error::UnsupportedDTypeForOp(dtype, "alloc_uninit").bt())
-            }
-        };
-        Ok(storage)
+        // SAFETY: each vector's capacity is `elem_count` elements of a plain numeric type for which
+        // any bits are a value; the caller writes every element before it reads one, as this
+        // function requires.
+        unsafe {
+            let elem_count = shape.elem_count();
+            // The code below is highly unsafe but hopefully not directly unsound as we only consider
+            // types that are Copy, not Drop, and for which all bit patterns are proper values.
+            // It's still pretty risky, see the following for more details:
+            // https://github.com/rust-lang/rust-clippy/issues/4483
+            let storage = match dtype {
+                DType::U8 => {
+                    let mut v = Vec::with_capacity(elem_count);
+                    v.set_len(elem_count);
+                    CpuStorage::U8(v)
+                }
+                DType::U32 => {
+                    let mut v = Vec::with_capacity(elem_count);
+                    v.set_len(elem_count);
+                    CpuStorage::U32(v)
+                }
+                DType::I16 => {
+                    let mut v = Vec::with_capacity(elem_count);
+                    v.set_len(elem_count);
+                    CpuStorage::I16(v)
+                }
+                DType::I32 => {
+                    let mut v = Vec::with_capacity(elem_count);
+                    v.set_len(elem_count);
+                    CpuStorage::I32(v)
+                }
+                DType::I64 => {
+                    let mut v = Vec::with_capacity(elem_count);
+                    v.set_len(elem_count);
+                    CpuStorage::I64(v)
+                }
+                DType::BF16 => {
+                    let mut v = Vec::with_capacity(elem_count);
+                    v.set_len(elem_count);
+                    CpuStorage::BF16(v)
+                }
+                DType::F16 => {
+                    let mut v = Vec::with_capacity(elem_count);
+                    v.set_len(elem_count);
+                    CpuStorage::F16(v)
+                }
+                DType::F32 => {
+                    let mut v = Vec::with_capacity(elem_count);
+                    v.set_len(elem_count);
+                    CpuStorage::F32(v)
+                }
+                DType::F64 => {
+                    let mut v = Vec::with_capacity(elem_count);
+                    v.set_len(elem_count);
+                    CpuStorage::F64(v)
+                }
+                DType::F8E4M3 => {
+                    let mut v = Vec::with_capacity(elem_count);
+                    v.set_len(elem_count);
+                    CpuStorage::F8E4M3(v)
+                }
+                DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+                    return Err(Error::UnsupportedDTypeForOp(dtype, "alloc_uninit").bt());
+                }
+            };
+            Ok(storage)
+        }
     }
 
     /// A storage of `shape.elem_count()` zeros.
@@ -3259,7 +3281,7 @@ impl CpuDevice {
             DType::F64 => CpuStorage::F64(vec![0f64; elem_count]),
             DType::F8E4M3 => CpuStorage::F8E4M3(vec![F8E4M3::ZERO; elem_count]),
             DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                return Err(Error::UnsupportedDTypeForOp(dtype, "zeros").bt())
+                return Err(Error::UnsupportedDTypeForOp(dtype, "zeros").bt());
             }
         };
         Ok(storage)

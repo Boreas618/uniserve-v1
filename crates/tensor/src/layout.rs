@@ -108,7 +108,7 @@ impl Layout {
             .dims()
             .iter()
             .zip(self.stride())
-            .filter(|(&d, _)| d > 1)
+            .filter(|&(&d, _)| d > 1)
             .map(|(&d, &s)| (d, s))
             .collect();
         axes.sort_unstable_by_key(|&(_, s)| s);

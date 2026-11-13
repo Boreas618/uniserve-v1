@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::capability::{
     CausalLm, ConditionShape, Decoder, Denoiser, Drafter, Encoder, MediaFormat, Splicer,

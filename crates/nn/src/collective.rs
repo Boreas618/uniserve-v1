@@ -14,7 +14,7 @@
 //! Every tensor a collective takes is a contiguous tensor of the device backend, meta under a
 //! meta context; a CPU tensor is refused, because one process holds one rank.
 
-use uniserve_tensor::Tensor;
+use tensor::Tensor;
 
 use crate::Result;
 

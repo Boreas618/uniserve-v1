@@ -15,7 +15,7 @@
 //! The bytes are little-endian, the order of every device this tree serves and of a safetensors
 //! payload.
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::abi;
 use crate::error::{Error, Result};

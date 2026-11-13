@@ -18,7 +18,7 @@ use ops::frame::{
     FrameMoments, FrameMomentsArgs, FrameMomentsDescriptor, FrameNormPad, FrameNormPadArgs,
     FrameNormPadDescriptor, frame_reduction_class,
 };
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::conv::{Padding, causal_pad, packed};
 use super::on_cpu;

@@ -1,0 +1,584 @@
+//! The causal language model of `Qwen4ExpForConditionalGeneration` (vLLM's
+//! `Qwen4ExpForCausalLM`, `refs/vllm/vllm/models/qwen4_exp/nvidia/model.py:540-671`).
+//!
+//! ```text
+//! embedding:  x = Σ_ranks embed_shard(ids)                          [tokens, H]
+//! streams:    S = [x | x | … ]                                      [tokens, C · H]
+//! layers:     S, y, r ← layer(S, (y, r))                            (crate::qwen4_exp::decoder)
+//! read-out:   S ← combine(S, y, r)                                  the forward's result
+//! logits:     lm_head(mix(norm(S)))                                 no final norm
+//! ```
+//!
+//! [`CausalLm::forward`] returns the streams, which the drafter reads, and
+//! [`CausalLm::compute_logits`] mixes the rows it is given through `hyper_connection_mixer`
+//! and projects them: the mix is row-wise, so it runs on the rows logits are asked for.
+//!
+//! ## The state the layers keep
+//!
+//! The recurrent state's layers are, in order ([`TextModel::state_layers`]): the gated delta
+//! networks (a convolution window and the delta rule's matrices each), the PLE layers (a
+//! convolution window each), then the attention layers (a ring of raw index keys and its
+//! rotary positions each). A deployment that drafts lends [`nn::VerifySlots`]: the windows
+//! hold one row more per draft token, and a request owns one slot of the delta rule's
+//! matrices per row of a step.
+//!
+//! ## Rotary positions
+//!
+//! Every batch turns by the sectioned M-RoPE spectrum over three axes: a batch of text states
+//! one position per token, read on every axis, and a batch that holds image rows states three
+//! ([`TokenBatch::rope_positions`]).
+
+use std::collections::BTreeMap;
+
+use nn::family::{
+    CacheShape, ExpertOrder, ExpertShape, IndexKeys, StateShape, TextModel, TextPlacement,
+};
+use nn::modules::{Embedding, EmbeddingConfig, LmHead, LmHeadConfig, Rotary};
+use nn::{
+    CausalLm, DType, Device, Drafter, ExpertExchange, KvCache, RecurrentState, Split, Tensor,
+    TokenBatch, VarBuilder, Vision,
+};
+
+use crate::qwen3::VisionTower;
+use crate::qwen4_exp::attention::IndexedAttention;
+use crate::qwen4_exp::config::Config;
+use crate::qwen4_exp::decoder::DecoderLayer;
+use crate::qwen4_exp::hyper_connection::HyperConnection;
+use crate::qwen4_exp::mtp::Mtp;
+use crate::qwen4_exp::ngram::{PleLayer, int};
+use crate::qwen4_exp::{Error, Result};
+
+/// The profiler class of the whole decoder stack, at path `model`.
+const TRANSFORMER: &str = "models.qwen4_exp.transformer.Transformer";
+
+/// The module path the language model's modules sit under.
+const LANGUAGE_MODEL: &str = "model.language_model";
+
+/// The per-token columns of a forward ([`token_columns`]), by their index.
+///
+/// `[tokens]` U32: the batch row each token is of, its row of the cache's page table.
+pub const ROW: usize = 0;
+/// `[tokens]` I32: the token's position in its request's token order.
+pub const POSITION: usize = 1;
+/// `[tokens]` I32: the token's request slot, negative for a token of a padding row.
+pub const SLOT: usize = 2;
+/// `[tokens]` I32: the tokens of the token's state row before it.
+pub const LEADING: usize = 3;
+/// `[tokens]` I32: the tokens of the token's state row after it.
+pub const TRAILING: usize = 4;
+/// `[tokens]` I32: the tokens of the token's batch row before it.
+pub const INDEX: usize = 5;
+
+/// For each of `tokens` packed tokens, the row of `offsets` (`[rows + 1]` U32 packed offsets)
+/// it lies in, clamped to the last row, with the row's first token and the first token past
+/// it: `(row, first, end)`, `[tokens]` each, the row U32 and the bounds I32.
+fn rows_of(offsets: &Tensor, tokens: usize) -> Result<(Tensor, Tensor, Tensor)> {
+    let rows = offsets.elem_count() - 1;
+    let device = offsets.device();
+    let offsets = offsets.to_dtype(DType::I32)?;
+    let token = Tensor::arange(0_i32, tokens as i32, &Device::Cpu)?.to_device(device)?;
+
+    // A token lies in the row whose end is the first past it: the count of ends at or
+    // before it.
+    let ends = offsets.narrow(0, 1, rows)?;
+    let row = token
+        .unsqueeze(1)?
+        .broadcast_ge(&ends.unsqueeze(0)?)?
+        .to_dtype(DType::I32)?
+        .sum(1)?
+        .minimum((rows - 1) as f64)?
+        .to_dtype(DType::U32)?;
+
+    let first = offsets.narrow(0, 0, rows)?.index_select(&row, 0)?;
+    let end = ends.index_select(&row, 0)?;
+    Ok((row, first, end))
+}
+
+/// The per-token columns the layers of a forward read, as tensor expressions over the batch's
+/// and the state's row columns: [`ROW`], [`POSITION`], [`SLOT`], [`LEADING`], [`TRAILING`]
+/// and [`INDEX`].
+///
+/// A batch's rows are its attention rows and a state's rows its requests' (a verification's
+/// tokens attend as one row each while one state row covers them), so a token's place is
+/// stated in both.
+///
+/// # Errors
+///
+/// What a tensor operation refuses.
+pub fn token_columns(batch: &TokenBatch, state: &RecurrentState) -> Result<Vec<Tensor>> {
+    let tokens = batch.tokens();
+    let device = batch.query_offsets.device();
+    let token = Tensor::arange(0_i32, tokens as i32, &Device::Cpu)?.to_device(device)?;
+
+    // A row has seen `seq_lens` tokens, its new ones the last of them.
+    let (row, first, end) = rows_of(&batch.query_offsets, tokens)?;
+    let seen = batch.seq_lens.to_dtype(DType::I32)?.index_select(&row, 0)?;
+    let position = seen.sub(&end)?.add(&token)?.maximum(0.0)?;
+    let index = token.sub(&first)?.maximum(0.0)?;
+
+    // A token past the state's last row is padding: it names no slot.
+    let (state_row, state_first, state_end) = rows_of(&state.query_offsets, tokens)?;
+    let slot = state.slots.view(DType::I32)?.index_select(&state_row, 0)?;
+    let slot = token
+        .lt(&state_end)?
+        .where_cond(&slot, &int(-1, &slot)?.broadcast_as(slot.shape())?)?;
+    let leading = token.sub(&state_first)?.maximum(0.0)?;
+    let trailing = state_end.sub(&token)?.broadcast_sub(&int(1, &token)?)?;
+
+    Ok(vec![row, position, slot, leading, trailing, index])
+}
+
+/// Each token's n-gram context, `[tokens, 3]` U32 `(p2, p1, t0)`: the token two before it, the
+/// one before it and its own, from the batch's token ids and, for a row's first tokens, from
+/// the two ids before the row ([`TokenBatch::ngram_context`]).
+///
+/// # Errors
+///
+/// A batch that states no token ids.
+pub fn ngram_context(batch: &TokenBatch, columns: &[Tensor]) -> Result<Tensor> {
+    let (Some(ids), Some(before)) = (&batch.token_ids, &batch.ngram_context) else {
+        return Err(Error::Config(
+            "the n-gram embedding hashes token ids, and the batch states none \
+             (token_ids, ngram_context)"
+                .to_owned(),
+        ));
+    };
+    let tokens = batch.tokens();
+    let rows = batch.rows();
+    let index = &columns[INDEX];
+    let token = Tensor::arange(0_i32, tokens as i32, &Device::Cpu)?.to_device(ids.device())?;
+    let constant = |value: usize| int(value as i64, index);
+
+    // A row's history is the two ids before it, then its own tokens: the ids of every row's
+    // context, then the batch's token ids.
+    let history = Tensor::cat(&[&before.flatten_all()?, ids], 0)?;
+    let own = token.broadcast_add(&constant(2 * rows)?)?;
+    let before_row = columns[ROW]
+        .to_dtype(DType::I32)?
+        .broadcast_mul(&constant(2)?)?;
+
+    let earlier = |back: usize| -> Result<Tensor> {
+        // The token `back` before a token is the row's own when the row reaches that far
+        // back, and the row's context otherwise: its last id for the token before the row's
+        // first, and so on.
+        let in_row = own.broadcast_sub(&constant(back)?)?;
+        let in_context = before_row.add(index)?.broadcast_add(&constant(2 - back)?)?;
+        let entry = index
+            .broadcast_ge(&constant(back)?)?
+            .where_cond(&in_row, &in_context)?;
+
+        Ok(history.index_select(&entry.to_dtype(DType::U32)?, 0)?)
+    };
+
+    Ok(Tensor::stack(&[earlier(2)?, earlier(1)?, ids.clone()], 1)?)
+}
+
+/// The rotary coordinates of a batch's tokens, `[3, tokens]` I32: the batch's own when it
+/// holds image rows, and each token's position on every axis otherwise.
+pub fn coordinates(batch: &TokenBatch) -> Result<Tensor> {
+    match &batch.rope_positions {
+        Some(coordinates) => Ok(coordinates.clone()),
+        None => {
+            let position = &batch.positions;
+            Ok(Tensor::stack(&[position, position, position], 0)?)
+        }
+    }
+}
+
+/// A Qwen3.8 Flash Next causal language model.
+pub struct Qwen4ExpForCausalLm {
+    config: Config,
+    tensor: Split,
+    /// The tokens a step of the deployment drafts.
+    draft_tokens: u32,
+    embed_tokens: Embedding,
+    /// The sectioned rotation of every batch.
+    rotary_emb: Rotary,
+    layers: Vec<DecoderLayer>,
+    /// The read-out of the streams: its norm and mix, without combine logits.
+    hyper_connection_mixer: HyperConnection,
+    lm_head: LmHead,
+    mtp: Option<Mtp>,
+    visual: Option<VisionTower>,
+}
+
+/// The path an [`ExpertOrder`] names the routed experts of decoder layer `layer` by.
+pub fn expert_module(layer: u32) -> String {
+    format!("layers.{layer}.mlp.experts")
+}
+
+/// The routed experts of every layer of `config` by module path, each with its expert count:
+/// what an expert redistribution may order.
+pub fn expert_layers(config: &Config) -> BTreeMap<String, u32> {
+    (0..config.text.num_hidden_layers)
+        .map(|layer| (expert_module(layer), config.moe.num_experts))
+        .collect()
+}
+
+impl Qwen4ExpForCausalLm {
+    /// The model `config` describes, its modules read under `vb` (the checkpoint's root), at
+    /// the ranks `placement` states, with the routed experts in the slots `order` states, the
+    /// drafter when the deployment speculates, and the vision tower when the configuration
+    /// states the processor its images are sized by.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Representation`] for a checkpoint whose decoder layers store their routed
+    /// experts as block-scaled FP8; a split the model does not divide; an order that names no
+    /// layer; a drafter the checkpoint does not carry; or a module the loader refuses.
+    pub fn load(
+        config: &Config,
+        vb: VarBuilder<'_, '_>,
+        placement: &TextPlacement,
+        order: &ExpertOrder,
+    ) -> Result<Self> {
+        let splits = (placement.tensor, placement.experts);
+        config.check_splits(splits.0, splits.1)?;
+
+        let routed = expert_layers(config);
+        if let Some(stray) = order.keys().find(|module| !routed.contains_key(*module)) {
+            return Err(Error::Config(format!(
+                "{stray} is not a routed expert layer of this model"
+            )));
+        }
+
+        let text = &config.text;
+        let model = vb.pp(LANGUAGE_MODEL);
+        let layers = (0..text.num_hidden_layers)
+            .map(|layer| {
+                DecoderLayer::load(
+                    config,
+                    model.pp("layers").pp(layer),
+                    text.linear_layers[layer as usize],
+                    config.ple(layer).is_some(),
+                    splits,
+                    placement.draft_tokens,
+                    order.get(&expert_module(layer)),
+                    false,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mtp = if placement.drafter {
+            Some(Mtp::load(
+                config,
+                vb.pp("mtp"),
+                splits,
+                placement.draft_tokens,
+            )?)
+        } else {
+            None
+        };
+        let visual = match config.images {
+            Some((processor, pixels)) => Some(VisionTower::load(
+                &config.vision,
+                vb.pp("model.visual"),
+                processor,
+                pixels,
+            )?),
+            None => None,
+        };
+
+        Ok(Self {
+            config: config.clone(),
+            tensor: splits.0,
+            draft_tokens: placement.draft_tokens,
+            embed_tokens: Embedding::load(
+                &EmbeddingConfig {
+                    vocabulary: text.vocab_size,
+                    hidden: text.hidden_size,
+                    split: splits.0,
+                },
+                model.pp("embed_tokens"),
+            )?,
+            rotary_emb: Rotary::load(&text.rope, model.pp("rotary_emb"))?,
+            layers,
+            hyper_connection_mixer: HyperConnection::load(
+                config,
+                model.pp("hyper_connection_mixer"),
+                false,
+            )?,
+            lm_head: LmHead::load(
+                &LmHeadConfig {
+                    vocabulary: text.vocab_size,
+                    hidden: text.hidden_size,
+                    split: splits.0,
+                },
+                vb.pp("lm_head"),
+            )?,
+            mtp,
+            visual,
+        })
+    }
+
+    /// The checkpoint configuration this model was built for.
+    pub const fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// The width of the streams: `C · H`.
+    fn streams_width(&self) -> usize {
+        (self.config.text.hidden_size * self.config.hyper_connection.streams) as usize
+    }
+}
+
+impl CausalLm for Qwen4ExpForCausalLm {
+    fn embed_input_ids(&self, ids: &Tensor) -> nn::Result<Tensor> {
+        self.embed_tokens.forward(ids)
+    }
+
+    /// The layers over the batch's embeddings `hidden`, `[tokens, H]`, which every stream
+    /// opens as: the streams after the last layer's output is folded in, `[tokens, C · H]`.
+    fn forward(
+        &self,
+        batch: &TokenBatch,
+        cache: &[KvCache],
+        state: Option<&RecurrentState>,
+        exchange: Option<&ExpertExchange>,
+        hidden: &Tensor,
+    ) -> nn::Result<Tensor> {
+        let (tokens, width) = (batch.tokens(), self.config.text.hidden_size as usize);
+        if hidden.dims() != [tokens, width] {
+            return Err(Error::Config(format!(
+                "hidden is {:?}, [{tokens}, {width}] expected",
+                hidden.dims()
+            ))
+            .into());
+        }
+
+        let forward = || -> Result<Tensor> {
+            let state = state.ok_or_else(|| {
+                Error::Config(
+                    "the model's layers keep a state, and the forward was lent none".to_owned(),
+                )
+            })?;
+            let streams = self.config.hyper_connection.streams as usize;
+
+            let coordinates = coordinates(batch)?;
+            let (cos, sin) = self.rotary_emb.forward(&coordinates)?;
+            let columns = token_columns(batch, state)?;
+            let context = if self.layers.iter().any(DecoderLayer::has_ple) {
+                Some(ngram_context(batch, &columns)?)
+            } else {
+                None
+            };
+
+            // The recurrent layers in the state's order: the gated delta networks, the PLE
+            // layers, the attention layers' rings.
+            let linear_layers = self.config.linear_layers() as usize;
+            let ple_layers = self.config.ngram.layers.len();
+            let group = cache.first();
+
+            let (mut attention, mut linear, mut ple) = (0, 0, 0);
+            let mut residual = Tensor::cat(&vec![hidden; streams], 1)?;
+            let mut pending: Option<(Tensor, Tensor)> = None;
+
+            for layer in &self.layers {
+                let (ordinal, mixer_state) = if layer.is_linear() {
+                    (linear, linear)
+                } else {
+                    (attention, linear_layers + ple_layers + attention)
+                };
+
+                let (folded, output, logits) = layer.forward(
+                    &residual,
+                    pending.as_ref().map(|(output, logits)| (output, logits)),
+                    (&cos, &sin),
+                    &self.rotary_emb,
+                    &coordinates,
+                    &columns,
+                    context.as_ref(),
+                    batch,
+                    group,
+                    state,
+                    exchange,
+                    ordinal,
+                    (mixer_state, linear_layers + ple),
+                )?;
+                (residual, pending) = (folded, Some((output, logits)));
+
+                if layer.is_linear() {
+                    linear += 1;
+                } else {
+                    attention += 1;
+                }
+                if layer.has_ple() {
+                    ple += 1;
+                }
+            }
+
+            // The last layer's output is folded in by the read-out (`model.py:643-647`).
+            match pending {
+                Some((output, logits)) => {
+                    HyperConnection::combine(&residual, &output, Some(&logits), streams)
+                }
+                None => Ok(residual),
+            }
+        };
+
+        Ok(nn::profiler::range(TRANSFORMER, "model", forward)?)
+    }
+
+    /// The logits of `hidden`: rows of the streams, `[rows, C · H]`, which are normalized and
+    /// mixed by `hyper_connection_mixer` first, or rows a drafter has mixed already,
+    /// `[rows, H]` ([`Drafter::logits_rows`]).
+    fn compute_logits(&self, hidden: &Tensor) -> nn::Result<Tensor> {
+        let mixed = match hidden.dims() {
+            &[_, width] if width == self.streams_width() => {
+                let mixer = &self.hyper_connection_mixer;
+                mixer.mix(&mixer.norm(hidden)?)?.0
+            }
+            _ => hidden.clone(),
+        };
+
+        self.lm_head.forward(&mixed)
+    }
+
+    fn join_expert_step(&self, exchange: &ExpertExchange) -> nn::Result<()> {
+        for layer in &self.layers {
+            layer.experts().join_expert_step(exchange)?;
+        }
+        Ok(())
+    }
+}
+
+impl TextModel for Qwen4ExpForCausalLm {
+    fn hidden(&self) -> u32 {
+        self.config.text.hidden_size
+    }
+
+    fn vocabulary(&self) -> u32 {
+        self.config.text.vocab_size
+    }
+
+    fn dtype(&self) -> DType {
+        self.embed_tokens.weight().dtype()
+    }
+
+    fn cache(&self) -> CacheShape {
+        cache_shape(&self.config, self.tensor, self.config.attention_layers())
+    }
+
+    /// The gated delta networks' fields: the first of [`Self::state_layers`].
+    fn state(&self) -> Option<StateShape> {
+        self.state_layers().into_iter().next()
+    }
+
+    fn state_layers(&self) -> Vec<StateShape> {
+        let (config, dtype, drafts) = (&self.config, self.dtype(), self.draft_tokens);
+        let network = nn::modules::GatedDeltaNetConfig {
+            split: self.tensor,
+            draft_tokens: drafts,
+            ..config.text.gated_delta_net
+        };
+
+        vec![
+            StateShape {
+                layers: config.linear_layers(),
+                fields: network.state_fields(dtype),
+            },
+            StateShape {
+                layers: config.ngram.layers.len() as u32,
+                fields: PleLayer::state_fields(config, dtype, drafts),
+            },
+            StateShape {
+                layers: config.attention_layers(),
+                fields: IndexedAttention::state_fields(config, dtype, drafts),
+            },
+        ]
+    }
+
+    fn stream_width(&self) -> u32 {
+        self.streams_width() as u32
+    }
+
+    fn experts(&self) -> Option<ExpertShape> {
+        let moe = &self.config.moe;
+
+        Some(ExpertShape {
+            experts: moe.num_experts,
+            intermediate: moe.moe_intermediate_size,
+            top: moe.num_experts_per_tok,
+            encoded: self.config.quantization.is_encoded(),
+        })
+    }
+
+    fn drafter(&self) -> Option<&dyn Drafter> {
+        self.mtp.as_ref().map(|mtp| mtp as &dyn Drafter)
+    }
+
+    fn vision(&self) -> Option<&dyn Vision> {
+        self.visual.as_ref().map(|tower| tower as &dyn Vision)
+    }
+
+    /// The PLE layers hash each token with the two before it, so the forward reads token ids
+    /// and their n-gram context whenever one layer holds a PLE layer.
+    fn reads_token_ids(&self) -> bool {
+        self.layers.iter().any(DecoderLayer::has_ple)
+    }
+}
+
+/// The key/value cache of `layers` attention layers of `config`, as `tensor`'s rank holds it:
+/// a rank of a group wider than the key/value heads holds one head.
+pub(crate) fn cache_shape(config: &Config, tensor: Split, layers: u32) -> CacheShape {
+    let (text, indexer) = (&config.text, &config.indexer);
+
+    CacheShape {
+        layers,
+        kv_heads: (text.num_key_value_heads / tensor.size).max(1),
+        head_dim: text.head_dim,
+        index_keys: Some(IndexKeys {
+            width: indexer.head_dim,
+            ratio: indexer.compress_ratio,
+        }),
+    }
+}
+
+impl std::fmt::Debug for Qwen4ExpForCausalLm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Qwen4ExpForCausalLm")
+            .field("layers", &self.layers.len())
+            .field("tensor", &self.tensor)
+            .field("draft_tokens", &self.draft_tokens)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nn::config::Fields;
+
+    use super::*;
+
+    #[test]
+    fn an_order_names_every_layer_by_its_expert_module() {
+        let config = crate::qwen4_exp::config::fixtures::flash_next();
+        let config =
+            Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
+
+        let layers = expert_layers(&config);
+        assert_eq!(layers.len(), 8);
+        assert_eq!(layers.get("layers.7.mlp.experts"), Some(&512));
+    }
+
+    #[test]
+    fn a_rank_of_four_holds_one_key_value_head_and_the_index_keys() {
+        let config = crate::qwen4_exp::config::fixtures::flash_next();
+        let config =
+            Config::parse(&Fields::of("config.json", &config).expect("an object")).expect("parsed");
+
+        let whole = cache_shape(&config, Split::WHOLE, 2);
+        assert_eq!((whole.layers, whole.kv_heads, whole.head_dim), (2, 2, 256));
+        assert_eq!(
+            whole.index_keys,
+            Some(IndexKeys {
+                width: 128,
+                ratio: 4
+            })
+        );
+
+        let rank = cache_shape(&config, Split { size: 4, rank: 3 }, 2);
+        assert_eq!(rank.kv_heads, 1);
+    }
+}

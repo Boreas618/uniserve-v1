@@ -1,5 +1,5 @@
 use anyhow::Result;
-use uniserve_tensor::{Device, Tensor};
+use tensor::{Device, Tensor};
 
 fn main() -> Result<()> {
     let a = Tensor::new(&[[0.0f32, 1.0, 2.0], [3.0, 4.0, 5.0]], &Device::Cpu)?;

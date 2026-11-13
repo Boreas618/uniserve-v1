@@ -6,7 +6,7 @@
 //! logits a batch asks for is a row gather, which a caller writes as `index_select`.
 
 use ops::logits::{UnpadArgs, UnpadDescriptor, VocabUnpad};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::{PDL, on_cpu};
 use crate::error::{Error, Result};

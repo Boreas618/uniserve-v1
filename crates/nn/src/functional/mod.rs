@@ -57,7 +57,7 @@ mod sampling;
 mod sparse;
 mod vsa;
 
-use uniserve_tensor::{DType, Device, Shape, Tensor};
+use tensor::{DType, Device, Shape, Tensor};
 
 use crate::error::{Error, Result};
 

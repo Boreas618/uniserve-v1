@@ -34,7 +34,7 @@ use ipc::batch::{Batch, BatchOutput, Phase, TimingCounters, Variant};
 use nn::capability::{Encoder, PatchFormat};
 use nn::{NO_SLOT, PhaseKind, TokenBatch};
 use platform::Stream;
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::{DeviceCopy, address, element_bytes, issue, performed, settle};
 use crate::buckets::{Bucket, Buckets};
@@ -663,7 +663,7 @@ mod tests {
     use ops::Generation;
     use storage::Key;
     use storage::runtime::{Completion, GroupId, OwnerId, Request};
-    use uniserve_tensor::{DType, Tensor};
+    use tensor::{DType, Tensor};
 
     use super::{EncoderConfig, EncoderRunner};
     use crate::buckets::{Bucket, Buckets};

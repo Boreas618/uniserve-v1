@@ -4,10 +4,12 @@
 //! The expected values are PyTorch's for the same expression: `+`, `-` and `*` wrap, the
 //! quotient is `torch.div(.., rounding_mode="trunc")`, and the remainder is `torch.remainder`.
 
+#![cfg(test)]
+
 #[macro_use]
 mod common;
 
-use uniserve_tensor::{DType, Device, Result, Tensor};
+use tensor::{DType, Device, Result, Tensor};
 
 /// The message of the error `result` holds.
 fn refusal(result: Result<Tensor>) -> String {

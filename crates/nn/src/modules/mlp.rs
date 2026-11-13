@@ -6,7 +6,7 @@
 //! hold the value half and then the gate half ([`GateUp`]); the gated product reads them as two
 //! tensors or as the packed rows, at the [`Rounding`] the model's reference evaluates.
 
-use uniserve_tensor::{D, Module, Tensor};
+use tensor::{D, Module, Tensor};
 
 use crate::collective::Split;
 use crate::error::{Error, Result};
@@ -170,7 +170,7 @@ impl Mlp {
 }
 
 impl Module for Mlp {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }

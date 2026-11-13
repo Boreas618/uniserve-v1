@@ -24,7 +24,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     let server = StorageServer::start();
     let mut launch = launch();
     launch.engine_config.device.device = "meta".to_owned();
-    let registry = nn::family::Registry::new([qwen3::family::FAMILY]).unwrap();
+    let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
     let storage = ipc::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
         deployment: launch.engine_config.deployment.clone(),
@@ -102,7 +102,7 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
     let server = StorageServer::start();
     let mut launch = video_launch();
     launch.engine_config.device.device = "meta".to_owned();
-    let registry = nn::family::Registry::new([minimax_h3::family::FAMILY]).unwrap();
+    let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let storage = ipc::StorageLaunch {
         socket: server.socket.to_string_lossy().into_owned(),
         deployment: launch.engine_config.deployment.clone(),

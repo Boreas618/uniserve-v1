@@ -1,4 +1,6 @@
 //! Implement conversion traits for tensors
+use crate::cpu_backend::CpuStorage;
+use crate::tensor::from_storage;
 use crate::{DType, Device, Error, Tensor, WithDType};
 use half::{bf16, f16, slice::HalfFloatSliceExt};
 use std::convert::TryFrom;
@@ -158,9 +160,85 @@ impl Tensor {
                 }
             }
             DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
-                return Err(crate::Error::UnsupportedDTypeForOp(self.dtype(), "write_bytes").bt())
+                return Err(crate::Error::UnsupportedDTypeForOp(self.dtype(), "write_bytes").bt());
             }
         }
         Ok(())
     }
+}
+
+impl Tensor {
+    /// A tensor of `dtype` and `shape` on `device` over the little-endian element bytes `data`,
+    /// copied. The bytes of a packed dtype (`F6E2M3`, `F6E3M2`, `F4`, `F8E8M0`) are kept as they
+    /// are, since these dtypes have no host element type.
+    pub fn from_raw_buffer(
+        data: &[u8],
+        dtype: DType,
+        shape: &[usize],
+        device: &Device,
+    ) -> crate::Result<Self> {
+        match dtype {
+            DType::U8 => convert_slice::<u8>(data, shape, device),
+            DType::U32 => convert_slice::<u32>(data, shape, device),
+            DType::I16 => convert_slice::<i16>(data, shape, device),
+            DType::I32 => convert_slice::<i32>(data, shape, device),
+            DType::I64 => convert_slice::<i64>(data, shape, device),
+            DType::BF16 => convert_slice::<half::bf16>(data, shape, device),
+            DType::F16 => convert_slice::<half::f16>(data, shape, device),
+            DType::F32 => convert_slice::<f32>(data, shape, device),
+            DType::F64 => convert_slice::<f64>(data, shape, device),
+            DType::F8E4M3 => convert_slice::<float8::F8E4M3>(data, shape, device),
+            DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+                packed_tensor(data, dtype, shape, device)
+            }
+        }
+    }
+}
+
+fn convert_slice<T: WithDType>(
+    data: &[u8],
+    shape: &[usize],
+    device: &Device,
+) -> crate::Result<Tensor> {
+    let size_in_bytes = T::DTYPE.size_in_bytes();
+    let elem_count = data.len() / size_in_bytes;
+    if (data.as_ptr() as usize).is_multiple_of(size_in_bytes) {
+        // SAFETY: `data` is aligned for `T` (checked above) and holds `elem_count` whole
+        // elements of it; `T` is a plain numeric type for which any bits are a value.
+        let data: &[T] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const T, elem_count) };
+        Tensor::from_slice(data, shape, device)
+    } else {
+        // XXX: We need to specify `T` here, otherwise the compiler will infer u8 because of the following cast
+        // Making this vector too small to fit a full f16/f32/f64 weights, resulting in out-of-bounds access
+        let mut c: Vec<T> = Vec::with_capacity(elem_count);
+        // SAFETY: We just created c, so the allocated memory is necessarily
+        // contiguous and non overlapping with the view's data.
+        // We're downgrading the `c` pointer from T to u8, which removes alignment
+        // constraints.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), c.as_mut_ptr() as *mut u8, data.len());
+            c.set_len(elem_count)
+        }
+        Tensor::from_slice(&c, shape, device)
+    }
+}
+
+/// A tensor of a packed dtype. Its storage holds the bytes of `data` as they are, since these
+/// dtypes have no host element type.
+fn packed_tensor(
+    data: &[u8],
+    dtype: DType,
+    shape: &[usize],
+    device: &Device,
+) -> crate::Result<Tensor> {
+    let storage = match dtype {
+        DType::F6E2M3 => CpuStorage::F6E2M3(data.to_vec()),
+        DType::F6E3M2 => CpuStorage::F6E3M2(data.to_vec()),
+        DType::F4 => CpuStorage::F4(data.to_vec()),
+        DType::F8E8M0 => CpuStorage::F8E8M0(data.to_vec()),
+        dtype => return Err(Error::UnsupportedDTypeForOp(dtype, "packed load").bt()),
+    };
+    let storage = device.storage_from_cpu_storage(storage)?;
+    Ok(from_storage(storage, shape))
 }

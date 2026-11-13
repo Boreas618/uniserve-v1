@@ -7,7 +7,7 @@
 //! a mask, and two implementations of it agree bit for bit.
 
 use ops::embedding::{Args, Descriptor, Embedding};
-use uniserve_tensor::Tensor;
+use tensor::Tensor;
 
 use super::{PDL, columns, on_cpu};
 use crate::collective::Split;

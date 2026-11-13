@@ -1,0 +1,27 @@
+[package]
+name = "models"
+description = "The model families: Qwen3 (Qwen3-MoE, Qwen3.5-MoE, Qwen3-VL), Qwen3.8 Flash Next (Qwen4ExpForConditionalGeneration), MiniMax-H3 and FastH3: their configurations, module trees, checkpoint names and family values"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# A model family computes on tensors and composes `nn` modules: the crate lists the
+# neural-network library, the tensor library and request processing, and nothing of the kernels,
+# the device backend or the platform.
+[dependencies]
+nn.workspace = true
+tensor.workspace = true
+processing.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# The profile runs install a meta context and make their meta inputs, which the library target
+# names neither of; the tests write tiny checkpoints.
+[dev-dependencies]
+backend.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -13,7 +13,7 @@ use ipc::batch::{
 use ops::Generation;
 use storage::Key;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Tier};
-use uniserve_tensor::Tensor;
+use tensor::Tensor;
 use worker::buckets::Bucket;
 use worker::completion::Outcome;
 use worker::executor::{Executors, Sequences};

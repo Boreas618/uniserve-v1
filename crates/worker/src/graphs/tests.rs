@@ -11,7 +11,7 @@ use nn::modules::Linear;
 use nn::{CausalLm, ExpertExchange, KvCache, PhaseKind, RecurrentState, TokenBatch};
 use ops::{Generation, Kernel, KernelEntry};
 use platform::NativeLibrary;
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use storage::runtime::GroupId;
 

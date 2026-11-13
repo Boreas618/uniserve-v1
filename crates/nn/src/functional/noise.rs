@@ -27,7 +27,7 @@
 //! buffer of execution holds is returned as a new tensor ([`philox_normal_like`]).
 
 use ops::noise::{KeySource, NOISE_BLOCK, NoiseArgs, NoiseDescriptor, NoiseKind, PhiloxNoise};
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use super::on_cpu;
 use crate::error::{Error, Result};

@@ -57,7 +57,7 @@ use backend::{Context, ContextGuard, Group};
 use ops::Generation;
 use ops::moe::ExchangeTransport;
 use platform::{DeviceRange, Event, EventFlags, Stream};
-use uniserve_tensor::{DType, Device, Shape, Tensor};
+use tensor::{DType, Device, Shape, Tensor};
 
 use self::capture::{Executable, Recorder, kernels_of, take_break};
 use self::input_buffer::InputBuffer;

@@ -7,7 +7,7 @@
 //! `weight_g`, folded once at load; and `tf32`, the model's numerical declaration for an FP32
 //! convolution.
 
-use uniserve_tensor::{Module, Tensor};
+use tensor::{Module, Tensor};
 
 use crate::error::{Error, Result};
 use crate::functional;
@@ -208,7 +208,7 @@ impl Conv1d {
 }
 
 impl Module for Conv1d {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }
@@ -260,7 +260,7 @@ impl ConvTranspose1d {
 }
 
 impl Module for ConvTranspose1d {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }
@@ -328,7 +328,7 @@ impl Conv3d {
 }
 
 impl Module for Conv3d {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }

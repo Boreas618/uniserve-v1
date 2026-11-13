@@ -16,7 +16,7 @@ use build_server::{
 use ops::{Generation, KernelEntry};
 use platform::{DeviceAllocation, DeviceId, Stream};
 use proto::module::ModuleSlot;
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 pub(crate) const DEVICE: DeviceId = DeviceId(0);
 

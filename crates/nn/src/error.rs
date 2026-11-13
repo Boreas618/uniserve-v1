@@ -18,7 +18,7 @@ pub enum Error {
     /// A tensor operation was refused: operands of other shapes, element types or devices than
     /// the operation takes.
     #[error(transparent)]
-    Tensor(uniserve_tensor::Error),
+    Tensor(tensor::Error),
 
     /// The device backend refused a call: a launch, an allocation, a collective or a profiler
     /// range. A refused launch names its operator and its key.
@@ -164,27 +164,25 @@ impl Error {
     }
 }
 
-impl From<uniserve_tensor::Error> for Error {
+impl From<tensor::Error> for Error {
     /// The tensor library's failure, with the typed cause recovered when the failure is one the
     /// tensor library carried for this crate or for the backend.
-    fn from(error: uniserve_tensor::Error) -> Self {
+    fn from(error: tensor::Error) -> Self {
         match error {
             // A captured backtrace wraps the failure it was taken for.
-            uniserve_tensor::Error::WithBacktrace { inner, backtrace } => {
-                match Self::from(*inner) {
-                    Self::Tensor(inner) => Self::Tensor(uniserve_tensor::Error::WithBacktrace {
-                        inner: Box::new(inner),
-                        backtrace,
-                    }),
-                    typed => typed,
-                }
-            }
+            tensor::Error::WithBacktrace { inner, backtrace } => match Self::from(*inner) {
+                Self::Tensor(inner) => Self::Tensor(tensor::Error::WithBacktrace {
+                    inner: Box::new(inner),
+                    backtrace,
+                }),
+                typed => typed,
+            },
 
-            uniserve_tensor::Error::Backend(source) => match source.downcast::<Self>() {
+            tensor::Error::Backend(source) => match source.downcast::<Self>() {
                 Ok(own) => *own,
                 Err(source) => match source.downcast::<backend::Error>() {
                     Ok(backend) => Self::Backend(*backend),
-                    Err(source) => Self::Tensor(uniserve_tensor::Error::Backend(source)),
+                    Err(source) => Self::Tensor(tensor::Error::Backend(source)),
                 },
             },
 
@@ -193,7 +191,7 @@ impl From<uniserve_tensor::Error> for Error {
     }
 }
 
-impl From<Error> for uniserve_tensor::Error {
+impl From<Error> for tensor::Error {
     /// This crate's failure as the tensor library carries it across `Module::forward`.
     fn from(error: Error) -> Self {
         match error {
@@ -214,7 +212,7 @@ mod tests {
     #[test]
     fn a_failure_carried_by_the_tensor_library_comes_back_as_the_variant_it_was_raised_as() {
         let raised = Error::shape("rms_norm", "a weight of 4 elements for rows of 8");
-        let carried = uniserve_tensor::Error::from(raised);
+        let carried = tensor::Error::from(raised);
         assert!(matches!(
             Error::from(carried),
             Error::Shape {
@@ -226,7 +224,7 @@ mod tests {
         let backend = backend::Error::NoContext {
             operation: "a launch",
         };
-        let carried = uniserve_tensor::Error::from(Error::from(backend));
+        let carried = tensor::Error::from(Error::from(backend));
         assert!(matches!(
             Error::from(carried),
             Error::Backend(backend::Error::NoContext { .. })
@@ -235,10 +233,10 @@ mod tests {
 
     #[test]
     fn a_tensor_operation_s_own_refusal_stays_the_tensor_library_s() {
-        let refused = uniserve_tensor::Error::RequiresContiguous { op: "all_reduce" };
+        let refused = tensor::Error::RequiresContiguous { op: "all_reduce" };
         assert!(matches!(
             Error::from(refused),
-            Error::Tensor(uniserve_tensor::Error::RequiresContiguous { .. })
+            Error::Tensor(tensor::Error::RequiresContiguous { .. })
         ));
     }
 }

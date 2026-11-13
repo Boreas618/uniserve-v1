@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::{Error, Result, abi, platform};
 

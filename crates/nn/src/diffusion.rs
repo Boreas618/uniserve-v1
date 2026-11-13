@@ -33,7 +33,7 @@
 //! it as an input and one capture serves every step of the trajectory. The functions return the
 //! advanced sample; a model writes it into the latents execution lends with `slice_set`.
 
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use crate::capability::Step;
 use crate::error::{Error, Result};

@@ -1,7 +1,9 @@
+#![cfg(test)]
+
 #[macro_use]
 mod common;
 
-use uniserve_tensor::{Device, IndexOp, Result, Tensor};
+use tensor::{Device, IndexOp, Result, Tensor};
 
 // ============================================================================
 // PyTorch Exact Comparison Tests
@@ -337,7 +339,7 @@ output = F.interpolate(input, size=(128, 128), mode='bilinear', align_corners=Fa
 fn bilinear_pytorch_large_64x64_to_128x128(dev: &Device) -> Result<()> {
     // Test large tensor for numerical stability
     // We'll just verify dimensions and that output is finite
-    use uniserve_tensor::DType;
+    use tensor::DType;
 
     let input = common::sample(0, (1, 1, 64, 64), dev)?;
     let output = input.upsample_bilinear2d(128, 128, false)?;

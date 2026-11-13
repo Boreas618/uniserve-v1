@@ -41,7 +41,7 @@
 //! The comparison is `|candidate − reference| ≤ atol + rtol·magnitude`, where the magnitude is
 //! `|reference|`, or the output's largest `|reference|` for a bound that [`Tolerance::cancels`].
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 /// How far one implementation of an operator may be from another.
 #[derive(Clone, Copy, PartialEq, Debug)]

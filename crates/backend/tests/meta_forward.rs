@@ -9,7 +9,7 @@
 
 use backend::{Context, Error, cuda, empty, external, meta, operand, retained};
 use ops::platform::{DeviceRange, PlatformDevicePtr};
-use uniserve_tensor::{D, DType, Device, DeviceLocation, Result, Shape, Tensor};
+use tensor::{D, DType, Device, DeviceLocation, Result, Shape, Tensor};
 
 /// The key of a primitive compiled for the block the backend launches with.
 const TAIL: &str = "block_1024_pdl_false";
@@ -55,17 +55,17 @@ fn address(tensor: &Tensor) -> u64 {
 }
 
 /// The tensor library's error without the backtrace it carries when backtraces are captured.
-fn plain(error: &uniserve_tensor::Error) -> &uniserve_tensor::Error {
+fn plain(error: &tensor::Error) -> &tensor::Error {
     match error {
-        uniserve_tensor::Error::WithBacktrace { inner, .. } => plain(inner),
+        tensor::Error::WithBacktrace { inner, .. } => plain(inner),
         error => error,
     }
 }
 
 /// The backend's own error under a tensor library error.
-fn cause(error: &uniserve_tensor::Error) -> &Error {
+fn cause(error: &tensor::Error) -> &Error {
     match plain(error) {
-        uniserve_tensor::Error::Backend(error) => error
+        tensor::Error::Backend(error) => error
             .downcast_ref::<Error>()
             .expect("a backend error of this crate"),
         other => panic!("expected a backend error, not {other}"),
@@ -409,7 +409,7 @@ fn an_integer_operation_on_floats_and_a_sigmoid_of_integers_are_refused() {
     // A scalar that is no value of the element type never reaches the backend.
     assert!(matches!(
         plain(&(&counts * 0.5).unwrap_err()),
-        uniserve_tensor::Error::Msg(_)
+        tensor::Error::Msg(_)
     ));
 
     assert!(context.take_launches().is_empty());
@@ -844,7 +844,7 @@ fn a_host_tensor_and_a_backend_tensor_do_not_meet_in_one_operation() {
     for refused in [host.add(&device), device.add(&host)] {
         assert!(matches!(
             plain(&refused.unwrap_err()),
-            uniserve_tensor::Error::DeviceMismatchBinaryOp { .. }
+            tensor::Error::DeviceMismatchBinaryOp { .. }
         ));
     }
     assert!(host.matmul(&device.reshape((8, 1)).unwrap()).is_err());

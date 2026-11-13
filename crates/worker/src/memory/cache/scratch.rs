@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use nn::KvPlanes;
 use platform::{Buffer, CopyBatch, DeviceId, PoolKind, SourceOrder, Stream, memset_d8, memset_d32};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::layout::{CacheLayout, GroupLayout};
 use super::planes::Planes;

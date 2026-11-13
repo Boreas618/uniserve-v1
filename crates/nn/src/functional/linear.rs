@@ -17,7 +17,7 @@ use ops::fp4::{
 };
 use ops::fp8::{E4M3_MAX, Fp8Gemm, Fp8GemmArgs, Fp8GemmDescriptor};
 use ops::gemm::{Args, Descriptor, Epilogue, Gemm};
-use uniserve_tensor::{D, DType, Tensor};
+use tensor::{D, DType, Tensor};
 
 use super::nvfp4::{decoded, encoded, launch_quantize};
 use super::{ACCUMULATE, as_rows, columns, like_rows, on_cpu, vector};

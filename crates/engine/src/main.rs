@@ -30,14 +30,14 @@ use service::logging;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// The model families this executable loads. A model is added with its crate
-/// and one entry here, and its request-processing side in
+/// The model families this executable loads. A model is added with its module
+/// of `models` and one entry here, and its request-processing side in
 /// `processing::FAMILIES`, which the daemon serves.
 const FAMILIES: [nn::family::Family; 4] = [
-    qwen3::family::FAMILY,
-    qwen3::family::HYBRID_FAMILY,
-    qwen4_exp::family::FAMILY,
-    minimax_h3::family::FAMILY,
+    models::qwen3::family::FAMILY,
+    models::qwen3::family::HYBRID_FAMILY,
+    models::qwen4_exp::family::FAMILY,
+    models::minimax_h3::family::FAMILY,
 ];
 
 /// The engine's command line.

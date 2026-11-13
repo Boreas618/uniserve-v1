@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use ops::{Generation, Tolerance, Twins};
 use platform::{DeviceId, Event, EventFlags, PinnedBuffer, Stream};
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::{Error, Result, lock};
 
@@ -331,7 +331,7 @@ fn element<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N]> {
 #[cfg(test)]
 mod tests {
     use ops::Tolerance;
-    use uniserve_tensor::DType;
+    use tensor::DType;
 
     use super::compare_elements;
 

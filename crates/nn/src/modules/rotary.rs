@@ -33,7 +33,7 @@
 use std::f64::consts::PI;
 
 use ops::rope::MAX_AXES;
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use crate::config::Fields;
 use crate::error::{Error, Result};

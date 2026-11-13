@@ -34,7 +34,7 @@
 //! one product.
 
 use ops::fp4::{BLOCK_ELEMENTS, ScaleLayout};
-use uniserve_tensor::{DType, Module, Shape, Tensor};
+use tensor::{DType, Module, Shape, Tensor};
 
 use crate::collective::{self, Split};
 use crate::error::{Error, Result};
@@ -572,7 +572,7 @@ impl Linear {
 }
 
 impl Module for Linear {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }

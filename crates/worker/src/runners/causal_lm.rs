@@ -141,7 +141,7 @@ use nn::{KvCache, PhaseKind, RecurrentState, TokenBatch, VerifySlots};
 use platform::Stream;
 use proto::module::commit::COMMIT_FIELDS;
 use proto::module::sampler::{PARAMETER_COLUMNS, TEMPERATURE};
-use uniserve_tensor::{DType, Shape, Tensor};
+use tensor::{DType, Shape, Tensor};
 
 use self::columns::{Column, Layout, Refusal};
 use self::experts::Member;

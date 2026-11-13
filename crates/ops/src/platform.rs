@@ -36,7 +36,7 @@ pub use platform::{
 
 pub use crate::tensor::DevicePtr;
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 /// The device address a launch parameter carries.
 pub(crate) fn address(pointer: DevicePtr) -> u64 {

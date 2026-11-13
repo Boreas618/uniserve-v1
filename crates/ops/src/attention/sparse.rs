@@ -72,7 +72,7 @@ use crate::platform::Stream;
 use crate::tensor::{Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
-use uniserve_tensor::DType;
+use tensor::DType;
 
 /// The largest value magnitude the sparse attention bound's absolute term is written for.
 ///

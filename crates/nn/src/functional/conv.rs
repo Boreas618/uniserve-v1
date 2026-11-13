@@ -31,7 +31,7 @@
 
 use ops::conv::{Args, Conv1d, Conv3d, ConvTranspose1d, Descriptor};
 use ops::frame::is_channels_last;
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use super::on_cpu;
 use crate::error::{Error, Result};

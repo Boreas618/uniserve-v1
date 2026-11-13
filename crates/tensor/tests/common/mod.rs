@@ -11,16 +11,12 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use uniserve_tensor::backend::{BackendDevice, BackendStorage};
-use uniserve_tensor::conv::{
-    ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D,
-};
-use uniserve_tensor::cpu_backend::CpuDevice;
-use uniserve_tensor::op::{BinaryOp, CmpOp, ReduceOp, UnaryOp};
-use uniserve_tensor::scalar::Scalar;
-use uniserve_tensor::{
-    bail, CpuStorage, DType, Device, DeviceLocation, Layout, Result, Shape, Tensor,
-};
+use tensor::backend::{BackendDevice, BackendStorage};
+use tensor::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
+use tensor::cpu_backend::CpuDevice;
+use tensor::op::{BinaryOp, CmpOp, ReduceOp, UnaryOp};
+use tensor::scalar::Scalar;
+use tensor::{CpuStorage, DType, Device, DeviceLocation, Layout, Result, Shape, Tensor, bail};
 
 /// Runs the test function `$test`, which takes a `&Device` and returns a `Result`, once on the
 /// CPU device and once on the host backend device, as the tests `$test::cpu` and
@@ -30,7 +26,7 @@ macro_rules! test_device {
         mod $test {
             #[test]
             fn cpu() {
-                super::$test(&uniserve_tensor::Device::Cpu).unwrap()
+                super::$test(&tensor::Device::Cpu).unwrap()
             }
 
             #[test]
@@ -43,13 +39,13 @@ macro_rules! test_device {
 
 /// The backend device `ordinal` of kind `host`. Two of them are the same device when their
 /// ordinals are equal.
-pub fn host_device(ordinal: usize) -> Device {
+pub(crate) fn host_device(ordinal: usize) -> Device {
     Device::Backend(Arc::new(HostDevice { ordinal }))
 }
 
 /// A tensor of F32 values in `[-1, 1)` that depend on `seed` only, for tests whose expected
 /// values are computed from their inputs.
-pub fn sample<S: Into<Shape>>(seed: u64, shape: S, device: &Device) -> Result<Tensor> {
+pub(crate) fn sample<S: Into<Shape>>(seed: u64, shape: S, device: &Device) -> Result<Tensor> {
     let shape = shape.into();
 
     // SplitMix64: consecutive states are well mixed whatever the seed.
@@ -71,12 +67,12 @@ pub fn sample<S: Into<Shape>>(seed: u64, shape: S, device: &Device) -> Result<Te
 }
 
 #[derive(Debug)]
-pub struct HostDevice {
+pub(crate) struct HostDevice {
     ordinal: usize,
 }
 
 #[derive(Debug)]
-pub struct HostStorage {
+pub(crate) struct HostStorage {
     storage: CpuStorage,
     device: Arc<HostDevice>,
 }
@@ -84,33 +80,33 @@ pub struct HostStorage {
 impl HostStorage {
     /// The storage of a backend tensor as this backend's storage; an error when it belongs to
     /// another backend.
-    pub fn from_dyn(storage: &dyn BackendStorage) -> Result<&Self> {
+    pub(crate) fn from_dyn(storage: &dyn BackendStorage) -> Result<&Self> {
         match storage.as_any().downcast_ref::<Self>() {
             Some(storage) => Ok(storage),
             None => bail!("expected a host storage, got {storage:?}"),
         }
     }
 
-    pub fn from_dyn_mut(storage: &mut dyn BackendStorage) -> Result<&mut Self> {
+    pub(crate) fn from_dyn_mut(storage: &mut dyn BackendStorage) -> Result<&mut Self> {
         match storage.as_any_mut().downcast_mut::<Self>() {
             Some(storage) => Ok(storage),
             None => bail!("expected a host storage"),
         }
     }
 
-    pub fn cpu(&self) -> &CpuStorage {
+    pub(crate) fn cpu(&self) -> &CpuStorage {
         &self.storage
     }
 
-    pub fn cpu_mut(&mut self) -> &mut CpuStorage {
+    pub(crate) fn cpu_mut(&mut self) -> &mut CpuStorage {
         &mut self.storage
     }
 
     /// A storage on the device of `self` holding `storage`.
-    pub fn on_same_device(&self, storage: CpuStorage) -> Box<dyn BackendStorage> {
+    pub(crate) fn on_same_device(&self, storage: CpuStorage) -> Box<dyn BackendStorage> {
         Box::new(Self {
             storage,
-            device: self.device.clone(),
+            device: Arc::clone(&self.device),
         })
     }
 }
@@ -145,8 +141,11 @@ impl BackendDevice for HostDevice {
     }
 
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
-        let storage = CpuDevice.alloc_uninit(shape, dtype)?;
-        Ok(self.storage(storage))
+        // SAFETY: the caller writes every element before it reads one, as this method requires.
+        unsafe {
+            let storage = CpuDevice.alloc_uninit(shape, dtype)?;
+            Ok(self.storage(storage))
+        }
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Box<dyn BackendStorage>> {
@@ -183,7 +182,7 @@ impl BackendStorage for HostStorage {
     }
 
     fn device(&self) -> Arc<dyn BackendDevice> {
-        self.device.clone()
+        Arc::<HostDevice>::clone(&self.device)
     }
 
     fn try_clone(&self, _layout: &Layout) -> Result<Box<dyn BackendStorage>> {
@@ -496,4 +495,55 @@ impl BackendStorage for HostStorage {
         )?;
         Ok(self.on_same_device(storage))
     }
+}
+
+/// Asserts that `t1` and `t2` have one shape and equal elements.
+pub(crate) fn assert_tensor_eq(t1: &Tensor, t2: &Tensor) -> Result<()> {
+    assert_eq!(t1.shape(), t2.shape());
+    // Default U8 may not be large enough to hold the sum (`t.sum_all` defaults to the dtype of `t`)
+    let eq_tensor = t1.eq(t2)?.to_dtype(DType::U32)?;
+    let all_equal = eq_tensor.sum_all()?;
+    assert_eq!(all_equal.to_scalar::<u32>()?, eq_tensor.elem_count() as u32);
+    Ok(())
+}
+
+/// The F32 scalar `t` rounded to `digits` decimal digits.
+pub(crate) fn to_vec0_round(t: &Tensor, digits: i32) -> Result<f32> {
+    let b = 10f32.powi(digits);
+    let t = t.to_vec0::<f32>()?;
+    Ok(f32::round(t * b) / b)
+}
+
+/// The F32 vector `t` with each element rounded to `digits` decimal digits.
+pub(crate) fn to_vec1_round(t: &Tensor, digits: i32) -> Result<Vec<f32>> {
+    let b = 10f32.powi(digits);
+    let t = t.to_vec1::<f32>()?;
+    let t = t.iter().map(|t| f32::round(t * b) / b).collect();
+    Ok(t)
+}
+
+/// The F32 matrix `t` with each element rounded to `digits` decimal digits.
+pub(crate) fn to_vec2_round(t: &Tensor, digits: i32) -> Result<Vec<Vec<f32>>> {
+    let b = 10f32.powi(digits);
+    let t = t.to_vec2::<f32>()?;
+    let t = t
+        .iter()
+        .map(|t| t.iter().map(|t| f32::round(t * b) / b).collect())
+        .collect();
+    Ok(t)
+}
+
+/// The F32 rank-3 tensor `t` with each element rounded to `digits` decimal digits.
+pub(crate) fn to_vec3_round(t: &Tensor, digits: i32) -> Result<Vec<Vec<Vec<f32>>>> {
+    let b = 10f32.powi(digits);
+    let t = t.to_vec3::<f32>()?;
+    let t = t
+        .iter()
+        .map(|t| {
+            t.iter()
+                .map(|t| t.iter().map(|t| f32::round(t * b) / b).collect())
+                .collect()
+        })
+        .collect();
+    Ok(t)
 }

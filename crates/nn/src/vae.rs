@@ -32,7 +32,7 @@
 
 use std::ops::Range;
 
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use crate::capability::Splice;
 use crate::collective;

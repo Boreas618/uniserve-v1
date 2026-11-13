@@ -81,7 +81,7 @@ use platform::{
     Buffer, CopyBatch, DeviceId, DevicePtr, DeviceRange, Event, EventFlags, PoolKind, SourceOrder,
     Stream,
 };
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use crate::memory::cache::{CacheLayout, KvCacheConfig, KvCacheMemory};
 use crate::memory::lend;

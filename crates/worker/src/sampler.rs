@@ -696,8 +696,8 @@ mod tests {
     use nn::Device;
     use proto::module::commit::mode;
     use proto::module::sampler::TOP_P;
-    use uniserve_tensor::WithDType;
-    use uniserve_tensor::shape::ShapeWithOneHole;
+    use tensor::WithDType;
+    use tensor::shape::ShapeWithOneHole;
 
     use super::*;
 

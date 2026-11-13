@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use backend::allocator::ALIGNMENT;
 use ops::values::{bf16_to_f32, f16_to_f32, f32_to_f16};
 use sha2::{Digest, Sha256};
-use uniserve_tensor::{CpuStorage, DType, Device, Shape, Storage, Tensor};
+use tensor::{CpuStorage, DType, Device, Shape, Storage, Tensor};
 
 use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};
 use crate::error::{Error, Result};

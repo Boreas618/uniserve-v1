@@ -50,7 +50,7 @@
 //! with its scores. The drafts a call proposes are added by `speculation::propose`.
 
 use ipc::batch::{CallOutput, CallStatus, Columns, ErrorCode};
-use uniserve_tensor::{Tensor, WithDType};
+use tensor::{Tensor, WithDType};
 
 use super::columns::Refusal;
 use super::speculation::token_rows;

@@ -23,7 +23,7 @@ use ops::norm::{
     RmsNormDescriptor,
 };
 use ops::residual::{WeightedRmsNorm, WeightedRmsNormArgs, WeightedRmsNormDescriptor};
-use uniserve_tensor::{D, DType, Tensor};
+use tensor::{D, DType, Tensor};
 
 use super::{PDL, as_rows, columns, like_rows, on_cpu, row_tile, same_rows, vector};
 use crate::error::{Error, Result};

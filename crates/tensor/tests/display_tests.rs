@@ -1,5 +1,7 @@
+#![cfg(test)]
+
 use anyhow::Result;
-use uniserve_tensor::{DType, Device::Cpu, Tensor};
+use tensor::{DType, Device::Cpu, Tensor};
 
 #[test]
 fn display_scalar() -> Result<()> {

@@ -10,7 +10,7 @@
 //! distinct; two tokens that name one row leave either's.
 
 use ops::rows::{Args, Descriptor, Mode, Rows};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::{PDL, on_cpu};
 use crate::error::{Error, Result};

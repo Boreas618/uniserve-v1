@@ -31,7 +31,7 @@ use std::sync::Arc;
 use ipc::batch::{Batch, Rows, VisionRows};
 use nn::family::TextModel;
 use platform::Stream;
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use crate::memory::allocation::Storage;
 use crate::memory::buffers::BufferMemory;
@@ -341,7 +341,7 @@ mod tests {
 
     use ipc::batch::{Batch, BatchId, Columns, Phase, Row, Rows, Shape, Variant, VisionRows};
     use storage::runtime::GroupId;
-    use uniserve_tensor::DType;
+    use tensor::DType;
 
     use super::Features;
     use crate::memory::buffers::BufferMemory;

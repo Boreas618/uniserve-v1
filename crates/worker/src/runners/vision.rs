@@ -45,7 +45,7 @@ use ipc::batch::{Batch, BatchOutput, MediaRow, Phase, TimingCounters, Variant};
 use nn::capability::{PatchFormat, Vision};
 use nn::family::TextModel;
 use platform::Stream;
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::{DeviceCopy, address, conditions, element_bytes, issue, performed, refused, settle};
 use crate::buckets::Bucket;
@@ -556,7 +556,7 @@ pub(crate) mod tests {
     use nn::{Drafter, ExpertExchange, KvCache, RecurrentState, TokenBatch};
     use ops::Generation;
     use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Run};
-    use uniserve_tensor::{DType, Device, Tensor};
+    use tensor::{DType, Device, Tensor};
 
     use super::VisionRunner;
     use crate::buckets::Bucket;

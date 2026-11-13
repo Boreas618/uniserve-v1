@@ -1,4 +1,5 @@
-use crate::{Result, Tensor};
+use crate::tensor::from_storage;
+use crate::{Result, Storage, Tensor};
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -56,16 +57,14 @@ impl ArgSort {
     }
 }
 
-impl crate::CustomOp1 for ArgSort {
-    fn name(&self) -> &'static str {
-        "argsort"
-    }
-
+impl ArgSort {
+    /// The sorting indices of `storage` viewed through `layout`, along its last dimension, as a
+    /// U32 storage of the layout's shape.
     fn cpu_fwd(
         &self,
         storage: &crate::CpuStorage,
         layout: &crate::Layout,
-    ) -> Result<(crate::CpuStorage, crate::Shape)> {
+    ) -> Result<crate::CpuStorage> {
         let sort_indexes = match storage {
             crate::CpuStorage::U8(vs) => self.asort(vs, layout)?,
             crate::CpuStorage::U32(vs) => self.asort(vs, layout)?,
@@ -81,24 +80,23 @@ impl crate::CustomOp1 for ArgSort {
             crate::CpuStorage::F6E2M3(_) => {
                 return Err(
                     crate::Error::UnsupportedDTypeForOp(crate::DType::F6E2M3, "argsort").bt(),
-                )
+                );
             }
             crate::CpuStorage::F6E3M2(_) => {
                 return Err(
                     crate::Error::UnsupportedDTypeForOp(crate::DType::F6E3M2, "argsort").bt(),
-                )
+                );
             }
             crate::CpuStorage::F4(_) => {
-                return Err(crate::Error::UnsupportedDTypeForOp(crate::DType::F4, "argsort").bt())
+                return Err(crate::Error::UnsupportedDTypeForOp(crate::DType::F4, "argsort").bt());
             }
             crate::CpuStorage::F8E8M0(_) => {
                 return Err(
                     crate::Error::UnsupportedDTypeForOp(crate::DType::F8E8M0, "argsort").bt(),
-                )
+                );
             }
         };
-        let sort_indexes = crate::CpuStorage::U32(sort_indexes);
-        Ok((sort_indexes, layout.shape().into()))
+        Ok(crate::CpuStorage::U32(sort_indexes))
     }
 }
 
@@ -121,7 +119,12 @@ impl Tensor {
             None => crate::bail!("empty last-dim in arg-sort"),
             Some(last_dim) => *last_dim,
         };
-        self.apply_op1(&ArgSort { asc, last_dim })
+        let sort = ArgSort { asc, last_dim };
+        let storage = match &*self.storage() {
+            Storage::Cpu(storage) => Storage::Cpu(sort.cpu_fwd(storage, self.layout())?),
+            Storage::Backend(_) => crate::bail!("no backend implementation for argsort"),
+        };
+        Ok(from_storage(storage, self.shape().clone()))
     }
 
     /// Sorts the tensor along the last dimension, returns the sorted tensor together with the

@@ -1,4 +1,4 @@
-use crate::{shape::Dim, Context, Error, Result, Shape, Tensor};
+use crate::{Context, Error, Result, Shape, Tensor, shape::Dim};
 
 impl Tensor {
     /// Concatenates two or more tensors along a particular dimension.
@@ -7,7 +7,7 @@ impl Tensor {
     /// the same rank
     ///
     /// ```rust
-    /// # use uniserve_tensor::{Tensor, DType, Device};
+    /// # use tensor::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     ///
@@ -16,7 +16,7 @@ impl Tensor {
     ///
     /// let c = Tensor::cat(&[&a, &b], 1)?;
     /// assert_eq!(c.shape().dims(), &[2, 6]);
-    /// # Ok::<(), uniserve_tensor::Error>(())
+    /// # Ok::<(), tensor::Error>(())
     /// ```
     pub fn cat<A: AsRef<Tensor>, D: Dim>(args: &[A], dim: D) -> Result<Self> {
         if args.is_empty() {
@@ -141,6 +141,9 @@ impl Tensor {
             offsets.push(next_offset);
         }
         let shape = Shape::from(cat_dims);
+        // SAFETY: the copies below write every element: the arguments' extents along the
+        // concatenated dimension sum to the result's, and each argument is copied at its own
+        // offset.
         let mut storage = unsafe { device.alloc_uninit(&shape, dtype)? };
         for (arg, &offset) in args.iter().zip(offsets.iter()) {
             let arg = arg.as_ref();
@@ -214,6 +217,9 @@ impl Tensor {
         let cat_target_dim_len = cat_dims[dim];
         let block_size: usize = cat_dims.iter().skip(1 + dim).product();
         let shape = Shape::from(cat_dims);
+        // SAFETY: the copies below write every element: the arguments' extents along the
+        // concatenated dimension sum to the result's, and each argument is copied into its own
+        // columns.
         let mut storage = unsafe { device.alloc_uninit(&shape, dtype)? };
         let mut dst_o = 0;
         for arg in args.iter() {

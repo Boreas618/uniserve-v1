@@ -65,13 +65,11 @@ use ops::gemm::{Epilogue, Gemm, WeightOrder};
 use ops::index::Index;
 use ops::reduce::Reduce;
 use ops::{Operand, cast, conv, copy_strided, gemm, index, reduce};
-use uniserve_tensor::backend::{BackendDevice, BackendStorage};
-use uniserve_tensor::conv::{
-    ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D,
-};
-use uniserve_tensor::op::{BinaryOp, CmpOp, ReduceOp, UnaryOp};
-use uniserve_tensor::scalar::Scalar;
-use uniserve_tensor::{CpuStorage, DType, Layout, Shape};
+use tensor::backend::{BackendDevice, BackendStorage};
+use tensor::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
+use tensor::op::{BinaryOp, CmpOp, ReduceOp, UnaryOp};
+use tensor::scalar::Scalar;
+use tensor::{CpuStorage, DType, Layout, Shape};
 
 use crate::storage::CudaStorage;
 use crate::{Error, Result, launch};
@@ -609,7 +607,7 @@ impl BackendStorage for CudaStorage {
         Self::device(self)
     }
 
-    fn try_clone(&self, _layout: &Layout) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    fn try_clone(&self, _layout: &Layout) -> tensor::Result<Box<dyn BackendStorage>> {
         // The copy keeps every element at its position, so it is the whole storage that moves.
         let whole = Layout::contiguous(self.elements());
         let source = self.operand(&whole)?;
@@ -623,7 +621,7 @@ impl BackendStorage for CudaStorage {
         Ok(Box::new(clone))
     }
 
-    fn to_cpu_storage(&self) -> uniserve_tensor::Result<CpuStorage> {
+    fn to_cpu_storage(&self) -> tensor::Result<CpuStorage> {
         Ok(self.read()?)
     }
 
@@ -632,7 +630,7 @@ impl BackendStorage for CudaStorage {
         layout: &Layout,
         mul: f64,
         add: f64,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(self.map(
             UnaryFunction::Affine,
             [mul, add],
@@ -640,11 +638,7 @@ impl BackendStorage for CudaStorage {
         )?))
     }
 
-    fn powf(
-        &self,
-        layout: &Layout,
-        exponent: f64,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    fn powf(&self, layout: &Layout, exponent: f64) -> tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(self.map(
             UnaryFunction::Powf,
             [exponent, 0.0],
@@ -652,7 +646,7 @@ impl BackendStorage for CudaStorage {
         )?))
     }
 
-    fn elu(&self, layout: &Layout, alpha: f64) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    fn elu(&self, layout: &Layout, alpha: f64) -> tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(self.map(
             UnaryFunction::Elu,
             [alpha, 0.0],
@@ -660,11 +654,7 @@ impl BackendStorage for CudaStorage {
         )?))
     }
 
-    fn unary(
-        &self,
-        op: UnaryOp,
-        layout: &Layout,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    fn unary(&self, op: UnaryOp, layout: &Layout) -> tensor::Result<Box<dyn BackendStorage>> {
         let function = match op {
             UnaryOp::Exp => UnaryFunction::Exp,
             UnaryOp::Log => UnaryFunction::Log,
@@ -697,7 +687,7 @@ impl BackendStorage for CudaStorage {
         rhs: &dyn BackendStorage,
         lhs_layout: &Layout,
         rhs_layout: &Layout,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         let function = match op {
             BinaryOp::Add => BinaryFunction::Add,
             BinaryOp::Mul => BinaryFunction::Mul,
@@ -722,7 +712,7 @@ impl BackendStorage for CudaStorage {
         rhs: &dyn BackendStorage,
         lhs_layout: &Layout,
         rhs_layout: &Layout,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         let function = match op {
             CmpOp::Eq => BinaryFunction::Eq,
             CmpOp::Ne => BinaryFunction::Ne,
@@ -742,7 +732,7 @@ impl BackendStorage for CudaStorage {
         true_layout: &Layout,
         on_false: &dyn BackendStorage,
         false_layout: &Layout,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         let on_true = Self::of(on_true)?;
         let on_false = Self::of(on_false)?;
 
@@ -768,7 +758,7 @@ impl BackendStorage for CudaStorage {
         op: ReduceOp,
         layout: &Layout,
         dims: &[usize],
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         let function = match op {
             ReduceOp::Sum => reduce::Function::Sum,
             ReduceOp::Min => reduce::Function::Min,
@@ -780,15 +770,11 @@ impl BackendStorage for CudaStorage {
         Ok(Box::new(self.folded(function, layout, dims)?))
     }
 
-    fn to_dtype(
-        &self,
-        layout: &Layout,
-        dtype: DType,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    fn to_dtype(&self, layout: &Layout, dtype: DType) -> tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(self.converted(layout, dtype)?))
     }
 
-    fn view(&self, dtype: DType) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    fn view(&self, dtype: DType) -> tensor::Result<Box<dyn BackendStorage>> {
         Ok(Box::new(self.reinterpreted(dtype)?))
     }
 
@@ -798,7 +784,7 @@ impl BackendStorage for CudaStorage {
         bmnk: (usize, usize, usize, usize),
         lhs_layout: &Layout,
         rhs_layout: &Layout,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         let rhs = Self::of(rhs)?;
 
         Ok(Box::new(self.product(rhs, bmnk, lhs_layout, rhs_layout)?))
@@ -810,7 +796,7 @@ impl BackendStorage for CudaStorage {
         layout: &Layout,
         ids_layout: &Layout,
         dim: usize,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         let mut dims = layout.dims().to_vec();
         dims[dim] = ids_layout.shape().elem_count();
 
@@ -824,7 +810,7 @@ impl BackendStorage for CudaStorage {
         ids: &dyn BackendStorage,
         ids_layout: &Layout,
         dim: usize,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         let indices = Self::of(ids)?.operand(ids_layout)?;
 
         Ok(Box::new(self.gathered(
@@ -843,7 +829,7 @@ impl BackendStorage for CudaStorage {
         src: &dyn BackendStorage,
         src_layout: &Layout,
         dim: usize,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         // The result is a copy of `self` that the slices of `src` are then added into.
         let result = self.packed(layout)?;
         let destination = result.operand(&Layout::contiguous(layout.shape().clone()))?;
@@ -871,7 +857,7 @@ impl BackendStorage for CudaStorage {
         src: &dyn BackendStorage,
         src_layout: &Layout,
         dim: usize,
-    ) -> uniserve_tensor::Result<()> {
+    ) -> tensor::Result<()> {
         let source = Self::of(src)?.operand(src_layout)?;
         let indices = Self::of(ids)?.operand(ids_layout)?;
         let destination = self.operand(layout)?;
@@ -893,7 +879,7 @@ impl BackendStorage for CudaStorage {
         src: &dyn BackendStorage,
         src_layout: &Layout,
         dim: usize,
-    ) -> uniserve_tensor::Result<()> {
+    ) -> tensor::Result<()> {
         let source = Self::of(src)?.operand(src_layout)?;
         let indices = Self::of(ids)?.operand(ids_layout)?;
         let destination = self.operand(layout)?;
@@ -912,7 +898,7 @@ impl BackendStorage for CudaStorage {
         dst: &mut dyn BackendStorage,
         dst_offset: usize,
         src_layout: &Layout,
-    ) -> uniserve_tensor::Result<()> {
+    ) -> tensor::Result<()> {
         let source = self.operand(src_layout)?;
         let destination = Self::of(dst)?.operand(&Layout::contiguous_with_offset(
             src_layout.shape().clone(),
@@ -934,7 +920,7 @@ impl BackendStorage for CudaStorage {
         dst_stride1: usize,
         src_offset: usize,
         dst_offset: usize,
-    ) -> uniserve_tensor::Result<()> {
+    ) -> tensor::Result<()> {
         // `d1` rows of `d2` contiguous elements, the rows a stride apart on each side.
         let rows = |stride: usize, offset: usize| {
             Layout::new(Shape::from_dims(&[d1, d2]), vec![stride, 1], offset)
@@ -948,9 +934,9 @@ impl BackendStorage for CudaStorage {
         Ok(())
     }
 
-    fn const_set(&mut self, value: Scalar, layout: &Layout) -> uniserve_tensor::Result<()> {
+    fn const_set(&mut self, value: Scalar, layout: &Layout) -> tensor::Result<()> {
         if value.dtype() != self.dtype() {
-            return Err(uniserve_tensor::Error::DTypeMismatchBinaryOp {
+            return Err(tensor::Error::DTypeMismatchBinaryOp {
                 lhs: self.dtype(),
                 rhs: value.dtype(),
                 op: "const-set",
@@ -967,7 +953,7 @@ impl BackendStorage for CudaStorage {
         kernel: &dyn BackendStorage,
         kernel_layout: &Layout,
         params: &ParamsConv1D,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         const NAME: &str = "conv1d";
 
         let descriptor = convolution(
@@ -998,7 +984,7 @@ impl BackendStorage for CudaStorage {
         kernel: &dyn BackendStorage,
         kernel_layout: &Layout,
         params: &ParamsConvTranspose1D,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         const NAME: &str = "conv_transpose1d";
 
         if params.output_padding != 0 {
@@ -1038,7 +1024,7 @@ impl BackendStorage for CudaStorage {
         kernel: &dyn BackendStorage,
         kernel_layout: &Layout,
         params: &ParamsConv2D,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         const NAME: &str = "conv2d";
 
         // The three-dimensional operator over a depth of one: a filter one deep, stepped,
@@ -1076,7 +1062,7 @@ impl BackendStorage for CudaStorage {
         _kernel: &dyn BackendStorage,
         _kernel_layout: &Layout,
         _params: &ParamsConvTranspose2D,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         Err(unsupported(
             "conv_transpose2d",
             "the transposed convolution operator is one-dimensional",
@@ -1089,7 +1075,7 @@ impl BackendStorage for CudaStorage {
         _layout: &Layout,
         _kernel_size: (usize, usize),
         _stride: (usize, usize),
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         Err(unsupported("avg_pool2d", "no operator pools a window").into())
     }
 
@@ -1098,7 +1084,7 @@ impl BackendStorage for CudaStorage {
         _layout: &Layout,
         _kernel_size: (usize, usize),
         _stride: (usize, usize),
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         Err(unsupported("max_pool2d", "no operator pools a window").into())
     }
 
@@ -1106,7 +1092,7 @@ impl BackendStorage for CudaStorage {
         &self,
         _layout: &Layout,
         _size: usize,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         Err(unsupported("upsample_nearest1d", "no operator resamples a tensor").into())
     }
 
@@ -1115,7 +1101,7 @@ impl BackendStorage for CudaStorage {
         _layout: &Layout,
         _height: usize,
         _width: usize,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         Err(unsupported("upsample_nearest2d", "no operator resamples a tensor").into())
     }
 
@@ -1127,7 +1113,7 @@ impl BackendStorage for CudaStorage {
         _align_corners: bool,
         _scale_h: Option<f64>,
         _scale_w: Option<f64>,
-    ) -> uniserve_tensor::Result<Box<dyn BackendStorage>> {
+    ) -> tensor::Result<Box<dyn BackendStorage>> {
         Err(unsupported("upsample_bilinear2d", "no operator resamples a tensor").into())
     }
 }

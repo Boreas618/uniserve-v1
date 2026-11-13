@@ -33,7 +33,7 @@ use ops::rope::{
     FactorsArgs, FactorsDescriptor, MAX_AXES, QkNormRope, QkNormRopeArgs, QkNormRopeDescriptor,
     RopeApply, RopeApplyArgs, RopeApplyDescriptor, RotaryFactors, Rotation,
 };
-use uniserve_tensor::{D, DType, Device, Tensor};
+use tensor::{D, DType, Device, Tensor};
 
 use super::norm::{gain, rms_scaled};
 use super::nvfp4::{integer, remainder};

@@ -24,7 +24,7 @@
 //! have saved at once ([`pool_pages`]). The scheduler decides what is saved and restored and keys
 //! it; the rank only copies, on a stream of its device.
 
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::memory::buffers::BufferMemory;
 use crate::memory::client::StorageClient;

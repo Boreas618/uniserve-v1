@@ -63,7 +63,7 @@ pub mod tables;
 pub mod weights;
 
 use platform::DeviceId;
-use uniserve_tensor::{DType, Shape, Tensor};
+use tensor::{DType, Shape, Tensor};
 
 use crate::Result;
 

@@ -12,7 +12,7 @@ use nn::{Conditioning, Denoiser, LatentShape, Layout, Step, VideoRequest};
 use ops::Generation;
 use storage::Key;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::{DenoiserConfig, DenoiserRunner};
 use crate::graphs::Graphs;

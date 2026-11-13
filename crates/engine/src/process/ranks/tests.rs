@@ -77,7 +77,7 @@ fn succeeded(submission: worker::Result<Submission>) {
 
 /// The ranks of `launch`'s process loaded onto the meta device to their division.
 pub(crate) fn loaded(launch: &EngineArgs) -> Vec<LoadedRank> {
-    let registry = nn::family::Registry::new([qwen3::family::FAMILY]).unwrap();
+    let registry = nn::family::Registry::new([models::qwen3::family::FAMILY]).unwrap();
     let family = crate::resolve(&registry, Path::new(&launch.engine_config.model.model)).unwrap();
     let model_runner = ModelRunner::of(launch, family).unwrap();
 
@@ -312,7 +312,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
 
     // The rank's load and its runners' profile run: every phase of a video request on its one
     // rank, a slot's row holding the largest trajectory, and its group's product sizes.
-    let registry = nn::family::Registry::new([minimax_h3::family::FAMILY]).unwrap();
+    let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let family = crate::resolve(&registry, Path::new(FAST_H3)).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let mut ranks = load_ranks(
@@ -556,7 +556,7 @@ fn the_conditioning_lies_with_the_text_encoder_and_the_denoising_group_reads_it(
     let server = StorageServer::start();
     let launch = split_launch();
 
-    let registry = nn::family::Registry::new([minimax_h3::family::FAMILY]).unwrap();
+    let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let family = crate::resolve(&registry, Path::new(FAST_H3)).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let mut ranks = load_ranks(
@@ -673,7 +673,7 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
     assert_eq!(launch.engine_config.parallel.worker_groups.len(), 9);
 
     // Sixteen ranks, two on each device: text rank `i` and the rank of flow replica `i`.
-    let registry = nn::family::Registry::new([minimax_h3::family::FAMILY]).unwrap();
+    let registry = nn::family::Registry::new([models::minimax_h3::family::FAMILY]).unwrap();
     let family = crate::resolve(&registry, Path::new(FAST_H3)).unwrap();
     let model_runner = ModelRunner::of(&launch, family).unwrap();
     let placed = model_runner.ranks().unwrap();

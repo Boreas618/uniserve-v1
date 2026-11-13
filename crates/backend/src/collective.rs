@@ -31,7 +31,7 @@ use ops::platform::{
     ReduceOp, Stream, collective_group,
 };
 use ops::{Operand, collective_type};
-use uniserve_tensor::Tensor;
+use tensor::Tensor;
 
 use crate::context::{self, Context};
 use crate::{Error, Result, launch, storage};
@@ -568,7 +568,7 @@ fn wait_unless_captured(stream: &Stream) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_tensor::{DType, Device, Tensor};
+    use tensor::{DType, Device, Tensor};
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

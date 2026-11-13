@@ -17,7 +17,7 @@ use ipc::batch::Variant;
 use nn::family::{StateField, TextModel};
 use platform::DeviceId;
 use storage::runtime::Segments;
-use uniserve_tensor::DType;
+use tensor::DType;
 use worker::buckets::Buckets;
 use worker::memory::cache::segments::{self, PlaneSegment};
 use worker::memory::cache::{ATTENTION_WORKSPACE_BYTES, CacheLayout, KvCacheConfig};

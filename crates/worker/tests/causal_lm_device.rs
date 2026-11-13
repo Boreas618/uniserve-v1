@@ -33,7 +33,7 @@ use platform::{DeviceAllocation, DeviceRange, Stream};
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
 use proto::module::sampler::{PARAMETER_COLUMNS, TOP_P};
 use storage::runtime::GroupId;
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 use worker::buckets::Buckets;
 use worker::memory::tables::BlockTables;
 use worker::runners::causal_lm::speculation::DraftPool;

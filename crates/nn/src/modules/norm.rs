@@ -1,7 +1,7 @@
 //! Normalization modules: RMS normalization, its gated form, and layer normalization, each a
 //! per-channel weight over the functions of [`crate::functional`].
 
-use uniserve_tensor::{DType, Module, Tensor};
+use tensor::{DType, Module, Tensor};
 
 use crate::error::{Error, Result};
 use crate::functional;
@@ -91,7 +91,7 @@ impl RmsNorm {
 }
 
 impl Module for RmsNorm {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }
@@ -193,7 +193,7 @@ impl LayerNorm {
 }
 
 impl Module for LayerNorm {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }

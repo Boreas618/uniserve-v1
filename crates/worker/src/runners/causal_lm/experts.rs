@@ -55,7 +55,7 @@ use ops::moe::ExchangeTransport;
 use ops::moe::exchange::{Descriptor, Mode, Transport, TransportShape};
 use platform::Stream;
 use storage::runtime::GroupId;
-use uniserve_tensor::Tensor;
+use tensor::Tensor;
 
 use crate::buckets::{Bucket, Buckets};
 use crate::parallel::host::HostGroup;

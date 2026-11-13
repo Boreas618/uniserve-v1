@@ -154,7 +154,7 @@ use ipc::philox::DrawAddress;
 use nn::NO_SLOT;
 use proto::module::commit::{COMMIT_FIELDS, column};
 use proto::module::sampler::PARAMETER_COLUMNS;
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use crate::buckets::Bucket;
 use crate::memory::tables::BlockTables;

@@ -20,7 +20,7 @@ use ipc::batch::StateDirection;
 use nn::family::{StateField, StateShape};
 use ops::Generation;
 use platform::{Budget, DeviceId, PoolKind, Stream};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 use worker::memory::cache::{CacheLayout, KvCacheConfig, KvCacheMemory};
 use worker::memory::exclusive::LocalStorage;
 use worker::memory::state::{StateConfig, StateMemory};

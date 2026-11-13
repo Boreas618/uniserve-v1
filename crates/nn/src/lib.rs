@@ -3,7 +3,7 @@
 //!
 //! ## Where this crate sits
 //!
-//! Three layers, as in PyTorch: the tensor library (`uniserve-tensor`: tensors, views, the CPU
+//! Three layers, as in PyTorch: the tensor library (`tensor`: tensors, views, the CPU
 //! device), the device backend (`backend`: the CUDA and meta devices, the execution context, the
 //! one dispatch point of every kernel) and this crate, the `torch.nn` of the tree. A model crate
 //! depends on this crate, the tensor library and `processing` only; what it may name of the
@@ -92,7 +92,7 @@ pub use collective::Split;
 pub use error::{Error, Result};
 pub use proto::module::PhaseKind;
 pub use proto::video::{ConditionRole, LatentShape, Layout, VisionGrid};
-pub use uniserve_tensor::{D, DType, Device, IndexOp, Module, Shape, Tensor};
+pub use tensor::{D, DType, Device, IndexOp, Module, Shape, Tensor};
 pub use var_builder::VarBuilder;
 pub use weights::{
     CpuWeights, PartBlock, Provenance, Quantization, RetainedWeights, WeightKey, WeightLayout,

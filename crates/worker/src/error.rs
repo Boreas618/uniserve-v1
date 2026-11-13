@@ -135,8 +135,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// A tensor operation's failure is a model computation's: the conversion through `nn::Error`
 /// recovers the backend's typed cause the tensor library carried boxed.
-impl From<uniserve_tensor::Error> for Error {
-    fn from(error: uniserve_tensor::Error) -> Self {
+impl From<tensor::Error> for Error {
+    fn from(error: tensor::Error) -> Self {
         Self::Nn(nn::Error::from(error))
     }
 }

@@ -17,7 +17,7 @@ use platform::{
     DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
     SegmentedMapping,
 };
-use uniserve_tensor::{DType, Shape, Tensor};
+use tensor::{DType, Shape, Tensor};
 
 use crate::{Error, Result, lock};
 

@@ -86,7 +86,7 @@ use nn::{Clip, Decoder, Layout, Splice, Splicer};
 use ops::pcm::{self, PcmInterleave};
 use ops::rgb::{self, RgbBytes};
 use platform::{Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream};
-use uniserve_tensor::{DType, Device, Shape, Tensor};
+use tensor::{DType, Device, Shape, Tensor};
 
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;

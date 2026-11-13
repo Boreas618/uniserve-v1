@@ -79,7 +79,7 @@ use ipc::batch::{
 use nn::{ConditionPiece, ConditionRole, ConditionShape, Conditioning, Denoiser, Layout};
 use nn::{LatentShape, MediaInput, Step, VideoRequest};
 use platform::{Event, EventFlags, PitchedBatch, SourceOrder, Stream};
-use uniserve_tensor::{DType, Tensor};
+use tensor::{DType, Tensor};
 
 use super::decoder::{elements, pitched, voxels};
 use super::{address, element_bytes, performed, settle};

@@ -76,7 +76,7 @@ use ipc::{PoolConversion, PrefixCacheInfo};
 use nn::{KvCache, KvPlanes};
 use platform::{DeviceId, Event, Stream};
 use storage::runtime::Run;
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use self::conversion::Conversion;
 use self::host::{HostPage, HostTier};

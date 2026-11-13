@@ -23,7 +23,7 @@
 
 use ops::commit::{CommitArgs, CommitDescriptor, SlotCommit};
 use proto::module::commit::{COMMIT_FIELDS, column, mode};
-use uniserve_tensor::{DType, Device, Tensor};
+use tensor::{DType, Device, Tensor};
 
 use super::nvfp4::integer;
 use super::sampling::{require, signed};
@@ -282,8 +282,8 @@ pub fn slot_commit_(
 
 #[cfg(test)]
 mod tests {
-    use uniserve_tensor::WithDType;
-    use uniserve_tensor::shape::ShapeWithOneHole;
+    use tensor::WithDType;
+    use tensor::shape::ShapeWithOneHole;
 
     use super::*;
 
@@ -505,7 +505,7 @@ mod tests {
     /// names that table's rows, so every step of the runner states one key.
     #[test]
     fn the_commit_states_its_kernel_by_the_table_its_rows_lead() {
-        let meta = |shape: uniserve_tensor::Shape, dtype: DType| {
+        let meta = |shape: tensor::Shape, dtype: DType| {
             backend::retained(1 << 40, shape, dtype, &backend::meta()).unwrap()
         };
         let context = backend::Context::meta(None);

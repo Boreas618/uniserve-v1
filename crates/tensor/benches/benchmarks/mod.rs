@@ -11,7 +11,7 @@ pub(crate) mod unary;
 pub(crate) mod vec_dot;
 pub(crate) mod where_cond;
 
-use uniserve_tensor::{DType, Device, DeviceLocation, Shape, Tensor};
+use tensor::{DType, Device, DeviceLocation, Shape, Tensor};
 
 /// The name of a benchmark group: the device kind, then the benchmark.
 pub(crate) fn bench_name<S: Into<String>>(device: &Device, name: S) -> String {

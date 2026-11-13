@@ -1,7 +1,7 @@
 //! The modules of a causal video VAE's convolution stack: the per-frame normalization that
 //! writes a convolution's padded input, and the residual block built from it.
 
-use uniserve_tensor::{Module, Tensor};
+use tensor::{Module, Tensor};
 
 use crate::error::{Error, Result};
 use crate::functional::{self, Padding};
@@ -89,7 +89,7 @@ impl FrameNorm {
 }
 
 impl Module for FrameNorm {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }
@@ -198,7 +198,7 @@ impl ResnetBlock3d {
 }
 
 impl Module for ResnetBlock3d {
-    fn forward(&self, x: &Tensor) -> uniserve_tensor::Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> tensor::Result<Tensor> {
         Ok(Self::forward(self, x)?)
     }
 }

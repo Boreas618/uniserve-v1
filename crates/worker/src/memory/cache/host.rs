@@ -28,7 +28,7 @@ use std::sync::Arc;
 use ::storage::Key;
 use ::storage::protocol::PageShape;
 use platform::{CopyBatch, DeviceId, Event, EventFlags, SourceOrder, Stream};
-use uniserve_tensor::DType;
+use tensor::DType;
 
 use super::conversion::Conversion;
 use super::layout::{CacheLayout, GroupLayout};

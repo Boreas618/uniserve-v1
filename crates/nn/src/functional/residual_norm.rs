@@ -32,7 +32,7 @@ use ops::residual::{
     ScaledResidualLayerNorm, ScaledResidualLayerNormArgs, ScaledResidualLayerNormDescriptor,
     ScaledResidualRmsNorm, ScaledResidualRmsNormArgs, ScaledResidualRmsNormDescriptor,
 };
-use uniserve_tensor::{D, DType, Tensor};
+use tensor::{D, DType, Tensor};
 
 use super::norm::rms_scaled;
 use super::{as_rows, columns, like_rows, on_cpu, row_tile, vector};
