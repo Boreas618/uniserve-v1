@@ -1,6 +1,11 @@
-//! The interface between Rust and kernel packages: operators and their launch code, the kernels a
-//! program compiles into, the generation of kernels a runner serves, and the shadow buffers and
-//! tolerances that decide whether a new implementation may replace an old one.
+//! The device side of the tensor library: the interface between Rust and kernel packages, and the
+//! CUDA and meta devices the tensor library computes on through it.
+//!
+//! An operator's launch code, the kernels a program compiles into, the generation of kernels a
+//! runner serves, and the shadow buffers and tolerances that decide whether a new implementation
+//! may replace an old one live here, beside the device backend that launches them: the execution
+//! context a forward computes under, the storage of a device tensor and the allocator of its
+//! memory, the generic primitives, host-to-device copies and collectives.
 //!
 //! ## The chain this crate sits in
 //!
@@ -8,10 +13,47 @@
 //! type with a name, a descriptor, and an argument struct; a kernel package — a Triton package, a
 //! CuTe DSL package, a CUDA C++ package or a native library — fills that operator, and
 //! `uniserve engine` resolves the programs the epoch record names and hands the modules to
-//! [`Kernel`]. `ops` depends on `platform`, on the module vocabulary of `proto` (operator
-//! names and phases) and on the tensor library for the element type of an operand, whose number
-//! and spelling in the package ABI [`abi`] states: it launches what it is given, allocates
-//! nothing that outlives a launch, owns no model and knows no layer.
+//! [`Kernel`]. `ops` depends on `platform`, which makes every driver call, on the module
+//! vocabulary of `proto` (operator names and phases) and on the tensor library, whose device
+//! backend it is and whose element type an operand carries, with the number and spelling in the
+//! package ABI [`abi`] states. It owns no model and knows no layer.
+//!
+//! ## What a model sees
+//!
+//! Tensors. A model computes with the tensor library's operations on tensors whose device is
+//! [`cuda`] or [`meta`], and each operation is one launch of a generic primitive operator with an
+//! output from the context's allocator. A tensor is freed when its last reference drops, which
+//! returns its block to the allocator it came from.
+//!
+//! ## What execution does
+//!
+//! The context is the thread's: execution builds one [`Context`] per runner and installs it
+//! around a model call ([`Context::enter`]), and a model never holds, receives or names it. What
+//! a forward does follows from the context and from the capture state of its stream:
+//!
+//! - under a context that launches, operations issue kernels on its stream, and while the stream
+//!   is being captured they become the nodes of the graph;
+//! - under a **meta context** nothing is launched. Every operation checks its operands, states
+//!   the key of the kernel it would launch and takes its output from the meta context's
+//!   allocator, so a profile run yields a forward's launch table and memory peak, and the
+//!   forward of `prepare_inputs` writes a replay's host values into the input buffer at the
+//!   offsets the capture recorded.
+//!
+//! Execution makes the tensors a forward starts from: [`retained`] over a weight, [`external`]
+//! over memory it lends for the call (KV pages, state, latents, a graph's inputs), and
+//! [`empty`] for a new tensor of the installed context. A tensor that has no data, the input of
+//! a profile run or of a `prepare_inputs` forward, is [`retained`] or [`external`] over the
+//! [`meta`] device: it takes no block of any allocator and its address is never read.
+//!
+//! ## What a fused operator does
+//!
+//! Every kernel reaches the device through [`launch()`], the one dispatch of an operator, so
+//! kernel updates, profile runs, graph rebinding and shadow comparison cover every launch alike.
+//! A fused operator of `nn` allocates its output with [`empty`], states its arguments with
+//! [`operand()`] and calls [`launch()`]. A partitioned forward meets the other ranks of its group
+//! through [`collective`], a module states the range its forward runs in through
+//! [`profiler::range`], and a forward states host work between two of its launches through
+//! [`graph_break()`].
 //!
 //! ## The operators
 //!
@@ -96,20 +138,24 @@ pub mod abi;
 pub mod activation;
 pub mod activation1d;
 pub mod adaptive_pool;
+pub mod allocator;
 pub mod attention;
 pub mod block_copy;
+pub mod breaks;
 // Test-only: the package headers' mirrors checked against the layouts this crate passes.
 #[cfg(test)]
 pub mod call_layout_check;
-pub mod capture;
 pub mod cast;
 pub mod channel_affine;
+pub mod collective;
 pub mod commit;
+pub mod context;
 pub mod conv;
 pub mod copy_block;
 pub mod copy_strided;
 pub mod cross_fade;
 pub mod descriptor;
+mod device;
 pub mod elementwise;
 pub mod embedding;
 pub mod error;
@@ -121,21 +167,25 @@ pub mod gelu;
 pub mod gemm;
 pub mod generation;
 pub mod index;
+mod input;
 pub mod install;
 pub mod kernel;
 pub mod kv;
+mod launch;
 pub mod logits;
 pub mod modulation;
 pub mod moe;
 pub mod noise;
 pub mod norm;
 pub mod op;
+mod operand;
 pub mod patch;
 pub mod pcm;
-pub mod platform;
 pub mod position;
 pub mod posterior;
 pub mod prefix_cache;
+mod primitives;
+pub mod profiler;
 pub mod recurrent;
 pub mod reduce;
 pub mod residual;
@@ -144,8 +194,8 @@ pub mod rope;
 pub mod rows;
 pub mod sampler;
 pub mod snake;
+mod storage;
 pub mod strided;
-pub mod tensor;
 pub mod tile_stitch;
 pub mod tolerance;
 pub mod transpose;
@@ -154,17 +204,21 @@ pub mod unpatchify;
 pub mod values;
 pub mod vsa;
 
+pub use allocator::Allocator;
+pub use breaks::graph_break;
+pub use collective::Group;
+pub use context::{Context, ContextGuard};
 pub use descriptor::{Float, Key};
+pub use device::{cuda, meta};
 pub use error::{Error, Result};
 pub use fp4::{Nvfp4Gemm, Nvfp4Quantize, ScaleLayout};
 pub use generation::{Generation, KernelEntry};
 pub use install::{Module, install};
 pub use kernel::{Arguments, CubinMetadata, Entry, Kernel, LaunchGrid, NativeCall, NativeEntry};
+pub use launch::launch;
 pub use op::{Call, Checked, Op, Route};
-pub use platform::zero_bytes;
-pub use platform::{
-    CollectiveType, Communicator, DeviceRange, PlatformDevicePtr, ReduceOp, Stream, collective_type,
-};
-pub use tensor::{DevicePtr, MAX_RANK, Operand, Shape, Strides};
+pub use operand::Operand;
+pub use profiler::Profiler;
+pub use storage::{empty, external, operand, retained};
 pub use tolerance::Tolerance;
 pub use twins::{Twin, Twins};

@@ -1,22 +1,25 @@
 [package]
 name = "ops"
-description = "Operator signatures, launch code, loaded kernels and their generations"
+description = "The device side of the tensor library: operators and their kernel packages, generations, the one launch path, the CUDA and meta backends, the allocator of tensor memory, collectives"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
-# `ops` depends on the CUDA boundary, on the tensor library for the element type its operands
-# carry, and on `serde` for the one value the epoch record carries as data (the phase): it loads
-# and launches the modules it is handed and knows no model, no layer and no runtime object.
+# `ops` depends on the CUDA boundary, which makes every driver call, on the tensor library, whose
+# device backend it is and whose element type and layout its operands carry, and on `serde` for
+# the one value the epoch record carries as data (the phase): it loads and launches the modules it
+# is handed and knows no model and no layer.
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
-platform = { path = "../platform" }
+platform.workspace = true
 # The element type of an operand (`DType`); `ops::abi` states its number and spelling for packages.
 tensor.workspace = true
 # The operator names and phases the kernel library keys its generations by.
 proto.workspace = true
 thiserror.workspace = true
+# A host value's BF16 and F16 bytes, rounded as the tensor library's element types round.
+half = "2.5.0"
 
 [lints]
 workspace = true

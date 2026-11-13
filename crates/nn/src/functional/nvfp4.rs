@@ -20,12 +20,12 @@
 //! lies on a rounding boundary may differ from the formula's by one step; a device check
 //! compares the two under the consuming product's tolerance.
 
+use float8::F8E4M3;
 use ops::fp4::{BLOCK_ELEMENTS, Nvfp4Quantize, QuantizeArgs, QuantizeDescriptor, ScaleLayout};
 use tensor::{D, DType, Device, Tensor};
 
 use super::{ACCUMULATE, PDL, as_rows, columns, on_cpu};
 use crate::error::{Error, Result};
-use crate::quantization::e4m3;
 
 /// Elements of a row one activation-encoding kernel covers.
 ///
@@ -110,7 +110,7 @@ pub fn nvfp4_quantize(
     let count = rows.dims()[0];
     let (packed, blocks) = ((k / 2) as usize, (k / BLOCK_ELEMENTS) as usize);
     let table = layout.shape(count as u64, u64::from(k));
-    let table = (table.dim(0) as usize, table.dim(1) as usize);
+    let table = (table[0] as usize, table[1] as usize);
 
     if on_cpu(x) {
         let (codes, scale) = encoded(&rows, global_scale)?;
@@ -132,7 +132,9 @@ pub fn nvfp4_quantize(
 
         // A scale's byte is its rank among the format's positive values, which ascend with
         // their bits.
-        let positive: Vec<f32> = (1..=E4M3_LARGEST).map(e4m3).collect();
+        let positive: Vec<f32> = (1..=E4M3_LARGEST)
+            .map(|byte| F8E4M3::from_bits(byte).to_f32())
+            .collect();
         let bytes = scale
             .unsqueeze(D::Minus1)?
             .broadcast_ge(&Tensor::new(positive.as_slice(), &Device::Cpu)?)?
@@ -155,18 +157,18 @@ pub fn nvfp4_quantize(
         return Ok((values, scales));
     }
 
-    let values = backend::empty((count, packed), DType::U8)?;
-    let scales = backend::empty(table, DType::U8)?;
-    let factor = backend::empty(count, DType::F32)?;
+    let values = ops::empty((count, packed), DType::U8)?;
+    let scales = ops::empty(table, DType::U8)?;
+    let factor = ops::empty(count, DType::F32)?;
 
     launch_quantize(
         &rows,
         global_scale,
         layout,
         (
-            backend::operand(&values)?,
-            backend::operand(&scales)?,
-            backend::operand(&factor)?,
+            ops::operand(&values)?,
+            ops::operand(&scales)?,
+            ops::operand(&factor)?,
         ),
     )?;
     Ok((values, scales))
@@ -187,7 +189,7 @@ pub(super) fn launch_quantize(
     let k = columns("nvfp4_quantize", rows)?;
     let (values, scales, token_scale) = encoded;
 
-    backend::launch::<Nvfp4Quantize>(
+    ops::launch::<Nvfp4Quantize>(
         &QuantizeDescriptor {
             input: rows.dtype(),
             columns: k,
@@ -196,10 +198,10 @@ pub(super) fn launch_quantize(
             pdl: PDL,
         },
         QuantizeArgs {
-            input: backend::operand(rows)?,
+            input: ops::operand(rows)?,
             values,
             scales,
-            global_scale: backend::operand(global_scale)?,
+            global_scale: ops::operand(global_scale)?,
             token_scale,
         },
     )?;
@@ -252,7 +254,7 @@ pub(super) fn decoded(values: &Tensor, scales: &Tensor, layout: ScaleLayout) -> 
     let (k, blocks) = (packed * 2, packed * 2 / BLOCK_ELEMENTS as usize);
 
     let high = values.broadcast_div(&integer(16, values)?)?;
-    let low = remainder(values, 16)?;
+    let low = values.broadcast_remainder(&integer(16, values)?)?;
     let nibbles = Tensor::stack(&[low, high], D::Minus1)?.flatten_all()?;
     let codes = Tensor::new(&E2M1, &Device::Cpu)?
         .index_select(&nibbles, 0)?
@@ -310,25 +312,14 @@ fn e4m3_values(scales: &Tensor) -> Result<Tensor> {
         return Ok(scales.to_dtype(ACCUMULATE)?);
     }
 
-    // Raw bytes have no cast: each byte selects its value from the format's 256.
-    let table: Vec<f32> = (0..=u8::MAX).map(e4m3).collect();
-    Ok(Tensor::new(table.as_slice(), &Device::Cpu)?
-        .index_select(&scales.flatten_all()?, 0)?
-        .reshape(scales.shape())?)
+    // Raw bytes are the elements' bits: read as E4M3, they are cast like a stored scale.
+    Ok(scales.view(DType::F8E4M3)?.to_dtype(ACCUMULATE)?)
 }
 
 /// `value` as a one-element tensor of `like`'s integer element type, for integer arithmetic,
 /// which the scalar operators of the tensor library evaluate in floating point.
 pub(super) fn integer(value: u32, like: &Tensor) -> Result<Tensor> {
     Ok(Tensor::new(value, &Device::Cpu)?.to_dtype(like.dtype())?)
-}
-
-/// `values mod modulus`, elementwise over an integer tensor.
-pub(super) fn remainder(values: &Tensor, modulus: u32) -> Result<Tensor> {
-    let modulus = integer(modulus, values)?;
-    let whole = values.broadcast_div(&modulus)?.broadcast_mul(&modulus)?;
-
-    Ok(values.broadcast_sub(&whole)?)
 }
 
 /// The flat offsets, `[rows · blocks]` U32 in row-major order, of a `[rows, blocks]` block-scale
@@ -345,12 +336,16 @@ fn swizzled_offsets(rows: usize, blocks: usize, padded_columns: usize) -> Result
         Ok(values.broadcast_div(&integer(divisor, values)?)?)
     };
 
-    let within = times(remainder(&row, 32)?, 16)?;
-    let group = times(over(&remainder(&row, 128)?, 32)?, 4)?;
+    let within = times(row.broadcast_remainder(&integer(32, &row)?)?, 16)?;
+    let group = times(
+        over(&row.broadcast_remainder(&integer(128, &row)?)?, 32)?,
+        4,
+    )?;
     let tile = times(over(&row, 128)?, 128 * padded_columns)?;
     let row_offset = ((within + group)? + tile)?;
 
-    let column_offset = (remainder(&column, 4)? + times(over(&column, 4)?, 512)?)?;
+    let column_offset =
+        (column.broadcast_remainder(&integer(4, &column)?)? + times(over(&column, 4)?, 512)?)?;
 
     Ok(row_offset
         .unsqueeze(1)?

@@ -163,7 +163,7 @@ use crate::{Error, Result};
 
 /// The alignment of a column in the input block: the allocator's, which `Graphs::input` asks
 /// of every input tensor.
-const ALIGNMENT: u64 = backend::allocator::ALIGNMENT;
+const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 
 /// One input tensor of the runner (module documentation).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

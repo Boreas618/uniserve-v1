@@ -91,13 +91,13 @@ pub use sparse::{SparseArgs, SparseAttention, SparseCall, SparseDescriptor};
 use std::ffi::c_void;
 use std::fmt;
 
+use platform::{DevicePtr, Stream};
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
-use crate::platform::{self, Stream};
-use crate::tensor::{DevicePtr, Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -199,7 +199,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one attention call.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[tokens, q_heads, head_dim]` queries, row-major on the last axis.
     pub query: Operand,
@@ -445,22 +445,22 @@ impl Op for PagedAttention {
         // The token count is the first extent of a `[tokens, heads, head_dim]` query; `rows()` is
         // the product of every extent but the last and would count tokens times heads, refusing a
         // launch whose own views agree (the defect `qk_norm_rope` had).
-        let tokens = args.query.shape.dim(0);
+        let tokens = args.query.dim(0);
         args.query
-            .require_shape(Self::NAME, Shape::new(&[tokens, q_heads, head_dim]))?;
+            .require_shape(Self::NAME, &[tokens, q_heads, head_dim])?;
         args.query
             .require_row(Self::NAME, descriptor.query, head_dim)?;
-        if args.query.strides.rank() >= 2 && args.query.strides.get(1) != head_dim {
+        if args.query.rank() >= 2 && args.query.stride(1) != head_dim {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "expected {head_dim} elements between query heads, found {}",
-                    args.query.strides.get(1)
+                    args.query.stride(1)
                 ),
             ));
         }
         args.out
-            .require_shape(Self::NAME, Shape::new(&[tokens, q_heads, head_dim]))?;
+            .require_shape(Self::NAME, &[tokens, q_heads, head_dim])?;
         args.out
             .require_row(Self::NAME, descriptor.output, head_dim)?;
 
@@ -476,31 +476,28 @@ impl Op for PagedAttention {
                     ),
                 ));
             }
-            if cache.shape.dim(1) != page_size
-                || cache.shape.dim(2) != kv_heads
-                || cache.shape.dim(3) != head_dim
-            {
+            if cache.dim(1) != page_size || cache.dim(2) != kv_heads || cache.dim(3) != head_dim {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "expected pages of [page_size, kv_heads, head_dim] = {page_size}x{kv_heads}x{head_dim}, found {:?}",
-                        cache.shape.dims()
+                        cache.dims()
                     ),
                 ));
             }
-            if cache.strides.last() != 1 {
+            if cache.last_stride() != 1 {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "expected a unit stride on the cache's last axis, found {}",
-                        cache.strides.last()
+                        cache.last_stride()
                     ),
                 ));
             }
         }
 
-        for (name, view) in [("query", args.query), ("out", args.out)] {
-            check_vector_alignment(Self::NAME, name, &view)?;
+        for (name, view) in [("query", &args.query), ("out", &args.out)] {
+            check_vector_alignment(Self::NAME, name, view)?;
         }
         check_vector_alignment(Self::NAME, "key", &args.key)?;
         check_vector_alignment(Self::NAME, "value", &args.value)?;
@@ -515,17 +512,16 @@ impl Op for PagedAttention {
                 ),
             ));
         }
-        let batch = args.page_table.shape.dim(0);
-        let max_pages = args.page_table.shape.dim(1);
-        if args.page_table.strides.last() != 1 {
+        let batch = args.page_table.dim(0);
+        let max_pages = args.page_table.dim(1);
+        if args.page_table.last_stride() != 1 {
             return Err(Error::argument(
                 Self::NAME,
                 "expected a unit stride on the page table's last axis",
             ));
         }
 
-        args.seq_lens
-            .require_shape(Self::NAME, Shape::new(&[batch]))?;
+        args.seq_lens.require_shape(Self::NAME, &[batch])?;
         if args.seq_lens.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -549,8 +545,7 @@ impl Op for PagedAttention {
 
         match descriptor.phase {
             Phase::Prefill => {
-                if args.cum_seq_lens_q.shape.rank() != 1 || args.cum_seq_lens_q.dtype != DType::U32
-                {
+                if args.cum_seq_lens_q.rank() != 1 || args.cum_seq_lens_q.dtype != DType::U32 {
                     return Err(Error::argument(
                         Self::NAME,
                         "a prefill passes its packed query offsets as a u32 [batch + 1] view",
@@ -572,14 +567,14 @@ impl Op for PagedAttention {
                 // sequence lengths by that row: a call whose query or output is shorter than the
                 // page table's rows is a row the kernel reads and writes past, which is an illegal
                 // address rather than a wrong number. The invariant was stated and not enforced.
-                for (name, view) in [("query", args.query), ("out", args.out)] {
-                    if view.shape.dim(0) != batch {
+                for (name, view) in [("query", &args.query), ("out", &args.out)] {
+                    if view.dim(0) != batch {
                         return Err(Error::argument(
                             Self::NAME,
                             format!(
                                 "a decode has one {name} row per page-table row: {batch} rows of \
                                  pages, {} rows of {name}",
-                                view.shape.dim(0)
+                                view.dim(0)
                             ),
                         ));
                     }
@@ -591,13 +586,13 @@ impl Op for PagedAttention {
         // the descriptor's dtype decides whether the call carries them.
         match (
             quantized(descriptor.key_value),
-            args.key_scale,
-            args.value_scale,
+            &args.key_scale,
+            &args.value_scale,
         ) {
             (false, None, None) => {}
             (true, Some(key), Some(value)) => {
                 for (name, view) in [("key_scale", key), ("value_scale", value)] {
-                    view.require_shape(Self::NAME, Shape::new(&[args.key.shape.dim(0), 1, 1, 1]))?;
+                    view.require_shape(Self::NAME, &[args.key.dim(0), 1, 1, 1])?;
                     if view.dtype != DType::F32 {
                         return Err(Error::argument(
                             Self::NAME,
@@ -670,10 +665,10 @@ impl Op for PagedAttention {
         let element_bytes = abi::bytes(descriptor.query).unwrap_or(2).max(2);
         let unit = 16 / element_bytes.max(1);
         for (name, view) in [
-            ("query", args.query),
-            ("key", args.key),
-            ("value", args.value),
-            ("out", args.out),
+            ("query", &args.query),
+            ("key", &args.key),
+            ("value", &args.value),
+            ("out", &args.out),
         ] {
             if !address(view.ptr).is_multiple_of(16) {
                 return Err(Error::argument(
@@ -685,9 +680,9 @@ impl Op for PagedAttention {
                     ),
                 ));
             }
-            for axis in 0..view.strides.rank() {
-                let step = view.strides.get(axis);
-                if axis + 1 != view.strides.rank() && !step.is_multiple_of(unit) {
+            for axis in 0..view.rank() {
+                let step = view.stride(axis);
+                if axis + 1 != view.rank() && !step.is_multiple_of(unit) {
                     return Err(Error::argument(
                         Self::NAME,
                         format!(
@@ -698,7 +693,10 @@ impl Op for PagedAttention {
                 }
             }
         }
-        for (name, view) in [("page_table", args.page_table), ("seq_lens", args.seq_lens)] {
+        for (name, view) in [
+            ("page_table", &args.page_table),
+            ("seq_lens", &args.seq_lens),
+        ] {
             if !address(view.ptr).is_multiple_of(16) {
                 return Err(Error::argument(
                     Self::NAME,
@@ -724,9 +722,9 @@ impl Op for PagedAttention {
         let kv_heads = u64::from(descriptor.kv_heads);
         let page_size = u64::from(descriptor.page_size);
         // The first extent of the `[tokens, heads, head_dim]` query.
-        let tokens = args.query.shape.dim(0);
-        let batch = args.page_table.shape.dim(0);
-        let max_pages = args.page_table.shape.dim(1);
+        let tokens = args.query.dim(0);
+        let batch = args.page_table.dim(0);
+        let max_pages = args.page_table.dim(1);
         let max_kv_len = max_pages * page_size;
 
         // `check` holds the offsets to the phase. A decode's are the row ends and the package
@@ -744,7 +742,7 @@ impl Op for PagedAttention {
 
         // `check` holds the page scales to the cache: a quantized cache passes both and any other
         // passes none.
-        let (key_scale, value_scale) = match (args.key_scale, args.value_scale) {
+        let (key_scale, value_scale) = match (&args.key_scale, &args.value_scale) {
             (Some(key), Some(value)) => (
                 address(key.ptr) as usize as *const c_void,
                 address(value.ptr) as usize as *const c_void,
@@ -799,16 +797,16 @@ impl Op for PagedAttention {
             tokens: to_i64(Self::NAME, tokens)?,
             max_q_len: to_i64(Self::NAME, max_q_len)?,
             max_kv_len: to_i64(Self::NAME, max_kv_len)?,
-            num_pages: to_i64(Self::NAME, args.key.shape.dim(0))?,
+            num_pages: to_i64(Self::NAME, args.key.dim(0))?,
             page_size: to_i64(Self::NAME, page_size)?,
             q_heads: to_i64(Self::NAME, q_heads)?,
             kv_heads: to_i64(Self::NAME, kv_heads)?,
             head_dim: to_i64(Self::NAME, head_dim)?,
             q_stride_tokens: to_i64(Self::NAME, row_stride(&args.query))?,
             q_stride_heads: to_i64(Self::NAME, head_stride(&args.query))?,
-            kv_stride_page: to_i64(Self::NAME, args.key.strides.get(0))?,
-            kv_stride_tokens: to_i64(Self::NAME, args.key.strides.get(1))?,
-            kv_stride_heads: to_i64(Self::NAME, args.key.strides.get(2))?,
+            kv_stride_page: to_i64(Self::NAME, args.key.stride(0))?,
+            kv_stride_tokens: to_i64(Self::NAME, args.key.stride(1))?,
+            kv_stride_heads: to_i64(Self::NAME, args.key.stride(2))?,
             o_stride_tokens: to_i64(Self::NAME, row_stride(&args.out))?,
             o_stride_heads: to_i64(Self::NAME, head_stride(&args.out))?,
             scale: f64::from(args.scale),
@@ -1030,7 +1028,7 @@ impl PagedAttention {
                 ),
             ));
         }
-        let (Some(key_scale), Some(value_scale)) = (args.key_scale, args.value_scale) else {
+        let (Some(key_scale), Some(value_scale)) = (&args.key_scale, &args.value_scale) else {
             return Err(Error::argument(
                 Self::NAME,
                 "an E4M3 page is read through one scale per page, and the call passes none"
@@ -1070,7 +1068,7 @@ impl PagedAttention {
             })
         };
         let stride = |name: &str, view: &Operand, axis: usize| -> Result<i32> {
-            word(name, view.strides.get(axis))
+            word(name, view.stride(axis))
         };
 
         // The program's words, in the order its signature declares them. One list holds the order,
@@ -1081,16 +1079,16 @@ impl PagedAttention {
         for parameter in words(descriptor.phase) {
             match parameter {
                 PagedWord::Out => {
-                    let _ = arguments.view(args.out);
+                    let _ = arguments.view(&args.out);
                 }
                 PagedWord::Query => {
-                    let _ = arguments.view(args.query);
+                    let _ = arguments.view(&args.query);
                 }
                 PagedWord::Key => {
-                    let _ = arguments.view(args.key);
+                    let _ = arguments.view(&args.key);
                 }
                 PagedWord::Value => {
-                    let _ = arguments.view(args.value);
+                    let _ = arguments.view(&args.value);
                 }
                 PagedWord::KeyScale => {
                     let _ = arguments.view(key_scale);
@@ -1099,15 +1097,15 @@ impl PagedAttention {
                     let _ = arguments.view(value_scale);
                 }
                 PagedWord::PageTable => {
-                    let _ = arguments.view(args.page_table);
+                    let _ = arguments.view(&args.page_table);
                 }
                 PagedWord::SeqLens => {
-                    let _ = arguments.view(args.seq_lens);
+                    let _ = arguments.view(&args.seq_lens);
                 }
                 // Passed whether or not the batch is packed: `packed` is what the program branches
                 // on, and an unpacked call leaves the pointer unread.
                 PagedWord::CumSeqLensQ => {
-                    let _ = arguments.view(args.cum_seq_lens_q);
+                    let _ = arguments.view(&args.cum_seq_lens_q);
                 }
                 PagedWord::QueryRow => {
                     let _ = arguments.i32(stride("the query's row stride", &args.query, 0)?);
@@ -1154,10 +1152,7 @@ impl PagedAttention {
                     let _ = arguments.i32(stride("the output's element stride", &args.out, 2)?);
                 }
                 PagedWord::MaxPages => {
-                    let _ = arguments.i32(word(
-                        "the page table's width",
-                        args.page_table.shape.dim(1),
-                    )?);
+                    let _ = arguments.i32(word("the page table's width", args.page_table.dim(1))?);
                 }
                 PagedWord::PageSize => {
                     let _ = arguments.i32(word("the page size", launch.page_size)?);
@@ -1211,9 +1206,9 @@ pub(super) fn head_stride(view: &Operand) -> u64 {
 
 /// The stride of the axis `from_last` positions from the last, or `0` when the view has no such axis.
 fn axis_stride(view: &Operand, from_last: usize) -> u64 {
-    let rank = view.strides.rank();
+    let rank = view.rank();
     match rank.checked_sub(from_last + 1) {
-        Some(axis) => view.strides.get(axis),
+        Some(axis) => view.stride(axis),
         None => 0,
     }
 }
@@ -1246,7 +1241,7 @@ pub(super) fn check_vector_alignment(
         return Ok(());
     }
     let unit = ATTENTION_ALIGNMENT / bytes;
-    let address = platform::address(view.ptr);
+    let address = view.ptr.address();
     if !address.is_multiple_of(ATTENTION_ALIGNMENT) {
         return Err(Error::argument(
             operator,
@@ -1256,9 +1251,9 @@ pub(super) fn check_vector_alignment(
             ),
         ));
     }
-    let rank = view.strides.rank();
+    let rank = view.rank();
     for axis in 0..rank.saturating_sub(1) {
-        let stride = view.strides.get(axis);
+        let stride = view.stride(axis);
         if !stride.is_multiple_of(unit) {
             return Err(Error::argument(
                 operator,
@@ -1274,7 +1269,7 @@ pub(super) fn check_vector_alignment(
 }
 
 pub(super) fn address(pointer: DevicePtr) -> u64 {
-    platform::address(pointer)
+    pointer.address()
 }
 
 /// An extent as the ABI's `i64`, or an argument error naming `operator`.
@@ -1484,9 +1479,9 @@ mod tests {
     #[test]
     fn a_rows_strides_are_the_rows_and_not_the_head() {
         let view = Operand::new(
-            DevicePtr::new(0x1_0000),
+            DevicePtr::from_address(0x1_0000),
             DType::BF16,
-            Shape::new(&[15, 32, 128]),
+            &[15, 32, 128],
         );
         assert_eq!(row_stride(&view), 4096);
         assert_eq!(head_stride(&view), 128);
@@ -1497,16 +1492,16 @@ mod tests {
     #[test]
     fn a_misaligned_operand_is_refused_by_name() {
         let ok = Operand::new(
-            DevicePtr::new(0x1_0000),
+            DevicePtr::from_address(0x1_0000),
             DType::BF16,
-            Shape::new(&[15, 32, 128]),
+            &[15, 32, 128],
         );
         check_vector_alignment("test", "query", &ok).unwrap();
 
         let odd_base = Operand::new(
-            DevicePtr::new(0x1_0002),
+            DevicePtr::from_address(0x1_0002),
             DType::BF16,
-            Shape::new(&[15, 32, 128]),
+            &[15, 32, 128],
         );
         let refusal = check_vector_alignment("test", "query", &odd_base).unwrap_err();
         assert!(
@@ -1515,7 +1510,7 @@ mod tests {
         );
 
         // A row of 100 elements of bf16 is 200 bytes: every second row starts four bytes off.
-        let narrow = Operand::new(DevicePtr::new(0x1_0000), DType::BF16, Shape::new(&[4, 100]));
+        let narrow = Operand::new(DevicePtr::from_address(0x1_0000), DType::BF16, &[4, 100]);
         let refusal = check_vector_alignment("test", "key", &narrow).unwrap_err();
         assert!(format!("{refusal}").contains("stride of 100"), "{refusal}");
     }

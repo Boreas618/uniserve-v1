@@ -16,13 +16,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -48,7 +48,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `channel_affine`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[batch, channels, positions]`, contiguous.
     pub x: Operand,
@@ -77,24 +77,24 @@ impl Op for ChannelAffine {
             ));
         }
         args.x.require_rank(Self::NAME, 3)?;
-        let shape = args.x.shape;
+        let dims = args.x.dims();
         for (name, view) in [("x", &args.x), ("out", &args.out)] {
-            view.require_shape(Self::NAME, shape)?;
-            view.require_row(Self::NAME, descriptor.dtype, shape.dim(2))?;
-            if view.strides != Strides::row_major(shape) {
+            view.require_dims(Self::NAME, dims)?;
+            view.require_row(Self::NAME, descriptor.dtype, args.x.dim(2))?;
+            if !view.is_row_major() {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
-                        "{name} is read as contiguous; found strides {}",
-                        view.strides
+                        "{name} is read as contiguous; found strides {:?}",
+                        view.strides()
                     ),
                 ));
             }
         }
-        let channels = Shape::new(&[shape.dim(1)]);
+        let channels = &[args.x.dim(1)];
         for view in [&args.scale, &args.shift] {
             view.require_shape(Self::NAME, channels)?;
-            view.require_row(Self::NAME, descriptor.dtype, shape.dim(1))?;
+            view.require_row(Self::NAME, descriptor.dtype, args.x.dim(1))?;
         }
         Ok(())
     }
@@ -105,16 +105,15 @@ impl Op for ChannelAffine {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let shape = args.x.shape;
-        let elements = shape.numel();
+        let elements = args.x.numel();
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.scale)
-            .view(args.shift)
-            .view(args.out)
-            .u64(shape.dim(1))
-            .u64(shape.dim(2))
+            .view(&args.x)
+            .view(&args.scale)
+            .view(&args.shift)
+            .view(&args.out)
+            .u64(args.x.dim(1))
+            .u64(args.x.dim(2))
             .u64(elements)
             .flag(descriptor.pdl);
         kernel.launch(

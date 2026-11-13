@@ -27,11 +27,12 @@
 
 use std::sync::Arc;
 
-use ops::platform::{CaptureStatus, Stream, copy_to_host};
-use ops::{DevicePtr, MAX_RANK, Operand, Strides};
+use platform::{CaptureStatus, DevicePtr, Stream};
 use tensor::backend::{BackendDevice, BackendStorage};
+use tensor::nditer::MAX_DIMS;
 use tensor::{CpuStorage, DType, Device, Layout, Shape, Storage, Tensor};
 
+use crate::Operand;
 use crate::allocator::Allocator;
 use crate::device::{self, CudaDevice, MetaDevice};
 use crate::{Error, Result, context};
@@ -230,15 +231,15 @@ impl CudaStorage {
     ///
     /// # Errors
     ///
-    /// [`Error::Rank`] for more than [`MAX_RANK`] axes; [`Error::ElementType`] for a view into a
+    /// [`Error::Rank`] for more than [`MAX_DIMS`] axes; [`Error::ElementType`] for a view into a
     /// packed tensor that starts inside a byte; [`Error::MetaOperand`] for a meta storage while
     /// a context that launches is installed.
     pub(crate) fn operand(&self, layout: &Layout) -> Result<Operand> {
         let rank = layout.dims().len();
-        if rank > MAX_RANK {
+        if rank > MAX_DIMS {
             return Err(Error::Rank {
                 rank,
-                limit: MAX_RANK,
+                limit: MAX_DIMS,
             });
         }
 
@@ -262,18 +263,10 @@ impl CudaStorage {
             size => self.address + offset * size as u64,
         };
 
-        let mut dims = [0_u64; MAX_RANK];
-        let mut strides = [0_u64; MAX_RANK];
-        for (axis, (dim, stride)) in layout.dims().iter().zip(layout.stride()).enumerate() {
-            dims[axis] = *dim as u64;
-            strides[axis] = *stride as u64;
-        }
-
-        Ok(Operand::with_strides(
-            DevicePtr::new(address),
+        Ok(Operand::with_layout(
+            DevicePtr::from_address(address),
             self.dtype,
-            ops::Shape::new(&dims[..rank]),
-            Strides::new(&strides[..rank]),
+            layout,
         ))
     }
 
@@ -285,8 +278,8 @@ impl CudaStorage {
     /// # Errors
     ///
     /// [`Error::MetaRead`] for a meta storage and under a meta context; [`Error::NoContext`];
-    /// [`Error::CapturedRead`] while the stream is being captured; [`Error::Platform`] and
-    /// [`Error::Ops`] when the stream cannot be queried, copied on or waited for.
+    /// [`Error::CapturedRead`] while the stream is being captured; [`Error::Platform`] when the
+    /// stream cannot be queried, copied on or waited for.
     pub(crate) fn read(&self) -> Result<CpuStorage> {
         if self.gpu.is_none() {
             return Err(Error::MetaRead);
@@ -341,10 +334,10 @@ impl CudaStorage {
         // SAFETY: the vector's buffer holds `count` elements of `T`, which are the bytes copied,
         // and it is not read before the stream has finished the copy.
         unsafe {
-            copy_to_host(
+            platform::memcpy_async(
                 values.as_mut_ptr() as u64,
-                DevicePtr::new(self.address),
-                (count * size_of::<T>()) as u64,
+                self.address,
+                count * size_of::<T>(),
                 stream,
             )?;
         }
@@ -463,7 +456,7 @@ fn borrowed(address: u64, shape: Shape, dtype: DType, device: &Device) -> Result
 /// # Errors
 ///
 /// [`Error::ForeignTensor`] for a CPU tensor and for a tensor of another backend;
-/// [`Error::Rank`] for more than [`MAX_RANK`] axes; [`Error::ElementType`] for a view into a
+/// [`Error::Rank`] for more than [`MAX_DIMS`] axes; [`Error::ElementType`] for a view into a
 /// packed tensor that starts inside a byte; [`Error::MetaOperand`] for a meta tensor while a
 /// context that launches is installed.
 pub fn operand(tensor: &Tensor) -> Result<Operand> {

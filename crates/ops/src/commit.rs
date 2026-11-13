@@ -35,13 +35,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::Operand;
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -95,7 +95,7 @@ impl fmt::Display for CommitDescriptor {
 /// (an `argmax` over a row with no numeric value answers the row's width), and installing it would
 /// hand the next step an id the embedding cannot address and land a count in the next slot's row.
 /// Whether the batch is served is the caller's decision, taken where the tokens are read back.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct CommitArgs {
     /// `[8, capacity]` i64: the step's commit rows, `stride` elements between columns.
     pub columns: Operand,
@@ -159,12 +159,12 @@ impl Op for SlotCommit {
             ));
         }
         args.columns.require_rank(SlotCommit::NAME, 2)?;
-        if args.columns.shape.dim(0) < COMMIT_FIELDS as u64 {
+        if args.columns.dim(0) < COMMIT_FIELDS as u64 {
             return Err(Error::argument(
                 SlotCommit::NAME,
                 format!(
                     "the commit table has {} columns, a row is {COMMIT_FIELDS}",
-                    args.columns.shape.dim(0)
+                    args.columns.dim(0)
                 ),
             ));
         }
@@ -174,24 +174,24 @@ impl Op for SlotCommit {
             &args.columns,
             descriptor.index,
         )?;
-        if args.columns.strides.get(1) != 1 || args.columns.strides.get(0) != descriptor.stride {
+        if args.columns.stride(1) != 1 || args.columns.stride(0) != descriptor.stride {
             return Err(Error::argument(
                 SlotCommit::NAME,
                 format!(
                     "the commit columns are {} elements apart and {} apart within a column, the \
                      descriptor says {}",
-                    args.columns.strides.get(0),
-                    args.columns.strides.get(1),
+                    args.columns.stride(0),
+                    args.columns.stride(1),
                     descriptor.stride
                 ),
             ));
         }
-        if args.columns.shape.dim(1) < args.count {
+        if args.columns.dim(1) < args.count {
             return Err(Error::argument(
                 SlotCommit::NAME,
                 format!(
                     "the commit table holds {} rows, the step commits {}",
-                    args.columns.shape.dim(1),
+                    args.columns.dim(1),
                     args.count
                 ),
             ));
@@ -259,37 +259,35 @@ impl Op for SlotCommit {
             &args.future,
             descriptor.index,
         )?;
-        if args.future.strides.get(0) != descriptor.future_stride {
+        if args.future.stride(0) != descriptor.future_stride {
             return Err(Error::argument(
                 SlotCommit::NAME,
                 format!(
                     "the next-input rows are {} elements apart, the descriptor says {}",
-                    args.future.strides.get(0),
+                    args.future.stride(0),
                     descriptor.future_stride
                 ),
             ));
         }
-        let slots = args.future.shape.dim(0);
+        let slots = args.future.dim(0);
         for (name, view) in [
             ("the predicates", &args.predicates),
             ("the logical positions", &args.logical),
             ("the sampling positions", &args.sampling),
             ("the verified lengths", &args.verified),
         ] {
-            if view.shape.dim(0) < slots {
+            if view.dim(0) < slots {
                 return Err(Error::argument(
                     SlotCommit::NAME,
                     format!(
                         "the {name} hold {} slots, the next-input matrix {slots}",
-                        view.shape.dim(0)
+                        view.dim(0)
                     ),
                 ));
             }
         }
         args.penalties.require_rank(SlotCommit::NAME, 2)?;
-        if args.penalties.shape.dim(0) < slots
-            || args.penalties.shape.dim(1) != u64::from(descriptor.vocab)
-        {
+        if args.penalties.dim(0) < slots || args.penalties.dim(1) != u64::from(descriptor.vocab) {
             return Err(Error::argument(
                 SlotCommit::NAME,
                 format!("the penalty counts are not [{slots}, {}]", descriptor.vocab),
@@ -306,18 +304,18 @@ impl Op for SlotCommit {
     ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
-            .view(args.columns)
-            .view(args.tokens)
-            .view(args.valid)
-            .view(args.active)
-            .view(args.continuation)
-            .view(args.points)
-            .view(args.future)
-            .view(args.predicates)
-            .view(args.logical)
-            .view(args.sampling)
-            .view(args.verified)
-            .view(args.penalties)
+            .view(&args.columns)
+            .view(&args.tokens)
+            .view(&args.valid)
+            .view(&args.active)
+            .view(&args.continuation)
+            .view(&args.points)
+            .view(&args.future)
+            .view(&args.predicates)
+            .view(&args.logical)
+            .view(&args.sampling)
+            .view(&args.verified)
+            .view(&args.penalties)
             .i64(args.count as i64);
         kernel.launch(LaunchGrid::linear(1)?, &mut arguments, stream)
     }
@@ -359,19 +357,14 @@ fn check_type(operator: &'static str, name: &str, view: &Operand, expected: DTyp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DevicePtr, Shape, Strides};
+    use platform::DevicePtr;
 
     const SLOTS: u64 = 4;
     const VOCAB: u64 = 8;
     const FUTURE: u64 = 16;
 
     fn view(dtype: DType, shape: &[u64], strides: &[u64]) -> Operand {
-        Operand::with_strides(
-            DevicePtr::new(0x1000),
-            dtype,
-            Shape::new(shape),
-            Strides::new(strides),
-        )
+        Operand::with_strides(DevicePtr::from_address(0x1000), dtype, shape, strides)
     }
 
     fn descriptor() -> CommitDescriptor {

@@ -112,11 +112,11 @@ pub fn rms_norm(
     }
 
     let rows = as_rows(OWNER, x)?;
-    let out = backend::empty(rows.shape(), output)?;
+    let out = ops::empty(rows.shape(), output)?;
     let tile = row_tile(width);
 
     if output == x.dtype() {
-        backend::launch::<RmsNorm>(
+        ops::launch::<RmsNorm>(
             &RmsNormDescriptor {
                 dtype: x.dtype(),
                 columns: width,
@@ -126,14 +126,14 @@ pub fn rms_norm(
                 groups: groups as u32,
             },
             RmsNormArgs {
-                x: backend::operand(&rows)?,
-                weight: backend::operand(weight)?,
-                out: backend::operand(&out)?,
+                x: ops::operand(&rows)?,
+                weight: ops::operand(weight)?,
+                out: ops::operand(&out)?,
                 eps,
             },
         )?;
     } else {
-        backend::launch::<WeightedRmsNorm>(
+        ops::launch::<WeightedRmsNorm>(
             &WeightedRmsNormDescriptor {
                 dtype: x.dtype(),
                 columns: width,
@@ -142,9 +142,9 @@ pub fn rms_norm(
                 activation: output,
             },
             WeightedRmsNormArgs {
-                x: backend::operand(&rows)?,
-                weight: backend::operand(weight)?,
-                out: backend::operand(&out)?,
+                x: ops::operand(&rows)?,
+                weight: ops::operand(weight)?,
+                out: ops::operand(&out)?,
                 eps,
                 partials: None,
             },
@@ -186,10 +186,10 @@ pub fn add_rms_norm(
 
     let rows = as_rows(OWNER, x)?;
     let residual_rows = as_rows(OWNER, residual)?;
-    let out = backend::empty(rows.shape(), x.dtype())?;
-    let sum = backend::empty(rows.shape(), x.dtype())?;
+    let out = ops::empty(rows.shape(), x.dtype())?;
+    let sum = ops::empty(rows.shape(), x.dtype())?;
 
-    backend::launch::<AddRmsNorm>(
+    ops::launch::<AddRmsNorm>(
         &AddRmsNormDescriptor {
             dtype: x.dtype(),
             columns: width,
@@ -198,11 +198,11 @@ pub fn add_rms_norm(
             centred,
         },
         AddRmsNormArgs {
-            x: backend::operand(&rows)?,
-            residual: backend::operand(&residual_rows)?,
-            weight: backend::operand(weight)?,
-            out: backend::operand(&out)?,
-            residual_out: backend::operand(&sum)?,
+            x: ops::operand(&rows)?,
+            residual: ops::operand(&residual_rows)?,
+            weight: ops::operand(weight)?,
+            out: ops::operand(&out)?,
+            residual_out: ops::operand(&sum)?,
             eps,
         },
     )?;
@@ -248,9 +248,9 @@ pub fn gated_rms_norm(
 
     let rows = as_rows(OWNER, x)?;
     let gate_rows = as_rows(OWNER, gate)?;
-    let out = backend::empty(rows.shape(), x.dtype())?;
+    let out = ops::empty(rows.shape(), x.dtype())?;
 
-    backend::launch::<GatedRmsNorm>(
+    ops::launch::<GatedRmsNorm>(
         &GatedRmsNormDescriptor {
             dtype: x.dtype(),
             columns: width,
@@ -258,10 +258,10 @@ pub fn gated_rms_norm(
             sigmoid,
         },
         GatedRmsNormArgs {
-            x: backend::operand(&rows)?,
-            gate: backend::operand(&gate_rows)?,
-            weight: backend::operand(weight)?,
-            out: backend::operand(&out)?,
+            x: ops::operand(&rows)?,
+            gate: ops::operand(&gate_rows)?,
+            weight: ops::operand(weight)?,
+            out: ops::operand(&out)?,
             eps,
         },
     )?;
@@ -301,9 +301,9 @@ pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, eps: f32) 
     }
 
     let rows = as_rows(OWNER, x)?;
-    let out = backend::empty(rows.shape(), x.dtype())?;
+    let out = ops::empty(rows.shape(), x.dtype())?;
 
-    backend::launch::<LayerNorm>(
+    ops::launch::<LayerNorm>(
         // The bias is in the descriptor, so a normalization with one and one without are two
         // kernels: the epilogue loads a second vector or it does not.
         &LayerNormDescriptor {
@@ -314,10 +314,10 @@ pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, eps: f32) 
             pdl: PDL,
         },
         LayerNormArgs {
-            x: backend::operand(&rows)?,
-            weight: backend::operand(weight)?,
-            bias: bias.map(backend::operand).transpose()?,
-            out: backend::operand(&out)?,
+            x: ops::operand(&rows)?,
+            weight: ops::operand(weight)?,
+            bias: bias.map(ops::operand).transpose()?,
+            out: ops::operand(&out)?,
             eps,
         },
     )?;

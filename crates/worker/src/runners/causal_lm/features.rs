@@ -40,7 +40,7 @@ use crate::runners::{DeviceCopy, address, element_bytes, issue};
 use crate::{Error, Result};
 
 /// The alignment of each buffer in the feature buffer's memory.
-const ALIGNMENT: u64 = backend::allocator::ALIGNMENT;
+const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 
 /// The runner's feature buffer (module documentation).
 pub(super) struct Features {
@@ -161,7 +161,7 @@ impl Features {
                 // and fills `Features::issue` makes and those graphs' kernels touch it.
                 Some(storage) => unsafe { storage.external(offset as usize, shape, dtype) },
                 // SAFETY: a meta tensor's address is never read or written.
-                None => Ok(unsafe { backend::external(offset, shape, dtype, &backend::meta()) }?),
+                None => Ok(unsafe { ops::external(offset, shape, dtype, &ops::meta()) }?),
             }
         };
 
@@ -436,13 +436,13 @@ mod tests {
     fn a_prefill_reads_its_embeddings_and_rotary_coordinates_through_the_marks() {
         let memory = BufferMemory::meta(0, (PRODUCTS, 64), (SLOTS, 4), 0, &[]).unwrap();
         let features = Features::new(&Seeing, TOKENS, None, Arc::new(memory), ENCODER).unwrap();
-        let meta = backend::meta();
+        let meta = ops::meta();
         let tensor = |shape: (usize, usize), dtype| {
             // SAFETY: a meta tensor's address is never read.
-            unsafe { backend::external(0, shape, dtype, &meta) }.unwrap()
+            unsafe { ops::external(0, shape, dtype, &meta) }.unwrap()
         };
 
-        let context = backend::Context::meta(None);
+        let context = ops::Context::meta(None);
         let _guard = context.enter();
         let embedded = tensor((12, HIDDEN), DType::BF16);
         let positions = tensor((12, 1), DType::I32).flatten_all().unwrap();

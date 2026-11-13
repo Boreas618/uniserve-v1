@@ -143,20 +143,20 @@ pub fn activation1d(
 
     // A batch is the same channel set read again: one launch per batch row over one descriptor.
     let signal = x.contiguous()?.reshape((batch, channels, length))?;
-    let out = backend::empty((batch, channels, expected), x.dtype())?;
+    let out = ops::empty((batch, channels, expected), x.dtype())?;
     let length = u32::try_from(length)
         .map_err(|_| Error::shape(OWNER, format!("{length} samples exceed a launch value")))?;
 
     for row in 0..batch {
-        backend::launch::<Activation1d>(
+        ops::launch::<Activation1d>(
             &descriptor,
             Args {
-                values: backend::operand(&signal.get(row)?)?,
-                alpha: backend::operand(alpha)?,
-                beta: backend::operand(beta)?,
-                filter_up: backend::operand(filter_up)?,
-                filter_down: backend::operand(filter_down)?,
-                out: backend::operand(&out.get(row)?)?,
+                values: ops::operand(&signal.get(row)?)?,
+                alpha: ops::operand(alpha)?,
+                beta: ops::operand(beta)?,
+                filter_up: ops::operand(filter_up)?,
+                filter_down: ops::operand(filter_down)?,
+                out: ops::operand(&out.get(row)?)?,
                 length,
             },
         )?;

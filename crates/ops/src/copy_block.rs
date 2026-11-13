@@ -19,7 +19,7 @@
 //!
 //! - **No permutation field.** A permutation is the source's strides permuted; a mode would be a
 //!   second way to say the same thing, and the two could disagree.
-//! - **No unit-stride rule on the destination.** `crate::tensor::row_writable` exists for operators
+//! - **No unit-stride rule on the destination.** `crate::operand::row_writable` exists for operators
 //!   that store one contiguous row per program; this one walks whatever strides it is given, so a
 //!   destination whose innermost axis is not unit stride is legal.
 //!
@@ -28,13 +28,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::Operand;
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -78,7 +78,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `copy_block`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args<'a> {
     /// The source view, read through its own strides.
     pub source: Operand,
@@ -136,8 +136,8 @@ impl Op for CopyBlock {
             ));
         }
         for (name, view, dtype) in [
-            ("source", args.source, descriptor.source),
-            ("out", args.out, descriptor.out),
+            ("source", &args.source, descriptor.source),
+            ("out", &args.out, descriptor.out),
         ] {
             if view.dtype != dtype {
                 return Err(Error::argument(
@@ -152,19 +152,19 @@ impl Op for CopyBlock {
             view.require_rank(Self::NAME, RANK)?;
         }
         let extents = [
-            args.out.shape.dim(0),
-            args.out.shape.dim(1),
-            args.out.shape.dim(2),
-            args.out.shape.dim(3),
+            args.out.dim(0),
+            args.out.dim(1),
+            args.out.dim(2),
+            args.out.dim(3),
         ];
         for (axis, extent) in extents.iter().enumerate() {
-            if args.source.shape.dim(axis) != *extent {
+            if args.source.dim(axis) != *extent {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "axis {axis}: the source has {} elements and the destination {extent}; a \
                          block copy moves one logical block",
-                        args.source.shape.dim(axis)
+                        args.source.dim(axis)
                     ),
                 ));
             }
@@ -173,7 +173,7 @@ impl Op for CopyBlock {
         if extents.contains(&0) {
             return Ok(());
         }
-        let strides = args.source.strides.as_slice();
+        let strides = args.source.strides();
         let source_strides = [strides[0], strides[1], strides[2], strides[3]];
         let source_strides = [
             i64::try_from(source_strides[0]).map_err(strided("source", 0))?,
@@ -215,17 +215,17 @@ impl Op for CopyBlock {
         stream: &Stream,
     ) -> Result<()> {
         let extents = [
-            args.out.shape.dim(0),
-            args.out.shape.dim(1),
-            args.out.shape.dim(2),
-            args.out.shape.dim(3),
+            args.out.dim(0),
+            args.out.dim(1),
+            args.out.dim(2),
+            args.out.dim(3),
         ];
         // An empty block moves nothing, so nothing is launched.
         if extents.contains(&0) {
             return Ok(());
         }
         // `check` holds every source stride within an `i64`.
-        let strides = args.source.strides.as_slice();
+        let strides = args.source.strides();
         let source_strides = [
             strides[0] as i64,
             strides[1] as i64,
@@ -234,7 +234,7 @@ impl Op for CopyBlock {
         ];
 
         let mut arguments = Arguments::new();
-        arguments.view(args.source).view(args.out);
+        arguments.view(&args.source).view(&args.out);
         for extent in extents {
             arguments.u64(extent);
         }

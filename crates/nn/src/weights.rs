@@ -44,8 +44,9 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use backend::allocator::ALIGNMENT;
-use ops::values::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use float8::F8E4M3;
+use half::{bf16, f16};
+use ops::allocator::ALIGNMENT;
 use sha2::{Digest, Sha256};
 use tensor::{CpuStorage, DType, Device, Shape, Storage, Tensor};
 
@@ -348,7 +349,7 @@ impl fmt::Display for WeightKey {
 ///
 /// Execution implements this over the Storage Server and its read-only device mappings, giving
 /// each weight as a tensor over retained storage on the device it serves from
-/// (`backend::retained`): a weight already retained under the key is returned without reading
+/// (`ops::retained`): a weight already retained under the key is returned without reading
 /// the checkpoint again, and a converted weight is published once. [`CpuWeights`] is the store of
 /// a model loaded on the CPU device.
 ///
@@ -865,10 +866,8 @@ impl<'a> WeightLoader<'a> {
         let mut out = Vec::with_capacity(rows * columns * 2);
         for row in 0..rows {
             for column in 0..columns {
-                let value = crate::quantization::e4m3(values[row * columns + column]);
-                out.extend_from_slice(
-                    &crate::quantization::bf16_bits(value * scale(row, column)).to_le_bytes(),
-                );
+                let value = F8E4M3::from_bits(values[row * columns + column]).to_f32();
+                out.extend_from_slice(&bf16::from_f32(value * scale(row, column)).to_le_bytes());
             }
         }
         Ok(out)
@@ -1507,11 +1506,11 @@ fn meta_tensor(key: &WeightKey, shape: &Shape, bytes: u64) -> Result<Tensor> {
             "the meta loader's address range is exhausted",
         ));
     }
-    Ok(backend::retained(
+    Ok(ops::retained(
         address,
         shape.clone(),
         key.dtype,
-        &backend::meta(),
+        &ops::meta(),
     )?)
 }
 
@@ -1894,8 +1893,8 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
     for index in 0..count {
         let chunk = &bytes[index * source_bytes..][..source_bytes];
         let value = match from {
-            DType::BF16 => bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
-            DType::F16 => f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
+            DType::BF16 => bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32(),
+            DType::F16 => f16::from_le_bytes([chunk[0], chunk[1]]).to_f32(),
             DType::F32 => f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
             // A PCM sample is an integer that F32 holds exactly, so the read is lossless.
             DType::I16 => f32::from(i16::from_le_bytes([chunk[0], chunk[1]])),
@@ -1915,7 +1914,7 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
             DType::BF16 => {
                 converted.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
             }
-            DType::F16 => converted.extend_from_slice(&f32_to_f16(value).to_le_bytes()),
+            DType::F16 => converted.extend_from_slice(&f16::from_f32(value).to_le_bytes()),
             DType::F32 => converted.extend_from_slice(&value.to_le_bytes()),
             DType::I16 => converted.extend_from_slice(&f32_to_i16(value).to_le_bytes()),
             other => {

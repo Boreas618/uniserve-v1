@@ -88,7 +88,7 @@ pub(crate) fn element_bytes(dtype: tensor::DType) -> Result<u64> {
 /// The address of `tensor`'s first element: a device address, or for a meta tensor the address
 /// it was made at, which nothing reads.
 pub(crate) fn address(tensor: &Tensor) -> Result<u64> {
-    Ok(backend::operand(tensor)?.ptr.address())
+    Ok(ops::operand(tensor)?.ptr.address())
 }
 
 /// Issues `copies` on `stream`, behind the work issued on it before; with no stream, for a

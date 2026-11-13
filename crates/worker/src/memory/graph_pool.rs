@@ -6,7 +6,7 @@
 //! [`GraphPool`] maps one region per runner from the device's graph pool when it opens, at the
 //! bytes the runner's profile run stated ([`Graphs::peak`](crate::Graphs::peak)), and lends
 //! each to [`Graphs::new`](crate::Graphs::new) as a `platform::DeviceRange`. The runner's
-//! `backend::Context` places every forward's tensors inside its region; the pool keeps no
+//! `ops::Context` places every forward's tensors inside its region; the pool keeps no
 //! account of them.
 //!
 //! The scratch pool holds what no serving forward reads: the regions the shadow outputs of

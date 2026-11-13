@@ -21,13 +21,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -66,7 +66,7 @@ impl fmt::Display for ZeroPaddingDescriptor {
 }
 
 /// The arguments of `vsa_zero_padding`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ZeroPaddingArgs {
     /// `[tiles · tile_rows, heads, width]`, unit column stride; rows past a tile's valid size become
     /// zeros.
@@ -93,7 +93,7 @@ impl Op for VsaZeroPadding {
             &args.values,
         )?;
         check_block(Self::NAME, descriptor.tile_rows, descriptor.block_rows)?;
-        let rows = args.values.shape.dim(0);
+        let rows = args.values.dim(0);
         if rows % u64::from(descriptor.tile_rows) != 0 {
             return Err(Error::argument(
                 Self::NAME,
@@ -104,7 +104,7 @@ impl Op for VsaZeroPadding {
             ));
         }
         let tiles = rows / u64::from(descriptor.tile_rows);
-        args.sizes.require_shape(Self::NAME, Shape::new(&[tiles]))?;
+        args.sizes.require_shape(Self::NAME, &[tiles])?;
         args.sizes.require_row(Self::NAME, DType::U32, tiles)?;
         Ok(())
     }
@@ -115,12 +115,12 @@ impl Op for VsaZeroPadding {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let tiles = args.values.shape.dim(0) / u64::from(descriptor.tile_rows);
+        let tiles = args.values.dim(0) / u64::from(descriptor.tile_rows);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.values)
-            .view(args.sizes)
+            .view(&args.values)
+            .view(&args.sizes)
             .i32(stride(&args.values, 0)?)
             .i32(stride(&args.values, 1)?);
         kernel.launch(
@@ -172,7 +172,7 @@ impl fmt::Display for AddGatedTilesDescriptor {
 }
 
 /// The arguments of `vsa_add_gated_tiles`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct AddGatedTilesArgs {
     /// `[tiles · tile_rows, heads, width]`, unit column stride; receives the gated compression.
     pub output: Operand,
@@ -192,11 +192,11 @@ impl Op for VsaAddGatedTiles {
     type Args<'a> = AddGatedTilesArgs;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        let (rows, heads) = (args.output.shape.dim(0), descriptor.heads_hint(args)?);
+        let (rows, heads) = (args.output.dim(0), descriptor.heads_hint(args)?);
         let width = u64::from(descriptor.width);
         let tiles = rows / u64::from(descriptor.tile_rows);
         args.compressed
-            .require_shape(Self::NAME, Shape::new(&[heads, tiles, width]))?;
+            .require_shape(Self::NAME, &[heads, tiles, width])?;
         for view in [&args.output, &args.gate] {
             check_rows(
                 Self::NAME,
@@ -225,13 +225,13 @@ impl Op for VsaAddGatedTiles {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let (rows, heads) = (args.output.shape.dim(0), args.output.shape.dim(1));
+        let (rows, heads) = (args.output.dim(0), args.output.dim(1));
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.output)
-            .view(args.compressed)
-            .view(args.gate)
+            .view(&args.output)
+            .view(&args.compressed)
+            .view(&args.gate)
             .i32(stride(&args.output, 0)?)
             .i32(stride(&args.output, 1)?)
             .i32(stride(&args.gate, 0)?)
@@ -262,13 +262,13 @@ impl AddGatedTilesDescriptor {
     /// The heads the launch's shapes imply; the descriptor does not carry them because the kernel
     /// reads them from the grid.
     fn heads_hint(&self, args: &AddGatedTilesArgs) -> Result<u64> {
-        let heads = args.output.shape.dim(1);
-        if args.compressed.shape.dim(0) != heads {
+        let heads = args.output.dim(1);
+        if args.compressed.dim(0) != heads {
             return Err(Error::argument(
                 VsaAddGatedTiles::NAME,
                 format!(
                     "the compression holds {} heads, the rows {heads}",
-                    args.compressed.shape.dim(0)
+                    args.compressed.dim(0)
                 ),
             ));
         }
@@ -314,7 +314,7 @@ impl fmt::Display for ComposeGatedRowsDescriptor {
 }
 
 /// The arguments of `vsa_compose_gated_rows`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ComposeGatedRowsArgs {
     /// `[members, count, heads, width]`, contiguous: receives the members' gated rows.
     pub output: Operand,
@@ -357,14 +357,14 @@ impl Op for VsaComposeGatedRows {
                 format!("the payload slots {slots:?} are not one per member of {members}"),
             ));
         }
-        let heads = args.output.shape.dim(2);
-        let width = args.output.shape.dim(3);
-        if args.output.shape.dim(0) != members {
+        let heads = args.output.dim(2);
+        let width = args.output.dim(3);
+        if args.output.dim(0) != members {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the payload holds {} members, the descriptor {members}",
-                    args.output.shape.dim(0)
+                    args.output.dim(0)
                 ),
             ));
         }
@@ -379,11 +379,11 @@ impl Op for VsaComposeGatedRows {
         }
         let rows = members * args.owner_rows;
         for (name, view) in [("fine rows", &args.fine), ("gate", &args.gate)] {
-            if view.shape.dim(0) != rows
-                || view.shape.dim(1) != heads
-                || view.shape.dim(2) != width
+            if view.dim(0) != rows
+                || view.dim(1) != heads
+                || view.dim(2) != width
                 || view.dtype != descriptor.dtype
-                || view.strides.last() != 1
+                || view.last_stride() != 1
             {
                 return Err(Error::argument(
                     Self::NAME,
@@ -403,8 +403,8 @@ impl Op for VsaComposeGatedRows {
             ));
         }
         args.compressed
-            .require_shape(Self::NAME, Shape::new(&[heads, tiles, width]))?;
-        if args.compressed.strides.last() != 1 {
+            .require_shape(Self::NAME, &[heads, tiles, width])?;
+        if args.compressed.last_stride() != 1 {
             return Err(Error::argument(
                 Self::NAME,
                 "the compression's column stride is not one".to_owned(),
@@ -452,14 +452,14 @@ impl Op for VsaComposeGatedRows {
         stream: &Stream,
     ) -> Result<()> {
         let members = u64::from(descriptor.members);
-        let heads = args.output.shape.dim(2);
+        let heads = args.output.dim(2);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.output)
-            .view(args.fine)
-            .view(args.compressed)
-            .view(args.gate)
+            .view(&args.output)
+            .view(&args.fine)
+            .view(&args.compressed)
+            .view(&args.gate)
             .i32(stride(&args.fine, 0)?)
             .i32(stride(&args.fine, 1)?)
             .i32(stride(&args.gate, 0)?)
@@ -508,7 +508,7 @@ impl fmt::Display for SelectTilesDescriptor {
 }
 
 /// The arguments of `vsa_select_tiles`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SelectTilesArgs {
     /// `[heads, query tiles, tiles]` FP32, contiguous: the pooled (query tile, key tile) scores.
     pub scores: Operand,
@@ -543,12 +543,9 @@ impl Op for VsaSelectTiles {
                 "the pooled scores are FP32".to_owned(),
             ));
         }
-        let (heads, query_tiles, tiles) = (
-            args.scores.shape.dim(0),
-            args.scores.shape.dim(1),
-            args.scores.shape.dim(2),
-        );
-        if args.scores.strides != crate::tensor::Strides::row_major(args.scores.shape) {
+        let (heads, query_tiles, tiles) =
+            (args.scores.dim(0), args.scores.dim(1), args.scores.dim(2));
+        if !args.scores.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the scores are not contiguous".to_owned(),
@@ -560,7 +557,7 @@ impl Op for VsaSelectTiles {
             ("segment", &args.segments, DType::I32),
             ("size", &args.sizes, DType::U32),
         ] {
-            table.require_shape(Self::NAME, Shape::new(&[tiles]))?;
+            table.require_shape(Self::NAME, &[tiles])?;
             table.require_row(Self::NAME, dtype, tiles)?;
             if table.dtype != dtype {
                 return Err(Error::argument(
@@ -569,23 +566,23 @@ impl Op for VsaSelectTiles {
                 ));
             }
         }
-        let segments = args.segments.shape.dim(0);
-        if args.keep.shape.dim(0) != segments || args.keep.dtype != DType::U32 {
+        let segments = args.segments.dim(0);
+        if args.keep.dim(0) != segments || args.keep.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
                 "the keep table does not hold one u32 entry per segment".to_owned(),
             ));
         }
-        args.indices.require_shape(Self::NAME, args.scores.shape)?;
+        args.indices.require_dims(Self::NAME, args.scores.dims())?;
         args.indices.require_row(Self::NAME, DType::U32, tiles)?;
-        if args.indices.strides != crate::tensor::Strides::row_major(args.indices.shape) {
+        if !args.indices.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the index matrix is not contiguous".to_owned(),
             ));
         }
         args.counts
-            .require_shape(Self::NAME, Shape::new(&[heads, query_tiles]))?;
+            .require_shape(Self::NAME, &[heads, query_tiles])?;
         args.counts
             .require_row(Self::NAME, DType::U32, query_tiles)?;
         if args.query_offset > tiles - query_tiles {
@@ -615,20 +612,17 @@ impl Op for VsaSelectTiles {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let (heads, query_tiles, tiles) = (
-            args.scores.shape.dim(0),
-            args.scores.shape.dim(1),
-            args.scores.shape.dim(2),
-        );
+        let (heads, query_tiles, tiles) =
+            (args.scores.dim(0), args.scores.dim(1), args.scores.dim(2));
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.scores)
-            .view(args.segments)
-            .view(args.sizes)
-            .view(args.keep)
-            .view(args.indices)
-            .view(args.counts)
+            .view(&args.scores)
+            .view(&args.segments)
+            .view(&args.sizes)
+            .view(&args.keep)
+            .view(&args.indices)
+            .view(&args.counts)
             .i32(query_tiles as i32)
             .i32(tiles as i32)
             .i32(args.query_offset as i32);
@@ -712,7 +706,7 @@ impl fmt::Display for PrepareTilesDescriptor {
 }
 
 /// The arguments of `vsa_prepare_tiles`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PrepareTilesArgs {
     /// `[tiles · tile_rows, heads, width]`, unit column stride: the query rows, normalized and
     /// rotated in place.
@@ -749,8 +743,8 @@ impl Op for VsaPrepareTiles {
     type Args<'a> = PrepareTilesArgs;
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        let heads = args.query.shape.dim(1);
-        let width = args.query.shape.dim(2);
+        let heads = args.query.dim(1);
+        let width = args.query.dim(2);
         if u64::from(descriptor.heads) != heads || u64::from(descriptor.width) != width {
             return Err(Error::argument(
                 Self::NAME,
@@ -788,7 +782,7 @@ impl Op for VsaPrepareTiles {
                 descriptor.width,
                 view,
             )?;
-            if view.shape != args.query.shape {
+            if view.dims() != args.query.dims() {
                 return Err(Error::argument(
                     Self::NAME,
                     format!("the {name} rows do not have the query's shape"),
@@ -812,7 +806,7 @@ impl Op for VsaPrepareTiles {
                 "the block rows do not divide a tile".to_owned(),
             ));
         }
-        let rows = args.query.shape.dim(0);
+        let rows = args.query.dim(0);
         if rows % u64::from(descriptor.tile_rows) != 0 {
             return Err(Error::argument(
                 Self::NAME,
@@ -820,9 +814,9 @@ impl Op for VsaPrepareTiles {
             ));
         }
         let tiles = rows / u64::from(descriptor.tile_rows);
-        args.sizes.require_shape(Self::NAME, Shape::new(&[tiles]))?;
+        args.sizes.require_shape(Self::NAME, &[tiles])?;
         args.sizes.require_row(Self::NAME, DType::U32, tiles)?;
-        let pooled = Shape::new(&[tiles, heads, width]);
+        let pooled = &[tiles, heads, width];
         for (name, view) in [
             ("query", &args.pooled_query),
             ("key", &args.pooled_key),
@@ -846,14 +840,11 @@ impl Op for VsaPrepareTiles {
         ) {
             (Some(query_weight), Some(key_weight), Some(cosine), Some(sine), true) => {
                 for view in [query_weight, key_weight] {
-                    view.require_shape(Self::NAME, Shape::new(&[width]))?;
+                    view.require_shape(Self::NAME, &[width])?;
                     view.require_row(Self::NAME, descriptor.dtype, width)?;
                 }
                 for (name, view) in [("cosine", cosine), ("sine", sine)] {
-                    view.require_shape(
-                        Self::NAME,
-                        Shape::new(&[rows, u64::from(descriptor.rotated / 2)]),
-                    )?;
+                    view.require_shape(Self::NAME, &[rows, u64::from(descriptor.rotated / 2)])?;
                     // The factors are the rotary operator's output, FP32 whatever the rows' type:
                     // the kernel rounds each product to the rows' type as two eager operations do.
                     if view.dtype != DType::F32 {
@@ -862,13 +853,13 @@ impl Op for VsaPrepareTiles {
                             format!("the {name} table is not f32"),
                         ));
                     }
-                    if view.strides.get(0) != descriptor.factor_stride {
+                    if view.stride(0) != descriptor.factor_stride {
                         return Err(Error::argument(
                             Self::NAME,
                             format!(
                                 "the {name} table's rows are {} elements apart, the descriptor says \
                                  {}",
-                                view.strides.get(0),
+                                view.stride(0),
                                 descriptor.factor_stride
                             ),
                         ));
@@ -892,27 +883,27 @@ impl Op for VsaPrepareTiles {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let heads = args.query.shape.dim(1);
-        let tiles = args.query.shape.dim(0) / u64::from(descriptor.tile_rows);
+        let heads = args.query.dim(1);
+        let tiles = args.query.dim(0) / u64::from(descriptor.tile_rows);
 
         // The stepwise recipe's operands stand in with the rows they would have touched.
-        let query_weight = args.query_weight.unwrap_or(args.query);
-        let key_weight = args.key_weight.unwrap_or(args.key);
-        let cosine = args.cosine.unwrap_or(args.query);
-        let sine = args.sine.unwrap_or(args.query);
+        let query_weight = args.query_weight.as_ref().unwrap_or(&args.query);
+        let key_weight = args.key_weight.as_ref().unwrap_or(&args.key);
+        let cosine = args.cosine.as_ref().unwrap_or(&args.query);
+        let sine = args.sine.as_ref().unwrap_or(&args.query);
         let mut arguments = Arguments::new();
         arguments
-            .view(args.query)
-            .view(args.key)
-            .view(args.value)
+            .view(&args.query)
+            .view(&args.key)
+            .view(&args.value)
             .view(query_weight)
             .view(key_weight)
             .view(cosine)
             .view(sine)
-            .view(args.sizes)
-            .view(args.pooled_query)
-            .view(args.pooled_key)
-            .view(args.pooled_value);
+            .view(&args.sizes)
+            .view(&args.pooled_query)
+            .view(&args.pooled_key)
+            .view(&args.pooled_value);
         kernel.launch(LaunchGrid::new([tiles, heads, 1])?, &mut arguments, stream)
     }
 
@@ -946,13 +937,13 @@ fn check_rows(
     view: &Operand,
 ) -> Result<()> {
     view.require_rank(operator, 3)?;
-    if view.shape.dim(1) != u64::from(heads) || view.shape.dim(2) != u64::from(width) {
+    if view.dim(1) != u64::from(heads) || view.dim(2) != u64::from(width) {
         return Err(Error::argument(
             operator,
             format!(
                 "the rows hold {} heads of {} features, the descriptor {heads} of {width}",
-                view.shape.dim(1),
-                view.shape.dim(2)
+                view.dim(1),
+                view.dim(2)
             ),
         ));
     }
@@ -966,13 +957,10 @@ fn check_rows(
             ),
         ));
     }
-    if view.strides.last() != 1 {
+    if view.last_stride() != 1 {
         return Err(Error::argument(
             operator,
-            format!(
-                "the rows' column stride is {}, not one",
-                view.strides.last()
-            ),
+            format!("the rows' column stride is {}, not one", view.last_stride()),
         ));
     }
     Ok(())
@@ -994,7 +982,7 @@ fn check_block(operator: &'static str, tile_rows: u32, block_rows: u32) -> Resul
 
 /// A stride the kernel takes as an `int32`.
 fn stride(view: &Operand, axis: usize) -> Result<i32> {
-    let stride = view.strides.get(axis);
+    let stride = view.stride(axis);
     i32::try_from(stride)
         .map_err(|_| Error::Shape(format!("the stride {stride} does not fit int32")))
 }
@@ -1041,7 +1029,7 @@ impl fmt::Display for ScoresDescriptor {
 }
 
 /// The arguments of `vsa_scores`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ScoresArgs {
     /// `[query tiles, heads, width]` FP32: the pooled query rows, in the layout
     /// `vsa_prepare_tiles` writes them.
@@ -1111,21 +1099,21 @@ impl Op for VsaScores {
         // A tile's pooled row is `[heads, width]` and the tile is its leading axis, so both operands
         // carry the same two inner extents; a view whose planes are another head count or another
         // width would contract against the wrong operands and produce plausible scores.
-        for (name, view) in [("query", args.pooled_query), ("key", args.pooled_key)] {
-            if view.shape.dim(1) != heads || view.shape.dim(2) != width {
+        for (name, view) in [("query", &args.pooled_query), ("key", &args.pooled_key)] {
+            if view.dim(1) != heads || view.dim(2) != width {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "the pooled {name} tiles are [_, {}, {}], the descriptor's [_, {heads}, \
                          {width}]",
-                        view.shape.dim(1),
-                        view.shape.dim(2)
+                        view.dim(1),
+                        view.dim(2)
                     ),
                 ));
             }
         }
-        let query_tiles = args.pooled_query.shape.dim(0);
-        let key_tiles = args.pooled_key.shape.dim(0);
+        let query_tiles = args.pooled_query.dim(0);
+        let key_tiles = args.pooled_key.dim(0);
         if args.out.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1133,10 +1121,10 @@ impl Op for VsaScores {
             ));
         }
         args.out
-            .require_shape(Self::NAME, Shape::new(&[heads, query_tiles, key_tiles]))?;
+            .require_shape(Self::NAME, &[heads, query_tiles, key_tiles])?;
         // The selection reads the scores as a contiguous `[heads, query tiles, tiles]` matrix, so
         // this operator writes exactly that layout and no other.
-        if args.out.strides != crate::tensor::Strides::row_major(args.out.shape) {
+        if !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the score matrix is written row-major".to_owned(),
@@ -1161,14 +1149,14 @@ impl Op for VsaScores {
         stream: &Stream,
     ) -> Result<()> {
         let heads = u64::from(descriptor.heads);
-        let query_tiles = args.pooled_query.shape.dim(0);
-        let key_tiles = args.pooled_key.shape.dim(0);
+        let query_tiles = args.pooled_query.dim(0);
+        let key_tiles = args.pooled_key.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.pooled_query)
-            .view(args.pooled_key)
-            .view(args.out)
+            .view(&args.pooled_query)
+            .view(&args.pooled_key)
+            .view(&args.out)
             .i32(query_tiles as i32)
             .i32(key_tiles as i32)
             .flag(descriptor.pdl);
@@ -1283,7 +1271,7 @@ impl fmt::Display for CompressPooledDescriptor {
 }
 
 /// The arguments of `vsa_compress_pooled`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct CompressPooledArgs {
     /// `[heads, query tiles, tiles]` FP32: the pooled similarities, in `vsa_scores`' layout.
     pub scores: Operand,
@@ -1350,35 +1338,35 @@ impl Op for VsaCompressPooled {
         }
         args.scores.require_rank(Self::NAME, 3)?;
         args.values.require_rank(Self::NAME, 3)?;
-        if args.scores.shape.dim(0) != heads || args.values.shape.dim(1) != heads {
+        if args.scores.dim(0) != heads || args.values.dim(1) != heads {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the scores are [{}, _, _] and the values [_, {}, _], the descriptor's {heads} \
                      heads",
-                    args.scores.shape.dim(0),
-                    args.values.shape.dim(1)
+                    args.scores.dim(0),
+                    args.values.dim(1)
                 ),
             ));
         }
-        if args.values.shape.dim(2) != width {
+        if args.values.dim(2) != width {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the pooled values carry {} features, the descriptor's {width}",
-                    args.values.shape.dim(2)
+                    args.values.dim(2)
                 ),
             ));
         }
-        let query_tiles = args.scores.shape.dim(1);
-        let tiles = args.scores.shape.dim(2);
-        if args.values.shape.dim(0) != tiles {
+        let query_tiles = args.scores.dim(1);
+        let tiles = args.scores.dim(2);
+        if args.values.dim(0) != tiles {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "{} key tiles of scores against {} of pooled values",
                     tiles,
-                    args.values.shape.dim(0)
+                    args.values.dim(0)
                 ),
             ));
         }
@@ -1391,10 +1379,10 @@ impl Op for VsaCompressPooled {
                 ),
             ));
         }
-        args.sizes.require_shape(Self::NAME, Shape::new(&[tiles]))?;
+        args.sizes.require_shape(Self::NAME, &[tiles])?;
         args.sizes.require_row(Self::NAME, DType::U32, tiles)?;
         args.out
-            .require_shape(Self::NAME, Shape::new(&[heads, query_tiles, width]))?;
+            .require_shape(Self::NAME, &[heads, query_tiles, width])?;
         if args.out.dtype != descriptor.dtype {
             return Err(Error::argument(
                 Self::NAME,
@@ -1407,7 +1395,7 @@ impl Op for VsaCompressPooled {
         }
         // The gate step reads one contiguous `[heads, query tiles, width]` matrix, so this operator
         // writes exactly that layout and no other.
-        if args.out.strides != crate::tensor::Strides::row_major(args.out.shape) {
+        if !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the compression is written row-major".to_owned(),
@@ -1432,15 +1420,15 @@ impl Op for VsaCompressPooled {
         stream: &Stream,
     ) -> Result<()> {
         let heads = u64::from(descriptor.heads);
-        let query_tiles = args.scores.shape.dim(1);
-        let tiles = args.scores.shape.dim(2);
+        let query_tiles = args.scores.dim(1);
+        let tiles = args.scores.dim(2);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.scores)
-            .view(args.values)
-            .view(args.sizes)
-            .view(args.out)
+            .view(&args.scores)
+            .view(&args.values)
+            .view(&args.sizes)
+            .view(&args.out)
             .i32(query_tiles as i32)
             .i32(tiles as i32)
             .flag(descriptor.pdl);

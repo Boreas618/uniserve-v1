@@ -160,7 +160,7 @@ pub(crate) struct TextRank {
     /// What the profile run states of the rank's runner, which its pools are sized by.
     pub(crate) peaks: Peaks,
     /// The rank's tensor group's communicator; `None` for a group of one and on the meta device.
-    pub(crate) tensor: Option<Arc<backend::Group>>,
+    pub(crate) tensor: Option<Arc<ops::Group>>,
     /// The config of the rank's runner: the profiled runner's until the rank is opened, the
     /// serving runner's after.
     pub(crate) config: CausalLmConfig,
@@ -211,7 +211,7 @@ impl LoadedRank {
             graphs: Arc::clone(pool),
             stream: Stream::new(device)
                 .with_context(|| format!("creating device {}'s stream", device.0))?,
-            // A communicator states no bytes NVML attributes to no process (`backend::Group`).
+            // A communicator states no bytes NVML attributes to no process (`ops::Group`).
             unattributed: 0,
             model: Arc::new(RankModel::new(self.model_runner.clone())),
             serving: self.weights.clone(),
@@ -713,7 +713,7 @@ fn group_over(
     device: DeviceId,
     collective: &Collective,
     communicates: bool,
-) -> Result<Option<Arc<backend::Group>>> {
+) -> Result<Option<Arc<ops::Group>>> {
     let members = host.size();
     for &(first, size) in &collective.spans {
         if size > 1 && first + size > members {
@@ -761,7 +761,7 @@ fn group_over(
     let member = i32::try_from(rank).context("a rank past what NCCL addresses")?;
     let communicator = platform::Communicator::init(device, size, member, &id)
         .context("joining a communicator")?;
-    Ok(Some(Arc::new(backend::Group::new(communicator)?)))
+    Ok(Some(Arc::new(ops::Group::new(communicator)?)))
 }
 
 /// The session's numbers of the deployment's worker groups `groups` and each scheduler's groups,

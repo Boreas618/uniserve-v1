@@ -130,10 +130,10 @@ pub fn philox_normal(out: &Tensor, seed: u64, stage: u32, draw: u32, offset: u64
     }
 
     let rows = out.reshape((elements / width.max(1), width))?;
-    backend::launch::<PhiloxNoise>(
+    ops::launch::<PhiloxNoise>(
         &descriptor(out.dtype(), KeySource::Scalar),
         NoiseArgs {
-            out: backend::operand(&rows)?,
+            out: ops::operand(&rows)?,
             keys: None,
             key: seed,
             stage,
@@ -166,7 +166,7 @@ pub fn philox_normal_like(
     let out = if on_cpu(like) {
         Tensor::zeros(like.shape(), like.dtype(), &Device::Cpu)?
     } else {
-        backend::empty(like.shape(), like.dtype())?
+        ops::empty(like.shape(), like.dtype())?
     };
 
     philox_normal(&out, seed, stage, draw, offset)?;
@@ -220,11 +220,11 @@ pub fn philox_normal_rows(
         return Ok(out.slice_set(&drawn, 0, 0)?);
     }
 
-    backend::launch::<PhiloxNoise>(
+    ops::launch::<PhiloxNoise>(
         &descriptor(out.dtype(), KeySource::Rows),
         NoiseArgs {
-            out: backend::operand(out)?,
-            keys: Some(backend::operand(keys)?),
+            out: ops::operand(out)?,
+            keys: Some(ops::operand(keys)?),
             key: 0,
             stage,
             draw,

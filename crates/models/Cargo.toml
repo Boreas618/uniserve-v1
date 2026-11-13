@@ -13,13 +13,16 @@ publish = false
 nn.workspace = true
 tensor.workspace = true
 processing.workspace = true
+# The latent layout a video family's packing and decoders state (`proto::video::Layout`), which
+# `nn` does not re-export beside the tensor library's own `Layout`.
+proto.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 # The profile runs install a meta context and make their meta inputs, which the library target
 # names neither of; the tests write tiny checkpoints.
 [dev-dependencies]
-backend.workspace = true
+ops.workspace = true
 serde.workspace = true
 tempfile.workspace = true
 

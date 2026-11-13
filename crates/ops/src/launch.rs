@@ -7,7 +7,7 @@
 //! states it and a captured graph's node for it can be found; and it is offered to the context's
 //! route, so execution can run two implementations of it side by side.
 
-use ops::{Checked, Op};
+use crate::{Checked, Op};
 
 use crate::context::{self, Context};
 use crate::{Error, Result, profiler};
@@ -32,12 +32,12 @@ use crate::{Error, Result, profiler};
 /// the key, or the route or the launch fails.
 pub fn launch<'t, O: Op>(descriptor: &O::Descriptor, args: O::Args<'t>) -> Result<()>
 where
-    O::Args<'t>: Copy,
+    O::Args<'t>: Clone,
 {
     let refused = |source| Error::Launch {
         operator: O::NAME,
-        key: ops::descriptor::key(descriptor),
-        source,
+        key: crate::descriptor::key(descriptor),
+        source: Box::new(source),
     };
 
     let context = context::current("a launch")?;
@@ -54,7 +54,7 @@ where
 
     // Every launch of a serving step passes through here and a recording is the exception, so
     // the key is formatted only when the table will hold it.
-    let key = recording.then(|| ops::descriptor::key(descriptor));
+    let key = recording.then(|| crate::descriptor::key(descriptor));
 
     if let (Some(stream), Some(kernels)) = (context.stream(), kernels) {
         let kernel = match &key {
@@ -65,7 +65,11 @@ where
 
         let routed = match route {
             Some(route) => route
-                .launch(&Checked::<O>::new(descriptor, args), &kernels, stream)
+                .launch(
+                    &Checked::<O>::new(descriptor, args.clone()),
+                    &kernels,
+                    stream,
+                )
                 .map_err(refused)?,
             None => false,
         };
@@ -94,9 +98,11 @@ fn record(context: &Context, operator: &'static str, key: String) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use ops::norm::{RmsNorm, RmsNormArgs, RmsNormDescriptor};
-    use ops::{DevicePtr, Operand, Shape};
+    use platform::DevicePtr;
     use tensor::DType;
+
+    use crate::Operand;
+    use crate::norm::{RmsNorm, RmsNormArgs, RmsNormDescriptor};
 
     use super::launch;
     use crate::{Context, Error, Result};
@@ -116,15 +122,11 @@ pub(crate) mod tests {
     /// The arguments of `rms_norm` over two rows of `columns` elements with a weight of `weight`
     /// elements. The addresses are never read: a meta context launches nothing.
     fn args(columns: u64, weight: u64) -> RmsNormArgs {
-        let rows = Operand::new(
-            DevicePtr::new(0x1000),
-            DType::BF16,
-            Shape::new(&[2, columns]),
-        );
+        let rows = Operand::new(DevicePtr::from_address(0x1000), DType::BF16, &[2, columns]);
 
         RmsNormArgs {
-            x: rows,
-            weight: Operand::new(DevicePtr::new(0x2000), DType::BF16, Shape::new(&[weight])),
+            x: rows.clone(),
+            weight: Operand::new(DevicePtr::from_address(0x2000), DType::BF16, &[weight]),
             out: rows,
             eps: 1e-6,
         }
@@ -201,7 +203,7 @@ pub(crate) mod tests {
         };
         assert_eq!(operator, "rms_norm");
         assert_eq!(key, descriptor(8).to_string());
-        assert!(matches!(source, ops::Error::Argument { .. }));
+        assert!(matches!(*source, Error::Argument { .. }));
 
         // A refused call is not a launch.
         assert!(context.take_launches().is_empty());

@@ -36,7 +36,7 @@ use ops::rope::{
 use tensor::{D, DType, Device, Tensor};
 
 use super::norm::{gain, rms_scaled};
-use super::nvfp4::{integer, remainder};
+use super::nvfp4::integer;
 use super::{ACCUMULATE, PDL, on_cpu, vector};
 use crate::error::{Error, Result};
 
@@ -145,7 +145,7 @@ fn frequency_axes(sections: &[u32], columns: usize, interleaved: bool) -> Result
 
     if interleaved {
         // The axes cycle over the spectrum; a frequency its axis cannot claim falls to axis 0.
-        let cycle = remainder(&frequency, axes as u32)?;
+        let cycle = frequency.broadcast_remainder(&integer(axes as u32, &frequency)?)?;
         let claimed = widths
             .index_select(&cycle, 0)?
             .broadcast_mul(&integer(axes as u32, &frequency)?)?;
@@ -242,12 +242,12 @@ pub fn rotary_factors(
         return Ok((angle.cos()?, angle.sin()?));
     }
 
-    let cos = backend::empty((tokens, columns), DType::F32)?;
-    let sin = backend::empty((tokens, columns), DType::F32)?;
+    let cos = ops::empty((tokens, columns), DType::F32)?;
+    let sin = ops::empty((tokens, columns), DType::F32)?;
 
     let mut owned = [0; MAX_AXES];
     owned[..sections.len()].copy_from_slice(sections);
-    backend::launch::<RotaryFactors>(
+    ops::launch::<RotaryFactors>(
         &FactorsDescriptor {
             dtype: DType::F32,
             positions: positions.dtype(),
@@ -260,10 +260,10 @@ pub fn rotary_factors(
             interleaved: !sections.is_empty() && interleaved,
         },
         FactorsArgs {
-            positions: backend::operand(positions)?,
-            frequencies: backend::operand(inv_freq)?,
-            cosine: backend::operand(&cos)?,
-            sine: backend::operand(&sin)?,
+            positions: ops::operand(positions)?,
+            frequencies: ops::operand(inv_freq)?,
+            cosine: ops::operand(&cos)?,
+            sine: ops::operand(&sin)?,
         },
     )?;
     Ok((cos, sin))
@@ -287,8 +287,8 @@ pub fn rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         return Ok(rotate(&x.to_dtype(ACCUMULATE)?, cos, sin)?.to_dtype(x.dtype())?);
     }
 
-    let out = backend::empty(x.shape(), x.dtype())?;
-    backend::launch::<RopeApply>(
+    let out = ops::empty(x.shape(), x.dtype())?;
+    ops::launch::<RopeApply>(
         &RopeApplyDescriptor {
             dtype: x.dtype(),
             output: out.dtype(),
@@ -301,10 +301,10 @@ pub fn rotary(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
             pdl: PDL,
         },
         RopeApplyArgs {
-            x: backend::operand(x)?,
-            cosine: backend::operand(cos)?,
-            sine: backend::operand(sin)?,
-            out: backend::operand(&out)?,
+            x: ops::operand(x)?,
+            cosine: ops::operand(cos)?,
+            sine: ops::operand(sin)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)
@@ -377,9 +377,9 @@ pub fn qk_norm_rope(
         ));
     }
 
-    let query_out = backend::empty(query.shape(), query.dtype())?;
-    let key_out = backend::empty(key.shape(), key.dtype())?;
-    backend::launch::<QkNormRope>(
+    let query_out = ops::empty(query.shape(), query.dtype())?;
+    let key_out = ops::empty(key.shape(), key.dtype())?;
+    ops::launch::<QkNormRope>(
         // With learned gains the kernel loads them; without, it has no weight arguments.
         &QkNormRopeDescriptor {
             dtype: query.dtype(),
@@ -399,16 +399,14 @@ pub fn qk_norm_rope(
             centred,
         },
         QkNormRopeArgs {
-            query: backend::operand(query)?,
-            key: backend::operand(key)?,
-            q_weight: weights
-                .map(|(query, _)| backend::operand(query))
-                .transpose()?,
-            k_weight: weights.map(|(_, key)| backend::operand(key)).transpose()?,
-            cosine: backend::operand(cos)?,
-            sine: backend::operand(sin)?,
-            q_out: backend::operand(&query_out)?,
-            k_out: backend::operand(&key_out)?,
+            query: ops::operand(query)?,
+            key: ops::operand(key)?,
+            q_weight: weights.map(|(query, _)| ops::operand(query)).transpose()?,
+            k_weight: weights.map(|(_, key)| ops::operand(key)).transpose()?,
+            cosine: ops::operand(cos)?,
+            sine: ops::operand(sin)?,
+            q_out: ops::operand(&query_out)?,
+            k_out: ops::operand(&key_out)?,
         },
     )?;
     Ok((query_out, key_out))
@@ -508,11 +506,8 @@ pub fn qk_norm_rope_(
         return Ok(projected);
     }
 
-    let (query_operand, key_operand) = (
-        backend::operand(&query_heads)?,
-        backend::operand(&key_heads)?,
-    );
-    backend::launch::<QkNormRope>(
+    let (query_operand, key_operand) = (ops::operand(&query_heads)?, ops::operand(&key_heads)?);
+    ops::launch::<QkNormRope>(
         // Each kernel owns some tokens of one head, the queries' heads and the keys' alike, and
         // the outputs are the inputs.
         &QkNormRopeDescriptor {
@@ -533,12 +528,12 @@ pub fn qk_norm_rope_(
             centred: false,
         },
         QkNormRopeArgs {
-            query: query_operand,
-            key: key_operand,
+            query: query_operand.clone(),
+            key: key_operand.clone(),
             q_weight: None,
             k_weight: None,
-            cosine: backend::operand(cos)?,
-            sine: backend::operand(sin)?,
+            cosine: ops::operand(cos)?,
+            sine: ops::operand(sin)?,
             q_out: query_operand,
             k_out: key_operand,
         },

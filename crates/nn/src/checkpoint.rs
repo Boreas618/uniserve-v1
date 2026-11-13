@@ -39,6 +39,7 @@ use memmap2::Mmap;
 use safetensors::Dtype as FormatDtype;
 use safetensors::SafeTensors;
 use safetensors::tensor::Metadata;
+use tensor::nditer::MAX_DIMS;
 use tensor::{DType, Shape};
 
 use crate::adapter::{Adapter, Fusion};
@@ -962,16 +963,16 @@ fn element_type(path: &Path, tensor: &str, dtype: FormatDtype) -> Result<DType> 
 
 /// The extents of a tensor a kernel argument can carry.
 ///
-/// The format allows any rank; a kernel argument's is a fixed maximum, so a shard of deeper
-/// tensors is refused by name instead of truncated to the axes that fit.
+/// The format allows any rank; a tensor's strided operations and a kernel argument take at most
+/// [`MAX_DIMS`](tensor::nditer::MAX_DIMS) axes, so a shard of deeper tensors is refused by name
+/// instead of truncated to the axes that fit.
 fn extents(path: &Path, tensor: &str, dims: &[usize]) -> Result<Shape> {
-    if dims.len() > ops::MAX_RANK {
+    if dims.len() > MAX_DIMS {
         return Err(Error::Checkpoint {
             path: path.to_path_buf(),
             problem: format!(
-                "tensor `{tensor}` has {} axes, more than a kernel argument's {MAX_RANK}",
-                dims.len(),
-                MAX_RANK = ops::MAX_RANK
+                "tensor `{tensor}` has {} axes, more than a kernel argument's {MAX_DIMS}",
+                dims.len()
             ),
         });
     }

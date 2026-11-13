@@ -180,7 +180,7 @@ pub(crate) fn meta(shape: impl Into<Shape>, dtype: DType) -> Tensor {
     static NEXT: AtomicU64 = AtomicU64::new(1 << 40);
     let address = NEXT.fetch_add(1 << 32, Ordering::Relaxed);
 
-    backend::retained(address, shape, dtype, &backend::meta()).unwrap()
+    ops::retained(address, shape, dtype, &ops::meta()).unwrap()
 }
 
 /// What a forward run under a meta context states: its launches, as `(operator, key)` in launch
@@ -190,7 +190,7 @@ pub(crate) type Recording = (Vec<(&'static str, String)>, u64);
 /// Runs `forward` under a new meta context while it records, and returns what it returned with
 /// the context's [`Recording`].
 pub(crate) fn recorded<T, E>(forward: impl FnOnce() -> Result<T, E>) -> (Result<T, E>, Recording) {
-    let context = backend::Context::meta(None);
+    let context = ops::Context::meta(None);
     context.record_launches();
 
     let output = {
@@ -206,7 +206,7 @@ pub(crate) fn recorded<T, E>(forward: impl FnOnce() -> Result<T, E>) -> (Result<
     (output, (launches, context.peak()))
 }
 
-/// The operators of the device backend's generic tensor primitives (`backend::primitives`);
+/// The operators of the device backend's generic tensor primitives (`ops::primitives`);
 /// every other operator a forward launches is a fused operator of `nn`.
 pub(crate) const PRIMITIVES: [&str; 8] = [
     "cast",

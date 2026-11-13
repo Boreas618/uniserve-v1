@@ -30,13 +30,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -68,7 +68,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `snake`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[rows, channels, width]`, row-major, the signal to activate.
     pub x: Operand,
@@ -90,31 +90,29 @@ impl Op for Snake {
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let channels = u64::from(descriptor.channels);
         args.x.require_rank(Self::NAME, 3)?;
-        let shape = args.x.shape;
-        let width = shape.dim(2);
-        if shape.dim(1) != channels {
+        let width = args.x.dim(2);
+        if args.x.dim(1) != channels {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "expected {channels} channels on the axis after the rows, found {}",
-                    shape.dim(1)
+                    args.x.dim(1)
                 ),
             ));
         }
         args.x.require_row(Self::NAME, descriptor.dtype, width)?;
-        if args.x.strides != Strides::row_major(shape) {
+        if !args.x.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the activation is read row-major; found strides {}",
-                    args.x.strides
+                    "the activation is read row-major; found strides {:?}",
+                    args.x.strides()
                 ),
             ));
         }
-        args.out.require_shape(Self::NAME, shape)?;
+        args.out.require_dims(Self::NAME, args.x.dims())?;
         args.out.require_row(Self::NAME, descriptor.dtype, width)?;
-        args.alpha
-            .require_shape(Self::NAME, Shape::new(&[channels]))?;
+        args.alpha.require_shape(Self::NAME, &[channels])?;
         args.alpha
             .require_row(Self::NAME, descriptor.dtype, channels)?;
         u32::try_from(width).map_err(|_| {
@@ -132,17 +130,16 @@ impl Op for Snake {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let shape = args.x.shape;
-        let width = shape.dim(2);
-        let rows = shape.dim(0);
+        let width = args.x.dim(2);
+        let rows = args.x.dim(0);
 
         // One thread per element; the plane stride is the row-major one the check above pins.
-        let elements = shape.numel();
+        let elements = args.x.numel();
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.alpha)
-            .view(args.out)
+            .view(&args.x)
+            .view(&args.alpha)
+            .view(&args.out)
             .u64(rows)
             .u32(descriptor.channels)
             // `check` keeps the width within a kernel parameter.

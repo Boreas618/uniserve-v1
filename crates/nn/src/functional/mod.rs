@@ -9,8 +9,8 @@
 //!   the kernel rounds. This is what a host check runs and the reference a device check compares
 //!   with;
 //! - on **tensors of the device backend** it takes its output from the context's allocator
-//!   (`backend::empty`), states its arguments (`backend::operand`) and makes one launch
-//!   (`backend::launch`) of the operator, with the descriptor computed from the tensors' element
+//!   (`ops::empty`), states its arguments (`ops::operand`) and makes one launch
+//!   (`ops::launch`) of the operator, with the descriptor computed from the tensors' element
 //!   types and widths. Under a meta context the launch states its key and computes nothing.
 //!
 //! Which body runs follows from the device of the first tensor argument; mixing devices is

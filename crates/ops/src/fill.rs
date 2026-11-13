@@ -20,14 +20,14 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
+use crate::operand::Operand;
 use crate::strided;
-use crate::tensor::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -49,7 +49,7 @@ impl Descriptor {
     pub fn of(args: &Args, block: u32, pdl: bool) -> Self {
         Self {
             dtype: args.destination.dtype,
-            rank: strided::rank([args.destination]),
+            rank: strided::rank([&args.destination]),
             block,
             pdl,
         }
@@ -68,7 +68,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `fill`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// The elements to set: a row-major window.
     pub destination: Operand,
@@ -112,7 +112,7 @@ impl Op for Fill {
             ));
         }
 
-        let traversed = strided::rank([args.destination]);
+        let traversed = strided::rank([&args.destination]);
         strided::require_rank(Self::NAME, "rank", descriptor.rank, traversed)
     }
 
@@ -122,13 +122,13 @@ impl Op for Fill {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let [destination] = strided::merge_axes([args.destination]);
+        let [destination] = strided::merge_axes([&args.destination]);
         let elements = destination.numel();
 
         let mut arguments = Arguments::new();
-        arguments.view(destination).u64(elements);
-        strided::pack_extents(&mut arguments, destination.shape);
-        strided::pack_strides(&mut arguments, destination.strides);
+        arguments.view(&destination).u64(elements);
+        strided::pack_extents(&mut arguments, &destination);
+        strided::pack_strides(&mut arguments, &destination);
         arguments.u64(args.bits).flag(descriptor.pdl);
 
         kernel.launch(
@@ -154,17 +154,17 @@ impl Op for Fill {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DevicePtr, Shape, Strides};
+    use platform::DevicePtr;
 
     const BLOCK: u32 = 1024;
 
     fn window(dtype: DType, shape: &[u64], strides: &[u64], bits: u64) -> Args {
         Args {
             destination: Operand::with_strides(
-                DevicePtr::new(0x2000),
+                DevicePtr::from_address(0x2000),
                 dtype,
-                Shape::new(shape),
-                Strides::new(strides),
+                shape,
+                strides,
             ),
             bits,
         }

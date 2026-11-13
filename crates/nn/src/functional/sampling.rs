@@ -101,7 +101,7 @@ const MAX_ORDERED: usize = 1 << 21;
 /// The kernel argument of `indices`, a `U32` index tensor, read as the `I32` the sampling
 /// kernels are compiled for: the same elements, bit for bit, with [`NO_SLOT`] as `-1`.
 pub(super) fn signed(indices: &Tensor) -> Result<Operand> {
-    Ok(backend::operand(&indices.view(INDEX)?)?)
+    Ok(ops::operand(&indices.view(INDEX)?)?)
 }
 
 /// Checks that `x`, the tensor `name`, holds `dtype` elements in `shape`, where `None` is an
@@ -409,8 +409,8 @@ pub fn logits_shape(
         return Ok(x.broadcast_div(&divisor)?);
     }
 
-    let out = backend::empty((rows, width), DType::F32)?;
-    backend::launch::<LogitsShape>(
+    let out = ops::empty((rows, width), DType::F32)?;
+    ops::launch::<LogitsShape>(
         &ShapeDescriptor {
             dtype: logits.dtype(),
             vocabulary,
@@ -420,15 +420,15 @@ pub fn logits_shape(
             pdl: PDL,
         },
         ShapeArgs {
-            logits: backend::operand(logits)?,
-            counts: backend::operand(counts)?,
+            logits: ops::operand(logits)?,
+            counts: ops::operand(counts)?,
             slots: signed(slots)?,
-            parameters: backend::operand(parameters)?,
+            parameters: ops::operand(parameters)?,
             extras: extras.map(signed).transpose()?,
-            bias: backend::operand(bias)?,
+            bias: ops::operand(bias)?,
             adjustments: signed(adjustments)?,
             bans: signed(bans)?,
-            out: backend::operand(&out)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)
@@ -467,14 +467,14 @@ pub fn top_k(logits: &Tensor, width: u32) -> Result<(Tensor, Tensor)> {
         return Ok((values.gather(&ids, 1)?, ids));
     }
 
-    let values = backend::empty((rows, kept), DType::F32)?;
-    let ids = backend::empty((rows, kept), DType::U32)?;
+    let values = ops::empty((rows, kept), DType::F32)?;
+    let ids = ops::empty((rows, kept), DType::U32)?;
 
     // The ordering's scratch is the kernel's for the launch and nothing reads it afterwards.
     let scratch = top_k_workspace(rows as u64, u64::from(width));
-    let workspace = backend::empty((rows, scratch.last() as usize), DType::I32)?;
+    let workspace = ops::empty((rows, scratch[1] as usize), DType::I32)?;
 
-    backend::launch::<TopK>(
+    ops::launch::<TopK>(
         &TopKDescriptor {
             dtype: logits.dtype(),
             vocabulary,
@@ -484,10 +484,10 @@ pub fn top_k(logits: &Tensor, width: u32) -> Result<(Tensor, Tensor)> {
             pdl: PDL,
         },
         TopKArgs {
-            logits: backend::operand(logits)?,
-            values: backend::operand(&values)?,
+            logits: ops::operand(logits)?,
+            values: ops::operand(&values)?,
             ids: signed(&ids)?,
-            workspace: backend::operand(&workspace)?,
+            workspace: ops::operand(&workspace)?,
         },
     )?;
     Ok((values, ids))
@@ -608,8 +608,8 @@ pub fn filter_candidates_(
         return Ok((values, valid));
     }
 
-    let valid = backend::empty(rows, DType::I32)?;
-    backend::launch::<FilterCandidates>(
+    let valid = ops::empty(rows, DType::I32)?;
+    ops::launch::<FilterCandidates>(
         &FilterDescriptor {
             width: extent(OWNER, "candidates", width)?,
             tile: CANDIDATE_TILE,
@@ -617,10 +617,10 @@ pub fn filter_candidates_(
             pdl: PDL,
         },
         FilterArgs {
-            values: backend::operand(&values)?,
+            values: ops::operand(&values)?,
             ids: signed(ids)?,
-            parameters: backend::operand(parameters)?,
-            valid: backend::operand(&valid)?,
+            parameters: ops::operand(parameters)?,
+            valid: ops::operand(&valid)?,
         },
     )?;
     Ok((values, valid))
@@ -682,25 +682,25 @@ pub fn candidate_order(values: &Tensor, ids: &Tensor, vocabulary: u32) -> Result
         ));
     }
 
-    let ordered_values = backend::empty((rows, width), DType::F32)?;
-    let ordered_ids = backend::empty((rows, width), DType::U32)?;
+    let ordered_values = ops::empty((rows, width), DType::F32)?;
+    let ordered_ids = ops::empty((rows, width), DType::U32)?;
 
     // The kernel counts the candidates of each id rather than comparing them, in scratch as
     // wide as the id space, which is its own for the launch.
-    let counts = backend::empty((rows, vocabulary as usize), DType::I32)?;
+    let counts = ops::empty((rows, vocabulary as usize), DType::I32)?;
 
-    backend::launch::<CandidateOrder>(
+    ops::launch::<CandidateOrder>(
         &OrderDescriptor {
             values: DType::F32,
             ids: INDEX,
             pdl: PDL,
         },
         OrderArgs {
-            values: backend::operand(values)?,
+            values: ops::operand(values)?,
             ids: signed(ids)?,
-            ordered_values: backend::operand(&ordered_values)?,
+            ordered_values: ops::operand(&ordered_values)?,
             ordered_ids: signed(&ordered_ids)?,
-            counts: backend::operand(&counts)?,
+            counts: ops::operand(&counts)?,
             vocabulary: u64::from(vocabulary),
         },
     )?;
@@ -732,9 +732,9 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
     }
 
     let rows = as_rows(OWNER, x)?;
-    let out = backend::empty(rows.shape(), x.dtype())?;
+    let out = ops::empty(rows.shape(), x.dtype())?;
 
-    backend::launch::<Softmax>(
+    ops::launch::<Softmax>(
         &SoftmaxDescriptor {
             dtype: x.dtype(),
             columns: width,
@@ -742,8 +742,8 @@ pub fn softmax(x: &Tensor) -> Result<Tensor> {
             pdl: PDL,
         },
         SoftmaxArgs {
-            x: backend::operand(&rows)?,
-            out: backend::operand(&out)?,
+            x: ops::operand(&rows)?,
+            out: ops::operand(&out)?,
         },
     )?;
     like_rows(out, x)
@@ -809,8 +809,8 @@ pub fn inverse_cdf(probabilities: &Tensor, ids: &Tensor, draws: &Tensor) -> Resu
         return Ok(found.where_cond(&drawn, &fallback)?.squeeze(1)?);
     }
 
-    let tokens = backend::empty(rows, DType::U32)?;
-    backend::launch::<InverseCdf>(
+    let tokens = ops::empty(rows, DType::U32)?;
+    ops::launch::<InverseCdf>(
         &InverseCdfDescriptor {
             width: extent(OWNER, "candidates", width)?,
             tile: CANDIDATE_TILE,
@@ -819,9 +819,9 @@ pub fn inverse_cdf(probabilities: &Tensor, ids: &Tensor, draws: &Tensor) -> Resu
             pdl: PDL,
         },
         InverseCdfArgs {
-            probabilities: backend::operand(probabilities)?,
+            probabilities: ops::operand(probabilities)?,
             ids: signed(ids)?,
-            draws: backend::operand(draws)?,
+            draws: ops::operand(draws)?,
             tokens: signed(&tokens)?,
         },
     )?;
@@ -859,8 +859,8 @@ pub fn argmax(values: &Tensor) -> Result<Tensor> {
         return Ok(numeric.where_cond(&first, &none)?.squeeze(1)?);
     }
 
-    let out = backend::empty(rows, DType::U32)?;
-    backend::launch::<ArgMax>(
+    let out = ops::empty(rows, DType::U32)?;
+    ops::launch::<ArgMax>(
         &ArgMaxDescriptor {
             dtype: values.dtype(),
             width,
@@ -868,7 +868,7 @@ pub fn argmax(values: &Tensor) -> Result<Tensor> {
             pdl: PDL,
         },
         ArgMaxArgs {
-            values: backend::operand(values)?,
+            values: ops::operand(values)?,
             out: signed(&out)?,
         },
     )?;
@@ -898,8 +898,8 @@ pub fn log_softmax(logits: &Tensor) -> Result<Tensor> {
         return Ok(x.broadcast_sub(&(largest + total.log()?)?)?);
     }
 
-    let out = backend::empty((rows, width), DType::F32)?;
-    backend::launch::<LogSoftmax>(
+    let out = ops::empty((rows, width), DType::F32)?;
+    ops::launch::<LogSoftmax>(
         &LogSoftmaxDescriptor {
             dtype: logits.dtype(),
             columns,
@@ -907,8 +907,8 @@ pub fn log_softmax(logits: &Tensor) -> Result<Tensor> {
             pdl: PDL,
         },
         LogSoftmaxArgs {
-            x: backend::operand(logits)?,
-            out: backend::operand(&out)?,
+            x: ops::operand(logits)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)
@@ -961,10 +961,10 @@ pub fn logprob_gather(logprobs: &Tensor, tokens: &Tensor) -> Result<(Tensor, Ten
         return Ok((value.squeeze(1)?, rank.squeeze(1)?));
     }
 
-    let out = backend::empty(rows, DType::F32)?;
-    let ranks = backend::empty(rows, DType::I32)?;
+    let out = ops::empty(rows, DType::F32)?;
+    let ranks = ops::empty(rows, DType::I32)?;
 
-    backend::launch::<LogprobGather>(
+    ops::launch::<LogprobGather>(
         &LogprobDescriptor {
             columns,
             ids: INDEX,
@@ -972,10 +972,10 @@ pub fn logprob_gather(logprobs: &Tensor, tokens: &Tensor) -> Result<(Tensor, Ten
             pdl: PDL,
         },
         LogprobArgs {
-            logprobabilities: backend::operand(logprobs)?,
+            logprobabilities: ops::operand(logprobs)?,
             tokens: signed(tokens)?,
-            out: backend::operand(&out)?,
-            ranks: backend::operand(&ranks)?,
+            out: ops::operand(&out)?,
+            ranks: ops::operand(&ranks)?,
         },
     )?;
     Ok((out, ranks))
@@ -1051,8 +1051,8 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
         ));
     }
 
-    let chunk_values = backend::empty((rows, chunk_candidates as usize), DType::F32)?;
-    let chunk_ids = backend::empty((rows, chunk_candidates as usize), DType::U32)?;
+    let chunk_values = ops::empty((rows, chunk_candidates as usize), DType::F32)?;
+    let chunk_ids = ops::empty((rows, chunk_candidates as usize), DType::U32)?;
     let chunks = TopLogprobsDescriptor {
         candidates,
         tile: LOGPROB_TILE,
@@ -1060,20 +1060,20 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
         pdl: PDL,
     };
 
-    backend::launch::<TopLogprobs>(
+    ops::launch::<TopLogprobs>(
         &chunks,
         TopLogprobsArgs {
-            values: backend::operand(logprobs)?,
+            values: ops::operand(logprobs)?,
             ids: None,
-            out_values: backend::operand(&chunk_values)?,
+            out_values: ops::operand(&chunk_values)?,
             out_ids: signed(&chunk_ids)?,
         },
     )?;
 
-    let values = backend::empty((rows, kept), DType::F32)?;
-    let ids = backend::empty((rows, kept), DType::U32)?;
+    let values = ops::empty((rows, kept), DType::F32)?;
+    let ids = ops::empty((rows, kept), DType::U32)?;
 
-    backend::launch::<TopLogprobs>(
+    ops::launch::<TopLogprobs>(
         // The second selection reads each candidate's id beside it, and its one chunk is the
         // chunks' candidates rounded up to the power of two a kernel's width is.
         &TopLogprobsDescriptor {
@@ -1082,9 +1082,9 @@ pub fn top_logprobs(logprobs: &Tensor, candidates: u32) -> Result<(Tensor, Tenso
             ..chunks
         },
         TopLogprobsArgs {
-            values: backend::operand(&chunk_values)?,
+            values: ops::operand(&chunk_values)?,
             ids: Some(signed(&chunk_ids)?),
-            out_values: backend::operand(&values)?,
+            out_values: ops::operand(&values)?,
             out_ids: signed(&ids)?,
         },
     )?;
@@ -1153,7 +1153,7 @@ mod tests {
         static NEXT: AtomicU64 = AtomicU64::new(1 << 40);
         let address = NEXT.fetch_add(1 << 28, Ordering::Relaxed);
 
-        backend::retained(address, shape, dtype, &backend::meta()).unwrap()
+        ops::retained(address, shape, dtype, &ops::meta()).unwrap()
     }
 
     /// Runs `forward` under a meta context while it records, and returns what it returned with
@@ -1161,7 +1161,7 @@ mod tests {
     fn recorded<T>(
         forward: impl FnOnce() -> Result<T>,
     ) -> (Result<T>, Vec<(&'static str, String)>) {
-        let context = backend::Context::meta(None);
+        let context = ops::Context::meta(None);
         context.record_launches();
 
         let output = {

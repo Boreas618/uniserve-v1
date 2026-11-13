@@ -56,25 +56,6 @@ pub fn code(dtype: DType) -> Result<i64> {
     })
 }
 
-/// The element type a package header numbers `code`, or `None` for a number the ABI does not
-/// state.
-pub const fn from_code(code: i64) -> Option<DType> {
-    Some(match code {
-        0 => DType::U8,
-        1 => DType::I32,
-        2 => DType::I64,
-        3 => DType::F16,
-        4 => DType::BF16,
-        5 => DType::F32,
-        6 => DType::F8E4M3,
-        7 => DType::F4,
-        8 => DType::I16,
-        9 => DType::U32,
-        10 => DType::F64,
-        _ => return None,
-    })
-}
-
 /// The spelling of `dtype` inside a kernel key, and in a refusal that names an element type.
 ///
 /// It is the tensor library's own spelling except for the NVFP4 element, which the stored
@@ -137,13 +118,9 @@ mod tests {
     fn numbers_spellings_and_sizes_are_the_documented_table() {
         for (dtype, number, spelling, size) in TABLE {
             assert_eq!(code(dtype).unwrap(), number, "{spelling}");
-            assert_eq!(from_code(number), Some(dtype), "{spelling}");
             assert_eq!(name(dtype), spelling);
             assert_eq!(bytes(dtype), size, "{spelling}");
         }
-
-        assert_eq!(from_code(11), None);
-        assert_eq!(from_code(-1), None);
     }
 
     #[test]

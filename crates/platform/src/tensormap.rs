@@ -10,7 +10,7 @@
 use std::ffi::c_void;
 
 use crate::driver::{self, TensorMap as RawTensorMap};
-use crate::{DataType, Device, Error, Result};
+use crate::{Device, Error, Result};
 
 /// The largest tensor rank a tensor map describes.
 const MAX_RANK: usize = 5;
@@ -62,7 +62,7 @@ impl TensorMap {
             unsafe {
                 (driver.tensor_map_encode_tiled)(
                     &mut raw,
-                    spec.data_type as i32,
+                    spec.data_type,
                     rank as u32,
                     spec.global_address as *mut c_void,
                     spec.global_dim.as_ptr(),
@@ -101,8 +101,10 @@ impl TensorMap {
 /// `cuTensorMapEncodeTiled` takes them.
 #[derive(Clone, Copy, Debug)]
 pub struct TensorMapSpec<'a> {
-    /// The element type the kernel reads or writes.
-    pub data_type: TensorDataType,
+    /// The element type the kernel reads or writes, as its `CUtensorMapDataType` code
+    /// (`CU_TENSOR_MAP_DATA_TYPE_FLOAT32` is 7). The caller derives it from its own element
+    /// type; the driver refuses a code it does not define.
+    pub data_type: i32,
     /// The tensor's base address in device storage; 16-byte aligned, 32-byte
     /// aligned for a 32-byte interleave.
     pub global_address: u64,
@@ -163,60 +165,6 @@ impl TensorMapSpec<'_> {
             return Err(Error::invalid("a tensor map addresses no storage"));
         }
         Ok(rank)
-    }
-}
-
-/// `CUtensorMapDataType`: the element type of the described tensor.
-///
-/// This is not a second element type of the crate — [`DataType`] is the one a
-/// buffer, kernel, collective or convolution is told its storage holds. A
-/// tensor map's code set is wider than [`DataType`]'s: it names TF32, an FP32 that
-/// flushes denormals, and packed 4- and 6-bit formats that no device buffer
-/// has an element size for, which is why the driver's codes are spelled out
-/// here. [`TensorDataType::from_dtype`] converts the types both name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(i32)]
-pub enum TensorDataType {
-    Uint8 = 0,
-    Uint16 = 1,
-    Uint32 = 2,
-    Int32 = 3,
-    Uint64 = 4,
-    Int64 = 5,
-    Float16 = 6,
-    Float32 = 7,
-    Float64 = 8,
-    BFloat16 = 9,
-    /// FP32 with denormals flushed to zero.
-    Float32Ftz = 10,
-    /// TF32, the 19-bit format the tensor cores take.
-    TFloat32 = 11,
-    /// TF32 with denormals flushed to zero.
-    TFloat32Ftz = 12,
-    /// Packed 4-bit unsigned values, 16 per 8 bytes.
-    Uint4Align8 = 13,
-    /// Packed 4-bit unsigned values, 16 per 16-byte slot.
-    Uint4Align16 = 14,
-    /// Packed 6-bit unsigned values, 16 per 16-byte slot.
-    Uint6Align16 = 15,
-}
-
-impl TensorDataType {
-    /// The tensor-map code for `dtype`, when the driver names that element
-    /// type; the signed narrow and packed formats of [`DataType`] have none.
-    pub fn from_dtype(dtype: DataType) -> Option<Self> {
-        Some(match dtype {
-            DataType::U8 => Self::Uint8,
-            DataType::I32 => Self::Int32,
-            DataType::U64 => Self::Uint64,
-            DataType::I64 => Self::Int64,
-            DataType::F16 => Self::Float16,
-            DataType::F32 => Self::Float32,
-            DataType::F64 => Self::Float64,
-            DataType::Bf16 => Self::BFloat16,
-            DataType::U32 => Self::Uint32,
-            DataType::I16 | DataType::I8 | DataType::F8E4M3 | DataType::F8E5M2 => return None,
-        })
     }
 }
 
@@ -290,70 +238,6 @@ mod tests {
         crate::header::assert_constants(
             "cuda.h",
             &[
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_UINT8",
-                    TensorDataType::Uint8 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_UINT16",
-                    TensorDataType::Uint16 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_UINT32",
-                    TensorDataType::Uint32 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_INT32",
-                    TensorDataType::Int32 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_UINT64",
-                    TensorDataType::Uint64 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_INT64",
-                    TensorDataType::Int64 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
-                    TensorDataType::Float16 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT32",
-                    TensorDataType::Float32 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT64",
-                    TensorDataType::Float64 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
-                    TensorDataType::BFloat16 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ",
-                    TensorDataType::Float32Ftz as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_TFLOAT32",
-                    TensorDataType::TFloat32 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ",
-                    TensorDataType::TFloat32Ftz as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
-                    TensorDataType::Uint4Align8 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B",
-                    TensorDataType::Uint4Align16 as i64,
-                ),
-                (
-                    "CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B",
-                    TensorDataType::Uint6Align16 as i64,
-                ),
                 ("CU_TENSOR_MAP_INTERLEAVE_NONE", Interleave::None as i64),
                 ("CU_TENSOR_MAP_INTERLEAVE_16B", Interleave::B16 as i64),
                 ("CU_TENSOR_MAP_INTERLEAVE_32B", Interleave::B32 as i64),
@@ -403,7 +287,8 @@ mod tests {
         let boxes = [4u32, 4];
         let element = [1u32, 1];
         let valid = TensorMapSpec {
-            data_type: TensorDataType::Float32,
+            // CU_TENSOR_MAP_DATA_TYPE_FLOAT32
+            data_type: 7,
             global_address: address,
             global_dim: &dim,
             global_strides: &strides,
@@ -451,22 +336,5 @@ mod tests {
                 "{spec:?}"
             );
         }
-    }
-
-    #[test]
-    fn the_element_types_both_names_share_convert() {
-        use crate::DataType;
-
-        assert_eq!(
-            TensorDataType::from_dtype(DataType::F32),
-            Some(TensorDataType::Float32)
-        );
-        assert_eq!(
-            TensorDataType::from_dtype(DataType::Bf16),
-            Some(TensorDataType::BFloat16)
-        );
-        // No tensor-map code names a signed byte or an FP8 element.
-        assert_eq!(TensorDataType::from_dtype(DataType::I8), None);
-        assert_eq!(TensorDataType::from_dtype(DataType::F8E4M3), None);
     }
 }

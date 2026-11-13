@@ -81,8 +81,8 @@ pub fn embedding(ids: &Tensor, weight: &Tensor, first: u32) -> Result<Tensor> {
         return Ok(mask.where_cond(&gathered.zeros_like()?, &gathered)?);
     }
 
-    let out = backend::empty((tokens, hidden as usize), weight.dtype())?;
-    backend::launch::<Embedding>(
+    let out = ops::empty((tokens, hidden as usize), weight.dtype())?;
+    ops::launch::<Embedding>(
         // The token count is not in the descriptor: the ids' length is a launch value.
         &Descriptor {
             dtype: weight.dtype(),
@@ -94,9 +94,9 @@ pub fn embedding(ids: &Tensor, weight: &Tensor, first: u32) -> Result<Tensor> {
             pdl: PDL,
         },
         Args {
-            ids: backend::operand(ids)?,
-            weight: backend::operand(weight)?,
-            out: backend::operand(&out)?,
+            ids: ops::operand(ids)?,
+            weight: ops::operand(weight)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)

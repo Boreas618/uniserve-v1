@@ -44,13 +44,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -100,23 +100,22 @@ pub fn quantize_scaled(scaled: f32) -> u8 {
 /// A sub-region of a larger raster passes unchanged: it is only a bigger outer stride, which is what
 /// the decoder's tile-in-a-canvas write needs.
 fn raster(operator: &'static str, name: &str, view: &Operand) -> Result<()> {
-    let rank = view.shape.rank();
-    let strides = view.strides.as_slice();
+    let rank = view.rank();
     for axis in 0..rank {
-        if strides[axis] == 0 {
+        let stride = view.stride(axis);
+        if stride == 0 {
             return Err(Error::argument(
                 operator,
                 format!("the {name} raster has a zero stride on axis {axis}"),
             ));
         }
         if axis + 1 < rank {
-            let needed = view.shape.dim(axis + 1) * strides[axis + 1];
-            if strides[axis] < needed {
+            let needed = view.dim(axis + 1) * view.stride(axis + 1);
+            if stride < needed {
                 return Err(Error::argument(
                     operator,
                     format!(
-                        "the {name} raster overlaps on axis {axis}: stride {} is below {needed}",
-                        strides[axis]
+                        "the {name} raster overlaps on axis {axis}: stride {stride} is below {needed}"
                     ),
                 ));
             }
@@ -127,8 +126,7 @@ fn raster(operator: &'static str, name: &str, view: &Operand) -> Result<()> {
 
 /// The three outer strides of a rank-4 raster view that [`raster`] accepted.
 fn outer_strides(view: &Operand) -> [u64; 3] {
-    let strides = view.strides.as_slice();
-    [strides[0], strides[1], strides[2]]
+    [view.stride(0), view.stride(1), view.stride(2)]
 }
 
 /// One compilation of `rgb_bytes`.
@@ -156,7 +154,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `rgb_bytes` launch.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[channels, frames, rows, columns]` the normalized raster.
     pub input: Operand,
@@ -209,15 +207,15 @@ impl Op for RgbBytes {
                 ),
             ));
         }
-        let frames = args.input.shape.dim(1);
-        let rows = args.input.shape.dim(2);
-        let columns = args.input.shape.dim(3);
-        if args.input.shape.dim(0) != channels {
+        let frames = args.input.dim(1);
+        let rows = args.input.dim(2);
+        let columns = args.input.dim(3);
+        if args.input.dim(0) != channels {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the raster's first axis is {}, the descriptor says {channels} channels",
-                    args.input.shape.dim(0)
+                    args.input.dim(0)
                 ),
             ));
         }
@@ -227,7 +225,7 @@ impl Op for RgbBytes {
             .require_row(Self::NAME, descriptor.dtype, columns)?;
 
         for (name, view) in [("mean", &args.mean), ("std", &args.std)] {
-            view.require_shape(Self::NAME, Shape::new(&[channels]))?;
+            view.require_shape(Self::NAME, &[channels])?;
             if view.dtype != DType::F32 {
                 return Err(Error::argument(
                     Self::NAME,
@@ -244,7 +242,7 @@ impl Op for RgbBytes {
             ));
         }
         args.out
-            .require_shape(Self::NAME, Shape::new(&[frames, rows, columns, channels]))?;
+            .require_shape(Self::NAME, &[frames, rows, columns, channels])?;
         // The packed image is contiguous, and the program writes it as a flat run of pixels.
         args.out.require_row(Self::NAME, DType::U8, channels)?;
 
@@ -261,9 +259,9 @@ impl Op for RgbBytes {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let frames = args.input.shape.dim(1);
-        let rows = args.input.shape.dim(2);
-        let columns = args.input.shape.dim(3);
+        let frames = args.input.dim(1);
+        let rows = args.input.dim(2);
+        let columns = args.input.dim(3);
         // A view carries its base address into the launch, not its strides, so a strided operand has
         // to hand them over: the program walks `out` as a block of a larger raster and `input` as a
         // slice of the latent, and both are only correct if it is told how far apart the axes are.
@@ -272,10 +270,10 @@ impl Op for RgbBytes {
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.input)
-            .view(args.mean)
-            .view(args.std)
-            .view(args.out)
+            .view(&args.input)
+            .view(&args.mean)
+            .view(&args.std)
+            .view(&args.out)
             .u64(frames)
             .u64(rows)
             .u64(columns)
@@ -400,32 +398,29 @@ mod tests {
 
     #[test]
     fn a_tile_inside_a_canvas_is_accepted_and_a_broadcast_or_an_overlap_is_not() {
-        use crate::DevicePtr;
-        use crate::tensor::{Shape, Strides};
+        use platform::DevicePtr;
+
+        let view = |strides: &[u64]| {
+            Operand::with_strides(
+                DevicePtr::from_address(0),
+                DType::U8,
+                &[2, 4, 32, 3],
+                strides,
+            )
+        };
 
         // One tile of a larger packed raster: 2 frames of rows × columns pixels of 3 bytes, placed
         // every 1000 bytes along the canvas's rows (a row is 96 bytes) and every 2000 rows in frames.
-        let tile = Operand {
-            ptr: DevicePtr::new(0),
-            dtype: DType::U8,
-            shape: Shape::new(&[2, 4, 32, 3]),
-            strides: Strides::new(&[4 * 1000, 1000, 3, 1]),
-        };
+        let tile = view(&[4 * 1000, 1000, 3, 1]);
         raster("test", "out", &tile).expect("a sub-region is a valid raster");
         assert_eq!(outer_strides(&tile), [4000, 1000, 3]);
 
         // The same view squeezed against its neighbour: the rows would share bytes.
-        let overlapping = Operand {
-            strides: Strides::new(&[4 * 90, 90, 3, 1]),
-            ..tile
-        };
+        let overlapping = view(&[4 * 90, 90, 3, 1]);
         assert!(raster("test", "out", &overlapping).is_err());
 
         // A broadcast axis is not a raster.
-        let broadcast = Operand {
-            strides: Strides::new(&[0, 1000, 3, 1]),
-            ..tile
-        };
+        let broadcast = view(&[0, 1000, 3, 1]);
         assert!(raster("test", "out", &broadcast).is_err());
     }
 

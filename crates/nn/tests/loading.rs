@@ -1031,7 +1031,7 @@ fn a_meta_load_returns_what_a_load_of_the_payload_returns() {
     );
 
     let again = load(&meta, &region("proj.weight", (4, 8)), (4, 8));
-    let address = |tensor: &Tensor| backend::operand(tensor).unwrap().ptr.address();
+    let address = |tensor: &Tensor| ops::operand(tensor).unwrap().ptr.address();
     assert_eq!(address(&weight), address(&again));
     let other = load(&meta, &region("rows.weight", (4, 8)), (4, 8));
     assert_ne!(address(&weight), address(&other));

@@ -155,17 +155,17 @@ fn check_buffers(
 /// The row columns a recurrent kernel reads: the state's rows.
 fn row_columns(state: &RecurrentState) -> Result<RowColumns> {
     Ok(RowColumns {
-        query_offsets: backend::operand(&state.query_offsets)?,
-        seq_lens: backend::operand(&state.seq_lens)?,
-        slots: backend::operand(&state.slots)?,
-        checkpoints: backend::operand(&state.checkpoints)?,
+        query_offsets: ops::operand(&state.query_offsets)?,
+        seq_lens: ops::operand(&state.seq_lens)?,
+        slots: ops::operand(&state.slots)?,
+        checkpoints: ops::operand(&state.checkpoints)?,
     })
 }
 
 /// The trail argument of a launch.
 fn trail_operand(trail: Option<&Tensor>) -> Result<Option<Trail>> {
     Ok(trail
-        .map(backend::operand)
+        .map(ops::operand)
         .transpose()?
         .map(|bank| Trail { bank }))
 }
@@ -180,8 +180,8 @@ fn slots_operand(verify: Option<&VerifySlots>) -> Result<Option<RequestSlots>> {
     verify
         .map(|verify| {
             Ok(RequestSlots {
-                state_indices: backend::operand(&verify.state_indices)?,
-                num_accepted: backend::operand(&verify.num_accepted)?,
+                state_indices: ops::operand(&verify.state_indices)?,
+                num_accepted: ops::operand(&verify.num_accepted)?,
             })
         })
         .transpose()
@@ -413,8 +413,8 @@ pub fn causal_conv1d(
         );
     }
 
-    let out = backend::empty((tokens, channels), x.dtype())?;
-    backend::launch::<CausalConv1d>(
+    let out = ops::empty((tokens, channels), x.dtype())?;
+    ops::launch::<CausalConv1d>(
         &CausalConv1dDescriptor {
             dtype: x.dtype(),
             channels: channels as u32,
@@ -426,12 +426,12 @@ pub fn causal_conv1d(
             stepwise,
         },
         CausalConv1dArgs {
-            x: backend::operand(x)?,
-            weight: backend::operand(weight)?,
-            out: backend::operand(&out)?,
+            x: ops::operand(x)?,
+            weight: ops::operand(weight)?,
+            out: ops::operand(&out)?,
             rows: row_columns(state)?,
-            state: backend::operand(live)?,
-            checkpoint: backend::operand(checkpoint)?,
+            state: ops::operand(live)?,
+            checkpoint: ops::operand(checkpoint)?,
             trail: trail_operand(trail)?,
             slots: slots_operand(state.verify.as_ref())?,
         },
@@ -703,8 +703,8 @@ pub fn gated_delta_rule(
         );
     }
 
-    let out = backend::empty((tokens, value_heads, value_dim), query.dtype())?;
-    backend::launch::<GatedDeltaRule>(
+    let out = ops::empty((tokens, value_heads, value_dim), query.dtype())?;
+    ops::launch::<GatedDeltaRule>(
         &GatedDeltaRuleDescriptor {
             dtype: query.dtype(),
             key_heads: key_heads as u32,
@@ -718,18 +718,18 @@ pub fn gated_delta_rule(
             request_slots: owned as u32,
         },
         GatedDeltaRuleArgs {
-            query: backend::operand(query)?,
-            key: backend::operand(key)?,
-            value: backend::operand(value)?,
-            a: backend::operand(a)?,
-            b: backend::operand(b)?,
-            a_log: backend::operand(a_log)?,
-            dt_bias: backend::operand(dt_bias)?,
+            query: ops::operand(query)?,
+            key: ops::operand(key)?,
+            value: ops::operand(value)?,
+            a: ops::operand(a)?,
+            b: ops::operand(b)?,
+            a_log: ops::operand(a_log)?,
+            dt_bias: ops::operand(dt_bias)?,
             rows: row_columns(state)?,
-            state: backend::operand(live)?,
-            checkpoint: backend::operand(checkpoint)?,
+            state: ops::operand(live)?,
+            checkpoint: ops::operand(checkpoint)?,
             trail: trail_operand(trail)?,
-            out: backend::operand(&out)?,
+            out: ops::operand(&out)?,
             slots: slots_operand(state.verify.as_ref())?,
         },
     )?;

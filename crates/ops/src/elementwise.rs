@@ -60,14 +60,14 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
+use crate::operand::Operand;
 use crate::strided;
-use crate::tensor::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -231,7 +231,7 @@ impl UnaryDescriptor {
         Self {
             function,
             dtype: args.x.dtype,
-            rank: strided::rank([args.x, args.out]),
+            rank: strided::rank([&args.x, &args.out]),
             block,
             pdl,
         }
@@ -251,7 +251,7 @@ impl fmt::Display for UnaryDescriptor {
 }
 
 /// The arguments of one `elementwise_unary`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct UnaryArgs {
     /// The values, at any strides.
     pub x: Operand,
@@ -303,11 +303,11 @@ impl Op for ElementwiseUnary {
 
         strided::require_dtype(Self::NAME, "x", &args.x, descriptor.dtype)?;
         strided::require_dtype(Self::NAME, "out", &args.out, descriptor.dtype)?;
-        strided::require_shape(Self::NAME, "out", &args.out, args.x.shape)?;
+        strided::require_shape(Self::NAME, "out", &args.out, args.x.dims())?;
         strided::require_elements(Self::NAME, "x", &args.x)?;
         strided::require_contiguous(Self::NAME, "out", &args.out)?;
 
-        let traversed = strided::rank([args.x, args.out]);
+        let traversed = strided::rank([&args.x, &args.out]);
         strided::require_rank(Self::NAME, "rank", descriptor.rank, traversed)
     }
 
@@ -317,13 +317,13 @@ impl Op for ElementwiseUnary {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let [x, out] = strided::merge_axes([args.x, args.out]);
+        let [x, out] = strided::merge_axes([&args.x, &args.out]);
         let elements = out.numel();
 
         let mut arguments = Arguments::new();
-        arguments.view(x).view(out).u64(elements);
-        strided::pack_extents(&mut arguments, out.shape);
-        strided::pack_strides(&mut arguments, x.strides);
+        arguments.view(&x).view(&out).u64(elements);
+        strided::pack_extents(&mut arguments, &out);
+        strided::pack_strides(&mut arguments, &x);
         for scalar in args.scalars {
             pack_scalar(&mut arguments, descriptor.dtype, scalar);
         }
@@ -496,7 +496,7 @@ impl BinaryDescriptor {
         Self {
             function,
             dtype: args.lhs.dtype,
-            rank: strided::rank([args.lhs, args.rhs, args.out]),
+            rank: strided::rank([&args.lhs, &args.rhs, &args.out]),
             block,
             pdl,
         }
@@ -516,7 +516,7 @@ impl fmt::Display for BinaryDescriptor {
 }
 
 /// The arguments of one `elementwise_binary`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct BinaryArgs {
     /// The left operand, at any strides; a zero stride repeats an axis.
     pub lhs: Operand,
@@ -553,13 +553,13 @@ impl Op for ElementwiseBinary {
         strided::require_dtype(Self::NAME, "lhs", &args.lhs, descriptor.dtype)?;
         strided::require_dtype(Self::NAME, "rhs", &args.rhs, descriptor.dtype)?;
         strided::require_dtype(Self::NAME, "out", &args.out, output)?;
-        strided::require_shape(Self::NAME, "rhs", &args.rhs, args.lhs.shape)?;
-        strided::require_shape(Self::NAME, "out", &args.out, args.lhs.shape)?;
+        strided::require_shape(Self::NAME, "rhs", &args.rhs, args.lhs.dims())?;
+        strided::require_shape(Self::NAME, "out", &args.out, args.lhs.dims())?;
         strided::require_elements(Self::NAME, "lhs", &args.lhs)?;
         strided::require_elements(Self::NAME, "rhs", &args.rhs)?;
         strided::require_contiguous(Self::NAME, "out", &args.out)?;
 
-        let traversed = strided::rank([args.lhs, args.rhs, args.out]);
+        let traversed = strided::rank([&args.lhs, &args.rhs, &args.out]);
         strided::require_rank(Self::NAME, "rank", descriptor.rank, traversed)
     }
 
@@ -569,14 +569,14 @@ impl Op for ElementwiseBinary {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let [lhs, rhs, out] = strided::merge_axes([args.lhs, args.rhs, args.out]);
+        let [lhs, rhs, out] = strided::merge_axes([&args.lhs, &args.rhs, &args.out]);
         let elements = out.numel();
 
         let mut arguments = Arguments::new();
-        arguments.view(lhs).view(rhs).view(out).u64(elements);
-        strided::pack_extents(&mut arguments, out.shape);
-        strided::pack_strides(&mut arguments, lhs.strides);
-        strided::pack_strides(&mut arguments, rhs.strides);
+        arguments.view(&lhs).view(&rhs).view(&out).u64(elements);
+        strided::pack_extents(&mut arguments, &out);
+        strided::pack_strides(&mut arguments, &lhs);
+        strided::pack_strides(&mut arguments, &rhs);
         arguments.flag(descriptor.pdl);
 
         kernel.launch(
@@ -635,7 +635,7 @@ impl WhereDescriptor {
         Self {
             dtype: args.on_true.dtype,
             condition: args.condition.dtype,
-            rank: strided::rank([args.condition, args.on_true, args.on_false, args.out]),
+            rank: strided::rank([&args.condition, &args.on_true, &args.on_false, &args.out]),
             block,
             pdl,
         }
@@ -655,7 +655,7 @@ impl fmt::Display for WhereDescriptor {
 }
 
 /// The arguments of one `elementwise_where`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct WhereArgs {
     /// The condition, at any strides: an element is taken from `on_true` where it is not zero.
     pub condition: Operand,
@@ -686,7 +686,7 @@ impl Op for ElementwiseWhere {
         )?;
         strided::require_block(Self::NAME, descriptor.block)?;
 
-        let shape = args.condition.shape;
+        let shape = args.condition.dims();
         strided::require_dtype(
             Self::NAME,
             "condition",
@@ -706,7 +706,7 @@ impl Op for ElementwiseWhere {
         strided::require_elements(Self::NAME, "on_false", &args.on_false)?;
         strided::require_contiguous(Self::NAME, "out", &args.out)?;
 
-        let traversed = strided::rank([args.condition, args.on_true, args.on_false, args.out]);
+        let traversed = strided::rank([&args.condition, &args.on_true, &args.on_false, &args.out]);
         strided::require_rank(Self::NAME, "rank", descriptor.rank, traversed)
     }
 
@@ -717,20 +717,20 @@ impl Op for ElementwiseWhere {
         stream: &Stream,
     ) -> Result<()> {
         let [condition, on_true, on_false, out] =
-            strided::merge_axes([args.condition, args.on_true, args.on_false, args.out]);
+            strided::merge_axes([&args.condition, &args.on_true, &args.on_false, &args.out]);
         let elements = out.numel();
 
         let mut arguments = Arguments::new();
         arguments
-            .view(condition)
-            .view(on_true)
-            .view(on_false)
-            .view(out)
+            .view(&condition)
+            .view(&on_true)
+            .view(&on_false)
+            .view(&out)
             .u64(elements);
-        strided::pack_extents(&mut arguments, out.shape);
-        strided::pack_strides(&mut arguments, condition.strides);
-        strided::pack_strides(&mut arguments, on_true.strides);
-        strided::pack_strides(&mut arguments, on_false.strides);
+        strided::pack_extents(&mut arguments, &out);
+        strided::pack_strides(&mut arguments, &condition);
+        strided::pack_strides(&mut arguments, &on_true);
+        strided::pack_strides(&mut arguments, &on_false);
         arguments.flag(descriptor.pdl);
 
         kernel.launch(
@@ -757,27 +757,29 @@ impl Op for ElementwiseWhere {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DevicePtr, Shape, Strides};
+    use platform::DevicePtr;
 
     const BLOCK: u32 = 1024;
 
     fn operand(dtype: DType, shape: &[u64], strides: &[u64]) -> Operand {
-        Operand::with_strides(
-            DevicePtr::new(0x1000),
-            dtype,
-            Shape::new(shape),
-            Strides::new(strides),
-        )
+        Operand::with_strides(DevicePtr::from_address(0x1000), dtype, shape, strides)
     }
 
     fn contiguous(dtype: DType, shape: &[u64]) -> Operand {
-        Operand::new(DevicePtr::new(0x2000), dtype, Shape::new(shape))
+        Operand::new(DevicePtr::from_address(0x2000), dtype, shape)
+    }
+
+    /// A contiguous `dtype` operand of the extents of `like`.
+    fn contiguous_as(dtype: DType, like: &Operand) -> Operand {
+        let dims: Vec<u64> = like.dims().iter().map(|&dim| dim as u64).collect();
+        contiguous(dtype, &dims)
     }
 
     fn unary(x: Operand) -> UnaryArgs {
+        let out = contiguous_as(x.dtype, &x);
         UnaryArgs {
             x,
-            out: contiguous(x.dtype, x.shape.dims()),
+            out,
             scalars: [0.0; 2],
         }
     }
@@ -845,25 +847,25 @@ mod tests {
     #[test]
     fn a_unary_call_states_its_types_its_shape_and_a_contiguous_output() {
         let x = contiguous(DType::F32, &[4, 8]);
-        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &unary(x), BLOCK, false);
+        let descriptor = UnaryDescriptor::of(UnaryFunction::Exp, &unary(x.clone()), BLOCK, false);
 
         let other_type = UnaryArgs {
             out: contiguous(DType::BF16, &[4, 8]),
-            ..unary(x)
+            ..unary(x.clone())
         };
         let message = refusal(ElementwiseUnary::check(&descriptor, &other_type));
         assert!(message.contains("expected f32 out"), "{message}");
 
         let other_shape = UnaryArgs {
             out: contiguous(DType::F32, &[8, 4]),
-            ..unary(x)
+            ..unary(x.clone())
         };
         let message = refusal(ElementwiseUnary::check(&descriptor, &other_shape));
         assert!(message.contains("expected out of shape"), "{message}");
 
         let strided_out = UnaryArgs {
             out: operand(DType::F32, &[4, 8], &[16, 1]),
-            ..unary(x)
+            ..unary(x.clone())
         };
         let message = refusal(ElementwiseUnary::check(&descriptor, &strided_out));
         assert!(message.contains("out must be contiguous"), "{message}");
@@ -875,9 +877,9 @@ mod tests {
 
         let odd_block = UnaryDescriptor {
             block: 1000,
-            ..UnaryDescriptor::of(UnaryFunction::Exp, &unary(x), BLOCK, false)
+            ..UnaryDescriptor::of(UnaryFunction::Exp, &unary(x.clone()), BLOCK, false)
         };
-        let message = refusal(ElementwiseUnary::check(&odd_block, &unary(x)));
+        let message = refusal(ElementwiseUnary::check(&odd_block, &unary(x.clone())));
         assert!(message.contains("not a power of two"), "{message}");
     }
 
@@ -943,17 +945,14 @@ mod tests {
     }
 
     fn binary(lhs: Operand, rhs: Operand, function: BinaryFunction) -> BinaryArgs {
-        BinaryArgs {
-            lhs,
-            rhs,
-            out: contiguous(function.output(lhs.dtype), lhs.shape.dims()),
-        }
+        let out = contiguous_as(function.output(lhs.dtype), &lhs);
+        BinaryArgs { lhs, rhs, out }
     }
 
     #[test]
     fn a_binary_key_names_the_function_the_type_and_the_axes_traversed() {
         let lhs = contiguous(DType::BF16, &[2, 3, 5]);
-        let args = binary(lhs, lhs, BinaryFunction::Maximum);
+        let args = binary(lhs.clone(), lhs, BinaryFunction::Maximum);
         let descriptor = BinaryDescriptor::of(BinaryFunction::Maximum, &args, BLOCK, true);
         assert_eq!(
             descriptor.to_string(),
@@ -968,21 +967,21 @@ mod tests {
 
         // One value for every element: no stride at all, and still one run.
         let scalar = operand(DType::F32, &[2, 3, 5], &[0, 0, 0]);
-        let args = binary(lhs, scalar, BinaryFunction::Mul);
+        let args = binary(lhs.clone(), scalar, BinaryFunction::Mul);
         let descriptor = BinaryDescriptor::of(BinaryFunction::Mul, &args, BLOCK, false);
         assert_eq!(descriptor.rank, 1);
         ElementwiseBinary::check(&descriptor, &args).unwrap();
 
         // A bias along the last axis repeats over the two leading ones, which merge.
         let bias = operand(DType::F32, &[2, 3, 5], &[0, 0, 1]);
-        let args = binary(lhs, bias, BinaryFunction::Add);
+        let args = binary(lhs.clone(), bias, BinaryFunction::Add);
         let descriptor = BinaryDescriptor::of(BinaryFunction::Add, &args, BLOCK, false);
         assert_eq!(descriptor.rank, 2);
         ElementwiseBinary::check(&descriptor, &args).unwrap();
 
         // A value per middle index repeats on both sides of it.
         let middle = operand(DType::F32, &[2, 3, 5], &[0, 1, 0]);
-        let args = binary(lhs, middle, BinaryFunction::Add);
+        let args = binary(lhs.clone(), middle, BinaryFunction::Add);
         let descriptor = BinaryDescriptor::of(BinaryFunction::Add, &args, BLOCK, false);
         assert_eq!(descriptor.rank, 3);
     }
@@ -990,7 +989,7 @@ mod tests {
     #[test]
     fn a_comparison_writes_u8_and_arithmetic_writes_the_operands_type() {
         let lhs = contiguous(DType::F32, &[4, 8]);
-        let args = binary(lhs, lhs, BinaryFunction::Lt);
+        let args = binary(lhs.clone(), lhs, BinaryFunction::Lt);
         assert_eq!(args.out.dtype, DType::U8);
         let descriptor = BinaryDescriptor::of(BinaryFunction::Lt, &args, BLOCK, false);
         ElementwiseBinary::check(&descriptor, &args).unwrap();
@@ -1005,7 +1004,7 @@ mod tests {
 
         let mixed = BinaryArgs {
             rhs: contiguous(DType::BF16, &[4, 8]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(ElementwiseBinary::check(&descriptor, &mixed));
         assert!(message.contains("expected f32 rhs"), "{message}");
@@ -1055,7 +1054,7 @@ mod tests {
         for (function, name) in integral {
             for dtype in [DType::U8, DType::U32, DType::I16, DType::I32, DType::I64] {
                 let lhs = contiguous(dtype, &[4, 8]);
-                let args = binary(lhs, lhs, function);
+                let args = binary(lhs.clone(), lhs, function);
                 let descriptor = BinaryDescriptor::of(function, &args, BLOCK, false);
 
                 assert_eq!(
@@ -1075,7 +1074,7 @@ mod tests {
 
             for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
                 let lhs = contiguous(dtype, &[4, 8]);
-                let args = binary(lhs, lhs, function);
+                let args = binary(lhs.clone(), lhs, function);
                 let descriptor = BinaryDescriptor::of(function, &args, BLOCK, false);
 
                 let message = refusal(ElementwiseBinary::check(&descriptor, &args));
@@ -1089,7 +1088,7 @@ mod tests {
         // A broadcast shift count traverses the axes it repeats, as any right operand does.
         let lhs = contiguous(DType::I64, &[4, 8]);
         let count = operand(DType::I64, &[4, 8], &[0, 0]);
-        let args = binary(lhs, count, BinaryFunction::BitwiseRightShift);
+        let args = binary(lhs.clone(), count, BinaryFunction::BitwiseRightShift);
         let descriptor =
             BinaryDescriptor::of(BinaryFunction::BitwiseRightShift, &args, BLOCK, false);
         assert_eq!(descriptor.rank, 1);
@@ -1100,7 +1099,7 @@ mod tests {
     fn a_binary_tolerance_is_one_rounding_for_float_arithmetic_and_exact_otherwise() {
         let tolerance = |function, dtype| {
             let lhs = contiguous(dtype, &[16]);
-            let args = binary(lhs, lhs, function);
+            let args = binary(lhs.clone(), lhs, function);
             ElementwiseBinary::tolerance(&BinaryDescriptor::of(function, &args, BLOCK, false))
         };
 
@@ -1123,11 +1122,12 @@ mod tests {
     }
 
     fn selection(condition: Operand, values: Operand) -> WhereArgs {
+        let out = contiguous_as(values.dtype, &values);
         WhereArgs {
             condition,
-            on_true: values,
+            on_true: values.clone(),
             on_false: values,
-            out: contiguous(values.dtype, values.shape.dims()),
+            out,
         }
     }
 
@@ -1173,7 +1173,7 @@ mod tests {
 
         // Arithmetic on an FP8 element is no primitive's.
         let lhs = contiguous(DType::F8E4M3, &[4, 8]);
-        let sum = binary(lhs, lhs, BinaryFunction::Add);
+        let sum = binary(lhs.clone(), lhs, BinaryFunction::Add);
         let message = refusal(ElementwiseBinary::check(
             &BinaryDescriptor::of(BinaryFunction::Add, &sum, BLOCK, false),
             &sum,
@@ -1186,18 +1186,18 @@ mod tests {
         let values = contiguous(DType::F32, &[4, 8]);
 
         for condition in [DType::U8, DType::U32, DType::I64] {
-            let args = selection(contiguous(condition, &[4, 8]), values);
+            let args = selection(contiguous(condition, &[4, 8]), values.clone());
             ElementwiseWhere::check(&WhereDescriptor::of(&args, BLOCK, false), &args).unwrap();
         }
 
-        let args = selection(contiguous(DType::I32, &[4, 8]), values);
+        let args = selection(contiguous(DType::I32, &[4, 8]), values.clone());
         let message = refusal(ElementwiseWhere::check(
             &WhereDescriptor::of(&args, BLOCK, false),
             &args,
         ));
         assert!(message.contains("condition is i32"), "{message}");
 
-        let args = selection(contiguous(DType::U8, &[4]), values);
+        let args = selection(contiguous(DType::U8, &[4]), values.clone());
         let message = refusal(ElementwiseWhere::check(
             &WhereDescriptor::of(&args, BLOCK, false),
             &args,
@@ -1205,7 +1205,7 @@ mod tests {
         assert!(message.contains("expected on_true of shape"), "{message}");
 
         // A row-wise condition repeated along the last axis traverses two axes.
-        let args = selection(operand(DType::U8, &[4, 8], &[1, 0]), values);
+        let args = selection(operand(DType::U8, &[4, 8], &[1, 0]), values.clone());
         let descriptor = WhereDescriptor::of(&args, BLOCK, false);
         assert_eq!(descriptor.rank, 2);
         ElementwiseWhere::check(&descriptor, &args).unwrap();

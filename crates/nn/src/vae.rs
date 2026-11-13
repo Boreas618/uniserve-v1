@@ -414,11 +414,11 @@ pub fn tiled_encode(
     let mine = (rank * share).min(count)..((rank + 1) * share).min(count);
     let mut own = mine.map(&mut encoded).collect::<Result<Vec<Tensor>>>()?;
     while own.len() < share {
-        own.push(backend::empty(block.as_slice(), dtype)?);
+        own.push(ops::empty(block.as_slice(), dtype)?);
     }
     let own = Tensor::stack(&own, 0)?;
 
-    let gathered = backend::empty([&[share * ranks], block.as_slice()].concat(), dtype)?;
+    let gathered = ops::empty([&[share * ranks], block.as_slice()].concat(), dtype)?;
     collective::all_gather(&own, &gathered)?;
 
     let tiles = (0..count)

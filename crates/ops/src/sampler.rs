@@ -44,13 +44,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -87,7 +87,7 @@ impl fmt::Display for ShapeDescriptor {
 }
 
 /// The arguments of `logits_shape`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ShapeArgs {
     /// `[rows, vocabulary]` raw logits.
     pub logits: Operand,
@@ -138,11 +138,9 @@ impl Op for LogitsShape {
                 format!("{rows} logit rows but {} output rows", args.out.rows()),
             ));
         }
-        args.slots.require_shape(Self::NAME, Shape::new(&[rows]))?;
-        args.parameters.require_shape(
-            Self::NAME,
-            Shape::new(&[rows, u64::from(PARAMETER_COLUMNS)]),
-        )?;
+        args.slots.require_shape(Self::NAME, &[rows])?;
+        args.parameters
+            .require_shape(Self::NAME, &[rows, u64::from(PARAMETER_COLUMNS)])?;
         args.counts
             .require_row(Self::NAME, DType::I32, vocabulary)?;
         args.bias.require_row(Self::NAME, DType::F32, vocabulary)?;
@@ -156,17 +154,16 @@ impl Op for LogitsShape {
                 ),
             ));
         }
-        args.adjustments
-            .require_shape(Self::NAME, Shape::new(&[rows, 2]))?;
+        args.adjustments.require_shape(Self::NAME, &[rows, 2])?;
         args.bans.require_row(
             Self::NAME,
             DType::I32,
             u64::from(ban_words(descriptor.vocabulary)),
         )?;
-        match (descriptor.extras, args.extras) {
+        match (descriptor.extras, &args.extras) {
             (0, None) => {}
             (extras, Some(extra)) => {
-                extra.require_shape(Self::NAME, Shape::new(&[rows, u64::from(extras)]))?;
+                extra.require_shape(Self::NAME, &[rows, u64::from(extras)])?;
             }
             (extras, None) => {
                 return Err(Error::argument(
@@ -189,19 +186,19 @@ impl Op for LogitsShape {
         let vocabulary = u64::from(descriptor.vocabulary);
         let rows = args.logits.rows();
         // A descriptor without extra tokens reads the slots in their place.
-        let extras = args.extras.unwrap_or(args.slots);
+        let extras = args.extras.as_ref().unwrap_or(&args.slots);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.logits)
-            .view(args.counts)
-            .view(args.slots)
-            .view(args.parameters)
+            .view(&args.logits)
+            .view(&args.counts)
+            .view(&args.slots)
+            .view(&args.parameters)
             .view(extras)
-            .view(args.bias)
-            .view(args.adjustments)
-            .view(args.bans)
-            .view(args.out)
+            .view(&args.bias)
+            .view(&args.adjustments)
+            .view(&args.bans)
+            .view(&args.out)
             .u64(rows)
             .u32(descriptor.vocabulary)
             .flag(descriptor.divide);
@@ -267,8 +264,8 @@ pub const TOP_K_BINS: u32 = 16;
 /// The planes are the kept count wide, not the vocabulary's: the ordering works on the compacted
 /// candidates. It is one tensor per launch rather than five because a launch's operands are its
 /// arguments, and the program addresses the planes by offset from its own row.
-pub fn top_k_workspace(rows: u64, width: u64) -> Shape {
-    Shape::new(&[rows, 4 * width + 2 * u64::from(TOP_K_BINS)])
+pub fn top_k_workspace(rows: u64, width: u64) -> [u64; 2] {
+    [rows, 4 * width + 2 * u64::from(TOP_K_BINS)]
 }
 
 impl fmt::Display for TopKDescriptor {
@@ -286,7 +283,7 @@ impl fmt::Display for TopKDescriptor {
 }
 
 /// The arguments of `top_k`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct TopKArgs {
     /// `[rows, vocabulary]` shaped logits.
     pub logits: Operand,
@@ -329,8 +326,7 @@ impl Op for TopK {
         }
         args.logits
             .require_row(Self::NAME, descriptor.dtype, vocabulary)?;
-        args.values
-            .require_shape(Self::NAME, Shape::new(&[rows, width]))?;
+        args.values.require_shape(Self::NAME, &[rows, width])?;
         if args.values.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -341,10 +337,9 @@ impl Op for TopK {
                 ),
             ));
         }
-        args.ids
-            .require_shape(Self::NAME, Shape::new(&[rows, width]))?;
+        args.ids.require_shape(Self::NAME, &[rows, width])?;
         args.workspace
-            .require_shape(Self::NAME, top_k_workspace(rows, width))?;
+            .require_shape(Self::NAME, &top_k_workspace(rows, width))?;
         if args.workspace.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -377,10 +372,10 @@ impl Op for TopK {
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.logits)
-            .view(args.values)
-            .view(args.ids)
-            .view(args.workspace)
+            .view(&args.logits)
+            .view(&args.values)
+            .view(&args.ids)
+            .view(&args.workspace)
             .u64(rows)
             .u32(descriptor.vocabulary)
             .u32(descriptor.width);
@@ -431,7 +426,7 @@ impl fmt::Display for FilterDescriptor {
 }
 
 /// The arguments of `filter_candidates`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FilterArgs {
     /// `[rows, width]` FP32 candidates, descending; a dropped candidate is written as `-inf`.
     pub values: Operand,
@@ -456,8 +451,7 @@ impl Op for FilterCandidates {
         let width = u64::from(descriptor.width);
         let rows = args.values.rows();
         args.values.require_row(Self::NAME, DType::F32, width)?;
-        args.ids
-            .require_shape(Self::NAME, Shape::new(&[rows, width]))?;
+        args.ids.require_shape(Self::NAME, &[rows, width])?;
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
@@ -468,11 +462,9 @@ impl Op for FilterCandidates {
                 ),
             ));
         }
-        args.parameters.require_shape(
-            Self::NAME,
-            Shape::new(&[rows, u64::from(PARAMETER_COLUMNS)]),
-        )?;
-        args.valid.require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.parameters
+            .require_shape(Self::NAME, &[rows, u64::from(PARAMETER_COLUMNS)])?;
+        args.valid.require_shape(Self::NAME, &[rows])?;
         if args.valid.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -496,10 +488,10 @@ impl Op for FilterCandidates {
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.values)
-            .view(args.ids)
-            .view(args.parameters)
-            .view(args.valid)
+            .view(&args.values)
+            .view(&args.ids)
+            .view(&args.parameters)
+            .view(&args.valid)
             .u64(rows)
             .u64(width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
@@ -549,7 +541,7 @@ impl fmt::Display for InverseCdfDescriptor {
 }
 
 /// The arguments of `inverse_cdf`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct InverseCdfArgs {
     /// `[rows, width]` FP32 candidate probabilities, in the order the caller supplies them; the layer
     /// sorts by token id first, so the draw does not depend on
@@ -577,8 +569,7 @@ impl Op for InverseCdf {
         let rows = args.probabilities.rows();
         args.probabilities
             .require_row(Self::NAME, DType::F32, width)?;
-        args.ids
-            .require_shape(Self::NAME, Shape::new(&[rows, width]))?;
+        args.ids.require_shape(Self::NAME, &[rows, width])?;
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
@@ -589,14 +580,14 @@ impl Op for InverseCdf {
                 ),
             ));
         }
-        args.draws.require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.draws.require_shape(Self::NAME, &[rows])?;
         if args.draws.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
                 format!("expected f32 draws, found {}", abi::name(args.draws.dtype)),
             ));
         }
-        args.tokens.require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.tokens.require_shape(Self::NAME, &[rows])?;
         if args.tokens.dtype != descriptor.tokens {
             return Err(Error::argument(
                 Self::NAME,
@@ -623,10 +614,10 @@ impl Op for InverseCdf {
         // of the descriptor's `tile` lanes, so no block covers the row and nothing in the
         // signature depends on its width.
         arguments
-            .view(args.probabilities)
-            .view(args.ids)
-            .view(args.draws)
-            .view(args.tokens)
+            .view(&args.probabilities)
+            .view(&args.ids)
+            .view(&args.draws)
+            .view(&args.tokens)
             .u64(rows)
             .u32(descriptor.width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
@@ -672,7 +663,7 @@ impl fmt::Display for ArgMaxDescriptor {
 }
 
 /// The arguments of `argmax`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ArgMaxArgs {
     /// `[rows, width]` logits or candidates.
     pub values: Operand,
@@ -702,7 +693,7 @@ impl Op for ArgMax {
         let rows = args.values.rows();
         args.values
             .require_row(Self::NAME, descriptor.dtype, width)?;
-        args.out.require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.out.require_shape(Self::NAME, &[rows])?;
         if args.out.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
@@ -725,7 +716,7 @@ impl Op for ArgMax {
         let rows = args.values.rows();
 
         let mut arguments = Arguments::new();
-        arguments.view(args.values).view(args.out).u64(rows);
+        arguments.view(&args.values).view(&args.out).u64(rows);
         // The candidate width is compiled into the program, so it is not a parameter here: a word the
         // module does not declare would push the two scratch addresses the compiler's launcher appends
         // out of place.
@@ -772,7 +763,7 @@ impl fmt::Display for LogSoftmaxDescriptor {
 }
 
 /// The arguments of `log_softmax`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct LogSoftmaxArgs {
     /// `[rows, columns]`.
     pub x: Operand,
@@ -814,8 +805,8 @@ impl Op for LogSoftmax {
     ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.out)
+            .view(&args.x)
+            .view(&args.out)
             .u32(descriptor.columns)
             .flag(descriptor.pdl);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
@@ -862,7 +853,7 @@ impl fmt::Display for LogprobDescriptor {
 }
 
 /// The arguments of `logprob_gather`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct LogprobArgs {
     /// `[rows, columns]` FP32 log-probabilities.
     pub logprobabilities: Operand,
@@ -890,7 +881,7 @@ impl Op for LogprobGather {
         let rows = args.logprobabilities.rows();
         args.logprobabilities
             .require_row(Self::NAME, DType::F32, columns)?;
-        args.tokens.require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.tokens.require_shape(Self::NAME, &[rows])?;
         if args.tokens.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
@@ -901,7 +892,7 @@ impl Op for LogprobGather {
                 ),
             ));
         }
-        args.out.require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.out.require_shape(Self::NAME, &[rows])?;
         if args.out.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -911,7 +902,7 @@ impl Op for LogprobGather {
                 ),
             ));
         }
-        args.ranks.require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.ranks.require_shape(Self::NAME, &[rows])?;
         if args.ranks.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -934,10 +925,10 @@ impl Op for LogprobGather {
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.logprobabilities)
-            .view(args.tokens)
-            .view(args.out)
-            .view(args.ranks)
+            .view(&args.logprobabilities)
+            .view(&args.tokens)
+            .view(&args.out)
+            .view(&args.ranks)
             .u64(rows)
             .u32(descriptor.columns);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
@@ -991,7 +982,7 @@ pub fn top_logprobs_chunks(width: u64, tile: u32) -> u64 {
 }
 
 /// The arguments of `top_logprobs`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct TopLogprobsArgs {
     /// `[rows, width]` FP32 entries: log-probabilities, or a first launch's candidates.
     pub values: Operand,
@@ -1032,8 +1023,8 @@ impl Op for TopLogprobs {
         let rows = args.values.rows();
         let width = args.values.last();
         args.values.require_row(Self::NAME, DType::F32, width)?;
-        match (descriptor.indirect, args.ids) {
-            (true, Some(ids)) => ids.require_shape(Self::NAME, Shape::new(&[rows, width]))?,
+        match (descriptor.indirect, &args.ids) {
+            (true, Some(ids)) => ids.require_shape(Self::NAME, &[rows, width])?,
             (false, None) => {}
             _ => {
                 return Err(Error::argument(
@@ -1043,14 +1034,12 @@ impl Op for TopLogprobs {
             }
         }
         let kept = top_logprobs_chunks(width, descriptor.tile) * u64::from(descriptor.candidates);
-        args.out_values
-            .require_shape(Self::NAME, Shape::new(&[rows, kept]))?;
-        args.out_ids
-            .require_shape(Self::NAME, Shape::new(&[rows, kept]))?;
+        args.out_values.require_shape(Self::NAME, &[rows, kept])?;
+        args.out_ids.require_shape(Self::NAME, &[rows, kept])?;
         for (name, view, dtype) in [
-            ("ids", args.ids, DType::I32),
-            ("kept values", Some(args.out_values), DType::F32),
-            ("kept ids", Some(args.out_ids), DType::I32),
+            ("ids", args.ids.as_ref(), DType::I32),
+            ("kept values", Some(&args.out_values), DType::F32),
+            ("kept ids", Some(&args.out_ids), DType::I32),
         ] {
             if let Some(view) = view
                 && view.dtype != dtype
@@ -1080,11 +1069,11 @@ impl Op for TopLogprobs {
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.values)
+            .view(&args.values)
             // A direct launch reads no ids; the slot still takes a device address.
-            .view(args.ids.unwrap_or(args.out_ids))
-            .view(args.out_values)
-            .view(args.out_ids)
+            .view(args.ids.as_ref().unwrap_or(&args.out_ids))
+            .view(&args.out_values)
+            .view(&args.out_ids)
             .u32(u32::try_from(width).map_err(|_| Error::argument(Self::NAME, "a row past u32"))?)
             .u32(
                 u32::try_from(chunks)
@@ -1132,7 +1121,7 @@ impl fmt::Display for OrderDescriptor {
 }
 
 /// The arguments of `candidate_order`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct OrderArgs {
     /// `[rows, width]` the candidate values (probabilities or shaped logits — the permutation is the
     /// same for either).
@@ -1195,12 +1184,12 @@ impl Op for CandidateOrder {
             ));
         }
         for (name, view, dtype) in [
-            ("values", args.values, descriptor.values),
-            ("ids", args.ids, descriptor.ids),
-            ("ordered_values", args.ordered_values, descriptor.values),
-            ("ordered_ids", args.ordered_ids, descriptor.ids),
+            ("values", &args.values, descriptor.values),
+            ("ids", &args.ids, descriptor.ids),
+            ("ordered_values", &args.ordered_values, descriptor.values),
+            ("ordered_ids", &args.ordered_ids, descriptor.ids),
         ] {
-            view.require_shape(Self::NAME, Shape::new(&[rows, width]))?;
+            view.require_shape(Self::NAME, &[rows, width])?;
             if view.dtype != dtype {
                 return Err(Error::argument(
                     Self::NAME,
@@ -1213,10 +1202,13 @@ impl Op for CandidateOrder {
             }
             // A permutation written through rows that interleave would move each other's elements:
             // the program writes one row contiguously, so every view must be packed.
-            if view.strides != crate::tensor::Strides::row_major(view.shape) {
+            if !view.is_row_major() {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("the {name} are written row-major; found {}", view.strides),
+                    format!(
+                        "the {name} are written row-major; found {:?}",
+                        view.strides()
+                    ),
                 ));
             }
         }
@@ -1232,7 +1224,7 @@ impl Op for CandidateOrder {
             ));
         }
         args.counts
-            .require_shape(Self::NAME, Shape::new(&[rows, args.vocabulary]))?;
+            .require_shape(Self::NAME, &[rows, args.vocabulary])?;
         if args.counts.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1243,12 +1235,12 @@ impl Op for CandidateOrder {
                 ),
             ));
         }
-        if args.counts.strides != crate::tensor::Strides::row_major(args.counts.shape) {
+        if !args.counts.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the counts are written row-major; found {}",
-                    args.counts.strides
+                    "the counts are written row-major; found {:?}",
+                    args.counts.strides()
                 ),
             ));
         }
@@ -1284,11 +1276,11 @@ impl Op for CandidateOrder {
         // The scratch is the program's own: neither twin rule applies to it, and a shadow run gets
         // its own buffer only if the caller gives it one.
         arguments
-            .view(args.values)
-            .view(args.ids)
-            .view(args.ordered_values)
-            .view(args.ordered_ids)
-            .view(args.counts)
+            .view(&args.values)
+            .view(&args.ids)
+            .view(&args.ordered_values)
+            .view(&args.ordered_ids)
+            .view(&args.counts)
             .u64(rows)
             .u32(width as u32)
             .u32(args.vocabulary as u32);

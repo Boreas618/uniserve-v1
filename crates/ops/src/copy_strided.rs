@@ -26,14 +26,14 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
+use crate::operand::Operand;
 use crate::strided;
-use crate::tensor::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Op, Result, Twins};
 
@@ -55,7 +55,7 @@ impl Descriptor {
     pub fn of(args: &Args, block: u32, pdl: bool) -> Self {
         Self {
             dtype: args.source.dtype,
-            rank: strided::rank([args.source, args.destination]),
+            rank: strided::rank([&args.source, &args.destination]),
             block,
             pdl,
         }
@@ -74,7 +74,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `copy_strided`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// The elements to move, at any strides.
     pub source: Operand,
@@ -106,13 +106,13 @@ impl Op for CopyStrided {
             Self::NAME,
             "destination",
             &args.destination,
-            args.source.shape,
+            args.source.dims(),
         )?;
         strided::require_elements(Self::NAME, "source", &args.source)?;
         strided::require_elements(Self::NAME, "destination", &args.destination)?;
         strided::require_window(Self::NAME, "destination", &args.destination)?;
 
-        let traversed = strided::rank([args.source, args.destination]);
+        let traversed = strided::rank([&args.source, &args.destination]);
         strided::require_rank(Self::NAME, "rank", descriptor.rank, traversed)
     }
 
@@ -122,14 +122,14 @@ impl Op for CopyStrided {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let [source, destination] = strided::merge_axes([args.source, args.destination]);
+        let [source, destination] = strided::merge_axes([&args.source, &args.destination]);
         let elements = destination.numel();
 
         let mut arguments = Arguments::new();
-        arguments.view(source).view(destination).u64(elements);
-        strided::pack_extents(&mut arguments, destination.shape);
-        strided::pack_strides(&mut arguments, source.strides);
-        strided::pack_strides(&mut arguments, destination.strides);
+        arguments.view(&source).view(&destination).u64(elements);
+        strided::pack_extents(&mut arguments, &destination);
+        strided::pack_strides(&mut arguments, &source);
+        strided::pack_strides(&mut arguments, &destination);
         arguments.flag(descriptor.pdl);
 
         kernel.launch(
@@ -157,21 +157,21 @@ impl Op for CopyStrided {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DevicePtr, Shape, Strides};
+    use platform::DevicePtr;
 
     const BLOCK: u32 = 1024;
 
     fn operand(address: u64, shape: &[u64], strides: &[u64]) -> Operand {
         Operand::with_strides(
-            DevicePtr::new(address),
+            DevicePtr::from_address(address),
             DType::BF16,
-            Shape::new(shape),
-            Strides::new(strides),
+            shape,
+            strides,
         )
     }
 
     fn contiguous(address: u64, shape: &[u64]) -> Operand {
-        Operand::new(DevicePtr::new(address), DType::BF16, Shape::new(shape))
+        Operand::new(DevicePtr::from_address(address), DType::BF16, shape)
     }
 
     fn refusal(args: &Args) -> String {
@@ -242,14 +242,14 @@ mod tests {
 
         // A block inside a larger tensor keeps the larger tensor's strides.
         let window = Args {
-            source,
+            source: source.clone(),
             destination: operand(0x2000, &[4, 8], &[32, 1]),
         };
         CopyStrided::check(&Descriptor::of(&window, BLOCK, false), &window).unwrap();
 
         // A permuted destination is no window.
         let permuted = Args {
-            source,
+            source: source.clone(),
             destination: operand(0x2000, &[4, 8], &[1, 4]),
         };
         let message = refusal(&permuted);
@@ -257,18 +257,18 @@ mod tests {
 
         // Nor is one whose rows overlap, or one written once per repetition.
         let overlapping = Args {
-            source,
+            source: source.clone(),
             destination: operand(0x2000, &[4, 8], &[4, 1]),
         };
         assert!(refusal(&overlapping).contains("no row-major window"));
         let broadcast = Args {
-            source,
+            source: source.clone(),
             destination: operand(0x2000, &[4, 8], &[0, 1]),
         };
         assert!(refusal(&broadcast).contains("no row-major window"));
 
         let other_shape = Args {
-            source,
+            source: source.clone(),
             destination: contiguous(0x2000, &[8, 4]),
         };
         let message = refusal(&other_shape);
@@ -279,7 +279,7 @@ mod tests {
 
         let other_type = Args {
             source,
-            destination: Operand::new(DevicePtr::new(0x2000), DType::F16, Shape::new(&[4, 8])),
+            destination: Operand::new(DevicePtr::from_address(0x2000), DType::F16, &[4, 8]),
         };
         let message = refusal(&other_type);
         assert!(message.contains("expected bf16 destination"), "{message}");
@@ -295,12 +295,12 @@ mod tests {
     fn an_fp8_tensor_moves_as_its_bytes_and_a_packed_one_does_not() {
         let of = |dtype: DType, strides: &[u64]| Args {
             source: Operand::with_strides(
-                DevicePtr::new(0x1000),
+                DevicePtr::from_address(0x1000),
                 dtype,
-                Shape::new(&[5, 2, 3]),
-                Strides::new(strides),
+                &[5, 2, 3],
+                strides,
             ),
-            destination: Operand::new(DevicePtr::new(0x2000), dtype, Shape::new(&[5, 2, 3])),
+            destination: Operand::new(DevicePtr::from_address(0x2000), dtype, &[5, 2, 3]),
         };
 
         // A permuted FP8 view made contiguous.

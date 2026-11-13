@@ -12,13 +12,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -53,7 +53,7 @@ impl fmt::Display for Fp8GemmDescriptor {
 }
 
 /// The arguments of `fp8_gemm`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Fp8GemmArgs {
     /// `[m, k]`, unit-strided per row, rows any stride apart: the 16-bit activation.
     pub input: Operand,
@@ -86,9 +86,9 @@ impl Op for Fp8Gemm {
             ));
         }
         args.weight.require_rank(Self::NAME, 2)?;
-        let (n, k) = (args.weight.shape.dim(0), args.weight.shape.dim(1));
+        let (n, k) = (args.weight.dim(0), args.weight.dim(1));
         args.weight.require_row(Self::NAME, DType::F8E4M3, k)?;
-        if args.weight.strides != Strides::row_major(args.weight.shape) {
+        if !args.weight.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the weight is not contiguous".to_owned(),
@@ -96,10 +96,10 @@ impl Op for Fp8Gemm {
         }
         args.input.require_rank(Self::NAME, 2)?;
         args.input.require_row(Self::NAME, descriptor.dtype, k)?;
-        let m = args.input.shape.dim(0);
-        args.out.require_shape(Self::NAME, Shape::new(&[m, n]))?;
+        let m = args.input.dim(0);
+        args.out.require_shape(Self::NAME, &[m, n])?;
         args.out.require_row(Self::NAME, descriptor.dtype, n)?;
-        if args.out.strides != Strides::row_major(args.out.shape) {
+        if !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the output is not contiguous".to_owned(),
@@ -107,7 +107,7 @@ impl Op for Fp8Gemm {
         }
         match (descriptor.bias, &args.bias) {
             (true, Some(bias)) => {
-                bias.require_shape(Self::NAME, Shape::new(&[n]))?;
+                bias.require_shape(Self::NAME, &[n])?;
                 bias.require_row(Self::NAME, descriptor.dtype, n)?;
             }
             (false, None) => {}
@@ -127,7 +127,7 @@ impl Op for Fp8Gemm {
                 ),
             ));
         }
-        let widest = (m * args.input.strides.get(0)).max(m * n).max(n * k);
+        let widest = (m * args.input.stride(0)).max(m * n).max(n * k);
         if widest > i32::MAX as u64 {
             return Err(Error::argument(
                 Self::NAME,
@@ -143,20 +143,20 @@ impl Op for Fp8Gemm {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let (m, k) = (args.input.shape.dim(0), args.input.shape.dim(1));
-        let n = args.weight.shape.dim(0);
+        let (m, k) = (args.input.dim(0), args.input.dim(1));
+        let n = args.weight.dim(0);
 
         let mut arguments = Arguments::new();
         // A program compiled without a bias never reads its bias port; the output stands in.
         arguments
-            .view(args.input)
-            .view(args.weight)
-            .view(args.bias.unwrap_or(args.out))
-            .view(args.out)
+            .view(&args.input)
+            .view(&args.weight)
+            .view(args.bias.as_ref().unwrap_or(&args.out))
+            .view(&args.out)
             .i32(m as i32)
             .i32(n as i32)
             .i32(k as i32)
-            .i32(args.input.strides.get(0) as i32)
+            .i32(args.input.stride(0) as i32)
             .f32(args.input_scale.recip())
             .f32(args.alpha);
         kernel.launch(

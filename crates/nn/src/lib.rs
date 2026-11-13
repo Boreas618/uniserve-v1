@@ -4,8 +4,9 @@
 //! ## Where this crate sits
 //!
 //! Three layers, as in PyTorch: the tensor library (`tensor`: tensors, views, the CPU
-//! device), the device backend (`backend`: the CUDA and meta devices, the execution context, the
-//! one dispatch point of every kernel) and this crate, the `torch.nn` of the tree. A model crate
+//! device), its device side (`ops`: the operators and their kernels, the CUDA and meta devices,
+//! the execution context, the one dispatch point of every kernel) and this crate, the `torch.nn`
+//! of the tree. A model crate
 //! depends on this crate, the tensor library and `processing` only; what it may name of the
 //! layers below is re-exported here ([`Tensor`], [`DType`], [`Device`], [`Shape`], [`D`],
 //! [`IndexOp`], [`Module`], [`collective`], [`profiler`]).
@@ -40,8 +41,8 @@
 //! - A module states its forward as a profiler range ([`profiler::range`]) where a deployment
 //!   times it, with its class and the path its builder loaded it under
 //!   ([`VarBuilder::path`]).
-//! - A failure is this crate's [`Error`], which holds the tensor library's and the backend's
-//!   as typed causes; a model crate converts it into its own.
+//! - A failure is this crate's [`Error`], which holds the tensor library's and the device
+//!   side's as typed causes; a model crate converts it into its own.
 //!
 //! ## What a forward does
 //!
@@ -62,7 +63,7 @@
 //! | [`diffusion`] | Flow-matching schedules, the solver formulas and the sinusoidal time embedding |
 //! | [`vae`] | The tiles of a raster, their blend and stitch, the tiled encode and the temporal clips |
 //! | [`family`] | The family traits, the registry and the shapes execution sizes a model by |
-//! | [`collective`], [`profiler`] | The model-facing forms of the backend's collectives and profiler ranges |
+//! | [`collective`], [`profiler`] | The model-facing forms of the device side's collectives and profiler ranges |
 
 pub mod adapter;
 pub mod capability;
@@ -91,7 +92,7 @@ pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
 pub use collective::Split;
 pub use error::{Error, Result};
 pub use proto::module::PhaseKind;
-pub use proto::video::{ConditionRole, LatentShape, Layout, VisionGrid};
+pub use proto::video::{ConditionRole, LatentShape, VisionGrid};
 pub use tensor::{D, DType, Device, IndexOp, Module, Shape, Tensor};
 pub use var_builder::VarBuilder;
 pub use weights::{

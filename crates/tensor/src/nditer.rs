@@ -2,7 +2,12 @@ use std::iter::FusedIterator;
 
 use crate::Layout;
 
-/// Maximum tensor rank supported by [`NdIter`].
+/// The most axes a strided operation of the library takes.
+///
+/// The CPU backend's [`NdIter`] holds its folded axes inline in arrays of this many, and a device
+/// backend's kernel operand carries no more, so a tensor computes over the same ranks on the CPU
+/// and on a device: the CPU formula of an operation is the reference its device kernel is checked
+/// against, and a reference that took a rank the device refuses would check nothing.
 pub const MAX_DIMS: usize = 8;
 
 /// Multi-dimensional iterator that walks `N` tensor layouts simultaneously.
@@ -56,49 +61,15 @@ impl<const N: usize> NdIter<N> {
             debug_assert_eq!(l.dims(), dims);
         }
 
-        let rank = dims.len();
+        let (merged, merged_strides) = merge_axes(dims, layouts.map(|layout| layout.stride()));
+        debug_assert!(merged.len() <= MAX_DIMS, "rank exceeds MAX_DIMS={MAX_DIMS}");
+
+        let out_len = merged.len();
         let mut out_dims = [0usize; MAX_DIMS];
+        out_dims[..out_len].copy_from_slice(&merged);
         let mut out_strides = [[0usize; MAX_DIMS]; N];
-        let mut out_len;
-
-        if rank == 0 {
-            out_dims[0] = 1;
-            out_len = 1;
-        } else {
-            out_dims[0] = dims[0];
-            for n in 0..N {
-                out_strides[n][0] = layouts[n].stride()[0];
-            }
-            out_len = 1;
-
-            for (i, d) in dims.iter().enumerate().take(rank).skip(1) {
-                let top = out_len - 1;
-                let last_d = out_dims[top];
-
-                let (can_merge, use_inner) = if last_d == 1 {
-                    (true, true)
-                } else if *d == 1 {
-                    (true, false)
-                } else {
-                    let can_merge =
-                        (0..N).all(|n| out_strides[n][top] == layouts[n].stride()[i] * d);
-                    (can_merge, true)
-                };
-                if can_merge {
-                    out_dims[top] = last_d * d;
-                    if use_inner {
-                        for n in 0..N {
-                            out_strides[n][top] = layouts[n].stride()[i];
-                        }
-                    }
-                } else {
-                    out_dims[out_len] = *d;
-                    for n in 0..N {
-                        out_strides[n][out_len] = layouts[n].stride()[i];
-                    }
-                    out_len += 1;
-                }
-            }
+        for (out, strides) in out_strides.iter_mut().zip(&merged_strides) {
+            out[..out_len].copy_from_slice(strides);
         }
 
         // Update inner strides
@@ -141,6 +112,85 @@ impl<const N: usize> NdIter<N> {
             remaining,
         }
     }
+}
+
+/// The axes `N` views of one shape traverse together: `dims` with every run of adjacent axes
+/// that each view steps through as one folded into one axis.
+///
+/// Two adjacent axes fold when, in every view, the outer axis's stride is the inner run's extent
+/// times its stride; an axis of one element folds into its neighbour whatever stride it carries,
+/// and a run of one element takes the stride of the axis folded into it. The views name the same
+/// elements at the same offsets in the same row-major order before and after. The result is the
+/// folded extents, outermost first, and each view's strides over them; a view of no axis comes
+/// back as one axis of one element with a zero stride, so the result has at least one axis.
+///
+/// This is the one statement of axis folding: the CPU backend iterates over the folded axes
+/// ([`NdIter`]), and a device backend states the folded rank of a strided kernel's operands in its
+/// key and passes the folded extents and strides as launch words. A device key depends on the
+/// strides this returns for a run of one element, so the rule for it is part of the result.
+///
+/// # Panics
+///
+/// When a view has another number of strides than `dims` has axes.
+pub fn merge_axes<const N: usize>(
+    dims: &[usize],
+    strides: [&[usize]; N],
+) -> (Vec<usize>, [Vec<usize>; N]) {
+    assert!(
+        strides.iter().all(|view| view.len() == dims.len()),
+        "every view states one stride per axis of {dims:?}"
+    );
+
+    // Built from the last axis outward, so run 0 is the innermost one.
+    let mut extents: Vec<usize> = Vec::with_capacity(dims.len().max(1));
+    let mut runs: [Vec<usize>; N] = std::array::from_fn(|_| Vec::with_capacity(dims.len().max(1)));
+
+    for axis in (0..dims.len()).rev() {
+        let extent = dims[axis];
+
+        if let Some(&inner_extent) = extents.last() {
+            let together = extent == 1
+                || inner_extent == 1
+                || strides.iter().zip(&runs).all(|(view, run)| {
+                    run.last()
+                        .and_then(|&inner| inner_extent.checked_mul(inner))
+                        == Some(view[axis])
+                });
+
+            if together {
+                if inner_extent == 1 {
+                    // A run of one element takes no step of its own: it takes this axis's.
+                    for (view, run) in strides.iter().zip(&mut runs) {
+                        if let Some(inner) = run.last_mut() {
+                            *inner = view[axis];
+                        }
+                    }
+                }
+                if let Some(inner) = extents.last_mut() {
+                    *inner = extent.saturating_mul(inner_extent);
+                }
+                continue;
+            }
+        }
+
+        extents.push(extent);
+        for (view, run) in strides.iter().zip(&mut runs) {
+            run.push(view[axis]);
+        }
+    }
+
+    if extents.is_empty() {
+        extents.push(1);
+        for run in &mut runs {
+            run.push(0);
+        }
+    }
+
+    extents.reverse();
+    for run in &mut runs {
+        run.reverse();
+    }
+    (extents, runs)
 }
 
 impl<const N: usize> Iterator for NdIter<N> {

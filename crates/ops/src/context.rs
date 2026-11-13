@@ -21,15 +21,15 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use ops::moe::ExchangeTransport;
-use ops::platform::{DeviceRange, Stream};
-use ops::{Generation, Route};
+use platform::{DeviceRange, Stream};
 
 use crate::allocator::{ALIGNMENT, Allocator};
 use crate::breaks::HostWork;
 use crate::collective::Group;
+use crate::moe::ExchangeTransport;
 use crate::profiler::Profiler;
 use crate::{Error, Result};
+use crate::{Generation, Route};
 
 thread_local! {
     /// The context installed on this thread, or none.
@@ -418,7 +418,7 @@ fn allocator(region: DeviceRange) -> Allocator {
 
 #[cfg(test)]
 mod tests {
-    use ops::platform::{DeviceRange, PlatformDevicePtr};
+    use platform::{DevicePtr, DeviceRange};
 
     use super::Context;
     use crate::allocator::ALIGNMENT;
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn a_skewed_region_is_aligned_before_anything_is_allocated() {
-        let region = DeviceRange::new(PlatformDevicePtr::from_address(0x1_0008), 4096);
+        let region = DeviceRange::new(DevicePtr::from_address(0x1_0008), 4096);
         let context = Context::meta(Some(region));
 
         let (address, _) = context.allocator().allocate(8).unwrap();

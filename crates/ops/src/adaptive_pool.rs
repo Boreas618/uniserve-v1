@@ -24,13 +24,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -68,7 +68,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `adaptive_pool`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[rows, heads, width]`, contiguous: the attended values.
     pub x: Operand,
@@ -93,9 +93,8 @@ impl Op for AdaptivePool {
             ));
         }
         args.x.require_rank(Self::NAME, 3)?;
-        let shape = args.x.shape;
-        if shape.dim(1) != u64::from(descriptor.heads)
-            || shape.dim(2) != u64::from(descriptor.width)
+        if args.x.dim(1) != u64::from(descriptor.heads)
+            || args.x.dim(2) != u64::from(descriptor.width)
         {
             return Err(Error::argument(
                 Self::NAME,
@@ -103,26 +102,24 @@ impl Op for AdaptivePool {
                     "expected {} heads of {} elements, found {} of {}",
                     descriptor.heads,
                     descriptor.width,
-                    shape.dim(1),
-                    shape.dim(2)
+                    args.x.dim(1),
+                    args.x.dim(2)
                 ),
             ));
         }
         args.x
-            .require_row(Self::NAME, descriptor.dtype, shape.dim(2))?;
-        if args.x.strides != Strides::row_major(shape) {
+            .require_row(Self::NAME, descriptor.dtype, args.x.dim(2))?;
+        if !args.x.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the attended values are read contiguous; found strides {}",
-                    args.x.strides
+                    "the attended values are read contiguous; found strides {:?}",
+                    args.x.strides()
                 ),
             ));
         }
-        args.out.require_shape(
-            Self::NAME,
-            Shape::new(&[shape.dim(0), u64::from(descriptor.output)]),
-        )?;
+        args.out
+            .require_shape(Self::NAME, &[args.x.dim(0), u64::from(descriptor.output)])?;
         args.out
             .require_row(Self::NAME, descriptor.dtype, u64::from(descriptor.output))?;
         Ok(())
@@ -134,14 +131,12 @@ impl Op for AdaptivePool {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let shape = args.x.shape;
-
-        let outputs = shape.dim(0) * u64::from(descriptor.output);
+        let outputs = args.x.dim(0) * u64::from(descriptor.output);
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.out)
-            .u64(shape.dim(0))
+            .view(&args.x)
+            .view(&args.out)
+            .u64(args.x.dim(0))
             .u32(descriptor.heads)
             .u32(descriptor.width)
             .u32(descriptor.output)

@@ -72,7 +72,7 @@ impl Tiny {
     /// The model over meta weights: what a profile run loads.
     fn meta() -> Self {
         let weight = |address: u64, dims: &[usize]| {
-            backend::retained(address, dims, DType::F32, &backend::meta()).unwrap()
+            ops::retained(address, dims, DType::F32, &ops::meta()).unwrap()
         };
 
         Self {

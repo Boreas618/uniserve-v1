@@ -60,7 +60,7 @@
 //! The two kernels name the rows they move by I64 index vectors on the device, the element type
 //! they read them in. A batch's vectors are written from the host as the copies are issued,
 //! into one of [`RING`] sets, so a set is written again only once the copies that read it
-//! completed. The kernels launch through `backend::launch` under a context of the state's own,
+//! completed. The kernels launch through `ops::launch` under a context of the state's own,
 //! over the stream of the runner that holds the state and the generation the rank serves from;
 //! it allocates nothing, the snapshot and the index vectors being the state's memory.
 //!
@@ -197,7 +197,7 @@ struct Buffers {
     /// The stream the copies are issued on: the stream of the runner that holds the state.
     stream: Stream,
     /// What the two kernels launch under: that stream and the serving generation.
-    context: backend::Context,
+    context: ops::Context,
 }
 
 /// The recurrent-state buffers of one rank and the copies that move them.
@@ -375,7 +375,7 @@ impl StateMemory {
         let ordinal = usize::try_from(device.0)
             .map_err(|_| Error::Invalid(format!("{device} names no GPU ordinal")))?;
         let region = DeviceRange::new(DevicePtr::from_address(snapshot.address()), 0);
-        let context = backend::Context::new(ordinal, stream.clone(), kernels, region);
+        let context = ops::Context::new(ordinal, stream.clone(), kernels, region);
 
         state.device = Some(Buffers {
             device,
@@ -623,10 +623,14 @@ impl StateMemory {
     fn block_shape(field: &ops::Operand) -> BlockShape {
         BlockShape {
             dtype: DType::U8,
-            shape: field.shape,
-            strides: field.strides,
+            shape: field.dims().iter().map(|&dim| dim as u64).collect(),
+            strides: field
+                .strides()
+                .iter()
+                .map(|&stride| stride as u64)
+                .collect(),
             index_stride: 1,
-            width: field.shape.last(),
+            width: field.last(),
             block: COPY_BLOCK,
         }
     }
@@ -635,12 +639,12 @@ impl StateMemory {
     /// on this thread: the rows `blocks` names of `field` into `part` when `gather`, and
     /// `part` into those rows otherwise.
     fn launch_move(gather: bool, field: &Tensor, blocks: &Tensor, part: &Tensor) -> Result<()> {
-        let field = backend::operand(field)?;
-        let blocks = backend::operand(blocks)?;
-        let snapshot = backend::operand(part)?;
+        let field = ops::operand(field)?;
+        let blocks = ops::operand(blocks)?;
+        let snapshot = ops::operand(part)?;
 
         if gather {
-            backend::launch::<CacheBlockSnapshot>(
+            ops::launch::<CacheBlockSnapshot>(
                 &Self::block_shape(&field),
                 SnapshotArgs {
                     field,
@@ -649,7 +653,7 @@ impl StateMemory {
                 },
             )?;
         } else {
-            backend::launch::<CacheBlockScatter>(
+            ops::launch::<CacheBlockScatter>(
                 &Self::block_shape(&field),
                 ScatterArgs {
                     field,
@@ -758,7 +762,7 @@ impl StateMemory {
 
         let page = self.cells(1..1 + self.units_per_page)?;
 
-        let context = backend::Context::meta(None);
+        let context = ops::Context::meta(None);
         context.record_launches();
         {
             let _installed = context.enter();

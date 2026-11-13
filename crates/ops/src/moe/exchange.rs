@@ -35,13 +35,14 @@ use std::ffi::c_void;
 use std::fmt;
 use std::sync::Arc;
 
+use platform::DevicePtr;
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
-use crate::platform::Stream;
-use crate::tensor::{DevicePtr, Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -167,7 +168,7 @@ impl fmt::Display for Descriptor {
 /// stand in the transport's combined view, and the package writes the rank's own rows into `out`.
 /// At [`Mode::Fused`] one launch reads `state`, `ids` and `weights` and writes `out`, with the
 /// layer's expert operands in `fused`. Views a mode does not read are empty (`[0]`-element) views.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ExchangeArgs {
     /// The group's transport, created and owned by the worker through the package and stated by
     /// the execution context at the launch. `None` in a call that is checked before any
@@ -442,25 +443,25 @@ impl TransportShape {
     /// The element type and extents of each region a transport of this shape lays out, in the
     /// order [`TransportViews`] names them: `states`, `ids`, `weights`, `combined`, `live`, `packed`
     /// and `packed_scales`.
-    pub fn regions(&self) -> [(DType, Shape); 7] {
+    pub fn regions(&self) -> [(DType, Vec<u64>); 7] {
         let max_tokens = u64::from(self.max_tokens);
         let rows = u64::from(self.ranks) * max_tokens;
         let hidden = u64::from(self.hidden);
         let top = u64::from(self.top);
         [
-            (self.dtype, Shape::new(&[rows, hidden])),
-            (DType::U32, Shape::new(&[rows, top])),
-            (DType::F32, Shape::new(&[rows, top])),
-            (self.dtype, Shape::new(&[rows, hidden])),
-            (DType::U32, Shape::new(&[1])),
-            (DType::U8, Shape::new(&[max_tokens, hidden / 2])),
-            (DType::F8E4M3, Shape::new(&[max_tokens, hidden / 16])),
+            (self.dtype, vec![rows, hidden]),
+            (DType::U32, vec![rows, top]),
+            (DType::F32, vec![rows, top]),
+            (self.dtype, vec![rows, hidden]),
+            (DType::U32, vec![1]),
+            (DType::U8, vec![max_tokens, hidden / 2]),
+            (DType::F8E4M3, vec![max_tokens, hidden / 16]),
         ]
     }
 }
 
 /// The views of a transport, as the layer reads them.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct TransportViews {
     /// The transport's handle.
     pub transport: ExchangeTransport,
@@ -532,7 +533,7 @@ impl Transport {
             attention_ranks: i64::from(shape.attention_ranks),
             error: [0; 512],
         };
-        let handle = crate::platform::stream_handle(stream);
+        let handle = stream.raw() as *mut std::ffi::c_void;
         // SAFETY: `call` has the layout the header declares, and `group` is the caller's to keep.
         let status = unsafe { create(&mut call, handle) };
         check(status, "create", &call.error)?;
@@ -576,8 +577,8 @@ impl Transport {
         let status = unsafe { (self.info)(&mut info, std::ptr::null_mut()) };
         check(status, "info", &info.error)?;
         let [states, ids, weights, combined, live, packed, packed_scales] = self.shape.regions();
-        let view = |pointer: *mut c_void, (dtype, shape): (DType, Shape)| {
-            Operand::new(DevicePtr::new(pointer as u64), dtype, shape)
+        let view = |pointer: *mut c_void, (dtype, dims): (DType, Vec<u64>)| {
+            Operand::new(DevicePtr::from_address(pointer as u64), dtype, &dims)
         };
         Ok(TransportViews {
             transport: self.handle(),
@@ -595,7 +596,7 @@ impl Transport {
     /// Writes the step's agreed capacity on `stream`, ahead of the step's first launch.
     pub fn step(&mut self, capacity: u32, stream: &Stream) -> Result<()> {
         self.call.capacity = i64::from(capacity);
-        let handle = crate::platform::stream_handle(stream);
+        let handle = stream.raw() as *mut std::ffi::c_void;
         // SAFETY: the transport is live and the call has the header's layout.
         let status = unsafe { (self.step)(&mut self.call, handle) };
         check(status, "step", &self.call.error)
@@ -646,8 +647,8 @@ impl Op for ExpertExchange {
                 format!("{tokens} rows exceed the transport's {max_tokens}"),
             ));
         }
-        if let Some(live) = args.live {
-            live.require_shape(Self::NAME, Shape::new(&[1]))?;
+        if let Some(live) = &args.live {
+            live.require_shape(Self::NAME, &[1])?;
             if live.dtype != DType::U32 {
                 return Err(Error::argument(
                     Self::NAME,
@@ -657,13 +658,10 @@ impl Op for ExpertExchange {
         }
         if matches!(descriptor.mode, Mode::Dispatch | Mode::Fused) {
             if descriptor.mode == Mode::Dispatch {
-                args.state
-                    .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
+                args.state.require_shape(Self::NAME, &[tokens, hidden])?;
             }
-            args.ids
-                .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-            args.weights
-                .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+            args.ids.require_shape(Self::NAME, &[tokens, top])?;
+            args.weights.require_shape(Self::NAME, &[tokens, top])?;
             if tokens != 0 && descriptor.mode == Mode::Dispatch {
                 args.state
                     .require_row(Self::NAME, descriptor.dtype, hidden)?;
@@ -676,8 +674,7 @@ impl Op for ExpertExchange {
             }
         }
         if matches!(descriptor.mode, Mode::Combine | Mode::Fused) {
-            args.out
-                .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
+            args.out.require_shape(Self::NAME, &[tokens, hidden])?;
             if tokens != 0 {
                 args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
             }
@@ -803,11 +800,7 @@ mod tests {
             dtype: DType::BF16,
         };
         let view = |dtype, dims: &[u64]| {
-            Operand::new(
-                crate::tensor::DevicePtr::new(0x1000),
-                dtype,
-                Shape::new(dims),
-            )
+            Operand::new(platform::DevicePtr::from_address(0x1000), dtype, dims)
         };
         let args = ExchangeArgs {
             transport: None,

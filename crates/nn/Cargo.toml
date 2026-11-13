@@ -6,16 +6,14 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The neural-network library: `nn → backend → ops → platform`, beside the tensor library. A model
-# crate depends on `nn`, `tensor` and `processing` only; what it may name of the crates
-# below is re-exported here.
+# The neural-network library: `nn → ops → platform`, beside the tensor library. A model crate
+# depends on `nn`, `tensor` and `processing` only; what it may name of the crates below is
+# re-exported here.
 [dependencies]
 # Tensors, views and the CPU device every fused operator states its formula on.
 tensor.workspace = true
-# Tensors over retained and allocated device storage, the one dispatch point, collectives and
-# profiler ranges.
-backend.workspace = true
-# The operators a fused function launches: descriptors, arguments and keys.
+# The operators a fused function launches (descriptors, arguments and keys), tensors over
+# retained and allocated device storage, the one dispatch point, collectives and profiler ranges.
 ops.workspace = true
 # A family states what request processing serves of it beside what execution loads.
 processing.workspace = true
@@ -29,6 +27,10 @@ memmap2 = "0.9"
 # A computed weight has no file to name it, so its key carries a digest of the bytes it produced.
 sha2.workspace = true
 safetensors = "0.8.0"
+# A scalar's BF16 rounding and an E4M3 byte's value on the host, as the tensor library computes
+# them.
+half = "2.5.0"
+float8 = "0.7.0"
 
 [dev-dependencies]
 tempfile.workspace = true

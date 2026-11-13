@@ -26,13 +26,13 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -77,7 +77,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one sort.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SortArgs {
     /// `[tokens, top]` u32 route ids.
     pub ids: Operand,
@@ -255,10 +255,8 @@ impl Op for MoeSort {
         let tiles = super::max_tiles(tokens, top, local, tile);
         let permuted = super::max_permuted_rows(tokens, top, local, tile);
 
-        args.ids
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        args.scales
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+        args.ids.require_shape(Self::NAME, &[tokens, top])?;
+        args.scales.require_shape(Self::NAME, &[tokens, top])?;
         if args.ids.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -280,30 +278,28 @@ impl Op for MoeSort {
         }
         if !matches!(descriptor.scales, DType::F32 | DType::BF16 | DType::F16) {
             return Err(Error::Unsupported {
-                operator: Self::NAME,
-                problem: format!(
+                operation: Self::NAME,
+                reason: format!(
                     "{} route weights are not a sort weight",
                     abi::name(descriptor.scales)
                 ),
             });
         }
         for view in [&args.tile_to_expert, &args.tile_to_limit] {
-            view.require_shape(Self::NAME, Shape::new(&[tiles]))?;
+            view.require_shape(Self::NAME, &[tiles])?;
             super::require_u32_vector(Self::NAME, view)?;
         }
         args.expanded_to_permuted
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+            .require_shape(Self::NAME, &[tokens, top])?;
         super::require_u32_vector(Self::NAME, &args.expanded_to_permuted)?;
         args.permuted_to_expanded
-            .require_shape(Self::NAME, Shape::new(&[permuted]))?;
+            .require_shape(Self::NAME, &[permuted])?;
         args.permuted_to_token
-            .require_shape(Self::NAME, Shape::new(&[permuted]))?;
-        args.total_padded_tokens
-            .require_shape(Self::NAME, Shape::new(&[1]))?;
-        args.num_non_exiting_tiles
-            .require_shape(Self::NAME, Shape::new(&[1]))?;
-        if let Some(live_tokens) = args.live_tokens {
-            live_tokens.require_shape(Self::NAME, Shape::new(&[1]))?;
+            .require_shape(Self::NAME, &[permuted])?;
+        args.total_padded_tokens.require_shape(Self::NAME, &[1])?;
+        args.num_non_exiting_tiles.require_shape(Self::NAME, &[1])?;
+        if let Some(live_tokens) = &args.live_tokens {
+            live_tokens.require_shape(Self::NAME, &[1])?;
             live_tokens.require_row(Self::NAME, DType::U32, 1)?;
         }
         for view in [

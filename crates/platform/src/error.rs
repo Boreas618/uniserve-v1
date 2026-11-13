@@ -50,25 +50,6 @@ pub enum Error {
         source: Arc<libloading::Error>,
     },
 
-    /// A cuBLASLt call returned a `cublasStatus_t` other than
-    /// `CUBLAS_STATUS_SUCCESS`.
-    #[error("{call} failed with {name} ({code}): {message}")]
-    Blas {
-        call: &'static str,
-        code: i32,
-        name: &'static str,
-        message: &'static str,
-    },
-
-    /// A cuDNN call returned a `cudnnStatus_t` other than
-    /// `CUDNN_STATUS_SUCCESS`; the message is cuDNN's own for that status.
-    #[error("{call} failed with cuDNN status {code}: {message}")]
-    Cudnn {
-        call: &'static str,
-        code: i32,
-        message: String,
-    },
-
     /// A CUDA driver call returned a `CUresult` other than `CUDA_SUCCESS`.
     #[error("{call} failed with {name} ({code}): {message}")]
     Driver {

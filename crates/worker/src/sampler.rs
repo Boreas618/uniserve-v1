@@ -1691,7 +1691,7 @@ mod tests {
         static NEXT: AtomicU64 = AtomicU64::new(1 << 40);
         let address = NEXT.fetch_add(1 << 28, Ordering::Relaxed);
 
-        backend::retained(address, shape, dtype, &backend::meta()).unwrap()
+        ops::retained(address, shape, dtype, &ops::meta()).unwrap()
     }
 
     /// The same forwards over meta tensors are a profile run: each selection states its
@@ -1712,9 +1712,9 @@ mod tests {
         )
         .unwrap();
 
-        let context = backend::Context::meta(None);
+        let context = ops::Context::meta(None);
         let _guard = context.enter();
-        let operators = |context: &backend::Context| -> Vec<&'static str> {
+        let operators = |context: &ops::Context| -> Vec<&'static str> {
             context
                 .take_launches()
                 .into_iter()

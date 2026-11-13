@@ -281,19 +281,18 @@ pub fn vsa_prepare_tiles_(
         return Ok(([query, key, value], Tensor::stack(&means, 0)?));
     }
 
-    let pooled = backend::empty((3, tiles, heads, width), DType::F32)?;
+    let pooled = ops::empty((3, tiles, heads, width), DType::F32)?;
     let (query_rows, key_rows, value_rows) = (
-        backend::operand(&query)?,
-        backend::operand(&key)?,
-        backend::operand(&value)?,
+        ops::operand(&query)?,
+        ops::operand(&key)?,
+        ops::operand(&value)?,
     );
     let cosine = factors
-        .map(|(cosine, _)| backend::operand(cosine))
+        .map(|(cosine, _)| ops::operand(cosine))
         .transpose()?;
-    let means =
-        |index: usize| -> Result<ops::Operand> { Ok(backend::operand(&pooled.get(index)?)?) };
+    let means = |index: usize| -> Result<ops::Operand> { Ok(ops::operand(&pooled.get(index)?)?) };
 
-    backend::launch::<VsaPrepareTiles>(
+    ops::launch::<VsaPrepareTiles>(
         // The strides are compiled into the kernel, so they are stated from the layouts the
         // projections have.
         &PrepareTilesDescriptor {
@@ -305,27 +304,23 @@ pub fn vsa_prepare_tiles_(
             block_rows: BLOCK_ROWS,
             epsilon: Float::from(eps),
             norm: gains.is_some(),
-            query_row_stride: query_rows.strides.get(0),
-            query_head_stride: query_rows.strides.get(1),
-            key_row_stride: key_rows.strides.get(0),
-            key_head_stride: key_rows.strides.get(1),
-            value_row_stride: value_rows.strides.get(0),
-            value_head_stride: value_rows.strides.get(1),
-            factor_stride: cosine.map_or(0, |table| table.strides.get(0)),
+            query_row_stride: query_rows.stride(0),
+            query_head_stride: query_rows.stride(1),
+            key_row_stride: key_rows.stride(0),
+            key_head_stride: key_rows.stride(1),
+            value_row_stride: value_rows.stride(0),
+            value_head_stride: value_rows.stride(1),
+            factor_stride: cosine.as_ref().map_or(0, |table| table.stride(0)),
         },
         PrepareTilesArgs {
             query: query_rows,
             key: key_rows,
             value: value_rows,
-            query_weight: gains
-                .map(|(query, _)| backend::operand(query))
-                .transpose()?,
-            key_weight: gains.map(|(_, key)| backend::operand(key)).transpose()?,
+            query_weight: gains.map(|(query, _)| ops::operand(query)).transpose()?,
+            key_weight: gains.map(|(_, key)| ops::operand(key)).transpose()?,
             cosine,
-            sine: factors
-                .map(|(_, sine)| backend::operand(sine))
-                .transpose()?,
-            sizes: backend::operand(sizes)?,
+            sine: factors.map(|(_, sine)| ops::operand(sine)).transpose()?,
+            sizes: ops::operand(sizes)?,
             pooled_query: means(0)?,
             pooled_key: means(1)?,
             pooled_value: means(2)?,
@@ -380,10 +375,10 @@ pub fn vsa_scores(pooled_query: &Tensor, pooled_key: &Tensor) -> Result<Tensor> 
         return Ok(queries.matmul(&keys)?.broadcast_div(&root)?);
     }
 
-    let scores = backend::empty((heads, query_tiles, tiles), DType::F32)?;
+    let scores = ops::empty((heads, query_tiles, tiles), DType::F32)?;
     let width = field(OWNER, width)?;
 
-    backend::launch::<VsaScores>(
+    ops::launch::<VsaScores>(
         &ScoresDescriptor::new(
             field(OWNER, heads)?,
             width,
@@ -391,9 +386,9 @@ pub fn vsa_scores(pooled_query: &Tensor, pooled_key: &Tensor) -> Result<Tensor> 
             false,
         ),
         ScoresArgs {
-            pooled_query: backend::operand(pooled_query)?,
-            pooled_key: backend::operand(pooled_key)?,
-            out: backend::operand(&scores)?,
+            pooled_query: ops::operand(pooled_query)?,
+            pooled_key: ops::operand(pooled_key)?,
+            out: ops::operand(&scores)?,
         },
     )?;
     Ok(scores)
@@ -513,23 +508,23 @@ pub fn vsa_select_tiles(
         ));
     }
 
-    let indices = backend::empty(scores.shape(), DType::U32)?;
-    let counts = backend::empty((heads, query_tiles), DType::U32)?;
+    let indices = ops::empty(scores.shape(), DType::U32)?;
+    let counts = ops::empty((heads, query_tiles), DType::U32)?;
     let scores = scores.contiguous()?;
 
-    backend::launch::<VsaSelectTiles>(
+    ops::launch::<VsaSelectTiles>(
         // The kernel masks the tiles past the layout's own, so one compilation ranks every
         // layout up to its power of two.
         &SelectTilesDescriptor {
             block: field(OWNER, tiles.max(SELECT_FLOOR).next_power_of_two())?,
         },
         SelectTilesArgs {
-            scores: backend::operand(&scores)?,
-            segments: backend::operand(segments)?,
-            sizes: backend::operand(sizes)?,
-            keep: backend::operand(keep)?,
-            indices: backend::operand(&indices)?,
-            counts: backend::operand(&counts)?,
+            scores: ops::operand(&scores)?,
+            segments: ops::operand(segments)?,
+            sizes: ops::operand(sizes)?,
+            keep: ops::operand(keep)?,
+            indices: ops::operand(&indices)?,
+            counts: ops::operand(&counts)?,
             query_offset: 0,
         },
     )?;
@@ -620,11 +615,11 @@ pub fn vsa_compress_pooled(
         return Ok(compressed.to_dtype(output)?);
     }
 
-    let out = backend::empty((heads, query_tiles, width), output)?;
+    let out = ops::empty((heads, query_tiles, width), output)?;
     let scores = scores.contiguous()?;
     let width = field(OWNER, width)?;
 
-    backend::launch::<VsaCompressPooled>(
+    ops::launch::<VsaCompressPooled>(
         &CompressPooledDescriptor::new(
             output,
             field(OWNER, heads)?,
@@ -634,10 +629,10 @@ pub fn vsa_compress_pooled(
             false,
         ),
         CompressPooledArgs {
-            scores: backend::operand(&scores)?,
-            values: backend::operand(values)?,
-            sizes: backend::operand(sizes)?,
-            out: backend::operand(&out)?,
+            scores: ops::operand(&scores)?,
+            values: ops::operand(values)?,
+            sizes: ops::operand(sizes)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)
@@ -664,7 +659,7 @@ pub fn vsa_zero_padding_(values: Tensor, sizes: &Tensor, tile_rows: u32) -> Resu
         return Ok(values);
     }
 
-    backend::launch::<VsaZeroPadding>(
+    ops::launch::<VsaZeroPadding>(
         &ZeroPaddingDescriptor {
             dtype: values.dtype(),
             heads: field(OWNER, heads)?,
@@ -673,8 +668,8 @@ pub fn vsa_zero_padding_(values: Tensor, sizes: &Tensor, tile_rows: u32) -> Resu
             block_rows: BLOCK_ROWS,
         },
         ZeroPaddingArgs {
-            values: backend::operand(&values)?,
-            sizes: backend::operand(sizes)?,
+            values: ops::operand(&values)?,
+            sizes: ops::operand(sizes)?,
         },
     )?;
     Ok(values)
@@ -758,7 +753,7 @@ pub fn vsa_add_gated_tiles_(
         return Ok(fine);
     }
 
-    backend::launch::<VsaAddGatedTiles>(
+    ops::launch::<VsaAddGatedTiles>(
         &AddGatedTilesDescriptor {
             dtype: fine.dtype(),
             tile_rows,
@@ -766,9 +761,9 @@ pub fn vsa_add_gated_tiles_(
             block_rows: BLOCK_ROWS,
         },
         AddGatedTilesArgs {
-            output: backend::operand(&fine)?,
-            compressed: backend::operand(compressed)?,
-            gate: backend::operand(gate)?,
+            output: ops::operand(&fine)?,
+            compressed: ops::operand(compressed)?,
+            gate: ops::operand(gate)?,
         },
     )?;
     Ok(fine)
@@ -836,11 +831,11 @@ pub fn vsa_compose_gated_rows(
         return Ok(Tensor::stack(&blocks, 0)?);
     }
 
-    let payload = backend::empty((members, rows.len(), heads, width), fine.dtype())?;
+    let payload = ops::empty((members, rows.len(), heads, width), fine.dtype())?;
     let mut table = [0_u32; MAX_MEMBERS];
     table[..members].copy_from_slice(slots);
 
-    backend::launch::<VsaComposeGatedRows>(
+    ops::launch::<VsaComposeGatedRows>(
         &ComposeGatedRowsDescriptor {
             dtype: fine.dtype(),
             heads: field(OWNER, heads)?,
@@ -851,10 +846,10 @@ pub fn vsa_compose_gated_rows(
             members: members as u32,
         },
         ComposeGatedRowsArgs {
-            output: backend::operand(&payload)?,
-            fine: backend::operand(fine)?,
-            compressed: backend::operand(compressed)?,
-            gate: backend::operand(gate)?,
+            output: ops::operand(&payload)?,
+            fine: ops::operand(fine)?,
+            compressed: ops::operand(compressed)?,
+            gate: ops::operand(gate)?,
             owner_rows: owner_rows as u64,
             start: rows.start as u64,
             count: rows.len() as u64,

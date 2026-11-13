@@ -16,14 +16,15 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
+use crate::frame::is_channels_last;
 use crate::kernel::{Kernel, NativeCall};
-use crate::platform::{self, Stream};
+use crate::operand::Operand;
 use crate::strided;
-use crate::tensor::{Operand, Shape, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -74,6 +75,69 @@ impl fmt::Display for Descriptor {
             .field("weight", abi::name(self.weight))
             .field("output", abi::name(self.output))
             .finish(formatter)
+    }
+}
+
+impl Descriptor {
+    /// The descriptor of the convolution `args` states: the operands' element types, the filter's
+    /// taps along each spatial axis from the filter's extents, the spatial rank from the input's
+    /// axes (`[n, c, l]` is one, `[n, c, d, h, w]` three), a bias exactly when the call has one,
+    /// and channels-last storage when a three-dimensional input is stored that way. What the
+    /// operands cannot say is the caller's: the direction, the window (`stride`, `padding`,
+    /// `dilation` per spatial axis, 1, 0 and 1 on an axis the rank leaves unused), the channel
+    /// groups and the permission to narrow FP32 inputs to TF32.
+    ///
+    /// This is the one place a convolution's descriptor is made: the tensor library's
+    /// convolutions on this backend and `nn`'s convolutions take it from here, so one call has
+    /// one descriptor whichever path launched it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] for an input of other than one or three spatial axes, a filter of
+    /// another rank than the input, or a tap count beyond 32 bits.
+    pub fn of(
+        args: &Args,
+        transposed: bool,
+        [stride, padding, dilation]: [[u32; 3]; 3],
+        groups: u32,
+        tf32: bool,
+    ) -> Result<Self> {
+        let rank = args.input.rank().saturating_sub(2);
+        if !matches!(rank, 1 | 3) || args.weight.rank() != rank + 2 {
+            return Err(Error::argument(
+                "convolution",
+                format!(
+                    "an input of {:?} and a filter of {:?} are no convolution over one or three \
+                     axes",
+                    args.input.dims(),
+                    args.weight.dims()
+                ),
+            ));
+        }
+
+        let mut kernel = [1_u32; 3];
+        for (axis, taps) in kernel[..rank].iter_mut().enumerate() {
+            let extent = args.weight.dim(axis + 2);
+            *taps = u32::try_from(extent).map_err(|_| {
+                Error::argument("convolution", format!("a filter of {extent} taps"))
+            })?;
+        }
+
+        Ok(Self {
+            input: args.input.dtype,
+            weight: args.weight.dtype,
+            output: args.out.dtype,
+            kernel,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias: args.bias.is_some(),
+            tf32,
+            channels_last: rank == 3 && is_channels_last(&args.input),
+            rank: rank as u32,
+            transposed,
+        })
     }
 }
 
@@ -138,7 +202,7 @@ const _: () = assert!(
 );
 
 /// The arguments of a convolution.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[n, c, …]`.
     pub input: Operand,
@@ -172,8 +236,8 @@ pub struct Args {
 /// one element carries any stride.
 ///
 /// **The bias is contiguous**: the entry reads its elements one after the other.
-fn check_layouts(operator: &'static str, descriptor: &Descriptor, args: Args) -> Result<()> {
-    if args.weight.strides != Strides::row_major(args.weight.shape) {
+fn check_layouts(operator: &'static str, descriptor: &Descriptor, args: &Args) -> Result<()> {
+    if !args.weight.is_row_major() {
         return Err(Error::argument(
             operator,
             "the filter is not packed row-major: a convolution reads `[out, in, kd, kh, kw]` in \
@@ -182,10 +246,10 @@ fn check_layouts(operator: &'static str, descriptor: &Descriptor, args: Args) ->
         ));
     }
     if descriptor.channels_last {
-        for (operand, view) in [("input", args.input), ("out", args.out)] {
+        for (operand, view) in [("input", &args.input), ("out", &args.out)] {
             // A unit channel axis carries any stride's order and no other, so only an axis with
             // more than one element can be misread.
-            if view.shape.dim(1) > 1 && view.strides.get(1) != 1 {
+            if view.dim(1) > 1 && view.stride(1) != 1 {
                 return Err(Error::argument(
                     operator,
                     format!(
@@ -193,7 +257,7 @@ fn check_layouts(operator: &'static str, descriptor: &Descriptor, args: Args) ->
                          channel axis has stride {} rather than 1: the entry derives \
                          channels-last strides for these operands, so the buffer must be \
                          allocated in that order or the descriptor must say channels-first",
-                        view.strides.get(1)
+                        view.stride(1)
                     ),
                 ));
             }
@@ -231,7 +295,7 @@ impl Conv {
         // refusing it: the library indexes by the layout it was told, not by the bytes it holds.
         // A filter is the operand this bites first, because a checkpoint stores it channel-first
         // and a channels-last span is a layout its *weights* must be permuted into once.
-        check_layouts(operator, descriptor, *args)?;
+        check_layouts(operator, descriptor, args)?;
         if args.input.dtype != descriptor.input || args.out.dtype != descriptor.output {
             return Err(Error::argument(
                 operator,
@@ -244,16 +308,13 @@ impl Conv {
                 ),
             ));
         }
-        let channels = args.input.shape.dim(1);
+        let channels = args.input.dim(1);
         let channels_per_group = channels / u64::from(descriptor.groups);
         // A filter holds one kernel axis per spatial axis: a 1-d one is `[out, in, k]`, as a checkpoint
         // stores it, and the call structure's five slots pad it with ones below.
         let (first, second) = match descriptor.transposed {
-            false => (args.out.shape.dim(1), channels_per_group),
-            true => (
-                channels,
-                args.out.shape.dim(1) / u64::from(descriptor.groups),
-            ),
+            false => (args.out.dim(1), channels_per_group),
+            true => (channels, args.out.dim(1) / u64::from(descriptor.groups)),
         };
         let taps = descriptor.kernel;
         let filter = [
@@ -263,12 +324,11 @@ impl Conv {
             u64::from(taps[1]),
             u64::from(taps[2]),
         ];
-        args.weight
-            .require_shape(operator, Shape::new(&filter[..rank + 2]))?;
+        args.weight.require_shape(operator, &filter[..rank + 2])?;
 
-        match (descriptor.bias, args.bias) {
+        match (descriptor.bias, &args.bias) {
             (true, Some(bias)) => {
-                bias.require_shape(operator, Shape::new(&[args.out.shape.dim(1)]))?;
+                bias.require_shape(operator, &[args.out.dim(1)])?;
             }
             (true, None) => {
                 return Err(Error::argument(
@@ -291,8 +351,8 @@ impl Conv {
     fn launch(kernel: &Kernel, descriptor: &Descriptor, args: Args, stream: &Stream) -> Result<()> {
         let rank = descriptor.rank as usize;
         // The descriptor declares a bias exactly when the call passes one.
-        let bias = args.bias.map_or(std::ptr::null(), |bias| {
-            platform::address(bias.ptr) as usize as *const c_void
+        let bias = args.bias.as_ref().map_or(std::ptr::null(), |bias| {
+            bias.ptr.address() as usize as *const c_void
         });
 
         let mut input_shape = [1_i64; 5];
@@ -302,30 +362,30 @@ impl Conv {
         // 1-d one as [l, 1, 1], so the leading axes of the shorter ranks stay 1.
         let mut spatial = [1_u64; 3];
         for (axis, extent) in spatial.iter_mut().enumerate().take(rank) {
-            *extent = args.input.shape.dim(2 + axis);
+            *extent = args.input.dim(2 + axis);
         }
         let mut out_spatial = [1_u64; 3];
         for (axis, extent) in out_spatial.iter_mut().enumerate().take(rank) {
-            *extent = args.out.shape.dim(2 + axis);
+            *extent = args.out.dim(2 + axis);
         }
-        for (target, (extents, spatial)) in [
-            (&mut input_shape, (&args.input.shape, spatial)),
-            (&mut out_shape, (&args.out.shape, out_spatial)),
+        for (target, (view, spatial)) in [
+            (&mut input_shape, (&args.input, spatial)),
+            (&mut out_shape, (&args.out, out_spatial)),
         ] {
-            target[0] = to_i64(extents.dim(0))?;
-            target[1] = to_i64(extents.dim(1))?;
+            target[0] = to_i64(view.dim(0))?;
+            target[1] = to_i64(view.dim(1))?;
             target[2] = to_i64(spatial[0])?;
             target[3] = to_i64(spatial[1])?;
             target[4] = to_i64(spatial[2])?;
         }
         for (axis, extent) in weight_shape.iter_mut().enumerate().take(rank + 2) {
-            *extent = to_i64(args.weight.shape.dim(axis))?;
+            *extent = to_i64(args.weight.dim(axis))?;
         }
 
         let mut call = Call {
-            out: platform::address(args.out.ptr) as usize as *mut c_void,
-            input: platform::address(args.input.ptr) as usize as *const c_void,
-            weight: platform::address(args.weight.ptr) as usize as *const c_void,
+            out: args.out.ptr.address() as usize as *mut c_void,
+            input: args.input.ptr.address() as usize as *const c_void,
+            weight: args.weight.ptr.address() as usize as *const c_void,
             bias,
             input_shape,
             weight_shape,
@@ -509,15 +569,10 @@ impl Op for ConvTranspose1d {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::DevicePtr;
+    use platform::DevicePtr;
 
     fn view(shape: &[u64], strides: &[u64]) -> Operand {
-        Operand::with_strides(
-            DevicePtr::new(0x1000),
-            DType::BF16,
-            Shape::new(shape),
-            Strides::new(strides),
-        )
+        Operand::with_strides(DevicePtr::from_address(0x1000), DType::BF16, shape, strides)
     }
 
     fn descriptor(channels_last: bool) -> Descriptor {
@@ -554,7 +609,7 @@ mod tests {
             bias: None,
             out: channels_last(&shape),
         };
-        let error = check_layouts("conv3d", &descriptor(true), args)
+        let error = check_layouts("conv3d", &descriptor(true), &args)
             .expect_err("a channels-last module over a channel-first buffer must refuse");
         let message = error.to_string();
         assert!(
@@ -578,13 +633,13 @@ mod tests {
             bias: None,
             out: channels_last(&shape),
         };
-        check_layouts("conv3d", &descriptor(true), args)
+        check_layouts("conv3d", &descriptor(true), &args)
             .expect("a packed filter is the form both layouts read");
         let args = Args {
             weight: reordered,
             ..args
         };
-        let error = check_layouts("conv3d", &descriptor(true), args)
+        let error = check_layouts("conv3d", &descriptor(true), &args)
             .expect_err("a filter outside the checkpoint's order must refuse");
         assert!(
             error.to_string().contains("not packed row-major"),
@@ -616,7 +671,7 @@ mod tests {
         let input = view(&[2, 4, 16], &[64, 16, 1]);
         let out = view(&[2, 8, 16], &[128, 16, 1]);
 
-        let (descriptor, args) = one_dimensional(input, out);
+        let (descriptor, args) = one_dimensional(input.clone(), out.clone());
         Conv1d::check(&descriptor, &args).unwrap();
 
         // `[n, l, c]` storage read as `[n, c, l]`: the channels are innermost in memory.
@@ -628,8 +683,8 @@ mod tests {
         // Sixteen samples of rows that are twenty long.
         let window = view(&[2, 4, 16], &[80, 20, 1]);
 
-        for strided_input in [permuted, stepped, broadcast, window] {
-            let (descriptor, args) = one_dimensional(strided_input, out);
+        for strided_input in [permuted.clone(), stepped, broadcast, window] {
+            let (descriptor, args) = one_dimensional(strided_input, out.clone());
             let message = Conv1d::check(&descriptor, &args).unwrap_err().to_string();
             assert!(message.contains("input must be contiguous"), "{message}");
         }
@@ -675,7 +730,7 @@ mod tests {
         // Depth and height exchanged.
         let permuted = Args {
             input: view(&shape, &[32, 8, 2, 4, 1]),
-            ..args
+            ..args.clone()
         };
         let message = Conv3d::check(&descriptor(false), &permuted)
             .unwrap_err()
@@ -689,7 +744,7 @@ mod tests {
         };
         let stepped = Args {
             bias: Some(view(&[8], &[2])),
-            ..args
+            ..args.clone()
         };
         let message = Conv3d::check(&biased, &stepped).unwrap_err().to_string();
         assert!(message.contains("bias must be contiguous"), "{message}");
@@ -699,5 +754,78 @@ mod tests {
             ..args
         };
         Conv3d::check(&biased, &packed).unwrap();
+    }
+
+    /// A convolution's descriptor follows from its operands and the window the caller states:
+    /// the backend's `conv2d` over a depth of one, its `conv1d`, and a channels-last `conv3d`.
+    #[test]
+    fn a_convolutions_descriptor_follows_from_its_operands() {
+        let packed =
+            |shape: &[u64]| Operand::new(DevicePtr::from_address(0x1000), DType::F32, shape);
+        // A unit stride and dilation and no padding on every axis.
+        let unit = [[1, 1, 1], [0, 0, 0], [1, 1, 1]];
+
+        // `conv2d` of a `[1, 4, 8, 8]` input by a `[6, 4, 3, 3]` filter, as `[n, c, 1, h, w]`.
+        let planar = Args {
+            input: packed(&[1, 4, 1, 8, 8]),
+            weight: packed(&[6, 4, 1, 3, 3]),
+            bias: None,
+            out: packed(&[1, 6, 1, 4, 4]),
+        };
+        let stated = Descriptor::of(&planar, false, [[1, 2, 2], [0, 1, 1], [1, 1, 1]], 1, false);
+        assert_eq!(
+            stated.unwrap(),
+            Descriptor {
+                input: DType::F32,
+                weight: DType::F32,
+                output: DType::F32,
+                kernel: [1, 3, 3],
+                stride: [1, 2, 2],
+                padding: [0, 1, 1],
+                dilation: [1, 1, 1],
+                groups: 1,
+                bias: false,
+                tf32: false,
+                channels_last: false,
+                rank: 3,
+                transposed: false,
+            }
+        );
+
+        // A transposed `conv1d` of a `[2, 3, 5]` input by a `[3, 4, 3]` filter, with a bias.
+        let line = Args {
+            input: packed(&[2, 3, 5]),
+            weight: packed(&[3, 4, 3]),
+            bias: Some(packed(&[4])),
+            out: packed(&[2, 4, 11]),
+        };
+        let transposed = Descriptor::of(&line, true, [[2, 1, 1], [0, 0, 0], [1, 1, 1]], 1, true);
+        let transposed = transposed.unwrap();
+        assert_eq!(
+            (transposed.kernel, transposed.rank, transposed.bias),
+            ([3, 1, 1], 1, true)
+        );
+        assert!(transposed.transposed && transposed.tf32 && !transposed.channels_last);
+
+        // A channels-last volume is stated as one, and its key is the element types alone.
+        let volume = Args {
+            input: channels_last(&[1, 4, 2, 6, 6]),
+            weight: view(&[8, 4, 3, 3, 3], &[108, 27, 9, 3, 1]),
+            bias: None,
+            out: channels_last(&[1, 8, 2, 6, 6]),
+        };
+        let stored = Descriptor::of(&volume, false, unit, 1, false).unwrap();
+        assert!(stored.channels_last);
+        assert_eq!(stored.kernel, [3, 3, 3]);
+        assert_eq!(stored.to_string(), "input_bf16_weight_bf16_output_bf16");
+
+        // A two-dimensional input is no convolution any operator computes.
+        let flat = Args {
+            input: packed(&[1, 4, 8, 8]),
+            weight: packed(&[6, 4, 3, 3]),
+            bias: None,
+            out: packed(&[1, 6, 6, 6]),
+        };
+        assert!(Descriptor::of(&flat, false, unit, 1, false).is_err());
     }
 }

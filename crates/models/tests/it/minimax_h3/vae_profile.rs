@@ -22,10 +22,11 @@ use std::path::Path;
 use models::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder, padded_samples};
 use models::minimax_h3::video_vae::{self, VideoDecoder, VideoEncoder};
 use models::minimax_h3::{AudioVaeConfig, VideoVaeConfig};
-use nn::{Checkpoint, Clip, DType, Decoder, LatentShape, Layout, WeightLoader};
+use nn::{Checkpoint, Clip, DType, Decoder, LatentShape, WeightLoader};
 use processing::minimax_h3::{
     AUDIO_LATENTS_PER_SECOND, FRAMES, MAX_SECONDS, MIN_SECONDS, named_canvases,
 };
+use proto::video::Layout;
 use support::{meta, recorded, report};
 
 /// The released checkpoint the runs read the headers of.

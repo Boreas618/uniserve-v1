@@ -33,13 +33,14 @@ use ipc::Capacity;
 use ipc::batch::{Extent, Phase, Shape, Variant};
 use ipc::capacity::variants;
 use ipc::product;
+use nn::VideoRequest;
 use nn::family::{Stage, VideoModel, VideoPlacement, VideoServing};
-use nn::{Layout, VideoRequest};
 use ops::Generation;
 use platform::{DeviceId, Stream};
 use proto::config::{
     DEFAULT_BLOCK, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig, WorkerGroupRole,
 };
+use proto::video::Layout;
 use tensor::DType;
 use worker::buckets::{Bucket, Buckets};
 use worker::graphs::Graphs;
@@ -135,8 +136,8 @@ pub(crate) struct VideoRank {
     pub(crate) model: Arc<dyn VideoModel>,
     /// The text encoder's tensor group and the denoiser's sequence group; `None` for a group of
     /// one and on the meta device.
-    pub(crate) tensor: Option<Arc<backend::Group>>,
-    pub(crate) sequence: Option<Arc<backend::Group>>,
+    pub(crate) tensor: Option<Arc<ops::Group>>,
+    pub(crate) sequence: Option<Arc<ops::Group>>,
     /// What the profile run states of each runner that replays in the graph pool.
     pub(crate) peaks: Vec<(RunnerId, Peaks)>,
     /// The device bytes the runners hold beside their regions of the graph pool: the denoiser's
@@ -664,7 +665,7 @@ impl ModelRunner {
         model: &Arc<dyn VideoModel>,
         memory: &Arc<BufferMemory>,
         mut graphs: impl FnMut(RunnerId, u64) -> Result<(Graphs, Option<Stream>)>,
-        (tensor, sequence): (Option<Arc<backend::Group>>, Option<Arc<backend::Group>>),
+        (tensor, sequence): (Option<Arc<ops::Group>>, Option<Arc<ops::Group>>),
         classes: &[u8; 10],
     ) -> Result<DeviceRunners> {
         let phases = self.media_phases()?;
@@ -789,7 +790,7 @@ impl ModelRunner {
     pub(crate) fn profile_media(
         &self,
         model: Arc<dyn VideoModel>,
-        groups: (Option<Arc<backend::Group>>, Option<Arc<backend::Group>>),
+        groups: (Option<Arc<ops::Group>>, Option<Arc<ops::Group>>),
         pool_tasks: u32,
     ) -> Result<(VideoRank, Keys)> {
         let classes = product_classes(0);

@@ -1,4 +1,5 @@
-//! Loaded kernels, their metadata, and the one place a kernel is launched or a native entry called.
+//! Loaded kernels, their metadata, and the launch of a resolved kernel or the call of a native
+//! entry, which [`launch()`](crate::launch()) dispatches and `platform` issues to the driver.
 //!
 //! A [`Kernel`] is a module that has been loaded: a cubin loaded into a device's context, or a
 //! native library opened with the C entry it declares. A
@@ -30,9 +31,24 @@
 
 use std::ffi::c_void;
 
-use crate::platform::{self, Function, Library, NativeLibrary, Stream};
-use crate::tensor::DevicePtr;
+use platform::{
+    Cluster, Device, DevicePtr, Function, FunctionAttribute, LaunchConfig, Library, NativeLibrary,
+    Stream,
+};
+
+use crate::operand::Operand;
 use crate::{Error, Result};
+
+/// The driver's default limit on a kernel's dynamic shared memory, in bytes.
+///
+/// A kernel that declares more needs [`FunctionAttribute::MaxDynamicSharedMemory`] set before its
+/// first launch.
+const DEFAULT_SHARED_LIMIT: u32 = 48 * 1024;
+
+/// The raw stream handle a native entry receives (`void* stream`).
+fn stream_handle(stream: &Stream) -> *mut c_void {
+    stream.raw() as *mut c_void
+}
 
 /// The signature every native entry has.
 pub type Entry = unsafe extern "C" fn(call: *const c_void, stream: *mut c_void) -> i32;
@@ -260,11 +276,11 @@ impl Arguments {
 
     /// A device address.
     pub fn pointer(&mut self, pointer: DevicePtr) -> &mut Self {
-        self.packed(Word::Pointer, platform::address(pointer))
+        self.packed(Word::Pointer, pointer.address())
     }
 
     /// The address a tensor view starts at.
-    pub fn view(&mut self, view: crate::tensor::Operand) -> &mut Self {
+    pub fn view(&mut self, view: &Operand) -> &mut Self {
         self.pointer(view.ptr)
     }
 
@@ -343,7 +359,7 @@ impl Arguments {
             // address and the profile scratch address. They are values the driver reads at launch,
             // exactly like the packed words above, so they are passed through slots of their own that
             // outlive this call.
-            *self.scratch_slot = self.scratch.map(platform::address).unwrap_or(0);
+            *self.scratch_slot = self.scratch.map_or(0, DevicePtr::address);
             *self.profile_slot = 0;
             self.parameters
                 .push(self.scratch_slot.as_mut() as *mut u64 as *mut c_void);
@@ -456,7 +472,7 @@ impl NativeEntry {
     pub fn resolve(library: &NativeLibrary, name: &'static str) -> Result<Self> {
         // SAFETY: the convention every package follows is exactly `Entry`; a package that declares
         // another signature for its entry name breaks this contract, which its header states.
-        let function = unsafe { platform::native_entry::<Entry>(library, name)? };
+        let function = unsafe { library.entry::<Entry>(name)? };
         Ok(Self { name, function })
     }
 
@@ -492,15 +508,14 @@ impl Kernel {
     /// A module whose metadata declares a dynamic shared-memory size beyond the driver's default
     /// has its function's limit raised here, once, before any launch: the launch path never sets an
     /// attribute, so nothing an operator does can surprise a capture.
-    pub fn load_cubin(
-        device: &platform::Device,
-        image: &[u8],
-        metadata: CubinMetadata,
-    ) -> Result<Self> {
-        let library = platform::load_library(device, image)?;
-        let function = platform::library_kernel(&library, &metadata.name)?;
-        if metadata.shared > platform::DEFAULT_SHARED_LIMIT {
-            platform::raise_shared_limit(&function, metadata.shared)?;
+    pub fn load_cubin(device: &Device, image: &[u8], metadata: CubinMetadata) -> Result<Self> {
+        let library = Library::load(device, image)?;
+        let function = library.kernel(&metadata.name)?;
+        if metadata.shared > DEFAULT_SHARED_LIMIT {
+            function.set_attribute(
+                FunctionAttribute::MaxDynamicSharedMemory,
+                metadata.shared as i32,
+            )?;
         }
         Ok(Self::Cubin {
             library,
@@ -537,7 +552,7 @@ impl Kernel {
             });
         };
         // SAFETY: forwarded from the caller.
-        unsafe { platform::native_entry::<F>(library, symbol) }.map_err(Error::Platform)
+        unsafe { library.entry::<F>(symbol) }.map_err(Error::Platform)
     }
 
     /// What this kernel is called, for diagnostics and for a capture's node table.
@@ -583,20 +598,22 @@ impl Kernel {
             });
         };
         let parameters = arguments.parameters(Some(metadata))?;
-        platform::launch(
-            function,
-            stream,
-            platform::Launch {
-                blocks: grid.blocks,
-                threads: metadata.threads(),
-                shared: metadata.shared,
-                cluster: metadata.num_ctas,
-                pdl: metadata.launch_pdl,
-                cooperative: metadata.launch_cooperative_grid,
-            },
-            parameters,
-        )
-        .map_err(Error::Platform)
+
+        // The grid is the operator's; the block, the dynamic shared memory, the cluster,
+        // programmatic dependent launch and cooperative launch are the module's own metadata.
+        let config = LaunchConfig {
+            grid: grid.blocks,
+            block: [metadata.threads(), 1, 1],
+            shared_memory: metadata.shared,
+            // A cluster of one block is no cluster: the attribute is only set when the module
+            // asks for a real one.
+            cluster: (metadata.num_ctas > 1).then(|| Cluster::new([metadata.num_ctas, 1, 1])),
+            pdl: metadata.launch_pdl,
+            cooperative: metadata.launch_cooperative_grid,
+        };
+        function
+            .launch_ex(stream, &config, parameters)
+            .map_err(Error::Platform)
     }
 
     /// Call this native kernel's entry with `call` on `stream`.
@@ -618,12 +635,8 @@ impl Kernel {
         // signature.
         // SAFETY: forwarded from the caller: the entry is this package's `Entry`, and the call
         // structure has the layout the package's header declares for it.
-        let status = unsafe {
-            (entry.function)(
-                call as *mut C as *const c_void,
-                platform::stream_handle(stream),
-            )
-        };
+        let status =
+            unsafe { (entry.function)(call as *mut C as *const c_void, stream_handle(stream)) };
         if status == 0 {
             Ok(())
         } else {
@@ -882,7 +895,7 @@ mod tests {
     fn a_module_takes_its_own_parameters_and_then_the_two_scratch_addresses() {
         let module = metadata(r#"{"name":"_kernel","num_warps":4}"#);
         let mut arguments = Arguments::new();
-        arguments.pointer(DevicePtr::new(0x1000)).u32(7);
+        arguments.pointer(DevicePtr::from_address(0x1000)).u32(7);
         // The program's two parameters, then the global and the profile scratch address Triton's
         // launcher appends and its PTX declares whatever their size is.
         assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 4);
@@ -897,10 +910,10 @@ mod tests {
             r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32","global_scratch":"*i8","profile_scratch":"*i8"}}"#,
         );
         let mut arguments = Arguments::new();
-        arguments.pointer(DevicePtr::new(0x1000)).u32(7);
+        arguments.pointer(DevicePtr::from_address(0x1000)).u32(7);
         assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 4);
         let mut long = Arguments::new();
-        long.pointer(DevicePtr::new(0x1000)).u32(7).u32(1);
+        long.pointer(DevicePtr::from_address(0x1000)).u32(7).u32(1);
         let error = long.parameters(Some(&module)).unwrap_err().to_string();
         assert!(error.contains("declares 2 parameters"), "{error}");
         assert!(error.contains("packed 3"), "{error}");
@@ -911,7 +924,7 @@ mod tests {
         let module =
             metadata(r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32","eps":"fp32"}}"#);
         let mut short = Arguments::new();
-        short.pointer(DevicePtr::new(0x1000)).u32(7);
+        short.pointer(DevicePtr::from_address(0x1000)).u32(7);
         let error = short.parameters(Some(&module)).unwrap_err().to_string();
         assert!(error.contains("_kernel"), "{error}");
         assert!(error.contains("declares 3 parameters"), "{error}");
@@ -934,13 +947,13 @@ mod tests {
         let module =
             metadata(r#"{"name":"_kernel","signature":{"x":"*bf16"},"global_scratch_size":4096}"#);
         let mut arguments = Arguments::new();
-        arguments.pointer(DevicePtr::new(0x1000));
-        arguments.scratch(Some(DevicePtr::new(0x2000)));
+        arguments.pointer(DevicePtr::from_address(0x1000));
+        arguments.scratch(Some(DevicePtr::from_address(0x2000)));
         // One declared parameter and the two scratch addresses.
         assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 3);
 
         let mut without = Arguments::new();
-        without.pointer(DevicePtr::new(0x1000));
+        without.pointer(DevicePtr::from_address(0x1000));
         let error = without.parameters(Some(&module)).unwrap_err().to_string();
         assert!(error.contains("global scratch"), "{error}");
     }
@@ -951,8 +964,8 @@ mod tests {
             metadata(r#"{"name":"_kernel","signature":{"x":"*fp32","out":"*fp32","rows":"i64"}}"#);
         let mut arguments = Arguments::new();
         arguments
-            .pointer(DevicePtr::new(0x1000))
-            .pointer(DevicePtr::new(0x2000))
+            .pointer(DevicePtr::from_address(0x1000))
+            .pointer(DevicePtr::from_address(0x2000))
             .u64(4);
         assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 5);
     }

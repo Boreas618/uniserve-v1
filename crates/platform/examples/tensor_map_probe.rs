@@ -22,7 +22,7 @@ use std::ffi::c_void;
 
 use platform::{
     Device, DeviceAllocation, DeviceId, Error, Interleave, L2Promotion, NativeLibrary, OobFill,
-    PrimaryContext, Swizzle, TensorDataType, TensorMap, TensorMapSpec,
+    PrimaryContext, Swizzle, TensorMap, TensorMapSpec,
 };
 
 /// `CUtensorMap` is 128 opaque bytes that the driver requires be 64-byte
@@ -270,7 +270,8 @@ fn run() -> Result<(), Error> {
     // encodes.
     println!();
     let spec = TensorMapSpec {
-        data_type: TensorDataType::Float32,
+        // CU_TENSOR_MAP_DATA_TYPE_FLOAT32
+        data_type: 7,
         global_address: address,
         global_dim: &[16, 16],
         global_strides: &[64],

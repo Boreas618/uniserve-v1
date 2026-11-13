@@ -153,8 +153,8 @@ pub fn sparse_attention(
         return Ok(Tensor::stack(&heads_out, 1)?.to_dtype(output)?);
     }
 
-    let out = backend::empty(query.shape(), output)?;
-    backend::launch::<SparseAttention>(
+    let out = ops::empty(query.shape(), output)?;
+    ops::launch::<SparseAttention>(
         &SparseDescriptor {
             block,
             dtype: query.dtype(),
@@ -165,14 +165,14 @@ pub fn sparse_attention(
             keys,
         },
         SparseArgs {
-            query: backend::operand(query)?,
-            key: backend::operand(key)?,
-            value: backend::operand(value)?,
-            indices: backend::operand(indices)?,
-            counts: backend::operand(counts)?,
-            valid: backend::operand(valid)?,
+            query: ops::operand(query)?,
+            key: ops::operand(key)?,
+            value: ops::operand(value)?,
+            indices: ops::operand(indices)?,
+            counts: ops::operand(counts)?,
+            valid: ops::operand(valid)?,
             lse: None,
-            out: backend::operand(&out)?,
+            out: ops::operand(&out)?,
             scale,
         },
     )?;

@@ -30,6 +30,7 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
@@ -37,8 +38,7 @@ use crate::activation::Activation;
 use crate::descriptor::Key;
 use crate::fp4::ScaleLayout;
 use crate::kernel::{Kernel, NativeCall};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -140,7 +140,7 @@ impl fmt::Display for RouteGemmDescriptor {
 }
 
 /// The arguments of one FC1 launch.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct GatherGemmArgs {
     /// `[tokens, hidden]` hidden states, row-major.
     pub hidden: Operand,
@@ -261,12 +261,11 @@ impl Op for GatherGemm {
         let top = u64::from(descriptor.top);
         let tokens = args.hidden.rows();
 
-        args.hidden
-            .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
+        args.hidden.require_shape(Self::NAME, &[tokens, hidden])?;
         args.hidden
             .require_row(Self::NAME, descriptor.dtype, hidden)?;
         args.weights
-            .require_shape(Self::NAME, Shape::new(&[experts, 2 * intermediate, hidden]))?;
+            .require_shape(Self::NAME, &[experts, 2 * intermediate, hidden])?;
         args.weights
             .require_row(Self::NAME, descriptor.dtype, hidden)?;
         // `ids` states the expanded route count and `expanded_to_permuted` is that same
@@ -277,7 +276,7 @@ impl Op for GatherGemm {
             ("route ids", &args.ids),
             ("the route map", &args.expanded_to_permuted),
         ] {
-            view.require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+            view.require_shape(Self::NAME, &[tokens, top])?;
             if view.dtype != DType::U32 {
                 return Err(Error::argument(
                     Self::NAME,
@@ -324,7 +323,7 @@ impl Op for GatherGemm {
             ));
         }
         args.out
-            .require_shape(Self::NAME, Shape::new(&[permuted, intermediate]))?;
+            .require_shape(Self::NAME, &[permuted, intermediate])?;
         args.out
             .require_row(Self::NAME, descriptor.dtype, intermediate)?;
         Ok(())
@@ -411,16 +410,14 @@ impl Op for RouteGemm {
         let rows = args.rows.rows();
         let tokens = args.ids.rows();
 
-        args.rows
-            .require_shape(Self::NAME, Shape::new(&[rows, intermediate]))?;
+        args.rows.require_shape(Self::NAME, &[rows, intermediate])?;
         args.rows
             .require_row(Self::NAME, descriptor.dtype, intermediate)?;
         args.weights
-            .require_shape(Self::NAME, Shape::new(&[experts, hidden, intermediate]))?;
+            .require_shape(Self::NAME, &[experts, hidden, intermediate])?;
         args.weights
             .require_row(Self::NAME, descriptor.dtype, intermediate)?;
-        args.ids
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+        args.ids.require_shape(Self::NAME, &[tokens, top])?;
         if args.ids.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -531,7 +528,7 @@ impl Op for RouteGemm {
 }
 
 /// The arguments of one FC2 launch.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RouteGemmArgs {
     /// `[max_permuted_rows, intermediate]` FC1's gated products.
     pub rows: Operand,
@@ -680,7 +677,7 @@ impl fmt::Display for GatherGemmNvfp4Descriptor {
 }
 
 /// The arguments of one encoded FC1 launch.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct GatherGemmNvfp4Args {
     /// `[tokens, hidden/2]` U8: the activations, encoded — two E2M1 codes a byte along the
     /// contraction, exactly what `nvfp4_quantize` produces. **Token-major**: the product gathers its
@@ -734,7 +731,7 @@ pub struct GatherGemmNvfp4Args {
 /// the point of use by the entry, where a short buffer is a named refusal; it is never grown, because
 /// the step runs inside a captured graph and an allocation there lands at an address the pool did not
 /// bake into the capture.
-fn check_workspace(operator: &'static str, workspace: Operand) -> Result<()> {
+fn check_workspace(operator: &'static str, workspace: &Operand) -> Result<()> {
     workspace.require_rank(operator, 1)?;
     if workspace.dtype != DType::U8 {
         return Err(Error::argument(
@@ -956,12 +953,12 @@ impl Op for GatherGemmNvfp4 {
         // The activation operands are token-major: the product gathers its rows itself.
         let tokens = args.hidden.rows();
 
-        if args.out.shape.dims().last().copied().unwrap_or(0) != intermediate {
+        if args.out.last() != intermediate {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "a row of the gated product is {intermediate} wide, the output is {:?}",
-                    args.out.shape.dims()
+                    args.out.dims()
                 ),
             ));
         }
@@ -971,7 +968,7 @@ impl Op for GatherGemmNvfp4 {
         // contraction. A BF16 row here would be read as packed codes and produce a product of half
         // the contraction, so the operand's width is the encoding's and is refused when it is not.
         args.hidden
-            .require_shape(Self::NAME, Shape::new(&[tokens, hidden / 2]))?;
+            .require_shape(Self::NAME, &[tokens, hidden / 2])?;
         if args.hidden.dtype != DType::U8 {
             return Err(Error::argument(
                 Self::NAME,
@@ -985,13 +982,9 @@ impl Op for GatherGemmNvfp4 {
         // The activation's block scales are the encoder's output, whose element type is the
         // encoder's declaration; `descriptor.scale` is the *weight* stack's, which is the
         // checkpoint's. `require_byte_scale` states the property both share.
-        crate::fp4::require_byte_scale(
-            Self::NAME,
-            args.hidden_scale,
-            args.hidden_scale.shape.last(),
-        )?;
+        crate::fp4::require_byte_scale(Self::NAME, &args.hidden_scale, args.hidden_scale.last())?;
         args.hidden_token_scale
-            .require_shape(Self::NAME, Shape::new(&[tokens]))?;
+            .require_shape(Self::NAME, &[tokens])?;
         if args.hidden_token_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1005,7 +998,7 @@ impl Op for GatherGemmNvfp4 {
         // The scales cover the contraction in blocks of sixteen, one per *token*: the product gathers
         // rows, so the table is indexed by the same token rows the activations are.
         let activation_blocks = hidden.div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
-        let covered: u64 = args.hidden_scale.shape.dims().iter().product();
+        let covered = args.hidden_scale.numel();
         if covered < tokens * activation_blocks {
             return Err(Error::argument(
                 Self::NAME,
@@ -1017,10 +1010,8 @@ impl Op for GatherGemmNvfp4 {
         }
         // The packed field holds two codes a byte along the contraction, so its width is half the
         // contraction and no more: a wider one would read past the expert's weights.
-        args.weights.require_shape(
-            Self::NAME,
-            Shape::new(&[experts, 2 * intermediate, hidden / 2]),
-        )?;
+        args.weights
+            .require_shape(Self::NAME, &[experts, 2 * intermediate, hidden / 2])?;
         if args.weights.dtype != DType::U8 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1061,7 +1052,7 @@ impl Op for GatherGemmNvfp4 {
         }
         let blocks_per_row = hidden / block_elements;
         let scale_rows = 2 * intermediate;
-        let covered: u64 = args.scales.shape.dims().iter().product();
+        let covered = args.scales.numel();
         if covered < experts * scale_rows * blocks_per_row {
             return Err(Error::argument(
                 Self::NAME,
@@ -1071,8 +1062,7 @@ impl Op for GatherGemmNvfp4 {
                 ),
             ));
         }
-        args.global_scale
-            .require_shape(Self::NAME, Shape::new(&[2, experts]))?;
+        args.global_scale.require_shape(Self::NAME, &[2, experts])?;
         if args.global_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1085,14 +1075,14 @@ impl Op for GatherGemmNvfp4 {
         // The kernel reads each projection's table as `experts` consecutive floats, so the two rows
         // must be packed: a `[2, experts]` view with any other step would hand it one projection's
         // scales for both.
-        if args.global_scale.strides.get(0) != experts || args.global_scale.strides.last() != 1 {
+        if args.global_scale.stride(0) != experts || args.global_scale.last_stride() != 1 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the tensor scales step {}/{}, and the product reads each projection's table as \
                      {experts} consecutive f32: the operand must be packed `[2, {experts}]`",
-                    args.global_scale.strides.get(0),
-                    args.global_scale.strides.last()
+                    args.global_scale.stride(0),
+                    args.global_scale.last_stride()
                 ),
             ));
         }
@@ -1103,7 +1093,7 @@ impl Op for GatherGemmNvfp4 {
         // expert id: the routing is the sort's, and the product takes the tile maps the sort
         // computed.
         args.permuted_to_token
-            .require_shape(Self::NAME, Shape::new(&[routes]))?;
+            .require_shape(Self::NAME, &[routes])?;
         if args.permuted_to_token.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1123,7 +1113,7 @@ impl Op for GatherGemmNvfp4 {
                 "a launch with no routes per token packs no rows".to_owned(),
             ));
         }
-        check_workspace(Self::NAME, args.workspace)
+        check_workspace(Self::NAME, &args.workspace)
     }
 
     fn launch(
@@ -1146,9 +1136,8 @@ impl Op for GatherGemmNvfp4 {
             global_scale: address(args.global_scale.ptr) as usize as *const c_void,
             // The gate half's row: the two tables are consecutive `experts` floats, so the second
             // row is the first address plus the row stride the operand is validated for.
-            global_scale_gate: (address(args.global_scale.ptr)
-                + 4 * args.global_scale.strides.get(0)) as usize
-                as *const c_void,
+            global_scale_gate: (address(args.global_scale.ptr) + 4 * args.global_scale.stride(0))
+                as usize as *const c_void,
             tile_to_expert: address(args.tile_to_expert.ptr) as usize as *const i32,
             tile_to_limit: address(args.tile_to_limit.ptr) as usize as *const i32,
             permuted_to_token: address(args.permuted_to_token.ptr) as usize as *const i32,
@@ -1368,7 +1357,7 @@ impl fmt::Display for RouteGemmNvfp4Descriptor {
 }
 
 /// The arguments of one encoded FC2 launch.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RouteGemmNvfp4Args {
     /// `[routes, intermediate/2]` U8: the gated rows, encoded as `nvfp4_quantize` produces them —
     /// two E2M1 codes a byte along the contraction. FC1's epilogue is a BF16 row, so the encoding
@@ -1420,8 +1409,7 @@ impl Op for RouteGemmNvfp4 {
         let experts = u64::from(descriptor.experts);
         let routes = args.out.rows();
 
-        args.out
-            .require_shape(Self::NAME, Shape::new(&[routes, hidden]))?;
+        args.out.require_shape(Self::NAME, &[routes, hidden])?;
         args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
         // The contraction is this operator's packed axis, and it must be even and whole scale blocks
         // for the same reason FC1's is: two codes share a byte, and a partial block has no scale.
@@ -1442,7 +1430,7 @@ impl Op for RouteGemmNvfp4 {
             ));
         }
         args.hidden
-            .require_shape(Self::NAME, Shape::new(&[routes, intermediate / 2]))?;
+            .require_shape(Self::NAME, &[routes, intermediate / 2])?;
         if args.hidden.dtype != DType::U8 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1457,13 +1445,9 @@ impl Op for RouteGemmNvfp4 {
         // The activation's block scales are the encoder's output, whose element type is the
         // encoder's declaration; `descriptor.scale` is the *weight* stack's, which is the
         // checkpoint's. `require_byte_scale` states the property both share.
-        crate::fp4::require_byte_scale(
-            Self::NAME,
-            args.hidden_scale,
-            args.hidden_scale.shape.last(),
-        )?;
+        crate::fp4::require_byte_scale(Self::NAME, &args.hidden_scale, args.hidden_scale.last())?;
         args.hidden_token_scale
-            .require_shape(Self::NAME, Shape::new(&[routes]))?;
+            .require_shape(Self::NAME, &[routes])?;
         if args.hidden_token_scale.dtype != DType::F32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1474,7 +1458,7 @@ impl Op for RouteGemmNvfp4 {
             ));
         }
         let row_blocks = intermediate.div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
-        let covered: u64 = args.hidden_scale.shape.dims().iter().product();
+        let covered = args.hidden_scale.numel();
         if covered < routes * row_blocks {
             return Err(Error::argument(
                 Self::NAME,
@@ -1485,7 +1469,7 @@ impl Op for RouteGemmNvfp4 {
             ));
         }
         args.weights
-            .require_shape(Self::NAME, Shape::new(&[experts, hidden, intermediate / 2]))?;
+            .require_shape(Self::NAME, &[experts, hidden, intermediate / 2])?;
         if args.weights.dtype != DType::U8 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1506,7 +1490,7 @@ impl Op for RouteGemmNvfp4 {
             ));
         }
         let blocks_per_row = intermediate / block_elements;
-        let covered: u64 = args.scales.shape.dims().iter().product();
+        let covered = args.scales.numel();
         if covered < experts * hidden * blocks_per_row {
             return Err(Error::argument(
                 Self::NAME,
@@ -1520,14 +1504,14 @@ impl Op for RouteGemmNvfp4 {
         // (`[1, experts]`, stride `experts`), which is the form the gather product beside this one
         // reads. A rank-one `[experts]` has stride 1 there, so demanding that shape refuses the
         // table the model actually holds: this product reads the row, and the two agree.
-        if args.global_scale.strides.get(0) != experts || args.global_scale.strides.last() != 1 {
+        if args.global_scale.stride(0) != experts || args.global_scale.last_stride() != 1 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the tensor scales must be one packed f32 per expert, addressed by a row \
                      stride of {experts}; the table's strides are {} and {}",
-                    args.global_scale.strides.get(0),
-                    args.global_scale.strides.last()
+                    args.global_scale.stride(0),
+                    args.global_scale.last_stride()
                 ),
             ));
         }
@@ -1541,7 +1525,7 @@ impl Op for RouteGemmNvfp4 {
             ));
         }
         args.permuted_to_expanded
-            .require_shape(Self::NAME, Shape::new(&[routes]))?;
+            .require_shape(Self::NAME, &[routes])?;
         if args.permuted_to_expanded.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -1551,7 +1535,7 @@ impl Op for RouteGemmNvfp4 {
                 ),
             ));
         }
-        check_workspace(Self::NAME, args.workspace)?;
+        check_workspace(Self::NAME, &args.workspace)?;
         Ok(())
     }
 
@@ -1624,7 +1608,7 @@ mod nvfp4_launch_tests {
     use super::*;
 
     fn table(dtype: DType, dims: &[u64]) -> Operand {
-        Operand::new(crate::tensor::DevicePtr::new(0), dtype, Shape::new(dims))
+        Operand::new(platform::DevicePtr::from_address(0), dtype, dims)
     }
 
     fn fc1() -> GatherGemmNvfp4Descriptor {
@@ -1670,12 +1654,12 @@ mod nvfp4_launch_tests {
         let args = fc1_args();
         assert_eq!(args.hidden.rows(), 3);
         assert_eq!(args.out.rows(), 32);
-        assert_eq!(args.permuted_to_token.shape.dims()[0], 32);
+        assert_eq!(args.permuted_to_token.dims()[0], 32);
         // The scales cover one block per output row along the contraction, not one row's worth.
-        assert_eq!(args.scales.shape.dims(), &[128, 1536, 128]);
+        assert_eq!(args.scales.dims(), &[128, 1536, 128]);
         assert_eq!(descriptor.hidden / crate::fp4::BLOCK_ELEMENTS, 128);
         // And the weight stack is the packed field, half the contraction wide.
-        assert_eq!(args.weights.shape.dims(), &[128, 1536, 1024]);
+        assert_eq!(args.weights.dims(), &[128, 1536, 1024]);
     }
 
     #[test]

@@ -7,14 +7,13 @@ publish = false
 
 # Execution: one executor thread per device, the runners that serve a model through its
 # capability traits, their captured graphs, the sampler, and the device memory a rank holds.
-# `worker → nn → backend → ops → platform`, beside the tensor library.
+# `worker → nn → ops → platform`, beside the tensor library.
 [dependencies]
 media = { path = "../media" }
-# The execution context a runner's forwards compute under, and tensors over memory the worker
-# owns: weights, cache planes, recurrent state and a graph's inputs.
-backend.workspace = true
 base64.workspace = true
 bytemuck.workspace = true
+# A shadow comparison reads 16-bit floating elements as the tensor library does.
+half = "2.5.0"
 crossbeam-channel.workspace = true
 platform.workspace = true
 indexmap.workspace = true
@@ -23,6 +22,8 @@ libc.workspace = true
 libloading.workspace = true
 nvtx.workspace = true
 nn.workspace = true
+# The execution context a runner's forwards compute under, and tensors over memory the worker
+# owns: weights, cache planes, recurrent state and a graph's inputs; the operators it launches.
 ops.workspace = true
 # Tensors: a runner's inputs and a forward's outputs.
 tensor.workspace = true

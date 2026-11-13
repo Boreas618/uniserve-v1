@@ -20,7 +20,7 @@
 use std::error::Error as StdError;
 use std::sync::Arc;
 
-use ops::platform::CaptureStatus;
+use platform::CaptureStatus;
 
 use crate::{Error, Result, context, profiler};
 

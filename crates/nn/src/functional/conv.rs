@@ -224,12 +224,9 @@ fn convolve(
         ));
     }
 
-    let mut kernel = [1_u32; 3];
     let mut out = vec![dims[0], out_channels];
     for axis in 0..rank {
         let taps = filter[axis + 2];
-        kernel[axis] = u32::try_from(taps)
-            .map_err(|_| Error::shape(owner, format!("a filter of {taps} taps")))?;
 
         let length = dims[axis + 2];
         let span = dilation[axis] as usize * (taps - 1);
@@ -287,50 +284,35 @@ fn convolve(
 
     // The operator derives every operand's strides from the storage order it is told: packed
     // channel-first, or channels-last for a frame stored that way.
-    let channels_last = rank == 3 && is_channels_last(&backend::operand(x)?);
+    let channels_last = rank == 3 && is_channels_last(&ops::operand(x)?);
     let input = if channels_last { x.clone() } else { packed(x)? };
     let weight = packed(weight)?;
     let result = if channels_last {
-        backend::empty((out[0], out[2], out[3], out[4], out[1]), x.dtype())?
-            .permute((0, 4, 1, 2, 3))?
+        ops::empty((out[0], out[2], out[3], out[4], out[1]), x.dtype())?.permute((0, 4, 1, 2, 3))?
     } else {
-        backend::empty(out, x.dtype())?
+        ops::empty(out, x.dtype())?
     };
 
-    let descriptor = Descriptor {
-        input: x.dtype(),
-        weight: weight.dtype(),
-        output: x.dtype(),
-        kernel,
-        stride,
-        padding,
-        dilation,
-        groups,
-        bias: bias.is_some(),
-        tf32,
-        channels_last,
-        rank: rank as u32,
-        transposed,
-    };
     let args = Args {
-        input: backend::operand(&input)?,
-        weight: backend::operand(&weight)?,
-        bias: bias.map(backend::operand).transpose()?,
-        out: backend::operand(&result)?,
+        input: ops::operand(&input)?,
+        weight: ops::operand(&weight)?,
+        bias: bias.map(ops::operand).transpose()?,
+        out: ops::operand(&result)?,
     };
+    let descriptor = Descriptor::of(&args, transposed, [stride, padding, dilation], groups, tf32)?;
     match (rank, transposed) {
-        (1, false) => backend::launch::<Conv1d>(&descriptor, args)?,
-        (1, true) => backend::launch::<ConvTranspose1d>(&descriptor, args)?,
-        _ => backend::launch::<Conv3d>(&descriptor, args)?,
+        (1, false) => ops::launch::<Conv1d>(&descriptor, args)?,
+        (1, true) => ops::launch::<ConvTranspose1d>(&descriptor, args)?,
+        _ => ops::launch::<Conv3d>(&descriptor, args)?,
     }
     Ok(result)
 }
 
 /// `tensor` stored packed row-major: itself when it is, and a copy otherwise.
 pub(super) fn packed(tensor: &Tensor) -> Result<Tensor> {
-    let operand = backend::operand(tensor)?;
+    let operand = ops::operand(tensor)?;
 
-    if operand.strides == ops::Strides::row_major(operand.shape) {
+    if operand.is_row_major() {
         Ok(tensor.clone())
     } else {
         Ok(tensor.force_contiguous()?)

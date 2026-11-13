@@ -202,7 +202,7 @@ impl UlyssesAttention {
                 ),
             ));
         };
-        let gathered = backend::empty((rows * self.members(), hidden), normalized.dtype())?;
+        let gathered = ops::empty((rows * self.members(), hidden), normalized.dtype())?;
 
         collective::all_gather(normalized, &gathered)?;
         Ok(gathered)
@@ -263,7 +263,7 @@ impl UlyssesAttention {
         self.check_blocks(send)?;
         self.require_split()?;
 
-        let received = backend::empty(send.shape(), send.dtype())?;
+        let received = ops::empty(send.shape(), send.dtype())?;
         let started = collective::start_all_to_all(send, &received)?;
         Ok((received, started))
     }
@@ -348,7 +348,7 @@ impl UlyssesAttention {
         self.check_blocks(send)?;
         self.require_split()?;
 
-        let received = backend::empty(send.shape(), send.dtype())?;
+        let received = ops::empty(send.shape(), send.dtype())?;
         collective::all_to_all(send, &received)?;
         Ok(received)
     }

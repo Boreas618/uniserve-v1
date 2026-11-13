@@ -24,13 +24,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -74,7 +74,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of `kv_write`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[tokens, heads, head_dim]` keys.
     pub key: Operand,
@@ -106,7 +106,7 @@ impl Op for KvWrite {
         let head_dim = u64::from(descriptor.head_dim);
         // The token count is the first extent of a `[tokens, heads, head_dim]` view; `rows()` is the
         // product of every extent but the last and would count tokens times heads.
-        let tokens = args.key.shape.dim(0);
+        let tokens = args.key.dim(0);
         // The cache is filled in the source's type. An FP8 cache needs the page's scale applied
         // first, which is the scaled write's job: allowing it here would write values that a reader
         // multiplies by a scale they never had applied, which is wrong by orders of magnitude
@@ -122,9 +122,9 @@ impl Op for KvWrite {
             ));
         }
         args.key
-            .require_shape(Self::NAME, Shape::new(&[tokens, heads, head_dim]))?;
+            .require_shape(Self::NAME, &[tokens, heads, head_dim])?;
         args.value
-            .require_shape(Self::NAME, Shape::new(&[tokens, heads, head_dim]))?;
+            .require_shape(Self::NAME, &[tokens, heads, head_dim])?;
         if args.key.dtype != descriptor.dtype || args.value.dtype != descriptor.dtype {
             return Err(Error::argument(
                 Self::NAME,
@@ -136,8 +136,7 @@ impl Op for KvWrite {
                 ),
             ));
         }
-        args.slots
-            .require_shape(Self::NAME, Shape::new(&[tokens]))?;
+        args.slots.require_shape(Self::NAME, &[tokens])?;
         if args.slots.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -158,15 +157,12 @@ impl Op for KvWrite {
                     ),
                 ));
             }
-            if cache.shape.dim(1) != page
-                || cache.shape.dim(2) != heads
-                || cache.shape.dim(3) != head_dim
-            {
+            if cache.dim(1) != page || cache.dim(2) != heads || cache.dim(3) != head_dim {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "a cache page is {:?}, the descriptor says {page} tokens × {heads} heads × {head_dim}",
-                        cache.shape.dims()
+                        cache.dims()
                     ),
                 ));
             }
@@ -198,17 +194,17 @@ impl Op for KvWrite {
     ) -> Result<()> {
         let row = u64::from(descriptor.heads) * u64::from(descriptor.head_dim);
         // The token count is the first extent of the `[tokens, heads, head_dim]` key view.
-        let tokens = args.key.shape.dim(0);
+        let tokens = args.key.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.key)
-            .view(args.value)
-            .view(args.key_cache)
-            .view(args.value_cache)
-            .view(args.slots)
-            .view(args.key_initialized)
-            .view(args.value_initialized)
+            .view(&args.key)
+            .view(&args.value)
+            .view(&args.key_cache)
+            .view(&args.value_cache)
+            .view(&args.slots)
+            .view(&args.key_initialized)
+            .view(&args.value_initialized)
             .u64(tokens)
             .u32(descriptor.page)
             .u32(descriptor.heads)
@@ -304,7 +300,7 @@ impl fmt::Display for ScaledWriteDescriptor {
 }
 
 /// The arguments of `kv_write_scaled`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ScaledWriteArgs {
     /// `[tokens, heads · head_dim]` the layer's rotated keys or values, in full precision.
     pub source: Operand,
@@ -353,14 +349,12 @@ impl Op for KvWriteScaled {
                 ),
             ));
         }
-        args.source
-            .require_shape(Self::NAME, Shape::new(&[tokens, row]))?;
+        args.source.require_shape(Self::NAME, &[tokens, row])?;
         // A page whose scale would be derived from rows it does not own is the wrong cache, so the
         // source's row width is stated rather than inferred from a reshape's remainder.
         args.source
-            .require_row(Self::NAME, descriptor.dtype, args.source.shape.dim(1))?;
-        args.slots
-            .require_shape(Self::NAME, Shape::new(&[tokens]))?;
+            .require_row(Self::NAME, descriptor.dtype, args.source.dim(1))?;
+        args.slots.require_shape(Self::NAME, &[tokens])?;
         if args.slots.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -379,24 +373,21 @@ impl Op for KvWriteScaled {
                 ),
             ));
         }
-        if args.cache.shape.dim(1) != page
-            || args.cache.shape.dim(2) != heads
-            || args.cache.shape.dim(3) != head_dim
+        if args.cache.dim(1) != page || args.cache.dim(2) != heads || args.cache.dim(3) != head_dim
         {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "a cache page is {:?}, the descriptor says {page} tokens × {heads} heads × {head_dim}",
-                    args.cache.shape.dims()
+                    args.cache.dims()
                 ),
             ));
         }
 
         // The scale and the flag are the page's, so both are exactly one entry per page: a shorter
         // tensor would derive a scale for a page it cannot then record.
-        let pages = args.cache.shape.dim(0);
-        args.scales
-            .require_shape(Self::NAME, Shape::new(&[pages, 1, 1, 1]))?;
+        let pages = args.cache.dim(0);
+        args.scales.require_shape(Self::NAME, &[pages, 1, 1, 1])?;
         if args.scales.dtype != descriptor.scale {
             return Err(Error::argument(
                 Self::NAME,
@@ -414,7 +405,7 @@ impl Op for KvWriteScaled {
             ));
         }
         args.initialized
-            .require_shape(Self::NAME, Shape::new(&[pages, 1, 1, 1]))?;
+            .require_shape(Self::NAME, &[pages, 1, 1, 1])?;
         // One byte per page, as in `kv_write`: the flag is the page's own byte of its plane, and a
         // four-byte store would clobber the three pages after it.
         if args.initialized.dtype != DType::U8 {
@@ -437,15 +428,15 @@ impl Op for KvWriteScaled {
     ) -> Result<()> {
         let row = u64::from(descriptor.heads) * u64::from(descriptor.head_dim);
         let tokens = args.source.rows();
-        let pages = args.cache.shape.dim(0);
+        let pages = args.cache.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.source)
-            .view(args.slots)
-            .view(args.scales)
-            .view(args.cache)
-            .view(args.initialized)
+            .view(&args.source)
+            .view(&args.slots)
+            .view(&args.scales)
+            .view(&args.cache)
+            .view(&args.initialized)
             .u64(tokens)
             .u32(descriptor.page)
             .u32(descriptor.heads)

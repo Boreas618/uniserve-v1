@@ -27,13 +27,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -79,7 +79,7 @@ fn activation_of(key: Key, dtype: DType, activation: DType) -> Key {
 }
 
 /// The arguments of `weighted_rms_norm`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct WeightedRmsNormArgs {
     /// `[rows, columns]`, contiguous.
     pub x: Operand,
@@ -108,12 +108,11 @@ impl Op for WeightedRmsNorm {
         let columns = u64::from(descriptor.columns);
         args.x.require_rank(Self::NAME, 2)?;
         args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
-        let rows = args.x.shape.dim(0);
-        args.weight
-            .require_shape(Self::NAME, Shape::new(&[columns]))?;
+        let rows = args.x.dim(0);
+        args.weight.require_shape(Self::NAME, &[columns])?;
         args.weight
             .require_row(Self::NAME, descriptor.dtype, columns)?;
-        args.out.require_shape(Self::NAME, args.x.shape)?;
+        args.out.require_dims(Self::NAME, args.x.dims())?;
         args.out
             .require_row(Self::NAME, descriptor.activation, columns)?;
 
@@ -133,14 +132,14 @@ impl Op for WeightedRmsNorm {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let rows = args.x.shape.dim(0);
+        let rows = args.x.dim(0);
         // The descriptor's flag and this operand agree, as `check` states.
         let partials = args.partials;
 
         let mut arguments = Arguments::new();
-        arguments.view(args.x).view(args.weight).view(args.out);
+        arguments.view(&args.x).view(&args.weight).view(&args.out);
         if let Some(partials) = partials {
-            arguments.view(partials);
+            arguments.view(&partials);
         }
         arguments.f32(args.eps);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
@@ -196,7 +195,7 @@ impl fmt::Display for ScaledResidualRmsNormDescriptor {
 }
 
 /// The arguments of `scaled_residual_rms_norm`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ScaledResidualRmsNormArgs {
     /// `[rows, columns]`, contiguous: the residual, updated in place.
     pub hidden: Operand,
@@ -234,17 +233,17 @@ impl Op for ScaledResidualRmsNorm {
         ] {
             view.require_rank(Self::NAME, 2)?;
             view.require_row(Self::NAME, dtype, columns)?;
-            if view.shape.dim(0) != args.hidden.shape.dim(0) {
+            if view.dim(0) != args.hidden.dim(0) {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("the {name} holds {} rows", view.shape.dim(0)),
+                    format!("the {name} holds {} rows", view.dim(0)),
                 ));
             }
         }
-        let rows = args.hidden.shape.dim(0);
+        let rows = args.hidden.dim(0);
         match (&args.update_bias, descriptor.update_bias) {
             (Some(bias), true) => {
-                bias.require_shape(Self::NAME, Shape::new(&[columns]))?;
+                bias.require_shape(Self::NAME, &[columns])?;
                 bias.require_row(Self::NAME, descriptor.dtype, columns)?;
             }
             (None, false) => {}
@@ -262,11 +261,10 @@ impl Op for ScaledResidualRmsNorm {
             }
         }
         scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
-        args.weight
-            .require_shape(Self::NAME, Shape::new(&[columns]))?;
+        args.weight.require_shape(Self::NAME, &[columns])?;
         args.weight
             .require_row(Self::NAME, descriptor.dtype, columns)?;
-        args.out.require_shape(Self::NAME, args.hidden.shape)?;
+        args.out.require_dims(Self::NAME, args.hidden.dims())?;
         args.out
             .require_row(Self::NAME, descriptor.activation, columns)?;
         matches(
@@ -285,23 +283,23 @@ impl Op for ScaledResidualRmsNorm {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let rows = args.hidden.shape.dim(0);
+        let rows = args.hidden.dim(0);
         // The descriptor's flags and these operands agree, as `check` states.
         let bias = args.update_bias;
         let partials = args.partials;
         // A scale of one element broadcasts; the kernel reads its width as a launch argument.
-        let width = args.scale.shape.numel() as u32;
+        let width = args.scale.numel() as u32;
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.hidden)
-            .view(args.update)
-            .view(bias.unwrap_or(args.update))
-            .view(args.scale)
-            .view(args.weight)
-            .view(args.out);
+            .view(&args.hidden)
+            .view(&args.update)
+            .view(bias.as_ref().unwrap_or(&args.update))
+            .view(&args.scale)
+            .view(&args.weight)
+            .view(&args.out);
         if let Some(partials) = partials {
-            arguments.view(partials);
+            arguments.view(&partials);
         }
         arguments.f32(args.eps).u32(width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
@@ -361,7 +359,7 @@ impl fmt::Display for ScaledResidualLayerNormDescriptor {
 }
 
 /// The arguments of `scaled_residual_layer_norm`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ScaledResidualLayerNormArgs {
     /// `[rows, columns]`, contiguous: the residual, unchanged by the launch.
     pub hidden: Operand,
@@ -401,17 +399,17 @@ impl Op for ScaledResidualLayerNorm {
         ] {
             view.require_rank(Self::NAME, 2)?;
             view.require_row(Self::NAME, dtype, columns)?;
-            if view.shape.dim(0) != args.hidden.shape.dim(0) {
+            if view.dim(0) != args.hidden.dim(0) {
                 return Err(Error::argument(
                     Self::NAME,
-                    format!("the {name} holds {} rows", view.shape.dim(0)),
+                    format!("the {name} holds {} rows", view.dim(0)),
                 ));
             }
         }
-        let rows = args.hidden.shape.dim(0);
+        let rows = args.hidden.dim(0);
         match (&args.update_bias, descriptor.update_bias) {
             (Some(bias), true) => {
-                bias.require_shape(Self::NAME, Shape::new(&[columns]))?;
+                bias.require_shape(Self::NAME, &[columns])?;
                 bias.require_row(Self::NAME, descriptor.dtype, columns)?;
             }
             (None, false) => {}
@@ -430,10 +428,10 @@ impl Op for ScaledResidualLayerNorm {
         }
         scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
         for view in [&args.weight, &args.bias] {
-            view.require_shape(Self::NAME, Shape::new(&[columns]))?;
+            view.require_shape(Self::NAME, &[columns])?;
             view.require_row(Self::NAME, descriptor.dtype, columns)?;
         }
-        args.out.require_shape(Self::NAME, args.hidden.shape)?;
+        args.out.require_dims(Self::NAME, args.hidden.dims())?;
         args.out
             .require_row(Self::NAME, descriptor.activation, columns)?;
         matches(
@@ -452,24 +450,24 @@ impl Op for ScaledResidualLayerNorm {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let rows = args.hidden.shape.dim(0);
+        let rows = args.hidden.dim(0);
         // The descriptor's flags and these operands agree, as `check` states.
         let update_bias = args.update_bias;
         let partials = args.partials;
         // A scale of one element broadcasts; the kernel reads its width as a launch argument.
-        let width = args.scale.shape.numel() as u32;
+        let width = args.scale.numel() as u32;
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.hidden)
-            .view(args.update)
-            .view(update_bias.unwrap_or(args.update))
-            .view(args.scale)
-            .view(args.weight)
-            .view(args.bias)
-            .view(args.out);
+            .view(&args.hidden)
+            .view(&args.update)
+            .view(update_bias.as_ref().unwrap_or(&args.update))
+            .view(&args.scale)
+            .view(&args.weight)
+            .view(&args.bias)
+            .view(&args.out);
         if let Some(partials) = partials {
-            arguments.view(partials);
+            arguments.view(&partials);
         }
         arguments.f32(args.eps).u32(width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
@@ -524,7 +522,7 @@ impl fmt::Display for ScaledResidualDescriptor {
 }
 
 /// The arguments of `scaled_residual`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ScaledResidualArgs {
     /// `[rows, columns]`, contiguous: the residual, updated in place.
     pub hidden: Operand,
@@ -556,7 +554,7 @@ impl Op for ScaledResidual {
         for (name, view) in [("residual", &args.hidden), ("update", &args.update)] {
             view.require_rank(Self::NAME, 2)?;
             view.require_row(Self::NAME, descriptor.dtype, columns)?;
-            if view.shape != args.hidden.shape {
+            if view.dims() != args.hidden.dims() {
                 return Err(Error::argument(
                     Self::NAME,
                     format!("the {name} does not have the residual's shape"),
@@ -565,7 +563,7 @@ impl Op for ScaledResidual {
         }
         match (&args.update_bias, descriptor.update_bias) {
             (Some(bias), true) => {
-                bias.require_shape(Self::NAME, Shape::new(&[columns]))?;
+                bias.require_shape(Self::NAME, &[columns])?;
                 bias.require_row(Self::NAME, descriptor.dtype, columns)?;
             }
             (None, false) => {}
@@ -585,7 +583,7 @@ impl Op for ScaledResidual {
         // The channel count is compiled into the program (the package's `WIDTH`), so this only checks
         // that the scale is as wide as a row; the value is not a launch parameter.
         scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
-        let elements = args.hidden.shape.numel();
+        let elements = args.hidden.numel();
         if elements > i32::MAX as u64 {
             return Err(Error::argument(
                 Self::NAME,
@@ -603,14 +601,14 @@ impl Op for ScaledResidual {
     ) -> Result<()> {
         // The descriptor's flag and this operand agree, as `check` states.
         let bias = args.update_bias;
-        let elements = args.hidden.shape.numel();
+        let elements = args.hidden.numel();
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.hidden)
-            .view(args.update)
-            .view(bias.unwrap_or(args.update))
-            .view(args.scale)
+            .view(&args.hidden)
+            .view(&args.update)
+            .view(bias.as_ref().unwrap_or(&args.update))
+            .view(&args.scale)
             .i32(elements as i32);
         // The channel count is compiled into the program (the package's `WIDTH`), so it is not a
         // parameter: a word the module does not declare takes the position of the global scratch
@@ -660,15 +658,15 @@ fn check_descriptor(operator: &'static str, columns: u32, tile: u32) -> Result<(
 /// `element % scale_width`, which is the column for `[columns]` and index 0 for `[1]`. The width
 /// travels as a launch argument, so both forms are the same program and neither moves a key.
 fn scale_width(operator: &'static str, scale: &Operand, dtype: DType, columns: u64) -> Result<u32> {
-    let width = scale.shape.numel();
-    if scale.shape.rank() != 1 || (width != 1 && width != columns) {
+    let width = scale.numel();
+    if scale.rank() != 1 || (width != 1 && width != columns) {
         return Err(Error::argument(
             operator,
             format!(
                 "expected a scale of {columns} channels or one broadcast factor, found {} \
                  elements in {} dimensions",
                 width,
-                scale.shape.rank()
+                scale.rank()
             ),
         ));
     }
@@ -686,7 +684,7 @@ fn matches(
 ) -> Result<()> {
     match (partials, expected) {
         (Some(partials), true) => {
-            partials.require_shape(operator, Shape::new(&[rows]))?;
+            partials.require_shape(operator, &[rows])?;
             partials.require_row(operator, DType::F32, rows)
         }
         (None, false) => Ok(()),
@@ -726,7 +724,7 @@ impl fmt::Display for SigmoidGatedAddDescriptor {
 }
 
 /// The arguments of `sigmoid_gated_add`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SigmoidGatedAddArgs {
     /// `[rows, columns]`, contiguous: the target, updated in place.
     pub target: Operand,
@@ -757,17 +755,17 @@ impl Op for SigmoidGatedAdd {
             ));
         }
         args.target.require_rank(Self::NAME, 2)?;
-        let rows = args.target.shape.dim(0);
+        let rows = args.target.dim(0);
         for (name, view, width) in [
             ("target", &args.target, columns),
             ("update", &args.update, columns),
             ("gate", &args.gate, 1),
         ] {
-            view.require_shape(Self::NAME, Shape::new(&[rows, width]))
+            view.require_shape(Self::NAME, &[rows, width])
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
             view.require_row(Self::NAME, descriptor.dtype, width)
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
-            if view.strides.get(0) != width {
+            if view.stride(0) != width {
                 return Err(Error::argument(
                     Self::NAME,
                     format!("the {name} rows are not contiguous"),
@@ -789,13 +787,13 @@ impl Op for SigmoidGatedAdd {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let rows = args.target.shape.dim(0);
+        let rows = args.target.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.target)
-            .view(args.update)
-            .view(args.gate)
+            .view(&args.target)
+            .view(&args.update)
+            .view(&args.gate)
             .u32(descriptor.columns);
         kernel.launch(
             LaunchGrid::new([
@@ -857,7 +855,7 @@ impl fmt::Display for ScaledAddDescriptor {
 }
 
 /// The arguments of `scaled_add`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ScaledAddArgs {
     /// `[rows, columns]`, contiguous: the target, updated in place.
     pub target: Operand,
@@ -904,8 +902,8 @@ impl Op for ScaledAdd {
         // reads another pair's bytes at the wrong width. Losing this check is what a `columns` field
         // took with it when it left the descriptor.
         for (operand, named, role) in [
-            (args.target, descriptor.target, "target"),
-            (args.source, descriptor.source, "source"),
+            (&args.target, descriptor.target, "target"),
+            (&args.source, descriptor.source, "source"),
         ] {
             if operand.dtype != named {
                 return Err(Error::argument(
@@ -918,13 +916,13 @@ impl Op for ScaledAdd {
                 ));
             }
         }
-        if args.source.shape != args.target.shape {
+        if args.source.dims() != args.target.dims() {
             return Err(Error::argument(
                 Self::NAME,
                 "the source does not have the target's shape".to_owned(),
             ));
         }
-        let elements = args.target.shape.numel();
+        let elements = args.target.numel();
         // A call over no elements has nothing to add, and the grid would refuse it as `[0, 1, 1] has no
         // block` — a message about the launch rather than about the blend. The width is the operand's
         // now that it is not a descriptor field, so the empty case has to be read from the view too.
@@ -954,12 +952,12 @@ impl Op for ScaledAdd {
         stream: &Stream,
     ) -> Result<()> {
         // `check` keeps the count within the kernel's `int64`.
-        let elements = args.target.shape.numel() as i64;
+        let elements = args.target.numel() as i64;
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.target)
-            .view(args.source)
+            .view(&args.target)
+            .view(&args.source)
             .f32(args.alpha)
             .f32(args.beta)
             .i64(elements);
@@ -999,10 +997,10 @@ impl Op for ScaledAdd {
 #[cfg(test)]
 mod scaled_add_tests {
     use super::*;
-    use crate::DevicePtr;
+    use platform::DevicePtr;
 
     fn view(dtype: DType, rows: u64, columns: u64) -> Operand {
-        Operand::new(DevicePtr::new(0x1000), dtype, Shape::new(&[rows, columns]))
+        Operand::new(DevicePtr::from_address(0x1000), dtype, &[rows, columns])
     }
 
     fn descriptor(target: DType, source: DType) -> ScaledAddDescriptor {
@@ -1099,27 +1097,21 @@ mod scaled_add_tests {
 #[cfg(test)]
 mod scale_tests {
     use super::*;
-    use crate::DevicePtr;
+    use platform::DevicePtr;
 
-    fn scale(shape: Shape) -> Operand {
-        Operand::new(DevicePtr::new(0x1000), DType::BF16, shape)
+    fn scale(dims: &[u64]) -> Operand {
+        Operand::new(DevicePtr::from_address(0x1000), DType::BF16, dims)
     }
 
     #[test]
     fn one_factor_is_a_scale_and_so_is_a_whole_row() {
         assert_eq!(
-            scale_width("scaled_residual", &scale(Shape::new(&[1])), DType::BF16, 64).unwrap(),
+            scale_width("scaled_residual", &scale(&[1]), DType::BF16, 64).unwrap(),
             1,
             "one element is the broadcast form a per-step table hands over"
         );
         assert_eq!(
-            scale_width(
-                "scaled_residual",
-                &scale(Shape::new(&[64])),
-                DType::BF16,
-                64
-            )
-            .unwrap(),
+            scale_width("scaled_residual", &scale(&[64]), DType::BF16, 64).unwrap(),
             64,
             "a whole row is the per-channel form"
         );
@@ -1129,13 +1121,7 @@ mod scale_tests {
     fn a_scale_of_any_other_width_is_refused_rather_than_read_past_its_end() {
         for width in [2_u64, 63, 65] {
             assert!(
-                scale_width(
-                    "scaled_residual",
-                    &scale(Shape::new(&[width])),
-                    DType::BF16,
-                    64
-                )
-                .is_err(),
+                scale_width("scaled_residual", &scale(&[width]), DType::BF16, 64).is_err(),
                 "a {width} element scale is neither one factor nor a row"
             );
         }

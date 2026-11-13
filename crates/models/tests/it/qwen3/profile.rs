@@ -48,7 +48,7 @@ fn meta(shape: Shape, dtype: DType) -> Tensor {
         Ordering::Relaxed,
     );
 
-    backend::retained(address, shape, dtype, &backend::meta()).expect("a meta tensor")
+    ops::retained(address, shape, dtype, &ops::meta()).expect("a meta tensor")
 }
 
 /// The model of the released checkpoint `name`, meta-loaded for `placement`.
@@ -67,8 +67,8 @@ fn load(name: &str, placement: &TextPlacement) -> Arc<dyn TextModel> {
 
 /// A meta context, stating this rank's place `(rank, ranks)` in a group when it has one, that
 /// records the launches of what runs under it.
-fn context(group: Option<(u64, u64)>) -> backend::Context {
-    let context = backend::Context::meta(None);
+fn context(group: Option<(u64, u64)>) -> ops::Context {
+    let context = ops::Context::meta(None);
     if let Some((rank, ranks)) = group {
         context
             .set_group(None, rank, ranks)
@@ -80,7 +80,7 @@ fn context(group: Option<(u64, u64)>) -> backend::Context {
 
 /// The kernels `context` recorded, each checked: every launch names its operator and its key,
 /// and no key names a model.
-fn keys(context: &backend::Context) -> Keys {
+fn keys(context: &ops::Context) -> Keys {
     context
         .take_launches()
         .into_iter()

@@ -82,11 +82,11 @@ impl MetaWeights {
             ),
         );
 
-        Ok(backend::retained(
+        Ok(ops::retained(
             address,
             shape.clone(),
             key.dtype,
-            &backend::meta(),
+            &ops::meta(),
         )?)
     }
 }
@@ -372,11 +372,11 @@ impl RetainedWeights for Reload<'_> {
     fn writable(&self, key: &WeightKey, shape: &Shape, _bytes: &[u8]) -> nn::Result<Tensor> {
         self.store.note_table(key);
 
-        Ok(backend::retained(
+        Ok(ops::retained(
             META_BASE,
             shape.clone(),
             key.dtype,
-            &backend::meta(),
+            &ops::meta(),
         )?)
     }
 }

@@ -53,18 +53,18 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use ops::cast::Cast;
-use ops::conv::{Conv1d, Conv3d, ConvTranspose1d};
-use ops::copy_strided::CopyStrided;
-use ops::elementwise::{
+use crate::cast::Cast;
+use crate::conv::{Conv1d, Conv3d, ConvTranspose1d};
+use crate::copy_strided::CopyStrided;
+use crate::elementwise::{
     BinaryArgs, BinaryDescriptor, BinaryFunction, ElementwiseBinary, ElementwiseUnary,
     ElementwiseWhere, UnaryArgs, UnaryDescriptor, UnaryFunction, WhereArgs, WhereDescriptor,
 };
-use ops::fill::Fill;
-use ops::gemm::{Epilogue, Gemm, WeightOrder};
-use ops::index::Index;
-use ops::reduce::Reduce;
-use ops::{Operand, cast, conv, copy_strided, gemm, index, reduce};
+use crate::fill::Fill;
+use crate::gemm::{Gemm, WeightOrder};
+use crate::index::Index;
+use crate::reduce::Reduce;
+use crate::{Operand, cast, conv, copy_strided, gemm, index, reduce};
 use tensor::backend::{BackendDevice, BackendStorage};
 use tensor::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use tensor::op::{BinaryOp, CmpOp, ReduceOp, UnaryOp};
@@ -111,8 +111,8 @@ pub(crate) fn fill(storage: &CudaStorage, layout: &Layout, bits: u64) -> Result<
         return Ok(());
     }
 
-    let args = ops::fill::Args { destination, bits };
-    launch::<Fill>(&ops::fill::Descriptor::of(&args, BLOCK, PDL), args)
+    let args = crate::fill::Args { destination, bits };
+    launch::<Fill>(&crate::fill::Descriptor::of(&args, BLOCK, PDL), args)
 }
 
 /// The refusal of `operation`, for which this backend's kernels lack `reason`.
@@ -371,12 +371,12 @@ impl CudaStorage {
                 format!("the gemm operator multiplies bf16, f16 and f32 matrices, not {dtype:?}"),
             ));
         }
-        let contraction = u32::try_from(k).map_err(|_| {
-            unsupported(
+        if u32::try_from(k).is_err() {
+            return Err(unsupported(
                 "matmul",
                 format!("a contraction over {k} elements exceeds the gemm operator's length"),
-            )
-        })?;
+            ));
+        }
 
         let shape = Shape::from_dims(&[b * m, n]);
         let (storage, out) = output(&shape, dtype)?;
@@ -389,18 +389,9 @@ impl CudaStorage {
             return Ok(storage);
         }
 
+        // The product accumulates in FP32 and rounds once into the element type, as the CPU
+        // backend's product of 16-bit floats does, which is the descriptor every product states.
         let multiply = |input: Operand, weight: Operand, out: Operand, order: WeightOrder| {
-            let descriptor = gemm::Descriptor {
-                input: dtype,
-                weight: dtype,
-                // The product accumulates in FP32 and rounds once into the element type, as
-                // the CPU backend's product of 16-bit floats does.
-                accumulate: DType::F32,
-                output: dtype,
-                order,
-                epilogue: Epilogue::None,
-                k: contraction,
-            };
             let args = gemm::Args {
                 input,
                 weight,
@@ -409,7 +400,7 @@ impl CudaStorage {
                 alpha: 1.0,
             };
 
-            launch::<Gemm>(&descriptor, args)
+            launch::<Gemm>(&gemm::Descriptor::of(&args, order)?, args)
         };
 
         let batch = rhs_layout.dims().len() - 2;
@@ -494,9 +485,13 @@ impl CudaStorage {
     /// The convolution of the input `layout` views with the filter `kernel_layout` views in
     /// `kernel`, launched by `convolve` over packed operands.
     ///
-    /// `dims` are the output's dimensions and `descriptor` the convolution's; a descriptor of
-    /// spatial rank three states a two-dimensional convolution as the three-dimensional one over
-    /// a depth of one, and every operand then gains that axis.
+    /// `dims` are the output's dimensions, `spatial` the operator's spatial rank and `window` the
+    /// convolution's stride, padding and dilation per spatial axis; a spatial rank of three
+    /// states a two-dimensional convolution as the three-dimensional one over a depth of one,
+    /// and every operand then gains that axis. The tensor library splits a grouped convolution
+    /// into convolutions of one group, and the permission to narrow FP32 inputs to TF32 is a
+    /// model's numerical declaration, which a tensor operation does not carry: the descriptor
+    /// ([`conv::Descriptor::of`]) states one group and exact FP32 arithmetic.
     ///
     /// # Errors
     ///
@@ -507,7 +502,7 @@ impl CudaStorage {
         layout: &Layout,
         (kernel, kernel_layout): (&Self, &Layout),
         dims: &[usize],
-        descriptor: conv::Descriptor,
+        (spatial, transposed, window): (u32, bool, [[u32; 3]; 3]),
         operation: &'static str,
         convolve: impl Fn(&conv::Descriptor, conv::Args) -> Result<()>,
     ) -> Result<Self> {
@@ -543,7 +538,7 @@ impl CudaStorage {
 
         // `[n, c, h, w]` as `[n, c, 1, h, w]` for the three-dimensional operator.
         let view = |operand: &Self, dims: &[usize], start: usize| {
-            let dims = match descriptor.rank {
+            let dims = match spatial {
                 3 => vec![dims[0], dims[1], 1, dims[2], dims[3]],
                 _ => dims.to_vec(),
             };
@@ -556,37 +551,10 @@ impl CudaStorage {
             bias: None,
             out: view(&storage, dims, 0)?,
         };
+        let descriptor = conv::Descriptor::of(&args, transposed, window, 1, false)?;
         convolve(&descriptor, args)?;
 
         Ok(storage)
-    }
-}
-
-/// The descriptor of a convolution of this backend's tensors: one group, no bias, exact FP32
-/// arithmetic and channels-first operands.
-fn convolution(
-    dtype: DType,
-    rank: u32,
-    transposed: bool,
-    [kernel, stride, padding, dilation]: [[u32; 3]; 4],
-) -> conv::Descriptor {
-    conv::Descriptor {
-        input: dtype,
-        weight: dtype,
-        output: dtype,
-        kernel,
-        stride,
-        padding,
-        dilation,
-        // The tensor library splits a grouped convolution into convolutions of one group.
-        groups: 1,
-        bias: false,
-        // The permission to narrow FP32 inputs is a model's numerical declaration, which a
-        // tensor operation does not carry.
-        tf32: false,
-        channels_last: false,
-        rank,
-        transposed,
     }
 }
 
@@ -956,23 +924,17 @@ impl BackendStorage for CudaStorage {
     ) -> tensor::Result<Box<dyn BackendStorage>> {
         const NAME: &str = "conv1d";
 
-        let descriptor = convolution(
-            self.dtype(),
-            1,
-            false,
-            [
-                [word(params.k_size, NAME)?, 1, 1],
-                [word(params.stride, NAME)?, 1, 1],
-                [word(params.padding, NAME)?, 0, 0],
-                [word(params.dilation, NAME)?, 1, 1],
-            ],
-        );
+        let window = [
+            [word(params.stride, NAME)?, 1, 1],
+            [word(params.padding, NAME)?, 0, 0],
+            [word(params.dilation, NAME)?, 1, 1],
+        ];
 
         Ok(Box::new(self.convolved(
             layout,
             (Self::of(kernel)?, kernel_layout),
             &params.out_dims(),
-            descriptor,
+            (1, false, window),
             NAME,
             launch::<Conv1d>,
         )?))
@@ -996,23 +958,17 @@ impl BackendStorage for CudaStorage {
             .into());
         }
 
-        let descriptor = convolution(
-            self.dtype(),
-            1,
-            true,
-            [
-                [word(params.k_size, NAME)?, 1, 1],
-                [word(params.stride, NAME)?, 1, 1],
-                [word(params.padding, NAME)?, 0, 0],
-                [word(params.dilation, NAME)?, 1, 1],
-            ],
-        );
+        let window = [
+            [word(params.stride, NAME)?, 1, 1],
+            [word(params.padding, NAME)?, 0, 0],
+            [word(params.dilation, NAME)?, 1, 1],
+        ];
 
         Ok(Box::new(self.convolved(
             layout,
             (Self::of(kernel)?, kernel_layout),
             &params.out_dims(),
-            descriptor,
+            (1, true, window),
             NAME,
             launch::<ConvTranspose1d>,
         )?))
@@ -1034,23 +990,17 @@ impl BackendStorage for CudaStorage {
             word(params.padding, NAME)?,
             word(params.dilation, NAME)?,
         );
-        let descriptor = convolution(
-            self.dtype(),
-            3,
-            false,
-            [
-                [1, word(params.k_h, NAME)?, word(params.k_w, NAME)?],
-                [1, stride, stride],
-                [0, padding, padding],
-                [1, dilation, dilation],
-            ],
-        );
+        let window = [
+            [1, stride, stride],
+            [0, padding, padding],
+            [1, dilation, dilation],
+        ];
 
         Ok(Box::new(self.convolved(
             layout,
             (Self::of(kernel)?, kernel_layout),
             &params.out_dims(),
-            descriptor,
+            (3, false, window),
             NAME,
             launch::<Conv3d>,
         )?))

@@ -270,7 +270,7 @@ fn a_rank_connects_under_its_heads_claim_as_its_scope() {
 
 /// The bytes of `tensor`, a weight on `device`, copied to the host.
 fn device_bytes(tensor: &Tensor, device: DeviceId) -> Vec<u8> {
-    let operand = backend::operand(tensor).unwrap();
+    let operand = ops::operand(tensor).unwrap();
     let length = operand.byte_len().unwrap() as usize;
     let mut bytes = vec![0_u8; length];
     let stream = platform::Stream::new(device).unwrap();
@@ -478,7 +478,7 @@ fn two_epochs_of_one_region_address_the_same_flags_and_scales() {
     let address = |cache: &KvCacheMemory| {
         let layer = cache.planes(0).unwrap().remove(1);
         let scale = layer.value_scale.expect("an FP8 cache states its scales");
-        let start = |tensor: &Tensor| backend::operand(tensor).unwrap().ptr.address();
+        let start = |tensor: &Tensor| ops::operand(tensor).unwrap().ptr.address();
 
         // The cells of layer 1's column are `[units]`: a byte of flag, four of scale, per unit.
         (start(&layer.key_initialized) + 6, start(&scale) + 6 * 4)

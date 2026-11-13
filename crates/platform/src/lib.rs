@@ -1,6 +1,11 @@
 //! The CUDA boundary of UniServe: driver, virtual memory, device memory and
-//! allocator, streams, events, graphs, kernel launch, NVML, NCCL, cuBLASLt and
-//! cuDNN bindings. No other crate calls CUDA.
+//! allocator, streams, events, graphs, kernel launch, tensor maps, NVML, NCCL
+//! and CUPTI bindings. No other crate calls CUDA.
+//!
+//! Element types are not this crate's: a binding that names one takes the
+//! vendor's own code for it (`ncclDataType_t`, `CUtensorMapDataType`), which
+//! the caller derives from its own element type. cuBLASLt and cuDNN are bound
+//! by the kernel packages that call them, not here.
 //!
 //! Every native library is opened at runtime with `libloading`: building this
 //! crate needs no CUDA toolkit, and a machine without a driver fails only when
@@ -20,7 +25,6 @@
 //! | Device storage, standalone | [`DeviceAllocation`], [`PeerMapping`] | deferred to the reclaimer |
 //! | Host storage | [`PinnedBuffer`] (deferred), [`HostRegistration`] (synchronous) | on drop |
 //! | NCCL | [`Communicator`] | explicit `destroy`, and only after every graph that captured one of its collectives is gone |
-//! | cuDNN | [`Cudnn`] | `cudnnDestroy` on drop |
 //! | NVML | [`Nvml`] | `nvmlShutdown` on drop |
 //!
 //! Device addresses are plain `u64` values (`CUdeviceptr`, unified with host
@@ -32,12 +36,9 @@
 mod allocator;
 mod context;
 mod copy;
-mod cublas;
-mod cudnn;
 pub mod cupti;
 mod device;
 mod driver;
-mod dtype;
 mod error;
 mod event;
 mod graph;
@@ -58,21 +59,12 @@ mod vmm;
 pub use allocator::{Allocator, Budget, Buffer, DevicePtr, DeviceRange, PoolKind};
 pub use context::{DeviceGuard, PrimaryContext};
 pub use copy::{
-    CopyBatch, Pitched, PitchedBatch, SourceOrder, Strided, StridedCopy, memcpy_async,
-    memset_2d_d8, memset_2d_d32, memset_d8, memset_d16, memset_d32,
-};
-pub use cublas::{
-    Algorithm, ComputeType, Epilogue, Matmul, MatmulArgs, MatmulBytes, MatmulDescriptor,
-    MatrixLayout, Order,
-};
-pub use cudnn::{
-    Convolution, ConvolutionArgs, ConvolutionBytes, ConvolutionKind, ConvolutionPlan, Cudnn,
-    Engine, Tensor,
+    CopyBatch, Pitched, PitchedBatch, SourceOrder, memcpy_async, memset_2d_d8, memset_2d_d32,
+    memset_d8, memset_d16, memset_d32,
 };
 pub use device::{
     Device, DeviceAttribute, DeviceId, DeviceUuid, MemoryInfo, profiler_start, profiler_stop,
 };
-pub use dtype::DataType;
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
 pub use graph::{
@@ -89,9 +81,7 @@ pub use nccl::{Communicator, UniqueId};
 pub use nvml::{Nvml, NvmlMemory};
 pub use pool::VirtualPool;
 pub use stream::{CaptureStatus, Stream, WaitValue};
-pub use tensormap::{
-    Interleave, L2Promotion, OobFill, Swizzle, TensorDataType, TensorMap, TensorMapSpec,
-};
+pub use tensormap::{Interleave, L2Promotion, OobFill, Swizzle, TensorMap, TensorMapSpec};
 pub use vmm::{
     HandleType, PeerMapping, PhysicalAllocation, Protection, SegmentedMapping, ShareableHandle,
     created_bytes,

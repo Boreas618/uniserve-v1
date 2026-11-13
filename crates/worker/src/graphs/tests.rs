@@ -37,7 +37,7 @@ const INPUTS: u64 = 5 * COLUMN;
 
 /// A meta weight: a shape and an element type at an address nothing reads.
 fn weight(address: u64, dims: &[usize]) -> Tensor {
-    backend::retained(address, dims, DType::BF16, &backend::meta()).unwrap()
+    ops::retained(address, dims, DType::BF16, &ops::meta()).unwrap()
 }
 
 /// A causal language model of three `nn` operators and one host value.

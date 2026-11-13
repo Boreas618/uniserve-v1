@@ -4,7 +4,7 @@
 //! **Where.** A model states each module's forward as a profiler range (`nn::profiler::range`):
 //! its class, which names the kind of module, and its path, which names the instance. The context
 //! a runner captures a graph under carries the process's [`Markers`] as its profiler
-//! ([`profiler`], `backend::Context::set_profiler`), so a module whose class matches the
+//! ([`profiler`], `ops::Context::set_profiler`), so a module whose class matches the
 //! deployment's class patterns gets one marker as it is entered and one as it returns. Each is a
 //! launch of [`PTX`]'s single-thread kernel on the forward's stream, so the graph captures it and
 //! every replay runs it. The executor brackets each batch's execution with a step marker of the
@@ -303,18 +303,18 @@ static MARKERS: OnceLock<Arc<Markers>> = OnceLock::new();
 /// because a graph is what runs them at every step, and none for a forward run once or in a
 /// process without markers.
 ///
-/// A runner gives the result to `backend::Context::set_profiler` before it runs the forward it
+/// A runner gives the result to `ops::Context::set_profiler` before it runs the forward it
 /// captures.
-pub fn profiler(stream: &Stream) -> Option<Arc<dyn backend::Profiler>> {
+pub fn profiler(stream: &Stream) -> Option<Arc<dyn ops::Profiler>> {
     let markers = MARKERS.get()?;
     let capturing = stream
         .capture_status()
         .is_ok_and(|status| status != platform::CaptureStatus::None);
 
-    capturing.then(|| Arc::clone(markers) as Arc<dyn backend::Profiler>)
+    capturing.then(|| Arc::clone(markers) as Arc<dyn ops::Profiler>)
 }
 
-impl backend::Profiler for Markers {
+impl ops::Profiler for Markers {
     fn enter(
         &self,
         class: &str,

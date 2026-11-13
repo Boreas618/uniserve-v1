@@ -92,7 +92,7 @@ pub(super) fn activate(x: &Tensor, activation: Activation) -> Result<Tensor> {
 /// The row stride of `rows`, a `[rows, width]` tensor, in elements, as a kernel argument states
 /// it.
 fn row_stride(rows: &ops::Operand) -> u64 {
-    rows.strides.get(0)
+    rows.stride(0)
 }
 
 /// The gated activation `act(gate) · value`, the activation evaluated in FP32.
@@ -128,11 +128,8 @@ pub fn act_and_mul(
     }
 
     let (gate_rows, value_rows) = (as_rows(OWNER, gate)?, as_rows(OWNER, value)?);
-    let out = backend::empty(gate_rows.shape(), gate.dtype())?;
-    let (gate_operand, value_operand) = (
-        backend::operand(&gate_rows)?,
-        backend::operand(&value_rows)?,
-    );
+    let out = ops::empty(gate_rows.shape(), gate.dtype())?;
+    let (gate_operand, value_operand) = (ops::operand(&gate_rows)?, ops::operand(&value_rows)?);
     let (gate_stride, value_stride) = (row_stride(&gate_operand), row_stride(&value_operand));
 
     // The 64-bit form follows the furthest element either input row reaches: the halves of one
@@ -141,7 +138,7 @@ pub fn act_and_mul(
     let rows = elements.div_ceil(u64::from(width));
     let span = elements.max(rows.saturating_mul(gate_stride.max(value_stride)));
 
-    backend::launch::<ActAndMul>(
+    ops::launch::<ActAndMul>(
         &ActAndMulDescriptor {
             dtype: gate.dtype(),
             width,
@@ -156,7 +153,7 @@ pub fn act_and_mul(
         ActAndMulArgs {
             gate: gate_operand,
             value: value_operand,
-            out: backend::operand(&out)?,
+            out: ops::operand(&out)?,
         },
     )?;
     like_rows(out, gate)
@@ -204,13 +201,10 @@ pub fn swiglu(
     }
 
     let (value_rows, gate_rows) = (as_rows(OWNER, value)?, as_rows(OWNER, gate)?);
-    let out = backend::empty(value_rows.shape(), value.dtype())?;
-    let (value_operand, gate_operand) = (
-        backend::operand(&value_rows)?,
-        backend::operand(&gate_rows)?,
-    );
+    let out = ops::empty(value_rows.shape(), value.dtype())?;
+    let (value_operand, gate_operand) = (ops::operand(&value_rows)?, ops::operand(&gate_rows)?);
 
-    backend::launch::<Swiglu>(
+    ops::launch::<Swiglu>(
         &SwigluDescriptor {
             dtype: value.dtype(),
             width,
@@ -224,9 +218,9 @@ pub fn swiglu(
         SwigluArgs {
             value: value_operand,
             gate: gate_operand,
-            value_bias: value_bias.map(backend::operand).transpose()?,
-            gate_bias: gate_bias.map(backend::operand).transpose()?,
-            out: backend::operand(&out)?,
+            value_bias: value_bias.map(ops::operand).transpose()?,
+            gate_bias: gate_bias.map(ops::operand).transpose()?,
+            out: ops::operand(&out)?,
             partials: None,
         },
     )?;
@@ -271,10 +265,10 @@ pub fn value_first_swiglu(value_gate: &Tensor, bias: Option<&Tensor>) -> Result<
         return like_rows(product, value_gate);
     }
 
-    let out = backend::empty((rows.dims()[0], width as usize), value_gate.dtype())?;
-    let projection = backend::operand(&rows)?;
+    let out = ops::empty((rows.dims()[0], width as usize), value_gate.dtype())?;
+    let projection = ops::operand(&rows)?;
 
-    backend::launch::<ValueFirstSwiglu>(
+    ops::launch::<ValueFirstSwiglu>(
         &ValueFirstSwigluDescriptor {
             dtype: value_gate.dtype(),
             width,
@@ -285,8 +279,8 @@ pub fn value_first_swiglu(value_gate: &Tensor, bias: Option<&Tensor>) -> Result<
         },
         ValueFirstSwigluArgs {
             value_gate: projection,
-            bias: bias.map(backend::operand).transpose()?,
-            out: backend::operand(&out)?,
+            bias: bias.map(ops::operand).transpose()?,
+            out: ops::operand(&out)?,
             partials: None,
         },
     )?;
@@ -332,8 +326,8 @@ pub fn snake(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
         return Ok((x32 + periodic)?.to_dtype(x.dtype())?);
     }
 
-    let out = backend::empty(x.shape(), x.dtype())?;
-    backend::launch::<ops::snake::Snake>(
+    let out = ops::empty(x.shape(), x.dtype())?;
+    ops::launch::<ops::snake::Snake>(
         &ops::snake::Descriptor {
             dtype: x.dtype(),
             channels: u32::try_from(channels).unwrap_or(u32::MAX),
@@ -341,9 +335,9 @@ pub fn snake(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
             pdl: PDL,
         },
         ops::snake::Args {
-            x: backend::operand(x)?,
-            alpha: backend::operand(alpha)?,
-            out: backend::operand(&out)?,
+            x: ops::operand(x)?,
+            alpha: ops::operand(alpha)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)

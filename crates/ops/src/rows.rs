@@ -45,13 +45,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -104,7 +104,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `rows`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[count, columns]` the rows to place.
     pub source: Operand,
@@ -127,8 +127,7 @@ impl Op for Rows {
         let columns = u64::from(descriptor.columns);
         let count = args.indices.numel();
 
-        args.indices
-            .require_shape(Self::NAME, Shape::new(&[count]))?;
+        args.indices.require_shape(Self::NAME, &[count])?;
         if args.indices.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -138,8 +137,7 @@ impl Op for Rows {
                 ),
             ));
         }
-        args.source
-            .require_shape(Self::NAME, Shape::new(&[count, columns]))?;
+        args.source.require_shape(Self::NAME, &[count, columns])?;
         args.source
             .require_row(Self::NAME, descriptor.dtype, columns)?;
         args.destination
@@ -147,21 +145,21 @@ impl Op for Rows {
         // The destination is walked as a grid of rows: a row that is not `columns` elements long
         // would make the row stride meaningless, and a non-unit last stride would make an element
         // block read across two rows.
-        if args.destination.strides.last() != 1 {
+        if args.destination.last_stride() != 1 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "expected a unit stride on the last axis, found {}",
-                    args.destination.strides.last()
+                    args.destination.last_stride()
                 ),
             ));
         }
-        if args.destination.strides != Strides::row_major(args.destination.shape) {
+        if !args.destination.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the destination is written row-major; found strides {}",
-                    args.destination.strides
+                    "the destination is written row-major; found strides {:?}",
+                    args.destination.strides()
                 ),
             ));
         }
@@ -186,9 +184,9 @@ impl Op for Rows {
         let block = u64::from(descriptor.block);
         let mut arguments = Arguments::new();
         arguments
-            .view(args.source)
-            .view(args.destination)
-            .view(args.indices)
+            .view(&args.source)
+            .view(&args.destination)
+            .view(&args.indices)
             // `check` keeps the row count within a kernel parameter.
             .u32(count as u32)
             .u32(descriptor.columns)

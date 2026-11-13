@@ -82,10 +82,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ipc::batch::{Batch, BatchOutput, Extent, MediaRow, Phase, TimingCounters};
-use nn::{Clip, Decoder, Layout, Splice, Splicer};
+use nn::{Clip, Decoder, Splice, Splicer};
 use ops::pcm::{self, PcmInterleave};
 use ops::rgb::{self, RgbBytes};
 use platform::{Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream};
+use proto::video::Layout;
 use tensor::{DType, Device, Shape, Tensor};
 
 use crate::buckets::{Bucket, Buckets};
@@ -822,7 +823,7 @@ impl DecoderRunner {
             Some(rows) => rows.elem_count(),
             None => voxels(&video) as usize,
         };
-        let block = backend::empty((rows, channels), latent)?;
+        let block = ops::empty((rows, channels), latent)?;
         self.model.gather_latents(layout, &window, 0, &block)?;
 
         let shape = (
@@ -879,12 +880,12 @@ impl DecoderRunner {
                 0 => None,
                 overlap => Some(self.buffer(self.tail, (rgb, overlap, height, width), dtype)?),
             };
-            let bytes = backend::empty((splice.keep as usize, height, width, rgb), DType::U8)?;
+            let bytes = ops::empty((splice.keep as usize, height, width, rgb), DType::U8)?;
 
             for (run, frame) in splicer.splice(previous.as_ref(), &raster, splice)? {
                 let length = run.dims().get(1).copied().unwrap_or(0);
                 let out = bytes.narrow(0, frame as usize, length)?;
-                backend::launch::<RgbBytes>(
+                ops::launch::<RgbBytes>(
                     &rgb::Descriptor {
                         dtype,
                         channels: rgb::CHANNELS,
@@ -892,10 +893,10 @@ impl DecoderRunner {
                         pdl: false,
                     },
                     rgb::Args {
-                        input: backend::operand(&run)?,
-                        mean: backend::operand(&mean)?,
-                        std: backend::operand(&std)?,
-                        out: backend::operand(&out)?,
+                        input: ops::operand(&run)?,
+                        mean: ops::operand(&mean)?,
+                        std: ops::operand(&std)?,
+                        out: ops::operand(&out)?,
                     },
                 )?;
             }
@@ -914,20 +915,20 @@ impl DecoderRunner {
         let latents = self.buffer(0, shape, latent)?;
 
         let (samples, channels) = self.model.pcm_window(&track)?;
-        let waveform = backend::empty((channels as usize, samples as usize), DType::F32)?;
+        let waveform = ops::empty((channels as usize, samples as usize), DType::F32)?;
         self.model.decode(layout, &latents, None, Some(&waveform))?;
 
-        let pcm = backend::empty((samples as usize, PCM_CHANNELS as usize), DType::I16)?;
-        backend::launch::<PcmInterleave>(
+        let pcm = ops::empty((samples as usize, PCM_CHANNELS as usize), DType::I16)?;
+        ops::launch::<PcmInterleave>(
             &pcm::Descriptor {
                 dtype: DType::F32,
                 block: pcm::BLOCK,
                 pdl: false,
             },
             pcm::Args {
-                left: backend::operand(&waveform.get(0)?)?,
-                right: backend::operand(&waveform.get(1)?)?,
-                out: backend::operand(&pcm)?,
+                left: ops::operand(&waveform.get(0)?)?,
+                right: ops::operand(&waveform.get(1)?)?,
+                out: ops::operand(&pcm)?,
                 samples: u32::try_from(samples).map_err(|_| {
                     Error::Invalid("a track's samples exceed a launch value".into())
                 })?,

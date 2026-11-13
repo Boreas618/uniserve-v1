@@ -67,7 +67,7 @@ pub fn place_rows_(destination: &Tensor, indices: &Tensor, source: &Tensor) -> R
         return Ok(());
     }
 
-    backend::launch::<Rows>(
+    ops::launch::<Rows>(
         &Descriptor {
             dtype: destination.dtype(),
             mode: Mode::Place,
@@ -76,9 +76,9 @@ pub fn place_rows_(destination: &Tensor, indices: &Tensor, source: &Tensor) -> R
             pdl: PDL,
         },
         Args {
-            source: backend::operand(source)?,
-            destination: backend::operand(destination)?,
-            indices: backend::operand(indices)?,
+            source: ops::operand(source)?,
+            destination: ops::operand(destination)?,
+            indices: ops::operand(indices)?,
         },
     )?;
     Ok(())

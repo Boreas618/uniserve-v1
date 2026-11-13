@@ -167,7 +167,7 @@ pub(crate) fn meta(shape: impl Into<Shape>, dtype: DType) -> Tensor {
     static NEXT: AtomicU64 = AtomicU64::new(1 << 40);
     let address = NEXT.fetch_add(1 << 24, Ordering::Relaxed);
 
-    backend::retained(address, shape, dtype, &backend::meta()).unwrap()
+    ops::retained(address, shape, dtype, &ops::meta()).unwrap()
 }
 
 /// Runs `forward` under a new meta context while it records, and returns what it returned with
@@ -183,7 +183,7 @@ pub(crate) fn recorded_split<T>(
     split: Option<(u64, u64)>,
     forward: impl FnOnce() -> nn::Result<T>,
 ) -> (nn::Result<T>, Vec<(&'static str, String)>) {
-    let context = backend::Context::meta(None);
+    let context = ops::Context::meta(None);
     if let Some((rank, ranks)) = split {
         context.set_group(None, rank, ranks).unwrap();
     }

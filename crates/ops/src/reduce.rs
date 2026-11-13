@@ -36,14 +36,14 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
+use crate::operand::Operand;
 use crate::strided;
-use crate::tensor::{MAX_RANK, Operand, Shape};
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -121,8 +121,8 @@ impl Descriptor {
         Self {
             function,
             dtype: args.x.dtype,
-            kept: kept.shape.rank() as u8,
-            reduced: reduced.shape.rank() as u8,
+            kept: kept.rank() as u8,
+            reduced: reduced.rank() as u8,
             reduction: reduction_class(reduced.numel()),
             block,
             pdl,
@@ -153,7 +153,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `reduce`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args<'a> {
     /// The values, at any strides.
     pub x: Operand,
@@ -174,8 +174,8 @@ pub struct Reduce;
 /// follow in row-major order; the second is the view at index zero of every kept axis, whose
 /// elements one output folds.
 fn split(x: &Operand, axes: &[usize]) -> (Operand, Operand) {
-    let [kept] = strided::merge_axes([strided::select_axes(x, |axis| !axes.contains(&axis))]);
-    let [reduced] = strided::merge_axes([strided::select_axes(x, |axis| axes.contains(&axis))]);
+    let [kept] = strided::merge_axes([&strided::select_axes(x, |axis| !axes.contains(&axis))]);
+    let [reduced] = strided::merge_axes([&strided::select_axes(x, |axis| axes.contains(&axis))]);
     (kept, reduced)
 }
 
@@ -189,7 +189,7 @@ impl Op for Reduce {
         strided::require_element(Self::NAME, "dtype", descriptor.dtype, &strided::ELEMENTS)?;
         strided::require_block(Self::NAME, descriptor.block)?;
 
-        let rank = args.x.shape.rank();
+        let rank = args.x.rank();
         if args.axes.is_empty() {
             return Err(Error::argument(
                 Self::NAME,
@@ -217,18 +217,18 @@ impl Op for Reduce {
             ));
         }
 
-        let mut folded = [0_u64; MAX_RANK];
-        for (axis, extent) in folded[..rank].iter_mut().enumerate() {
-            *extent = if args.axes.contains(&axis) {
-                1
-            } else {
-                args.x.shape.dim(axis)
-            };
-        }
+        // The shape of `x` with every reduced extent one.
+        let folded: Vec<usize> = args
+            .x
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(axis, &extent)| if args.axes.contains(&axis) { 1 } else { extent })
+            .collect();
         let output = descriptor.function.output(descriptor.dtype);
         strided::require_dtype(Self::NAME, "x", &args.x, descriptor.dtype)?;
         strided::require_dtype(Self::NAME, "out", &args.out, output)?;
-        strided::require_shape(Self::NAME, "out", &args.out, Shape::new(&folded[..rank]))?;
+        strided::require_shape(Self::NAME, "out", &args.out, &folded)?;
         strided::require_elements(Self::NAME, "out", &args.out)?;
         strided::require_contiguous(Self::NAME, "out", &args.out)?;
         strided::require_words(Self::NAME, "x", &args.x)?;
@@ -240,7 +240,9 @@ impl Op for Reduce {
                 Self::NAME,
                 format!(
                     "{} over the axes {:?} of {:?} has no element to return",
-                    descriptor.function, args.axes, args.x.shape
+                    descriptor.function,
+                    args.axes,
+                    args.x.dims()
                 ),
             ));
         }
@@ -262,12 +264,12 @@ impl Op for Reduce {
             ));
         }
 
-        strided::require_rank(Self::NAME, "kept", descriptor.kept, kept.shape.rank() as u8)?;
+        strided::require_rank(Self::NAME, "kept", descriptor.kept, kept.rank() as u8)?;
         strided::require_rank(
             Self::NAME,
             "reduced",
             descriptor.reduced,
-            reduced.shape.rank() as u8,
+            reduced.rank() as u8,
         )
     }
 
@@ -282,14 +284,14 @@ impl Op for Reduce {
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.out)
+            .view(&args.x)
+            .view(&args.out)
             .u64(outputs)
             .u64(reduced.numel());
-        strided::pack_extents(&mut arguments, kept.shape);
-        strided::pack_strides(&mut arguments, kept.strides);
-        strided::pack_extents(&mut arguments, reduced.shape);
-        strided::pack_strides(&mut arguments, reduced.strides);
+        strided::pack_extents(&mut arguments, &kept);
+        strided::pack_strides(&mut arguments, &kept);
+        strided::pack_extents(&mut arguments, &reduced);
+        strided::pack_strides(&mut arguments, &reduced);
         arguments.flag(descriptor.pdl);
 
         // One program folds `block / tile` outputs.
@@ -325,32 +327,27 @@ impl Op for Reduce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DevicePtr, Strides};
+    use platform::DevicePtr;
 
     const BLOCK: u32 = 1024;
 
     fn contiguous(dtype: DType, shape: &[u64]) -> Operand {
-        Operand::new(DevicePtr::new(0x1000), dtype, Shape::new(shape))
+        Operand::new(DevicePtr::from_address(0x1000), dtype, shape)
     }
 
     /// A reduction of `x` along `axes`, with the output its function and shape call for.
-    fn reduction<'a>(function: Function, x: Operand, axes: &'a [usize]) -> Args<'a> {
-        let folded: Vec<u64> = (0..x.shape.rank())
-            .map(|axis| {
-                if axes.contains(&axis) {
-                    1
-                } else {
-                    x.shape.dim(axis)
-                }
-            })
+    fn reduction<'a>(function: Function, x: &Operand, axes: &'a [usize]) -> Args<'a> {
+        let folded: Vec<u64> = (0..x.rank())
+            .map(|axis| if axes.contains(&axis) { 1 } else { x.dim(axis) })
             .collect();
+        let out = Operand::new(
+            DevicePtr::from_address(0x2000),
+            function.output(x.dtype),
+            &folded,
+        );
         Args {
-            x,
-            out: Operand::new(
-                DevicePtr::new(0x2000),
-                function.output(x.dtype),
-                Shape::new(&folded),
-            ),
+            x: x.clone(),
+            out,
             axes,
         }
     }
@@ -361,7 +358,7 @@ mod tests {
 
     #[test]
     fn the_key_names_the_function_the_type_the_axes_traversed_and_the_tile() {
-        let args = reduction(Function::Sum, contiguous(DType::BF16, &[4, 16, 100]), &[2]);
+        let args = reduction(Function::Sum, &contiguous(DType::BF16, &[4, 16, 100]), &[2]);
         let descriptor = Descriptor::of(Function::Sum, &args, BLOCK, false);
         assert_eq!(descriptor.reduction, 128);
         assert_eq!(
@@ -375,7 +372,7 @@ mod tests {
     fn lengths_of_one_class_share_a_key_and_a_class_past_the_block_shares_its_tile() {
         let key = |length: u64| {
             let x = contiguous(DType::F32, &[8, length]);
-            let args = reduction(Function::Max, x, &[1]);
+            let args = reduction(Function::Max, &x, &[1]);
             Descriptor::of(Function::Max, &args, BLOCK, false).to_string()
         };
 
@@ -391,7 +388,7 @@ mod tests {
     fn the_kept_and_the_reduced_axes_merge_each_on_their_own() {
         let x = contiguous(DType::F32, &[2, 3, 4, 5]);
         let ranks = |axes: &[usize]| {
-            let args = reduction(Function::Sum, x, axes);
+            let args = reduction(Function::Sum, &x, axes);
             let descriptor = Descriptor::of(Function::Sum, &args, BLOCK, false);
             Reduce::check(&descriptor, &args).unwrap();
             (descriptor.kept, descriptor.reduced)
@@ -415,7 +412,7 @@ mod tests {
     #[test]
     fn an_index_is_u32_along_exactly_one_axis() {
         let x = contiguous(DType::F32, &[4, 151_936]);
-        let args = reduction(Function::ArgMax, x, &[1]);
+        let args = reduction(Function::ArgMax, &x, &[1]);
         assert_eq!(args.out.dtype, DType::U32);
         let descriptor = Descriptor::of(Function::ArgMax, &args, BLOCK, false);
         Reduce::check(&descriptor, &args).unwrap();
@@ -429,7 +426,7 @@ mod tests {
         let message = refusal(&maximum, &args);
         assert!(message.contains("expected f32 out"), "{message}");
 
-        let both = reduction(Function::ArgMax, x, &[0, 1]);
+        let both = reduction(Function::ArgMax, &x, &[0, 1]);
         let descriptor = Descriptor::of(Function::ArgMax, &both, BLOCK, false);
         let message = refusal(&descriptor, &both);
         assert!(message.contains("an index along one axis"), "{message}");
@@ -440,7 +437,7 @@ mod tests {
         let x = contiguous(DType::F32, &[4, 8]);
 
         for axes in [&[][..], &[2], &[1, 1]] {
-            let args = reduction(Function::Sum, x, axes);
+            let args = reduction(Function::Sum, &x, axes);
             let descriptor = Descriptor::of(Function::Sum, &args, BLOCK, false);
             assert!(Reduce::check(&descriptor, &args).is_err(), "{axes:?}");
         }
@@ -449,24 +446,24 @@ mod tests {
     #[test]
     fn the_output_has_the_inputs_shape_with_the_reduced_extents_one() {
         let x = contiguous(DType::F32, &[4, 8]);
-        let args = reduction(Function::Sum, x, &[1]);
+        let args = reduction(Function::Sum, &x, &[1]);
         let descriptor = Descriptor::of(Function::Sum, &args, BLOCK, false);
 
         let squeezed = Args {
             out: contiguous(DType::F32, &[4]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(&descriptor, &squeezed);
         assert!(message.contains("expected out of shape"), "{message}");
 
         let strided_out = Args {
             out: Operand::with_strides(
-                DevicePtr::new(0x2000),
+                DevicePtr::from_address(0x2000),
                 DType::F32,
-                Shape::new(&[4, 1]),
-                Strides::new(&[2, 1]),
+                &[4, 1],
+                &[2, 1],
             ),
-            ..args
+            ..args.clone()
         };
         let message = refusal(&descriptor, &strided_out);
         assert!(message.contains("out must be contiguous"), "{message}");
@@ -484,18 +481,18 @@ mod tests {
     fn a_sum_over_no_element_is_launched_and_an_extremum_over_none_is_refused() {
         let x = contiguous(DType::F32, &[4, 0]);
 
-        let sum = reduction(Function::Sum, x, &[1]);
+        let sum = reduction(Function::Sum, &x, &[1]);
         let descriptor = Descriptor::of(Function::Sum, &sum, BLOCK, false);
         assert_eq!(descriptor.reduction, 1);
         Reduce::check(&descriptor, &sum).unwrap();
 
-        let minimum = reduction(Function::Min, x, &[1]);
+        let minimum = reduction(Function::Min, &x, &[1]);
         let descriptor = Descriptor::of(Function::Min, &minimum, BLOCK, false);
         let message = refusal(&descriptor, &minimum);
         assert!(message.contains("no element to return"), "{message}");
 
         // No output at all is nothing to launch, whatever the function.
-        let none = reduction(Function::Sum, x, &[0]);
+        let none = reduction(Function::Sum, &x, &[0]);
         let descriptor = Descriptor::of(Function::Sum, &none, BLOCK, false);
         let message = refusal(&descriptor, &none);
         assert!(message.contains("nothing to launch"), "{message}");
@@ -504,7 +501,7 @@ mod tests {
     #[test]
     fn a_floating_sum_is_bounded_by_its_class_and_everything_else_is_exact() {
         let tolerance = |function, dtype, length| {
-            let args = reduction(function, contiguous(dtype, &[4, length]), &[1]);
+            let args = reduction(function, &contiguous(dtype, &[4, length]), &[1]);
             Reduce::tolerance(&Descriptor::of(function, &args, BLOCK, false))
         };
 

@@ -25,13 +25,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -93,7 +93,7 @@ impl fmt::Display for ModulatedRmsNormDescriptor {
 /// The three modulation vectors are `[parameters, width]` with `width` unit-strided and their leading
 /// stride equal to the descriptor's, because the kernel addresses a parameter row from the leading
 /// axis alone. `update` and `retain` are present exactly when the descriptor says so.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[rows, width]`, contiguous: the activation row the mean square reduces.
     pub value: Operand,
@@ -166,14 +166,12 @@ impl Op for ModulatedRmsNorm {
         args.value.require_rank(Self::NAME, 2)?;
         args.value
             .require_row(Self::NAME, descriptor.dtype, width)?;
-        let rows = args.value.shape.dim(0);
+        let rows = args.value.dim(0);
 
-        args.weight
-            .require_shape(Self::NAME, Shape::new(&[width]))?;
+        args.weight.require_shape(Self::NAME, &[width])?;
         args.weight
             .require_row(Self::NAME, descriptor.dtype, width)?;
-        args.row_indices
-            .require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.row_indices.require_shape(Self::NAME, &[rows])?;
         if args.row_indices.dtype != descriptor.indices {
             return Err(Error::argument(
                 Self::NAME,
@@ -187,19 +185,19 @@ impl Op for ModulatedRmsNorm {
         args.row_indices
             .require_row(Self::NAME, descriptor.indices, rows)?;
 
-        let activation = Shape::new(&[rows, width]);
+        let activation = &[rows, width];
         for (name, vector, stride) in [
             ("shift", &args.shift, descriptor.shift_stride),
             ("scale", &args.scale, descriptor.scale_stride),
         ] {
             vector.require_rank(Self::NAME, 2)?;
             vector.require_row(Self::NAME, descriptor.dtype, width)?;
-            if vector.strides.get(0) != stride {
+            if vector.stride(0) != stride {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "the {name} rows are {} elements apart, the descriptor says {stride}",
-                        vector.strides.get(0)
+                        vector.stride(0)
                     ),
                 ));
             }
@@ -211,12 +209,12 @@ impl Op for ModulatedRmsNorm {
                 update.require_row(Self::NAME, descriptor.dtype, width)?;
                 gate.require_rank(Self::NAME, 2)?;
                 gate.require_row(Self::NAME, descriptor.dtype, width)?;
-                if gate.strides.get(0) != descriptor.gate_stride {
+                if gate.stride(0) != descriptor.gate_stride {
                     return Err(Error::argument(
                         Self::NAME,
                         format!(
                             "the gate rows are {} elements apart, the descriptor says {}",
-                            gate.strides.get(0),
+                            gate.stride(0),
                             descriptor.gate_stride
                         ),
                     ));
@@ -261,7 +259,7 @@ impl Op for ModulatedRmsNorm {
         }
         match (&args.output_scale, scaled_output(descriptor.output)) {
             (Some(scale), true) => {
-                scale.require_shape(Self::NAME, Shape::new(&[rows]))?;
+                scale.require_shape(Self::NAME, &[rows])?;
                 scale.require_row(Self::NAME, DType::F32, rows)?;
             }
             (None, false) => {}
@@ -304,25 +302,25 @@ impl Op for ModulatedRmsNorm {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let rows = args.value.shape.dim(0);
+        let rows = args.value.dim(0);
 
         // A flag is off, so its slot is never dereferenced; the kernel still takes the argument, and
         // an address already in the launch keeps the slot valid.
-        let update = args.update.unwrap_or(args.value);
-        let gate = args.gate.unwrap_or(args.shift);
-        let output_scale = args.output_scale.unwrap_or(args.out);
-        let retain = args.retain.unwrap_or(args.out);
+        let update = args.update.as_ref().unwrap_or(&args.value);
+        let gate = args.gate.as_ref().unwrap_or(&args.shift);
+        let output_scale = args.output_scale.as_ref().unwrap_or(&args.out);
+        let retain = args.retain.as_ref().unwrap_or(&args.out);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.value)
+            .view(&args.value)
             .view(update)
             .view(gate)
-            .view(args.weight)
-            .view(args.shift)
-            .view(args.scale)
-            .view(args.row_indices)
-            .view(args.out)
+            .view(&args.weight)
+            .view(&args.shift)
+            .view(&args.scale)
+            .view(&args.row_indices)
+            .view(&args.out)
             .view(output_scale)
             .view(retain)
             .i32(descriptor.gate_stride as i32)
@@ -384,7 +382,7 @@ impl fmt::Display for GatedResidualDescriptor {
 }
 
 /// The arguments of `gated_residual`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct GatedResidualArgs {
     /// `[rows, width]`, contiguous: the residual stream.
     pub hidden: Operand,
@@ -410,26 +408,25 @@ impl Op for GatedResidual {
         args.hidden.require_rank(Self::NAME, 2)?;
         args.hidden
             .require_row(Self::NAME, descriptor.dtype, width)?;
-        let rows = args.hidden.shape.dim(0);
-        let activation = Shape::new(&[rows, width]);
+        let rows = args.hidden.dim(0);
+        let activation = &[rows, width];
 
         args.update.require_shape(Self::NAME, activation)?;
         args.update
             .require_row(Self::NAME, descriptor.dtype, width)?;
         args.gate.require_rank(Self::NAME, 2)?;
         args.gate.require_row(Self::NAME, descriptor.dtype, width)?;
-        if args.gate.strides.get(0) != descriptor.gate_stride {
+        if args.gate.stride(0) != descriptor.gate_stride {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the gate rows are {} elements apart, the descriptor says {}",
-                    args.gate.strides.get(0),
+                    args.gate.stride(0),
                     descriptor.gate_stride
                 ),
             ));
         }
-        args.row_indices
-            .require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.row_indices.require_shape(Self::NAME, &[rows])?;
         args.row_indices
             .require_row(Self::NAME, descriptor.indices, rows)?;
         if descriptor.gate_stride > i32::MAX as u64 {
@@ -451,14 +448,14 @@ impl Op for GatedResidual {
         stream: &Stream,
     ) -> Result<()> {
         let width = u64::from(descriptor.width);
-        let rows = args.hidden.shape.dim(0);
+        let rows = args.hidden.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.hidden)
-            .view(args.update)
-            .view(args.gate)
-            .view(args.row_indices)
+            .view(&args.hidden)
+            .view(&args.update)
+            .view(&args.gate)
+            .view(&args.row_indices)
             .i32(descriptor.gate_stride as i32)
             // Appended rather than inserted, so every parameter before it keeps its offset: the
             // row count is the one thing a request changes, and the kernel multiplies it by the

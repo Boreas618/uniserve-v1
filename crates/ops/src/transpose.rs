@@ -21,13 +21,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::Operand;
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -57,7 +57,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one transpose.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[rows, columns]` the source, contiguous.
     pub input: Operand,
@@ -76,9 +76,9 @@ pub struct Transpose;
 /// same test, because the stride of the outer one is then too small.
 fn contiguous(view: &Operand) -> bool {
     let mut expected = 1;
-    for axis in (0..view.shape.rank()).rev() {
-        let extent = view.shape.dim(axis);
-        if extent != 1 && view.strides.get(axis) != expected {
+    for axis in (0..view.rank()).rev() {
+        let extent = view.dim(axis);
+        if extent != 1 && view.stride(axis) != expected {
             return false;
         }
         expected *= extent;
@@ -105,12 +105,12 @@ fn matrix(view: &Operand, name: &str, dtype: DType) -> Result<(u64, u64)> {
             format!(
                 "the {name} must be contiguous: its strides are {:?} over {:?}, which is not a \
                  packed layout",
-                view.strides.as_slice(),
-                view.shape.dims()
+                view.strides(),
+                view.dims()
             ),
         ));
     }
-    let (rows, columns) = (view.shape.dim(0), view.shape.dim(1));
+    let (rows, columns) = (view.dim(0), view.dim(1));
     if rows == 0 || columns == 0 {
         return Err(Error::argument(
             Transpose::NAME,
@@ -168,12 +168,12 @@ impl Op for Transpose {
         stream: &Stream,
     ) -> Result<()> {
         // `check` holds the input to a nonempty contiguous matrix.
-        let (rows, columns) = (args.input.shape.dim(0), args.input.shape.dim(1));
+        let (rows, columns) = (args.input.dim(0), args.input.dim(1));
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.input)
-            .view(args.out)
+            .view(&args.input)
+            .view(&args.out)
             .u64(rows)
             .u64(columns)
             .u32(descriptor.block)
@@ -210,7 +210,6 @@ impl Op for Transpose {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{Shape, Strides};
 
     fn descriptor() -> Descriptor {
         Descriptor {
@@ -222,10 +221,10 @@ mod tests {
 
     fn view(dtype: DType, shape: &[u64], strides: &[u64]) -> Operand {
         Operand::with_strides(
-            crate::tensor::DevicePtr::new(0x1000),
+            platform::DevicePtr::from_address(0x1000),
             dtype,
-            Shape::new(shape),
-            Strides::new(strides),
+            shape,
+            strides,
         )
     }
 

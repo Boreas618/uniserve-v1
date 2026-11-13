@@ -38,7 +38,7 @@ use ops::kv::{self, KvWrite, KvWriteScaled};
 use proto::module::PhaseKind;
 use tensor::{D, DType, Device, Shape, Tensor};
 
-use super::nvfp4::{integer, remainder};
+use super::nvfp4::integer;
 use super::rotary::heads_of;
 use super::{ACCUMULATE, PDL, on_cpu};
 use crate::capability::{KvCache, KvPlanes, NO_SLOT, TokenBatch};
@@ -330,8 +330,8 @@ fn dense(
         return Ok(attended.to_dtype(query.dtype())?);
     }
 
-    let out = backend::empty(query.shape(), query.dtype())?;
-    backend::launch::<DenseAttention>(
+    let out = ops::empty(query.shape(), query.dtype())?;
+    ops::launch::<DenseAttention>(
         // The widths are the tensors' and the key bound the call's; whether offset tables are
         // read selects one of two kernels, so a launch never reads a table at a null address.
         &DenseDescriptor {
@@ -347,16 +347,16 @@ fn dense(
             cu_seq_lens: sequences.is_some(),
         },
         DenseArgs {
-            query: backend::operand(query)?,
-            key: backend::operand(key)?,
-            value: backend::operand(value)?,
+            query: ops::operand(query)?,
+            key: ops::operand(key)?,
+            value: ops::operand(value)?,
             cu_seq_lens_q: sequences
-                .map(|(queries, _, _)| backend::operand(queries))
+                .map(|(queries, _, _)| ops::operand(queries))
                 .transpose()?,
             cu_seq_lens_k: sequences
-                .map(|(_, keys, _)| backend::operand(keys))
+                .map(|(_, keys, _)| ops::operand(keys))
                 .transpose()?,
-            out: backend::operand(&out)?,
+            out: ops::operand(&out)?,
             scale: softmax_scale,
             window_left: window_left(window),
             causal,
@@ -587,8 +587,8 @@ pub fn paged_attention(
         return Ok(attended.to_dtype(query.dtype())?);
     }
 
-    let out = backend::empty(query.shape(), query.dtype())?;
-    backend::launch::<PagedAttention>(
+    let out = ops::empty(query.shape(), query.dtype())?;
+    ops::launch::<PagedAttention>(
         // The phase is the batch's, because a prefill reads a whole sequence and a decode one
         // token; the three element types are the query's, the planes' and the output's, because
         // the kernel is compiled for the combination.
@@ -606,16 +606,16 @@ pub fn paged_attention(
             max_kv_len,
         },
         Args {
-            query: backend::operand(query)?,
-            key: backend::operand(&planes.key)?,
-            value: backend::operand(&planes.value)?,
-            key_scale: key_scale.map(backend::operand).transpose()?,
-            value_scale: value_scale.map(backend::operand).transpose()?,
-            page_table: backend::operand(table)?,
-            seq_lens: backend::operand(&batch.seq_lens)?,
-            cum_seq_lens_q: backend::operand(&batch.query_offsets)?,
-            out: backend::operand(&out)?,
-            workspace: backend::operand(&cache.workspace)?,
+            query: ops::operand(query)?,
+            key: ops::operand(&planes.key)?,
+            value: ops::operand(&planes.value)?,
+            key_scale: key_scale.map(ops::operand).transpose()?,
+            value_scale: value_scale.map(ops::operand).transpose()?,
+            page_table: ops::operand(table)?,
+            seq_lens: ops::operand(&batch.seq_lens)?,
+            cum_seq_lens_q: ops::operand(&batch.query_offsets)?,
+            out: ops::operand(&out)?,
+            workspace: ops::operand(&cache.workspace)?,
             scale: softmax_scale,
             window_left: window_left(window),
             causal: true,
@@ -646,7 +646,7 @@ fn paged_formula(
         .block_tables
         .index_select(&place.broadcast_div(&page_slot)?, 1)?
         .broadcast_mul(&page_slot)?
-        .broadcast_add(&remainder(&place, page)?)?;
+        .broadcast_add(&place.broadcast_remainder(&integer(page, &place)?)?)?;
     let stored = place
         .unsqueeze(0)?
         .broadcast_lt(&batch.seq_lens.reshape((rows, 1))?)?;
@@ -818,7 +818,7 @@ pub fn kv_write_(
         return Ok(());
     }
 
-    backend::launch::<KvWrite>(
+    ops::launch::<KvWrite>(
         // The projection's type and the plane's are both key fields.
         &kv::Descriptor {
             dtype: key.dtype(),
@@ -830,13 +830,13 @@ pub fn kv_write_(
             pdl: PDL,
         },
         kv::Args {
-            key: backend::operand(key)?,
-            value: backend::operand(value)?,
-            key_cache: backend::operand(&planes.key)?,
-            value_cache: backend::operand(&planes.value)?,
-            slots: backend::operand(slots)?,
-            key_initialized: backend::operand(&planes.key_initialized)?,
-            value_initialized: backend::operand(&planes.value_initialized)?,
+            key: ops::operand(key)?,
+            value: ops::operand(value)?,
+            key_cache: ops::operand(&planes.key)?,
+            value_cache: ops::operand(&planes.value)?,
+            slots: ops::operand(slots)?,
+            key_initialized: ops::operand(&planes.key_initialized)?,
+            value_initialized: ops::operand(&planes.value_initialized)?,
         },
     )?;
     Ok(())
@@ -899,14 +899,14 @@ fn write_scaled(
             continue;
         }
 
-        backend::launch::<KvWriteScaled>(
+        ops::launch::<KvWriteScaled>(
             &descriptor,
             kv::ScaledWriteArgs {
-                source: backend::operand(&rows)?,
-                slots: backend::operand(slots)?,
-                scales: backend::operand(scale)?,
-                cache: backend::operand(plane)?,
-                initialized: backend::operand(flags)?,
+                source: ops::operand(&rows)?,
+                slots: ops::operand(slots)?,
+                scales: ops::operand(scale)?,
+                cache: ops::operand(plane)?,
+                initialized: ops::operand(flags)?,
             },
         )?;
     }

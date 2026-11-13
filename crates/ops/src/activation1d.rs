@@ -40,13 +40,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -142,7 +142,7 @@ pub fn lowpass_length(width: u64, kernel: u64, ratio: u64) -> Result<u64> {
 }
 
 /// The arguments of one fused activation.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[channels, length]` the signal entering the block.
     pub values: Operand,
@@ -199,15 +199,14 @@ impl Op for Activation1d {
         }
         let out_length = descriptor.output(length)?;
 
-        args.values
-            .require_shape(Self::NAME, Shape::new(&[channels, length]))?;
+        args.values.require_shape(Self::NAME, &[channels, length])?;
         args.out
-            .require_shape(Self::NAME, Shape::new(&[channels, out_length]))?;
+            .require_shape(Self::NAME, &[channels, out_length])?;
         for (name, view) in [
-            ("values", args.values),
-            ("out", args.out),
-            ("filter_up", args.filter_up),
-            ("filter_down", args.filter_down),
+            ("values", &args.values),
+            ("out", &args.out),
+            ("filter_up", &args.filter_up),
+            ("filter_down", &args.filter_down),
         ] {
             if view.dtype != descriptor.dtype {
                 return Err(Error::argument(
@@ -220,11 +219,11 @@ impl Op for Activation1d {
                 ));
             }
         }
-        for view in [args.filter_up, args.filter_down] {
-            view.require_shape(Self::NAME, Shape::new(&[1, 1, taps]))?;
+        for view in [&args.filter_up, &args.filter_down] {
+            view.require_shape(Self::NAME, &[1, 1, taps])?;
         }
-        for (name, view) in [("alpha", args.alpha), ("beta", args.beta)] {
-            view.require_shape(Self::NAME, Shape::new(&[channels]))?;
+        for (name, view) in [("alpha", &args.alpha), ("beta", &args.beta)] {
+            view.require_shape(Self::NAME, &[channels])?;
             if view.dtype != DType::F32 {
                 return Err(Error::argument(
                     Self::NAME,
@@ -255,12 +254,12 @@ impl Op for Activation1d {
         // Every narrowing below is of a value `check` holds within its kernel parameter.
         let mut arguments = Arguments::new();
         arguments
-            .view(args.values)
-            .view(args.alpha)
-            .view(args.beta)
-            .view(args.filter_up)
-            .view(args.filter_down)
-            .view(args.out)
+            .view(&args.values)
+            .view(&args.alpha)
+            .view(&args.beta)
+            .view(&args.filter_up)
+            .view(&args.filter_down)
+            .view(&args.out)
             .u32(descriptor.channels)
             .u32(descriptor.kernel)
             .u32(descriptor.ratio)

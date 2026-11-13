@@ -21,18 +21,29 @@
 //!
 //! ## The words
 //!
-//! A program takes [`MAX_RANK`] strides per strided operand and `MAX_RANK − 1` extents per index
-//! space, right-aligned: axis `k` of `rank` axes is slot `MAX_RANK − rank + k`, and the slots
+//! A program takes [`SLOTS`] strides per strided operand and `SLOTS − 1` extents per index
+//! space, right-aligned: axis `k` of `rank` axes is slot `SLOTS − rank + k`, and the slots
 //! before it are unit extents and zero strides that a program compiled for `rank` never reads.
 //! The extent of slot 0 does not travel: only an outermost axis can sit there, and a row-major
 //! index needs no modulus on its outermost axis.
+//!
+//! An operand takes as many axes as a tensor does, and the folding brings a call down to the axes
+//! its address arithmetic needs, which is what the slots carry: a call that still traverses more
+//! axes than [`SLOTS`] after folding is refused by its operator's check.
 
-use tensor::DType;
+use platform::Stream;
+use tensor::nditer::merge_axes as fold;
+use tensor::{DType, Layout, Shape};
 
 use crate::kernel::Arguments;
-use crate::platform::Stream;
-use crate::tensor::{MAX_RANK, Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::{Error, Result, Twins, abi};
+
+/// The axes a primitive's program addresses: the extent and stride words of the packages' ABI.
+///
+/// Every primitive package is compiled against six stride words per operand and five extent
+/// words per index space; a descriptor's `rank` is at most this.
+pub(crate) const SLOTS: usize = 6;
 
 /// The element types the primitives compute with.
 pub(crate) const ELEMENTS: [DType; 9] = [
@@ -124,21 +135,22 @@ pub(crate) fn require_dtype(
     ))
 }
 
-/// Check that the operand `name` has the extents of `shape`.
+/// Check that the operand `name` has the extents `dims`.
 pub(crate) fn require_shape(
     operator: &'static str,
     name: &str,
     operand: &Operand,
-    shape: Shape,
+    dims: &[usize],
 ) -> Result<()> {
-    if operand.shape.matches(&shape) && operand.strides.rank() == shape.rank() {
+    if operand.dims() == dims {
         return Ok(());
     }
     Err(Error::argument(
         operator,
         format!(
-            "expected {name} of shape {:?}, found {:?} with strides {:?}",
-            shape, operand.shape, operand.strides
+            "expected {name} of shape {dims:?}, found {:?} with strides {:?}",
+            operand.dims(),
+            operand.strides()
         ),
     ))
 }
@@ -158,7 +170,7 @@ pub(crate) fn require_elements(
             operator,
             format!(
                 "{name} of shape {:?} has no element, so there is nothing to launch",
-                operand.shape
+                operand.dims()
             ),
         ));
     }
@@ -169,8 +181,7 @@ pub(crate) fn require_elements(
 /// as.
 pub(crate) fn require_words(operator: &'static str, name: &str, operand: &Operand) -> Result<()> {
     if let Some(stride) = operand
-        .strides
-        .as_slice()
+        .strides()
         .iter()
         .find(|&&stride| i64::try_from(stride).is_err())
     {
@@ -188,9 +199,9 @@ pub(crate) fn require_words(operator: &'static str, name: &str, operand: &Operan
 /// An axis of one element may carry any stride, since no step is ever taken along it.
 pub(crate) fn is_contiguous(operand: &Operand) -> bool {
     let mut expected = 1;
-    for axis in (0..operand.shape.rank()).rev() {
-        let extent = operand.shape.dim(axis);
-        if extent != 1 && operand.strides.get(axis) != expected {
+    for axis in (0..operand.rank()).rev() {
+        let extent = operand.dim(axis);
+        if extent != 1 && operand.stride(axis) != expected {
             return false;
         }
         expected *= extent;
@@ -211,7 +222,8 @@ pub(crate) fn require_contiguous(
         operator,
         format!(
             "{name} must be contiguous: its strides are {:?} over {:?}",
-            operand.strides, operand.shape
+            operand.strides(),
+            operand.dims()
         ),
     ))
 }
@@ -226,19 +238,20 @@ pub(crate) fn require_contiguous(
 pub(crate) fn require_window(operator: &'static str, name: &str, operand: &Operand) -> Result<()> {
     // The largest offset the axes inside the current one reach.
     let mut reach = 0_u64;
-    for axis in (0..operand.shape.rank()).rev() {
-        let extent = operand.shape.dim(axis);
+    for axis in (0..operand.rank()).rev() {
+        let extent = operand.dim(axis);
         if extent <= 1 {
             continue;
         }
-        let stride = operand.strides.get(axis);
+        let stride = operand.stride(axis);
         if stride <= reach {
             return Err(Error::argument(
                 operator,
                 format!(
                     "axis {axis} of {name} advances by {stride} elements while the axes inside it \
                      reach {reach}: its strides {:?} over {:?} are no row-major window",
-                    operand.strides, operand.shape
+                    operand.strides(),
+                    operand.dims()
                 ),
             ));
         }
@@ -247,13 +260,23 @@ pub(crate) fn require_window(operator: &'static str, name: &str, operand: &Opera
     Ok(())
 }
 
-/// Check that a descriptor states the axes its call traverses.
+/// Check that a descriptor states the axes its call traverses, and that the program's slots
+/// hold them.
 pub(crate) fn require_rank(
     operator: &'static str,
     field: &str,
     stated: u8,
     traversed: u8,
 ) -> Result<()> {
+    if usize::from(traversed) > SLOTS {
+        return Err(Error::argument(
+            operator,
+            format!(
+                "the operands traverse {traversed} axes once folded, and a primitive's program \
+                 addresses at most {SLOTS}"
+            ),
+        ));
+    }
     if stated == traversed {
         return Ok(());
     }
@@ -267,11 +290,14 @@ pub(crate) fn require_rank(
 /// operand reaches.
 pub(crate) fn span(operand: &Operand) -> u64 {
     let last = operand
-        .shape
         .dims()
         .iter()
-        .zip(operand.strides.as_slice())
-        .map(|(&extent, &stride)| extent.saturating_sub(1).saturating_mul(stride))
+        .zip(operand.strides())
+        .map(|(&extent, &stride)| {
+            (extent as u64)
+                .saturating_sub(1)
+                .saturating_mul(stride as u64)
+        })
         .fold(0_u64, u64::saturating_add);
     last.saturating_add(1)
 }
@@ -287,140 +313,76 @@ pub(crate) fn shadow_window(destination: Operand, twins: &mut Twins, stream: &St
         return twins.shadow_of(destination);
     }
 
-    let reached = Operand::new(
-        destination.ptr,
-        destination.dtype,
-        Shape::new(&[span(&destination)]),
-    );
+    let reached = Operand::new(destination.ptr, destination.dtype, &[span(&destination)]);
     destination.at(twins.in_place(reached, stream).ptr)
 }
 
-/// The operands with every run of adjacent axes they all step through as one merged into one axis.
+/// The operands with every run of adjacent axes they all step through as one merged into one axis,
+/// by the tensor library's folding ([`merge_axes`](tensor::nditer::merge_axes)).
 ///
-/// The operands share one shape, which is the rule of every elementwise call. Two adjacent axes
-/// merge when each operand's outer stride is the inner extent times its inner stride, and an axis
-/// of one element merges with its neighbour whatever stride it carries. An operand of no axis
-/// comes back as one axis of one element. The result names the same elements at the same
-/// addresses in the same row-major order.
+/// The operands share one shape, which is the rule of every elementwise call. The result names
+/// the same elements at the same addresses in the same row-major order, with at least one axis.
 ///
 /// Operands of differing shapes come back as they are, for the operator's `check` to refuse.
-pub(crate) fn merge_axes<const N: usize>(operands: [Operand; N]) -> [Operand; N] {
+pub(crate) fn merge_axes<const N: usize>(operands: [&Operand; N]) -> [Operand; N] {
     let Some(first) = operands.first() else {
-        return operands;
+        return operands.map(Operand::clone);
     };
-    let shape = first.shape;
-    let alike = operands
-        .iter()
-        .all(|operand| operand.shape.matches(&shape) && operand.strides.rank() == shape.rank());
-    if !alike {
-        return operands;
+    let dims = first.dims();
+    if !operands.iter().all(|operand| operand.dims() == dims) {
+        return operands.map(Operand::clone);
     }
 
-    // Built from the last axis outward, so slot 0 is the innermost run. A slot never written is
-    // the one axis of an operand that has none: one element, no step.
-    let mut extents = [1_u64; MAX_RANK];
-    let mut strides = [[0_u64; MAX_RANK]; N];
-    let mut axes = 0;
-
-    for axis in (0..shape.rank()).rev() {
-        let extent = shape.dim(axis);
-
-        if axes > 0 {
-            let inner = axes - 1;
-            let inner_extent = extents[inner];
-            let together = extent == 1
-                || inner_extent == 1
-                || operands.iter().zip(&strides).all(|(operand, merged)| {
-                    inner_extent.checked_mul(merged[inner]) == Some(operand.strides.get(axis))
-                });
-
-            if together {
-                if inner_extent == 1 {
-                    // A run of one element takes no step of its own: it takes this axis's.
-                    for (operand, merged) in operands.iter().zip(&mut strides) {
-                        merged[inner] = operand.strides.get(axis);
-                    }
-                }
-                extents[inner] = extent.saturating_mul(inner_extent);
-                continue;
-            }
-        }
-
-        extents[axes] = extent;
-        for (operand, merged) in operands.iter().zip(&mut strides) {
-            merged[axes] = operand.strides.get(axis);
-        }
-        axes += 1;
-    }
-    let axes = axes.max(1);
-
-    let mut dims = [0_u64; MAX_RANK];
-    for (axis, dim) in dims[..axes].iter_mut().enumerate() {
-        *dim = extents[axes - 1 - axis];
-    }
-    let shape = Shape::new(&dims[..axes]);
+    let (extents, strides) = fold(dims, operands.map(Operand::strides));
+    let shape = Shape::from(extents);
 
     std::array::from_fn(|operand| {
-        let mut steps = [0_u64; MAX_RANK];
-        for (axis, step) in steps[..axes].iter_mut().enumerate() {
-            *step = strides[operand][axes - 1 - axis];
-        }
-        Operand::with_strides(
-            operands[operand].ptr,
-            operands[operand].dtype,
-            shape,
-            Strides::new(&steps[..axes]),
-        )
+        let layout = Layout::new(shape.clone(), strides[operand].clone(), 0);
+        Operand::with_layout(operands[operand].ptr, operands[operand].dtype, &layout)
     })
 }
 
 /// The number of axes a program traverses for `operands`: what is left once [`merge_axes`] has
 /// folded them.
-pub(crate) fn rank<const N: usize>(operands: [Operand; N]) -> u8 {
+pub(crate) fn rank<const N: usize>(operands: [&Operand; N]) -> u8 {
     merge_axes(operands)
         .first()
-        .map_or(1, |operand| operand.shape.rank() as u8)
+        .map_or(1, |operand| operand.rank() as u8)
 }
 
 /// The view of `operand` along the axes `keep` selects, at index zero of every other axis.
 pub(crate) fn select_axes(operand: &Operand, keep: impl Fn(usize) -> bool) -> Operand {
-    let mut dims = [0_u64; MAX_RANK];
-    let mut strides = [0_u64; MAX_RANK];
-    let mut axes = 0;
+    let (dims, strides): (Vec<usize>, Vec<usize>) = (0..operand.rank())
+        .filter(|&axis| keep(axis))
+        .map(|axis| (operand.dims()[axis], operand.strides()[axis]))
+        .unzip();
 
-    for axis in 0..operand.shape.rank() {
-        if keep(axis) {
-            dims[axes] = operand.shape.dim(axis);
-            strides[axes] = operand.strides.get(axis);
-            axes += 1;
-        }
-    }
-
-    Operand::with_strides(
-        operand.ptr,
-        operand.dtype,
-        Shape::new(&dims[..axes]),
-        Strides::new(&strides[..axes]),
-    )
+    let layout = Layout::new(Shape::from(dims), strides, 0);
+    Operand::with_layout(operand.ptr, operand.dtype, &layout)
 }
 
-/// Pack the extents of an index space: the words of slots 1 to `MAX_RANK − 1`, right-aligned,
-/// unit before the first axis.
-pub(crate) fn pack_extents(arguments: &mut Arguments, shape: Shape) {
-    let pad = MAX_RANK - shape.rank();
-    for word in 1..MAX_RANK {
-        arguments.u64(if word < pad { 1 } else { shape.dim(word - pad) });
+/// Pack the extents of an index space: the words of slots 1 to `SLOTS − 1`, right-aligned,
+/// unit before the first axis. The caller's check refused more than [`SLOTS`] axes.
+pub(crate) fn pack_extents(arguments: &mut Arguments, operand: &Operand) {
+    let pad = SLOTS - operand.rank();
+    for word in 1..SLOTS {
+        arguments.u64(if word < pad {
+            1
+        } else {
+            operand.dim(word - pad)
+        });
     }
 }
 
-/// Pack an operand's strides: `MAX_RANK` words, right-aligned, zero before the first axis.
-pub(crate) fn pack_strides(arguments: &mut Arguments, strides: Strides) {
-    let pad = MAX_RANK - strides.rank();
-    for word in 0..MAX_RANK {
+/// Pack an operand's strides: `SLOTS` words, right-aligned, zero before the first axis. The
+/// caller's check refused more than [`SLOTS`] axes.
+pub(crate) fn pack_strides(arguments: &mut Arguments, operand: &Operand) {
+    let pad = SLOTS - operand.rank();
+    for word in 0..SLOTS {
         arguments.u64(if word < pad {
             0
         } else {
-            strides.get(word - pad)
+            operand.stride(word - pad)
         });
     }
 }

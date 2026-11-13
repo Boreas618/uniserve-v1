@@ -62,10 +62,9 @@ use nn::modules::{
     ResnetBlock3d, ResnetBlock3dConfig, Rotary, RotaryConfig, Spectrum,
 };
 use nn::vae::{self, TemporalClips};
-use nn::{
-    Clip, DType, Decoder, Device, LatentShape, Layout, PixelNorm, Splice, Split, Tensor, VarBuilder,
-};
+use nn::{Clip, DType, Decoder, Device, LatentShape, PixelNorm, Splice, Split, Tensor, VarBuilder};
 use processing::minimax_h3::{FRAMES, LATENT_COMPRESSION};
+use proto::video::Layout;
 
 use crate::minimax_h3::{Error, Result, VideoVaeConfig};
 

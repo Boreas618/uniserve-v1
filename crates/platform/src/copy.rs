@@ -7,13 +7,11 @@
 //! until the stream reaches the copy.
 
 mod pitched;
-mod strided;
 
 use crate::driver::{MemLocation, MemcpyAttributes, driver};
 use crate::{Error, Result, Stream};
 
 pub use pitched::{Pitched, PitchedBatch};
-pub use strided::{Strided, StridedCopy};
 
 /// When a batched copy reads its sources (`CUmemcpySrcAccessOrder`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

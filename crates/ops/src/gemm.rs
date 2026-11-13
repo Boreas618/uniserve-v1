@@ -28,13 +28,13 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use platform::{DevicePtr, Stream};
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
-use crate::platform::{self, DevicePtr, Stream};
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -106,6 +106,45 @@ impl fmt::Display for Descriptor {
             .field("order", self.order)
             .field("epilogue", self.epilogue)
             .finish(formatter)
+    }
+}
+
+impl Descriptor {
+    /// The descriptor of the product `args` states, with the weight stored in `order`: the
+    /// operands' element types, an FP32 accumulation rounded once into the output's type, a bias
+    /// epilogue exactly when the call has a bias, and the contraction over the input's last axis.
+    ///
+    /// This is the one place a dense product's descriptor is made: the tensor library's `matmul`
+    /// on this backend and `nn`'s projections state their calls and take the descriptor from here,
+    /// so one product has one key whichever path launched it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] when the input's last axis does not fit the descriptor's 32 bits.
+    pub fn of(args: &Args, order: WeightOrder) -> Result<Self> {
+        let k = u32::try_from(args.input.last()).map_err(|_| {
+            Error::argument(
+                Gemm::NAME,
+                format!(
+                    "a contraction over {} elements exceeds the operator's length",
+                    args.input.last()
+                ),
+            )
+        })?;
+
+        Ok(Self {
+            input: args.input.dtype,
+            weight: args.weight.dtype,
+            accumulate: DType::F32,
+            output: args.out.dtype,
+            order,
+            epilogue: if args.bias.is_some() {
+                Epilogue::Bias
+            } else {
+                Epilogue::None
+            },
+            k,
+        })
     }
 }
 
@@ -198,7 +237,7 @@ impl NativeCall for Call {
 }
 
 /// The arguments of one product.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// Activations, `[m, k]`.
     pub input: Operand,
@@ -258,8 +297,8 @@ impl Op for Gemm {
         }
         Self::operands(descriptor)?;
         let (n, weight_row_stride) = match descriptor.order {
-            WeightOrder::KxN => (args.weight.last(), row_stride(&args.weight.strides)),
-            WeightOrder::NxK => (args.weight.rows(), row_stride(&args.weight.strides)),
+            WeightOrder::KxN => (args.weight.last(), row_stride(&args.weight)),
+            WeightOrder::NxK => (args.weight.rows(), row_stride(&args.weight)),
         };
         args.input.require_row(Self::NAME, descriptor.input, k)?;
         if args.out.dtype != descriptor.output {
@@ -272,30 +311,28 @@ impl Op for Gemm {
                 ),
             ));
         }
-        args.out.require_shape(Self::NAME, Shape::new(&[m, n]))?;
-        if args.out.strides.last() != 1 {
+        args.out.require_shape(Self::NAME, &[m, n])?;
+        if args.out.last_stride() != 1 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "expected a unit stride on the output's last axis, found {}",
-                    args.out.strides.last()
+                    args.out.last_stride()
                 ),
             ));
         }
-        args.weight.require_shape(
-            Self::NAME,
-            match descriptor.order {
-                WeightOrder::KxN => Shape::new(&[k, n]),
-                WeightOrder::NxK => Shape::new(&[n, k]),
-            },
-        )?;
-        if args.weight.strides.last() != 1 {
+        let weight_dims = match descriptor.order {
+            WeightOrder::KxN => [k, n],
+            WeightOrder::NxK => [n, k],
+        };
+        args.weight.require_shape(Self::NAME, &weight_dims)?;
+        if args.weight.last_stride() != 1 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "expected a unit stride on the weight's last axis, found {}: a transposed \
                      weight is the other weight order over the stored matrix",
-                    args.weight.strides.last()
+                    args.weight.last_stride()
                 ),
             ));
         }
@@ -303,9 +340,9 @@ impl Op for Gemm {
         require_rows("weight", &args.weight)?;
         require_rows("out", &args.out)?;
 
-        match (descriptor.epilogue, args.bias) {
+        match (descriptor.epilogue, &args.bias) {
             (Epilogue::Bias, Some(bias)) => {
-                bias.require_shape(Self::NAME, Shape::new(&[n]))?;
+                bias.require_shape(Self::NAME, &[n])?;
             }
             (Epilogue::Bias, None) => {
                 return Err(Error::argument(
@@ -327,9 +364,9 @@ impl Op for Gemm {
             m,
             n,
             k,
-            row_stride(&args.input.strides),
+            row_stride(&args.input),
             weight_row_stride,
-            row_stride(&args.out.strides),
+            row_stride(&args.out),
         ] {
             to_i64(value)?;
         }
@@ -345,11 +382,11 @@ impl Op for Gemm {
         let m = args.input.rows();
         let k = args.input.last();
         let (n, weight_row_stride) = match descriptor.order {
-            WeightOrder::KxN => (args.weight.last(), row_stride(&args.weight.strides)),
-            WeightOrder::NxK => (args.weight.rows(), row_stride(&args.weight.strides)),
+            WeightOrder::KxN => (args.weight.last(), row_stride(&args.weight)),
+            WeightOrder::NxK => (args.weight.rows(), row_stride(&args.weight)),
         };
         // `check` pairs the bias with the epilogue that adds it.
-        let bias = match args.bias {
+        let bias = match &args.bias {
             Some(bias) => address(bias.ptr) as usize as *const c_void,
             None => std::ptr::null(),
         };
@@ -363,9 +400,9 @@ impl Op for Gemm {
             m: m as i64,
             n: n as i64,
             k: k as i64,
-            input_row_stride: row_stride(&args.input.strides) as i64,
+            input_row_stride: row_stride(&args.input) as i64,
             weight_row_stride: weight_row_stride as i64,
-            out_row_stride: row_stride(&args.out.strides) as i64,
+            out_row_stride: row_stride(&args.out) as i64,
             alpha: args.alpha,
             error: [0; 512],
         };
@@ -403,7 +440,7 @@ impl Op for Gemm {
 /// before the row axis only multiply the row count, so each of them steps over the rows inside
 /// it.
 fn require_rows(name: &str, operand: &Operand) -> Result<()> {
-    let (stride, length) = (row_stride(&operand.strides), operand.last());
+    let (stride, length) = (row_stride(operand), operand.last());
     if stride < length {
         return Err(Error::argument(
             Gemm::NAME,
@@ -411,28 +448,28 @@ fn require_rows(name: &str, operand: &Operand) -> Result<()> {
                 "the {name}'s rows are {stride} elements apart and {length} long: a row stride \
                  is a leading dimension, which is no shorter than a row, in the view {:?} with \
                  strides {:?}",
-                operand.shape, operand.strides
+                operand.dims(),
+                operand.strides()
             ),
         ));
     }
 
-    let rank = operand.shape.rank();
+    let rank = operand.rank();
     for axis in 0..rank.saturating_sub(2) {
         let inside = operand
-            .shape
             .dim(axis + 1)
-            .saturating_mul(operand.strides.get(axis + 1));
+            .saturating_mul(operand.stride(axis + 1));
 
-        if operand.shape.dim(axis) > 1 && operand.strides.get(axis) != inside {
+        if operand.dim(axis) > 1 && operand.stride(axis) != inside {
             return Err(Error::argument(
                 Gemm::NAME,
                 format!(
                     "axis {axis} of the {name} advances by {} elements where the rows inside it \
                      span {inside}: its rows are not one stride apart, in the view {:?} with \
                      strides {:?}",
-                    operand.strides.get(axis),
-                    operand.shape,
-                    operand.strides
+                    operand.stride(axis),
+                    operand.dims(),
+                    operand.strides()
                 ),
             ));
         }
@@ -441,16 +478,16 @@ fn require_rows(name: &str, operand: &Operand) -> Result<()> {
 }
 
 /// The elements between consecutive rows of a view.
-fn row_stride(strides: &Strides) -> u64 {
-    if strides.rank() >= 2 {
-        strides.get(strides.rank() - 2)
+fn row_stride(view: &Operand) -> u64 {
+    if view.rank() >= 2 {
+        view.stride(view.rank() - 2)
     } else {
         0
     }
 }
 
 fn address(pointer: DevicePtr) -> u64 {
-    platform::address(pointer)
+    pointer.address()
 }
 
 fn to_i64(value: u64) -> Result<i64> {
@@ -489,12 +526,7 @@ mod tests {
     }
 
     fn matrix(shape: &[u64], strides: &[u64]) -> Operand {
-        Operand::with_strides(
-            DevicePtr::new(0x1000),
-            DType::BF16,
-            Shape::new(shape),
-            Strides::new(strides),
-        )
+        Operand::with_strides(DevicePtr::from_address(0x1000), DType::BF16, shape, strides)
     }
 
     /// Four rows of eight against a weight stored `[n, k]` with five outputs.
@@ -527,14 +559,14 @@ mod tests {
             input: matrix(&[4, 8], &[12, 1]),
             weight: matrix(&[5, 8], &[16, 1]),
             out: matrix(&[4, 5], &[9, 1]),
-            ..args
+            ..args.clone()
         };
         Gemm::check(&descriptor, &windows).unwrap();
 
         // A batch folded into the rows: two members of two rows each, contiguous.
         let folded = Args {
             input: matrix(&[2, 2, 8], &[16, 8, 1]),
-            ..args
+            ..args.clone()
         };
         Gemm::check(&descriptor, &folded).unwrap();
 
@@ -545,7 +577,7 @@ mod tests {
         };
         let args = Args {
             weight: matrix(&[8, 5], &[5, 1]),
-            ..args
+            ..args.clone()
         };
         Gemm::check(&stored, &args).unwrap();
     }
@@ -557,7 +589,7 @@ mod tests {
         // `[k, n]` storage read as `[n, k]`: its transpose.
         let transposed = Args {
             weight: matrix(&[5, 8], &[1, 5]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(&descriptor, &transposed);
         assert!(
@@ -568,7 +600,7 @@ mod tests {
         // Every other column of a wider weight.
         let stepped = Args {
             weight: matrix(&[5, 8], &[16, 2]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(&descriptor, &stepped);
         assert!(message.contains("found 2"), "{message}");
@@ -581,7 +613,7 @@ mod tests {
         // One row repeated over the batch: a broadcast.
         let broadcast = Args {
             input: matrix(&[4, 8], &[0, 1]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(&descriptor, &broadcast);
         assert!(
@@ -592,7 +624,7 @@ mod tests {
         // Rows that overlap.
         let overlapping = Args {
             weight: matrix(&[5, 8], &[4, 1]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(&descriptor, &overlapping);
         assert!(
@@ -602,7 +634,7 @@ mod tests {
 
         let out = Args {
             out: matrix(&[4, 5], &[0, 1]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(&descriptor, &out);
         assert!(
@@ -614,7 +646,7 @@ mod tests {
         let vector = Args {
             input: matrix(&[8], &[1]),
             out: matrix(&[1, 5], &[5, 1]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(&descriptor, &vector);
         assert!(
@@ -630,7 +662,7 @@ mod tests {
         // Two members of two rows, the members three rows apart.
         let spaced = Args {
             input: matrix(&[2, 2, 8], &[24, 8, 1]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(&descriptor, &spaced);
         assert!(
@@ -641,12 +673,35 @@ mod tests {
         // One member repeated.
         let repeated = Args {
             input: matrix(&[2, 2, 8], &[0, 8, 1]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(&descriptor, &repeated);
         assert!(
             message.contains("axis 0 of the input advances by 0"),
             "{message}"
+        );
+    }
+
+    /// A product's descriptor follows from its operands, so a `matmul` of the tensor library and
+    /// a projection of `nn` over the same operands state the key the stored module carries.
+    #[test]
+    fn a_products_descriptor_follows_from_its_operands() {
+        let (stated, mut args) = product();
+        let plain = Descriptor::of(&args, WeightOrder::NxK).unwrap();
+        assert_eq!(plain, stated);
+        assert_eq!(
+            plain.to_string(),
+            "input_bf16_weight_bf16_accumulate_f32_output_bf16_order_nxk_epilogue_none"
+        );
+
+        // A bias is the bias epilogue; the order is the caller's statement of the weight.
+        args.bias = Some(matrix(&[5], &[1]));
+        let biased = Descriptor::of(&args, WeightOrder::KxN).unwrap();
+        assert_eq!(biased.epilogue, Epilogue::Bias);
+        assert_eq!(biased.k, 8);
+        assert_eq!(
+            biased.to_string(),
+            "input_bf16_weight_bf16_accumulate_f32_output_bf16_order_kxn_epilogue_bias"
         );
     }
 }

@@ -21,7 +21,7 @@
 //! row of a small device table, written once per batch before the first page's kernels; the
 //! row is I32, the element type `cache_copy_region` reads its units in.
 //!
-//! The two kernels launch through `backend::launch` under a context of the conversion's own,
+//! The two kernels launch through `ops::launch` under a context of the conversion's own,
 //! over the copy stream and the generation the rank serves from; it allocates nothing, the
 //! scratch and the table being the conversion's storage.
 
@@ -106,7 +106,7 @@ fn convert_page(
     units: &Tensor,
 ) -> Result<()> {
     for (index, field) in FIELDS.into_iter().enumerate() {
-        backend::launch::<PageConversion>(
+        ops::launch::<PageConversion>(
             &ConversionDescriptor {
                 field,
                 source,
@@ -117,7 +117,7 @@ fn convert_page(
                 scaled: false,
             },
             ConversionArgs {
-                scratch: backend::operand(scratch)?,
+                scratch: ops::operand(scratch)?,
                 elements: group.page_elements(),
                 scales: 0,
                 block_size: group.block_size,
@@ -126,7 +126,7 @@ fn convert_page(
         )?;
 
         let (values, scale, initialized) = planes.fields(index)?;
-        backend::launch::<CacheCopyRegion>(
+        ops::launch::<CacheCopyRegion>(
             &CopyRegionDescriptor {
                 field,
                 columns: layout.columns,
@@ -138,11 +138,11 @@ fn convert_page(
                 scaled: layout.quantized,
             },
             CopyRegionArgs {
-                values: backend::operand(&values)?,
-                scale: scale.as_ref().map(backend::operand).transpose()?,
-                initialized: backend::operand(&initialized)?,
-                source: backend::operand(block)?,
-                units: backend::operand(units)?,
+                values: ops::operand(&values)?,
+                scale: scale.as_ref().map(ops::operand).transpose()?,
+                initialized: ops::operand(&initialized)?,
+                source: ops::operand(block)?,
+                units: ops::operand(units)?,
                 offset: 0,
                 count: u64::from(group.block_size),
             },
@@ -181,7 +181,7 @@ pub(crate) fn keys(
     // SAFETY: meta tensors have no data and their addresses are never read.
     let meta = |shape: &[usize], dtype| unsafe { lend(0, shape, dtype, None) };
 
-    let context = backend::Context::meta(None);
+    let context = ops::Context::meta(None);
     context.record_launches();
     {
         let _installed = context.enter();
@@ -221,7 +221,7 @@ pub(crate) struct Conversion {
     width: u32,
     units_per_page: u32,
     /// What the two kernels launch under: the copy stream and the serving generation.
-    context: backend::Context,
+    context: ops::Context,
 }
 
 impl Conversion {
@@ -301,7 +301,7 @@ impl Conversion {
         let ordinal = usize::try_from(device.0)
             .map_err(|_| Error::Invalid(format!("{device} names no GPU ordinal")))?;
         let region = DeviceRange::new(DevicePtr::from_address(scratch.address()), 0);
-        let context = backend::Context::new(ordinal, stream.clone(), kernels, region);
+        let context = ops::Context::new(ordinal, stream.clone(), kernels, region);
 
         Ok(Some((
             Self {

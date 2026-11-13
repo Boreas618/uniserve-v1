@@ -1286,7 +1286,7 @@ mod tests {
 
     /// The address a lent tensor's first element lies at.
     fn address_of(tensor: &Tensor) -> u64 {
-        backend::operand(tensor).unwrap().ptr.address()
+        ops::operand(tensor).unwrap().ptr.address()
     }
 
     #[test]

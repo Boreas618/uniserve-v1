@@ -7,13 +7,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -51,7 +51,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of `embedding`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[tokens]` token ids.
     pub ids: Operand,
@@ -83,15 +83,12 @@ impl Op for Embedding {
         }
         args.ids.require_rank(Self::NAME, 1)?;
         let hidden = u64::from(descriptor.hidden);
-        let tokens = args.ids.shape.dim(0);
-        args.weight.require_shape(
-            Self::NAME,
-            Shape::new(&[u64::from(descriptor.rows), hidden]),
-        )?;
+        let tokens = args.ids.dim(0);
+        args.weight
+            .require_shape(Self::NAME, &[u64::from(descriptor.rows), hidden])?;
         args.weight
             .require_row(Self::NAME, descriptor.dtype, hidden)?;
-        args.out
-            .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
+        args.out.require_shape(Self::NAME, &[tokens, hidden])?;
         args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
         Ok(())
     }
@@ -102,13 +99,13 @@ impl Op for Embedding {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let tokens = args.ids.shape.dim(0);
+        let tokens = args.ids.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.ids)
-            .view(args.weight)
-            .view(args.out)
+            .view(&args.ids)
+            .view(&args.weight)
+            .view(&args.out)
             .u64(tokens)
             .u32(descriptor.hidden)
             .u32(descriptor.first)

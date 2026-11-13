@@ -48,7 +48,7 @@ use ops::residual::{SigmoidGatedAdd, SigmoidGatedAddArgs, SigmoidGatedAddDescrip
 use tensor::{D, DType, Device, Tensor};
 
 use super::activation::activate;
-use super::nvfp4::{decoded, encoded, integer, launch_quantize, remainder};
+use super::nvfp4::{decoded, encoded, integer, launch_quantize};
 use super::{ACCUMULATE, Activation, as_rows, columns, on_cpu, row_tile, same_rows};
 use crate::capability::ExpertExchange;
 use crate::error::{Error, Result};
@@ -226,10 +226,10 @@ pub fn topk_softmax(
         return Ok((ids, weights));
     }
 
-    let ids = backend::empty((tokens, kept), DType::U32)?;
-    let weights = backend::empty((tokens, kept), DType::F32)?;
+    let ids = ops::empty((tokens, kept), DType::U32)?;
+    let weights = ops::empty((tokens, kept), DType::F32)?;
 
-    backend::launch::<TopkSoftmax>(
+    ops::launch::<TopkSoftmax>(
         &TopkDescriptor {
             scores: scores.dtype(),
             experts: experts as u32,
@@ -238,11 +238,11 @@ pub fn topk_softmax(
             scale: scale.map(Tensor::dtype),
         },
         TopkArgs {
-            scores: backend::operand(scores)?,
-            scale: scale.map(backend::operand).transpose()?,
-            ids: backend::operand(&ids)?,
-            weights: backend::operand(&weights)?,
-            map: map.map(backend::operand).transpose()?,
+            scores: ops::operand(scores)?,
+            scale: scale.map(ops::operand).transpose()?,
+            ids: ops::operand(&ids)?,
+            weights: ops::operand(&weights)?,
+            map: map.map(ops::operand).transpose()?,
         },
     )?;
     Ok((ids, weights))
@@ -314,11 +314,11 @@ pub fn moe_sort(
         return sort_formula(ids, &local, live_tokens, (tiles, rows));
     }
 
-    let maps = backend::empty((SORT_MAPS, rows), DType::U32)?;
+    let maps = ops::empty((SORT_MAPS, rows), DType::U32)?;
     let operand =
         |row: usize, entries: usize| -> Result<ops::Operand> { map_operand(&maps, row, entries) };
 
-    backend::launch::<MoeSort>(
+    ops::launch::<MoeSort>(
         &sort::Descriptor {
             experts,
             top: top as u32,
@@ -328,16 +328,16 @@ pub fn moe_sort(
             counted: true,
         },
         SortArgs {
-            ids: backend::operand(ids)?,
-            scales: backend::operand(weights)?,
+            ids: ops::operand(ids)?,
+            scales: ops::operand(weights)?,
             tile_to_expert: operand(TILE_TO_EXPERT, tiles)?,
             tile_to_limit: operand(TILE_TO_LIMIT, tiles)?,
-            expanded_to_permuted: backend::operand(&route_rows(&maps, tokens, top)?)?,
+            expanded_to_permuted: ops::operand(&route_rows(&maps, tokens, top)?)?,
             permuted_to_expanded: operand(PERMUTED_TO_EXPANDED, rows)?,
             permuted_to_token: operand(PERMUTED_TO_TOKEN, rows)?,
             total_padded_tokens: operand(TOTAL_PADDED_TOKENS, 1)?,
             num_non_exiting_tiles: operand(NUM_NON_EXITING_TILES, 1)?,
-            live_tokens: live_tokens.map(backend::operand).transpose()?,
+            live_tokens: live_tokens.map(ops::operand).transpose()?,
             local_offset: local.start,
         },
     )?;
@@ -419,8 +419,8 @@ pub fn gather_gemm(
         return Ok(zero_padding(&product, &live)?.to_dtype(hidden.dtype())?);
     }
 
-    let out = backend::empty((rows, intermediate), hidden.dtype())?;
-    backend::launch::<GatherGemm>(
+    let out = ops::empty((rows, intermediate), hidden.dtype())?;
+    ops::launch::<GatherGemm>(
         &GatherGemmDescriptor {
             hidden: width,
             intermediate: intermediate as u32,
@@ -432,17 +432,17 @@ pub fn gather_gemm(
             cluster: MMA_CLUSTER,
         },
         GatherGemmArgs {
-            hidden: backend::operand(hidden)?,
-            weights: backend::operand(up_gate)?,
-            ids: backend::operand(ids)?,
+            hidden: ops::operand(hidden)?,
+            weights: ops::operand(up_gate)?,
+            ids: ops::operand(ids)?,
             // The combine's lookup, not this product's: the product writes row `p` at the
             // sort's permuted row `p`.
-            expanded_to_permuted: backend::operand(&route_rows(maps, tokens, top)?)?,
+            expanded_to_permuted: ops::operand(&route_rows(maps, tokens, top)?)?,
             tile_to_expert: map_operand(maps, TILE_TO_EXPERT, tiles)?,
             tile_to_limit: map_operand(maps, TILE_TO_LIMIT, tiles)?,
             permuted_to_expanded: map_operand(maps, PERMUTED_TO_EXPANDED, rows)?,
             num_non_exiting_tiles: map_operand(maps, NUM_NON_EXITING_TILES, 1)?,
-            out: backend::operand(&out)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)
@@ -504,8 +504,8 @@ pub fn route_gemm(gated: &Tensor, down: &Tensor, ids: &Tensor, maps: &Tensor) ->
         return Ok(zero_padding(&product, &live)?.to_dtype(gated.dtype())?);
     }
 
-    let out = backend::empty((rows, width), gated.dtype())?;
-    backend::launch::<RouteGemm>(
+    let out = ops::empty((rows, width), gated.dtype())?;
+    ops::launch::<RouteGemm>(
         &RouteGemmDescriptor {
             hidden: width as u32,
             intermediate,
@@ -516,14 +516,14 @@ pub fn route_gemm(gated: &Tensor, down: &Tensor, ids: &Tensor, maps: &Tensor) ->
             cluster: MMA_CLUSTER,
         },
         RouteGemmArgs {
-            rows: backend::operand(gated)?,
-            weights: backend::operand(down)?,
-            ids: backend::operand(ids)?,
+            rows: ops::operand(gated)?,
+            weights: ops::operand(down)?,
+            ids: ops::operand(ids)?,
             tile_to_expert: map_operand(maps, TILE_TO_EXPERT, tiles)?,
             tile_to_limit: map_operand(maps, TILE_TO_LIMIT, tiles)?,
             permuted_to_expanded: map_operand(maps, PERMUTED_TO_EXPANDED, rows)?,
             num_non_exiting_tiles: map_operand(maps, NUM_NON_EXITING_TILES, 1)?,
-            out: backend::operand(&out)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)
@@ -628,28 +628,28 @@ pub fn gather_gemm_nvfp4(
     }
 
     // 1. The hidden rows' encoding, in the layout the gated product reads its tokens in.
-    let values = backend::empty((tokens, packed), DType::U8)?;
+    let values = ops::empty((tokens, packed), DType::U8)?;
     let blocks = GATED_TOKEN_SCALE_LAYOUT.shape(tokens as u64, u64::from(width));
-    let scales = backend::empty((blocks.dim(0) as usize, blocks.dim(1) as usize), DType::U8)?;
-    let token_scale = backend::empty(tokens, DType::F32)?;
+    let scales = ops::empty((blocks[0] as usize, blocks[1] as usize), DType::U8)?;
+    let token_scale = ops::empty(tokens, DType::F32)?;
     launch_quantize(
         hidden,
         &up_gate.encode_scale,
         GATED_TOKEN_SCALE_LAYOUT,
         (
-            backend::operand(&values)?,
-            backend::operand(&scales)?,
-            backend::operand(&token_scale)?,
+            ops::operand(&values)?,
+            ops::operand(&scales)?,
+            ops::operand(&token_scale)?,
         ),
     )?;
 
     // 2. The product, token-major: it gathers each permuted row's token itself.
-    let out = backend::empty((rows, intermediate), hidden.dtype())?;
-    let workspace = backend::empty(
+    let out = ops::empty((rows, intermediate), hidden.dtype())?;
+    let workspace = ops::empty(
         workspace_bytes(rows as u64, gated as u64) as usize,
         DType::U8,
     )?;
-    backend::launch::<GatherGemmNvfp4>(
+    ops::launch::<GatherGemmNvfp4>(
         &GatherGemmNvfp4Descriptor {
             hidden: width,
             intermediate: intermediate as u32,
@@ -665,18 +665,18 @@ pub fn gather_gemm_nvfp4(
             cluster: MMA_CLUSTER,
         },
         GatherGemmNvfp4Args {
-            hidden: backend::operand(&values)?,
-            hidden_scale: backend::operand(&scales)?,
-            hidden_token_scale: backend::operand(&token_scale)?,
-            weights: backend::operand(&up_gate.values)?,
-            scales: backend::operand(&up_gate.scales)?,
-            global_scale: backend::operand(&up_gate.global_scale)?,
+            hidden: ops::operand(&values)?,
+            hidden_scale: ops::operand(&scales)?,
+            hidden_token_scale: ops::operand(&token_scale)?,
+            weights: ops::operand(&up_gate.values)?,
+            scales: ops::operand(&up_gate.scales)?,
+            global_scale: ops::operand(&up_gate.global_scale)?,
             tile_to_expert: map_operand(maps, TILE_TO_EXPERT, tiles)?,
             tile_to_limit: map_operand(maps, TILE_TO_LIMIT, tiles)?,
             permuted_to_token: map_operand(maps, PERMUTED_TO_TOKEN, rows)?,
             num_non_exiting_tiles: map_operand(maps, NUM_NON_EXITING_TILES, 1)?,
-            out: backend::operand(&out)?,
-            workspace: backend::operand(&workspace)?,
+            out: ops::operand(&out)?,
+            workspace: ops::operand(&workspace)?,
         },
     )?;
     Ok(out)
@@ -763,28 +763,28 @@ pub fn route_gemm_nvfp4(
 
     // 1. The gated rows' encoding: the first product's output is a 16-bit row, so this is an
     //    encoding of its own and not a wider operand of the second product.
-    let values = backend::empty((rows, packed), DType::U8)?;
+    let values = ops::empty((rows, packed), DType::U8)?;
     let blocks = ACTIVATION_SCALE_LAYOUT.shape(rows as u64, u64::from(intermediate));
-    let scales = backend::empty((blocks.dim(0) as usize, blocks.dim(1) as usize), DType::U8)?;
-    let token_scale = backend::empty(rows, DType::F32)?;
+    let scales = ops::empty((blocks[0] as usize, blocks[1] as usize), DType::U8)?;
+    let token_scale = ops::empty(rows, DType::F32)?;
     launch_quantize(
         gated,
         &down.encode_scale,
         ACTIVATION_SCALE_LAYOUT,
         (
-            backend::operand(&values)?,
-            backend::operand(&scales)?,
-            backend::operand(&token_scale)?,
+            ops::operand(&values)?,
+            ops::operand(&scales)?,
+            ops::operand(&token_scale)?,
         ),
     )?;
 
     // 2. The product: one row per permuted row, the `top` routes of a token still separate.
-    let out = backend::empty((rows, width), gated.dtype())?;
-    let workspace = backend::empty(
+    let out = ops::empty((rows, width), gated.dtype())?;
+    let workspace = ops::empty(
         workspace_bytes(rows as u64, width as u64) as usize,
         DType::U8,
     )?;
-    backend::launch::<RouteGemmNvfp4>(
+    ops::launch::<RouteGemmNvfp4>(
         &RouteGemmNvfp4Descriptor {
             hidden: width as u32,
             intermediate,
@@ -797,18 +797,18 @@ pub fn route_gemm_nvfp4(
             cluster: MMA_CLUSTER,
         },
         RouteGemmNvfp4Args {
-            hidden: backend::operand(&values)?,
-            hidden_scale: backend::operand(&scales)?,
-            hidden_token_scale: backend::operand(&token_scale)?,
-            weights: backend::operand(&down.values)?,
-            scales: backend::operand(&down.scales)?,
-            global_scale: backend::operand(&down.global_scale)?,
+            hidden: ops::operand(&values)?,
+            hidden_scale: ops::operand(&scales)?,
+            hidden_token_scale: ops::operand(&token_scale)?,
+            weights: ops::operand(&down.values)?,
+            scales: ops::operand(&down.scales)?,
+            global_scale: ops::operand(&down.global_scale)?,
             tile_to_expert: map_operand(maps, TILE_TO_EXPERT, tiles)?,
             tile_to_limit: map_operand(maps, TILE_TO_LIMIT, tiles)?,
             permuted_to_expanded: map_operand(maps, PERMUTED_TO_EXPANDED, rows)?,
             num_non_exiting_tiles: map_operand(maps, NUM_NON_EXITING_TILES, 1)?,
-            out: backend::operand(&out)?,
-            workspace: backend::operand(&workspace)?,
+            out: ops::operand(&out)?,
+            workspace: ops::operand(&workspace)?,
         },
     )?;
     Ok(out)
@@ -896,9 +896,9 @@ pub fn moe_unpermute(
 
     let out = match combined {
         Some(combined) => combined.clone(),
-        None => backend::empty((tokens, width as usize), products.dtype())?,
+        None => ops::empty((tokens, width as usize), products.dtype())?,
     };
-    backend::launch::<MoeUnpermute>(
+    ops::launch::<MoeUnpermute>(
         &combine::Descriptor {
             // The second product writes one row per permuted row.
             layout: combine::Layout::Permuted,
@@ -910,10 +910,10 @@ pub fn moe_unpermute(
             output: out.dtype(),
         },
         UnpermuteArgs {
-            routes: backend::operand(products)?,
-            expanded_to_permuted: backend::operand(&route_rows(maps, tokens, top)?)?,
-            scales: backend::operand(weights)?,
-            out: backend::operand(&out)?,
+            routes: ops::operand(products)?,
+            expanded_to_permuted: ops::operand(&route_rows(maps, tokens, top)?)?,
+            scales: ops::operand(weights)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)
@@ -949,16 +949,16 @@ pub fn expert_dispatch(
         (experts, intermediate),
         exchange.states.dtype(),
     )?;
-    backend::collective::expert_exchange(
+    ops::collective::expert_exchange(
         &descriptor,
         ExchangeArgs {
             transport: None,
             tokens: sent(OWNER, hidden.dims()[0], exchange)?,
-            state: backend::operand(hidden)?,
-            ids: backend::operand(ids)?,
-            weights: backend::operand(weights)?,
-            live: live_tokens.map(backend::operand).transpose()?,
-            out: unread(),
+            state: ops::operand(hidden)?,
+            ids: ops::operand(ids)?,
+            weights: ops::operand(weights)?,
+            live: live_tokens.map(ops::operand).transpose()?,
+            out: ops::Operand::unread(),
             fused: None,
             ranks: exchange.ranks,
         },
@@ -990,16 +990,16 @@ pub fn expert_combine(
     let descriptor = exchange_descriptor(Mode::Combine, exchange, (experts, intermediate), dtype)?;
     let out = own_rows(tokens, exchange, dtype)?;
 
-    backend::collective::expert_exchange(
+    ops::collective::expert_exchange(
         &descriptor,
         ExchangeArgs {
             transport: None,
             tokens: sent(OWNER, tokens, exchange)?,
-            state: unread(),
-            ids: unread(),
-            weights: unread(),
-            live: live_tokens.map(backend::operand).transpose()?,
-            out: backend::operand(&out)?,
+            state: ops::Operand::unread(),
+            ids: ops::Operand::unread(),
+            weights: ops::Operand::unread(),
+            live: live_tokens.map(ops::operand).transpose()?,
+            out: ops::operand(&out)?,
             fused: None,
             ranks: exchange.ranks,
         },
@@ -1048,27 +1048,28 @@ pub fn expert_exchange_fused(
     // the stack's other products take: the encoding is the module's, and the kernel starts
     // from the bytes.
     if tokens > 0 {
-        let token_scale = backend::empty(tokens, DType::F32)?;
-        let scales = backend::operand(&exchange.packed_scales.narrow(0, 0, tokens)?)?;
+        let token_scale = ops::empty(tokens, DType::F32)?;
+        let scales = ops::operand(&exchange.packed_scales.narrow(0, 0, tokens)?)?;
 
         launch_quantize(
             hidden,
             &up_gate.encode_scale,
             ScaleLayout::Linear,
             (
-                backend::operand(&exchange.packed.narrow(0, 0, tokens)?)?,
+                ops::operand(&exchange.packed.narrow(0, 0, tokens)?)?,
                 // The encoder writes each scale's byte, whatever type the transport labels
                 // its rows.
-                ops::Operand {
-                    dtype: DType::U8,
-                    ..scales
+                {
+                    let mut bytes = scales.clone();
+                    bytes.dtype = DType::U8;
+                    bytes
                 },
-                backend::operand(&token_scale)?,
+                ops::operand(&token_scale)?,
             ),
         )?;
     }
 
-    let address = |tensor: &Tensor| -> Result<u64> { Ok(backend::operand(tensor)?.ptr.address()) };
+    let address = |tensor: &Tensor| -> Result<u64> { Ok(ops::operand(tensor)?.ptr.address()) };
     let expert_bytes = |tensor: &Tensor| -> Result<i64> {
         i64::try_from(tensor.elem_count() / local)
             .map_err(|_| Error::shape(OWNER, "a scale table beyond i64".to_owned()))
@@ -1094,16 +1095,16 @@ pub fn expert_exchange_fused(
     )?;
     let out = own_rows(tokens, exchange, hidden.dtype())?;
 
-    backend::collective::expert_exchange(
+    ops::collective::expert_exchange(
         &descriptor,
         ExchangeArgs {
             transport: None,
             tokens: sent(OWNER, tokens, exchange)?,
-            state: unread(),
-            ids: backend::operand(ids)?,
-            weights: backend::operand(weights)?,
-            live: live_tokens.map(backend::operand).transpose()?,
-            out: backend::operand(&out)?,
+            state: ops::Operand::unread(),
+            ids: ops::operand(ids)?,
+            weights: ops::operand(weights)?,
+            live: live_tokens.map(ops::operand).transpose()?,
+            out: ops::operand(&out)?,
             fused: Some(layer),
             ranks: exchange.ranks,
         },
@@ -1158,16 +1159,16 @@ pub fn sigmoid_gated_add_(target: Tensor, update: &Tensor, gate: &Tensor) -> Res
         return Ok(target);
     }
 
-    backend::launch::<SigmoidGatedAdd>(
+    ops::launch::<SigmoidGatedAdd>(
         &SigmoidGatedAddDescriptor {
             dtype: target.dtype(),
             columns: width,
             block: row_tile(width).min(1024),
         },
         SigmoidGatedAddArgs {
-            target: backend::operand(&as_rows(OWNER, &target)?)?,
-            update: backend::operand(&as_rows(OWNER, update)?)?,
-            gate: backend::operand(&as_rows(OWNER, gate)?)?,
+            target: ops::operand(&as_rows(OWNER, &target)?)?,
+            update: ops::operand(&as_rows(OWNER, update)?)?,
+            gate: ops::operand(&as_rows(OWNER, gate)?)?,
         },
     )?;
     Ok(target)
@@ -1215,7 +1216,7 @@ fn map(maps: &Tensor, row: usize, entries: usize) -> Result<Tensor> {
 
 /// The kernel argument of the first `entries` entries of the map `row` of `maps`.
 fn map_operand(maps: &Tensor, row: usize, entries: usize) -> Result<ops::Operand> {
-    Ok(backend::operand(&map(maps, row, entries)?)?)
+    Ok(ops::operand(&map(maps, row, entries)?)?)
 }
 
 /// The permuted row of each route of `maps`, as the `[tokens, top]` matrix the kernels read.
@@ -1269,9 +1270,11 @@ fn decoded_rows(rows: &Tensor, encode_scale: &Tensor) -> Result<Tensor> {
 /// Where the shuffle of a packed stack stores each row of `rows`, a U32 tensor of row indices:
 /// inside its block of thirty-two, row `r` moves to `(r mod 4) · 8 + r / 4`.
 fn shuffled(rows: &Tensor) -> Result<Tensor> {
-    let within = remainder(rows, 32)?;
+    let within = rows.broadcast_remainder(&integer(32, rows)?)?;
     let block = rows.broadcast_sub(&within)?;
-    let group = remainder(&within, 4)?.broadcast_mul(&integer(8, rows)?)?;
+    let group = within
+        .broadcast_remainder(&integer(4, &within)?)?
+        .broadcast_mul(&integer(8, rows)?)?;
 
     Ok(((block + group)? + within.broadcast_div(&integer(4, rows)?)?)?)
 }
@@ -1352,12 +1355,7 @@ fn own_rows(tokens: usize, exchange: &ExpertExchange, dtype: DType) -> Result<Te
     }
 
     let hidden = exchange.states.dims().last().copied().unwrap_or(0);
-    Ok(backend::empty((tokens, hidden), dtype)?)
-}
-
-/// The argument of a tensor a launch of the exchange does not read: no elements at no address.
-fn unread() -> ops::Operand {
-    ops::Operand::new(ops::DevicePtr::new(0), DType::U8, ops::Shape::new(&[0]))
+    Ok(ops::empty((tokens, hidden), dtype)?)
 }
 
 /// The route maps of [`moe_sort`] on CPU tensors, for `tiles` tiles of `rows` permuted rows.

@@ -301,7 +301,7 @@ pub(crate) fn track(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ops::values::{bf16_to_f32, f32_to_bf16};
+    use half::bf16;
 
     /// The format of a tower of `patch`-pixel patches, two-frame tubelets and `2 x 2` merges, its
     /// pixels and patches normalized about one half.
@@ -326,7 +326,7 @@ mod tests {
 
     fn row_value(rows: &[u8], index: usize) -> f32 {
         let bits = u16::from_le_bytes([rows[2 * index], rows[2 * index + 1]]);
-        bf16_to_f32(bits)
+        bf16::from_bits(bits).to_f32()
     }
 
     /// Frames reach the resize as planes, one frame after another: an interleaved raster read as
@@ -364,7 +364,7 @@ mod tests {
         patches(&format, &planes, 1, [1, 2, 4], &mut out)
             .expect("one frame fills one temporal patch");
         let pixel = |byte: u8| (f32::from(byte) - 127.5) / 127.5;
-        let rounded = |value: f32| bf16_to_f32(f32_to_bf16(value));
+        let rounded = |value: f32| bf16::from_f32(value).to_f32();
         // The rows of the first block are pixels (0,0), (0,1), (1,0), (1,1); the second block's
         // first row is pixel (0,2). A row is channel-major with its two frames inside a channel, and
         // the one frame fills both.
@@ -408,7 +408,7 @@ mod tests {
         let mut out = vec![0_u8; rows * row * 2];
         patches(&format, &planes, 3, [2, 2, 2], &mut out)
             .expect("three frames fill two temporal patches");
-        let pixel = |byte: u8| bf16_to_f32(f32_to_bf16((f32::from(byte) - 127.5) / 127.5));
+        let pixel = |byte: u8| bf16::from_f32((f32::from(byte) - 127.5) / 127.5).to_f32();
         // Inside a channel the tubelet holds its frames in order, four pixels each.
         assert_eq!(row_value(&out, 0), pixel(10));
         assert_eq!(row_value(&out, 4), pixel(20));

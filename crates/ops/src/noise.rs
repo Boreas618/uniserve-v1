@@ -44,15 +44,15 @@
 
 use std::fmt;
 
+use platform::{DevicePtr, Stream};
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::{self, Stream};
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
-use crate::{DevicePtr, Error, Op, Result, Twins};
+use crate::{Error, Op, Result, Twins};
 
 /// The elements one program draws.
 pub const NOISE_BLOCK: u32 = 1024;
@@ -123,7 +123,7 @@ impl fmt::Display for NoiseDescriptor {
 }
 
 /// The arguments of `philox_noise`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct NoiseArgs {
     /// `[rows, elements]`, contiguous: receives one standard normal sample per row.
     pub out: Operand,
@@ -183,7 +183,7 @@ impl Op for PhiloxNoise {
                 ),
             ));
         }
-        if args.out.strides != crate::tensor::Strides::row_major(args.out.shape) {
+        if !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the noise buffer is not contiguous".to_owned(),
@@ -199,12 +199,12 @@ impl Op for PhiloxNoise {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let plan = plan(descriptor, args)?;
+        let plan = plan(descriptor, &args)?;
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.out)
-            .pointer(DevicePtr::new(plan.keys))
+            .view(&args.out)
+            .pointer(DevicePtr::from_address(plan.keys))
             .u64(plan.elements)
             .u32(args.stage)
             .u32(args.draw)
@@ -265,10 +265,10 @@ struct Plan {
 /// The two key forms address the draw differently, so the view and the grid follow the descriptor
 /// and a call that hands the wrong one is refused rather than read.
 fn keyed(descriptor: &NoiseDescriptor, args: &NoiseArgs) -> Result<()> {
-    let rows = args.out.shape.dim(0);
-    match (descriptor.source, args.keys) {
+    let rows = args.out.dim(0);
+    match (descriptor.source, &args.keys) {
         (KeySource::Rows, Some(keys)) => {
-            keys.require_shape(PhiloxNoise::NAME, Shape::new(&[rows]))?;
+            keys.require_shape(PhiloxNoise::NAME, &[rows])?;
             keys.require_row(PhiloxNoise::NAME, DType::I64, rows)?;
             if args.key != 0 {
                 return Err(Error::argument(
@@ -296,13 +296,13 @@ fn keyed(descriptor: &NoiseDescriptor, args: &NoiseArgs) -> Result<()> {
 
 /// The addressing of one draw whose key form [`keyed`] accepted: a keys view is present exactly
 /// under [`KeySource::Rows`].
-fn plan(descriptor: &NoiseDescriptor, args: NoiseArgs) -> Result<Plan> {
-    let rows = args.out.shape.dim(0);
-    let row_elements = args.out.shape.dim(1);
+fn plan(descriptor: &NoiseDescriptor, args: &NoiseArgs) -> Result<Plan> {
+    let rows = args.out.dim(0);
+    let row_elements = args.out.dim(1);
 
-    match args.keys {
+    match &args.keys {
         Some(keys) => Ok(Plan {
-            keys: platform::address(keys.ptr),
+            keys: keys.ptr.address(),
             elements: row_elements,
             // One row per program column, the whole row in the other.
             grid: LaunchGrid::new([rows, row_elements.div_ceil(u64::from(descriptor.block)), 1])?,
@@ -325,14 +325,14 @@ mod tests {
     use super::*;
     fn out(rows: u64, elements: u64) -> Operand {
         Operand::new(
-            DevicePtr::new(0x1000),
+            DevicePtr::from_address(0x1000),
             DType::BF16,
-            Shape::new(&[rows, elements]),
+            &[rows, elements],
         )
     }
 
     fn keys(rows: u64) -> Operand {
-        Operand::new(DevicePtr::new(0x2000), DType::I64, Shape::new(&[rows]))
+        Operand::new(DevicePtr::from_address(0x2000), DType::I64, &[rows])
     }
 
     fn descriptor(source: KeySource) -> NoiseDescriptor {
@@ -418,13 +418,13 @@ mod tests {
         // depend on which row it is in.
         let rows_form = plan(
             &descriptor(KeySource::Rows),
-            args(out(4, 4096), Some(keys(4)), 0),
+            &args(out(4, 4096), Some(keys(4)), 0),
         )
         .expect("the per-row form with its keys view");
         assert_eq!(rows_form.grid.blocks, [4, 4, 1]);
         assert_eq!(rows_form.elements, 4096);
 
-        let scalar_form = plan(&descriptor(KeySource::Scalar), args(out(4, 4096), None, 7))
+        let scalar_form = plan(&descriptor(KeySource::Scalar), &args(out(4, 4096), None, 7))
             .expect("the scalar form with its key");
         assert_eq!(scalar_form.grid.blocks, [16, 1, 1]);
         assert_eq!(scalar_form.elements, 4 * 4096);
@@ -441,7 +441,7 @@ mod tests {
         assert!(
             keyed(
                 &descriptor(KeySource::Scalar),
-                &args(out(4, 16), Some(view), 7)
+                &args(out(4, 16), Some(view.clone()), 7)
             )
             .is_err(),
             "the scalar form read a keys view it does not address"

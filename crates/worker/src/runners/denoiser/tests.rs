@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use ipc::RequestId;
 use ipc::batch::{Batch, BatchId, Columns, Extent, MediaRow, Phase, Shape, Variant};
-use nn::{Conditioning, Denoiser, LatentShape, Layout, Step, VideoRequest};
+use nn::{Conditioning, Denoiser, LatentShape, Step, VideoRequest};
 use ops::Generation;
+use proto::video::Layout;
 use storage::Key;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run};
 use tensor::{DType, Tensor};

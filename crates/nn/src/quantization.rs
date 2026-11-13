@@ -61,6 +61,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use float8::F8E4M3;
+use half::bf16;
 use serde_json::Value;
 
 use crate::checkpoint::Checkpoint;
@@ -348,42 +350,12 @@ impl Declaration {
 /// The E2M1 values of the eight unsigned codes, the sign in the code's fourth bit.
 const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
-/// An E4M3 byte (`F8_E4M3`, bias 7, no infinities, `S.1111.111` NaN) as an FP32 value.
-pub(crate) fn e4m3(byte: u8) -> f32 {
-    let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
-    let exponent = i32::from((byte >> 3) & 0x0f);
-    let mantissa = f32::from(byte & 0x07);
-    if exponent == 0x0f && byte & 0x07 == 0x07 {
-        return f32::NAN;
-    }
-    let magnitude = if exponent == 0 {
-        // Subnormal: no implicit one, the smallest exponent.
-        mantissa / 8.0 * 2f32.powi(-6)
-    } else {
-        (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
-    };
-    sign * magnitude
-}
-
-/// `value` as BF16 bits, rounded to nearest even.
-pub(crate) fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    if value.is_nan() {
-        return ((bits >> 16) as u16) | 0x0040;
-    }
-    let lower = bits & 0xffff;
-    let mut upper = bits >> 16;
-    if lower > 0x8000 || (lower == 0x8000 && upper & 1 == 1) {
-        upper += 1;
-    }
-    upper as u16
-}
-
 /// The BF16 bytes of the `[rows, columns]` matrix a ModelOpt NVFP4 weight states: `packed` holds
 /// two E2M1 codes a byte (the even element in the low nibble), `scales` one E4M3 block scale per
 /// sixteen elements of a row, and `tensor_scale` the weight's one tensor scale.
 ///
-/// Each element is `code · block_scale · tensor_scale` evaluated in FP32 and rounded once to BF16.
+/// Each element is `code · block_scale · tensor_scale` evaluated in FP32 and rounded once to BF16,
+/// to nearest even.
 /// `code · block_scale` is exact in BF16 (two and four significant bits), so the one rounding is
 /// the tensor scale's, where a 16-bit-activation kernel applies the tensor scale to its FP32
 /// accumulator instead: the two differ by at most half a BF16 unit of each weight.
@@ -404,8 +376,8 @@ pub(crate) fn decode_nvfp4(
         };
         let value = E2M1[usize::from(code & 0x07)] * if code & 0x08 != 0 { -1.0 } else { 1.0 };
         let (row, column) = (element / columns, element % columns);
-        let scale = e4m3(scales[row * (columns / 16) + column / 16]);
-        out.extend_from_slice(&bf16_bits(value * scale * tensor_scale).to_le_bytes());
+        let scale = F8E4M3::from_bits(scales[row * (columns / 16) + column / 16]).to_f32();
+        out.extend_from_slice(&bf16::from_f32(value * scale * tensor_scale).to_le_bytes());
     }
     out
 }
@@ -735,17 +707,6 @@ fn matches_module(entry: &str, weight: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// An E4M3 byte decodes to its value: normal, subnormal, the largest finite and NaN.
-    #[test]
-    fn an_e4m3_byte_decodes_to_its_value() {
-        assert_eq!(e4m3(0x38), 1.0);
-        assert_eq!(e4m3(0xb8), -1.0);
-        assert_eq!(e4m3(0x7e), 448.0);
-        assert_eq!(e4m3(0x01), 2f32.powi(-9));
-        assert_eq!(e4m3(0x3c), 1.5);
-        assert!(e4m3(0x7f).is_nan());
-    }
 
     /// A weight-only NVFP4 row decodes to `code · block scale · tensor scale`, the even element in
     /// the low nibble, each sixteen elements reading their own scale.

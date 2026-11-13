@@ -11,7 +11,7 @@
 //! this crate's:
 //!
 //! - the execution context a forward computes under, installed on the executor's thread around
-//!   each model call (`backend::Context::enter`);
+//!   each model call (`ops::Context::enter`);
 //! - the tensors a forward starts from: a runner's input tensors at fixed addresses, the weights
 //!   as retained storage, and the cache planes and recurrent state as external tensors;
 //! - the captured graphs, their buckets and the generations of kernels they launch;
@@ -28,7 +28,7 @@
 //! | [`runners`] | [`CausalLmRunner`], the runner of every causal language model: its input tensors, the request slots' device state, the forward of each bucket, the completion of a step, paired forwards over the scratch page set, its membership of an expert union, its speculation with the model's drafter (verification and drafter buckets), and its wiring over the rank's cache and state |
 //! | [`sampler`] | [`Sampler`](sampler::Sampler), the token selection that ends a causal forward, the commit of its tokens into the slots' state, and the host encodings of the columns it reads |
 //! | [`memory`] | The rank's storage at the host's Storage Server and what is kept in it: the [`WeightStore`](memory::weights::WeightStore) that `nn::WeightLoader` publishes to, the KV cache's planes and page tables ([`KvCacheMemory`](memory::cache::KvCacheMemory)), the recurrent state ([`StateMemory`](memory::state::StateMemory)), the division of a GPU's quota from the profile runs' peaks ([`memory::division`]) and the [`GraphPool`](memory::graph_pool::GraphPool) that maps the runners' regions |
-//! | [`profiling`] | The range markers that time a model's modules, the engine's `backend::Profiler`; CUPTI's always-on counters; profiling sessions and their collectors and files |
+//! | [`profiling`] | The range markers that time a model's modules, the engine's `ops::Profiler`; CUPTI's always-on counters; profiling sessions and their collectors and files |
 //! | [`thread_pool`] | [`ThreadPool`](thread_pool::ThreadPool), a bounded pool of threads for one kind of blocking host work |
 //! | [`parallel`] | [`HostGroup`](parallel::host::HostGroup), the host collectives of a rank group over a TCP full mesh |
 //! | [`stream`] | [`EventPool`](stream::EventPool), the event leases storage owners defer their releases behind |

@@ -103,7 +103,7 @@ impl ModelRunner {
         stream: Option<Stream>,
         cache: &Arc<Mutex<KvCacheMemory>>,
         state: Option<&Arc<Mutex<StateMemory>>>,
-        group: Option<Arc<backend::Group>>,
+        group: Option<Arc<ops::Group>>,
         member: Option<Member>,
         kernels: &Generation,
     ) -> Result<CausalLmRunner> {

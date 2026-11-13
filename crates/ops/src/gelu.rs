@@ -22,13 +22,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Strides};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -80,7 +80,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `gelu`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[rows, columns]`, contiguous: the values to activate.
     pub x: Operand,
@@ -101,24 +101,24 @@ impl Op for Gelu {
         let columns = u64::from(descriptor.columns);
         args.x.require_rank(Self::NAME, 2)?;
         args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
-        if args.x.strides != Strides::row_major(args.x.shape) {
+        if !args.x.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the activation is read contiguous; found strides {}",
-                    args.x.strides
+                    "the activation is read contiguous; found strides {:?}",
+                    args.x.strides()
                 ),
             ));
         }
         args.out
             .require_row(Self::NAME, descriptor.dtype, columns)?;
-        args.out.require_shape(Self::NAME, args.x.shape)?;
-        if args.out.strides != Strides::row_major(args.x.shape) {
+        args.out.require_dims(Self::NAME, args.x.dims())?;
+        if !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the result is written contiguous; found strides {}",
-                    args.out.strides
+                    "the result is written contiguous; found strides {:?}",
+                    args.out.strides()
                 ),
             ));
         }
@@ -131,11 +131,11 @@ impl Op for Gelu {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let elements = args.x.shape.numel();
+        let elements = args.x.numel();
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.out)
+            .view(&args.x)
+            .view(&args.out)
             .u64(elements)
             .u32(descriptor.columns)
             .flag(descriptor.pdl);

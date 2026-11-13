@@ -130,9 +130,9 @@ pub fn frame_norm_pad(
     let [top, bottom, left, right] = spatial;
     let values = packed(x)?;
     let statistics = (batches * frames, group_count);
-    let mean = backend::empty(statistics, DType::F32)?;
-    let rstd = backend::empty(statistics, DType::F32)?;
-    let out = backend::empty(
+    let mean = ops::empty(statistics, DType::F32)?;
+    let rstd = ops::empty(statistics, DType::F32)?;
+    let out = ops::empty(
         (
             batches,
             channels,
@@ -147,20 +147,20 @@ pub fn frame_norm_pad(
     // the power of two the kernel's tolerance is stated for.
     let reduction = frame_reduction_class(group_channels as u64, pixels as u64);
 
-    backend::launch::<FrameMoments>(
+    ops::launch::<FrameMoments>(
         &FrameMomentsDescriptor {
             dtype: x.dtype(),
             reduction,
             epsilon: Float::from(eps),
         },
         FrameMomentsArgs {
-            values: backend::operand(&values)?,
-            mean: backend::operand(&mean)?,
-            rstd: backend::operand(&rstd)?,
+            values: ops::operand(&values)?,
+            mean: ops::operand(&mean)?,
+            rstd: ops::operand(&rstd)?,
             groups: u64::from(groups),
         },
     )?;
-    backend::launch::<FrameNormPad>(
+    ops::launch::<FrameNormPad>(
         &FrameNormPadDescriptor {
             dtype: x.dtype(),
             reduction,
@@ -169,14 +169,12 @@ pub fn frame_norm_pad(
             single_pixel: pixels == 1,
         },
         FrameNormPadArgs {
-            values: backend::operand(&values)?,
-            mean: backend::operand(&mean)?,
-            rstd: backend::operand(&rstd)?,
-            weight: affine
-                .map(|(weight, _)| backend::operand(weight))
-                .transpose()?,
-            bias: affine.map(|(_, bias)| backend::operand(bias)).transpose()?,
-            out: backend::operand(&out)?,
+            values: ops::operand(&values)?,
+            mean: ops::operand(&mean)?,
+            rstd: ops::operand(&rstd)?,
+            weight: affine.map(|(weight, _)| ops::operand(weight)).transpose()?,
+            bias: affine.map(|(_, bias)| ops::operand(bias)).transpose()?,
+            out: ops::operand(&out)?,
             groups: u64::from(groups),
             top: top as u64,
             left: left as u64,

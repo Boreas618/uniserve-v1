@@ -61,18 +61,18 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
 /// The batch columns a recurrent operator reads, as paged attention reads them.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RowColumns {
     /// `[rows + 1]` u32: packed offsets of each row's new tokens.
     pub query_offsets: Operand,
@@ -88,14 +88,14 @@ impl RowColumns {
     /// The rows of the batch, checked against each other.
     fn check(&self, operator: &'static str) -> Result<u64> {
         self.seq_lens.require_rank(operator, 1)?;
-        let rows = self.seq_lens.shape.dim(0);
+        let rows = self.seq_lens.dim(0);
         for (name, view, count) in [
             ("query_offsets", &self.query_offsets, rows + 1),
             ("seq_lens", &self.seq_lens, rows),
             ("slots", &self.slots, rows),
             ("checkpoints", &self.checkpoints, rows),
         ] {
-            view.require_shape(operator, Shape::new(&[count]))
+            view.require_shape(operator, &[count])
                 .map_err(|error| Error::argument(operator, format!("{name}: {error}")))?;
             view.require_row(operator, DType::U32, count)
                 .map_err(|error| Error::argument(operator, format!("{name}: {error}")))?;
@@ -113,14 +113,14 @@ impl RowColumns {
 /// The per-token state bank a batch's rows keep beside their slots' banks (the module's Trails):
 /// `[rows, dims…]` of the slot banks' element type, contiguous, row `t` receiving the state after
 /// the batch's token `t`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Trail {
     /// `[rows, dims…]`, contiguous, with a row for every token of the batch.
     pub bank: Operand,
 }
 
 /// The slots of a batch whose requests own several (the module's Request slots).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RequestSlots {
     /// `[rows, Q]` u32, contiguous: each row's slots, the first its entry of
     /// [`RowColumns::slots`].
@@ -133,20 +133,20 @@ impl RequestSlots {
     /// The slots a request owns, `Q`, checked against a batch of `rows` rows.
     fn check(&self, operator: &'static str, rows: u64) -> Result<u64> {
         self.state_indices.require_rank(operator, 2)?;
-        let owned = self.state_indices.shape.dim(1);
+        let owned = self.state_indices.dim(1);
 
         self.state_indices
-            .require_shape(operator, Shape::new(&[rows, owned]))
+            .require_shape(operator, &[rows, owned])
             .and_then(|()| self.state_indices.require_row(operator, DType::U32, owned))
             .map_err(|error| Error::argument(operator, format!("state_indices: {error}")))?;
-        if self.state_indices.strides != Strides::row_major(self.state_indices.shape) {
+        if !self.state_indices.is_row_major() {
             return Err(Error::argument(
                 operator,
                 "state_indices is not contiguous".to_owned(),
             ));
         }
         self.num_accepted
-            .require_shape(operator, Shape::new(&[rows]))
+            .require_shape(operator, &[rows])
             .and_then(|()| self.num_accepted.require_row(operator, DType::U32, rows))
             .map_err(|error| Error::argument(operator, format!("num_accepted: {error}")))?;
         Ok(owned)
@@ -155,9 +155,9 @@ impl RequestSlots {
 
 /// The trail operand of a launch and the flag the kernel tests: the bank, or the state bank itself
 /// and a cleared flag when the batch keeps none, which the kernel then never writes.
-fn trail_operand(trail: Option<Trail>, state: Operand) -> (Operand, i32) {
+fn trail_operand<'a>(trail: Option<&'a Trail>, state: &'a Operand) -> (&'a Operand, i32) {
     match trail {
-        Some(trail) => (trail.bank, 1),
+        Some(trail) => (&trail.bank, 1),
         None => (state, 0),
     }
 }
@@ -200,16 +200,17 @@ fn check_bank(
             abi::name(dtype)
         )));
     }
-    if bank.shape.rank() != dims.len() + 1 || bank.shape.dims()[1..] != *dims {
+    let slot_dims = bank.dims().iter().skip(1).map(|&dim| dim as u64);
+    if bank.rank() != dims.len() + 1 || !slot_dims.eq(dims.iter().copied()) {
         return Err(refuse(format!(
             "is {:?}, [slots, {dims:?}] expected",
-            bank.shape.dims()
+            bank.dims()
         )));
     }
-    if bank.strides != Strides::row_major(bank.shape) {
+    if !bank.is_row_major() {
         return Err(refuse("is not contiguous".to_owned()));
     }
-    Ok(bank.shape.dim(0))
+    Ok(bank.dim(0))
 }
 
 /// One compilation of `causal_conv1d`.
@@ -271,7 +272,7 @@ impl fmt::Display for CausalConv1dDescriptor {
 }
 
 /// The arguments of `causal_conv1d`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct CausalConv1dArgs {
     /// `[tokens, channels]`, unit-strided per channel, rows any stride apart: the projected inputs.
     pub x: Operand,
@@ -358,19 +359,17 @@ impl Op for CausalConv1d {
         }
         args.x.require_rank(Self::NAME, 2)?;
         args.x.require_row(Self::NAME, descriptor.dtype, channels)?;
-        let tokens = args.x.shape.dim(0);
-        args.out
-            .require_shape(Self::NAME, Shape::new(&[tokens, channels]))?;
+        let tokens = args.x.dim(0);
+        args.out.require_shape(Self::NAME, &[tokens, channels])?;
         args.out
             .require_row(Self::NAME, descriptor.dtype, channels)?;
-        if args.out.strides != Strides::row_major(args.out.shape) {
+        if !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the output is not contiguous".to_owned(),
             ));
         }
-        args.weight
-            .require_shape(Self::NAME, Shape::new(&[channels, width]))?;
+        args.weight.require_shape(Self::NAME, &[channels, width])?;
         args.weight
             .require_row(Self::NAME, descriptor.dtype, width)?;
         let dims = [window, channels];
@@ -395,7 +394,7 @@ impl Op for CausalConv1d {
             &dims,
             tokens,
         )?;
-        if args.x.strides.get(0) > i32::MAX as u64 || tokens * channels > i32::MAX as u64 {
+        if args.x.stride(0) > i32::MAX as u64 || tokens * channels > i32::MAX as u64 {
             return Err(Error::argument(
                 Self::NAME,
                 "the inputs span more elements than the kernel's 32-bit rows address".to_owned(),
@@ -410,28 +409,30 @@ impl Op for CausalConv1d {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let rows = args.rows.seq_lens.shape.dim(0);
-        let (trail, trailing) = trail_operand(args.trail, args.state);
+        let rows = args.rows.seq_lens.dim(0);
+        let (trail, trailing) = trail_operand(args.trail.as_ref(), &args.state);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.weight)
-            .view(args.out)
-            .view(args.rows.query_offsets)
-            .view(args.rows.seq_lens)
-            .view(args.rows.slots)
-            .view(args.rows.checkpoints)
-            .view(args.state)
-            .view(args.checkpoint)
+            .view(&args.x)
+            .view(&args.weight)
+            .view(&args.out)
+            .view(&args.rows.query_offsets)
+            .view(&args.rows.seq_lens)
+            .view(&args.rows.slots)
+            .view(&args.rows.checkpoints)
+            .view(&args.state)
+            .view(&args.checkpoint)
             .view(trail)
-            .i32(args.x.strides.get(0) as i32)
+            .i32(args.x.stride(0) as i32)
             .i32(trailing);
 
         // A program compiled for requests of several slots reads their two columns after the
         // plain convolution's parameters; the dilation, the window and the form are compiled in.
         if let Some(slots) = args.slots {
-            arguments.view(slots.state_indices).view(slots.num_accepted);
+            arguments
+                .view(&slots.state_indices)
+                .view(&slots.num_accepted);
         }
         kernel.launch(
             LaunchGrid::new([
@@ -564,7 +565,7 @@ impl fmt::Display for GatedDeltaRuleDescriptor {
 }
 
 /// The arguments of `gated_delta_rule`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct GatedDeltaRuleArgs {
     /// `[tokens, key_heads, key_dim]`: the convolved queries, heads contiguous, rows `row_stride`
     /// elements apart.
@@ -667,34 +668,34 @@ impl Op for GatedDeltaRule {
         let value_dim = u64::from(d.value_dim);
 
         args.query.require_rank(Self::NAME, 3)?;
-        let tokens = args.query.shape.dim(0);
-        let row_stride = args.query.strides.get(0);
+        let tokens = args.query.dim(0);
+        let row_stride = args.query.stride(0);
         for (name, view, heads, dim) in [
             ("query", &args.query, key_heads, key_dim),
             ("key", &args.key, key_heads, key_dim),
             ("value", &args.value, value_heads, value_dim),
         ] {
-            view.require_shape(Self::NAME, Shape::new(&[tokens, heads, dim]))
+            view.require_shape(Self::NAME, &[tokens, heads, dim])
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
             view.require_row(Self::NAME, d.dtype, dim)
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
-            if view.strides.get(1) != dim || view.strides.get(0) != row_stride {
+            if view.stride(1) != dim || view.stride(0) != row_stride {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "the {name} heads are {:?} apart, [{row_stride}, {dim}, 1] expected",
-                        view.strides
+                        view.strides()
                     ),
                 ));
             }
         }
-        let gate_stride = args.a.strides.get(0);
+        let gate_stride = args.a.stride(0);
         for (name, view) in [("a", &args.a), ("b", &args.b)] {
-            view.require_shape(Self::NAME, Shape::new(&[tokens, value_heads]))
+            view.require_shape(Self::NAME, &[tokens, value_heads])
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
             view.require_row(Self::NAME, d.dtype, value_heads)
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
-            if view.strides.get(0) != gate_stride {
+            if view.stride(0) != gate_stride {
                 return Err(Error::argument(
                     Self::NAME,
                     "the a and b rows are not one stride apart".to_owned(),
@@ -702,15 +703,15 @@ impl Op for GatedDeltaRule {
             }
         }
         for (name, view) in [("A_log", &args.a_log), ("dt_bias", &args.dt_bias)] {
-            view.require_shape(Self::NAME, Shape::new(&[value_heads]))
+            view.require_shape(Self::NAME, &[value_heads])
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
             view.require_row(Self::NAME, d.dtype, value_heads)
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
         }
         args.out
-            .require_shape(Self::NAME, Shape::new(&[tokens, value_heads, value_dim]))?;
+            .require_shape(Self::NAME, &[tokens, value_heads, value_dim])?;
         args.out.require_row(Self::NAME, d.dtype, value_dim)?;
-        if args.out.strides != Strides::row_major(args.out.shape) {
+        if !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the output is not contiguous".to_owned(),
@@ -757,36 +758,38 @@ impl Op for GatedDeltaRule {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let rows = args.rows.seq_lens.shape.dim(0);
+        let rows = args.rows.seq_lens.dim(0);
         // The query is scaled by the inverse square root of its width before it reads the state.
         let scale = (f64::from(descriptor.key_dim).sqrt().recip()) as f32;
-        let (trail, trailing) = trail_operand(args.trail, args.state);
+        let (trail, trailing) = trail_operand(args.trail.as_ref(), &args.state);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.query)
-            .view(args.key)
-            .view(args.value)
-            .view(args.a)
-            .view(args.b)
-            .view(args.a_log)
-            .view(args.dt_bias)
-            .view(args.rows.query_offsets)
-            .view(args.rows.seq_lens)
-            .view(args.rows.slots)
-            .view(args.rows.checkpoints)
-            .view(args.state)
-            .view(args.checkpoint)
+            .view(&args.query)
+            .view(&args.key)
+            .view(&args.value)
+            .view(&args.a)
+            .view(&args.b)
+            .view(&args.a_log)
+            .view(&args.dt_bias)
+            .view(&args.rows.query_offsets)
+            .view(&args.rows.seq_lens)
+            .view(&args.rows.slots)
+            .view(&args.rows.checkpoints)
+            .view(&args.state)
+            .view(&args.checkpoint)
             .view(trail)
-            .view(args.out)
-            .i32(args.query.strides.get(0) as i32)
-            .i32(args.a.strides.get(0) as i32)
+            .view(&args.out)
+            .i32(args.query.stride(0) as i32)
+            .i32(args.a.stride(0) as i32)
             .f32(scale)
             .i32(trailing);
 
         // A program compiled for requests of several slots reads their two columns last.
         if let Some(slots) = args.slots {
-            arguments.view(slots.state_indices).view(slots.num_accepted);
+            arguments
+                .view(&slots.state_indices)
+                .view(&slots.num_accepted);
         }
         kernel.launch(
             LaunchGrid::new([

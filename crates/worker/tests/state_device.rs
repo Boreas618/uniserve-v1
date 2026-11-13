@@ -97,7 +97,7 @@ fn allocator() -> Outcome<platform::Allocator> {
 
 /// The device address of row `row` of the state's second field in `buffer`.
 fn row_address(buffer: &Tensor, row: usize) -> Outcome<u64> {
-    Ok(backend::operand(buffer)?.ptr.address() + (row * FIELD_BYTES) as u64)
+    Ok(ops::operand(buffer)?.ptr.address() + (row * FIELD_BYTES) as u64)
 }
 
 /// Reads row `row` of the state's second field in `buffer` back to the host.
@@ -128,7 +128,7 @@ fn write_row(stream: &Stream, buffer: &Tensor, row: usize, values: &[f32]) -> Ou
     unsafe {
         platform::memcpy_async(
             row_address(buffer, row)?,
-            backend::operand(&source)?.ptr.address(),
+            ops::operand(&source)?.ptr.address(),
             FIELD_BYTES,
             stream,
         )?;

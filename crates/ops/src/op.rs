@@ -10,12 +10,13 @@
 use std::fmt::Display;
 use std::hash::Hash;
 
+use platform::Stream;
+
 use crate::generation::Generation;
 use crate::kernel::Kernel;
-use crate::platform::Stream;
 use crate::tolerance::Tolerance;
 use crate::twins::Twins;
-use crate::{Result, capture, descriptor};
+use crate::{Result, descriptor};
 
 /// One operator.
 ///
@@ -52,7 +53,8 @@ pub trait Op {
     /// The kernel must be the one the caller resolved for this descriptor, and the caller has
     /// passed these arguments through [`Op::check`]; `launch` does not check them again. It reads
     /// the descriptor for what the module was compiled with and the arguments for what this call
-    /// is. It is capture-safe: no allocation, no synchronization, no host read of device memory.
+    /// is. It is capture-safe: no device allocation, no synchronization, no host read of device
+    /// memory.
     fn launch(
         kernel: &Kernel,
         descriptor: &Self::Descriptor,
@@ -84,9 +86,9 @@ pub trait Op {
 /// One checked call of an operator, with the operator's type erased.
 ///
 /// A launching forward hands its calls to a [`Route`] as this, so a route chosen at runtime can
-/// launch a call, or launch it with its outputs redirected, without naming the operator. Every
-/// launch through it reports itself to the installed capture sink ([`crate::capture`]), as a
-/// forward's own launches do.
+/// launch a call, or launch it with its outputs redirected, without naming the operator. The call
+/// is one entry of the context's launch table however many kernels the route launches for it
+/// ([`crate::launch()`]).
 pub trait Call {
     /// The operator's [`Op::NAME`].
     fn operator(&self) -> &'static str;
@@ -140,18 +142,11 @@ impl<'d, 't, O: Op> Checked<'d, 't, O> {
     pub const fn new(descriptor: &'d O::Descriptor, args: O::Args<'t>) -> Self {
         Self { descriptor, args }
     }
-
-    /// Tells the capture sink, when one is installed, that the call's program launched.
-    fn launched(&self) {
-        if capture::installed() {
-            capture::launched(O::NAME, &descriptor::key(self.descriptor));
-        }
-    }
 }
 
 impl<'t, O: Op> Call for Checked<'_, 't, O>
 where
-    O::Args<'t>: Copy,
+    O::Args<'t>: Clone,
 {
     fn operator(&self) -> &'static str {
         O::NAME
@@ -166,16 +161,12 @@ where
     }
 
     fn launch(&self, kernel: &Kernel, stream: &Stream) -> Result<()> {
-        O::launch(kernel, self.descriptor, self.args, stream)?;
-        self.launched();
-        Ok(())
+        O::launch(kernel, self.descriptor, self.args.clone(), stream)
     }
 
     fn launch_redirected(&self, kernel: &Kernel, twins: &mut Twins, stream: &Stream) -> Result<()> {
-        let redirected = O::shadow(self.args, twins, stream);
+        let redirected = O::shadow(self.args.clone(), twins, stream);
         O::check(self.descriptor, &redirected)?;
-        O::launch(kernel, self.descriptor, redirected, stream)?;
-        self.launched();
-        Ok(())
+        O::launch(kernel, self.descriptor, redirected, stream)
     }
 }

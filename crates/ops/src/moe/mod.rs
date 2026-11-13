@@ -61,9 +61,9 @@ pub fn max_permuted_rows(tokens: u64, top: u64, local_experts: u64, tile: u64) -
 }
 
 /// The elements between consecutive rows of a view.
-pub(crate) fn row_stride(view: &crate::tensor::Operand) -> u64 {
-    if view.strides.rank() >= 2 {
-        view.strides.get(view.strides.rank() - 2)
+pub(crate) fn row_stride(view: &crate::operand::Operand) -> u64 {
+    if view.rank() >= 2 {
+        view.stride(view.rank() - 2)
     } else {
         0
     }
@@ -77,7 +77,7 @@ pub(crate) fn row_stride(view: &crate::tensor::Operand) -> u64 {
 /// batch produces.
 pub(crate) fn require_u32_vector(
     operator: &'static str,
-    view: &crate::tensor::Operand,
+    view: &crate::operand::Operand,
 ) -> crate::Result<()> {
     if view.dtype != tensor::DType::U32 {
         return Err(crate::Error::argument(
@@ -88,12 +88,12 @@ pub(crate) fn require_u32_vector(
             ),
         ));
     }
-    if view.strides.last() != 1 {
+    if view.last_stride() != 1 {
         return Err(crate::Error::argument(
             operator,
             format!(
                 "expected a unit stride on the metadata's last axis, found {}",
-                view.strides.last()
+                view.last_stride()
             ),
         ));
     }
@@ -101,8 +101,8 @@ pub(crate) fn require_u32_vector(
 }
 
 /// The device address a call structure carries.
-pub(crate) fn address(pointer: crate::tensor::DevicePtr) -> u64 {
-    crate::platform::address(pointer)
+pub(crate) fn address(pointer: platform::DevicePtr) -> u64 {
+    pointer.address()
 }
 
 /// An extent as the `i64` a package reads.
@@ -113,7 +113,8 @@ pub(crate) fn to_i64(operator: &'static str, value: u64) -> crate::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DevicePtr, Operand, Shape};
+    use crate::operand::Operand;
+    use platform::DevicePtr;
     use tensor::DType;
 
     /// A C++ entry's dtype numbers are the operator crate's, or the build says so here.
@@ -182,14 +183,14 @@ mod tests {
     /// tile: a decode batch of 15 tokens with 8 routes each has 120 tiles.
     #[test]
     fn a_metadata_vector_longer_than_one_element_is_accepted() {
-        let list = Operand::new(DevicePtr::new(0x1000), DType::U32, Shape::new(&[120]));
+        let list = Operand::new(DevicePtr::from_address(0x1000), DType::U32, &[120]);
         assert!(require_u32_vector("moe_sort", &list).is_ok());
     }
 
     /// The same check still refuses what the entries cannot read.
     #[test]
     fn a_metadata_vector_of_the_wrong_element_type_is_refused() {
-        let list = Operand::new(DevicePtr::new(0x1000), DType::BF16, Shape::new(&[120]));
+        let list = Operand::new(DevicePtr::from_address(0x1000), DType::BF16, &[120]);
         let error = require_u32_vector("moe_sort", &list).unwrap_err();
         assert!(
             error.to_string().contains("expected u32 metadata"),

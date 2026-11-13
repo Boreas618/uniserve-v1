@@ -9,13 +9,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -44,7 +44,7 @@ impl fmt::Display for GatherDescriptor {
 }
 
 /// The arguments of `logits_gather`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct GatherArgs {
     /// `[tokens, columns]` hidden state of the whole batch.
     pub hidden: Operand,
@@ -77,9 +77,8 @@ impl Op for LogitsGather {
                 ),
             ));
         }
-        let count = args.rows.shape.dim(0);
-        args.out
-            .require_shape(Self::NAME, Shape::new(&[count, columns]))?;
+        let count = args.rows.dim(0);
+        args.out.require_shape(Self::NAME, &[count, columns])?;
         args.out
             .require_row(Self::NAME, descriptor.dtype, columns)?;
         Ok(())
@@ -92,13 +91,13 @@ impl Op for LogitsGather {
         stream: &Stream,
     ) -> Result<()> {
         let columns = u64::from(descriptor.columns);
-        let count = args.rows.shape.dim(0);
+        let count = args.rows.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.hidden)
-            .view(args.rows)
-            .view(args.out)
+            .view(&args.hidden)
+            .view(&args.rows)
+            .view(&args.out)
             .u64(count)
             .u32(descriptor.columns);
         kernel.launch(
@@ -158,7 +157,7 @@ impl fmt::Display for UnpadDescriptor {
 }
 
 /// The arguments of `vocab_unpad`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct UnpadArgs {
     /// `[rows, padded]` the gathered logits: `ranks` shards of `[rows, padded / ranks]`, rank by
     /// rank, as a collective gather lays them.
@@ -188,8 +187,7 @@ impl Op for VocabUnpad {
             ));
         }
         let rows = args.gathered.rows();
-        args.gathered
-            .require_shape(Self::NAME, Shape::new(&[rows, padded]))?;
+        args.gathered.require_shape(Self::NAME, &[rows, padded])?;
         let ranks = u64::from(args.ranks);
         if ranks == 0 || padded % ranks != 0 || vocabulary.div_ceil(ranks) > padded / ranks {
             return Err(Error::argument(
@@ -200,8 +198,7 @@ impl Op for VocabUnpad {
                 ),
             ));
         }
-        args.out
-            .require_shape(Self::NAME, Shape::new(&[rows, vocabulary]))?;
+        args.out.require_shape(Self::NAME, &[rows, vocabulary])?;
         if args.gathered.dtype != descriptor.dtype || args.out.dtype != descriptor.output {
             return Err(Error::argument(
                 Self::NAME,
@@ -228,8 +225,8 @@ impl Op for VocabUnpad {
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.gathered)
-            .view(args.out)
+            .view(&args.gathered)
+            .view(&args.out)
             .u64(rows)
             .u32(descriptor.padded)
             .u32(descriptor.vocabulary)

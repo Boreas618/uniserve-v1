@@ -21,8 +21,7 @@
 //! that agreement when it captures: the input copies of the capture and of the meta forward
 //! over the same region are one list.
 
-use ops::DevicePtr;
-use ops::platform::{CaptureStatus, copy_from_host};
+use platform::CaptureStatus;
 
 use crate::allocator::ALIGNMENT;
 use crate::context::{self, State};
@@ -38,7 +37,7 @@ use crate::{Error, Result};
 ///
 /// [`Error::NoContext`]; [`Error::NoInputBuffer`] under a context that launches and has no
 /// input buffer; [`Error::InputBufferExhausted`] when the lent memory cannot hold the bytes;
-/// [`Error::Platform`] and [`Error::Ops`] when the stream cannot be queried or the copy issued.
+/// [`Error::Platform`] when the stream cannot be queried or the copy issued.
 ///
 /// # Safety
 ///
@@ -88,7 +87,7 @@ pub(crate) unsafe fn copy_to_device(address: u64, bytes: &[u8]) -> Result<()> {
         // SAFETY: the source is the page-locked bytes just written, which nothing overwrites
         // before the next reset, and the caller keeps the destination valid until the copy
         // completed.
-        unsafe { copy_from_host(DevicePtr::new(address), host, length, stream) }?;
+        unsafe { platform::memcpy_async(address, host, length as usize, stream) }?;
     }
     Ok(())
 }

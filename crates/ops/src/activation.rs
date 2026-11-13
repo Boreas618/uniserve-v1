@@ -23,13 +23,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -108,7 +108,7 @@ impl fmt::Display for ActAndMulDescriptor {
 }
 
 /// The arguments of `act_and_mul`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ActAndMulArgs {
     /// The gate half, its rows `gate_stride` elements apart and its last axis unit-strided.
     pub gate: Operand,
@@ -144,21 +144,21 @@ impl Op for ActAndMul {
         args.out.require_row(Self::NAME, descriptor.dtype, width)?;
         let rows = args.out.rows();
         for (name, view) in [("gate", &args.gate), ("value", &args.value)] {
-            if view.shape.last() != width {
+            if view.last() != width {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "the {name} rows hold {} elements, the output holds {width}",
-                        view.shape.last()
+                        view.last()
                     ),
                 ));
             }
-            if view.strides.last() != 1 {
+            if view.last_stride() != 1 {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "the {name} rows are not unit-strided in their last axis: {}",
-                        view.strides.last()
+                        view.last_stride()
                     ),
                 ));
             }
@@ -187,12 +187,12 @@ impl Op for ActAndMul {
             ("gate", &args.gate, descriptor.gate_stride),
             ("value", &args.value, descriptor.value_stride),
         ] {
-            if view.shape.rank() > 1 && view.strides.get(0) != stride {
+            if view.rank() > 1 && view.stride(0) != stride {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "the {name} rows are {} elements apart, the descriptor says {stride}",
-                        view.strides.get(0)
+                        view.stride(0)
                     ),
                 ));
             }
@@ -237,7 +237,7 @@ impl Op for ActAndMul {
         let elements = args.out.rows() * u64::from(descriptor.width);
 
         let mut arguments = Arguments::new();
-        arguments.view(args.gate).view(args.value).view(args.out);
+        arguments.view(&args.gate).view(&args.value).view(&args.out);
         if descriptor.wide {
             arguments
                 .u64(elements)
@@ -310,7 +310,7 @@ impl fmt::Display for ValueFirstSwigluDescriptor {
 }
 
 /// The arguments of `value_first_swiglu`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ValueFirstSwigluArgs {
     /// `[..., 2 · width]`, contiguous, value half first: the packed projection.
     pub value_gate: Operand,
@@ -354,21 +354,19 @@ impl Op for ValueFirstSwiglu {
                 ),
             ));
         }
-        if args.value_gate.shape.rank() > 1
-            && args.value_gate.strides.get(0) != descriptor.input_stride
-        {
+        if args.value_gate.rank() > 1 && args.value_gate.stride(0) != descriptor.input_stride {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the packed rows are {} elements apart, the descriptor says {}",
-                    args.value_gate.strides.get(0),
+                    args.value_gate.stride(0),
                     descriptor.input_stride
                 ),
             ));
         }
         match (&args.bias, descriptor.bias) {
             (Some(bias), true) => {
-                bias.require_shape(Self::NAME, Shape::new(&[2 * width]))?;
+                bias.require_shape(Self::NAME, &[2 * width])?;
                 bias.require_row(Self::NAME, descriptor.dtype, 2 * width)?;
             }
             (None, false) => {}
@@ -390,7 +388,7 @@ impl Op for ValueFirstSwiglu {
         let programs = elements.div_ceil(u64::from(descriptor.block));
         match (&args.partials, descriptor.absmax) {
             (Some(partials), true) => {
-                partials.require_shape(Self::NAME, Shape::new(&[programs]))?;
+                partials.require_shape(Self::NAME, &[programs])?;
                 partials.require_row(Self::NAME, DType::F32, programs)?;
             }
             (None, false) => {}
@@ -429,13 +427,13 @@ impl Op for ValueFirstSwiglu {
         let programs = elements.div_ceil(u64::from(descriptor.block));
 
         // A flag is off, so its slot is never dereferenced; the kernel still takes the argument.
-        let bias = args.bias.unwrap_or(args.out);
-        let partials = args.partials.unwrap_or(args.out);
+        let bias = args.bias.as_ref().unwrap_or(&args.out);
+        let partials = args.partials.as_ref().unwrap_or(&args.out);
         let mut arguments = Arguments::new();
         arguments
-            .view(args.value_gate)
+            .view(&args.value_gate)
             .view(bias)
-            .view(args.out)
+            .view(&args.out)
             .view(partials)
             .i32(elements as i32)
             .i32(descriptor.input_stride as i32);
@@ -495,7 +493,7 @@ impl fmt::Display for SwigluDescriptor {
 }
 
 /// The arguments of `swiglu`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SwigluArgs {
     /// The value half, its rows `value_stride` elements apart.
     pub value: Operand,
@@ -544,12 +542,12 @@ impl Op for Swiglu {
                     ),
                 ));
             }
-            if view.shape.rank() > 1 && view.strides.get(0) != stride {
+            if view.rank() > 1 && view.stride(0) != stride {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "the {name} rows are {} elements apart, the descriptor says {stride}",
-                        view.strides.get(0)
+                        view.stride(0)
                     ),
                 ));
             }
@@ -560,7 +558,7 @@ impl Op for Swiglu {
         ] {
             match (bias, present) {
                 (Some(bias), true) => {
-                    bias.require_shape(Self::NAME, Shape::new(&[width]))?;
+                    bias.require_shape(Self::NAME, &[width])?;
                     bias.require_row(Self::NAME, descriptor.dtype, width)?;
                 }
                 (None, false) => {}
@@ -589,7 +587,7 @@ impl Op for Swiglu {
         let programs = elements.div_ceil(u64::from(descriptor.block));
         match (&args.partials, descriptor.absmax) {
             (Some(partials), true) => {
-                partials.require_shape(Self::NAME, Shape::new(&[programs]))?;
+                partials.require_shape(Self::NAME, &[programs])?;
                 partials.require_row(Self::NAME, DType::F32, programs)?;
             }
             (None, false) => {}
@@ -619,16 +617,16 @@ impl Op for Swiglu {
         let programs = elements.div_ceil(u64::from(descriptor.block));
 
         // A flag is off, so its slot is never dereferenced; the kernel still takes the argument.
-        let value_bias = args.value_bias.unwrap_or(args.out);
-        let gate_bias = args.gate_bias.unwrap_or(args.out);
-        let partials = args.partials.unwrap_or(args.out);
+        let value_bias = args.value_bias.as_ref().unwrap_or(&args.out);
+        let gate_bias = args.gate_bias.as_ref().unwrap_or(&args.out);
+        let partials = args.partials.as_ref().unwrap_or(&args.out);
         let mut arguments = Arguments::new();
         arguments
-            .view(args.value)
-            .view(args.gate)
+            .view(&args.value)
+            .view(&args.gate)
             .view(value_bias)
             .view(gate_bias)
-            .view(args.out)
+            .view(&args.out)
             .view(partials)
             .i32(elements as i32);
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
@@ -677,7 +675,7 @@ impl fmt::Display for SiluDescriptor {
 }
 
 /// The arguments of `silu`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SiluArgs {
     /// `[rows, columns]`, contiguous: the values to activate.
     pub x: Operand,
@@ -702,24 +700,24 @@ impl Op for Silu {
         let columns = u64::from(descriptor.columns);
         args.x.require_rank(Self::NAME, 2)?;
         args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
-        if args.x.strides != crate::tensor::Strides::row_major(args.x.shape) {
+        if !args.x.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the activation is read contiguous; found strides {}",
-                    args.x.strides
+                    "the activation is read contiguous; found strides {:?}",
+                    args.x.strides()
                 ),
             ));
         }
         args.out
             .require_row(Self::NAME, descriptor.dtype, columns)?;
-        args.out.require_shape(Self::NAME, args.x.shape)?;
-        if args.out.strides != crate::tensor::Strides::row_major(args.x.shape) {
+        args.out.require_dims(Self::NAME, args.x.dims())?;
+        if !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the result is written contiguous; found strides {}",
-                    args.out.strides
+                    "the result is written contiguous; found strides {:?}",
+                    args.out.strides()
                 ),
             ));
         }
@@ -732,11 +730,11 @@ impl Op for Silu {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let elements = args.x.shape.numel();
+        let elements = args.x.numel();
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.out)
+            .view(&args.x)
+            .view(&args.out)
             .u64(elements)
             .u32(descriptor.columns)
             .flag(descriptor.pdl);

@@ -27,9 +27,8 @@ use models::minimax_h3::video_vae::{self, TransformerBlock, VideoDecoder, VideoE
 use models::minimax_h3::{AudioVaeConfig, VideoVaeConfig};
 use nn::functional::{self, Padding};
 use nn::modules::{ResnetBlock3d, ResnetBlock3dConfig, Rotary};
-use nn::{
-    Checkpoint, Clip, CpuWeights, DType, Decoder, Device, LatentShape, Layout, Tensor, WeightLoader,
-};
+use nn::{Checkpoint, Clip, CpuWeights, DType, Decoder, Device, LatentShape, Tensor, WeightLoader};
+use proto::video::Layout;
 use support::{assert_close, f32_shard, f32_values, sequence, tensor, values};
 
 /// The unit roundoff of FP32.

@@ -6,7 +6,7 @@ use std::ffi::c_void;
 
 use ffi::{Handle, RawConfig, RawUniqueId, api};
 
-use crate::{DataType, DeviceId, DevicePtr, DeviceRange, Error, PrimaryContext, Result, Stream};
+use crate::{DeviceId, DevicePtr, DeviceRange, Error, PrimaryContext, Result, Stream};
 
 /// `NCCL_SPLIT_NOCOLOR`: the colour a rank that does not join a split passes,
 /// `#define NCCL_SPLIT_NOCOLOR -1` in `nccl.h`, compared there by
@@ -179,10 +179,10 @@ impl Communicator {
     /// Reduces `count` elements from every rank into every rank's `recv` (in
     /// place when both ranges start at the same address).
     ///
-    /// Each range states how many bytes are valid from its address. The call
-    /// checks, before any NCCL call, that `stream` belongs to this
-    /// communicator's device and that `count` elements of `dtype` fit both
-    /// ranges; the caller keeps the storage alive until the stream (or graph
+    /// `dtype` is the elements' `ncclDataType_t` code. Each range states how
+    /// many bytes are valid from its address. The call checks, before any NCCL
+    /// call, that `stream` belongs to this communicator's device, that `dtype`
+    /// is a code of `nccl.h`, and that `count` elements of it fit both ranges; the caller keeps the storage alive until the stream (or graph
     /// replay) completes.
     ///
     /// Takes `&self` so that a caller may hold the group as a shared reference
@@ -195,7 +195,7 @@ impl Communicator {
         send: DeviceRange,
         recv: DeviceRange,
         count: usize,
-        dtype: DataType,
+        dtype: i32,
         op: ReduceOp,
     ) -> Result<()> {
         self.ready(stream, "ncclAllReduce")?;
@@ -215,7 +215,7 @@ impl Communicator {
                 pointer(send.ptr()),
                 pointer(recv.ptr()),
                 count,
-                dtype.nccl(),
+                dtype,
                 op as i32,
                 self.raw,
                 stream.handle(),
@@ -234,7 +234,7 @@ impl Communicator {
         send: DeviceRange,
         recv: DeviceRange,
         count: usize,
-        dtype: DataType,
+        dtype: i32,
     ) -> Result<()> {
         self.ready(stream, "ncclAllGather")?;
         require_room(send.bytes(), elements_bytes(count, dtype)?, "send")?;
@@ -251,7 +251,7 @@ impl Communicator {
                 pointer(send.ptr()),
                 pointer(recv.ptr()),
                 count,
-                dtype.nccl(),
+                dtype,
                 self.raw,
                 stream.handle(),
             )
@@ -270,7 +270,7 @@ impl Communicator {
         send: DeviceRange,
         recv: DeviceRange,
         count: usize,
-        dtype: DataType,
+        dtype: i32,
     ) -> Result<()> {
         self.ready(stream, "ncclAlltoAll")?;
         let needed = ranks_bytes(count, dtype, self.size)?;
@@ -296,7 +296,7 @@ impl Communicator {
                     (api.send)(
                         pointer(send.ptr().offset(offset)?),
                         count,
-                        dtype.nccl(),
+                        dtype,
                         peer,
                         self.raw,
                         stream.handle(),
@@ -307,7 +307,7 @@ impl Communicator {
                     (api.recv)(
                         pointer(recv.ptr().offset(offset)?),
                         count,
-                        dtype.nccl(),
+                        dtype,
                         peer,
                         self.raw,
                         stream.handle(),
@@ -327,7 +327,7 @@ impl Communicator {
                 pointer(send.ptr()),
                 pointer(recv.ptr()),
                 count,
-                dtype.nccl(),
+                dtype,
                 self.raw,
                 stream.handle(),
             )
@@ -346,7 +346,7 @@ impl Communicator {
         send: DeviceRange,
         recv: DeviceRange,
         count: usize,
-        dtype: DataType,
+        dtype: i32,
         root: i32,
     ) -> Result<()> {
         self.ready(stream, "ncclBroadcast")?;
@@ -366,7 +366,7 @@ impl Communicator {
                 pointer(send.ptr()),
                 pointer(recv.ptr()),
                 count,
-                dtype.nccl(),
+                dtype,
                 root,
                 self.raw,
                 stream.handle(),
@@ -385,7 +385,7 @@ impl Communicator {
         stream: &Stream,
         data: DeviceRange,
         count: usize,
-        dtype: DataType,
+        dtype: i32,
         peer: i32,
     ) -> Result<()> {
         self.ready(stream, "ncclSend")?;
@@ -402,7 +402,7 @@ impl Communicator {
             (api.send)(
                 pointer(data.ptr()),
                 count,
-                dtype.nccl(),
+                dtype,
                 peer,
                 self.raw,
                 stream.handle(),
@@ -420,7 +420,7 @@ impl Communicator {
         stream: &Stream,
         data: DeviceRange,
         count: usize,
-        dtype: DataType,
+        dtype: i32,
         peer: i32,
     ) -> Result<()> {
         self.ready(stream, "ncclRecv")?;
@@ -437,7 +437,7 @@ impl Communicator {
             (api.recv)(
                 pointer(data.ptr()),
                 count,
-                dtype.nccl(),
+                dtype,
                 peer,
                 self.raw,
                 stream.handle(),
@@ -532,22 +532,44 @@ impl Communicator {
     }
 }
 
-/// The bytes `count` elements of `dtype` occupy, without overflowing.
-fn elements_bytes(count: usize, dtype: DataType) -> Result<usize> {
-    count.checked_mul(dtype.bytes()).ok_or_else(|| {
+/// The width in bytes of one element of the `ncclDataType_t` code `dtype`, as `nccl.h` defines
+/// the code.
+///
+/// The code is the caller's, derived from its own element type; this is the one place the crate
+/// reads it, to check a range's room before NCCL addresses it. A code `nccl.h` does not define is
+/// refused rather than passed on.
+fn width(dtype: i32) -> Result<usize> {
+    match dtype {
+        // ncclInt8, ncclUint8, ncclFloat8e4m3, ncclFloat8e5m2
+        0 | 1 | 10 | 11 => Ok(1),
+        // ncclFloat16, ncclBfloat16
+        6 | 9 => Ok(2),
+        // ncclInt32, ncclUint32, ncclFloat32
+        2 | 3 | 7 => Ok(4),
+        // ncclInt64, ncclUint64, ncclFloat64
+        4 | 5 | 8 => Ok(8),
+        _ => Err(Error::invalid(format!(
+            "{dtype} is no ncclDataType_t code of nccl.h"
+        ))),
+    }
+}
+
+/// The bytes `count` elements of the NCCL type `dtype` occupy, without overflowing.
+fn elements_bytes(count: usize, dtype: i32) -> Result<usize> {
+    count.checked_mul(width(dtype)?).ok_or_else(|| {
         Error::invalid(format!(
-            "{count} elements of {dtype:?} overflow the byte count"
+            "{count} elements of NCCL type {dtype} overflow the byte count"
         ))
     })
 }
 
-/// The bytes `size * count` elements of `dtype` occupy, without overflowing.
-fn ranks_bytes(count: usize, dtype: DataType, size: i32) -> Result<usize> {
+/// The bytes `size * count` elements of the NCCL type `dtype` occupy, without overflowing.
+fn ranks_bytes(count: usize, dtype: i32, size: i32) -> Result<usize> {
     elements_bytes(count, dtype)?
         .checked_mul(size as usize)
         .ok_or_else(|| {
             Error::invalid(format!(
-                "{count} elements of {dtype:?} on {size} ranks overflow the byte count"
+                "{count} elements of NCCL type {dtype} on {size} ranks overflow the byte count"
             ))
         })
 }
@@ -631,6 +653,19 @@ mod tests {
                 "nccl.h does not declare {name}, which this crate binds"
             );
         }
+    }
+
+    /// A range's room is checked at the width `nccl.h` gives each type code,
+    /// and a code it does not define is refused before NCCL sees it.
+    #[test]
+    fn a_type_code_has_the_width_nccl_gives_it() {
+        // ncclInt8, ncclFloat16, ncclBfloat16, ncclFloat32, ncclInt64, ncclFloat8e4m3.
+        for (code, width) in [(0, 1), (6, 2), (9, 2), (7, 4), (4, 8), (10, 1)] {
+            assert_eq!(super::width(code).unwrap(), width, "code {code}");
+        }
+        assert!(super::width(-1).is_err());
+        assert!(super::width(12).is_err());
+        assert_eq!(super::ranks_bytes(3, 7, 4).unwrap(), 48);
     }
 
     /// The unique id is the 128 bytes NCCL's ABI fixes, whatever header is

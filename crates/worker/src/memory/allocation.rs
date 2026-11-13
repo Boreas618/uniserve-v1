@@ -8,7 +8,7 @@
 //!
 //! A forward reads and writes a storage through a tensor: [`Storage::external`] gives the tensor
 //! over a window of a device allocation, which execution lends for the duration of a call
-//! (`backend::external`). The tensor does not keep the allocation alive; its owner does.
+//! (`ops::external`). The tensor does not keep the allocation alive; its owner does.
 
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
@@ -422,7 +422,7 @@ impl Storage {
     }
 
     /// The tensor of `shape` elements of `dtype` whose first element lies `offset` bytes into
-    /// this allocation: memory execution owns and lends to a forward (`backend::external`). A
+    /// this allocation: memory execution owns and lends to a forward (`ops::external`). A
     /// strided window is a view of the tensor this returns.
     ///
     /// # Errors
@@ -472,11 +472,11 @@ impl Storage {
         // SAFETY: the window lies inside this allocation, as checked above, and the caller
         // keeps it valid and unwritten for as long as the tensor's work may read it.
         let tensor = unsafe {
-            backend::external(
+            ops::external(
                 self.address() + offset as u64,
                 shape,
                 dtype,
-                &backend::cuda(device.0 as usize),
+                &ops::cuda(device.0 as usize),
             )
         }?;
         Ok(tensor)

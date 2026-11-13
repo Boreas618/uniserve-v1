@@ -52,10 +52,10 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use backend::breaks::{BREAK, HostWork};
-use backend::{Context, ContextGuard, Group};
 use ops::Generation;
+use ops::breaks::{BREAK, HostWork};
 use ops::moe::ExchangeTransport;
+use ops::{Context, ContextGuard, Group};
 use platform::{DeviceRange, Event, EventFlags, Stream};
 use tensor::{DType, Device, Shape, Tensor};
 
@@ -67,7 +67,7 @@ use crate::runner::Runner;
 use crate::{Error, Result};
 
 /// The alignment of the input tensors' block and of the allocator region behind it.
-const ALIGNMENT: u64 = backend::allocator::ALIGNMENT;
+const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 
 /// A launch table: `(operator, key, module path)` per launch, in launch order.
 type Table = Vec<(&'static str, String, String)>;
@@ -247,8 +247,8 @@ impl Graphs {
     /// device for graphs that hold none.
     pub fn device(&self) -> Device {
         match &self.device {
-            Some(cuda) => backend::cuda(cuda.stream.device().0 as usize),
-            None => backend::meta(),
+            Some(cuda) => ops::cuda(cuda.stream.device().0 as usize),
+            None => ops::meta(),
         }
     }
 
@@ -282,7 +282,7 @@ impl Graphs {
         // SAFETY: on a GPU the address lies in the input block at the start of the region,
         // which the caller of `Graphs::new` keeps mapped for as long as these graphs exist and
         // which only the copies these graphs issue write; on the meta device nothing is read.
-        Ok(unsafe { backend::external(address, shape, dtype, &self.device()) }?)
+        Ok(unsafe { ops::external(address, shape, dtype, &self.device()) }?)
     }
 
     /// Installs the launching context on this thread until the guard drops: what a runner reads
@@ -345,7 +345,7 @@ impl Graphs {
     ///
     /// # Errors
     ///
-    /// As `backend::Context::set_group`.
+    /// As `ops::Context::set_group`.
     pub fn set_group(&self, group: Option<Arc<Group>>, rank: u64, ranks: u64) -> Result<()> {
         self.profile.set_group(None, rank, ranks)?;
         self.preparing.set_group(None, rank, ranks)?;
@@ -356,11 +356,11 @@ impl Graphs {
         Ok(())
     }
 
-    /// The expert exchange of the runner's forwards (`backend::Context::set_exchange`).
+    /// The expert exchange of the runner's forwards (`ops::Context::set_exchange`).
     pub fn set_exchange(
         &self,
         transport: Option<ExchangeTransport>,
-        meet: Option<Arc<dyn Fn() -> backend::Result<()> + Send + Sync>>,
+        meet: Option<Arc<dyn Fn() -> ops::Result<()> + Send + Sync>>,
     ) {
         if let Some(cuda) = &self.device {
             cuda.launching.set_exchange(transport, meet);
@@ -1154,8 +1154,7 @@ impl Graphs {
 
         cuda.launching.reset();
         cuda.launching.record_launches();
-        let breaks: Arc<dyn Fn(HostWork) -> backend::Result<()> + Send + Sync> =
-            Arc::new(take_break);
+        let breaks: Arc<dyn Fn(HostWork) -> ops::Result<()> + Send + Sync> = Arc::new(take_break);
         cuda.launching.set_route(Some(Arc::new(Recorder)));
         cuda.launching.set_breaks(Some(breaks));
 

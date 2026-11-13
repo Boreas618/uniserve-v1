@@ -57,12 +57,13 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use platform::Stream;
+
 use super::{Mask, address, head_stride, row_stride, to_i64};
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 use tensor::DType;
@@ -134,7 +135,7 @@ impl fmt::Display for DenseDescriptor {
 }
 
 /// The arguments of one dense attention call.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DenseArgs {
     /// `[q_tokens, q_heads, head_dim]` queries, packed by sequence.
     pub query: Operand,
@@ -358,21 +359,21 @@ impl Op for DenseAttention {
         args.out
             .require_row(operator, descriptor.output, head_dim)?;
 
-        let q_tokens = args.query.shape.dim(0);
-        let kv_tokens = args.key.shape.dim(0);
+        let q_tokens = args.query.dim(0);
+        let kv_tokens = args.key.dim(0);
         if q_tokens == 0 || kv_tokens == 0 {
             return Err(Error::argument(
                 operator,
                 "a call attends from at least one query row to at least one key row",
             ));
         }
-        if args.query.shape.dim(1) != q_heads || args.key.shape.dim(1) != kv_heads {
+        if args.query.dim(1) != q_heads || args.key.dim(1) != kv_heads {
             return Err(Error::argument(
                 operator,
                 format!(
                     "expected {q_heads} query heads and {kv_heads} key heads, found {} and {}",
-                    args.query.shape.dim(1),
-                    args.key.shape.dim(1)
+                    args.query.dim(1),
+                    args.key.dim(1)
                 ),
             ));
         }
@@ -382,30 +383,35 @@ impl Op for DenseAttention {
                 format!("{q_heads} query heads do not divide over {kv_heads} key heads"),
             ));
         }
-        if !args.key.shape.matches(&args.value.shape) {
+        if args.key.dims() != args.value.dims() {
             return Err(Error::argument(
                 operator,
                 format!(
                     "keys and values take one shape, found {:?} and {:?}",
-                    args.key.shape.dims(),
-                    args.value.shape.dims()
+                    args.key.dims(),
+                    args.value.dims()
                 ),
             ));
         }
-        if !args.out.shape.matches(&args.query.shape) {
+        if args.out.dims() != args.query.dims() {
             return Err(Error::argument(
                 operator,
                 format!(
                     "the output takes the query's shape {:?}, found {:?}",
-                    args.query.shape.dims(),
-                    args.out.shape.dims()
+                    args.query.dims(),
+                    args.out.dims()
                 ),
             ));
         }
         // The scheduler writes the offsets; the module pads its schedule to the longest row, which
         // the descriptor bounds. Two absent tables are the one-sequence form: every query row
         // attends the whole key range, which is exactly `[0, q_tokens)` and `[0, kv_tokens)`.
-        sequence_layout(operator, descriptor, args.cu_seq_lens_q, args.cu_seq_lens_k)?;
+        sequence_layout(
+            operator,
+            descriptor,
+            args.cu_seq_lens_q.as_ref(),
+            args.cu_seq_lens_k.as_ref(),
+        )?;
         if kv_tokens > u64::from(descriptor.max_kv_len) {
             return Err(Error::argument(
                 operator,
@@ -452,12 +458,13 @@ impl Op for DenseAttention {
         let head_dim = u64::from(descriptor.head_dim);
         let q_heads = u64::from(descriptor.q_heads);
         let kv_heads = u64::from(descriptor.kv_heads);
-        let q_tokens = args.query.shape.dim(0);
-        let kv_tokens = args.key.shape.dim(0);
+        let q_tokens = args.query.dim(0);
+        let kv_tokens = args.key.dim(0);
         // The query offsets hold `batch + 1` entries; without offsets the packing is one sequence.
         let batch = args
             .cu_seq_lens_q
-            .map_or(1, |offsets| offsets.shape.dim(0) - 1);
+            .as_ref()
+            .map_or(1, |offsets| offsets.dim(0) - 1);
         // The descriptor's mask and the call's flag agree.
         let causal = args.causal;
 
@@ -470,9 +477,11 @@ impl Op for DenseAttention {
             // its entry reads `batch == 1` as `[0, q_tokens)` against `[0, kv_tokens)`.
             cu_seq_lens_q: args
                 .cu_seq_lens_q
+                .as_ref()
                 .map_or(std::ptr::null(), |q| address(q.ptr) as usize as *const i32),
             cu_seq_lens_k: args
                 .cu_seq_lens_k
+                .as_ref()
                 .map_or(std::ptr::null(), |k| address(k.ptr) as usize as *const i32),
             batch: to_i64(operator, batch)?,
             q_tokens: to_i64(operator, q_tokens)?,
@@ -542,8 +551,8 @@ impl Op for DenseAttention {
 fn sequence_layout(
     operator: &'static str,
     descriptor: &DenseDescriptor,
-    queries: Option<Operand>,
-    keys: Option<Operand>,
+    queries: Option<&Operand>,
+    keys: Option<&Operand>,
 ) -> Result<u64> {
     let offsets = match (queries, keys) {
         (Some(q), Some(k)) => Some((q, k)),
@@ -574,14 +583,12 @@ fn sequence_layout(
         return Ok(1);
     };
     let batch = q
-        .shape
         .dims()
         .first()
-        .copied()
-        .unwrap_or(0)
+        .map_or(0, |&entries| entries as u64)
         .saturating_sub(1);
-    q.require_shape(operator, Shape::new(&[batch + 1]))?;
-    k.require_shape(operator, Shape::new(&[batch + 1]))?;
+    q.require_shape(operator, &[batch + 1])?;
+    k.require_shape(operator, &[batch + 1])?;
     for (name, view) in [("cu_seq_lens_q", q), ("cu_seq_lens_k", k)] {
         if view.dtype != DType::U32 {
             return Err(Error::argument(
@@ -637,11 +644,7 @@ mod tests {
 
     /// A view the validation reads without touching: an address of zero is never dereferenced here.
     fn table(extent: u64) -> Operand {
-        Operand::new(
-            crate::tensor::DevicePtr::new(0),
-            DType::U32,
-            Shape::new(&[extent]),
-        )
+        Operand::new(platform::DevicePtr::from_address(0), DType::U32, &[extent])
     }
 
     #[test]
@@ -659,7 +662,13 @@ mod tests {
         );
         // The batch path is unchanged: two tables of `batch + 1` offsets.
         assert_eq!(
-            sequence_layout("dense_attention", &cross(), Some(table(3)), Some(table(3))).unwrap(),
+            sequence_layout(
+                "dense_attention",
+                &cross(),
+                Some(&table(3)),
+                Some(&table(3))
+            )
+            .unwrap(),
             2
         );
         // A launch that disagrees with its descriptor is refused in both directions, and one table
@@ -669,12 +678,12 @@ mod tests {
             sequence_layout(
                 "dense_attention",
                 &unweighted,
-                Some(table(3)),
-                Some(table(3))
+                Some(&table(3)),
+                Some(&table(3))
             )
             .is_err()
         );
-        assert!(sequence_layout("dense_attention", &cross(), Some(table(3)), None).is_err());
+        assert!(sequence_layout("dense_attention", &cross(), Some(&table(3)), None).is_err());
     }
 
     #[test]

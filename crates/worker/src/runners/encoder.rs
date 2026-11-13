@@ -48,7 +48,7 @@ use crate::{Error, Result};
 const PHASES: &[Phase] = &[Phase::TextEncode];
 
 /// The alignment of each input column in the input block.
-const ALIGNMENT: u64 = backend::allocator::ALIGNMENT;
+const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 
 /// The input columns, in the order they lie in the input block, each of 4-byte elements:
 /// `[tokens]` U32 ids, `[tokens]` I32 positions, `[tokens]` U32 slot mapping, `[rows]` U32
@@ -239,7 +239,7 @@ impl EncoderRunner {
             .map(|grid| {
                 let patches: usize = grid.iter().map(|extent| *extent as usize).product();
                 let shape = (patches, format.width() as usize);
-                Ok(backend::empty(shape, format.dtype)?)
+                Ok(ops::empty(shape, format.dtype)?)
             })
             .collect()
     }

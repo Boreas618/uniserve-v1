@@ -26,13 +26,13 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
-use crate::platform::{self, Stream};
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -106,18 +106,19 @@ impl ScaleLayout {
         columns.div_ceil(u64::from(BLOCK_ELEMENTS))
     }
 
-    /// The shape a scale field of a `[rows, columns]` matrix takes in this layout.
+    /// The `[rows, scale columns]` extents a scale field of a `[rows, columns]` matrix takes in
+    /// this layout.
     ///
     /// The linear layout is the matrix's own scale matrix; the swizzled one is that matrix padded
     /// to [`SWIZZLE_ROWS`] rows and [`SWIZZLE_COLUMNS`] scale columns.
-    pub fn shape(self, rows: u64, columns: u64) -> Shape {
+    pub fn shape(self, rows: u64, columns: u64) -> [u64; 2] {
         let scales = self.columns(columns);
         match self {
-            Self::Linear => Shape::new(&[rows, scales]),
-            Self::Swizzled128X4 => Shape::new(&[
+            Self::Linear => [rows, scales],
+            Self::Swizzled128X4 => [
                 rows.div_ceil(SWIZZLE_ROWS) * SWIZZLE_ROWS,
                 scales.div_ceil(SWIZZLE_COLUMNS) * SWIZZLE_COLUMNS,
-            ]),
+            ],
         }
     }
 }
@@ -150,7 +151,7 @@ impl fmt::Display for QuantizeDescriptor {
 }
 
 /// The arguments of one `nvfp4_quantize`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct QuantizeArgs {
     /// The activations, `[rows, columns]`, unit stride on the last axis.
     pub input: Operand,
@@ -220,7 +221,7 @@ impl Op for Nvfp4Quantize {
         let columns = u64::from(descriptor.columns);
         args.input
             .require_row(Self::NAME, descriptor.input, columns)?;
-        if args.input.strides.last() != 1 {
+        if args.input.last_stride() != 1 {
             return Err(Error::argument(
                 Self::NAME,
                 "the activations need a unit stride on the last axis",
@@ -228,18 +229,17 @@ impl Op for Nvfp4Quantize {
         }
         let rows = args.input.rows();
         args.values
-            .require_shape(Self::NAME, Shape::new(&[rows, columns / 2]))?;
+            .require_shape(Self::NAME, &[rows, columns / 2])?;
         args.values
             .require_row(Self::NAME, DType::U8, columns / 2)?;
         args.scales
-            .require_row(Self::NAME, DType::U8, args.scales.shape.last())?;
+            .require_row(Self::NAME, DType::U8, args.scales.last())?;
         args.scales
-            .require_shape(Self::NAME, descriptor.layout.shape(rows, columns))?;
+            .require_shape(Self::NAME, &descriptor.layout.shape(rows, columns))?;
 
         args.global_scale.require_row(Self::NAME, DType::F32, 1)?;
 
-        args.token_scale
-            .require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.token_scale.require_shape(Self::NAME, &[rows])?;
         args.token_scale.require_row(Self::NAME, DType::F32, rows)?;
         Ok(())
     }
@@ -259,12 +259,12 @@ impl Op for Nvfp4Quantize {
         let elements = rows;
         let mut arguments = Arguments::new();
         arguments
-            .view(args.input)
-            .view(args.values)
-            .view(args.scales)
+            .view(&args.input)
+            .view(&args.values)
+            .view(&args.scales)
             .u64(rows)
-            .view(args.global_scale)
-            .view(args.token_scale);
+            .view(&args.global_scale)
+            .view(&args.token_scale);
         kernel.launch(LaunchGrid::covering(elements, 1)?, &mut arguments, stream)
     }
 
@@ -345,7 +345,7 @@ impl fmt::Display for GemmDescriptor {
 }
 
 /// The arguments of one `nvfp4_gemm`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct GemmArgs {
     /// The packed activations, `[m, k / 2]` bytes.
     pub input: Operand,
@@ -410,7 +410,7 @@ const _: () = assert!(
 /// The product reads either bit-for-bit, so the element type is the producer's declaration and not
 /// a property of the product. What a kernel does depend on is one byte per scale, which is what
 /// this states — pinning one declaration instead refused the other producer and cost a run.
-pub fn require_byte_scale(op: &'static str, view: Operand, columns: u64) -> Result<()> {
+pub fn require_byte_scale(op: &'static str, view: &Operand, columns: u64) -> Result<()> {
     if !matches!(view.dtype, DType::U8 | DType::F8E4M3) {
         return Err(Error::argument(
             op,
@@ -470,35 +470,28 @@ impl Op for Nvfp4Gemm {
             ));
         }
         args.input
-            .require_shape(Self::NAME, Shape::new(&[m, u64::from(descriptor.k / 2)]))?;
+            .require_shape(Self::NAME, &[m, u64::from(descriptor.k / 2)])?;
         args.input.require_row(Self::NAME, DType::U8, k)?;
         args.weight
-            .require_shape(Self::NAME, Shape::new(&[n, u64::from(descriptor.k / 2)]))?;
+            .require_shape(Self::NAME, &[n, u64::from(descriptor.k / 2)])?;
         args.weight.require_row(Self::NAME, DType::U8, k)?;
         // The activation's block scales are the encoder's output, so their element type is the
         // encoder's declaration (`require_byte_scale`); the weight's are the checkpoint's, which the
         // descriptor's key names.
-        require_byte_scale(
-            Self::NAME,
-            args.input_scales,
-            args.input_scales.shape.last(),
-        )?;
+        require_byte_scale(Self::NAME, &args.input_scales, args.input_scales.last())?;
         args.input_scales.require_shape(
             Self::NAME,
-            descriptor.layout.shape(m, u64::from(descriptor.k)),
+            &descriptor.layout.shape(m, u64::from(descriptor.k)),
         )?;
         // An E4M3 block scale, not a byte of packed values: the scale table is its own element
         // type and the packed weight is the only U8 operand of this product.
-        args.weight_scales.require_row(
-            Self::NAME,
-            DType::F8E4M3,
-            args.weight_scales.shape.last(),
-        )?;
+        args.weight_scales
+            .require_row(Self::NAME, DType::F8E4M3, args.weight_scales.last())?;
         args.weight_scales.require_shape(
             Self::NAME,
-            ScaleLayout::Swizzled128X4.shape(n, u64::from(descriptor.k)),
+            &ScaleLayout::Swizzled128X4.shape(n, u64::from(descriptor.k)),
         )?;
-        args.alpha.require_shape(Self::NAME, Shape::new(&[1]))?;
+        args.alpha.require_shape(Self::NAME, &[1])?;
         args.alpha.require_row(Self::NAME, DType::F32, 1)?;
         if args.out.dtype != descriptor.output {
             return Err(Error::argument(
@@ -510,10 +503,10 @@ impl Op for Nvfp4Gemm {
                 ),
             ));
         }
-        args.out.require_shape(Self::NAME, Shape::new(&[m, n]))?;
-        match (descriptor.epilogue, args.bias) {
+        args.out.require_shape(Self::NAME, &[m, n])?;
+        match (descriptor.epilogue, &args.bias) {
             (Epilogue::Bias, Some(bias)) => {
-                bias.require_shape(Self::NAME, Shape::new(&[n]))?;
+                bias.require_shape(Self::NAME, &[n])?;
             }
             (Epilogue::Bias, None) => {
                 return Err(Error::argument(
@@ -541,16 +534,16 @@ impl Op for Nvfp4Gemm {
         let m = args.input.rows();
         let n = args.weight.rows();
         // Without a bias epilogue the slot is never read; the call still takes an address.
-        let bias = args.bias.unwrap_or(args.alpha);
+        let bias = args.bias.as_ref().unwrap_or(&args.alpha);
 
         let mut call = Call {
-            input: platform::address(args.input.ptr) as usize as *const c_void,
-            weight: platform::address(args.weight.ptr) as usize as *const c_void,
-            input_scales: platform::address(args.input_scales.ptr) as usize as *const c_void,
-            weight_scales: platform::address(args.weight_scales.ptr) as usize as *const c_void,
-            alpha: platform::address(args.alpha.ptr) as usize as *const c_void,
-            bias: platform::address(bias.ptr) as usize as *const c_void,
-            out: platform::address(args.out.ptr) as usize as *mut c_void,
+            input: args.input.ptr.address() as usize as *const c_void,
+            weight: args.weight.ptr.address() as usize as *const c_void,
+            input_scales: args.input_scales.ptr.address() as usize as *const c_void,
+            weight_scales: args.weight_scales.ptr.address() as usize as *const c_void,
+            alpha: args.alpha.ptr.address() as usize as *const c_void,
+            bias: bias.ptr.address() as usize as *const c_void,
+            out: args.out.ptr.address() as usize as *mut c_void,
             m: m as i64,
             n: n as i64,
             k: i64::from(descriptor.k),
@@ -622,18 +615,12 @@ mod tests {
         );
         assert_eq!(
             ScaleLayout::Linear.shape(3, 4096),
-            Shape::new(&[3, 256]),
+            [3, 256],
             "the linear layout is the matrix's own"
         );
         // The swizzled layout pads rows to 128 and scale columns to 4.
-        assert_eq!(
-            ScaleLayout::Swizzled128X4.shape(3, 4096),
-            Shape::new(&[128, 256])
-        );
-        assert_eq!(
-            ScaleLayout::Swizzled128X4.shape(129, 64),
-            Shape::new(&[256, 4])
-        );
+        assert_eq!(ScaleLayout::Swizzled128X4.shape(3, 4096), [128, 256]);
+        assert_eq!(ScaleLayout::Swizzled128X4.shape(129, 64), [256, 4]);
     }
 
     /// The two operands of an NVFP4 product are two element types, and the pair is the descriptor's.

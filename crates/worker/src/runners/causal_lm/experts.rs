@@ -170,11 +170,12 @@ impl Member {
         }
 
         // A profile run computes over regions of the transport's extents and no memory.
-        let meta = backend::meta();
+        let meta = ops::meta();
         let mut regions = Vec::with_capacity(7);
         for (dtype, extents) in shape.regions() {
+            let dims: Vec<usize> = extents.iter().map(|&extent| extent as usize).collect();
             // SAFETY: a tensor over the meta device has no memory: its address is never read.
-            regions.push(unsafe { backend::external(0, dims(&extents), dtype, &meta) }?);
+            regions.push(unsafe { ops::external(0, dims, dtype, &meta) }?);
         }
 
         let link = Box::new(ops::moe::exchange::HostGroup {
@@ -233,7 +234,7 @@ impl Member {
         let views = transport
             .views()
             .map_err(|error| Error::Invalid(format!("reading the expert transport: {error}")))?;
-        let device = backend::cuda(self.shape.device as usize);
+        let device = ops::cuda(self.shape.device as usize);
         let lent = [
             views.states,
             views.ids,
@@ -247,7 +248,12 @@ impl Member {
             // SAFETY: the region is the transport's own memory, laid out with these extents,
             // which the package keeps for as long as the transport this member holds.
             *region = unsafe {
-                backend::external(view.ptr.address(), dims(&view.shape), view.dtype, &device)
+                ops::external(
+                    view.ptr.address(),
+                    view.shape().clone(),
+                    view.dtype,
+                    &device,
+                )
             }?;
         }
 
@@ -276,18 +282,18 @@ impl Member {
     /// once every member has called it, so no member waits on its device for a launch another
     /// has not reached; while serving it returns at once, the agreement having met the
     /// members.
-    pub(crate) fn meet(&self) -> Arc<dyn Fn() -> backend::Result<()> + Send + Sync> {
+    pub(crate) fn meet(&self) -> Arc<dyn Fn() -> ops::Result<()> + Send + Sync> {
         let group = Arc::clone(&self.group);
         let warming = Arc::clone(&self.warming);
 
         Arc::new(move || {
             if warming.load(Ordering::Acquire) {
-                group.all_gather_fixed(&[], &mut []).map_err(|error| {
-                    backend::Error::Unsupported {
+                group
+                    .all_gather_fixed(&[], &mut [])
+                    .map_err(|error| ops::Error::Unsupported {
                         operation: "an expert exchange",
                         reason: format!("the members of the union did not meet: {error}"),
-                    }
-                })?;
+                    })?;
             }
             Ok(())
         })
@@ -442,11 +448,6 @@ impl Member {
             dtype: shape.dtype,
         }
     }
-}
-
-/// The extents of a region, as a tensor's dimensions.
-fn dims(shape: &ops::Shape) -> Vec<usize> {
-    shape.dims().iter().map(|extent| *extent as usize).collect()
 }
 
 /// The package's gather of `bytes` bytes of every member, in member order

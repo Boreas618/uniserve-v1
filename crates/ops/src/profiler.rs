@@ -11,7 +11,7 @@
 
 use std::error::Error as StdError;
 
-use ops::platform::Stream;
+use platform::Stream;
 
 use crate::{Error, context};
 

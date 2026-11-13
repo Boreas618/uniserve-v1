@@ -6,7 +6,7 @@
 //! - [`counters`]: the process's CUPTI subscription, and the watch of its threads' waits for the
 //!   device and the record of its streams' device time.
 //! - [`markers`]: the range markers at the entry and exit of the model's profiler ranges
-//!   (`nn::profiler::range`), the process's `backend::Profiler`, exported as per-step module
+//!   (`nn::profiler::range`), the process's `ops::Profiler`, exported as per-step module
 //!   times.
 //! - [`pc_sampling`]: CUPTI's PC sampling, enabled for a rank's life when the deployment profiles
 //!   its CUDA graphs' kernels.

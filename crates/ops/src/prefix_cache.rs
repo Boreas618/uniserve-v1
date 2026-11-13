@@ -57,13 +57,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -132,7 +132,7 @@ impl fmt::Display for ConversionDescriptor {
 }
 
 /// The arguments of `page_conversion`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ConversionArgs {
     /// `[scratch_bytes]` u8, contiguous: the workspace's scratch, holding the staged page.
     pub scratch: Operand,
@@ -195,12 +195,12 @@ impl Op for PageConversion {
             ));
         }
         let needed = scratch_bytes(args.elements, args.scales);
-        if args.scratch.shape.dim(0) < needed {
+        if args.scratch.dim(0) < needed {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the scratch holds {} bytes, the page needs {needed}",
-                    args.scratch.shape.dim(0)
+                    args.scratch.dim(0)
                 ),
             ));
         }
@@ -252,7 +252,7 @@ impl Op for PageConversion {
     ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
-            .view(args.scratch)
+            .view(&args.scratch)
             .u64(args.elements)
             .u64(args.scales)
             .u32(args.block_size)
@@ -331,7 +331,7 @@ impl fmt::Display for CopyRegionDescriptor {
 }
 
 /// The arguments of `cache_copy_region`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct CopyRegionArgs {
     /// `[columns, units, plane_bytes]` u8, contiguous: the field's stored values.
     pub values: Operand,
@@ -385,9 +385,9 @@ impl Op for CacheCopyRegion {
                 "the stored values are raw bytes".to_owned(),
             ));
         }
-        if args.values.shape.dim(0) != u64::from(descriptor.columns)
-            || args.values.shape.dim(2) != expected_plane
-            || args.values.strides != Strides::row_major(args.values.shape)
+        if args.values.dim(0) != u64::from(descriptor.columns)
+            || args.values.dim(2) != expected_plane
+            || !args.values.is_row_major()
         {
             return Err(Error::argument(
                 Self::NAME,
@@ -397,11 +397,12 @@ impl Op for CacheCopyRegion {
                 ),
             ));
         }
-        let shape = Shape::new(&[u64::from(descriptor.columns), args.values.shape.dim(1)]);
+        let units = args.values.dim(1);
+        let shape = &[u64::from(descriptor.columns), units];
         match (&args.scale, descriptor.scaled) {
             (Some(scale), true) => {
                 scale.require_shape(Self::NAME, shape)?;
-                scale.require_row(Self::NAME, DType::F32, shape.last())?;
+                scale.require_row(Self::NAME, DType::F32, units)?;
             }
             (None, false) => {}
             (None, true) => {
@@ -432,25 +433,21 @@ impl Op for CacheCopyRegion {
         }
         args.source.require_shape(
             Self::NAME,
-            Shape::new(&[
+            &[
                 u64::from(descriptor.units_per_page) * u64::from(descriptor.columns),
                 args.count,
                 u64::from(descriptor.heads),
                 u64::from(descriptor.head_dim),
-            ]),
+            ],
         )?;
-        if args.source.dtype != DType::F32
-            || args.source.strides != Strides::row_major(args.source.shape)
-        {
+        if args.source.dtype != DType::F32 || !args.source.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the decoded block is contiguous FP32".to_owned(),
             ));
         }
-        args.units.require_shape(
-            Self::NAME,
-            Shape::new(&[u64::from(descriptor.units_per_page)]),
-        )?;
+        args.units
+            .require_shape(Self::NAME, &[u64::from(descriptor.units_per_page)])?;
         if args.units.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -469,12 +466,12 @@ impl Op for CacheCopyRegion {
                 ),
             ));
         }
-        if u32::try_from(args.values.shape.dim(1)).is_err() {
+        if u32::try_from(args.values.dim(1)).is_err() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the field's {} units per column do not fit a kernel parameter",
-                    args.values.shape.dim(1)
+                    args.values.dim(1)
                 ),
             ));
         }
@@ -487,21 +484,21 @@ impl Op for CacheCopyRegion {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let scale = args.scale.unwrap_or(args.initialized);
+        let scale = args.scale.as_ref().unwrap_or(&args.initialized);
         let mut arguments = Arguments::new();
         arguments
-            .view(args.values)
+            .view(&args.values)
             .view(scale)
-            .view(args.initialized)
-            .view(args.source)
-            .view(args.units)
+            .view(&args.initialized)
+            .view(&args.source)
+            .view(&args.units)
             .u64(args.offset)
             .u64(args.count)
             // The field's units *per column*. `values` and `initialized` are addressed as
             // `[column, unit, …]` and the unit ids arrive per page, so a program needs the pool's own
             // shape to turn (column, unit) into an offset; the views do not carry extents into the
             // kernel.
-            .u32(args.values.shape.dim(1) as u32);
+            .u32(args.values.dim(1) as u32);
         // One program per (column, unit slot): it owns the whole written span of that cell, so the
         // FP8 path's amax is one reduction over the span rather than one per token - the write
         // takes `max(scale, max(abs(span), 1e-12) / 448)` once and rescales the unit's resident
@@ -540,10 +537,10 @@ impl Op for CacheCopyRegion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DevicePtr;
+    use platform::DevicePtr;
 
     fn view(dtype: DType, dims: &[u64]) -> Operand {
-        Operand::new(DevicePtr::new(0x1000), dtype, Shape::new(dims))
+        Operand::new(DevicePtr::from_address(0x1000), dtype, dims)
     }
 
     /// Two layers of a 16-token page of four 64-wide heads, FP8 with one scale per field and layer.

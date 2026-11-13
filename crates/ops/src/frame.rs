@@ -21,13 +21,13 @@
 use std::fmt;
 use std::mem::{offset_of, size_of};
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -77,8 +77,8 @@ impl FramePadDescriptor {
     /// and channels, which coalesces in the layout the operands are stored in. The descriptor
     /// carries the result, so the caller and the compiled program agree on the variant.
     pub fn tiles(values: &Operand, out: &Operand) -> (u32, u32) {
-        let contiguous_out = out.strides == Strides::row_major(out.shape);
-        Self::tiles_of(values.strides.last() == 1, contiguous_out, out.shape.dim(4))
+        let contiguous_out = out.is_row_major();
+        Self::tiles_of(values.last_stride() == 1, contiguous_out, out.dim(4))
     }
 
     /// The same split, from the two facts it turns on: whether the source's columns are unit-strided
@@ -94,7 +94,7 @@ impl FramePadDescriptor {
 }
 
 /// The arguments of `frame_pad`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FramePadArgs {
     /// `[batch, channels, frames, height, width]`, any strides, channel-first or
     /// channels-last: the kernel walks both operands through the strides it is given.
@@ -133,25 +133,25 @@ impl Op for FramePad {
                 ),
             ));
         }
-        if args.out.strides != Strides::row_major(args.out.shape) && !is_channels_last(&args.out) {
+        if !args.out.is_row_major() && !is_channels_last(&args.out) {
             return Err(Error::argument(
                 Self::NAME,
                 "the output is neither contiguous nor channels-last".to_owned(),
             ));
         }
-        let (batch, channels) = (args.values.shape.dim(0), args.values.shape.dim(1));
-        if args.out.shape.dim(0) != batch || args.out.shape.dim(1) != channels {
+        let (batch, channels) = (args.values.dim(0), args.values.dim(1));
+        if args.out.dim(0) != batch || args.out.dim(1) != channels {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the output holds {} batches and {} channels, the source {batch} and {channels}",
-                    args.out.shape.dim(0),
-                    args.out.shape.dim(1)
+                    args.out.dim(0),
+                    args.out.dim(1)
                 ),
             ));
         }
-        let (height, width) = (args.values.shape.dim(3), args.values.shape.dim(4));
-        let (out_width, out_height) = (args.out.shape.dim(4), args.out.shape.dim(3));
+        let (height, width) = (args.values.dim(3), args.values.dim(4));
+        let (out_width, out_height) = (args.out.dim(4), args.out.dim(3));
         if args.top >= out_height
             || args.left >= out_width
             || args.top + height > out_height
@@ -166,12 +166,12 @@ impl Op for FramePad {
                 ),
             ));
         }
-        if args.front != args.out.shape.dim(2) - args.values.shape.dim(2) {
+        if args.front != args.out.dim(2) - args.values.dim(2) {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the output gains {} frames, the launch pads {}",
-                    args.out.shape.dim(2) - args.values.shape.dim(2),
+                    args.out.dim(2) - args.values.dim(2),
                     args.front
                 ),
             ));
@@ -187,7 +187,7 @@ impl Op for FramePad {
             ("channels", channels),
             ("height", height),
             ("width", width),
-            ("output frames", args.out.shape.dim(2)),
+            ("output frames", args.out.dim(2)),
             ("output height", out_height),
             ("output width", out_width),
         ] {
@@ -207,22 +207,22 @@ impl Op for FramePad {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let (batch, channels) = (args.values.shape.dim(0), args.values.shape.dim(1));
-        let (height, width) = (args.values.shape.dim(3), args.values.shape.dim(4));
-        let (out_width, out_height) = (args.out.shape.dim(4), args.out.shape.dim(3));
+        let (batch, channels) = (args.values.dim(0), args.values.dim(1));
+        let (height, width) = (args.values.dim(3), args.values.dim(4));
+        let (out_width, out_height) = (args.out.dim(4), args.out.dim(3));
 
         let mut arguments = Arguments::new();
-        arguments.view(args.values).view(args.out);
-        for stride in args.values.strides.as_slice() {
+        arguments.view(&args.values).view(&args.out);
+        for stride in args.values.strides() {
             arguments.i32(*stride as i32);
         }
-        for stride in args.out.strides.as_slice() {
+        for stride in args.out.strides() {
             arguments.i32(*stride as i32);
         }
         arguments
             .i32(height as i32)
             .i32(width as i32)
-            .i32(args.out.shape.dim(2) as i32)
+            .i32(args.out.dim(2) as i32)
             .i32(out_height as i32)
             .i32(out_width as i32)
             .i32(channels as i32)
@@ -231,7 +231,7 @@ impl Op for FramePad {
             .i32(args.front as i32);
 
         let columns = u64::from(descriptor.block_pixels);
-        let rows = batch * args.out.shape.dim(2) * out_height;
+        let rows = batch * args.out.dim(2) * out_height;
         let grid = LaunchGrid::new([
             rows,
             out_width.div_ceil(columns),
@@ -270,20 +270,20 @@ pub fn frame_reduction_class(channels_per_group: u64, pixels: u64) -> u32 {
     reduction.next_power_of_two().min(u64::from(u32::MAX)) as u32
 }
 
-/// The strides of a `[batch, channels, frames, height, width]` frame stored channels-last.
+/// The strides of a frame of extents `dims`, `[batch, channels, frames, height, width]`, stored
+/// channels-last.
 ///
 /// The logical axes keep their meaning and the order lives in the strides: a pixel's channels are
 /// contiguous, so the channel axis' stride is 1 and a pixel is a channel count away from the next.
-pub fn channels_last_strides(shape: Shape) -> Strides {
-    let (channels, frames, height, width) =
-        (shape.dim(1), shape.dim(2), shape.dim(3), shape.dim(4));
-    Strides::new(&[
+pub fn channels_last_strides(dims: [u64; 5]) -> [u64; 5] {
+    let [_, channels, frames, height, width] = dims;
+    [
         channels * frames * height * width,
         1,
         height * width * channels,
         width * channels,
         channels,
-    ])
+    ]
 }
 
 /// Whether `out` is stored channels-last: exactly the channels-last order and not the contiguous
@@ -294,7 +294,14 @@ pub fn channels_last_strides(shape: Shape) -> Strides {
 /// through whichever vector it was handed, so reading the extent instead of the vector would let one
 /// buffer run two ways in one deployment.
 pub fn is_channels_last(out: &Operand) -> bool {
-    out.strides == channels_last_strides(out.shape) && out.strides != Strides::row_major(out.shape)
+    // Only a five-axis frame has a channels-last order.
+    let Ok(dims) = <[usize; 5]>::try_from(out.dims()) else {
+        return false;
+    };
+    let channels_last = channels_last_strides(dims.map(|dim| dim as u64));
+    let strides = out.strides().iter().map(|&stride| stride as u64);
+
+    strides.eq(channels_last) && !out.is_row_major()
 }
 
 /// The element step between neighbouring pixels of one frame, in either layout a video tensor is
@@ -310,21 +317,17 @@ pub fn is_channels_last(out: &Operand) -> bool {
 /// The batch axis is not constrained — a view of a slice carries whatever step its buffer gives —
 /// because the entry is told it and never derives it.
 pub fn pixel_stride(values: &Operand) -> Result<i64> {
-    let (channels, height, width) = (
-        values.shape.dim(1),
-        values.shape.dim(3),
-        values.shape.dim(4),
-    );
-    let strides = values.strides.as_slice();
+    let (channels, height, width) = (values.dim(1), values.dim(3), values.dim(4));
+    let stride = |axis| values.stride(axis);
     // Channel-first: `[batch, channels, frames, height, width]`, a frame's pixels contiguous.
-    if strides[4] == 1 && strides[3] == width && strides[2] == height * width {
+    if stride(4) == 1 && stride(3) == width && stride(2) == height * width {
         return Ok(1);
     }
     // Channels-last: the same logical axes, a pixel's channels contiguous.
-    if strides[1] == 1
-        && strides[4] == channels
-        && strides[3] == width * channels
-        && strides[2] == height * width * channels
+    if stride(1) == 1
+        && stride(4) == channels
+        && stride(3) == width * channels
+        && stride(2) == height * width * channels
     {
         return Ok(i64::try_from(channels).unwrap_or(i64::MAX));
     }
@@ -332,8 +335,8 @@ pub fn pixel_stride(values: &Operand) -> Result<i64> {
         FrameMoments::NAME,
         format!(
             "the frame's pixels are in neither layout a video tensor is stored in: strides {:?}              for {:?} are not channel-first ({}) nor channels-last ({})",
-            values.strides,
-            values.shape.dims(),
+            values.strides(),
+            values.dims(),
             "a frame's pixels contiguous",
             "a pixel's channels contiguous"
         ),
@@ -417,7 +420,7 @@ impl fmt::Display for FrameMomentsDescriptor {
 }
 
 /// The arguments of `frame_moments`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FrameMomentsArgs {
     /// `[batch, channels, frames, height, width]` FP32, channel-first or channels-last: a
     /// frame's pixels are one step apart, which [`pixel_stride`] derives from the layout.
@@ -448,11 +451,8 @@ impl Op for FrameMoments {
             ));
         }
         pixel_stride(&args.values)?;
-        let (batch, channels, frames) = (
-            args.values.shape.dim(0),
-            args.values.shape.dim(1),
-            args.values.shape.dim(2),
-        );
+        let (batch, channels, frames) =
+            (args.values.dim(0), args.values.dim(1), args.values.dim(2));
         if args.groups == 0 || channels % args.groups != 0 {
             return Err(Error::argument(
                 Self::NAME,
@@ -462,7 +462,7 @@ impl Op for FrameMoments {
                 ),
             ));
         }
-        let shape = Shape::new(&[batch * frames, args.groups]);
+        let shape = &[batch * frames, args.groups];
         for (name, view) in [("mean", &args.mean), ("rstd", &args.rstd)] {
             view.require_shape(Self::NAME, shape)?;
             view.require_row(Self::NAME, DType::F32, args.groups)?;
@@ -474,7 +474,7 @@ impl Op for FrameMoments {
             }
         }
 
-        let pixels = args.values.shape.dim(3) * args.values.shape.dim(4);
+        let pixels = args.values.dim(3) * args.values.dim(4);
         let channels_per_group = channels / args.groups;
         let reduction = channels_per_group.saturating_mul(pixels);
         if reduction > u64::from(descriptor.reduction) {
@@ -497,14 +497,14 @@ impl Op for FrameMoments {
         stream: &Stream,
     ) -> Result<()> {
         let pixel = pixel_stride(&args.values)?;
-        let (channels, frames) = (args.values.shape.dim(1), args.values.shape.dim(2));
-        let pixels = args.values.shape.dim(3) * args.values.shape.dim(4);
+        let (channels, frames) = (args.values.dim(1), args.values.dim(2));
+        let pixels = args.values.dim(3) * args.values.dim(4);
 
         let mut call = FrameMomentsCall {
             values: args.values.ptr.address(),
-            values_batch: args.values.strides.get(0) as i64,
-            values_channel: args.values.strides.get(1) as i64,
-            values_frame: args.values.strides.get(2) as i64,
+            values_batch: args.values.stride(0) as i64,
+            values_channel: args.values.stride(1) as i64,
+            values_frame: args.values.stride(2) as i64,
             values_pixel: pixel,
             frames: frames as i64,
             pixels: pixels as i64,
@@ -661,7 +661,7 @@ const _: () = assert!(offset_of!(FrameNormPadCall, error) == 216);
 const _: () = assert!(size_of::<FrameNormPadCall>() == 216 + MESSAGE);
 
 /// The arguments of `frame_norm_pad`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FrameNormPadArgs {
     /// `[batch, channels, frames, height, width]` FP32, each frame's pixels contiguous.
     pub values: Operand,
@@ -706,20 +706,16 @@ impl Op for FrameNormPad {
                 "the reference kernel normalizes and stores FP32 values".to_owned(),
             ));
         }
-        if args.values.strides.get(4) != 1 || args.values.strides.get(3) != args.values.shape.dim(4)
-        {
+        if args.values.stride(4) != 1 || args.values.stride(3) != args.values.dim(4) {
             return Err(Error::argument(
                 Self::NAME,
                 "a frame's pixels of one channel are not contiguous".to_owned(),
             ));
         }
-        let (batch, channels, frames) = (
-            args.values.shape.dim(0),
-            args.values.shape.dim(1),
-            args.values.shape.dim(2),
-        );
-        let (height, width) = (args.values.shape.dim(3), args.values.shape.dim(4));
-        if args.out.shape.dim(0) != batch || args.out.shape.dim(1) != channels {
+        let (batch, channels, frames) =
+            (args.values.dim(0), args.values.dim(1), args.values.dim(2));
+        let (height, width) = (args.values.dim(3), args.values.dim(4));
+        if args.out.dim(0) != batch || args.out.dim(1) != channels {
             return Err(Error::argument(
                 Self::NAME,
                 "the output's batch and channels differ from the source's".to_owned(),
@@ -729,18 +725,13 @@ impl Op for FrameNormPad {
         // path is chosen at compilation, so a view in the other order would be written through the
         // wrong branch. A frame in neither packed order is refused, not walked.
         let channels_last = is_channels_last(&args.out);
-        let expected = if channels_last {
-            channels_last_strides(args.out.shape)
-        } else {
-            Strides::row_major(args.out.shape)
-        };
-        if args.out.strides != expected {
+        if !channels_last && !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the output is neither contiguous nor channels-last: strides {:?} for {:?}",
-                    args.out.strides.as_slice(),
-                    args.out.shape.dims()
+                    args.out.strides(),
+                    args.out.dims()
                 ),
             ));
         }
@@ -764,9 +755,9 @@ impl Op for FrameNormPad {
         }
         // The padding is both sides of a frame and `top` and `left` place the source inside it, as
         // `frame_pad` reads them: what lies past the source is the bottom and right padding.
-        if height + args.top > args.out.shape.dim(3)
-            || width + args.left > args.out.shape.dim(4)
-            || args.out.shape.dim(2) != frames + args.front
+        if height + args.top > args.out.dim(3)
+            || width + args.left > args.out.dim(4)
+            || args.out.dim(2) != frames + args.front
         {
             return Err(Error::argument(
                 Self::NAME,
@@ -776,7 +767,7 @@ impl Op for FrameNormPad {
                     args.top,
                     args.left,
                     args.front,
-                    args.out.shape.dims()
+                    args.out.dims()
                 ),
             ));
         }
@@ -795,7 +786,7 @@ impl Op for FrameNormPad {
                 "the descriptor's single-pixel branch does not match the frames' extent".to_owned(),
             ));
         }
-        let shape = Shape::new(&[batch * frames, args.groups]);
+        let shape = &[batch * frames, args.groups];
         for (name, view) in [("mean", &args.mean), ("rstd", &args.rstd)] {
             view.require_shape(Self::NAME, shape)?;
             view.require_row(Self::NAME, DType::F32, args.groups)?;
@@ -810,7 +801,7 @@ impl Op for FrameNormPad {
         for (name, parameter) in [("weight", &args.weight), ("bias", &args.bias)] {
             match (parameter, affine) {
                 (Some(view), true) => {
-                    view.require_shape(Self::NAME, Shape::new(&[channels]))?;
+                    view.require_shape(Self::NAME, &[channels])?;
                     view.require_row(Self::NAME, DType::F32, channels)?;
                     if view.dtype != DType::F32 {
                         return Err(Error::argument(
@@ -835,7 +826,7 @@ impl Op for FrameNormPad {
             }
         }
         // The reference entry addresses rows and channels with 32-bit indices.
-        let rows = batch * args.out.shape.dim(2) * args.out.shape.dim(3);
+        let rows = batch * args.out.dim(2) * args.out.dim(3);
         if rows >= 1 << 31 || channels >= 1 << 31 {
             return Err(Error::argument(
                 Self::NAME,
@@ -865,8 +856,8 @@ impl Op for FrameNormPad {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let (channels, frames) = (args.values.shape.dim(1), args.values.shape.dim(2));
-        let (height, width) = (args.values.shape.dim(3), args.values.shape.dim(4));
+        let (channels, frames) = (args.values.dim(1), args.values.dim(2));
+        let (height, width) = (args.values.dim(3), args.values.dim(4));
 
         // The kernel's branch: one pixel per frame, the centered reduction, or the fused affine one.
         let normalization = if descriptor.single_pixel {
@@ -878,9 +869,9 @@ impl Op for FrameNormPad {
         };
         let mut call = FrameNormPadCall {
             values: args.values.ptr.address(),
-            values_batch: args.values.strides.get(0) as i64,
-            values_channel: args.values.strides.get(1) as i64,
-            values_frame: args.values.strides.get(2) as i64,
+            values_batch: args.values.stride(0) as i64,
+            values_channel: args.values.stride(1) as i64,
+            values_frame: args.values.stride(2) as i64,
             mean: args.mean.ptr.address(),
             rstd: args.rstd.ptr.address(),
             weight: args
@@ -889,18 +880,18 @@ impl Op for FrameNormPad {
                 .unwrap_or_default(),
             bias: args.bias.map(|view| view.ptr.address()).unwrap_or_default(),
             out: args.out.ptr.address(),
-            out_batch: args.out.strides.get(0) as i64,
-            out_channel: args.out.strides.get(1) as i64,
-            out_frame: args.out.strides.get(2) as i64,
-            out_height: args.out.strides.get(3) as i64,
-            out_width: args.out.strides.get(4) as i64,
+            out_batch: args.out.stride(0) as i64,
+            out_channel: args.out.stride(1) as i64,
+            out_frame: args.out.stride(2) as i64,
+            out_height: args.out.stride(3) as i64,
+            out_width: args.out.stride(4) as i64,
             channels: channels as i64,
             frames: frames as i64,
             height: height as i64,
             width: width as i64,
-            out_frames: args.out.shape.dim(2) as i64,
-            out_rows: args.out.shape.dim(3) as i64,
-            out_columns: args.out.shape.dim(4) as i64,
+            out_frames: args.out.dim(2) as i64,
+            out_rows: args.out.dim(3) as i64,
+            out_columns: args.out.dim(4) as i64,
             channels_per_group: (channels / args.groups) as i64,
             groups: args.groups as i64,
             top: args.top as i64,
@@ -933,15 +924,10 @@ impl Op for FrameNormPad {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::DevicePtr;
+    use platform::DevicePtr;
 
     fn view(shape: &[u64], strides: &[u64]) -> Operand {
-        Operand::with_strides(
-            DevicePtr::new(0x1000),
-            DType::F32,
-            Shape::new(shape),
-            Strides::new(strides),
-        )
+        Operand::with_strides(DevicePtr::from_address(0x1000), DType::F32, shape, strides)
     }
 
     /// The same frame in the two layouts a video tensor is stored in: `[1, 4, 3, 2, 5]` is 120
@@ -981,12 +967,9 @@ mod tests {
         // let one buffer be two keys.
         let single_first = view(&[1, 1, 3, 2, 5], &[30, 30, 10, 5, 1]);
         let single_last = view(&[1, 1, 3, 2, 5], &[30, 1, 10, 5, 1]);
-        assert_eq!(single_first.strides, Strides::row_major(single_first.shape));
-        assert_eq!(
-            single_last.strides,
-            channels_last_strides(single_last.shape)
-        );
-        assert_ne!(single_first.strides, single_last.strides);
+        assert!(single_first.is_row_major());
+        assert_eq!(channels_last_strides([1, 1, 3, 2, 5]), [30, 1, 10, 5, 1]);
+        assert_ne!(single_first.strides(), single_last.strides());
         assert!(!is_channels_last(&single_first));
         assert!(is_channels_last(&single_last));
     }

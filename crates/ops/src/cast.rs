@@ -24,14 +24,14 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
+use crate::operand::Operand;
 use crate::strided;
-use crate::tensor::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -56,7 +56,7 @@ impl Descriptor {
         Self {
             input: args.x.dtype,
             output: args.out.dtype,
-            rank: strided::rank([args.x, args.out]),
+            rank: strided::rank([&args.x, &args.out]),
             block,
             pdl,
         }
@@ -76,7 +76,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `cast`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// The values, at any strides.
     pub x: Operand,
@@ -139,11 +139,11 @@ impl Op for Cast {
 
         strided::require_dtype(Self::NAME, "x", &args.x, descriptor.input)?;
         strided::require_dtype(Self::NAME, "out", &args.out, descriptor.output)?;
-        strided::require_shape(Self::NAME, "out", &args.out, args.x.shape)?;
+        strided::require_shape(Self::NAME, "out", &args.out, args.x.dims())?;
         strided::require_elements(Self::NAME, "x", &args.x)?;
         strided::require_contiguous(Self::NAME, "out", &args.out)?;
 
-        let traversed = strided::rank([args.x, args.out]);
+        let traversed = strided::rank([&args.x, &args.out]);
         strided::require_rank(Self::NAME, "rank", descriptor.rank, traversed)
     }
 
@@ -153,13 +153,13 @@ impl Op for Cast {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let [x, out] = strided::merge_axes([args.x, args.out]);
+        let [x, out] = strided::merge_axes([&args.x, &args.out]);
         let elements = out.numel();
 
         let mut arguments = Arguments::new();
-        arguments.view(x).view(out).u64(elements);
-        strided::pack_extents(&mut arguments, out.shape);
-        strided::pack_strides(&mut arguments, x.strides);
+        arguments.view(&x).view(&out).u64(elements);
+        strided::pack_extents(&mut arguments, &out);
+        strided::pack_strides(&mut arguments, &x);
         arguments.flag(descriptor.pdl);
 
         kernel.launch(
@@ -194,12 +194,12 @@ impl Op for Cast {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DevicePtr, Shape, Strides};
+    use platform::DevicePtr;
 
     const BLOCK: u32 = 1024;
 
     fn contiguous(dtype: DType, shape: &[u64]) -> Operand {
-        Operand::new(DevicePtr::new(0x2000), dtype, Shape::new(shape))
+        Operand::new(DevicePtr::from_address(0x2000), dtype, shape)
     }
 
     fn args(input: DType, output: DType, shape: &[u64]) -> Args {
@@ -244,10 +244,10 @@ mod tests {
     fn a_permuted_input_traverses_its_own_axes_and_the_output_stays_contiguous() {
         let permuted = Args {
             x: Operand::with_strides(
-                DevicePtr::new(0x1000),
+                DevicePtr::from_address(0x1000),
                 DType::I64,
-                Shape::new(&[5, 3, 2]),
-                Strides::new(&[1, 5, 15]),
+                &[5, 3, 2],
+                &[1, 5, 15],
             ),
             out: contiguous(DType::F32, &[5, 3, 2]),
         };
@@ -257,12 +257,12 @@ mod tests {
 
         let strided_out = Args {
             out: Operand::with_strides(
-                DevicePtr::new(0x2000),
+                DevicePtr::from_address(0x2000),
                 DType::F32,
-                Shape::new(&[5, 3, 2]),
-                Strides::new(&[12, 4, 2]),
+                &[5, 3, 2],
+                &[12, 4, 2],
             ),
-            ..permuted
+            ..permuted.clone()
         };
         let descriptor = Descriptor::of(&strided_out, BLOCK, false);
         let message = refusal(Cast::check(&descriptor, &strided_out));

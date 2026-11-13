@@ -12,14 +12,13 @@ use std::time::Duration;
 
 use platform::nccl::{Communicator, ReduceOp, UniqueId};
 use platform::{
-    Algorithm, Capture, CaptureMode, CaptureStatus, Cluster, ComputeType, Convolution,
-    ConvolutionArgs, CopyBatch, Cudnn, DataType, Device, DeviceAllocation, DeviceAttribute,
-    DeviceId, DevicePtr, DeviceRange, EdgeKind, Engine, Error, Event, EventFlags,
+    Capture, CaptureMode, CaptureStatus, Cluster, CopyBatch, Device, DeviceAllocation,
+    DeviceAttribute, DeviceId, DevicePtr, DeviceRange, EdgeKind, Error, Event, EventFlags,
     FunctionAttribute, GraphNodeKind, HandleType, Interleave, KernelNodeParams, L2Promotion,
-    LaunchConfig, Library, Matmul, MatmulArgs, MatmulDescriptor, Nvml, OobFill, PeerMapping,
-    PinnedBuffer, PrimaryContext, Protection, SegmentedMapping, ShareableHandle, SourceOrder,
-    Stream, Strided, StridedCopy, Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec,
-    WaitValue, memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
+    LaunchConfig, Library, Nvml, OobFill, PeerMapping, PinnedBuffer, Pitched, PitchedBatch,
+    PrimaryContext, Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Swizzle,
+    TensorMap, TensorMapSpec, WaitValue, memcpy_async, memset_2d_d8, memset_d8, memset_d32,
+    reclaim,
 };
 
 pub(crate) const DEVICE: DeviceId = DeviceId(0);
@@ -168,64 +167,6 @@ fn during_call_batches_read_host_sources_before_returning() {
     stream.synchronize().unwrap();
 
     assert_eq!(read(&readback), (0..64).collect::<Vec<u8>>());
-}
-
-#[test]
-#[ignore = "requires a CUDA device"]
-fn strided_copies_match_the_reference_in_every_direction() {
-    let _driver = exclusive_driver();
-    // [layer, row, column] of u16: dense on the host, padded rows and layers
-    // on the device, so the plan is one 3D pitched copy.
-    let shape = [3_u64, 4, 6];
-    let host_strides = [24_i64, 6, 1];
-    let device_strides = [60_i64, 12, 1];
-    let stream = Stream::new(DEVICE).unwrap();
-    let device = DeviceAllocation::linear(DEVICE, 3 * 60 * 2).unwrap();
-    let staging = DeviceAllocation::linear(DEVICE, 3 * 60 * 2).unwrap();
-    let mut host = PinnedBuffer::new(DEVICE, 3 * 24 * 2).unwrap();
-    let pattern: Vec<u8> = (0..3 * 24 * 2).map(|index| (index * 5 + 1) as u8).collect();
-    // SAFETY: no copy is pending on the buffer.
-    unsafe { host.as_mut_slice() }.copy_from_slice(&pattern);
-
-    let operand = |address, strides| Strided {
-        address,
-        element_bytes: 2,
-        shape: &shape,
-        strides,
-    };
-    let host_operand = operand(host.address(), &host_strides[..]);
-
-    // SAFETY: every operand lies inside its allocation, all of which outlive
-    // the synchronization below.
-    unsafe {
-        memset_d8(device.address(), 0, device.len(), &stream).unwrap();
-
-        // Host to device, device to device, device back to host.
-        let mut upload = StridedCopy::for_device(DEVICE, SourceOrder::Stream).unwrap();
-        upload
-            .plan(&operand(device.address(), &device_strides), &host_operand)
-            .unwrap();
-        assert_eq!(upload.pitched().len(), 1);
-        assert_eq!(upload.pitched().copies()[0].depth, 3);
-        upload.submit(&stream).unwrap();
-
-        let mut copy = StridedCopy::for_device(DEVICE, SourceOrder::Stream).unwrap();
-        copy.plan(
-            &operand(staging.address(), &device_strides),
-            &operand(device.address(), &device_strides),
-        )
-        .unwrap();
-        copy.submit(&stream).unwrap();
-
-        memset_d8(host.address(), 0, host.len(), &stream).unwrap();
-        let mut download = StridedCopy::for_device(DEVICE, SourceOrder::Stream).unwrap();
-        download
-            .plan(&host_operand, &operand(staging.address(), &device_strides))
-            .unwrap();
-        download.submit(&stream).unwrap();
-    }
-    stream.synchronize().unwrap();
-    assert_eq!(read(&host), pattern);
 }
 
 /// One stream tells another that work is done by writing a 32-bit flag the
@@ -730,8 +671,8 @@ fn a_pitched_fill_across_a_released_segment_is_refused() {
 /// A pitched copy whose rows lie in mapped segments while the range they
 /// span holds a segment given back, as a strided copy of one cache unit
 /// across the columns of planes given back in part: the driver refuses
-/// it, and a plan bounded by the segment length (`plan_within`) copies
-/// each column on its own, which the driver serves.
+/// it, and one contiguous copy per row, each inside its segment, is
+/// served.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn a_pitched_copy_across_a_released_segment_is_refused() {
@@ -749,30 +690,31 @@ fn a_pitched_copy_across_a_released_segment_is_refused() {
     let width = granularity / 2;
     let target = DeviceAllocation::linear(DEVICE, 2 * width).unwrap();
     let host = PinnedBuffer::new(DEVICE, 2 * width).unwrap();
-    let shape = [2_u64, width as u64];
-    let destination = Strided {
-        address: target.address(),
-        element_bytes: 1,
-        shape: &shape,
-        strides: &[width as i64, 1],
-    };
-    let source = Strided {
-        address: segmented.address(),
-        element_bytes: 1,
-        shape: &shape,
-        strides: &[pitch as i64, 1],
-    };
-    let mut spanning = StridedCopy::for_device(DEVICE, SourceOrder::Stream).unwrap();
-    spanning.plan(&destination, &source).unwrap();
-    assert_eq!(spanning.pitched().len(), 1, "one pitched copy of two rows");
-    let mut bounded = StridedCopy::for_device(DEVICE, SourceOrder::Stream).unwrap();
-    bounded
-        .plan_within(&destination, &source, [u64::MAX, granularity as u64])
+    // Both rows of the source as one pitched copy, which spans the released
+    // segment between them, and as one contiguous copy per row, each inside a
+    // mapped segment.
+    let mut spanning = PitchedBatch::new(SourceOrder::Stream);
+    spanning
+        .push(Pitched {
+            destination: target.address(),
+            destination_pitch: width,
+            destination_layer: 2,
+            source: segmented.address(),
+            source_pitch: pitch,
+            source_layer: 2,
+            width,
+            height: 2,
+            depth: 1,
+        })
         .unwrap();
-    assert!(
-        bounded.pitched().is_empty(),
-        "one contiguous copy per column"
-    );
+    let mut bounded = CopyBatch::new(SourceOrder::Stream);
+    for row in 0..2 {
+        bounded.push(
+            target.address() + (row * width) as u64,
+            segmented.address() + (row * pitch) as u64,
+            width,
+        );
+    }
     // SAFETY: each row lies inside a mapped segment, the target and the
     // host buffer outlive the synchronization below.
     let (refused, copied) = unsafe {
@@ -868,16 +810,30 @@ fn single_rank_communicators_run_collectives() {
     unsafe { memset_d32(data.address(), 41, 4, &stream).unwrap() };
     let words = DeviceRange::new(DevicePtr::from_address(data.address()), data.len());
     communicator
-        .all_reduce(&stream, words, words, 4, DataType::I32, ReduceOp::Min)
+        .all_reduce(
+            &stream,
+            words,
+            words,
+            4,
+            2, /* ncclInt32 */
+            ReduceOp::Min,
+        )
         .unwrap();
     communicator
-        .broadcast(&stream, words, words, 4, DataType::I32, 0)
+        .broadcast(&stream, words, words, 4, 2 /* ncclInt32 */, 0)
         .unwrap();
     // A collective whose stated ranges cannot hold the elements it asks for
     // fails before any NCCL call is made.
     let short = DeviceRange::new(DevicePtr::from_address(data.address()), 8);
     let refused = communicator
-        .all_reduce(&stream, short, words, 4, DataType::I32, ReduceOp::Min)
+        .all_reduce(
+            &stream,
+            short,
+            words,
+            4,
+            2, /* ncclInt32 */
+            ReduceOp::Min,
+        )
         .unwrap_err();
     assert!(
         matches!(refused, Error::InvalidArgument { .. }),
@@ -1584,118 +1540,6 @@ fn rebinding_changes_a_kernel_node_function_and_arguments() {
     assert_eq!(words(&host), vec![7; 8], "the template node is unchanged");
 }
 
-/// A row-major matrix product runs on an algorithm cuBLASLt's heuristic
-/// offers, and its result is the arithmetic the descriptor names.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
-    let _driver = exclusive_driver();
-    let device = Device::new(DEVICE).unwrap();
-    let stream = Stream::new(DEVICE).unwrap();
-    let (m, n, k) = (4u64, 6, 3);
-    // Small integers, so an FP32 product is exact and a tolerance would only
-    // hide a wrong layout.
-    let a: Vec<f32> = (0..m * k).map(|index| (index % 7) as f32 - 3.0).collect();
-    let b: Vec<f32> = (0..k * n).map(|index| (index % 5) as f32 + 1.0).collect();
-    let mut expected = vec![0f32; (m * n) as usize];
-    for row in 0..m as usize {
-        for col in 0..n as usize {
-            let mut sum = 0f64;
-            for inner in 0..k as usize {
-                sum += a[row * k as usize + inner] as f64 * b[inner * n as usize + col] as f64;
-            }
-            expected[row * n as usize + col] = sum as f32;
-        }
-    }
-
-    let a_device = DeviceAllocation::linear(DEVICE, a.len() * 4).unwrap();
-    let b_device = DeviceAllocation::linear(DEVICE, b.len() * 4).unwrap();
-    let c_device = DeviceAllocation::linear(DEVICE, expected.len() * 4).unwrap();
-    let d_device = DeviceAllocation::linear(DEVICE, expected.len() * 4).unwrap();
-    // SAFETY: each copy fills a device allocation of exactly the bytes it
-    // reads from a live slice, and the stream is synchronized afterwards.
-    unsafe {
-        memcpy_async(a_device.address(), a.as_ptr() as u64, a.len() * 4, &stream).unwrap();
-        memcpy_async(b_device.address(), b.as_ptr() as u64, b.len() * 4, &stream).unwrap();
-        memset_d32(c_device.address(), 0, expected.len(), &stream).unwrap();
-        memset_d32(d_device.address(), 0, expected.len(), &stream).unwrap();
-    }
-    stream.synchronize().unwrap();
-
-    let matmul = Matmul::new(&device).unwrap();
-    let descriptor = MatmulDescriptor::row_major(m, n, k, DataType::F32, ComputeType::F32);
-    let algorithms = matmul.candidates(&descriptor, 0, 4).unwrap();
-    assert!(
-        !algorithms.is_empty(),
-        "cuBLASLt's heuristic proposes an algorithm for a 4x6x3 product"
-    );
-    let algorithm = algorithms[0];
-    let workspace = if algorithm.workspace_bytes() > 0 {
-        DeviceAllocation::linear(DEVICE, algorithm.workspace_bytes()).unwrap()
-    } else {
-        DeviceAllocation::linear(DEVICE, 4).unwrap()
-    };
-    let range = |allocation: &DeviceAllocation| {
-        DeviceRange::new(
-            DevicePtr::from_address(allocation.address()),
-            allocation.len(),
-        )
-    };
-    let args = MatmulArgs {
-        a: range(&a_device),
-        b: range(&b_device),
-        c: range(&c_device),
-        d: range(&d_device),
-        alpha: 1.0,
-        beta: 0.0,
-        // A multiplication without the bias epilogue names no bias vector.
-        bias: DeviceRange::new(DevicePtr::from_address(0), 0),
-        workspace: range(&workspace),
-    };
-    matmul.run(&descriptor, &algorithm, &args, &stream).unwrap();
-    // A range too small for the descriptor's shape is refused by name, before
-    // any cuBLASLt call.
-    let short = MatmulArgs {
-        a: DeviceRange::new(DevicePtr::from_address(a_device.address()), 8),
-        ..args
-    };
-    let refused = matmul
-        .run(&descriptor, &algorithm, &short, &stream)
-        .unwrap_err();
-    assert!(matches!(refused, Error::InvalidArgument(_)), "{refused:?}");
-    stream.synchronize().unwrap();
-
-    let host = PinnedBuffer::new(DEVICE, expected.len() * 4).unwrap();
-    // SAFETY: the copy reads the result allocation into a pinned buffer of its
-    // size, and the stream is synchronized afterwards.
-    unsafe {
-        memcpy_async(
-            host.address(),
-            d_device.address(),
-            expected.len() * 4,
-            &stream,
-        )
-    }
-    .unwrap();
-    stream.synchronize().unwrap();
-    let result: Vec<f32> = read(&host)
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect();
-    assert_eq!(
-        result, expected,
-        "D = A·B with A 4x3 row-major, B 3x6 row-major"
-    );
-
-    // The algorithm is what the program's tuning data carries: the record
-    // reproduces the same algorithm's bytes.
-    let record = algorithm.to_bytes();
-    let restored = Algorithm::from_bytes(&record, algorithm.workspace_bytes());
-    assert_eq!(restored.to_bytes(), record, "the tuning record round-trips");
-}
-
 /// The read half of a rebind walk: a template's node gives back the kernel it
 /// captured, its grid, block and the values of its arguments, and setting those
 /// on another executable's node runs the same work.
@@ -1831,7 +1675,8 @@ fn tensor_maps_encode_tiled_descriptors() {
     // A one-dimensional tensor of 64 elements, as the rank the driver takes.
     let one_dimensional_strides = [64 * 4];
     let one_dimensional = TensorMapSpec {
-        data_type: TensorDataType::Float32,
+        // CU_TENSOR_MAP_DATA_TYPE_FLOAT32
+        data_type: 7,
         global_address: storage.address(),
         global_dim: &[64, 1],
         global_strides: &one_dimensional_strides,
@@ -1850,7 +1695,8 @@ fn tensor_maps_encode_tiled_descriptors() {
 
     let strides = [16 * 4];
     let rank_two = TensorMapSpec {
-        data_type: TensorDataType::Float32,
+        // CU_TENSOR_MAP_DATA_TYPE_FLOAT32
+        data_type: 7,
         global_address: storage.address(),
         global_dim: &[16, 16],
         global_strides: &strides,
@@ -1912,8 +1758,15 @@ fn a_communicator_splits_into_a_subgroup_and_a_rank_left_out_gets_none() {
     // SAFETY: the buffers outlive the synchronization below.
     unsafe { memset_d32(data.address(), 41, 4, &stream).unwrap() };
     let words = DeviceRange::new(DevicePtr::from_address(data.address()), data.len());
-    tp.all_reduce(&stream, words, words, 4, DataType::I32, ReduceOp::Min)
-        .unwrap();
+    tp.all_reduce(
+        &stream,
+        words,
+        words,
+        4,
+        2, /* ncclInt32 */
+        ReduceOp::Min,
+    )
+    .unwrap();
     // SAFETY: the buffer outlives the synchronization below.
     unsafe { memcpy_async(host.address(), data.address(), 16, &stream).unwrap() };
     stream.synchronize().unwrap();
@@ -1930,570 +1783,6 @@ fn a_communicator_splits_into_a_subgroup_and_a_rank_left_out_gets_none() {
     // hands it no communicator.
     assert!(world.split(&[], 0).unwrap().is_none());
     world.destroy().unwrap();
-}
-
-/// One tensor of floats as bytes, for a copy in or out.
-fn float_bytes(values: &[f32]) -> &[u8] {
-    // SAFETY: a float slice is readable as its own bytes.
-    unsafe {
-        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-    }
-}
-
-/// The bytes of a copy read back as floats.
-fn floats(bytes: Vec<u8>) -> Vec<f32> {
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect()
-}
-
-/// The definition of a one-dimensional cross-correlation, computed on the
-/// host: `y[n][k][o] = sum over c, j of x[n][c][i] * w[k][c][j]` with
-/// `o = i · stride - padding + j · dilation`.
-///
-/// This is the reference the convolution's own numbers are compared with; it
-/// is written from the definition, not from the device's result.
-#[allow(clippy::too_many_arguments)]
-fn forward_reference(
-    x: &[f32],
-    x_dims: [usize; 3],
-    w: &[f32],
-    w_dims: [usize; 3],
-    y_dims: [usize; 3],
-    stride: i64,
-    padding: i64,
-    dilation: i64,
-) -> Vec<f32> {
-    let [batch, channels, length] = x_dims;
-    let [filters, _, kernel] = w_dims;
-    let [_, _, out_length] = y_dims;
-    let mut y = vec![0.0f32; batch * filters * out_length];
-    for n in 0..batch {
-        for k in 0..filters {
-            for o in 0..out_length {
-                let mut total = 0.0f64;
-                for c in 0..channels {
-                    for j in 0..kernel {
-                        // The definition of a cross-correlation: output `o`
-                        // reads the input at `o·stride − padding +
-                        // j·dilation`, the whole tap position and nothing
-                        // divided into it. A position outside the input is the
-                        // padding and contributes nothing.
-                        let i = o as i64 * stride - padding + j as i64 * dilation;
-                        if i >= 0 && i < length as i64 {
-                            let value = x[(n * channels + c) * length + i as usize];
-                            let weight = w[(k * channels + c) * kernel + j];
-                            total += f64::from(value) * f64::from(weight);
-                        }
-                    }
-                }
-                y[(n * filters + k) * out_length + o] = total as f32;
-            }
-        }
-    }
-    y
-}
-
-/// The host reference is the definition the device is compared against, so it
-/// is checked against values computed by hand: a reference that is wrong in
-/// the same way for every input would let a wrong device result pass, and one
-/// that is merely wrong turns a correct device result into a failure (which is
-/// how the tap position, divided by the stride, was found).
-#[test]
-fn the_one_dimensional_reference_is_the_definition() {
-    // x[1, 2, 5] as two channels of five, w[3, 2, 3] as KCRS, stride 2,
-    // padding 1, dilation 1: the taps of output 0 sit at input -1 (the
-    // padding), 0 and 1.
-    let x = [-1.0f32, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5];
-    let w = [
-        -0.5f32, 0.25, -0.25, 0.5, 0.0, -0.5, // filter 0
-        0.25, -0.25, 0.5, 0.0, -0.5, 0.25, // filter 1
-        -0.25, 0.5, 0.0, -0.5, 0.25, -0.25, // filter 2
-    ];
-    let y = forward_reference(&x, [1, 2, 5], &w, [3, 2, 3], [1, 3, 3], 2, 1, 1);
-    // Output 0 of filter 0: x[0][0]·w[0][0][1] + x[0][1]·w[0][0][2] +
-    // x[1][0]·w[0][1][1] + x[1][1]·w[0][1][2]
-    // = -1·0.25 + -0.5·-0.25 + 1.5·0.0 + 2.0·-0.5 = -0.25 + 0.125 - 1.0.
-    assert_eq!(y[0], -1.125);
-    // Output 1 reads inputs 1, 2 and 3: channel 0 gives
-    // -0.5·-0.5 + 0·0.25 + 0.5·-0.25 = 0.125, channel 1 gives
-    // 2·0.5 + 2.5·0.0 + 3·-0.5 = -0.5, and the sum is -0.375.
-    assert_eq!(y[1], -0.375);
-}
-
-/// The other two host references, against values computed by hand from the same
-/// definitions: the three-dimensional one takes its taps at `o − padding + j`
-/// in each axis, and the transposed one scatters `i·stride − padding + j·dilation`.
-/// Each had, or could have, the tap sign reversed in silence.
-#[test]
-fn the_three_dimensional_and_transposed_references_are_the_definitions() {
-    // One channel, a kernel of three along the width, padding 1, so output 0
-    // reads the padding and inputs 0 and 1: 0·1 + 1·10 + 2·100 = 210. Output 1
-    // reads all three: 1·1 + 2·10 + 3·100 = 321. Output 2 reads inputs 1 and 2
-    // and the padding: 2·1 + 3·10 = 32. The reversed tap (`o + padding − j`)
-    // would answer 12, 123 and 230 instead.
-    let x = [1.0f32, 2.0, 3.0];
-    // A 3×3×3 filter whose only non-zero plane is the centre one, so the
-    // hand values below are the width taps alone: a filter that is one deep
-    // has no centre plane to reach through the padding.
-    let mut w = [0.0f32; 27];
-    w[12] = 1.0;
-    w[13] = 10.0;
-    w[14] = 100.0;
-    let y = forward_reference_3d(&x, [1, 1, 1, 1, 3], &w, [1, 1, 3, 3, 3], [1, 1, 1, 1, 3], 1);
-    assert_eq!(y, vec![210.0, 321.0, 32.0]);
-
-    // The transposed reference on the transposed test's own inputs, generated
-    // as that test generates them: output 0 is scattered to by
-    // `i·2 − 1 + j = 0`, which is `i = 0, j = 1` only — x[0]·w[0][0][1] =
-    // -0.5·0 = 0 and x[1]·w[1][0][1] = 0.5·-0.25 = -0.125.
-    let xt: Vec<f32> = (0..8).map(|i| (i % 5) as f32 * 0.25 - 0.5).collect();
-    let wt: Vec<f32> = (0..24).map(|i| ((i * 7) % 5) as f32 * 0.25 - 0.5).collect();
-    let z = transposed_reference(&xt, [1, 2, 4], &wt, [2, 3, 4], [1, 3, 8], 2, 1, 1);
-    assert_eq!(z[0], -0.125);
-}
-
-/// The definition of a one-dimensional transposed convolution, computed on
-/// the host: every input element is scattered through the filter,
-/// `y[n][k][i · stride - padding + j · dilation] += x[n][c][i] · w[c][k][j]`.
-#[allow(clippy::too_many_arguments)]
-fn transposed_reference(
-    x: &[f32],
-    x_dims: [usize; 3],
-    w: &[f32],
-    w_dims: [usize; 3],
-    y_dims: [usize; 3],
-    stride: i64,
-    padding: i64,
-    dilation: i64,
-) -> Vec<f32> {
-    let [batch, channels, length] = x_dims;
-    let [_, filters, kernel] = w_dims;
-    let [_, _, out_length] = y_dims;
-    let mut y = vec![0.0f32; batch * filters * out_length];
-    for n in 0..batch {
-        for c in 0..channels {
-            for i in 0..length {
-                for k in 0..filters {
-                    for j in 0..kernel {
-                        let o = i as i64 * stride - padding + j as i64 * dilation;
-                        if o >= 0 && o < out_length as i64 {
-                            let value = x[(n * channels + c) * length + i];
-                            let weight = w[(c * filters + k) * kernel + j];
-                            y[(n * filters + k) * out_length + o as usize] += value * weight;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    y
-}
-
-/// Runs `convolution` through cuDNN on device storage, with the given host
-/// tensors, and answers what the device computed.
-fn convolve(
-    cudnn: &Cudnn,
-    stream: &Stream,
-    convolution: &Convolution,
-    x: &[f32],
-    w: &[f32],
-    y_len: usize,
-    engine: Option<platform::Engine>,
-) -> Vec<f32> {
-    let plan = cudnn.plan(convolution, engine).unwrap();
-    let input = DeviceAllocation::linear(DEVICE, x.len() * 4).unwrap();
-    let filter = DeviceAllocation::linear(DEVICE, w.len() * 4).unwrap();
-    let output = DeviceAllocation::linear(DEVICE, y_len * 4).unwrap();
-    let workspace = DeviceAllocation::linear(DEVICE, plan.workspace_bytes().max(4)).unwrap();
-    let mut host_input = PinnedBuffer::new(DEVICE, x.len() * 4).unwrap();
-    let mut host_filter = PinnedBuffer::new(DEVICE, w.len() * 4).unwrap();
-    let host_output = PinnedBuffer::new(DEVICE, y_len * 4).unwrap();
-
-    // SAFETY: each copy lies inside the buffers it names, and every one of
-    // them outlives the synchronization below.
-    unsafe {
-        host_input.as_mut_slice().copy_from_slice(float_bytes(x));
-        host_filter.as_mut_slice().copy_from_slice(float_bytes(w));
-        memcpy_async(input.address(), host_input.address(), x.len() * 4, stream).unwrap();
-        memcpy_async(filter.address(), host_filter.address(), w.len() * 4, stream).unwrap();
-    }
-    let args = ConvolutionArgs::new(
-        DeviceRange::new(DevicePtr::from_address(input.address()), x.len() * 4),
-        DeviceRange::new(DevicePtr::from_address(filter.address()), w.len() * 4),
-        DeviceRange::new(DevicePtr::from_address(output.address()), y_len * 4),
-        DeviceRange::new(
-            DevicePtr::from_address(workspace.address()),
-            workspace.len(),
-        ),
-    );
-    cudnn.run(&plan, args, stream).unwrap();
-    // SAFETY: the copy reads the output allocation into a pinned buffer of
-    // its size.
-    unsafe {
-        memcpy_async(host_output.address(), output.address(), y_len * 4, stream).unwrap();
-    }
-    stream.synchronize().unwrap();
-    floats(read(&host_output))
-}
-
-/// Compares a computed convolution with the definition's numbers.
-fn assert_close(observed: &[f32], expected: &[f32]) {
-    assert_eq!(observed.len(), expected.len());
-    for (index, (observed, expected)) in observed.iter().zip(expected).enumerate() {
-        let tolerance = 1e-4 * expected.abs().max(1.0);
-        assert!(
-            (observed - expected).abs() <= tolerance,
-            "element {index}: {observed} where the definition gives {expected}"
-        );
-    }
-}
-
-/// cuDNN's forward convolution computes the definition of a `Conv1d`: the
-/// engine the heuristic picks, the plan built from it, and the variant pack
-/// the call passes all agree with a host reference of the same numbers.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn a_convolution_matches_the_definition_of_a_conv1d() {
-    let _driver = exclusive_driver();
-    let device = Device::new(DEVICE).unwrap();
-    let cudnn = Cudnn::new(&device).unwrap();
-    assert!(cudnn.version() >= 9_000, "cuDNN 9 is bound");
-    let stream = Stream::new(DEVICE).unwrap();
-
-    let (x_dims, w_dims) = ([1usize, 2, 5], [3usize, 2, 3]);
-    let (stride, padding, dilation) = (2i64, 1i64, 1i64);
-    let out_length = ((x_dims[2] as i64 + 2 * padding - dilation * (w_dims[2] as i64 - 1) - 1)
-        / stride
-        + 1) as usize;
-    let y_dims = [x_dims[0], w_dims[0], out_length];
-
-    let x: Vec<f32> = (0..x_dims.iter().product())
-        .map(|i| i as f32 * 0.5 - 1.0)
-        .collect();
-    let w: Vec<f32> = (0..w_dims.iter().product())
-        .map(|i| ((i * 3) % 5) as f32 * 0.25 - 0.5)
-        .collect();
-    let expected = forward_reference(&x, x_dims, &w, w_dims, y_dims, stride, padding, dilation);
-
-    // The definition is an FP32 convolution, so the comparison asks for the
-    // engines that do not down-convert their inputs to TF32.
-    let convolution = Convolution::new(
-        Tensor::contiguous(vec![1, 2, 5], DataType::F32),
-        Tensor::contiguous(vec![3, 2, 3], DataType::F32),
-        Tensor::contiguous(vec![1, 3, out_length as i64], DataType::F32),
-        vec![padding],
-        vec![stride],
-        vec![dilation],
-    )
-    .with_tf32_allowed(false);
-    let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
-
-    assert_close(&observed, &expected);
-
-    // With TF32 allowed an engine may round both inputs to ten mantissa bits,
-    // so each product carries up to 2 · 2⁻¹¹ of relative error and the sum is
-    // bounded by that times the products' magnitudes. That is the numerical
-    // contract a layer that leaves TF32 on accepts, and it is what the video
-    // VAE runs under.
-    let largest = |values: &[f32]| {
-        values
-            .iter()
-            .fold(0.0f32, |most, value| most.max(value.abs()))
-    };
-    let taps = (w_dims[1] * w_dims[2]) as f32;
-    let tf32_error = 2.0 * 2f32.powi(-11) * taps * largest(&x) * largest(&w);
-    let allowed = convolve(
-        &cudnn,
-        &stream,
-        &convolution.clone().with_tf32_allowed(true),
-        &x,
-        &w,
-        expected.len(),
-        None,
-    );
-    for (index, (observed, expected)) in allowed.iter().zip(&expected).enumerate() {
-        assert!(
-            (observed - expected).abs() <= tf32_error,
-            "element {index}: {observed} is outside TF32's error bound {tf32_error} around {expected}"
-        );
-    }
-
-    // The plan's engine is the record a program carries: eight bytes that
-    // round-trip, and a plan built from the recorded engine runs the same
-    // shape.
-    let plan = cudnn.plan(&convolution, None).unwrap();
-    let record = plan.engine().to_bytes();
-    let recorded = Engine::from_bytes(&record).unwrap();
-    assert_eq!(recorded, plan.engine(), "the engine record round-trips");
-    assert_eq!(
-        cudnn.plan(&convolution, Some(recorded)).unwrap().engine(),
-        plan.engine(),
-        "the recorded engine is the one the heuristic proposes"
-    );
-
-    // A range shorter than its tensor is named before the driver sees it.
-    let bytes = plan.bytes();
-    let input = DeviceAllocation::linear(DEVICE, bytes.x as usize).unwrap();
-    let filter = DeviceAllocation::linear(DEVICE, bytes.w as usize).unwrap();
-    let output = DeviceAllocation::linear(DEVICE, bytes.y as usize).unwrap();
-    let workspace = DeviceAllocation::linear(DEVICE, plan.workspace_bytes().max(4)).unwrap();
-    let short = ConvolutionArgs::new(
-        DeviceRange::new(DevicePtr::from_address(input.address()), bytes.x as usize),
-        DeviceRange::new(DevicePtr::from_address(filter.address()), bytes.w as usize),
-        DeviceRange::new(
-            DevicePtr::from_address(output.address()),
-            bytes.y as usize - 4,
-        ),
-        DeviceRange::new(
-            DevicePtr::from_address(workspace.address()),
-            workspace.len(),
-        ),
-    );
-    let error = cudnn
-        .run(&plan, short, &stream)
-        .expect_err("an output range one element short");
-    assert!(error.to_string().contains("its tensor needs"), "{error}");
-}
-
-/// cuDNN's backward data pass computes the definition of a `ConvTranspose1d`,
-/// with the layer's own weight and the padding and output padding the
-/// description carries, and the engine the tuning data recorded is the one
-/// the plan runs.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn a_transposed_convolution_matches_the_definition_of_a_conv_transpose1d() {
-    let _driver = exclusive_driver();
-    let device = Device::new(DEVICE).unwrap();
-    let cudnn = Cudnn::new(&device).unwrap();
-    let stream = Stream::new(DEVICE).unwrap();
-
-    // The audio decoder's upsampling: a stride-two layer, a kernel of twice
-    // the stride, half its padding, and the same length doubling.
-    let (x_dims, w_dims) = ([1usize, 2, 4], [2usize, 3, 4]);
-    let (stride, padding, dilation, output_padding) = (2i64, 1i64, 1i64, 0i64);
-    let out_length = ((x_dims[2] as i64 - 1) * stride - 2 * padding
-        + dilation * (w_dims[2] as i64 - 1)
-        + output_padding
-        + 1) as usize;
-    let y_dims = [x_dims[0], w_dims[1], out_length];
-
-    let x: Vec<f32> = (0..x_dims.iter().product())
-        .map(|i| (i % 5) as f32 * 0.25 - 0.5)
-        .collect();
-    let w: Vec<f32> = (0..w_dims.iter().product())
-        .map(|i| ((i * 7) % 5) as f32 * 0.25 - 0.5)
-        .collect();
-    let expected = transposed_reference(&x, x_dims, &w, w_dims, y_dims, stride, padding, dilation);
-
-    let convolution = Convolution::transpose(
-        Tensor::contiguous(vec![1, 2, 4], DataType::F32),
-        Tensor::contiguous(vec![2, 3, 4], DataType::F32),
-        Tensor::contiguous(vec![1, 3, out_length as i64], DataType::F32),
-        vec![padding],
-        vec![stride],
-        vec![dilation],
-        vec![output_padding],
-    )
-    .with_tf32_allowed(false);
-    let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
-
-    assert_close(&observed, &expected);
-}
-
-/// One logical 5-D tensor (batch, channels, depth, height, width) laid out the
-/// way `torch.channels_last_3d` lays it out: the channel of an element is
-/// adjacent to it and the batch strides over the rest.
-fn channels_last_3d(values: &[f32], dims: [usize; 5]) -> Vec<f32> {
-    let [batch, channels, depth, height, width] = dims;
-    let mut laid_out = vec![0.0f32; values.len()];
-    for n in 0..batch {
-        for c in 0..channels {
-            for d in 0..depth {
-                for h in 0..height {
-                    for w in 0..width {
-                        let logical =
-                            ((n * channels + c) * depth + d) * height * width + h * width + w;
-                        let offset =
-                            ((n * depth + d) * height * width + h * width + w) * channels + c;
-                        laid_out[offset] = values[logical];
-                    }
-                }
-            }
-        }
-    }
-    laid_out
-}
-
-/// The logical order of a tensor laid out the way `torch.channels_last_3d`
-/// lays it out, the inverse of [`channels_last_3d`].
-fn logical_3d(values: &[f32], dims: [usize; 5]) -> Vec<f32> {
-    let [batch, channels, depth, height, width] = dims;
-    let mut logical = vec![0.0f32; values.len()];
-    for n in 0..batch {
-        for c in 0..channels {
-            for d in 0..depth {
-                for h in 0..height {
-                    for w in 0..width {
-                        let offset =
-                            ((n * depth + d) * height * width + h * width + w) * channels + c;
-                        let logical_offset =
-                            ((n * channels + c) * depth + d) * height * width + h * width + w;
-                        logical[logical_offset] = values[offset];
-                    }
-                }
-            }
-        }
-    }
-    logical
-}
-
-/// The definition of a three-dimensional cross-correlation, computed on the
-/// host: `y[n][k][d][h][w] = sum over c, (j1, j2, j3) of
-/// x[n][c][d·s − p + j1·dil][h·s − p + j2·dil][w·s − p + j3·dil] · w[k][c][j]`,
-/// with a zero outside the input.
-#[allow(clippy::too_many_arguments)]
-fn forward_reference_3d(
-    x: &[f32],
-    x_dims: [usize; 5],
-    w: &[f32],
-    w_dims: [usize; 5],
-    y_dims: [usize; 5],
-    padding: usize,
-) -> Vec<f32> {
-    let [batch, channels, depth, height, width] = x_dims;
-    let [_, filters, kernel_d, kernel_h, kernel_w] = w_dims;
-    let [_, _, out_d, out_h, out_w] = y_dims;
-    let mut y = vec![0.0f32; batch * filters * out_d * out_h * out_w];
-    for n in 0..batch {
-        for k in 0..filters {
-            // The same definition as the one-dimensional reference: in each
-            // axis, output `o` reads the input at `o + j − padding`.
-            for od in 0..out_d {
-                for oh in 0..out_h {
-                    for ow in 0..out_w {
-                        let mut total = 0.0f64;
-                        for c in 0..channels {
-                            for jd in 0..kernel_d {
-                                let d = od as i64 - padding as i64 + jd as i64;
-                                if d < 0 || d >= depth as i64 {
-                                    continue;
-                                }
-                                for jh in 0..kernel_h {
-                                    let h = oh as i64 - padding as i64 + jh as i64;
-                                    if h < 0 || h >= height as i64 {
-                                        continue;
-                                    }
-                                    for jw in 0..kernel_w {
-                                        let w_index = ow as i64 - padding as i64 + jw as i64;
-                                        if w_index < 0 || w_index >= width as i64 {
-                                            continue;
-                                        }
-                                        let value = x[(((n * channels + c) * depth + d as usize)
-                                            * height
-                                            + h as usize)
-                                            * width
-                                            + w_index as usize];
-                                        let weight = w[(((k * channels + c) * kernel_d + jd)
-                                            * kernel_h
-                                            + jh)
-                                            * kernel_w
-                                            + jw];
-                                        total += f64::from(value) * f64::from(weight);
-                                    }
-                                }
-                            }
-                        }
-                        y[(((n * filters + k) * out_d + od) * out_h + oh) * out_w + ow] =
-                            total as f32;
-                    }
-                }
-            }
-        }
-    }
-    y
-}
-
-/// cuDNN runs the video VAE's layout: a `Conv3d` whose filter and tensors are
-/// laid out `channels_last_3d` — cuDNN's NHWC — computes the same definition
-/// as the contiguous case, so the description's explicit strides are what
-/// makes the VAE expressible.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn a_channels_last_convolution_matches_the_definition_of_a_conv3d() {
-    let _driver = exclusive_driver();
-    let device = Device::new(DEVICE).unwrap();
-    let cudnn = Cudnn::new(&device).unwrap();
-    let stream = Stream::new(DEVICE).unwrap();
-
-    let x_dims = [1usize, 2, 2, 3, 3];
-    let w_dims = [2usize, 2, 3, 3, 3];
-    let y_dims = [1usize, 2, 2, 3, 3];
-    let padding = 1usize;
-    let kernel = w_dims[2..].to_vec();
-
-    // Logical tensors, then the layout the model keeps them in.
-    let logical_x: Vec<f32> = (0..x_dims.iter().product())
-        .map(|i| (i % 7) as f32 * 0.25 - 0.75)
-        .collect();
-    let logical_w: Vec<f32> = (0..w_dims.iter().product())
-        .map(|i| ((i * 3) % 5) as f32 * 0.25 - 0.5)
-        .collect();
-    let expected = forward_reference_3d(&logical_x, x_dims, &logical_w, w_dims, y_dims, padding);
-    let x = channels_last_3d(&logical_x, x_dims);
-    let w = channels_last_3d(&logical_w, w_dims);
-
-    // Channels-last strides: the channel of an element is one step away, and
-    // the batch strides over the whole channel-last image.
-    let [batch, channels, depth, height, width] = x_dims;
-    let image = depth * height * width;
-    let x_strides = vec![
-        (image * channels) as i64,
-        1,
-        (height * width * channels) as i64,
-        (width * channels) as i64,
-        channels as i64,
-    ];
-    let [filters, _, kd, kh, kw] = w_dims;
-    let filter_strides = vec![
-        (kd * kh * kw * channels) as i64,
-        1,
-        (kh * kw * channels) as i64,
-        (kw * channels) as i64,
-        channels as i64,
-    ];
-    let y_strides = vec![
-        (y_dims[2] * y_dims[3] * y_dims[4] * y_dims[1]) as i64,
-        1,
-        (y_dims[3] * y_dims[4] * y_dims[1]) as i64,
-        (y_dims[4] * y_dims[1]) as i64,
-        y_dims[1] as i64,
-    ];
-    let tensor = |dims: [usize; 5], strides: Vec<i64>, dtype: DataType| Tensor {
-        dims: dims.iter().map(|&dim| dim as i64).collect(),
-        strides,
-        dtype,
-        byte_alignment: 16,
-    };
-    let convolution = Convolution::new(
-        tensor(x_dims, x_strides, DataType::F32),
-        tensor(w_dims, filter_strides, DataType::F32),
-        tensor(y_dims, y_strides, DataType::F32),
-        vec![padding as i64; 3],
-        vec![1; 3],
-        vec![1; 3],
-    )
-    .with_tf32_allowed(false);
-    assert_eq!(convolution.rank(), 3);
-    assert_eq!((batch, channels, filters, kernel), (1, 2, 2, vec![3, 3, 3]));
-
-    let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
-    // The output comes back in the channels-last order its descriptor names;
-    // the comparison is made in the logical order the definition uses.
-    assert_close(&logical_3d(&observed, y_dims), &expected);
 }
 
 #[test]
@@ -2552,7 +1841,7 @@ fn two_rank_half(rank: i32, id: UniqueId) -> Result<(), String> {
     let send_range = DeviceRange::new(DevicePtr::from_address(send.address()), 16);
     let recv_range = DeviceRange::new(DevicePtr::from_address(recv.address()), 16);
     group
-        .all_to_all(&stream, send_range, recv_range, 2, DataType::U32)
+        .all_to_all(&stream, send_range, recv_range, 2, 3 /* ncclUint32 */)
         .map_err(|error| error.to_string())?;
     // Sum the exchanged window across the group, in place.
     group
@@ -2561,7 +1850,7 @@ fn two_rank_half(rank: i32, id: UniqueId) -> Result<(), String> {
             recv_range,
             recv_range,
             4,
-            DataType::U32,
+            3, /* ncclUint32 */
             ReduceOp::Sum,
         )
         .map_err(|error| error.to_string())?;

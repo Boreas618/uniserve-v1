@@ -26,7 +26,7 @@
 //!
 //! **Retained weights** are read-only and shared: one allocation per weight key and GPU,
 //! mapped by every rank and epoch that loads the weight, with small weights packed into shared
-//! allocations. A weight tensor is `backend::retained` over the mapping's address, so the
+//! allocations. A weight tensor is `ops::retained` over the mapping's address, so the
 //! modules and graphs of a rank hold addresses that an update in place keeps while it changes
 //! the bytes behind them.
 //!
@@ -34,7 +34,7 @@
 //! pool region, which every epoch that names the region maps writable while the buffer pool
 //! keeps the blocks they write apart. Their owner takes them by name and length, resets what was
 //! created for it and keeps what exists, and lends windows of them to forwards as
-//! `backend::external` tensors.
+//! `ops::external` tensors.
 //!
 //! The rank's parts of the buffer pool's host regions are the third kind of storage the server
 //! keeps for a rank: host memory of equal units, which the rank maps, registers for device
@@ -84,12 +84,12 @@ pub(crate) unsafe fn lend(
     device: Option<DeviceId>,
 ) -> Result<Tensor> {
     let device = match device {
-        Some(device) => backend::cuda(device.0 as usize),
-        None => backend::meta(),
+        Some(device) => ops::cuda(device.0 as usize),
+        None => ops::meta(),
     };
 
     // SAFETY: forwarded from the caller.
-    Ok(unsafe { backend::external(address, shape, dtype, &device) }?)
+    Ok(unsafe { ops::external(address, shape, dtype, &device) }?)
 }
 
 /// What the tests of this module's files share.

@@ -5,7 +5,7 @@
 //! instance and is the prefix its `VarBuilder` loaded it under
 //! ([`VarBuilder::path`](crate::VarBuilder::path)). The range changes nothing the forward
 //! computes: a profile run files every launch inside it under the path, and a deployment that
-//! times modules places range markers around it (`backend::profiler`).
+//! times modules places range markers around it (`ops::profiler`).
 
 use crate::Error;
 
@@ -18,11 +18,11 @@ enum Failure<E> {
     /// The body failed.
     Body(E),
     /// A range marker could not be launched.
-    Range(backend::Error),
+    Range(ops::Error),
 }
 
-impl<E> From<backend::Error> for Failure<E> {
-    fn from(error: backend::Error) -> Self {
+impl<E> From<ops::Error> for Failure<E> {
+    fn from(error: ops::Error) -> Self {
         Self::Range(error)
     }
 }
@@ -39,11 +39,11 @@ pub fn range<T, E: From<Error>>(
     path: &str,
     body: impl FnOnce() -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
-    let ranged = backend::profiler::range(class, path, || body().map_err(Failure::Body));
+    let ranged = ops::profiler::range(class, path, || body().map_err(Failure::Body));
 
     ranged.map_err(|failure| match failure {
         Failure::Body(error) => error,
-        Failure::Range(error) => E::from(Error::Backend(error)),
+        Failure::Range(error) => E::from(Error::Ops(error)),
     })
 }
 

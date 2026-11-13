@@ -1340,7 +1340,7 @@ fn meta_stack(experts: usize, rows: usize, columns: usize, projections: usize) -
     Nvfp4Stack {
         values: meta((experts, rows, columns / 2), DType::U8),
         scales: meta(
-            (experts, scales.dim(0) as usize, scales.dim(1) as usize),
+            (experts, scales[0] as usize, scales[1] as usize),
             DType::F8E4M3,
         ),
         global_scale: meta((projections, experts), DType::F32),

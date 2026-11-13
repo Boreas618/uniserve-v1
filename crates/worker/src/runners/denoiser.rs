@@ -76,9 +76,10 @@ use ::storage::runtime;
 use ipc::batch::{
     Batch, BatchOutput, CallOutput, Extent, MediaRow, Phase, Shape, TimingCounters, Variant,
 };
-use nn::{ConditionPiece, ConditionRole, ConditionShape, Conditioning, Denoiser, Layout};
+use nn::{ConditionPiece, ConditionRole, ConditionShape, Conditioning, Denoiser};
 use nn::{LatentShape, MediaInput, Step, VideoRequest};
 use platform::{Event, EventFlags, PitchedBatch, SourceOrder, Stream};
+use proto::video::Layout;
 use tensor::{DType, Tensor};
 
 use super::decoder::{elements, pitched, voxels};
@@ -585,7 +586,7 @@ impl DenoiserRunner {
             let noise = match piece.draw {
                 Some(draw) => {
                     let dims = [draw.channels, draw.frames, draw.height, draw.width];
-                    let out = backend::empty(&dims.map(|d| d as usize)[..], self.config.sample)?;
+                    let out = ops::empty(&dims.map(|d| d as usize)[..], self.config.sample)?;
                     self.model.draw_condition_noise(seed, piece, &out)?;
                     Some(out)
                 }
@@ -866,12 +867,12 @@ impl Runner for DenoiserRunner {
                     .sum();
                 match total {
                     0 => Ok(None),
-                    total => Ok(Some(backend::empty(total, CONDITION_MEDIA)?)),
+                    total => Ok(Some(ops::empty(total, CONDITION_MEDIA)?)),
                 }
             };
             let prompt = (request.text_tokens as usize, self.config.width as usize);
             let products = [
-                Some(backend::empty(prompt, self.config.stack)?),
+                Some(ops::empty(prompt, self.config.stack)?),
                 placeholder(|piece| piece.pixels.as_ref())?,
                 placeholder(|piece| piece.track.as_ref())?,
             ];

@@ -13,10 +13,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use platform::NativeLibrary;
+
+use crate::Result;
 use crate::generation::KernelEntry;
 use crate::kernel::{CubinMetadata, Kernel};
-use crate::platform::NativeLibrary;
-use crate::{Result, platform};
 
 /// One module of a generation layer, as the package delivered it.
 pub enum Module<'a> {
@@ -94,8 +95,8 @@ fn intern(entry: &str) -> Result<&'static str> {
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let names = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut names = names.lock().map_err(|_| crate::Error::Unsupported {
-        operator: "install",
-        problem: "an entry name was interned while another thread panicked".to_owned(),
+        operation: "install",
+        reason: "an entry name was interned while another thread panicked".to_owned(),
     })?;
     if let Some(name) = names.get(entry) {
         return Ok(name);

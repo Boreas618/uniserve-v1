@@ -4,7 +4,7 @@
 //! tensors: a sum over every rank's tensor ([`all_reduce`]), a gather of every rank's tensor in
 //! rank order ([`all_gather`]), or an exchange of equal blocks between every pair of ranks
 //! ([`all_to_all`]). Which communicator and stream carry it is the execution context's, which a
-//! model never names (`backend::collective`).
+//! model never names (`ops::collective`).
 //!
 //! A rank's place has two readers. At load, a module takes the [`Split`] its family was given and
 //! reads its share of each weight. In a forward, shape arithmetic over the partition reads
@@ -35,7 +35,7 @@ impl Split {
 /// This rank's index in the forward's group and the group's member count, or `None` when the
 /// forward is not partitioned or runs on CPU tensors with no context installed.
 pub fn split() -> Option<(u64, u64)> {
-    backend::collective::split()
+    ops::collective::split()
 }
 
 /// Sums every rank's `x` into every rank's `x`, in place.
@@ -47,7 +47,7 @@ pub fn split() -> Option<(u64, u64)> {
 /// When no context is installed or it carries no group, `x` is a strided view or a CPU tensor,
 /// or the collective cannot be issued.
 pub fn all_reduce(x: &Tensor) -> Result<()> {
-    Ok(backend::collective::all_reduce(x)?)
+    Ok(ops::collective::all_reduce(x)?)
 }
 
 /// Gathers every rank's `send` into `recv`, in rank order.
@@ -57,7 +57,7 @@ pub fn all_reduce(x: &Tensor) -> Result<()> {
 /// As [`all_reduce`], and when `recv` does not hold the group's member count times `send`'s
 /// elements of the same element type.
 pub fn all_gather(send: &Tensor, recv: &Tensor) -> Result<()> {
-    Ok(backend::collective::all_gather(send, recv)?)
+    Ok(ops::collective::all_gather(send, recv)?)
 }
 
 /// An unwritten tensor that holds one block of `block`'s shape and element type per rank of the
@@ -84,7 +84,7 @@ pub fn sequence_like(block: &Tensor) -> Result<Tensor> {
     };
     let dims = [&[rows * ranks as usize], rest].concat();
 
-    Ok(backend::empty(dims, block.dtype())?)
+    Ok(ops::empty(dims, block.dtype())?)
 }
 
 /// Every rank's `send` in rank order: a new tensor of [`sequence_like`]'s shape, gathered.
@@ -107,7 +107,7 @@ pub fn gathered(send: &Tensor) -> Result<Tensor> {
 /// As [`all_reduce`], and when the tensors are not the group's member count of equal blocks of
 /// one element type.
 pub fn all_to_all(send: &Tensor, recv: &Tensor) -> Result<()> {
-    Ok(backend::collective::all_to_all(send, recv)?)
+    Ok(ops::collective::all_to_all(send, recv)?)
 }
 
 /// Starts [`all_to_all`] beside the forward, which goes on computing at once.
@@ -119,7 +119,7 @@ pub fn all_to_all(send: &Tensor, recv: &Tensor) -> Result<()> {
 ///
 /// As [`all_to_all`].
 pub fn start_all_to_all(send: &Tensor, recv: &Tensor) -> Result<usize> {
-    Ok(backend::collective::start_all_to_all(send, recv)?)
+    Ok(ops::collective::start_all_to_all(send, recv)?)
 }
 
 /// Starts delivering rows `first..first + count` of this rank's `owner_rows` rows to every rank,
@@ -139,7 +139,7 @@ pub fn start_gather_rows(
     first: u64,
     count: u64,
 ) -> Result<usize> {
-    Ok(backend::collective::start_gather_rows(
+    Ok(ops::collective::start_gather_rows(
         gathered, owner_rows, first, count,
     )?)
 }
@@ -152,7 +152,7 @@ pub fn start_gather_rows(
 /// When no context is installed or it carries no group, or `started` is not a value a started
 /// collective returned.
 pub fn finish(started: usize) -> Result<()> {
-    Ok(backend::collective::finish(started)?)
+    Ok(ops::collective::finish(started)?)
 }
 
 /// Waits for what the forward issued so far, when it is not being captured.
@@ -166,5 +166,5 @@ pub fn finish(started: usize) -> Result<()> {
 ///
 /// When the stream cannot be waited for.
 pub fn settle() -> Result<()> {
-    Ok(backend::collective::settle()?)
+    Ok(ops::collective::settle()?)
 }

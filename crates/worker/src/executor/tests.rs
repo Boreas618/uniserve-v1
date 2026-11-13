@@ -93,7 +93,7 @@ struct LoggingRunner {
 impl LoggingRunner {
     fn new(name: &'static str, phase: Phase, kernels: Arc<Generation>, log: &Log) -> Self {
         let weight = |address: u64, dims: &[usize]| {
-            backend::retained(address, dims, DType::BF16, &backend::meta()).unwrap()
+            ops::retained(address, dims, DType::BF16, &ops::meta()).unwrap()
         };
 
         Self {

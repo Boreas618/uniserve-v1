@@ -7,8 +7,8 @@
 // The helpers below unwrap, as tests do (`clippy.toml`).
 #![cfg(test)]
 
-use backend::{Context, Error, cuda, empty, external, meta, operand, retained};
-use ops::platform::{DeviceRange, PlatformDevicePtr};
+use ops::{Context, Error, cuda, empty, external, meta, operand, retained};
+use platform::{DevicePtr, DeviceRange};
 use tensor::{D, DType, Device, DeviceLocation, Result, Shape, Tensor};
 
 /// The key of a primitive compiled for the block the backend launches with.
@@ -436,8 +436,8 @@ fn a_view_as_another_element_type_shares_the_storage_and_launches_nothing() {
         let signed = operand(&window.view(DType::I32).unwrap()).unwrap();
         assert_eq!(signed.dtype, DType::I32);
         assert_eq!(signed.ptr.address(), address(&window));
-        assert_eq!(signed.shape.dims(), [3, 4]);
-        assert_eq!(signed.strides.as_slice(), [1, 8]);
+        assert_eq!(signed.dims(), [3, 4]);
+        assert_eq!(signed.strides(), [1, 8]);
     }
 
     // An element type of another size would hold another number of elements.
@@ -766,7 +766,7 @@ fn run(context: &Context) -> Vec<u64> {
 
 #[test]
 fn two_runs_of_one_forward_from_a_reset_receive_the_same_addresses() {
-    let region = DeviceRange::new(PlatformDevicePtr::from_address(0x1000_0000), 1 << 20);
+    let region = DeviceRange::new(DevicePtr::from_address(0x1000_0000), 1 << 20);
     let context = Context::meta(Some(region));
 
     let first = run(&context);
@@ -779,7 +779,7 @@ fn two_runs_of_one_forward_from_a_reset_receive_the_same_addresses() {
 #[test]
 fn a_counting_context_places_and_peaks_as_a_context_over_a_region_does() {
     const BASE: u64 = 0x1000_0000;
-    let region = DeviceRange::new(PlatformDevicePtr::from_address(BASE), 1 << 20);
+    let region = DeviceRange::new(DevicePtr::from_address(BASE), 1 << 20);
     let placed = Context::meta(Some(region));
     let counting = Context::meta(None);
 
@@ -922,42 +922,44 @@ fn a_kernel_argument_states_the_address_dimensions_and_strides_of_a_view() {
     let whole = operand(&matrix).unwrap();
     assert_eq!(whole.ptr.address(), BASE);
     assert_eq!(whole.dtype, DType::F32);
-    assert_eq!(whole.shape.dims(), [4, 6]);
-    assert_eq!(whole.strides.as_slice(), [6, 1]);
+    assert_eq!(whole.dims(), [4, 6]);
+    assert_eq!(whole.strides(), [6, 1]);
 
     // Columns 2..5: two FP32 elements further, at the matrix's own strides.
     let columns = operand(&matrix.narrow(1, 2, 3).unwrap()).unwrap();
     assert_eq!(columns.ptr.address(), BASE + 2 * 4);
-    assert_eq!(columns.shape.dims(), [4, 3]);
-    assert_eq!(columns.strides.as_slice(), [6, 1]);
+    assert_eq!(columns.dims(), [4, 3]);
+    assert_eq!(columns.strides(), [6, 1]);
 
     // Rows 1..3: one row of six elements further.
     let rows = operand(&matrix.narrow(0, 1, 2).unwrap()).unwrap();
     assert_eq!(rows.ptr.address(), BASE + 6 * 4);
-    assert_eq!(rows.shape.dims(), [2, 6]);
+    assert_eq!(rows.dims(), [2, 6]);
 
     let transposed = operand(&matrix.t().unwrap()).unwrap();
     assert_eq!(transposed.ptr.address(), BASE);
-    assert_eq!(transposed.shape.dims(), [6, 4]);
-    assert_eq!(transposed.strides.as_slice(), [1, 6]);
+    assert_eq!(transposed.dims(), [6, 4]);
+    assert_eq!(transposed.strides(), [1, 6]);
 
     // A repeated axis is a zero stride.
     let row = retained(BASE, (1, 6), DType::BF16, &cuda(0)).unwrap();
     let repeated = operand(&row.broadcast_as((4, 6)).unwrap()).unwrap();
     assert_eq!(repeated.dtype, DType::BF16);
-    assert_eq!(repeated.shape.dims(), [4, 6]);
-    assert_eq!(repeated.strides.as_slice(), [0, 1]);
+    assert_eq!(repeated.dims(), [4, 6]);
+    assert_eq!(repeated.strides(), [0, 1]);
 
     assert_eq!(matrix.device().location(), cuda(0).location());
 }
 
 #[test]
 fn a_tensor_of_more_axes_than_an_operand_carries_is_no_kernel_argument() {
-    let deep = retained(0, [1_usize; 7].as_slice(), DType::F32, &meta()).unwrap();
+    // An operand carries as many axes as the tensor library's strided operations take.
+    let limit = tensor::nditer::MAX_DIMS;
+    let deep = retained(0, vec![1_usize; limit + 1].as_slice(), DType::F32, &meta()).unwrap();
 
     assert!(matches!(
         operand(&deep),
-        Err(Error::Rank { rank: 7, limit: 6 })
+        Err(Error::Rank { rank, limit: refused }) if rank == limit + 1 && refused == limit
     ));
 }
 

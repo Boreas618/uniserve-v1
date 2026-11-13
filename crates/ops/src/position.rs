@@ -32,13 +32,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -74,7 +74,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one resample.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[in_side · in_side, channels]` the learned table.
     pub table: Operand,
@@ -107,21 +107,18 @@ impl Op for PositionInterpolate {
 
         args.table.require_shape(
             Self::NAME,
-            Shape::new(&[
+            &[
                 u64::from(descriptor.in_side) * u64::from(descriptor.in_side),
                 channels,
-            ]),
+            ],
         )?;
         args.table
             .require_row(Self::NAME, descriptor.dtype, channels)?;
-        args.out
-            .require_shape(Self::NAME, Shape::new(&[points, channels]))?;
+        args.out.require_shape(Self::NAME, &[points, channels])?;
         args.out
             .require_row(Self::NAME, descriptor.dtype, channels)?;
-        args.indices
-            .require_shape(Self::NAME, Shape::new(&[points, TAPS]))?;
-        args.weights
-            .require_shape(Self::NAME, Shape::new(&[points, TAPS]))?;
+        args.indices.require_shape(Self::NAME, &[points, TAPS])?;
+        args.weights.require_shape(Self::NAME, &[points, TAPS])?;
         if args.indices.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -143,21 +140,21 @@ impl Op for PositionInterpolate {
         // The program walks the destination as rows of `channels` elements: a row that is not that
         // wide, or a last axis that is not unit-stride, would make the tap arithmetic address the
         // wrong elements.
-        if args.out.strides != Strides::row_major(args.out.shape) {
+        if !args.out.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the output is written row-major; found strides {}",
-                    args.out.strides
+                    "the output is written row-major; found strides {:?}",
+                    args.out.strides()
                 ),
             ));
         }
-        if args.table.strides != Strides::row_major(args.table.shape) {
+        if !args.table.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the table is read row-major; found strides {}",
-                    args.table.strides
+                    "the table is read row-major; found strides {:?}",
+                    args.table.strides()
                 ),
             ));
         }
@@ -183,10 +180,10 @@ impl Op for PositionInterpolate {
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.table)
-            .view(args.indices)
-            .view(args.weights)
-            .view(args.out)
+            .view(&args.table)
+            .view(&args.indices)
+            .view(&args.weights)
+            .view(&args.out)
             // `check` keeps the point count within a kernel parameter.
             .u32(points as u32)
             .u32(descriptor.channels)

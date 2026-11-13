@@ -91,35 +91,16 @@ pub fn linear(
         return like_rows(product.to_dtype(x.dtype())?, x);
     }
 
-    let out = backend::empty((rows.dims()[0], n as usize), x.dtype())?;
-    backend::launch::<Gemm>(
-        &Descriptor {
-            input: x.dtype(),
-            weight: weight.dtype(),
-            accumulate: ACCUMULATE,
-            output: x.dtype(),
-            order,
-            epilogue: epilogue(bias),
-            k,
-        },
-        Args {
-            input: backend::operand(&rows)?,
-            weight: backend::operand(weight)?,
-            bias: bias.map(backend::operand).transpose()?,
-            out: backend::operand(&out)?,
-            alpha: 1.0,
-        },
-    )?;
+    let out = ops::empty((rows.dims()[0], n as usize), x.dtype())?;
+    let args = Args {
+        input: ops::operand(&rows)?,
+        weight: ops::operand(weight)?,
+        bias: bias.map(ops::operand).transpose()?,
+        out: ops::operand(&out)?,
+        alpha: 1.0,
+    };
+    ops::launch::<Gemm>(&Descriptor::of(&args, order)?, args)?;
     like_rows(out, x)
-}
-
-/// The epilogue a bias asks for.
-fn epilogue(bias: Option<&Tensor>) -> Epilogue {
-    if bias.is_some() {
-        Epilogue::Bias
-    } else {
-        Epilogue::None
-    }
 }
 
 /// `x · weightᵀ + bias` over a per-tensor FP8 weight (ModelOpt's `FP8`):
@@ -193,9 +174,9 @@ pub fn linear_fp8(
         return like_rows(product.to_dtype(x.dtype())?, x);
     }
 
-    let out = backend::empty((rows.dims()[0], n as usize), x.dtype())?;
+    let out = ops::empty((rows.dims()[0], n as usize), x.dtype())?;
     let (block_m, block_n, block_k) = FP8_TILE;
-    backend::launch::<Fp8Gemm>(
+    ops::launch::<Fp8Gemm>(
         &Fp8GemmDescriptor {
             dtype: x.dtype(),
             block_m,
@@ -204,10 +185,10 @@ pub fn linear_fp8(
             bias: bias.is_some(),
         },
         Fp8GemmArgs {
-            input: backend::operand(&rows)?,
-            weight: backend::operand(weight)?,
-            bias: bias.map(backend::operand).transpose()?,
-            out: backend::operand(&out)?,
+            input: ops::operand(&rows)?,
+            weight: ops::operand(weight)?,
+            bias: bias.map(ops::operand).transpose()?,
+            out: ops::operand(&out)?,
             input_scale,
             alpha,
         },
@@ -288,12 +269,12 @@ pub fn linear_nvfp4(
     // arranged and, by naming the product, how the weight's are read.
     let expected = PRODUCT_SCALE_LAYOUT.shape(n as u64, u64::from(k));
     let stated: Vec<u64> = scales.dims().iter().map(|dim| *dim as u64).collect();
-    if stated != expected.dims() {
+    if stated != expected {
         return Err(refuse(format!(
             "the block scales are {:?}; {n} rows of {k} elements take {:?} in the \
              {PRODUCT_SCALE_LAYOUT} layout",
             scales.dims(),
-            expected.dims()
+            expected
         )));
     }
     for (what, scalar) in [("input scale", input_scale), ("alpha", alpha)] {
@@ -366,7 +347,7 @@ fn packed_product(
     // the products laid end to end are the rows in order, and only the last block's rows past
     // the activation's trail them.
     let padded: usize = blocks.iter().map(|(_, _, class)| class).sum();
-    let out = backend::empty((padded, n), rows.dtype())?;
+    let out = ops::empty((padded, n), rows.dtype())?;
 
     for (first, held, class) in blocks {
         // 1. Encode the block's rows into the layout the product reads.
@@ -374,13 +355,13 @@ fn packed_product(
         // The buffers are class-height and the encode writes the block's rows into their first
         // rows; the product's rows past those are computed from bytes nothing reads and are not
         // part of the result.
-        let packed_rows = backend::empty((class, packed), DType::U8)?;
+        let packed_rows = ops::empty((class, packed), DType::U8)?;
         let class_scales = PRODUCT_SCALE_LAYOUT.shape(class as u64, k as u64);
-        let packed_scales = backend::empty(
-            (class_scales.dim(0) as usize, class_scales.dim(1) as usize),
+        let packed_scales = ops::empty(
+            (class_scales[0] as usize, class_scales[1] as usize),
             DType::U8,
         )?;
-        let token_scale = backend::empty(class, DType::F32)?;
+        let token_scale = ops::empty(class, DType::F32)?;
 
         let row_scales = PRODUCT_SCALE_LAYOUT.shape(held as u64, k as u64);
         launch_quantize(
@@ -388,10 +369,10 @@ fn packed_product(
             input_scale,
             PRODUCT_SCALE_LAYOUT,
             (
-                backend::operand(&packed_rows.narrow(0, 0, held)?)?,
-                backend::operand(&packed_scales.narrow(0, 0, row_scales.dim(0) as usize)?)?,
+                ops::operand(&packed_rows.narrow(0, 0, held)?)?,
+                ops::operand(&packed_scales.narrow(0, 0, row_scales[0] as usize)?)?,
                 // One scalar per row, so the tensor has one axis.
-                backend::operand(&token_scale.narrow(0, 0, held)?)?,
+                ops::operand(&token_scale.narrow(0, 0, held)?)?,
             ),
         )?;
 
@@ -413,16 +394,16 @@ fn packed_product(
         // tensor.
         ops::fp4::check_gemm(&descriptor)?;
 
-        backend::launch::<Nvfp4Gemm>(
+        ops::launch::<Nvfp4Gemm>(
             &descriptor,
             GemmArgs {
-                input: backend::operand(&packed_rows)?,
-                weight: backend::operand(values)?,
-                input_scales: backend::operand(&packed_scales)?,
-                weight_scales: backend::operand(scales)?,
-                alpha: backend::operand(alpha)?,
+                input: ops::operand(&packed_rows)?,
+                weight: ops::operand(values)?,
+                input_scales: ops::operand(&packed_scales)?,
+                weight_scales: ops::operand(scales)?,
+                alpha: ops::operand(alpha)?,
                 bias: None,
-                out: backend::operand(&out.narrow(0, first, class)?)?,
+                out: ops::operand(&out.narrow(0, first, class)?)?,
             },
         )?;
     }

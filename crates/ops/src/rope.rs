@@ -17,13 +17,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -166,7 +166,7 @@ impl fmt::Display for FactorsDescriptor {
 }
 
 /// The arguments of `rotary_factors`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FactorsArgs {
     /// `[…, tokens]` positions, in any leading shape; every element is one token's position.
     ///
@@ -202,8 +202,7 @@ impl Op for RotaryFactors {
             ));
         }
         let columns = u64::from(descriptor.columns);
-        args.frequencies
-            .require_shape(Self::NAME, Shape::new(&[columns]))?;
+        args.frequencies.require_shape(Self::NAME, &[columns])?;
         let axes = u64::from(descriptor.axes.max(1));
         if args.positions.numel() % axes != 0 {
             return Err(Error::argument(
@@ -272,10 +271,10 @@ impl Op for RotaryFactors {
         let total = tokens * columns;
         let mut arguments = Arguments::new();
         arguments
-            .view(args.positions)
-            .view(args.frequencies)
-            .view(args.cosine)
-            .view(args.sine)
+            .view(&args.positions)
+            .view(&args.frequencies)
+            .view(&args.cosine)
+            .view(&args.sine)
             .u64(total)
             .u32(descriptor.columns)
             .f32(f32::from_bits(descriptor.scale.0 as u32));
@@ -441,17 +440,18 @@ fn check_strided(
             ),
         ));
     }
-    let [_, query_head, ..] = *args.query.strides.as_slice() else {
+    let [_, query_head, ..] = *args.query.strides() else {
         return Err(Error::argument(name, "a query has three axes".to_owned()));
     };
     let head_dim = u64::from(descriptor.head_dim);
-    if query_head != head_dim || args.key.strides != args.query.strides {
+    if query_head as u64 != head_dim || args.key.strides() != args.query.strides() {
         return Err(Error::argument(
             name,
             format!(
                 "the query's heads are {query_head} elements apart and its strides {:?} are the \
                  key's {:?}: a head's channels and the two views' rows are what this form reads",
-                args.query.strides, args.key.strides
+                args.query.strides(),
+                args.key.strides()
             ),
         ));
     }
@@ -473,15 +473,15 @@ fn launch_strided(
     stream: &Stream,
 ) -> Result<()> {
     let table = args.cosine.rows();
-    let query_row = args.query.strides.get(0);
+    let query_row = args.query.stride(0);
 
     let blocks = tokens.div_ceil(u64::from(descriptor.rows));
     let mut arguments = Arguments::new();
     arguments
-        .view(args.query)
-        .view(args.key)
-        .view(args.cosine)
-        .view(args.sine)
+        .view(&args.query)
+        .view(&args.key)
+        .view(&args.cosine)
+        .view(&args.sine)
         .u64(tokens)
         .u64(query_row)
         .u64(table)
@@ -495,7 +495,7 @@ fn launch_strided(
 }
 
 /// The arguments of `qk_norm_rope`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct QkNormRopeArgs {
     /// `[tokens, q_heads, head_dim]` queries, before normalization.
     pub query: Operand,
@@ -548,31 +548,28 @@ impl Op for QkNormRope {
         // The token count is the FIRST extent: these views are `[tokens, heads, head_dim]`, and
         // `rows()` is the product of every extent but the last, which would count tokens times
         // heads. A head count of one hides that; any real head count refuses its own query view.
-        let tokens = args.query.shape.dim(0);
-        if args.key.shape.dim(0) != tokens {
+        let tokens = args.query.dim(0);
+        if args.key.dim(0) != tokens {
             return Err(Error::argument(
                 Self::NAME,
-                format!(
-                    "{tokens} query tokens but {} key tokens",
-                    args.key.shape.dim(0)
-                ),
+                format!("{tokens} query tokens but {} key tokens", args.key.dim(0)),
             ));
         }
         args.query.require_shape(
             Self::NAME,
-            Shape::new(&[tokens, u64::from(descriptor.q_heads), head_dim]),
+            &[tokens, u64::from(descriptor.q_heads), head_dim],
         )?;
         args.key.require_shape(
             Self::NAME,
-            Shape::new(&[tokens, u64::from(descriptor.k_heads), head_dim]),
+            &[tokens, u64::from(descriptor.k_heads), head_dim],
         )?;
         args.q_out.require_shape(
             Self::NAME,
-            Shape::new(&[tokens, u64::from(descriptor.q_heads), head_dim]),
+            &[tokens, u64::from(descriptor.q_heads), head_dim],
         )?;
         args.k_out.require_shape(
             Self::NAME,
-            Shape::new(&[tokens, u64::from(descriptor.k_heads), head_dim]),
+            &[tokens, u64::from(descriptor.k_heads), head_dim],
         )?;
         if args.q_out.dtype != descriptor.output || args.k_out.dtype != descriptor.output {
             return Err(Error::argument(
@@ -589,20 +586,20 @@ impl Op for QkNormRope {
         // compiled unweighted has no weight ports, and one compiled weighted cannot normalize
         // without them.
         if descriptor.affine {
-            let q_weight = args.q_weight.ok_or_else(|| {
+            let q_weight = args.q_weight.as_ref().ok_or_else(|| {
                 Error::argument(
                     Self::NAME,
                     "a weighted normalization was launched without its query weight".to_owned(),
                 )
             })?;
-            let k_weight = args.k_weight.ok_or_else(|| {
+            let k_weight = args.k_weight.as_ref().ok_or_else(|| {
                 Error::argument(
                     Self::NAME,
                     "a weighted normalization was launched without its key weight".to_owned(),
                 )
             })?;
-            q_weight.require_shape(Self::NAME, Shape::new(&[head_dim]))?;
-            k_weight.require_shape(Self::NAME, Shape::new(&[head_dim]))?;
+            q_weight.require_shape(Self::NAME, &[head_dim])?;
+            k_weight.require_shape(Self::NAME, &[head_dim])?;
         } else if args.q_weight.is_some() || args.k_weight.is_some() {
             return Err(Error::argument(
                 Self::NAME,
@@ -638,7 +635,7 @@ impl Op for QkNormRope {
         stream: &Stream,
     ) -> Result<()> {
         // The token count is the first extent of the `[tokens, heads, head_dim]` views.
-        let tokens = args.query.shape.dim(0);
+        let tokens = args.query.dim(0);
         if descriptor.strided {
             return launch_strided(kernel, descriptor, args, tokens, stream);
         }
@@ -650,15 +647,15 @@ impl Op for QkNormRope {
         let programs = (tokens * u64::from(descriptor.q_heads)).div_ceil(rows)
             + (tokens * u64::from(descriptor.k_heads)).div_ceil(rows);
         let mut arguments = Arguments::new();
-        arguments.view(args.query).view(args.key);
+        arguments.view(&args.query).view(&args.key);
         if let Some((q_weight, k_weight)) = weights {
-            arguments.view(q_weight).view(k_weight);
+            arguments.view(&q_weight).view(&k_weight);
         }
         arguments
-            .view(args.cosine)
-            .view(args.sine)
-            .view(args.q_out)
-            .view(args.k_out)
+            .view(&args.cosine)
+            .view(&args.sine)
+            .view(&args.q_out)
+            .view(&args.k_out)
             .u64(tokens)
             .f32(f32::from_bits(descriptor.epsilon.0 as u32))
             .flag(descriptor.pdl);
@@ -738,7 +735,7 @@ impl fmt::Display for RopeApplyDescriptor {
 }
 
 /// The arguments of `rope_apply`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RopeApplyArgs {
     /// `[tokens, heads, head_dim]`: the values to rotate.
     pub x: Operand,
@@ -784,11 +781,11 @@ impl Op for RopeApply {
         let pairs = u64::from(descriptor.rotated) / 2;
         let heads = u64::from(descriptor.heads);
         args.x.require_rank(Self::NAME, 3)?;
-        let tokens = args.x.shape.dim(0);
+        let tokens = args.x.dim(0);
         args.x
-            .require_shape(Self::NAME, Shape::new(&[tokens, heads, head_dim]))?;
+            .require_shape(Self::NAME, &[tokens, heads, head_dim])?;
         args.out
-            .require_shape(Self::NAME, Shape::new(&[tokens, heads, head_dim]))?;
+            .require_shape(Self::NAME, &[tokens, heads, head_dim])?;
         if args.out.dtype != descriptor.output {
             return Err(Error::argument(
                 Self::NAME,
@@ -817,14 +814,14 @@ impl Op for RopeApply {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let tokens = args.x.shape.dim(0);
+        let tokens = args.x.dim(0);
         let programs = tokens.div_ceil(u64::from(descriptor.rows));
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.cosine)
-            .view(args.sine)
-            .view(args.out)
+            .view(&args.x)
+            .view(&args.cosine)
+            .view(&args.sine)
+            .view(&args.out)
             .u64(tokens)
             .flag(descriptor.pdl);
         // A full rotation's arguments end at `pdl`; a partial one names how many channels rotate.

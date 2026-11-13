@@ -561,12 +561,12 @@ impl WeightLoader<'_> {
         let expected = file.shape(rows, columns);
         let scales_shape = gathered(scales);
         let stated: Vec<u64> = scales_shape.dims().iter().map(|dim| *dim as u64).collect();
-        if stated != expected.dims() {
+        if stated != expected {
             return Err(Error::weight(
                 scales_name,
                 format!(
                     "the {file} block scales of a [{rows}, {columns}] matrix are {:?}, not {:?}",
-                    expected.dims(),
+                    expected,
                     scales_shape.dims()
                 ),
             ));
@@ -631,7 +631,7 @@ impl WeightLoader<'_> {
         // does not meet.
         let product_layout = scales_layout(product);
         let scales_tensor = if file == product {
-            let shape = extents(expected.dims());
+            let shape = extents(&expected);
             let loaded = self.load(scales_name, scales, product_layout, &shape, None, true)?;
 
             block_scale_dtype(scales_name, loaded.dtype())?;
@@ -729,7 +729,7 @@ impl WeightLoader<'_> {
             ranges.push(first..end);
         }
 
-        let shape = extents(product.shape(rows, columns).dims());
+        let shape = extents(&product.shape(rows, columns));
         let key = computed_key(
             self.identities(&[name.to_owned()])?,
             dtype,
@@ -958,14 +958,14 @@ impl WeightLoader<'_> {
                 // here instead of published after a second pass over it.
                 let expected = ScaleLayout::Linear.shape(rows_here, columns_here);
                 let stated: Vec<u64> = scales.shape.dims().iter().map(|dim| *dim as u64).collect();
-                if stated != expected.dims() {
+                if stated != expected {
                     return Err(Error::weight(
                         &scales_name,
                         format!(
                             "a checkpoint's block scales of a [{rows_here}, {columns_here}] \
                              matrix are linear {:?}, not {:?}: the published {layout} table is \
                              this loader's to build, not the export's to state",
-                            expected.dims(),
+                            expected,
                             scales.shape.dims()
                         ),
                     ));
@@ -978,20 +978,20 @@ impl WeightLoader<'_> {
 
                 values_names.push(values_name);
                 scales_names.push(scales_name);
-                entry = expected.numel();
+                entry = expected.iter().product();
             }
         }
 
         // One projection's matrix as the checkpoint stores it, and as this rank publishes it.
         let (stored_rows, stored_columns) = (rows.unwrap_or(0), columns.unwrap_or(0));
         let shard_scales = ScaleLayout::Linear.shape(stored_rows * per, stored_columns);
-        if shard_scales.numel() != entry * per {
+        if shard_scales.iter().product::<u64>() != entry * per {
             return Err(Error::weight(
                 name,
                 format!(
                     "a linear entry for {stored_rows} rows of {stored_columns} elements is {} \
                      block scales, and {per} concatenated entries hold {entry} each",
-                    shard_scales.numel() / per.max(1)
+                    shard_scales.iter().product::<u64>() / per.max(1)
                 ),
             ));
         }
@@ -1034,7 +1034,7 @@ impl WeightLoader<'_> {
 
         let values_shape = extents(&[count, rows, columns / 2]);
         let published = layout.shape(rows, columns);
-        let scales_shape = extents(&[count, published.dim(0), published.dim(1)]);
+        let scales_shape = extents(&[count, published[0], published[1]]);
 
         // `tensor_scales` was collected expert-major, in the checkpoint's own reading order;
         // the published table is projection-major, one packed row per projection.

@@ -113,9 +113,8 @@ impl Tiny {
     /// The model over meta weights, with its drafter when `drafting`: what a profile run
     /// computes on.
     fn meta(drafting: bool) -> Outcome<Self> {
-        let weight = |address: u64, dims: &[usize]| {
-            backend::retained(address, dims, DType::F32, &backend::meta())
-        };
+        let weight =
+            |address: u64, dims: &[usize]| ops::retained(address, dims, DType::F32, &ops::meta());
 
         Ok(Self {
             table: weight(0x1_0000, &[VOCABULARY, HIDDEN])?,
@@ -285,7 +284,7 @@ impl Bench {
             None,
         )?;
         if drafts > 0 {
-            let unread = backend::retained(0x5_0000, &[4], DType::F32, &backend::meta())?;
+            let unread = ops::retained(0x5_0000, &[4], DType::F32, &ops::meta())?;
             profiled.set_draft_cache(draft(unread), None, None)?;
         }
         profiled.graphs().profile_run(&profiled)?;

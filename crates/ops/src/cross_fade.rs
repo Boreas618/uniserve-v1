@@ -29,13 +29,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::Operand;
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -72,7 +72,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one blend.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[channels, frames, height, width]` the tile already written, or the seam band of it: a view
     /// inside the raster, read through its own strides.
@@ -104,7 +104,7 @@ impl Op for CrossFade {
                 ),
             ));
         }
-        let dims = args.current.shape.dims();
+        let dims = args.current.dims();
         if dims.len() != 4 {
             return Err(Error::argument(
                 Self::NAME,
@@ -112,7 +112,7 @@ impl Op for CrossFade {
             ));
         }
         let extent = u64::from(descriptor.extent);
-        let along = dims[descriptor.axis as usize];
+        let along = args.current.dim(descriptor.axis as usize);
         // The seam is the shape the caller hands, so the refusal is about that shape rather than
         // about a value: the descriptor compiles `extent` blended positions along axis `axis`, and
         // the operand must have that many to blend. A seam the caller passed has exactly `extent`
@@ -128,14 +128,14 @@ impl Op for CrossFade {
                 ),
             ));
         }
-        for (name, view) in [("previous", args.previous), ("current", args.current)] {
+        for (name, view) in [("previous", &args.previous), ("current", &args.current)] {
             // Named here rather than left to `require_shape`, because the mistake this catches is
             // specific and the generic refusal sends the reader to the wrong place: a caller that
             // hands over two whole tiles differing by the grid's stride is told an overlap does not
             // fit an axis, and goes looking at `extent`. What a cross-fade blends is the band each
             // tile contributes to the seam — the last `extent` voxels of one and the first `extent`
             // of the next — so both operands are the same shape by construction.
-            if view.shape != args.current.shape {
+            if view.dims() != args.current.dims() {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
@@ -143,8 +143,8 @@ impl Op for CrossFade {
                          the current tile's {:?}: the operands are the seam band each tile \
                          contributes along axis {} (the band is {extent} voxels wide), not the tiles \
                          themselves",
-                        view.shape.dims(),
-                        args.current.shape.dims(),
+                        view.dims(),
+                        args.current.dims(),
                         descriptor.axis
                     ),
                 ));
@@ -160,7 +160,7 @@ impl Op for CrossFade {
                 ));
             }
         }
-        args.out.require_shape(Self::NAME, args.current.shape)?;
+        args.out.require_dims(Self::NAME, args.current.dims())?;
         if args.out.dtype != descriptor.dtype {
             return Err(Error::argument(
                 Self::NAME,
@@ -173,9 +173,9 @@ impl Op for CrossFade {
         }
         // The same rule as `unpatchify_video`'s, and stated once: `tensor::row_writable`. `out` may
         // still alias `current` — every element is read before the position it lives at is written.
-        let out_strides = crate::tensor::row_writable(&args.out, Self::NAME)?;
-        let previous_strides = crate::tensor::row_readable(&args.previous, Self::NAME)?;
-        let current_strides = crate::tensor::row_readable(&args.current, Self::NAME)?;
+        let out_strides = crate::operand::row_writable(&args.out, Self::NAME)?;
+        let previous_strides = crate::operand::row_readable(&args.previous, Self::NAME)?;
+        let current_strides = crate::operand::row_readable(&args.current, Self::NAME)?;
         // Every stride travels as a 32-bit word, and a value that does not fit is refused rather
         // than truncated: a source inside a raster states its own row stride, which is the raster's
         // width, so this is the number that used to be assumed.
@@ -252,18 +252,18 @@ impl Op for CrossFade {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let dims = args.current.shape.dims();
+        let dims = args.current.dims();
         // The outer strides of the layouts `check` accepted.
-        let out_strides = crate::tensor::outer_strides(&args.out);
-        let previous_strides = crate::tensor::outer_strides(&args.previous);
-        let current_strides = crate::tensor::outer_strides(&args.current);
+        let out_strides = crate::operand::outer_strides(&args.out);
+        let previous_strides = crate::operand::outer_strides(&args.previous);
+        let current_strides = crate::operand::outer_strides(&args.current);
 
         // Every narrowing below is of a value `check` holds within its kernel parameter.
         let mut arguments = Arguments::new();
         arguments
-            .view(args.previous)
-            .view(args.current)
-            .view(args.out)
+            .view(&args.previous)
+            .view(&args.current)
+            .view(&args.out)
             .u32(descriptor.extent)
             .u32(descriptor.axis)
             .u32(dims[0] as u32)

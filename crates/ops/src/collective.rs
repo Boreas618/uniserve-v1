@@ -24,16 +24,14 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use ops::moe::exchange::Descriptor as ExchangeDescriptor;
-use ops::moe::{ExchangeArgs, ExpertExchange};
-use ops::platform::{
-    CaptureStatus, CollectiveType, Communicator, DeviceRange, Event, EventFlags, PlatformDevicePtr,
-    ReduceOp, Stream, collective_group,
-};
-use ops::{Operand, collective_type};
-use tensor::Tensor;
+use platform::nccl::{Communicator, ReduceOp, group as nccl_group};
+use platform::{CaptureStatus, DeviceRange, Event, EventFlags, Stream};
+use tensor::{DType, Tensor};
 
+use crate::Operand;
 use crate::context::{self, Context};
+use crate::moe::exchange::Descriptor as ExchangeDescriptor;
+use crate::moe::{ExchangeArgs, ExpertExchange};
 use crate::{Error, Result, launch, storage};
 
 /// The priority of a group's side stream: the driver clamps it to the device's highest.
@@ -125,9 +123,9 @@ impl Group {
     /// hold `bytes` bytes each.
     fn all_to_all(
         &self,
-        send: Operand,
-        recv: Operand,
-        (block, bytes, dtype): (usize, usize, CollectiveType),
+        send: &Operand,
+        recv: &Operand,
+        (block, bytes, dtype): (usize, usize, i32),
         stream: &Stream,
     ) -> Result<()> {
         self.communicator().all_to_all(
@@ -145,7 +143,7 @@ impl Group {
     fn exchange_rows(
         &self,
         block: impl Fn(u64) -> DeviceRange,
-        (elements, dtype): (usize, CollectiveType),
+        (elements, dtype): (usize, i32),
         ranks: u64,
         stream: &Stream,
     ) -> Result<()> {
@@ -153,7 +151,7 @@ impl Group {
             let communicator = self.communicator();
             let rank = communicator.rank();
 
-            collective_group(|| {
+            nccl_group(|| {
                 for peer in 0..ranks as i32 {
                     if peer != rank {
                         communicator.send(stream, block(rank as u64), elements, dtype, peer)?;
@@ -191,18 +189,18 @@ pub fn split() -> Option<(u64, u64)> {
 pub fn all_reduce(x: &Tensor) -> Result<()> {
     let (context, _) = member("all_reduce")?;
     let x = buffer(x, "all_reduce")?;
-    let (count, dtype) = elements(x, x, "all_reduce")?;
+    let (count, dtype) = elements(&x, &x, "all_reduce")?;
 
     let Some(stream) = context.stream() else {
         return Ok(());
     };
     let group = group(&context, "all_reduce")?;
-    let bytes = dtype.bytes() * count;
+    let bytes = x.dtype.size_in_bytes() * count;
 
     group.communicator().all_reduce(
         stream,
-        range(x, bytes),
-        range(x, bytes),
+        range(&x, bytes),
+        range(&x, bytes),
         count,
         dtype,
         ReduceOp::Sum,
@@ -219,18 +217,18 @@ pub fn all_reduce(x: &Tensor) -> Result<()> {
 pub fn all_gather(send: &Tensor, recv: &Tensor) -> Result<()> {
     let (context, ranks) = member("all_gather")?;
     let (send, recv) = (buffer(send, "all_gather")?, buffer(recv, "all_gather")?);
-    let (count, gathered, dtype) = gather(send, recv, ranks)?;
+    let (count, gathered, dtype) = gather(&send, &recv, ranks)?;
 
     let Some(stream) = context.stream() else {
         return Ok(());
     };
     let group = group(&context, "all_gather")?;
-    let bytes = dtype.bytes();
+    let bytes = send.dtype.size_in_bytes();
 
     group.communicator().all_gather(
         stream,
-        range(send, bytes * count),
-        range(recv, bytes * gathered),
+        range(&send, bytes * count),
+        range(&recv, bytes * gathered),
         count,
         dtype,
     )?;
@@ -247,12 +245,12 @@ pub fn all_gather(send: &Tensor, recv: &Tensor) -> Result<()> {
 pub fn all_to_all(send: &Tensor, recv: &Tensor) -> Result<()> {
     let (context, ranks) = member("all_to_all")?;
     let (send, recv) = (buffer(send, "all_to_all")?, buffer(recv, "all_to_all")?);
-    let exchange = exchange(send, recv, ranks)?;
+    let exchange = exchange(&send, &recv, ranks)?;
 
     let Some(stream) = context.stream() else {
         return Ok(());
     };
-    group(&context, "all_to_all")?.all_to_all(send, recv, exchange, stream)
+    group(&context, "all_to_all")?.all_to_all(&send, &recv, exchange, stream)
 }
 
 /// Starts [`all_to_all`] beside the context's stream, which goes on at once.
@@ -267,14 +265,16 @@ pub fn all_to_all(send: &Tensor, recv: &Tensor) -> Result<()> {
 pub fn start_all_to_all(send: &Tensor, recv: &Tensor) -> Result<usize> {
     let (context, ranks) = member("all_to_all")?;
     let (send, recv) = (buffer(send, "all_to_all")?, buffer(recv, "all_to_all")?);
-    let exchange = exchange(send, recv, ranks)?;
+    let exchange = exchange(&send, &recv, ranks)?;
 
     let Some(stream) = context.stream() else {
         return Ok(0);
     };
     let group = group(&context, "all_to_all")?;
 
-    group.start(stream, |side| group.all_to_all(send, recv, exchange, side))
+    group.start(stream, |side| {
+        group.all_to_all(&send, &recv, exchange, side)
+    })
 }
 
 /// Starts delivering rows `first..first + count` of this rank's `owner_rows` rows to every rank,
@@ -296,8 +296,8 @@ pub fn start_gather_rows(
 ) -> Result<usize> {
     let (context, ranks) = member("gather_rows")?;
     let gathered = buffer(gathered, "gather_rows")?;
-    let (_, dtype) = elements(gathered, gathered, "gather_rows")?;
-    let width = gathered.shape.last();
+    let (_, dtype) = elements(&gathered, &gathered, "gather_rows")?;
+    let width = gathered.last();
 
     let interval = first.checked_add(count).filter(|end| *end <= owner_rows);
     let whole = ranks
@@ -307,8 +307,8 @@ pub fn start_gather_rows(
         return Err(misuse(
             "gather_rows",
             format!(
-                "rows {first}..+{count} of {owner_rows} per rank in a {} buffer of {ranks} ranks",
-                gathered.shape
+                "rows {first}..+{count} of {owner_rows} per rank in a {:?} buffer of {ranks} ranks",
+                gathered.dims()
             ),
         ));
     }
@@ -321,10 +321,10 @@ pub fn start_gather_rows(
     // One rank's rows of the interval; every rank's lie at the same offset of its own block.
     let elements = usize::try_from(count * width)
         .map_err(|_| misuse("gather_rows", "an element count above usize::MAX"))?;
-    let bytes = dtype.bytes() * elements;
+    let bytes = gathered.dtype.size_in_bytes() * elements;
     let block = |rank: u64| {
         let at = gathered.offset_elements((rank * owner_rows + first) * width);
-        range(gathered.at(at), bytes)
+        DeviceRange::new(at, bytes)
     };
 
     group.start(stream, |side| {
@@ -470,37 +470,55 @@ fn misuse(collective: &'static str, problem: impl Into<String>) -> Error {
 }
 
 /// The `bytes` bytes `operand` starts at, as the communicator takes a buffer.
-fn range(operand: Operand, bytes: usize) -> DeviceRange {
-    DeviceRange::new(
-        PlatformDevicePtr::from_address(operand.ptr.address()),
-        bytes,
-    )
+fn range(operand: &Operand, bytes: usize) -> DeviceRange {
+    DeviceRange::new(operand.ptr, bytes)
+}
+
+/// The `ncclDataType_t` code NCCL moves `dtype` as, when NCCL has one: the one conversion of an
+/// element type into a vendor's code.
+///
+/// A sub-byte type has no collective counterpart: it travels inside a program's own encoded
+/// layout, never as a buffer a collective reads.
+fn nccl_type(dtype: DType) -> Option<i32> {
+    // The codes of `nccl.h`'s `ncclDataType_t`.
+    Some(match dtype {
+        DType::U8 => 1,      // ncclUint8
+        DType::I32 => 2,     // ncclInt32
+        DType::U32 => 3,     // ncclUint32
+        DType::I64 => 4,     // ncclInt64
+        DType::F16 => 6,     // ncclFloat16
+        DType::F32 => 7,     // ncclFloat32
+        DType::F64 => 8,     // ncclFloat64
+        DType::BF16 => 9,    // ncclBfloat16
+        DType::F8E4M3 => 10, // ncclFloat8e4m3
+        // NCCL has no 16-bit integer reduction: a silent fallback would be a wrong answer, so a
+        // PCM sample travels as bytes and never as a collective's element.
+        DType::I16 => return None,
+        // Neither a packed element nor one the tensor library adds is a collective's element.
+        _ => return None,
+    })
 }
 
 /// The element count of `send` and the element type NCCL moves it as, refusing buffers of two
 /// element types and element types NCCL does not have.
-fn elements(
-    send: Operand,
-    recv: Operand,
-    collective: &'static str,
-) -> Result<(usize, CollectiveType)> {
+fn elements(send: &Operand, recv: &Operand, collective: &'static str) -> Result<(usize, i32)> {
     if send.dtype != recv.dtype {
         return Err(misuse(
             collective,
             format!(
                 "sends {} and receives {}",
-                ops::abi::name(send.dtype),
-                ops::abi::name(recv.dtype)
+                crate::abi::name(send.dtype),
+                crate::abi::name(recv.dtype)
             ),
         ));
     }
 
     let count = usize::try_from(send.numel())
         .map_err(|_| misuse(collective, "an element count above usize::MAX"))?;
-    let dtype = collective_type(send.dtype).ok_or_else(|| {
+    let dtype = nccl_type(send.dtype).ok_or_else(|| {
         misuse(
             collective,
-            format!("{} has no NCCL element type", ops::abi::name(send.dtype)),
+            format!("{} has no NCCL element type", crate::abi::name(send.dtype)),
         )
     })?;
 
@@ -509,7 +527,7 @@ fn elements(
 
 /// The element counts of an all-gather over `ranks` members, `send`'s and the `ranks` times as
 /// many `recv` must hold, and its element type.
-fn gather(send: Operand, recv: Operand, ranks: u64) -> Result<(usize, usize, CollectiveType)> {
+fn gather(send: &Operand, recv: &Operand, ranks: u64) -> Result<(usize, usize, i32)> {
     let (count, dtype) = elements(send, recv, "all_gather")?;
     let gathered = usize::try_from(ranks)
         .ok()
@@ -529,7 +547,7 @@ fn gather(send: Operand, recv: Operand, ranks: u64) -> Result<(usize, usize, Col
 
 /// One block's element count, the bytes of each whole buffer and the element type of an
 /// all-to-all over `ranks` members, whose buffers both hold `ranks` equal blocks.
-fn exchange(send: Operand, recv: Operand, ranks: u64) -> Result<(usize, usize, CollectiveType)> {
+fn exchange(send: &Operand, recv: &Operand, ranks: u64) -> Result<(usize, usize, i32)> {
     let (count, dtype) = elements(send, recv, "all_to_all")?;
     let ranks = usize::try_from(ranks).unwrap_or(usize::MAX);
 
@@ -543,7 +561,7 @@ fn exchange(send: Operand, recv: Operand, ranks: u64) -> Result<(usize, usize, C
         ));
     }
 
-    Ok((count / ranks, dtype.bytes() * count, dtype))
+    Ok((count / ranks, send.dtype.size_in_bytes() * count, dtype))
 }
 
 /// Waits for a collective issued outside a capture, so the forward goes on with none in flight.
@@ -573,8 +591,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use ops::moe::ExchangeArgs;
-    use ops::moe::exchange::{Descriptor, Mode};
+    use crate::moe::ExchangeArgs;
+    use crate::moe::exchange::{Descriptor, Mode};
 
     use super::{
         all_gather, all_reduce, all_to_all, expert_exchange, finish, settle, split,

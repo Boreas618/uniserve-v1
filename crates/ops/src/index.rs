@@ -51,14 +51,14 @@
 
 use std::fmt;
 
-use tensor::DType;
+use platform::Stream;
+use tensor::{DType, Layout};
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
+use crate::operand::Operand;
 use crate::strided;
-use crate::tensor::{MAX_RANK, Operand, Strides};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -135,7 +135,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one `index`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// The elements read, at any strides. A `gather` reads it at the indexed positions and it has
     /// the destination's shape off the axis; a scatter reads all of it.
@@ -160,20 +160,24 @@ pub struct Index;
 /// along the axis, so the three traverse the destination's shape together and the axis needs no
 /// special place among the others.
 fn gathered(args: &Args) -> [Operand; 3] {
-    let rank = args.source.shape.rank();
-    let mut steps = [0_u64; MAX_RANK];
-    steps[..rank].copy_from_slice(args.source.strides.as_slice());
-    if args.axis < rank {
-        steps[args.axis] = 0;
+    // A source of another rank than the destination has no row to repeat over the destination's
+    // axes: the operands come back as they are, for `check` to refuse.
+    if args.source.rank() != args.destination.rank() {
+        return [
+            args.destination.clone(),
+            args.source.clone(),
+            args.indices.clone(),
+        ];
     }
 
-    let repeated = Operand::with_strides(
-        args.source.ptr,
-        args.source.dtype,
-        args.destination.shape,
-        Strides::new(&steps[..rank]),
-    );
-    strided::merge_axes([args.destination, repeated, args.indices])
+    let mut steps = args.source.strides().to_vec();
+    if let Some(step) = steps.get_mut(args.axis) {
+        *step = 0;
+    }
+
+    let layout = Layout::new(args.destination.shape().clone(), steps, 0);
+    let repeated = Operand::with_layout(args.source.ptr, args.source.dtype, &layout);
+    strided::merge_axes([&args.destination, &repeated, &args.indices])
 }
 
 /// The columns of a scatter, merged: the source, the indices and the destination along every
@@ -181,9 +185,9 @@ fn gathered(args: &Args) -> [Operand; 3] {
 fn columns(args: &Args) -> [Operand; 3] {
     let off_axis = |axis: usize| axis != args.axis;
     strided::merge_axes([
-        strided::select_axes(&args.source, off_axis),
-        strided::select_axes(&args.indices, off_axis),
-        strided::select_axes(&args.destination, off_axis),
+        &strided::select_axes(&args.source, off_axis),
+        &strided::select_axes(&args.indices, off_axis),
+        &strided::select_axes(&args.destination, off_axis),
     ])
 }
 
@@ -193,7 +197,7 @@ fn rank(function: Function, args: &Args) -> u8 {
         Function::Gather => gathered(args),
         Function::ScatterSet | Function::ScatterAdd => columns(args),
     };
-    first.shape.rank() as u8
+    first.rank() as u8
 }
 
 /// Check that `narrow` and `wide` have one rank and one extent on every axis but `axis`.
@@ -204,10 +208,8 @@ fn require_alike_off_axis(
 ) -> Result<()> {
     let (narrow_name, narrow) = narrow;
     let (wide_name, wide) = wide;
-    let alike = narrow.shape.rank() == wide.shape.rank()
-        && narrow.strides.rank() == narrow.shape.rank()
-        && (0..narrow.shape.rank())
-            .all(|other| other == axis || narrow.shape.dim(other) == wide.shape.dim(other));
+    let alike = narrow.rank() == wide.rank()
+        && (0..narrow.rank()).all(|other| other == axis || narrow.dim(other) == wide.dim(other));
     if alike {
         return Ok(());
     }
@@ -215,7 +217,8 @@ fn require_alike_off_axis(
         Index::NAME,
         format!(
             "{narrow_name} of shape {:?} and {wide_name} of shape {:?} differ off axis {axis}",
-            narrow.shape, wide.shape
+            narrow.dims(),
+            wide.dims()
         ),
     ))
 }
@@ -245,13 +248,13 @@ impl Op for Index {
         )?;
         strided::require_dtype(Self::NAME, "indices", &args.indices, descriptor.indices)?;
 
-        if args.axis >= args.destination.shape.rank() {
+        if args.axis >= args.destination.rank() {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "axis {} is none of the destination's {} axes",
                     args.axis,
-                    args.destination.shape.rank()
+                    args.destination.rank()
                 ),
             ));
         }
@@ -265,7 +268,7 @@ impl Op for Index {
             Function::Gather => &args.destination,
             Function::ScatterSet | Function::ScatterAdd => &args.source,
         };
-        strided::require_shape(Self::NAME, "indices", &args.indices, side.shape)?;
+        strided::require_shape(Self::NAME, "indices", &args.indices, side.dims())?;
 
         strided::require_elements(Self::NAME, "source", &args.source)?;
         strided::require_elements(Self::NAME, "destination", &args.destination)?;
@@ -288,9 +291,9 @@ impl Op for Index {
     ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
-            .view(args.source)
-            .view(args.indices)
-            .view(args.destination);
+            .view(&args.source)
+            .view(&args.indices)
+            .view(&args.destination);
 
         let work = match descriptor.function {
             Function::Gather => {
@@ -298,25 +301,25 @@ impl Op for Index {
                 let elements = destination.numel();
 
                 arguments.u64(elements);
-                strided::pack_extents(&mut arguments, destination.shape);
-                strided::pack_strides(&mut arguments, repeated.strides);
-                strided::pack_strides(&mut arguments, indices.strides);
-                arguments.u64(args.source.strides.get(args.axis));
+                strided::pack_extents(&mut arguments, &destination);
+                strided::pack_strides(&mut arguments, &repeated);
+                strided::pack_strides(&mut arguments, &indices);
+                arguments.u64(args.source.stride(args.axis));
                 elements
             }
             Function::ScatterSet | Function::ScatterAdd => {
                 let [source, indices, destination] = columns(&args);
                 let count = source.numel();
 
-                arguments.u64(count).u64(args.source.shape.dim(args.axis));
-                strided::pack_extents(&mut arguments, source.shape);
-                strided::pack_strides(&mut arguments, source.strides);
-                strided::pack_strides(&mut arguments, indices.strides);
-                strided::pack_strides(&mut arguments, destination.strides);
+                arguments.u64(count).u64(args.source.dim(args.axis));
+                strided::pack_extents(&mut arguments, &source);
+                strided::pack_strides(&mut arguments, &source);
+                strided::pack_strides(&mut arguments, &indices);
+                strided::pack_strides(&mut arguments, &destination);
                 arguments
-                    .u64(args.source.strides.get(args.axis))
-                    .u64(args.indices.strides.get(args.axis))
-                    .u64(args.destination.strides.get(args.axis));
+                    .u64(args.source.stride(args.axis))
+                    .u64(args.indices.stride(args.axis))
+                    .u64(args.destination.stride(args.axis));
                 count
             }
         };
@@ -351,21 +354,16 @@ impl Op for Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DevicePtr, Shape};
+    use platform::DevicePtr;
 
     const BLOCK: u32 = 1024;
 
     fn operand(dtype: DType, shape: &[u64], strides: &[u64]) -> Operand {
-        Operand::with_strides(
-            DevicePtr::new(0x1000),
-            dtype,
-            Shape::new(shape),
-            Strides::new(strides),
-        )
+        Operand::with_strides(DevicePtr::from_address(0x1000), dtype, shape, strides)
     }
 
     fn contiguous(dtype: DType, shape: &[u64]) -> Operand {
-        Operand::new(DevicePtr::new(0x2000), dtype, Shape::new(shape))
+        Operand::new(DevicePtr::from_address(0x2000), dtype, shape)
     }
 
     fn refusal(function: Function, args: &Args) -> String {
@@ -525,7 +523,7 @@ mod tests {
         for indices in [DType::U8, DType::U32, DType::I64] {
             let typed = Args {
                 indices: operand(indices, &[7, 64], &[1, 0]),
-                ..args
+                ..args.clone()
             };
             Index::check(
                 &Descriptor::of(Function::Gather, &typed, BLOCK, false),
@@ -536,7 +534,7 @@ mod tests {
 
         let signed = Args {
             indices: operand(DType::I32, &[7, 64], &[1, 0]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(Function::Gather, &signed);
         assert!(message.contains("indices is i32"), "{message}");
@@ -544,7 +542,7 @@ mod tests {
         // A gather's indices have the destination's shape, not the source's.
         let of_source = Args {
             indices: operand(DType::U32, &[1000, 64], &[1, 0]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(Function::Gather, &of_source);
         assert!(message.contains("expected indices of shape"), "{message}");
@@ -566,18 +564,21 @@ mod tests {
 
         let wider = Args {
             source: contiguous(DType::BF16, &[1000, 65]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(Function::Gather, &wider);
         assert!(message.contains("differ off axis 0"), "{message}");
 
-        let past = Args { axis: 2, ..args };
+        let past = Args {
+            axis: 2,
+            ..args.clone()
+        };
         let message = refusal(Function::Gather, &past);
         assert!(message.contains("axis 2 is none"), "{message}");
 
         let strided_destination = Args {
             destination: operand(DType::BF16, &[7, 64], &[128, 1]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(Function::Gather, &strided_destination);
         assert!(
@@ -587,7 +588,7 @@ mod tests {
 
         let other_type = Args {
             destination: contiguous(DType::F32, &[7, 64]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(Function::Gather, &other_type);
         assert!(message.contains("expected bf16 destination"), "{message}");
@@ -595,7 +596,7 @@ mod tests {
         let empty = Args {
             indices: operand(DType::U32, &[0, 64], &[1, 0]),
             destination: contiguous(DType::BF16, &[0, 64]),
-            ..args
+            ..args.clone()
         };
         let message = refusal(Function::Gather, &empty);
         assert!(message.contains("nothing to launch"), "{message}");
@@ -603,7 +604,7 @@ mod tests {
         // A strided source is read as it lies.
         let permuted = Args {
             source: operand(DType::BF16, &[1000, 64], &[1, 1000]),
-            ..args
+            ..args.clone()
         };
         Index::check(
             &Descriptor::of(Function::Gather, &permuted, BLOCK, false),

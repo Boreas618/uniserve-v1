@@ -33,8 +33,9 @@ use nn::modules::{
     LayerNormConfig, Linear, LinearConfig, Mlp, MlpConfig, Parallel, QkvBias, QkvLinear,
     QkvLinearConfig, QkvNames,
 };
-use nn::{DType, Decoder, LatentShape, Layout, Split, Tensor, VarBuilder};
+use nn::{DType, Decoder, LatentShape, Split, Tensor, VarBuilder};
 use processing::minimax_h3::AUDIO_CHANNELS;
+use proto::video::Layout;
 
 use crate::minimax_h3::{AudioVaeConfig, Error, Result};
 

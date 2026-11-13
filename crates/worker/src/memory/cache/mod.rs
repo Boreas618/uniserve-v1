@@ -283,8 +283,8 @@ impl KvCacheMemory {
     /// The device the cache's tensors are on: its GPU, or the meta device.
     pub fn device(&self) -> Device {
         match self.planes.device_id() {
-            Some(device) => backend::cuda(device.0 as usize),
-            None => backend::meta(),
+            Some(device) => ops::cuda(device.0 as usize),
+            None => ops::meta(),
         }
     }
 
@@ -1083,7 +1083,7 @@ mod tests {
     #[test]
     fn a_cache_with_no_device_lends_tensors_of_its_shapes() -> Result<()> {
         let cache = KvCacheMemory::meta(config())?;
-        assert_eq!(cache.device().location(), backend::meta().location());
+        assert_eq!(cache.device().location(), ops::meta().location());
 
         // The attention group: one column per layer, FP8 with a scale and a flag per unit.
         let planes = cache.planes(0)?;
@@ -1367,7 +1367,7 @@ mod tests {
             &crate::memory::exclusive::LocalStorage,
             &stream,
         )?;
-        assert_ne!(cache.device().location(), backend::meta().location());
+        assert_ne!(cache.device().location(), ops::meta().location());
         assert!(cache.mapped_bytes() > 0);
         assert_eq!(cache.planes(0)?[1].key.dims(), [16, 4, 1, 4]);
 
@@ -1405,7 +1405,7 @@ mod tests {
         unsafe {
             platform::memcpy_async(
                 device_row.as_mut_ptr() as u64,
-                backend::operand(&table)?.ptr.address(),
+                ops::operand(&table)?.ptr.address(),
                 16,
                 &stream,
             )?;
@@ -1422,7 +1422,7 @@ mod tests {
             unsafe {
                 platform::memcpy_async(
                     flag.as_mut_ptr() as u64,
-                    backend::operand(&flags)?.ptr.address() + unit,
+                    ops::operand(&flags)?.ptr.address() + unit,
                     1,
                     &stream,
                 )?;

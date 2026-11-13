@@ -248,11 +248,6 @@ fn element_types_keep_their_abi_numbering_and_round_off() {
     // Appended for the tensor primitives' indices and for double precision.
     assert_eq!(abi::code(DType::U32).unwrap(), 9);
     assert_eq!(abi::code(DType::F64).unwrap(), 10);
-    for number in 0..11 {
-        let dtype = abi::from_code(number).expect("the ABI states eleven element types");
-        assert_eq!(abi::code(dtype).unwrap(), number);
-    }
-    assert_eq!(abi::from_code(11), None);
     // An element type the tensor library has and no package reads has no number.
     assert!(abi::code(DType::F8E8M0).is_err());
     assert_eq!(abi::bytes(DType::I16), Some(2));
@@ -270,30 +265,6 @@ fn element_types_keep_their_abi_numbering_and_round_off() {
     assert_eq!(abi::name(DType::F4), "f4e2m1");
     assert!(!DType::I32.is_float());
     assert!(DType::F8E4M3.is_float());
-}
-
-#[test]
-fn shapes_are_row_major_views_with_a_row_count() {
-    let shape = ops::Shape::new(&[3, 5, 128]);
-    assert_eq!(shape.rank(), 3);
-    assert_eq!(shape.numel(), 3 * 5 * 128);
-    assert_eq!(shape.rows(), 15);
-    assert_eq!(shape.last(), 128);
-    assert_eq!(shape.dim(1), 5);
-    assert_eq!(shape.dims(), &[3, 5, 128]);
-    assert_eq!(
-        ops::Strides::row_major(shape).as_slice(),
-        &[5 * 128, 128, 1]
-    );
-    assert_eq!(ops::Strides::row_major(shape).last(), 1);
-    assert_eq!(shape.with_last(256).dims(), &[3, 5, 256]);
-    assert!(shape.matches(&ops::Shape::new(&[3, 5, 128])));
-    assert!(!shape.matches(&ops::Shape::new(&[3, 5, 256])));
-
-    let unshaped = ops::Shape::new(&[]);
-    assert_eq!(unshaped.rank(), 0);
-    assert_eq!(unshaped.numel(), 1);
-    assert_eq!(unshaped.rows(), 1);
 }
 
 #[test]

@@ -21,13 +21,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -79,7 +79,7 @@ fn centred(key: Key, centred: bool) -> Key {
 }
 
 /// The arguments of `rms_norm`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RmsNormArgs {
     /// `[rows, columns]`.
     pub x: Operand,
@@ -125,8 +125,7 @@ impl Op for RmsNorm {
                 ),
             ));
         }
-        args.weight
-            .require_shape(Self::NAME, Shape::new(&[groups * columns]))?;
+        args.weight.require_shape(Self::NAME, &[groups * columns])?;
         Ok(())
     }
 
@@ -139,9 +138,9 @@ impl Op for RmsNorm {
         // The gain's row count is compiled in: a program reads gain row `row mod groups`.
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.weight)
-            .view(args.out)
+            .view(&args.x)
+            .view(&args.weight)
+            .view(&args.out)
             .u32(descriptor.columns)
             .f32(args.eps)
             .flag(descriptor.pdl);
@@ -190,7 +189,7 @@ impl fmt::Display for AddRmsNormDescriptor {
 }
 
 /// The arguments of `add_rms_norm`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct AddRmsNormArgs {
     /// `[rows, columns]`, this layer's output before the residual add.
     pub x: Operand,
@@ -235,8 +234,7 @@ impl Op for AddRmsNorm {
                 ),
             ));
         }
-        args.weight
-            .require_shape(Self::NAME, Shape::new(&[columns]))?;
+        args.weight.require_shape(Self::NAME, &[columns])?;
         Ok(())
     }
 
@@ -248,11 +246,11 @@ impl Op for AddRmsNorm {
     ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.residual)
-            .view(args.weight)
-            .view(args.out)
-            .view(args.residual_out)
+            .view(&args.x)
+            .view(&args.residual)
+            .view(&args.weight)
+            .view(&args.out)
+            .view(&args.residual_out)
             .u32(descriptor.columns)
             .f32(args.eps)
             .flag(descriptor.pdl);
@@ -309,7 +307,7 @@ impl fmt::Display for GatedRmsNormDescriptor {
 }
 
 /// The arguments of `gated_rms_norm`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct GatedRmsNormArgs {
     /// `[rows, columns]`, contiguous: the rows normalized.
     pub x: Operand,
@@ -351,7 +349,7 @@ impl Op for GatedRmsNorm {
         for (name, view) in [("x", &args.x), ("gate", &args.gate), ("out", &args.out)] {
             view.require_row(Self::NAME, descriptor.dtype, columns)
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
-            if view.strides != Strides::row_major(view.shape) {
+            if !view.is_row_major() {
                 return Err(Error::argument(
                     Self::NAME,
                     format!("the {name} rows are not contiguous"),
@@ -368,8 +366,7 @@ impl Op for GatedRmsNorm {
                 ));
             }
         }
-        args.weight
-            .require_shape(Self::NAME, Shape::new(&[columns]))?;
+        args.weight.require_shape(Self::NAME, &[columns])?;
         args.weight
             .require_row(Self::NAME, descriptor.dtype, columns)?;
         Ok(())
@@ -383,10 +380,10 @@ impl Op for GatedRmsNorm {
     ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.gate)
-            .view(args.weight)
-            .view(args.out)
+            .view(&args.x)
+            .view(&args.gate)
+            .view(&args.weight)
+            .view(&args.out)
             .u32(descriptor.columns)
             .f32(args.eps);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
@@ -439,7 +436,7 @@ impl fmt::Display for LayerNormDescriptor {
 }
 
 /// The arguments of `layer_norm`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct LayerNormArgs {
     /// `[rows, columns]`.
     pub x: Operand,
@@ -477,11 +474,10 @@ impl Op for LayerNorm {
                 ),
             ));
         }
-        args.weight
-            .require_shape(Self::NAME, Shape::new(&[columns]))?;
-        match (descriptor.bias, args.bias) {
+        args.weight.require_shape(Self::NAME, &[columns])?;
+        match (descriptor.bias, &args.bias) {
             (true, Some(bias)) => {
-                bias.require_shape(Self::NAME, Shape::new(&[columns]))?;
+                bias.require_shape(Self::NAME, &[columns])?;
             }
             (true, None) => {
                 return Err(Error::argument(
@@ -508,14 +504,14 @@ impl Op for LayerNorm {
     ) -> Result<()> {
         // `check` pairs the bias with the descriptor that declares it. Without one the bias slot
         // holds the weight's address, which the program never reads under a false bias flag.
-        let bias = args.bias.unwrap_or(args.weight);
+        let bias = args.bias.as_ref().unwrap_or(&args.weight);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.weight)
+            .view(&args.x)
+            .view(&args.weight)
             .view(bias)
-            .view(args.out)
+            .view(&args.out)
             .u32(descriptor.columns)
             .f32(args.eps)
             .flag(args.bias.is_some())
@@ -567,7 +563,7 @@ impl fmt::Display for SoftmaxDescriptor {
 }
 
 /// The arguments of `softmax`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SoftmaxArgs {
     /// `[rows, columns]`.
     pub x: Operand,
@@ -610,8 +606,8 @@ impl Op for Softmax {
     ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.out)
+            .view(&args.x)
+            .view(&args.out)
             .u32(descriptor.columns)
             .flag(descriptor.pdl);
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)

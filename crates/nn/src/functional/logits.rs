@@ -65,8 +65,8 @@ pub fn vocab_unpad(gathered: &Tensor, vocabulary: u32, ranks: u32) -> Result<Ten
         return Ok(Tensor::cat(&columns, 1)?.to_dtype(LOGITS)?);
     }
 
-    let out = backend::empty((rows, vocabulary as usize), LOGITS)?;
-    backend::launch::<VocabUnpad>(
+    let out = ops::empty((rows, vocabulary as usize), LOGITS)?;
+    ops::launch::<VocabUnpad>(
         // The gathered width is a launch value that follows the deployment's rank count; the
         // two element types are separate because the head's product is in the model's type and
         // the sampler reads FP32: the logits are widened here, once.
@@ -80,8 +80,8 @@ pub fn vocab_unpad(gathered: &Tensor, vocabulary: u32, ranks: u32) -> Result<Ten
             pdl: PDL,
         },
         UnpadArgs {
-            gathered: backend::operand(gathered)?,
-            out: backend::operand(&out)?,
+            gathered: ops::operand(gathered)?,
+            out: ops::operand(&out)?,
             ranks,
         },
     )?;

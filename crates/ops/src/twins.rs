@@ -19,13 +19,12 @@
 //! there. A region that is too small therefore cannot turn into a comparison of a buffer against
 //! itself.
 
-use tensor::DType;
+use platform::{Allocator, Buffer, DevicePtr, PoolKind, Stream};
 
 use crate::abi;
-use crate::platform::{Allocator, Buffer, PoolKind, Stream};
-use crate::tensor::{DevicePtr, Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
-use crate::{Error, Result, platform};
+use crate::{Error, Result};
 
 /// The alignment every twin buffer starts at.
 ///
@@ -34,7 +33,7 @@ use crate::{Error, Result, platform};
 pub const ALIGNMENT: u64 = 256;
 
 /// One shadow buffer and the real buffer it shadows.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Twin {
     /// Where the new implementation writes.
     pub shadow: Operand,
@@ -79,7 +78,7 @@ impl Twins {
 
     /// The address of the region's first byte.
     fn base(&self) -> DevicePtr {
-        DevicePtr::new(self.buffer.address())
+        DevicePtr::from_address(self.buffer.address())
     }
 
     /// The number of bytes this region holds.
@@ -102,15 +101,18 @@ impl Twins {
             self.fail(Error::Shape(format!(
                 "a strided output of {:?} elements has no shadow buffer of its own extent: its \
                  operator shadows it through the storage it reaches",
-                real.shape.dims()
+                real.dims()
             )));
             return real;
         }
 
-        match self.carve(real.shape, real.dtype) {
+        match self.carve(&real) {
             Ok(address) => {
-                let shadow = Operand::with_strides(address, real.dtype, real.shape, real.strides);
-                self.pairs.push(Twin { shadow, real });
+                let shadow = real.at(address);
+                self.pairs.push(Twin {
+                    shadow: shadow.clone(),
+                    real,
+                });
                 shadow
             }
             Err(error) => {
@@ -126,22 +128,20 @@ impl Twins {
     /// The copy is asynchronous on `stream`: every launch after it on that stream sees the bytes, and
     /// a capture records the copy as a node like any other.
     pub fn in_place(&mut self, real: Operand, stream: &Stream) -> Operand {
-        match self.carve(real.shape, real.dtype) {
+        match self.carve(&real) {
             Ok(address) => {
-                match real.byte_len() {
-                    Ok(bytes) => {
-                        if let Err(error) = platform::copy_bytes(stream, address, real.ptr, bytes) {
-                            self.fail(error);
-                            return real;
-                        }
-                    }
-                    Err(error) => {
-                        self.fail(error);
-                        return real;
-                    }
+                if let Err(error) = real
+                    .byte_len()
+                    .and_then(|bytes| copy_bytes(stream, address, real.ptr, bytes))
+                {
+                    self.fail(error);
+                    return real;
                 }
-                let shadow = Operand::with_strides(address, real.dtype, real.shape, real.strides);
-                self.pairs.push(Twin { shadow, real });
+                let shadow = real.at(address);
+                self.pairs.push(Twin {
+                    shadow: shadow.clone(),
+                    real,
+                });
                 shadow
             }
             Err(error) => {
@@ -164,16 +164,15 @@ impl Twins {
     /// kernels produced from one input, which is the comparison 7.3 asks for.
     pub fn freeze(&mut self, stream: &Stream) {
         for index in self.frozen..self.pairs.len() {
-            let real = self.pairs[index].real;
-            let copied = self.carve(real.shape, real.dtype).and_then(|address| {
+            let real = self.pairs[index].real.clone();
+            let copied = self.carve(&real).and_then(|address| {
                 let bytes = real.byte_len()?;
-                platform::copy_bytes(stream, address, real.ptr, bytes)?;
+                copy_bytes(stream, address, real.ptr, bytes)?;
                 Ok(address)
             });
             match copied {
                 Ok(address) => {
-                    self.pairs[index].real =
-                        Operand::with_strides(address, real.dtype, real.shape, real.strides);
+                    self.pairs[index].real = real.at(address);
                 }
                 Err(error) => self.fail(error),
             }
@@ -209,15 +208,15 @@ impl Twins {
         self.tolerance
     }
 
-    /// A buffer of `shape` elements of `dtype`, from the region.
-    fn carve(&mut self, shape: Shape, dtype: DType) -> Result<DevicePtr> {
-        let bytes = abi::bytes(dtype).ok_or_else(|| {
+    /// A buffer of as many elements as `real` names, of its element type, from the region.
+    fn carve(&mut self, real: &Operand) -> Result<DevicePtr> {
+        let bytes = abi::bytes(real.dtype).ok_or_else(|| {
             Error::Shape(format!(
                 "{} elements have no whole-byte size; a twin cannot address them",
-                abi::name(dtype)
+                abi::name(real.dtype)
             ))
         })?;
-        let bytes = shape.numel() * bytes;
+        let bytes = real.numel() * bytes;
         let start = self.cursor.div_ceil(ALIGNMENT) * ALIGNMENT;
         let end = start.checked_add(bytes).ok_or_else(|| Error::Twins {
             operator: "twins",
@@ -232,7 +231,7 @@ impl Twins {
             });
         }
         self.cursor = end;
-        Ok(platform::offset(self.base(), start))
+        Ok(DevicePtr::from_address(self.base().address() + start))
     }
 
     fn fail(&mut self, error: Error) {
@@ -240,6 +239,21 @@ impl Twins {
             self.failure = Some(error);
         }
     }
+}
+
+/// Copies `bytes` device bytes from `source` to `destination` on `stream`.
+fn copy_bytes(
+    stream: &Stream,
+    destination: DevicePtr,
+    source: DevicePtr,
+    bytes: u64,
+) -> Result<()> {
+    let bytes = usize::try_from(bytes)
+        .map_err(|_| Error::Shape(format!("a {bytes}-byte copy is larger than usize::MAX")))?;
+    // SAFETY: both ranges address device memory the caller keeps alive until the copy completes
+    // and until the stream work after it finishes.
+    unsafe { platform::memcpy_async(destination.address(), source.address(), bytes, stream) }?;
+    Ok(())
 }
 
 impl std::fmt::Debug for Twins {

@@ -439,7 +439,7 @@ impl Linear {
                 weight.layout
             )));
         }
-        let expected = extents(weight.layout.shape(n, k).dims());
+        let expected = extents(&weight.layout.shape(n, k));
         if weight.scales.dims() != expected.dims() {
             return Err(refuse(format!(
                 "the block scales are {:?}; {n} rows of {k} elements take {:?}",

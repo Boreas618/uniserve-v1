@@ -220,11 +220,11 @@ pub(crate) fn weight(
     }
     stream.synchronize()?;
 
-    let tensor = backend::retained(
+    let tensor = ops::retained(
         allocation.address(),
         dims,
         DType::F32,
-        &backend::cuda(DEVICE.0 as usize),
+        &ops::cuda(DEVICE.0 as usize),
     )?;
     Ok((allocation, tensor))
 }

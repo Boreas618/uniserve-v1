@@ -25,13 +25,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, row_writable};
+use crate::operand::{Operand, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -69,7 +69,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one stitch.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[tiles · token_rows, channels · patch_frames · patch_side²]`: each tile's tokens in turn.
     pub tokens: Operand,
@@ -100,8 +100,12 @@ impl Op for TileStitch {
 
     fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         args.out.require_rank(Self::NAME, 4)?;
-        let dims = args.out.shape.dims();
-        let (channels, frames, height, width) = (dims[0], dims[1], dims[2], dims[3]);
+        let (channels, frames, height, width) = (
+            args.out.dim(0),
+            args.out.dim(1),
+            args.out.dim(2),
+            args.out.dim(3),
+        );
         if channels != u64::from(descriptor.channels) {
             return Err(Error::argument(
                 Self::NAME,
@@ -119,10 +123,10 @@ impl Op for TileStitch {
         args.tokens
             .require_row(Self::NAME, descriptor.dtype, patch)?;
         args.rows
-            .require_shape(Self::NAME, Shape::new(&[height, TABLE_WIDTH]))?;
+            .require_shape(Self::NAME, &[height, TABLE_WIDTH])?;
         args.columns
-            .require_shape(Self::NAME, Shape::new(&[width, TABLE_WIDTH]))?;
-        for (name, table) in [("row", args.rows), ("column", args.columns)] {
+            .require_shape(Self::NAME, &[width, TABLE_WIDTH])?;
+        for (name, table) in [("row", &args.rows), ("column", &args.columns)] {
             if table.dtype != DType::I32 {
                 return Err(Error::argument(
                     Self::NAME,
@@ -150,18 +154,22 @@ impl Op for TileStitch {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let dims = args.out.shape.dims();
-        let (channels, frames, height, width) = (dims[0], dims[1], dims[2], dims[3]);
+        let (channels, frames, height, width) = (
+            args.out.dim(0),
+            args.out.dim(1),
+            args.out.dim(2),
+            args.out.dim(3),
+        );
         // The outer strides of the layout `check` accepted.
-        let strides = crate::tensor::outer_strides(&args.out);
+        let strides = crate::operand::outer_strides(&args.out);
 
         // `check` keeps the frame count and the width within kernel parameters.
         let mut arguments = Arguments::new();
         arguments
-            .view(args.tokens)
-            .view(args.rows)
-            .view(args.columns)
-            .view(args.out)
+            .view(&args.tokens)
+            .view(&args.rows)
+            .view(&args.columns)
+            .view(&args.out)
             .u32(frames as u32)
             .u32(width as u32)
             .u64(strides[0])

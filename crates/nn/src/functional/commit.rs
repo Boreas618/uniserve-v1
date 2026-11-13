@@ -249,7 +249,7 @@ pub fn slot_commit_(
     // rows: both follow the table the rows were taken from, so every step of a runner states
     // one key.
     let stride = table.stride()[0] as u64;
-    backend::launch::<SlotCommit>(
+    ops::launch::<SlotCommit>(
         &CommitDescriptor {
             index: DType::I32,
             verified: DType::I32,
@@ -262,18 +262,18 @@ pub fn slot_commit_(
             })?),
         },
         CommitArgs {
-            columns: backend::operand(table)?,
+            columns: ops::operand(table)?,
             tokens: signed(tokens)?,
-            valid: backend::operand(valid)?,
-            active: backend::operand(active)?,
-            continuation: backend::operand(continuation)?,
-            points: backend::operand(points)?,
+            valid: ops::operand(valid)?,
+            active: ops::operand(active)?,
+            continuation: ops::operand(continuation)?,
+            points: ops::operand(points)?,
             future: signed(future)?,
-            predicates: backend::operand(predicates)?,
-            logical: backend::operand(logical)?,
-            sampling: backend::operand(sampling)?,
-            verified: backend::operand(verified)?,
-            penalties: backend::operand(counts)?,
+            predicates: ops::operand(predicates)?,
+            logical: ops::operand(logical)?,
+            sampling: ops::operand(sampling)?,
+            verified: ops::operand(verified)?,
+            penalties: ops::operand(counts)?,
             count: rows as u64,
         },
     )?;
@@ -506,9 +506,9 @@ mod tests {
     #[test]
     fn the_commit_states_its_kernel_by_the_table_its_rows_lead() {
         let meta = |shape: tensor::Shape, dtype: DType| {
-            backend::retained(1 << 40, shape, dtype, &backend::meta()).unwrap()
+            ops::retained(1 << 40, shape, dtype, &ops::meta()).unwrap()
         };
-        let context = backend::Context::meta(None);
+        let context = ops::Context::meta(None);
         context.record_launches();
 
         {

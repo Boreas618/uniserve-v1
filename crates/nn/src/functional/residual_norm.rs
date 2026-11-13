@@ -134,9 +134,9 @@ pub fn scaled_residual_rms_norm_(
     }
 
     let (rows, update_rows) = (as_rows(OWNER, &hidden)?, as_rows(OWNER, update)?);
-    let out = backend::empty(rows.shape(), update.dtype())?;
+    let out = ops::empty(rows.shape(), update.dtype())?;
 
-    backend::launch::<ScaledResidualRmsNorm>(
+    ops::launch::<ScaledResidualRmsNorm>(
         &ScaledResidualRmsNormDescriptor {
             dtype: hidden.dtype(),
             columns: width,
@@ -146,12 +146,12 @@ pub fn scaled_residual_rms_norm_(
             activation: update.dtype(),
         },
         ScaledResidualRmsNormArgs {
-            hidden: backend::operand(&rows)?,
-            update: backend::operand(&update_rows)?,
-            update_bias: update_bias.map(backend::operand).transpose()?,
-            scale: backend::operand(scale)?,
-            weight: backend::operand(weight)?,
-            out: backend::operand(&out)?,
+            hidden: ops::operand(&rows)?,
+            update: ops::operand(&update_rows)?,
+            update_bias: update_bias.map(ops::operand).transpose()?,
+            scale: ops::operand(scale)?,
+            weight: ops::operand(weight)?,
+            out: ops::operand(&out)?,
             eps,
             partials: None,
         },
@@ -200,9 +200,9 @@ pub fn scaled_residual_layer_norm(
     }
 
     let (rows, update_rows) = (as_rows(OWNER, hidden)?, as_rows(OWNER, update)?);
-    let out = backend::empty(rows.shape(), update.dtype())?;
+    let out = ops::empty(rows.shape(), update.dtype())?;
 
-    backend::launch::<ScaledResidualLayerNorm>(
+    ops::launch::<ScaledResidualLayerNorm>(
         &ScaledResidualLayerNormDescriptor {
             dtype: hidden.dtype(),
             columns: width,
@@ -212,13 +212,13 @@ pub fn scaled_residual_layer_norm(
             activation: update.dtype(),
         },
         ScaledResidualLayerNormArgs {
-            hidden: backend::operand(&rows)?,
-            update: backend::operand(&update_rows)?,
-            update_bias: update_bias.map(backend::operand).transpose()?,
-            scale: backend::operand(scale)?,
-            weight: backend::operand(weight)?,
-            bias: backend::operand(bias)?,
-            out: backend::operand(&out)?,
+            hidden: ops::operand(&rows)?,
+            update: ops::operand(&update_rows)?,
+            update_bias: update_bias.map(ops::operand).transpose()?,
+            scale: ops::operand(scale)?,
+            weight: ops::operand(weight)?,
+            bias: ops::operand(bias)?,
+            out: ops::operand(&out)?,
             eps,
             partials: None,
         },
@@ -307,7 +307,7 @@ fn modulate(
 /// The leading stride of `table`, a `[parameters, width]` view, in elements: where the kernel
 /// finds the next parameter row.
 fn row_stride(table: &ops::Operand) -> u64 {
-    table.strides.get(0)
+    table.stride(0)
 }
 
 /// The per-row modulation of an RMS normalization:
@@ -345,10 +345,10 @@ pub fn modulated_rms_norm(
     }
 
     let value = x.contiguous()?;
-    let out = backend::empty(x.shape(), output)?;
-    let (shift, scale) = (backend::operand(shift)?, backend::operand(scale)?);
+    let out = ops::empty(x.shape(), output)?;
+    let (shift, scale) = (ops::operand(shift)?, ops::operand(scale)?);
 
-    backend::launch::<ModulatedRmsNorm>(
+    ops::launch::<ModulatedRmsNorm>(
         &ModulatedRmsNormDescriptor {
             dtype: x.dtype(),
             output,
@@ -363,14 +363,14 @@ pub fn modulated_rms_norm(
             retain: false,
         },
         modulation::Args {
-            value: backend::operand(&value)?,
+            value: ops::operand(&value)?,
             update: None,
             gate: None,
-            weight: backend::operand(weight)?,
+            weight: ops::operand(weight)?,
             shift,
             scale,
-            row_indices: backend::operand(rows)?,
-            out: backend::operand(&out)?,
+            row_indices: ops::operand(rows)?,
+            out: ops::operand(&out)?,
             output_scale: None,
             retain: None,
         },
@@ -444,15 +444,15 @@ pub fn modulated_rms_norm_(
     }
 
     let value = hidden.contiguous()?;
-    let out = backend::empty(update.shape(), output)?;
-    let sum = backend::empty(update.shape(), output)?;
+    let out = ops::empty(update.shape(), output)?;
+    let sum = ops::empty(update.shape(), output)?;
     let (shift, scale, gate) = (
-        backend::operand(shift)?,
-        backend::operand(scale)?,
-        backend::operand(gate)?,
+        ops::operand(shift)?,
+        ops::operand(scale)?,
+        ops::operand(gate)?,
     );
 
-    backend::launch::<ModulatedRmsNorm>(
+    ops::launch::<ModulatedRmsNorm>(
         &ModulatedRmsNormDescriptor {
             dtype: activation,
             output,
@@ -467,16 +467,16 @@ pub fn modulated_rms_norm_(
             retain: true,
         },
         modulation::Args {
-            value: backend::operand(&value)?,
-            update: Some(backend::operand(&update)?),
+            value: ops::operand(&value)?,
+            update: Some(ops::operand(&update)?),
             gate: Some(gate),
-            weight: backend::operand(weight)?,
+            weight: ops::operand(weight)?,
             shift,
             scale,
-            row_indices: backend::operand(rows)?,
-            out: backend::operand(&out)?,
+            row_indices: ops::operand(rows)?,
+            out: ops::operand(&out)?,
             output_scale: None,
-            retain: Some(backend::operand(&sum)?),
+            retain: Some(ops::operand(&sum)?),
         },
     )?;
     Ok((out, sum))

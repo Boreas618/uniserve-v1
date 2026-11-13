@@ -331,7 +331,7 @@ impl ModelRunner {
 pub(crate) fn unreserved(client: &StorageClient, device: DeviceId) -> Result<u64> {
     // What the process holds beside its pools and the server's storages. The weight store waits
     // for each copy of the load before it returns, so the figure counts the load's work. A
-    // communicator states no bytes NVML attributes to no process (`backend::Group`), so NVML's
+    // communicator states no bytes NVML attributes to no process (`ops::Group`), so NVML's
     // figure is taken whole.
     let nvml = platform::Nvml::init().context("opening NVML")?;
     let process = division::process_bytes(&nvml, device, 0, 0)?;

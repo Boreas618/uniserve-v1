@@ -24,13 +24,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::Operand;
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -73,7 +73,7 @@ impl fmt::Display for Descriptor {
 /// channel stride of the position count; a channels-last caller passes the same two words the other way
 /// round. Either way the moments' two halves are one buffer cut by an offset, with no transpose and no
 /// second buffer, which is what the strides are in the signature for.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[positions, channels]` f32: the mean half of the moments.
     pub mean: Operand,
@@ -95,17 +95,17 @@ impl Op for Posterior {
     type Args<'a> = Args;
 
     fn check(_descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
-        if args.mean.shape.rank() != 2 {
+        if args.mean.rank() != 2 {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "expected [positions, channels] moments, found the extents {:?}",
-                    args.mean.shape.dims()
+                    args.mean.dims()
                 ),
             ));
         }
-        let positions = args.mean.shape.dim(0);
-        let channels = args.mean.shape.dim(1);
+        let positions = args.mean.dim(0);
+        let channels = args.mean.dim(1);
         if channels == 0 || positions == 0 {
             return Err(Error::argument(
                 Self::NAME,
@@ -118,12 +118,12 @@ impl Op for Posterior {
         // advances by the position count between channels, and refusing that is what forced three
         // transposes before these words existed.
         for (name, view) in [
-            ("mean", args.mean),
-            ("log_variance", args.log_variance),
-            ("noise", args.noise),
-            ("out", args.out),
+            ("mean", &args.mean),
+            ("log_variance", &args.log_variance),
+            ("noise", &args.noise),
+            ("out", &args.out),
         ] {
-            view.require_shape(Self::NAME, args.mean.shape)?;
+            view.require_dims(Self::NAME, args.mean.dims())?;
             if view.dtype != DType::F32 {
                 return Err(Error::argument(
                     Self::NAME,
@@ -134,12 +134,12 @@ impl Op for Posterior {
                     ),
                 ));
             }
-            if view.shape.dim(1) != channels {
+            if view.dim(1) != channels {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
                         "expected {channels} channels in the {name}, found {}",
-                        view.shape.dim(1)
+                        view.dim(1)
                     ),
                 ));
             }
@@ -150,13 +150,13 @@ impl Op for Posterior {
         // stride of at least `positions · row stride`). Both physical layouts are legal; a stride pair
         // that overlaps is not, because which write won would depend on the block's order.
         for (name, view) in [
-            ("mean", args.mean),
-            ("log_variance", args.log_variance),
-            ("noise", args.noise),
-            ("out", args.out),
+            ("mean", &args.mean),
+            ("log_variance", &args.log_variance),
+            ("noise", &args.noise),
+            ("out", &args.out),
         ] {
-            let row = view.strides.get(0);
-            let channel = view.strides.get(1);
+            let row = view.stride(0);
+            let channel = view.stride(1);
             let packed_channels = row >= channels * channel;
             let packed_positions = channel >= positions * row;
             if !packed_channels && !packed_positions {
@@ -176,75 +176,75 @@ impl Op for Posterior {
                 format!("{channels} channels do not fit a kernel parameter"),
             )
         })?;
-        u32::try_from(args.mean.strides.get(0)).map_err(|_| {
+        u32::try_from(args.mean.stride(0)).map_err(|_| {
             Error::argument(
                 Self::NAME,
                 format!(
                     "the mean's row stride {} does not fit a kernel parameter",
-                    args.mean.strides.get(0)
+                    args.mean.stride(0)
                 ),
             )
         })?;
-        u32::try_from(args.mean.strides.get(1)).map_err(|_| {
+        u32::try_from(args.mean.stride(1)).map_err(|_| {
             Error::argument(
                 Self::NAME,
                 format!(
                     "the mean's channel stride {} does not fit a kernel parameter",
-                    args.mean.strides.get(1)
+                    args.mean.stride(1)
                 ),
             )
         })?;
-        u32::try_from(args.log_variance.strides.get(0)).map_err(|_| {
+        u32::try_from(args.log_variance.stride(0)).map_err(|_| {
             Error::argument(
                 Self::NAME,
                 format!(
                     "the log-variance's row stride {} does not fit a kernel parameter",
-                    args.log_variance.strides.get(0)
+                    args.log_variance.stride(0)
                 ),
             )
         })?;
-        u32::try_from(args.log_variance.strides.get(1)).map_err(|_| {
+        u32::try_from(args.log_variance.stride(1)).map_err(|_| {
             Error::argument(
                 Self::NAME,
                 format!(
                     "the log-variance's channel stride {} does not fit a kernel parameter",
-                    args.log_variance.strides.get(1)
+                    args.log_variance.stride(1)
                 ),
             )
         })?;
-        u32::try_from(args.noise.strides.get(0)).map_err(|_| {
+        u32::try_from(args.noise.stride(0)).map_err(|_| {
             Error::argument(
                 Self::NAME,
                 format!(
                     "the noise's row stride {} does not fit a kernel parameter",
-                    args.noise.strides.get(0)
+                    args.noise.stride(0)
                 ),
             )
         })?;
-        u32::try_from(args.noise.strides.get(1)).map_err(|_| {
+        u32::try_from(args.noise.stride(1)).map_err(|_| {
             Error::argument(
                 Self::NAME,
                 format!(
                     "the noise's channel stride {} does not fit a kernel parameter",
-                    args.noise.strides.get(1)
+                    args.noise.stride(1)
                 ),
             )
         })?;
-        u32::try_from(args.out.strides.get(0)).map_err(|_| {
+        u32::try_from(args.out.stride(0)).map_err(|_| {
             Error::argument(
                 Self::NAME,
                 format!(
                     "the sample's row stride {} does not fit a kernel parameter",
-                    args.out.strides.get(0)
+                    args.out.stride(0)
                 ),
             )
         })?;
-        u32::try_from(args.out.strides.get(1)).map_err(|_| {
+        u32::try_from(args.out.stride(1)).map_err(|_| {
             Error::argument(
                 Self::NAME,
                 format!(
                     "the sample's channel stride {} does not fit a kernel parameter",
-                    args.out.strides.get(1)
+                    args.out.stride(1)
                 ),
             )
         })?;
@@ -257,25 +257,25 @@ impl Op for Posterior {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let positions = args.mean.shape.dim(0);
-        let channels = args.mean.shape.dim(1);
+        let positions = args.mean.dim(0);
+        let channels = args.mean.dim(1);
 
         // Every narrowing below is of a value `check` holds within its kernel parameter.
         let mut arguments = Arguments::new();
         arguments
-            .view(args.mean)
-            .view(args.log_variance)
-            .view(args.noise)
-            .view(args.out)
+            .view(&args.mean)
+            .view(&args.log_variance)
+            .view(&args.noise)
+            .view(&args.out)
             .u32(channels as u32)
-            .u32(args.mean.strides.get(0) as u32)
-            .u32(args.mean.strides.get(1) as u32)
-            .u32(args.log_variance.strides.get(0) as u32)
-            .u32(args.log_variance.strides.get(1) as u32)
-            .u32(args.noise.strides.get(0) as u32)
-            .u32(args.noise.strides.get(1) as u32)
-            .u32(args.out.strides.get(0) as u32)
-            .u32(args.out.strides.get(1) as u32)
+            .u32(args.mean.stride(0) as u32)
+            .u32(args.mean.stride(1) as u32)
+            .u32(args.log_variance.stride(0) as u32)
+            .u32(args.log_variance.stride(1) as u32)
+            .u32(args.noise.stride(0) as u32)
+            .u32(args.noise.stride(1) as u32)
+            .u32(args.out.stride(0) as u32)
+            .u32(args.out.stride(1) as u32)
             .u64(positions * channels)
             .flag(descriptor.pdl);
         kernel.launch(

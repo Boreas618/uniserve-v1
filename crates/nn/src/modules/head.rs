@@ -99,7 +99,7 @@ impl LmHead {
 
         let gathered = if ranks > 1 {
             let (rows, width) = (projected.dims()[0], projected.dims()[1]);
-            let gathered = backend::empty((rows, width * ranks as usize), projected.dtype())?;
+            let gathered = ops::empty((rows, width * ranks as usize), projected.dtype())?;
 
             collective::all_gather(&projected, &gathered)?;
             gathered

@@ -68,7 +68,7 @@ const CANDIDATES: u32 = 3;
 
 /// A meta tensor: a shape and an element type at an address nothing reads.
 fn meta(shape: impl Into<tensor::Shape>, dtype: DType) -> Tensor {
-    backend::retained(0x1_0000, shape, dtype, &backend::meta()).unwrap()
+    ops::retained(0x1_0000, shape, dtype, &ops::meta()).unwrap()
 }
 
 /// A causal language model of one attention layer over the paged cache, with one host value.
@@ -1656,7 +1656,7 @@ fn a_paired_forward_is_prepared_over_a_scratch_set_the_cache_lends() {
 
     // The forward over the scratch set makes the launches of the serving forward.
     let serving = operators(&runner, &bucket);
-    let context = backend::Context::meta(None);
+    let context = ops::Context::meta(None);
     context.record_launches();
     {
         let _guard = context.enter();
@@ -2084,7 +2084,7 @@ fn a_member_with_no_batch_is_driven_into_the_step_by_a_join_batch() {
 
     // The join computes the expert layers alone: no output, and no input tensor is read.
     let join = Bucket::expert_join().at_capacity(UNION_ROWS);
-    let context = backend::Context::meta(None);
+    let context = ops::Context::meta(None);
     {
         let _guard = context.enter();
         assert!(first.forward(&join).unwrap().is_empty());
@@ -2594,7 +2594,7 @@ fn a_paired_forward_computes_over_the_scratch_pages_the_cache_opened() {
 
     // The forward over the scratch planes makes the serving forward's launches.
     let serving = operators(&runner, &bucket);
-    let context = backend::Context::meta(None);
+    let context = ops::Context::meta(None);
     context.record_launches();
     {
         let _guard = context.enter();

@@ -71,7 +71,7 @@ def expected_of(function, x, axes):
 
 
 #: The block of the cases that fold several hundred outputs in one program: the backend's
-#: (`BLOCK` of `crates/backend/src/primitives.rs`).
+#: (`BLOCK` of `crates/ops/src/primitives.rs`).
 WIDE_BLOCK = 1024
 
 

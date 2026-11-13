@@ -26,13 +26,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::{Float, Key};
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -49,18 +49,18 @@ fn check_table(
     tokens: u64,
 ) -> Result<u64> {
     table.require_rank(operator, 2)?;
-    let max_pages = table.shape.dim(1);
+    let max_pages = table.dim(1);
     table
         .require_row(operator, DType::U32, max_pages)
         .map_err(|error| Error::argument(operator, format!("page table: {error}")))?;
-    if table.strides != Strides::row_major(table.shape) || max_pages == 0 {
+    if !table.is_row_major() || max_pages == 0 {
         return Err(Error::argument(
             operator,
             "the page table is not contiguous rows of pages".to_owned(),
         ));
     }
 
-    rows.require_shape(operator, Shape::new(&[tokens]))
+    rows.require_shape(operator, &[tokens])
         .and_then(|()| rows.require_row(operator, DType::U32, tokens))
         .map_err(|error| Error::argument(operator, format!("rows: {error}")))?;
     Ok(max_pages)
@@ -97,7 +97,7 @@ impl fmt::Display for IndexScoresDescriptor {
 }
 
 /// The arguments of `index_scores`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct IndexScoresArgs {
     /// `[tokens, heads, width]`, contiguous: the index queries.
     pub query: Operand,
@@ -140,25 +140,25 @@ impl Op for IndexScores {
         let (heads, width, groups) = (u64::from(d.heads), u64::from(d.width), u64::from(d.groups));
 
         args.query.require_rank(Self::NAME, 3)?;
-        let tokens = args.query.shape.dim(0);
+        let tokens = args.query.dim(0);
         args.query
-            .require_shape(Self::NAME, Shape::new(&[tokens, heads, width]))?;
+            .require_shape(Self::NAME, &[tokens, heads, width])?;
         args.query.require_row(Self::NAME, d.dtype, width)?;
 
         args.keys.require_rank(Self::NAME, 3)?;
-        let pages = args.keys.shape.dim(0);
+        let pages = args.keys.dim(0);
         args.keys
-            .require_shape(Self::NAME, Shape::new(&[pages, groups, width]))?;
+            .require_shape(Self::NAME, &[pages, groups, width])?;
         args.keys.require_row(Self::NAME, d.keys, width)?;
 
         let max_pages = check_table(Self::NAME, &args.page_table, &args.rows, tokens)?;
         args.visible
-            .require_shape(Self::NAME, Shape::new(&[tokens]))
+            .require_shape(Self::NAME, &[tokens])
             .and_then(|()| args.visible.require_row(Self::NAME, DType::U32, tokens))
             .map_err(|error| Error::argument(Self::NAME, format!("visible: {error}")))?;
 
         args.out
-            .require_shape(Self::NAME, Shape::new(&[tokens, max_pages * groups]))?;
+            .require_shape(Self::NAME, &[tokens, max_pages * groups])?;
         args.out
             .require_row(Self::NAME, DType::F32, max_pages * groups)?;
         for (name, view) in [
@@ -166,7 +166,7 @@ impl Op for IndexScores {
             ("keys", &args.keys),
             ("out", &args.out),
         ] {
-            if view.strides != Strides::row_major(view.shape) {
+            if !view.is_row_major() {
                 return Err(Error::argument(
                     Self::NAME,
                     format!("the {name} is not contiguous"),
@@ -182,18 +182,18 @@ impl Op for IndexScores {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let tokens = args.query.shape.dim(0);
-        let max_pages = args.page_table.shape.dim(1);
+        let tokens = args.query.dim(0);
+        let max_pages = args.page_table.dim(1);
         let columns = max_pages * u64::from(descriptor.groups);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.query)
-            .view(args.keys)
-            .view(args.page_table)
-            .view(args.rows)
-            .view(args.visible)
-            .view(args.out)
+            .view(&args.query)
+            .view(&args.keys)
+            .view(&args.page_table)
+            .view(&args.rows)
+            .view(&args.visible)
+            .view(&args.out)
             .u64(tokens)
             .u64(max_pages);
         kernel.launch(
@@ -259,7 +259,7 @@ impl fmt::Display for IndexedAttentionDescriptor {
 }
 
 /// The arguments of `indexed_attention`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct IndexedAttentionArgs {
     /// `[tokens, heads, head_dim]`, contiguous: the queries.
     pub query: Operand,
@@ -311,17 +311,17 @@ impl Op for IndexedAttention {
         let (head_dim, page) = (u64::from(d.head_dim), u64::from(d.page));
 
         args.query.require_rank(Self::NAME, 3)?;
-        let tokens = args.query.shape.dim(0);
+        let tokens = args.query.dim(0);
         for (name, view) in [("query", &args.query), ("out", &args.out)] {
-            view.require_shape(Self::NAME, Shape::new(&[tokens, heads, head_dim]))
+            view.require_shape(Self::NAME, &[tokens, heads, head_dim])
                 .and_then(|()| view.require_row(Self::NAME, d.dtype, head_dim))
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
         }
 
         args.key.require_rank(Self::NAME, 4)?;
-        let pages = args.key.shape.dim(0);
+        let pages = args.key.dim(0);
         for (name, view) in [("key", &args.key), ("value", &args.value)] {
-            view.require_shape(Self::NAME, Shape::new(&[pages, page, kv_heads, head_dim]))
+            view.require_shape(Self::NAME, &[pages, page, kv_heads, head_dim])
                 .and_then(|()| view.require_row(Self::NAME, d.cache, head_dim))
                 .map_err(|error| Error::argument(Self::NAME, format!("{name}: {error}")))?;
         }
@@ -329,7 +329,7 @@ impl Op for IndexedAttention {
         check_table(Self::NAME, &args.page_table, &args.rows, tokens)?;
         let columns = u64::from(d.columns);
         args.selection
-            .require_shape(Self::NAME, Shape::new(&[tokens, columns]))
+            .require_shape(Self::NAME, &[tokens, columns])
             .and_then(|()| args.selection.require_row(Self::NAME, DType::I32, columns))
             .map_err(|error| Error::argument(Self::NAME, format!("selection: {error}")))?;
 
@@ -340,7 +340,7 @@ impl Op for IndexedAttention {
             ("selection", &args.selection),
             ("out", &args.out),
         ] {
-            if view.strides != Strides::row_major(view.shape) {
+            if !view.is_row_major() {
                 return Err(Error::argument(
                     Self::NAME,
                     format!("the {name} is not contiguous"),
@@ -356,19 +356,19 @@ impl Op for IndexedAttention {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let tokens = args.query.shape.dim(0);
+        let tokens = args.query.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.query)
-            .view(args.key)
-            .view(args.value)
-            .view(args.page_table)
-            .view(args.rows)
-            .view(args.selection)
-            .view(args.out)
+            .view(&args.query)
+            .view(&args.key)
+            .view(&args.value)
+            .view(&args.page_table)
+            .view(&args.rows)
+            .view(&args.selection)
+            .view(&args.out)
             .u64(tokens)
-            .u64(args.page_table.shape.dim(1));
+            .u64(args.page_table.dim(1));
         kernel.launch(
             LaunchGrid::new([u64::from(descriptor.heads), tokens, 1])?,
             &mut arguments,

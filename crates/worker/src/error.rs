@@ -23,11 +23,12 @@ pub enum Error {
     /// A CUDA driver or NCCL call failed.
     #[error(transparent)]
     Cuda(#[from] platform::Error),
-    /// An operator's launch or a kernel's load failed.
+    /// An operator's launch, a kernel's load, or a refusal of the device backend outside a tensor
+    /// operation (a context, an allocation, a copy) failed.
     #[error(transparent)]
     Ops(#[from] ops::Error),
     /// A model's computation failed: a module, a tensor operation or a launch of the device
-    /// backend, which the tensor library and the backend carry here as typed causes.
+    /// backend, which the tensor library and `nn` carry here as typed causes.
     #[error(transparent)]
     Nn(#[from] nn::Error),
     /// The media encoders or the muxer refused: a raster or a track the codecs cannot take, or an
@@ -141,13 +142,6 @@ impl From<tensor::Error> for Error {
     }
 }
 
-/// A refusal of the device backend outside a tensor operation: a context, an allocation, a copy.
-impl From<backend::Error> for Error {
-    fn from(error: backend::Error) -> Self {
-        Self::Nn(nn::Error::Backend(error))
-    }
-}
-
 /// A second outcome of a completion that already has one is the worker's state error.
 impl From<crate::completion::Settled> for Error {
     fn from(_: crate::completion::Settled) -> Self {
@@ -250,27 +244,19 @@ pub fn report(error: &dyn std::error::Error) -> String {
 fn driver_failure(error: &Error) -> Option<&platform::Error> {
     match error {
         Error::Cuda(failure) => Some(failure),
-        Error::Ops(failure) => ops_driver_failure(failure),
-        Error::Nn(nn::Error::Backend(backend::Error::Platform(failure))) => Some(failure),
-        Error::Nn(
-            nn::Error::Ops(failure)
-            | nn::Error::Backend(
-                backend::Error::Ops(failure)
-                | backend::Error::Launch {
-                    source: failure, ..
-                },
-            ),
-        ) => ops_driver_failure(failure),
+        Error::Ops(failure) | Error::Nn(nn::Error::Ops(failure)) => ops_driver_failure(failure),
         Error::Shared(shared) => shared.downcast_ref::<Error>().and_then(driver_failure),
         Error::InFlight { error, .. } | Error::Copies { error, .. } => driver_failure(error),
         _ => None,
     }
 }
 
-/// The CUDA failure an operator's failure is, when it is one.
+/// The CUDA failure an operator's failure is, when it is one: its own, or the one a refused
+/// launch carries.
 fn ops_driver_failure(error: &ops::Error) -> Option<&platform::Error> {
     match error {
         ops::Error::Platform(failure) => Some(failure),
+        ops::Error::Launch { source, .. } => ops_driver_failure(source),
         _ => None,
     }
 }
@@ -331,7 +317,11 @@ mod tests {
         };
         for error in [
             Error::Ops(ops::Error::Platform(platform())),
-            Error::Nn(nn::Error::Backend(backend::Error::Platform(platform()))),
+            Error::Ops(ops::Error::Launch {
+                operator: "rms_norm",
+                key: "dtype_bf16_columns_2048".to_owned(),
+                source: Box::new(ops::Error::Platform(platform())),
+            }),
             Error::Nn(nn::Error::Ops(ops::Error::Platform(platform()))),
         ] {
             let failure = Failure::classify(error, Some("decode"));

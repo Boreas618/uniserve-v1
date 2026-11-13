@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 use models::minimax_h3::config::{TransformerConfig, VsaConfig};
 use models::minimax_h3::packing;
-use nn::{ConditionRole, ConditionShape, DType, Layout, Tensor, VideoRequest};
+use nn::{ConditionRole, ConditionShape, DType, Tensor, VideoRequest};
+use proto::video::Layout;
 use serde_json::Value;
 
 /// The directory of the committed fixtures.

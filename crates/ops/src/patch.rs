@@ -28,13 +28,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -96,7 +96,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one mapping.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// The latent `[channels, frames, height, width]`.
     pub x: Operand,
@@ -151,12 +151,12 @@ impl Op for Patch {
         }
         let rows = frames * args.rows_per_frame();
         let row_width = args.row_width();
-        let latent = Shape::new(&[channels, frames, height, width]);
-        let packed = Shape::new(&[rows, row_width]);
+        let latent = &[channels, frames, height, width];
+        let packed = &[rows, row_width];
 
         args.x.require_shape(Self::NAME, latent)?;
         args.out.require_shape(Self::NAME, packed)?;
-        for (name, view) in [("latent", args.x), ("rows", args.out)] {
+        for (name, view) in [("latent", &args.x), ("rows", &args.out)] {
             if view.dtype != descriptor.dtype {
                 return Err(Error::argument(
                     Self::NAME,
@@ -189,8 +189,8 @@ impl Op for Patch {
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.x)
-            .view(args.out)
+            .view(&args.x)
+            .view(&args.out)
             .u32(args.frames)
             // `check` keeps the row count within a kernel parameter.
             .u32(rows as u32)
@@ -226,7 +226,7 @@ impl Op for Patch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{DevicePtr, Strides};
+    use platform::DevicePtr;
 
     fn descriptor() -> Descriptor {
         Descriptor {
@@ -250,14 +250,8 @@ mod tests {
 
     #[test]
     fn a_row_is_the_channels_patch_and_a_frame_is_one_raster_of_them() {
-        let view = |shape: &[u64]| {
-            Operand::with_strides(
-                DevicePtr::new(0x1000),
-                DType::BF16,
-                Shape::new(shape),
-                Strides::row_major(Shape::new(shape)),
-            )
-        };
+        let view =
+            |shape: &[u64]| Operand::new(DevicePtr::from_address(0x1000), DType::BF16, shape);
         let args = Args {
             x: view(&[24, 3, 32, 48]),
             out: view(&[72, 96]),

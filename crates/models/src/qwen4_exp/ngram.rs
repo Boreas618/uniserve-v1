@@ -49,20 +49,6 @@ use nn::{
 use crate::qwen4_exp::config::Config;
 use crate::qwen4_exp::{Error, Result};
 
-/// The value of an E4M3 byte (`F8_E4M3`: a sign, four exponent bits biased by seven, three
-/// mantissa bits, no infinities, `S.1111.111` not a number).
-fn e4m3(byte: u8) -> f32 {
-    let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
-    let (exponent, mantissa) = (i32::from((byte >> 3) & 0x0f), f32::from(byte & 0x07));
-
-    match (exponent, byte & 0x07) {
-        (15, 7) => f32::NAN,
-        // A subnormal has no implicit one and the smallest exponent.
-        (0, _) => sign * (mantissa / 8.0) * 2f32.powi(-6),
-        _ => sign * (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7),
-    }
-}
-
 /// The checkpoint tensor `name` of `vb`'s module, in the element type `dtype` its shard
 /// stores it in: an integer table or an E4M3 table is read as its own elements, whatever the
 /// loader's policy converts floating weights to.
@@ -157,7 +143,12 @@ impl NgramEmbedding {
         )?;
 
         let weight_scale = table.get(1, "weight_scale")?;
-        let values: Vec<f32> = (0..=u8::MAX).map(e4m3).collect();
+        // Every E4M3 byte's value, `S.1111.111` not a number: the bytes read as the tensor
+        // library's E4M3 elements and cast.
+        let values = Tensor::from_vec((0..=u8::MAX).collect::<Vec<u8>>(), 256, &Device::Cpu)?
+            .view(DType::F8E4M3)?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
         let eos = Tensor::new(&[i64::from(config.text.eos_token_id)], &Device::Cpu)?;
 
         Ok(Self {
@@ -465,23 +456,5 @@ impl std::fmt::Debug for PleLayer {
             .field("hidden", &self.hidden)
             .field("dilation", &self.dilation)
             .finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::e4m3;
-
-    #[test]
-    fn an_e4m3_byte_is_its_sign_exponent_and_mantissa() {
-        assert_eq!(e4m3(0x00), 0.0);
-        // The smallest subnormal and the largest finite value.
-        assert_eq!(e4m3(0x01), 2f32.powi(-9));
-        assert_eq!(e4m3(0x7e), 448.0);
-        assert_eq!(e4m3(0xfe), -448.0);
-        // One: exponent seven, no mantissa.
-        assert_eq!(e4m3(0x38), 1.0);
-        assert_eq!(e4m3(0xb9), -1.125);
-        assert!(e4m3(0x7f).is_nan() && e4m3(0xff).is_nan());
     }
 }

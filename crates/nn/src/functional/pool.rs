@@ -67,9 +67,9 @@ pub fn adaptive_avg_pool2d(x: &Tensor, size: [u32; 2]) -> Result<Tensor> {
     // The operator reads `[rows, heads, width]` contiguous and writes `[rows, output]`: the
     // input rows are its heads and the columns its width.
     let values = x.contiguous()?;
-    let out = backend::empty((batch, outputs as usize), x.dtype())?;
+    let out = ops::empty((batch, outputs as usize), x.dtype())?;
 
-    backend::launch::<AdaptivePool>(
+    ops::launch::<AdaptivePool>(
         &Descriptor {
             dtype: x.dtype(),
             heads,
@@ -79,8 +79,8 @@ pub fn adaptive_avg_pool2d(x: &Tensor, size: [u32; 2]) -> Result<Tensor> {
             pdl: PDL,
         },
         Args {
-            x: backend::operand(&values)?,
-            out: backend::operand(&out)?,
+            x: ops::operand(&values)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out.unsqueeze(1)?)

@@ -42,7 +42,8 @@
 
 use std::ops::Range;
 
-use nn::{ConditionRole, ConditionShape, DType, Device, LatentShape, Layout, Tensor, VideoRequest};
+use nn::{ConditionRole, ConditionShape, DType, Device, LatentShape, Tensor, VideoRequest};
+use proto::video::Layout;
 
 use crate::minimax_h3::config::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, FPS, FRAMES, LATENT_COMPRESSION,

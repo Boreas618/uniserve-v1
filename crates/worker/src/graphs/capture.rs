@@ -5,7 +5,7 @@
 //! passes through the context's route ([`Recorder`]), which launches it and then reads from the
 //! driver the graph nodes that launch added, so the nodes of each launch are known in launch
 //! order: the node table a rebind sets new kernel parameters through. A graph break
-//! (`backend::graph_break`) ends the segment being captured and begins the next; the host work
+//! (`ops::graph_break`) ends the segment being captured and begins the next; the host work
 //! it states is kept with the segment before it.
 //!
 //! The capture in progress is this thread's ([`SESSION`]): a capture is begun, recorded and
@@ -15,7 +15,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use backend::breaks::HostWork;
+use ops::breaks::HostWork;
 use ops::{Generation, Kernel};
 use platform::{
     Capture, CaptureMode, Graph, GraphExec, GraphNode, GraphNodeKind, OwnedKernelNodeParams,
@@ -89,10 +89,10 @@ impl ops::Route for Recorder {
 
 /// The break taker of a capturing context: ends the segment being captured on this thread and
 /// begins the next, keeping the break's host work.
-pub(crate) fn take_break(work: HostWork) -> backend::Result<()> {
+pub(crate) fn take_break(work: HostWork) -> ops::Result<()> {
     SESSION.with(|session| match session.borrow_mut().as_mut() {
-        Some(session) => session.broken(work).map_err(backend::Error::Platform),
-        None => Err(backend::Error::Break(
+        Some(session) => session.broken(work).map_err(ops::Error::Platform),
+        None => Err(ops::Error::Break(
             "a graph break was stated on a thread that captures nothing".into(),
         )),
     })
@@ -210,7 +210,7 @@ impl Executable {
             segment.exec.launch(stream)?;
 
             if let Some(work) = &segment.then {
-                work().map_err(|source| Error::from(backend::Error::Break(source)))?;
+                work().map_err(|source| Error::from(ops::Error::Break(source)))?;
             }
         }
         Ok(())
@@ -429,7 +429,7 @@ pub(crate) fn kernels_of(
     let mut held: Vec<Arc<Kernel>> = Vec::new();
 
     for (operator, key, _) in table {
-        if *operator == backend::breaks::BREAK {
+        if *operator == ops::breaks::BREAK {
             continue;
         }
 

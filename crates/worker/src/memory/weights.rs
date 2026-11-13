@@ -41,7 +41,7 @@
 //!
 //! ## An update in place
 //!
-//! A weight tensor is `backend::retained` over the address the weight is mapped at, and the
+//! A weight tensor is `ops::retained` over the address the weight is mapped at, and the
 //! modules and the captured graphs of a rank hold that address. An in-place weight update
 //! (`/admin/update_weights`) keeps it: the checkpoint is loaded again beside the weights that
 //! serve ([`Reload`](crate::memory::reload::Reload)), each weight whose key changed is
@@ -133,7 +133,7 @@ fn byte_length(key: &WeightKey, shape: &Shape) -> Result<u64> {
 pub(crate) fn refusal(key: &WeightKey, error: Error) -> nn::Error {
     match error {
         Error::Nn(error) => error,
-        Error::Cuda(error) => nn::Error::Backend(backend::Error::Platform(error)),
+        Error::Cuda(error) => nn::Error::Ops(ops::Error::Platform(error)),
         other => nn::Error::Weight {
             tensor: key.to_string(),
             problem: report(&other),
@@ -565,11 +565,11 @@ impl WeightStore {
             )));
         }
 
-        Ok(backend::retained(
+        Ok(ops::retained(
             mapping.address(),
             shape.clone(),
             key.dtype,
-            &backend::cuda(self.device.0 as usize),
+            &ops::cuda(self.device.0 as usize),
         )?)
     }
 
@@ -876,11 +876,11 @@ impl WeightStore {
         }
         self.stream.synchronize()?;
 
-        let tensor = backend::retained(
+        let tensor = ops::retained(
             storage.address(),
             shape.clone(),
             key.dtype,
-            &backend::cuda(self.device.0 as usize),
+            &ops::cuda(self.device.0 as usize),
         )?;
 
         let mut state = lock(&self.state);

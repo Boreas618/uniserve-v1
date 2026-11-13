@@ -67,7 +67,7 @@ use crate::sampler::Sampler;
 use crate::{Error, Result};
 
 /// The alignment of a table in the slot memory.
-const ALIGNMENT: u64 = backend::allocator::ALIGNMENT;
+const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 
 /// The least bytes of page-locked memory the write buffer grows by: a step's small writes
 /// (slot starts, a few ban masks) fit one such block.
@@ -261,7 +261,7 @@ impl Slots {
                 },
                 // SAFETY: a tensor over the meta device has no memory: its address is never
                 // read or written.
-                None => Ok(unsafe { backend::external(0, shape, dtype, &backend::meta()) }?),
+                None => Ok(unsafe { ops::external(0, shape, dtype, &ops::meta()) }?),
             }
         };
 

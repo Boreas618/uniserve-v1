@@ -18,6 +18,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use half::{bf16, f16};
 use ops::{Generation, Tolerance, Twins};
 use platform::{DeviceId, Event, EventFlags, PinnedBuffer, Stream};
 use tensor::DType;
@@ -259,8 +260,8 @@ pub(crate) fn compare_elements(
         let at = index * width;
         let value = match dtype {
             DType::F32 => f32::from_ne_bytes(element(bytes, at)?),
-            DType::BF16 => ops::values::bf16_to_f32(u16::from_ne_bytes(element(bytes, at)?)),
-            DType::F16 => ops::values::f16_to_f32(u16::from_ne_bytes(element(bytes, at)?)),
+            DType::BF16 => bf16::from_ne_bytes(element(bytes, at)?).to_f32(),
+            DType::F16 => f16::from_ne_bytes(element(bytes, at)?).to_f32(),
             DType::I32 => i32::from_ne_bytes(element(bytes, at)?) as f32,
             DType::U32 => u32::from_ne_bytes(element(bytes, at)?) as f32,
             DType::I64 => i64::from_ne_bytes(element(bytes, at)?) as f32,

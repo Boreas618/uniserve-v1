@@ -40,9 +40,10 @@ use nn::diffusion::{add_noise, euler_step, scale_noise};
 use nn::family::SequenceSplit;
 use nn::modules::{TimestepTable, TimestepTableConfig};
 use nn::{
-    ConditionPiece, Conditioning, DType, Device, Layout, MediaInput, Shape, Split, Step, Tensor,
+    ConditionPiece, Conditioning, DType, Device, MediaInput, Shape, Split, Step, Tensor,
     VarBuilder, VideoRequest, functional,
 };
+use proto::video::Layout;
 
 use crate::minimax_h3::audio_vae::{AudioEncoder, padded_samples};
 use crate::minimax_h3::config::{

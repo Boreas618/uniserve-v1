@@ -146,8 +146,8 @@ pub fn index_scores(
         return Ok(Tensor::stack(&scores, 0)?);
     }
 
-    let out = backend::empty((tokens, columns), DType::F32)?;
-    backend::launch::<IndexScores>(
+    let out = ops::empty((tokens, columns), DType::F32)?;
+    ops::launch::<IndexScores>(
         &IndexScoresDescriptor {
             dtype: query.dtype(),
             keys: keys.dtype(),
@@ -157,12 +157,12 @@ pub fn index_scores(
             block: SCORES_BLOCK,
         },
         IndexScoresArgs {
-            query: backend::operand(query)?,
-            keys: backend::operand(keys)?,
-            page_table: backend::operand(&cache.block_tables)?,
-            rows: backend::operand(rows)?,
-            visible: backend::operand(visible)?,
-            out: backend::operand(&out)?,
+            query: ops::operand(query)?,
+            keys: ops::operand(keys)?,
+            page_table: ops::operand(&cache.block_tables)?,
+            rows: ops::operand(rows)?,
+            visible: ops::operand(visible)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)
@@ -305,8 +305,8 @@ pub fn indexed_attention(
         return Ok(Tensor::stack(&out, 0)?.to_dtype(query.dtype())?);
     }
 
-    let out = backend::empty((tokens, heads, head_dim), query.dtype())?;
-    backend::launch::<IndexedAttention>(
+    let out = ops::empty((tokens, heads, head_dim), query.dtype())?;
+    ops::launch::<IndexedAttention>(
         &IndexedAttentionDescriptor {
             dtype: query.dtype(),
             cache: key.dtype(),
@@ -318,13 +318,13 @@ pub fn indexed_attention(
             scale: scale.into(),
         },
         IndexedAttentionArgs {
-            query: backend::operand(query)?,
-            key: backend::operand(key)?,
-            value: backend::operand(value)?,
-            page_table: backend::operand(&cache.block_tables)?,
-            rows: backend::operand(rows)?,
-            selection: backend::operand(selection)?,
-            out: backend::operand(&out)?,
+            query: ops::operand(query)?,
+            key: ops::operand(key)?,
+            value: ops::operand(value)?,
+            page_table: ops::operand(&cache.block_tables)?,
+            rows: ops::operand(rows)?,
+            selection: ops::operand(selection)?,
+            out: ops::operand(&out)?,
         },
     )?;
     Ok(out)

@@ -64,12 +64,13 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use platform::Stream;
+
 use super::{address, head_stride, row_stride, to_i64};
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 use tensor::DType;
@@ -117,7 +118,7 @@ impl fmt::Display for SparseDescriptor {
 }
 
 /// The arguments of one block-sparse attention call.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SparseArgs {
     /// `[query_rows, heads, head_dim]` queries; rows are whole tiles.
     pub query: Operand,
@@ -310,9 +311,9 @@ impl Op for SparseAttention {
         args.query
             .require_row(operator, descriptor.dtype, head_dim)?;
 
-        let heads = args.query.shape.dim(1);
-        let query_rows = args.query.shape.dim(0);
-        let key_rows = args.key.shape.dim(0);
+        let heads = args.query.dim(1);
+        let query_rows = args.query.dim(0);
+        let key_rows = args.key.dim(0);
 
         if query_rows == 0 || key_rows == 0 {
             return Err(Error::argument(
@@ -352,23 +353,23 @@ impl Op for SparseAttention {
         args.out
             .require_row(operator, descriptor.output, head_dim)?;
         for (name, view) in [("key", &args.key), ("value", &args.value)] {
-            if view.shape.dim(1) != heads || view.shape.dim(0) != key_rows {
+            if view.dim(1) != heads || view.dim(0) != key_rows {
                 return Err(Error::argument(
                     operator,
                     format!(
                         "expected {name} of shape [{key_rows}, {heads}, {head_dim}], found {:?}",
-                        view.shape.dims()
+                        view.dims()
                     ),
                 ));
             }
         }
-        if !args.out.shape.matches(&args.query.shape) {
+        if args.out.dims() != args.query.dims() {
             return Err(Error::argument(
                 operator,
                 format!(
                     "the output takes the query's shape {:?}, found {:?}",
-                    args.query.shape.dims(),
-                    args.out.shape.dims()
+                    args.query.dims(),
+                    args.out.dims()
                 ),
             ));
         }
@@ -382,9 +383,9 @@ impl Op for SparseAttention {
         let query_tiles = query_rows / block;
         args.indices.require_rank(operator, 3)?;
         if args.indices.dtype != DType::U32
-            || args.indices.shape.dim(0) != heads
-            || args.indices.shape.dim(1) != query_tiles
-            || args.indices.shape.dim(2) == 0
+            || args.indices.dim(0) != heads
+            || args.indices.dim(1) != query_tiles
+            || args.indices.dim(2) == 0
         {
             return Err(Error::argument(
                 operator,
@@ -392,12 +393,11 @@ impl Op for SparseAttention {
                     "expected u32 indices [{heads}, {query_tiles}, selected] with selected > 0, \
                      found {} {:?}",
                     abi::name(args.indices.dtype),
-                    args.indices.shape.dims()
+                    args.indices.dims()
                 ),
             ));
         }
-        args.counts
-            .require_shape(operator, Shape::new(&[heads, query_tiles]))?;
+        args.counts.require_shape(operator, &[heads, query_tiles])?;
         if args.counts.dtype != DType::U32 {
             return Err(Error::argument(
                 operator,
@@ -407,8 +407,7 @@ impl Op for SparseAttention {
                 ),
             ));
         }
-        args.valid
-            .require_shape(operator, Shape::new(&[key_rows / block]))?;
+        args.valid.require_shape(operator, &[key_rows / block])?;
         if args.valid.dtype != DType::U32 {
             return Err(Error::argument(
                 operator,
@@ -418,9 +417,9 @@ impl Op for SparseAttention {
                 ),
             ));
         }
-        match (descriptor.lse, args.lse) {
+        match (descriptor.lse, &args.lse) {
             (true, Some(lse)) => {
-                lse.require_shape(operator, Shape::new(&[heads, query_rows]))?;
+                lse.require_shape(operator, &[heads, query_rows])?;
                 if lse.dtype != DType::F32 {
                     return Err(Error::argument(
                         operator,
@@ -465,12 +464,12 @@ impl Op for SparseAttention {
                 ));
             }
             for axis in [0, 1] {
-                if !view.strides.get(axis).is_multiple_of(8) {
+                if !view.stride(axis).is_multiple_of(8) {
                     return Err(Error::argument(
                         operator,
                         format!(
                             "{name} axis {axis} stride {} is not a whole 8-element group",
-                            view.strides.get(axis)
+                            view.stride(axis)
                         ),
                     ));
                 }
@@ -487,9 +486,9 @@ impl Op for SparseAttention {
     ) -> Result<()> {
         let head_dim = u64::from(descriptor.head_dim);
         let operator = Self::NAME;
-        let heads = args.query.shape.dim(1);
-        let query_rows = args.query.shape.dim(0);
-        let key_rows = args.key.shape.dim(0);
+        let heads = args.query.dim(1);
+        let query_rows = args.query.dim(0);
+        let key_rows = args.key.dim(0);
 
         let mut call = SparseCall {
             query: address(args.query.ptr) as usize as *const c_void,
@@ -514,7 +513,7 @@ impl Op for SparseAttention {
             k_head_stride: to_i64(operator, head_stride(&args.key))?,
             v_row_stride: to_i64(operator, row_stride(&args.value))?,
             v_head_stride: to_i64(operator, head_stride(&args.value))?,
-            selected: to_i64(operator, args.indices.shape.dim(2))?,
+            selected: to_i64(operator, args.indices.dim(2))?,
             head_dim: to_i64(operator, head_dim)?,
             dtype: abi::code(descriptor.dtype)?,
             output_dtype: abi::code(descriptor.output)?,

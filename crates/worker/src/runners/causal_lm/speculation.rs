@@ -114,7 +114,7 @@ use crate::sampler::{self, Sampler};
 use crate::{Error, Result};
 
 /// The alignment of a kept tensor in its memory.
-const ALIGNMENT: u64 = backend::allocator::ALIGNMENT;
+const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 
 /// The kept tensors, in the order they lie in their memory. The first twelve are the entries
 /// of a sampling forward's outputs in their order (`output`).
@@ -377,11 +377,11 @@ impl Kept {
                 Some(storage)
             }
             None => {
-                let meta = backend::meta();
+                let meta = ops::meta();
                 for (shape, dtype) in shapes {
                     // SAFETY: a tensor over the meta device has no memory: its address is
                     // never read or written.
-                    tensors.push(unsafe { backend::external(0, shape, dtype, &meta) }?);
+                    tensors.push(unsafe { ops::external(0, shape, dtype, &meta) }?);
                 }
                 None
             }

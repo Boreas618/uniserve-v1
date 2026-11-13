@@ -5,7 +5,7 @@
 //! of reading a checkpoint and converting a weight, and a module adds the one failure of its own:
 //! a tensor whose shape or element type it was not loaded for.
 //!
-//! The tensor library carries a backend's failure, and this crate's, across its own interfaces
+//! The tensor library carries the device backend's failure, and this crate's, across its own interfaces
 //! (`Module::forward` returns the tensor library's result) as a boxed error. Converting back
 //! recovers the typed cause, so a failure that crossed a `Module::forward` matches as the variant
 //! it was raised as.
@@ -20,13 +20,9 @@ pub enum Error {
     #[error(transparent)]
     Tensor(tensor::Error),
 
-    /// The device backend refused a call: a launch, an allocation, a collective or a profiler
-    /// range. A refused launch names its operator and its key.
-    #[error(transparent)]
-    Backend(#[from] backend::Error),
-
-    /// The kernel library refused a value outside a launch: a row count no packed product is
-    /// compiled for, an element type with no host encoding.
+    /// The device side refused a call: a launch, an allocation, a collective, a profiler range,
+    /// or a value outside a launch (a row count no packed product is compiled for, an element
+    /// type with no host encoding). A refused launch names its operator and its key.
     #[error(transparent)]
     Ops(#[from] ops::Error),
 
@@ -166,7 +162,7 @@ impl Error {
 
 impl From<tensor::Error> for Error {
     /// The tensor library's failure, with the typed cause recovered when the failure is one the
-    /// tensor library carried for this crate or for the backend.
+    /// tensor library carried for this crate or for the device backend.
     fn from(error: tensor::Error) -> Self {
         match error {
             // A captured backtrace wraps the failure it was taken for.
@@ -180,8 +176,8 @@ impl From<tensor::Error> for Error {
 
             tensor::Error::Backend(source) => match source.downcast::<Self>() {
                 Ok(own) => *own,
-                Err(source) => match source.downcast::<backend::Error>() {
-                    Ok(backend) => Self::Backend(*backend),
+                Err(source) => match source.downcast::<ops::Error>() {
+                    Ok(device) => Self::Ops(*device),
                     Err(source) => Self::Tensor(tensor::Error::Backend(source)),
                 },
             },
@@ -196,7 +192,7 @@ impl From<Error> for tensor::Error {
     fn from(error: Error) -> Self {
         match error {
             Error::Tensor(error) => error,
-            Error::Backend(error) => error.into(),
+            Error::Ops(error) => error.into(),
             other => Self::Backend(Box::new(other)),
         }
     }
@@ -221,13 +217,13 @@ mod tests {
             }
         ));
 
-        let backend = backend::Error::NoContext {
+        let device = ops::Error::NoContext {
             operation: "a launch",
         };
-        let carried = tensor::Error::from(Error::from(backend));
+        let carried = tensor::Error::from(Error::from(device));
         assert!(matches!(
             Error::from(carried),
-            Error::Backend(backend::Error::NoContext { .. })
+            Error::Ops(ops::Error::NoContext { .. })
         ));
     }
 

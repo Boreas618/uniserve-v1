@@ -32,17 +32,17 @@
 //!
 //! The destination may be a block inside a larger raster, as a decoder's tile is inside its clip:
 //! its three outer strides travel as launch words and its rows stay contiguous, which is
-//! [`crate::tensor::row_writable`]'s rule.
+//! [`crate::operand::row_writable`]'s rule.
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, row_writable};
+use crate::operand::{Operand, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -73,7 +73,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one unpatchify.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[tokens, channels · patch_volume]` the packed token rows.
     pub tokens: Operand,
@@ -124,13 +124,13 @@ impl Args {
     /// geometry this operator serves (`24` against `84` for the transformer's latents, `3` against
     /// `160` for the decoder's raster), and a launch check that reads the outer axis for the row
     /// refuses each of them.
-    pub fn raster(&self) -> Shape {
-        Shape::new(&[
+    pub fn raster(&self) -> [u64; 4] {
+        [
             u64::from(self.channels),
             u64::from(self.frames) * u64::from(self.patch_frames),
             u64::from(self.height) * u64::from(self.patch_height),
             u64::from(self.width) * u64::from(self.patch_width),
-        ])
+        ]
     }
 
     /// Values on the raster's innermost axis, which is the row a launch writes.
@@ -157,12 +157,11 @@ impl Args {
                     .to_owned(),
             ));
         }
-        let out_shape = self.raster();
-        self.out.require_shape(Unpatchify::NAME, out_shape)?;
+        self.out.require_shape(Unpatchify::NAME, &self.raster())?;
         self.out
             .require_row(Unpatchify::NAME, descriptor.dtype, self.raster_row())?;
         self.tokens
-            .require_shape(Unpatchify::NAME, Shape::new(&[tokens, self.token_width()]))?;
+            .require_shape(Unpatchify::NAME, &[tokens, self.token_width()])?;
         if self.tokens.dtype != descriptor.dtype {
             return Err(Error::argument(
                 Unpatchify::NAME,
@@ -175,7 +174,7 @@ impl Args {
         }
         // The two denormalization operands arrive together or not at all, and the descriptor says
         // which form this launch is: one alone would write a raster nobody asked for.
-        let affine = match (self.scale, self.bias) {
+        let affine = match (&self.scale, &self.bias) {
             (Some(scale), Some(bias)) => Some((scale, bias)),
             (None, None) => None,
             _ => {
@@ -198,7 +197,7 @@ impl Args {
         }
         if let Some((scale, bias)) = affine {
             for (name, view) in [("scale", scale), ("bias", bias)] {
-                view.require_shape(Unpatchify::NAME, Shape::new(&[channels]))?;
+                view.require_shape(Unpatchify::NAME, &[channels])?;
                 if view.dtype != descriptor.dtype {
                     return Err(Error::argument(
                         Unpatchify::NAME,
@@ -240,18 +239,18 @@ impl Op for Unpatchify {
         stream: &Stream,
     ) -> Result<()> {
         // The outer strides of the layout `check` accepted.
-        let strides = crate::tensor::outer_strides(&args.out);
+        let strides = crate::operand::outer_strides(&args.out);
 
         let mut arguments = Arguments::new();
-        arguments.view(args.tokens);
+        arguments.view(&args.tokens);
         if let (Some(scale), Some(bias)) = (args.scale, args.bias) {
-            arguments.view(scale).view(bias);
+            arguments.view(&scale).view(&bias);
         }
         // The affine operand pair and the raster's form are the compilation's, not the launch's: the
         // descriptor says which program this is, so naming it here would only shift the two scratch
         // addresses the compiler's launcher appends after these parameters.
         arguments
-            .view(args.out)
+            .view(&args.out)
             .u32(args.channels)
             .u32(args.frames)
             .u32(args.height)
@@ -292,7 +291,6 @@ impl Op for Unpatchify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::Strides;
 
     fn latents() -> Descriptor {
         Descriptor {
@@ -305,24 +303,18 @@ mod tests {
 
     /// A contiguous view of `dims`, which is what every operand of an admitted launch is.
     fn contiguous(dtype: DType, dims: &[u64]) -> Operand {
-        let shape = Shape::new(dims);
-        Operand::with_strides(
-            crate::tensor::DevicePtr::new(0x2000),
-            dtype,
-            shape,
-            Strides::row_major(shape),
-        )
+        Operand::new(platform::DevicePtr::from_address(0x2000), dtype, dims)
     }
 
     fn grid() -> Args {
         let view = Operand::with_strides(
-            crate::tensor::DevicePtr::new(0x1000),
+            platform::DevicePtr::from_address(0x1000),
             DType::F16,
-            Shape::new(&[1, 1]),
-            Strides::new(&[1, 1]),
+            &[1, 1],
+            &[1, 1],
         );
         Args {
-            tokens: view,
+            tokens: view.clone(),
             scale: None,
             bias: None,
             out: view,
@@ -367,7 +359,7 @@ mod tests {
         // The transformer's latents: 24 channels out of a `1x2x2` patch, so the raster is
         // `[24, 37, 48, 84]` and its innermost axis is 84 values — the row a launch writes.
         let latents = grid();
-        assert_eq!(latents.raster().dims(), &[24, 37, 48, 84]);
+        assert_eq!(latents.raster(), [24, 37, 48, 84]);
         assert_eq!(latents.raster_row(), 84);
         assert_ne!(latents.raster_row(), u64::from(latents.channels));
 
@@ -382,7 +374,7 @@ mod tests {
             width: 10,
             ..latents
         };
-        assert_eq!(decoded.raster().dims(), &[3, 36, 128, 160]);
+        assert_eq!(decoded.raster(), [3, 36, 128, 160]);
         assert_eq!(decoded.raster_row(), 160);
 
         // Neither geometry has a raster row equal to its channel count, which is why a launch check
@@ -396,7 +388,7 @@ mod tests {
         let mut launch = grid();
         launch.tokens = contiguous(DType::F16, &[launch.tokens(), launch.token_width()]);
         let per_channel = contiguous(DType::F16, &[u64::from(launch.channels)]);
-        launch.scale = Some(per_channel);
+        launch.scale = Some(per_channel.clone());
         launch.bias = Some(per_channel);
 
         // The raster this operator writes: `[channels, frames, height, width]` and its innermost
@@ -420,12 +412,12 @@ mod tests {
         // The row check itself: the raster's shape is right and its innermost axis is not contiguous,
         // so the program would address the wrong voxels. This is the branch `require_row` adds over
         // `require_shape`.
-        let shape = Shape::new(&[24, 37, 48, 84]);
+        let shape = &[24, 37, 48, 84];
         launch.out = Operand::with_strides(
-            crate::tensor::DevicePtr::new(0x3000),
+            platform::DevicePtr::from_address(0x3000),
             DType::F16,
             shape,
-            Strides::new(&[1, 24, 24 * 37, 24 * 37 * 48]),
+            &[1, 24, 24 * 37, 24 * 37 * 48],
         );
         let error = launch
             .validate(&descriptor)
@@ -442,15 +434,15 @@ mod tests {
         let descriptor = latents();
         launch.tokens = contiguous(DType::F16, &[launch.tokens(), launch.token_width()]);
         let per_channel = contiguous(DType::F16, &[u64::from(launch.channels)]);
-        launch.scale = Some(per_channel);
+        launch.scale = Some(per_channel.clone());
         launch.bias = Some(per_channel);
         let tile = launch.raster();
-        let (rows, columns) = (3 * tile.dim(2), 3 * tile.dim(3));
+        let (rows, columns) = (3 * tile[2], 3 * tile[3]);
         launch.out = Operand::with_strides(
-            crate::tensor::DevicePtr::new(0x3000),
+            platform::DevicePtr::from_address(0x3000),
             DType::F16,
-            tile,
-            Strides::new(&[tile.dim(1) * rows * columns, rows * columns, columns, 1]),
+            &tile,
+            &[tile[1] * rows * columns, rows * columns, columns, 1],
         );
         launch.validate(&descriptor).expect("a tile of a clip");
     }

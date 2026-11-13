@@ -20,13 +20,13 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Kernel, NativeCall};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -100,7 +100,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one combine.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct UnpermuteArgs {
     /// `[rows, hidden]` every route's expert product, in the descriptor's [`Layout`]: permuted (one
     /// row per permuted row, found through `expanded_to_permuted`) or expanded (`token · top + route`).
@@ -210,18 +210,15 @@ impl Op for MoeUnpermute {
         let tokens = args.out.rows();
         let routes = args.routes.rows();
 
-        args.routes
-            .require_shape(Self::NAME, Shape::new(&[routes, hidden]))?;
+        args.routes.require_shape(Self::NAME, &[routes, hidden])?;
         args.routes
             .require_row(Self::NAME, descriptor.input, hidden)?;
-        args.out
-            .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
+        args.out.require_shape(Self::NAME, &[tokens, hidden])?;
         args.out
             .require_row(Self::NAME, descriptor.output, hidden)?;
         args.expanded_to_permuted
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        args.scales
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+            .require_shape(Self::NAME, &[tokens, top])?;
+        args.scales.require_shape(Self::NAME, &[tokens, top])?;
         if args.expanded_to_permuted.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,

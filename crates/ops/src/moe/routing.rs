@@ -24,13 +24,14 @@
 
 use std::fmt;
 
+use platform::DevicePtr;
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{DevicePtr, Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::{self, Tolerance};
 use crate::{Error, Op, Result, Twins};
 
@@ -86,7 +87,7 @@ impl fmt::Display for TopkDescriptor {
 }
 
 /// The arguments of one routing call.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct TopkArgs {
     /// `[tokens, experts]` router scores, unit stride on the expert axis.
     pub scores: Operand,
@@ -129,8 +130,8 @@ impl Op for TopkSoftmax {
 
         if !matches!(descriptor.scores, DType::F32 | DType::BF16 | DType::F16) {
             return Err(Error::Unsupported {
-                operator: Self::NAME,
-                problem: format!(
+                operation: Self::NAME,
+                reason: format!(
                     "scores of {} are not routeable",
                     abi::name(descriptor.scores)
                 ),
@@ -138,8 +139,8 @@ impl Op for TopkSoftmax {
         }
         if descriptor.experts == 0 || descriptor.experts > MAX_EXPERTS {
             return Err(Error::Unsupported {
-                operator: Self::NAME,
-                problem: format!(
+                operation: Self::NAME,
+                reason: format!(
                     "{} experts are outside 1..={MAX_EXPERTS}",
                     descriptor.experts
                 ),
@@ -147,19 +148,16 @@ impl Op for TopkSoftmax {
         }
         if descriptor.top == 0 || descriptor.top > MAX_TOP || u64::from(descriptor.top) > experts {
             return Err(Error::Unsupported {
-                operator: Self::NAME,
-                problem: format!("top {} is outside 1..={MAX_TOP}", descriptor.top),
+                operation: Self::NAME,
+                reason: format!("top {} is outside 1..={MAX_TOP}", descriptor.top),
             });
         }
 
-        args.scores
-            .require_shape(Self::NAME, Shape::new(&[tokens, experts]))?;
+        args.scores.require_shape(Self::NAME, &[tokens, experts])?;
         args.scores
             .require_row(Self::NAME, descriptor.scores, experts)?;
-        args.ids
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
-        args.weights
-            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+        args.ids.require_shape(Self::NAME, &[tokens, top])?;
+        args.weights.require_shape(Self::NAME, &[tokens, top])?;
         if args.ids.dtype != DType::U32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -176,9 +174,9 @@ impl Op for TopkSoftmax {
             ));
         }
 
-        match (descriptor.scale, args.scale) {
+        match (descriptor.scale, &args.scale) {
             (Some(dtype), Some(scale)) => {
-                scale.require_shape(Self::NAME, Shape::new(&[experts]))?;
+                scale.require_shape(Self::NAME, &[experts])?;
                 if scale.dtype != dtype {
                     return Err(Error::argument(
                         Self::NAME,
@@ -205,8 +203,8 @@ impl Op for TopkSoftmax {
             }
         }
 
-        if let Some(map) = args.map {
-            map.require_shape(Self::NAME, Shape::new(&[experts]))?;
+        if let Some(map) = &args.map {
+            map.require_shape(Self::NAME, &[experts])?;
             if map.dtype != DType::U32 {
                 return Err(Error::argument(
                     Self::NAME,
@@ -236,7 +234,7 @@ impl Op for TopkSoftmax {
         let grid = LaunchGrid::covering(tokens, TOKENS_PER_BLOCK)?;
         let mut arguments = Arguments::new();
         arguments
-            .view(args.scores)
+            .view(&args.scores)
             .i32(Self::score_kind(descriptor.scores))
             .i64(to_i64(Self::NAME, row_stride(&args.scores))?)
             .i32(to_i32(Self::NAME, tokens)?)
@@ -253,11 +251,13 @@ impl Op for TopkSoftmax {
                 // it, not a scalar zero. The driver takes one machine word per parameter and the
                 // module declares a pointer there, so a scalar in that slot is refused before the
                 // launch — and if it were not, the program would read address zero.
-                arguments.pointer(DevicePtr::new(0)).i32(scale_kind);
+                arguments
+                    .pointer(DevicePtr::from_address(0))
+                    .i32(scale_kind);
             }
         }
-        arguments.view(args.ids).view(args.weights);
-        arguments.pointer(args.map.map_or(DevicePtr::new(0), |map| map.ptr));
+        arguments.view(&args.ids).view(&args.weights);
+        arguments.pointer(args.map.map_or(DevicePtr::from_address(0), |map| map.ptr));
         kernel.launch(grid, &mut arguments, stream)
     }
 

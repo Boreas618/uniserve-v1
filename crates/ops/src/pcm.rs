@@ -23,13 +23,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -62,7 +62,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one interleave.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Args {
     /// `[samples]` the left channel.
     pub left: Operand,
@@ -100,8 +100,8 @@ impl Op for PcmInterleave {
                 ),
             ));
         }
-        for (name, view) in [("left", args.left), ("right", args.right)] {
-            view.require_shape(Self::NAME, Shape::new(&[samples]))?;
+        for (name, view) in [("left", &args.left), ("right", &args.right)] {
+            view.require_shape(Self::NAME, &[samples])?;
             if view.dtype != DType::F32 {
                 return Err(Error::argument(
                     Self::NAME,
@@ -109,8 +109,7 @@ impl Op for PcmInterleave {
                 ));
             }
         }
-        args.out
-            .require_shape(Self::NAME, Shape::new(&[samples, 2]))?;
+        args.out.require_shape(Self::NAME, &[samples, 2])?;
         if args.out.dtype != DType::I16 {
             return Err(Error::argument(
                 Self::NAME,
@@ -130,9 +129,9 @@ impl Op for PcmInterleave {
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.left)
-            .view(args.right)
-            .view(args.out)
+            .view(&args.left)
+            .view(&args.right)
+            .view(&args.out)
             .u32(args.samples)
             .u32(descriptor.block)
             .flag(descriptor.pdl);

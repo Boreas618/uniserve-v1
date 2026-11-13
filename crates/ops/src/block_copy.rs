@@ -17,13 +17,13 @@
 
 use std::fmt;
 
+use platform::Stream;
 use tensor::DType;
 
 use crate::abi;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
-use crate::tensor::{Operand, Shape, Strides};
+use crate::operand::Operand;
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -34,14 +34,14 @@ pub const COPY_BLOCK: u32 = 1024;
 ///
 /// The shape and the strides are compile-time values of the kernel package, because the reference
 /// kernel unrolls the trailing axes' address arithmetic and normalizes the element count once.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct BlockShape {
     /// Element type of the raw storage.
     pub dtype: DType,
-    /// The field's block-major shape: axis 0 is the block, the rest is one block's extent.
-    pub shape: Shape,
-    /// The field's element strides.
-    pub strides: Strides,
+    /// The field's block-major extents: axis 0 is the block, the rest is one block's extent.
+    pub shape: Vec<u64>,
+    /// The field's element strides, one per axis of `shape`.
+    pub strides: Vec<u64>,
     /// Elements between entries of the index vector.
     pub index_stride: u64,
     /// Elements in one flattened block.
@@ -54,8 +54,8 @@ impl fmt::Display for BlockShape {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("dtype", abi::name(self.dtype))
-            .field("shape", self.shape)
-            .field("strides", self.strides)
+            .field("shape", axes(&self.shape))
+            .field("strides", axes(&self.strides))
             .field("index_stride", self.index_stride)
             .field("width", self.width)
             .field("block", self.block)
@@ -63,16 +63,28 @@ impl fmt::Display for BlockShape {
     }
 }
 
+/// Extents or strides as a key spells them: each value in decimal, joined by `x` (`4x2x8`), and
+/// nothing for a field of no axis.
+fn axes(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join("x")
+}
+
 impl BlockShape {
     /// Check the launch against the compiled variant and the index vector.
     fn check(&self, operator: &'static str, field: &Operand, blocks: &Operand) -> Result<u64> {
-        field.require_shape(operator, self.shape)?;
-        if field.strides != self.strides {
+        field.require_shape(operator, &self.shape)?;
+        let strides = field.strides().iter().map(|&stride| stride as u64);
+        if !strides.eq(self.strides.iter().copied()) {
             return Err(Error::argument(
                 operator,
                 format!(
-                    "the field's strides are {}, the descriptor says {}",
-                    field.strides, self.strides
+                    "the field's strides are {:?}, the descriptor says {:?}",
+                    field.strides(),
+                    self.strides
                 ),
             ));
         }
@@ -86,13 +98,15 @@ impl BlockShape {
                 ),
             ));
         }
-        if self.width == 0 || self.width != self.shape.numel() / self.shape.dim(0).max(1) {
+        // A field of no axis holds one element and counts as one block.
+        let blocks_held = self.shape.first().map_or(1, |&blocks| blocks.max(1));
+        let per_block = self.shape.iter().product::<u64>() / blocks_held;
+        if self.width == 0 || self.width != per_block {
             return Err(Error::argument(
                 operator,
                 format!(
-                    "the descriptor walks {} elements per block, the field holds {}",
-                    self.width,
-                    self.shape.numel() / self.shape.dim(0).max(1)
+                    "the descriptor walks {} elements per block, the field holds {per_block}",
+                    self.width
                 ),
             ));
         }
@@ -103,17 +117,17 @@ impl BlockShape {
                 format!("the block indices are {}, not i64", abi::name(blocks.dtype)),
             ));
         }
-        if blocks.strides.get(0) != self.index_stride {
+        if blocks.stride(0) != self.index_stride {
             return Err(Error::argument(
                 operator,
                 format!(
                     "the index vector's entries are {} elements apart, the descriptor says {}",
-                    blocks.strides.get(0),
+                    blocks.stride(0),
                     self.index_stride
                 ),
             ));
         }
-        Ok(blocks.shape.dim(0))
+        Ok(blocks.dim(0))
     }
 }
 
@@ -121,7 +135,7 @@ impl BlockShape {
 pub type SnapshotDescriptor = BlockShape;
 
 /// The arguments of `cache_block_snapshot`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SnapshotArgs {
     /// The field's block-major storage, at any strides.
     pub field: Operand,
@@ -145,16 +159,16 @@ impl Op for CacheBlockSnapshot {
         args.snapshot.require_rank(Self::NAME, 2)?;
         args.snapshot
             .require_row(Self::NAME, descriptor.dtype, descriptor.width)?;
-        if args.snapshot.shape.dim(0) != count {
+        if args.snapshot.dim(0) != count {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the snapshot holds {} rows, the index vector selects {count}",
-                    args.snapshot.shape.dim(0)
+                    args.snapshot.dim(0)
                 ),
             ));
         }
-        if args.snapshot.strides != Strides::row_major(args.snapshot.shape) {
+        if !args.snapshot.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the snapshot is not contiguous".to_owned(),
@@ -170,13 +184,13 @@ impl Op for CacheBlockSnapshot {
         stream: &Stream,
     ) -> Result<()> {
         // One block per selected index: `check` holds the index vector to one axis.
-        let count = args.blocks.shape.dim(0);
+        let count = args.blocks.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.field)
-            .view(args.blocks)
-            .view(args.snapshot);
+            .view(&args.field)
+            .view(&args.blocks)
+            .view(&args.snapshot);
         kernel.launch(
             LaunchGrid::new([
                 count,
@@ -206,7 +220,7 @@ impl Op for CacheBlockSnapshot {
 pub type ScatterDescriptor = BlockShape;
 
 /// The arguments of `cache_block_scatter`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ScatterArgs {
     /// The field's block-major storage, at any strides; the selected blocks are overwritten.
     pub field: Operand,
@@ -230,16 +244,16 @@ impl Op for CacheBlockScatter {
         args.snapshot.require_rank(Self::NAME, 2)?;
         args.snapshot
             .require_row(Self::NAME, descriptor.dtype, descriptor.width)?;
-        if args.snapshot.shape.dim(0) != count {
+        if args.snapshot.dim(0) != count {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "the snapshot holds {} rows, the index vector names {count}",
-                    args.snapshot.shape.dim(0)
+                    args.snapshot.dim(0)
                 ),
             ));
         }
-        if args.snapshot.strides != Strides::row_major(args.snapshot.shape) {
+        if !args.snapshot.is_row_major() {
             return Err(Error::argument(
                 Self::NAME,
                 "the snapshot is not contiguous".to_owned(),
@@ -255,13 +269,13 @@ impl Op for CacheBlockScatter {
         stream: &Stream,
     ) -> Result<()> {
         // One block per selected index: `check` holds the index vector to one axis.
-        let count = args.blocks.shape.dim(0);
+        let count = args.blocks.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
-            .view(args.field)
-            .view(args.blocks)
-            .view(args.snapshot);
+            .view(&args.field)
+            .view(&args.blocks)
+            .view(&args.snapshot);
         kernel.launch(
             LaunchGrid::new([
                 count,
@@ -285,5 +299,27 @@ impl Op for CacheBlockScatter {
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
         // Whole blocks of raw storage move unchanged.
         Tolerance::exact()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A block's extents and strides are part of the key, spelled as the stored modules name them.
+    #[test]
+    fn a_block_shape_names_its_extents_and_strides_in_its_key() {
+        let shape = BlockShape {
+            dtype: DType::BF16,
+            shape: vec![4, 2, 8],
+            strides: vec![16, 8, 1],
+            index_stride: 1,
+            width: 16,
+            block: COPY_BLOCK,
+        };
+        assert_eq!(
+            shape.to_string(),
+            "dtype_bf16_shape_4x2x8_strides_16x8x1_index_stride_1_width_16_block_1024"
+        );
     }
 }
