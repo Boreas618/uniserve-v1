@@ -17,6 +17,7 @@
 //! | [`weights`] | [`WeightStore`](weights::WeightStore): the retained weights of one device, which `nn::WeightLoader` publishes to and maps from |
 //! | [`reload`] | A second load of a serving model: its order compared with the one that serves, and the load that publishes what changed for an update in place |
 //! | [`state`] | [`StateMemory`](state::StateMemory): the live, checkpoint and trail buffers of a model's recurrent layers, and the copies between them and the cache's state pages |
+//! | [`tables`] | [`BlockTables`](tables::BlockTables): the device block table of one rank of a worker group as its executor keeps it on the host, fed by the buffer pool's completions |
 //!
 //! ## Two kinds of device storage
 //!
@@ -49,6 +50,7 @@ pub mod graph_pool;
 pub mod host_pages;
 pub mod reload;
 pub mod state;
+pub mod tables;
 pub mod weights;
 
 use platform::DeviceId;
