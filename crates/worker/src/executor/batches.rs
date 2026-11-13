@@ -20,14 +20,16 @@
 //! - **One order.** A group's jobs are handed under one lock, so every rank's queue holds them in
 //!   the same order: the order their collectives need, and the order in which a completion
 //!   mapped before a batch is seen by that batch on every rank.
-//! - **A rank alone.** A video decode round or its encode is one unit of a timeline and needs no
-//!   other rank: the batch names the rank that runs it ([`ipc::batch::MediaRow::rank`], among this
-//!   node's executors of the group), and every other rank, here or on a peer, passes its number.
-//!   A rank whose runners do not serve the batch's phase passes it too.
+//! - **A rank alone.** A batch whose rows name a rank ([`ipc::batch::MediaRow::rank`], among this
+//!   node's executors of the group), such as an audio decode, needs no other rank: the named rank
+//!   runs it, and every other rank, here or on a peer, passes its number. A video decode round
+//!   names none: every rank of the group that serves its phase runs it and decodes its share of
+//!   the round's units (`runners::decoder`). A rank whose runners do not serve the batch's phase
+//!   passes it too.
 //! - **Host work once.** A batch of a host phase (a media request's reading, encoding and
 //!   muxing, [`ipc::batch::Variant::host`]) is work of the host, not of a rank's device, and
 //!   runs once: a batch whose rows name no rank is named the first of this node's executors of
-//!   the group that serves its phase, as a decode round is named its rank, and every other rank
+//!   the group that serves its phase, as if its rows named that rank, and every other rank
 //!   passes its number. Its rows then start no copy, as no batch one rank runs alone does; a
 //!   host batch with no rows is every rank's and runs the copies. A group none of whose
 //!   executors here serves the phase hands the batch to its first peer link to run, and the

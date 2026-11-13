@@ -712,12 +712,22 @@ impl BufferMemory {
         Ok(moved)
     }
 
+    /// The run among `runs`, the runs of one block, that lies in the product buffer of the rank
+    /// of this process whose index is `rank`: this rank's own, or another's it reaches. `None`
+    /// when none of them does.
+    pub fn run_on(&self, runs: &[Run], rank: u32) -> Option<Run> {
+        runs.iter().copied().find(|run| {
+            let own = run.0 == self.products.0 && rank == self.rank;
+            own || self.peer(run.0).is_some_and(|peer| peer.1 == rank)
+        })
+    }
+
     /// Copies `bytes` from the device address `source`, the decode's tail in its runner's
-    /// memory, into the first bytes of the runs that the block `slot` holds at `position` of
-    /// `class` has on the other ranks of this process, on `stream`, and hands each of those
-    /// ranks an event recorded behind the copies, which [`BufferMemory::take_hand_off`] gives its
-    /// reader. Returns the places written; with `None` for memory that holds no device nothing
-    /// is issued and an empty hand-off is handed.
+    /// memory, into the first bytes of the run that the block `slot` holds at `position` of
+    /// `class` has on rank `reader`, another rank of this process, on `stream`, and hands that
+    /// rank an event recorded behind the copy, which [`BufferMemory::take_hand_off`] gives it.
+    /// Returns the places written; with `None` for memory that holds no device nothing is
+    /// issued and an empty hand-off is handed.
     ///
     /// # Safety
     ///
@@ -726,25 +736,26 @@ impl BufferMemory {
     ///
     /// # Errors
     ///
-    /// A block with no run on another rank of the process, bytes past a run, a hand-off into a
-    /// run whose last one was not taken, or as [`BufferMemory::copy`].
+    /// A block with no run on rank `reader` of the process other than this one, bytes past the
+    /// run, a hand-off into a run whose last one was not taken, or as [`BufferMemory::copy`].
     pub unsafe fn hand_off(
         &self,
         tables: &BlockTables,
         (slot, class, position): (u32, u8, u32),
         (source, bytes): (u64, u64),
+        reader: u32,
         stream: Option<&Stream>,
     ) -> Result<Vec<Place>> {
         let runs: Vec<Run> = tables
             .runs(slot, class, position)
             .iter()
             .copied()
-            .filter(|run| self.peer(run.0).is_some())
+            .filter(|run| self.peer(run.0).is_some_and(|peer| peer.1 == reader))
             .collect();
         if runs.is_empty() {
             return Err(Error::Invalid(format!(
                 "the block of slot {slot} at position {position} of class {class} has no run on \
-                 another rank of this process to hand off to"
+                 rank {reader}, another rank of this process, to hand off to"
             )));
         }
         let places = runs
@@ -1416,7 +1427,7 @@ mod tests {
             let taken = scope
                 .spawn(|| memories[1].take_hand_off(&reader, entry, None, Duration::from_secs(30)));
             // SAFETY: memory that holds no device reads no source.
-            let written = unsafe { memories[0].hand_off(&writer, entry, (0, 96), None) };
+            let written = unsafe { memories[0].hand_off(&writer, entry, (0, 96), OTHER, None) };
             assert_eq!(written.unwrap(), [(OTHER_PRODUCTS, OTHER, 4 * UNIT_BYTES)]);
             assert!(taken.join().unwrap().is_ok());
         });
@@ -1426,14 +1437,28 @@ mod tests {
                 .is_err()
         );
 
-        // A second tail waits until the first is taken, and none passes the run.
+        // A second tail waits until the first is taken, none passes the run, and none goes to a
+        // rank that holds no run of the block.
         // SAFETY: as above.
         unsafe {
-            assert!(memories[0].hand_off(&writer, entry, (0, 96), None).is_ok());
-            assert!(memories[0].hand_off(&writer, entry, (0, 96), None).is_err());
             assert!(
                 memories[0]
-                    .hand_off(&writer, entry, (0, 257), None)
+                    .hand_off(&writer, entry, (0, 96), OTHER, None)
+                    .is_ok()
+            );
+            assert!(
+                memories[0]
+                    .hand_off(&writer, entry, (0, 96), OTHER, None)
+                    .is_err()
+            );
+            assert!(
+                memories[0]
+                    .hand_off(&writer, entry, (0, 257), OTHER, None)
+                    .is_err()
+            );
+            assert!(
+                memories[0]
+                    .hand_off(&writer, entry, (0, 96), RANK, None)
                     .is_err()
             );
         }
