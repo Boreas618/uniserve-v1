@@ -706,9 +706,7 @@ mod tests {
     use storage::{Key, QueuePair};
 
     use super::{LATENT_ENCODER_BLOCK, PRODUCTS, VIDEO_PHASES};
-    use crate::scheduler::{
-        Capacity, Executor, Policy, Request, RequestStatus, Scheduler, WorkerGroup,
-    };
+    use crate::scheduler::{Capacity, Executor, Request, RequestStatus, Scheduler, WorkerGroup};
 
     const A: GroupId = GroupId(0);
     const B: GroupId = GroupId(1);
@@ -1014,11 +1012,7 @@ mod tests {
             0,
             QueuePair::create(1 << 12, 16).unwrap(),
             configs,
-            Policy {
-                calls: 0,
-                fuel: 0,
-                events: Vec::new(),
-            },
+            crate::scheduler::tests::idle_policy(),
             Box::new(Idle),
             output,
             Arc::new(AtomicU64::new(0)),

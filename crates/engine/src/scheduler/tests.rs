@@ -7,12 +7,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use ipc::batch::Phase;
 use proto::config::{SchedulerConfig, WorkerGroupConfig};
 use proto::request::{GenerationLimits, GenerationRequest};
+use scheduling_guest::limits::{Limits, Parameters};
+use scheduling_guest::view::Snapshot;
 use storage::runtime::{self, Class, Completion, GroupId, OwnerId, Region, Tier};
 use storage::{Key, QueuePair};
 
-use super::{Blocks, Capacity, Executor, Policy, Request, RequestStatus, Scheduler};
+use super::policy::tests::{packaged, toy};
+use super::{Blocks, Cached, Capacity, Executor, Policy, Request, RequestStatus, Scheduler};
 
 pub(super) const A: GroupId = GroupId(0);
 pub(super) const B: GroupId = GroupId(1);
@@ -147,11 +151,7 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
         0,
         engine,
         groups,
-        Policy {
-            calls: 0,
-            fuel: 0,
-            events: Vec::new(),
-        },
+        idle_policy(),
         Box::new(Recording(Arc::clone(&executors))),
         output,
         Arc::new(AtomicU64::new(0)),
@@ -165,7 +165,7 @@ pub(super) fn bench(ring_bytes: usize) -> Bench {
     }
 }
 
-fn capacity() -> Capacity {
+pub(super) fn capacity() -> Capacity {
     Capacity {
         phases: 0,
         slots: 16,
@@ -687,4 +687,135 @@ fn available_is_the_buffer_pools_word_less_the_units_of_allocates_not_yet_answer
     assert_eq!(bench.scheduler.available[0], 48);
     assert_eq!(bench.scheduler.retiring[0], 3);
     assert_eq!(bench.scheduler.available[2], 36);
+}
+
+/// A request marked since the last step is told to the policy at the next `dispatch`, however
+/// often it was marked, and can be marked again once told: `fcfs`, which learns of request 1 from
+/// nothing else, admits it.
+#[test]
+fn a_marked_request_is_told_at_the_next_dispatch() {
+    let mut bench = bench(1024);
+    bench.attach(&[]);
+    let scheduler = &mut bench.scheduler;
+    scheduler.policy = Policy::new(
+        packaged("fcfs"),
+        Parameters::default(),
+        Snapshot::default(),
+        &Limits::default(),
+    )
+    .unwrap();
+    let id = proto::request::RequestId(1);
+
+    scheduler.mark(id);
+    scheduler.mark(id);
+    assert!(scheduler.requests[&id].dirty);
+
+    let room = scheduler.room();
+    let output = scheduler
+        .policy
+        .dispatch(&room, &mut scheduler.requests, &scheduler.groups)
+        .unwrap();
+    assert_eq!(output.admit, [scheduling_guest::ids::RequestId(1)]);
+    assert!(!scheduler.requests[&id].dirty);
+
+    scheduler.mark(id);
+    assert!(scheduler.requests[&id].dirty);
+}
+
+/// The room states the units of the regions the cache groups' blocks are taken from (the KV
+/// regions of both groups, not the products), the free slots of the fullest serving group, the
+/// policy's own budgets, and the batches in flight with those that may carry prefill work.
+#[test]
+fn the_room_states_the_cache_regions_the_free_slots_and_the_batches_in_flight() {
+    let mut bench = bench(1024);
+    let scheduler = &mut bench.scheduler;
+    for group in &mut scheduler.groups {
+        group.capacity.phases = 1 << Phase::Prefill.index();
+    }
+    scheduler.groups[0].num_requests = 10;
+    scheduler.groups[1].num_requests = 4;
+    scheduler.groups[1].in_flight = 2;
+    scheduler.groups[1].occupied[Phase::Prefill.index()] = 1;
+    scheduler.available = vec![50, 30, 20, 16];
+
+    let room = scheduler.room();
+    assert_eq!(room.kv_units, 80);
+    assert_eq!(room.capacity_units, 128);
+    assert_eq!(room.slots, 6);
+    assert_eq!(room.token_budget, 8192);
+    assert_eq!(room.call_budget, 128);
+    assert_eq!(room.inflight.batches, 2);
+    assert_eq!(room.inflight.prefill_batches, 1);
+    assert_eq!(room.prefill_tokens, None);
+}
+
+/// A starting policy is told the waiting requests, every cached block of a cache group as a page
+/// (evictable when no request holds it, on the host when no device copy is left), every other
+/// cached block as an encoding, and the groups that serve phases with the phases they serve.
+#[test]
+fn the_snapshot_states_the_requests_the_cache_and_the_serving_groups() {
+    let mut bench = bench(1024);
+    bench.attach(&[]);
+    let scheduler = &mut bench.scheduler;
+    scheduler.waiting.push_back(proto::request::RequestId(1));
+    scheduler.groups[1].capacity.phases =
+        (1 << Phase::Prefill.index()) | (1 << Phase::Decode.index());
+
+    let cached = |byte, class, tiers, pins| Cached {
+        key: key(byte),
+        class,
+        tokens: 16,
+        tiers,
+        groups: 1,
+        pins,
+        last_used: 5,
+    };
+    for block in [
+        cached(1, KV, 0b001, 1),
+        cached(2, KV, 0b010, 0),
+        cached(3, PRODUCT, 0b001, 0),
+    ] {
+        scheduler.cache.insert(Cached::id(&block.key), block);
+    }
+
+    let snapshot = scheduler.snapshot();
+    let requests: Vec<u64> = snapshot.requests.iter().map(|view| view.id.0).collect();
+    assert_eq!(requests, [1]);
+
+    let mut pages: Vec<(u64, bool, bool)> = snapshot
+        .pages
+        .iter()
+        .map(|page| (page.id.0, page.evictable, page.on_host))
+        .collect();
+    pages.sort_unstable();
+    assert_eq!(
+        pages,
+        [
+            (Cached::id(&key(1)), false, false),
+            (Cached::id(&key(2)), true, true)
+        ]
+    );
+    let encodings: Vec<u64> = snapshot.encodings.iter().map(|entry| entry.id.0).collect();
+    assert_eq!(encodings, [Cached::id(&key(3))]);
+
+    assert_eq!(snapshot.replicas.len(), 1);
+    assert_eq!(snapshot.replicas[0].kinds, [Phase::Prefill, Phase::Decode]);
+    let phases: Vec<(u32, Phase)> = snapshot
+        .phases
+        .iter()
+        .map(|phase| (phase.id.0, phase.kind))
+        .collect();
+    assert_eq!(phases, [(3, Phase::Prefill), (4, Phase::Decode)]);
+}
+
+/// A policy that admits nothing: tests that drive the queue pair, the views or the placement,
+/// which no policy decision reaches.
+pub(super) fn idle_policy() -> Policy {
+    Policy::new(
+        toy("(i64.const 0)"),
+        Parameters::default(),
+        Snapshot::default(),
+        &Limits::default(),
+    )
+    .unwrap()
 }

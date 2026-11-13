@@ -99,17 +99,12 @@ fn the_artifact_the_tool_wrote_is_what_the_main_process_loads() {
     let bytes = fs::read(&artifact).expect("the artifact is written");
     let engine = scheduling::Engine::new().expect("this host has a policy engine");
     let module = engine
-        .module(&bytes)
+        .load(&bytes)
         .expect("the main process loads the artifact");
-    assert!(
-        module
-            .instantiate(
-                &scheduling::guest::Snapshot::default(),
-                &Default::default(),
-                &Default::default()
-            )
-            .is_err(),
-        "the artifact carries the policy's exports, and an empty module has none"
+    assert_eq!(
+        module.exports().count(),
+        0,
+        "the artifact is the module it was given, and an empty module exports nothing"
     );
     let _ = fs::remove_dir_all(&dir);
 }

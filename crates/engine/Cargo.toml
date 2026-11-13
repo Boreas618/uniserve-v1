@@ -42,18 +42,19 @@ serde_json.workspace = true
 storage.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
-# The compiled policy module a scheduler instantiates; the version and features are the policy
-# host's (`crates/scheduling/Cargo.toml`), whose precompiled modules the engine loads.
-wasmtime = { version = "50.0.1", default-features = false, features = [
-    "cranelift",
-    "runtime",
-    "std",
-] }
+# The runtime a scheduler instantiates its policy module in; the modules are compiled by the
+# engine `scheduling::Engine` configures, at the workspace's one pin.
+wasmtime.workspace = true
 worker.workspace = true
 
 [dev-dependencies]
 # A test states the serving a family it resolves names.
 processing.workspace = true
+# The engine policy modules are compiled for: a scheduler's tests load the packaged policies and
+# their own toy modules with it.
+scheduling.workspace = true
+# A toy policy module in a test is written as `wat`.
+wasmtime = { workspace = true, features = ["wat"] }
 tempfile.workspace = true
 # A test states the arguments a deployment pinned on a package, which are a TOML table
 # (`proto::module::Package`).

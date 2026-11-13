@@ -40,6 +40,7 @@ mod stats;
 #[cfg(test)]
 mod tests;
 mod video;
+mod view;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -59,8 +60,9 @@ use storage::{Key, QueuePair};
 
 pub use cache::Cached;
 pub use group::{Capacity, WorkerGroup};
-pub use policy::{Policy, PolicyError};
+pub use policy::{Policy, PolicyError, ceilings};
 pub use request::{Blocks, Request, RequestStatus};
+pub use view::view_of;
 
 /// The first request id of the warm-up requests the engine adds when admission opens: an
 /// ordinary request whose id is at or above it has its events dropped (SD §3.2).
@@ -303,6 +305,8 @@ pub struct Scheduler {
     /// The kernel and policy generation batches are assembled for.
     generation: Arc<AtomicU64>,
     paused: bool,
+    /// Whether the scheduler stopped on a fault (`fail`): its loop ends at the next pass.
+    stopped: bool,
     /// The replies owed to `Pause` once nothing is in flight.
     boundary: Vec<Sender<()>>,
     /// The reply, cause, deadline and whether memory is given back, of a drain under way.
@@ -311,6 +315,20 @@ pub struct Scheduler {
     resizing: Vec<(u8, Sender<()>)>,
     next_batch: u64,
     step: u64,
+}
+
+impl Scheduler {
+    /// Stops the scheduler on a fault it cannot recover from: `Output::Failed` tells the engine,
+    /// which ends the epoch's requests in flight as migratable with the cause `Loss`, as for a
+    /// lost process, and the loop ends at its next pass. Called once; later faults are dropped.
+    pub(super) fn fail(&mut self, error: Error) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        // An engine that no longer listens has stopped this scheduler's epoch already.
+        let _ = self.output.send(Output::Failed(error));
+    }
 }
 
 impl Scheduler {
@@ -427,6 +445,7 @@ impl Scheduler {
             published: Instant::now(),
             generation,
             paused: false,
+            stopped: false,
             boundary: Vec::new(),
             draining: None,
             resizing: Vec::new(),

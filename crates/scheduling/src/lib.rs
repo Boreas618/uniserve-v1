@@ -54,20 +54,20 @@ pub use scheduling_guest::wire::Call;
 /// A precompiled module carries wasmtime's own artifact format and the
 /// configuration it was compiled with, so a module precompiled by another
 /// wasmtime version, or with another `Config`, is rejected at load. This
-/// constant and the `wasmtime` version pinned in `Cargo.toml` are therefore
-/// one fact, and a test below fails if they drift.
+/// constant and the `wasmtime` version the workspace's `Cargo.toml` pins are
+/// therefore one fact, and a test below fails if they drift.
 pub const WASMTIME_VERSION: &str = "50.0.1";
 
 #[cfg(test)]
 mod tests {
     use super::WASMTIME_VERSION;
 
-    /// The declared wasmtime version is the one `Cargo.toml` pins: a package's
-    /// `[toolchain]` names it, and a module precompiled against another version
-    /// would not load.
+    /// The declared wasmtime version is the one the workspace's `Cargo.toml`
+    /// pins for this crate and the engine: a package's `[toolchain]` names it,
+    /// and a module precompiled against another version would not load.
     #[test]
     fn the_declared_wasmtime_version_is_the_one_cargo_pins() {
-        let manifest = include_str!("../Cargo.toml");
+        let manifest = include_str!("../../../Cargo.toml");
         let pin = format!("version = \"{WASMTIME_VERSION}\"");
         assert!(
             manifest.contains(&pin),

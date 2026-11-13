@@ -411,7 +411,7 @@ mod tests {
     use storage::QueuePair;
     use storage::runtime::{self, Completion, GroupId, Region, Tier};
 
-    use super::super::{Blocks, Executor, Policy, Request, RequestStatus, Scheduler};
+    use super::super::{Blocks, Executor, Request, RequestStatus, Scheduler};
     use super::{Capacity, WorkerGroup};
 
     struct Idle;
@@ -539,11 +539,7 @@ mod tests {
             0,
             QueuePair::create(4096, 1).unwrap(),
             groups,
-            Policy {
-                calls: 0,
-                fuel: 0,
-                events: Vec::new(),
-            },
+            crate::scheduler::tests::idle_policy(),
             Box::new(Idle),
             output,
             Arc::new(AtomicU64::new(0)),

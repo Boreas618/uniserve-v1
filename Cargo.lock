@@ -1234,6 +1234,7 @@ dependencies = [
  "proto",
  "qwen3",
  "scheduler",
+ "scheduling",
  "scheduling-guest",
  "serde_json",
  "service",

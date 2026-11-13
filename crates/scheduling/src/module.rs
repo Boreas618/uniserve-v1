@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use scheduling_guest::limits::{Limits, Parameters};
 use scheduling_guest::view::Snapshot;
-use wasmtime::{Module, Precompiled};
+use wasmtime::Module;
 
 use crate::Engine;
 use crate::error::PolicyError;
@@ -33,52 +33,11 @@ pub struct PolicyModule {
 impl PolicyModule {
     /// Loads the bytes the Build Server serves for a policy package: the
     /// precompiled artifact when the bytes are one (§5.3, "按本机 CPU 预编译"),
-    /// the wasm32 binary otherwise.
+    /// the wasm32 binary otherwise ([`Engine::load`]).
     pub fn load(engine: &Engine, bytes: &[u8]) -> Result<Self, PolicyError> {
-        match wasmtime::Engine::detect_precompiled(bytes) {
-            Some(Precompiled::Module) => Self::from_precompiled(engine, bytes),
-            Some(Precompiled::Component) => Err(PolicyError::Load {
-                message: "a policy is a core wasm module, not a component".into(),
-            }),
-            None => Self::from_wasm(engine, bytes),
-        }
-    }
-
-    /// Loads a wasm32 binary module and compiles it.
-    ///
-    /// The bytes are the package's compiled crate; a deployment serves the
-    /// artifact [`Engine::precompile`] made instead, so this is the path a
-    /// policy takes when the store holds no precompiled artifact for this host.
-    pub fn from_wasm(engine: &Engine, bytes: &[u8]) -> Result<Self, PolicyError> {
-        let module = Module::new(engine.inner(), bytes).map_err(|error| PolicyError::Load {
-            message: format!("cannot compile the policy module: {error}"),
-        })?;
         Ok(Self {
             engine: engine.clone(),
-            module: Arc::new(module),
-        })
-    }
-
-    /// Loads an artifact [`Engine::precompile`] produced.
-    ///
-    /// `Module::deserialize` is unsafe because wasmtime trusts the artifact's
-    /// code and its metadata; these bytes come from the Build Server's module
-    /// store, whose paths are named by the package's backend, revision and
-    /// target (§5.3) and whose content an `install` put there (§6.3), so this
-    /// code trusts the store exactly as the mechanism trusts the kernels it
-    /// loads from it.
-    pub fn from_precompiled(engine: &Engine, bytes: &[u8]) -> Result<Self, PolicyError> {
-        // Safety: the artifact was precompiled by an engine configured as this
-        // one, and it comes from the Build Server's store (§5.3); an artifact
-        // of another engine or another format is rejected by `deserialize`.
-        let module = unsafe { Module::deserialize(engine.inner(), bytes) }.map_err(|error| {
-            PolicyError::Load {
-                message: format!("cannot load the precompiled policy module: {error}"),
-            }
-        })?;
-        Ok(Self {
-            engine: engine.clone(),
-            module: Arc::new(module),
+            module: Arc::new(engine.load(bytes)?),
         })
     }
 

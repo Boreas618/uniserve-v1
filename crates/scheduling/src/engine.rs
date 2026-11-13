@@ -11,7 +11,7 @@
 //! the process that loads must agree, and the Build Server and the main
 //! process build their engines the one way this type builds them.
 
-use wasmtime::{Config, OptLevel};
+use wasmtime::{Config, Module, OptLevel, Precompiled};
 
 use crate::error::PolicyError;
 
@@ -91,6 +91,37 @@ impl Engine {
     /// otherwise.
     pub fn module(&self, bytes: &[u8]) -> Result<crate::PolicyModule, PolicyError> {
         crate::PolicyModule::load(self, bytes)
+    }
+
+    /// Compiles the bytes the Build Server serves for a policy package into
+    /// the module a scheduler instantiates (`engine::scheduler::Policy`): the
+    /// precompiled artifact when the bytes are one (§5.3), the wasm32 binary
+    /// otherwise, which is compiled here.
+    ///
+    /// The module carries this engine's configuration, fuel metering
+    /// included, so every instance of it is metered per call.
+    pub fn load(&self, bytes: &[u8]) -> Result<wasmtime::Module, PolicyError> {
+        match wasmtime::Engine::detect_precompiled(bytes) {
+            Some(Precompiled::Module) => {
+                // SAFETY: wasmtime trusts an artifact's code and metadata. These
+                // bytes come from the Build Server's module store, whose paths
+                // name the package's backend, revision and target (§5.3) and
+                // whose content an `install` put there (§6.3), and an artifact
+                // of another engine or format is rejected by `deserialize`; the
+                // store is trusted exactly as the kernels loaded from it are.
+                unsafe { Module::deserialize(&self.inner, bytes) }.map_err(|error| {
+                    PolicyError::Load {
+                        message: format!("cannot load the precompiled policy module: {error}"),
+                    }
+                })
+            }
+            Some(Precompiled::Component) => Err(PolicyError::Load {
+                message: "a policy is a core wasm module, and these bytes are not one".into(),
+            }),
+            None => Module::new(&self.inner, bytes).map_err(|error| PolicyError::Load {
+                message: format!("cannot compile the policy module: {error}"),
+            }),
+        }
     }
 
     /// The wasmtime engine itself, for the module and instance code of this
