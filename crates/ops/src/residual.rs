@@ -145,8 +145,7 @@ impl Op for WeightedRmsNorm {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         WeightedRmsNormArgs {
             out: twins.shadow_of(args.out),
             partials: args.partials.map(|partials| twins.shadow_of(partials)),
@@ -305,9 +304,9 @@ impl Op for ScaledResidualRmsNorm {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         ScaledResidualRmsNormArgs {
-            hidden: twins.in_place(args.hidden, stream),
+            hidden: twins.in_place(args.hidden),
             out: twins.shadow_of(args.out),
             partials: args.partials.map(|partials| twins.shadow_of(partials)),
             ..args
@@ -473,8 +472,7 @@ impl Op for ScaledResidualLayerNorm {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         ScaledResidualLayerNormArgs {
             out: twins.shadow_of(args.out),
             partials: args.partials.map(|partials| twins.shadow_of(partials)),
@@ -620,9 +618,9 @@ impl Op for ScaledResidual {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         ScaledResidualArgs {
-            hidden: twins.in_place(args.hidden, stream),
+            hidden: twins.in_place(args.hidden),
             ..args
         }
     }
@@ -806,9 +804,9 @@ impl Op for SigmoidGatedAdd {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         SigmoidGatedAddArgs {
-            target: twins.in_place(args.target, stream),
+            target: twins.in_place(args.target),
             ..args
         }
     }
@@ -968,9 +966,9 @@ impl Op for ScaledAdd {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         ScaledAddArgs {
-            target: twins.in_place(args.target, stream),
+            target: twins.in_place(args.target),
             source: twins.shadow_of(args.source),
             ..args
         }

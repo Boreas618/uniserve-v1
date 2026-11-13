@@ -407,24 +407,22 @@ impl Runner for Writes {
 }
 
 #[test]
-fn a_forward_s_shadow_region_holds_twice_its_largest_operator_s_outputs() {
-    // Four rows' fill writes 8192 bytes and their two normalizations 512 each: the fill writes
-    // the most, in the bucket of four rows, and the region holds twice its outputs, not twice
-    // everything the forward writes.
+fn a_forward_s_shadow_region_holds_its_largest_call_s_twins() {
+    // Four rows' fill writes 8192 bytes and each of their normalizations 512: the region holds
+    // the fill's twin, in the bucket of four rows, not everything the forward writes.
     let writes = Writes::new(2);
     writes.graphs.profile_run(&writes).unwrap();
-    assert_eq!(writes.graphs.shadow_peak(0), 2 * 8192);
+    assert_eq!(writes.graphs.shadow_peak(0), 8192);
 
-    // An operator's outputs are summed over its calls: twenty normalizations of four rows
-    // write 10240 bytes, more than the fill.
+    // A paired forward compares each call as both kernels ran it, so twenty normalizations of
+    // four rows, 10240 bytes in all, take the region no more than one of them does.
     let writes = Writes::new(20);
     writes.graphs.profile_run(&writes).unwrap();
-    assert_eq!(writes.graphs.shadow_peak(0), 2 * 20 * 512);
+    assert_eq!(writes.graphs.shadow_peak(0), 8192);
 
-    // Memory one operator writes in place that the forward did not allocate is copied twice
-    // too, when it is more than any operator's outputs.
-    assert_eq!(writes.graphs.shadow_peak(12_000), 2 * 12_000);
-    assert_eq!(writes.graphs.shadow_peak(1_000), 2 * 20 * 512);
+    // What a paired forward's cache writes write in place beyond the profiled forward's is
+    // held beside the largest call.
+    assert_eq!(writes.graphs.shadow_peak(12_000), 8192 + 12_000);
 }
 
 #[test]

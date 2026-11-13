@@ -256,8 +256,7 @@ impl Op for ActAndMul {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         ActAndMulArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -440,8 +439,7 @@ impl Op for ValueFirstSwiglu {
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         ValueFirstSwigluArgs {
             out: twins.shadow_of(args.out),
             partials: args.partials.map(|partials| twins.shadow_of(partials)),
@@ -632,8 +630,7 @@ impl Op for Swiglu {
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         SwigluArgs {
             out: twins.shadow_of(args.out),
             partials: args.partials.map(|partials| twins.shadow_of(partials)),
@@ -745,8 +742,7 @@ impl Op for Silu {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         SiluArgs {
             out: twins.shadow_of(args.out),
             ..args

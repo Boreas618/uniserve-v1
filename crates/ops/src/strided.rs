@@ -31,7 +31,6 @@
 //! its address arithmetic needs, which is what the slots carry: a call that still traverses more
 //! axes than [`SLOTS`] after folding is refused by its operator's check.
 
-use platform::Stream;
 use tensor::nditer::merge_axes as fold;
 use tensor::{DType, Layout, Shape};
 
@@ -308,13 +307,13 @@ pub(crate) fn span(operand: &Operand) -> u64 {
 /// window leaves the elements between its own untouched: its shadow buffer is the storage the
 /// window reaches, with that storage's bytes copied in, and the window keeps its strides inside
 /// it. The two sides of the comparison then differ only where the operator wrote.
-pub(crate) fn shadow_window(destination: Operand, twins: &mut Twins, stream: &Stream) -> Operand {
+pub(crate) fn shadow_window(destination: Operand, twins: &mut Twins) -> Operand {
     if is_contiguous(&destination) {
         return twins.shadow_of(destination);
     }
 
     let reached = Operand::new(destination.ptr, destination.dtype, &[span(&destination)]);
-    destination.at(twins.in_place(reached, stream).ptr)
+    destination.at(twins.in_place(reached).ptr)
 }
 
 /// The operands with every run of adjacent axes they all step through as one merged into one axis,

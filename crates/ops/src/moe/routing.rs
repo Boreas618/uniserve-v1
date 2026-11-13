@@ -261,8 +261,7 @@ impl Op for TopkSoftmax {
         kernel.launch(grid, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         TopkArgs {
             ids: twins.shadow_of(args.ids),
             weights: twins.shadow_of(args.weights),

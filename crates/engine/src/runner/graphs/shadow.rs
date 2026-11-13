@@ -4,17 +4,15 @@
 //! forward: an eager forward of a bucket under the generation being prepared whose route
 //! ([`Pairing`]) launches every call of that operator twice over the same inputs. The new kernel
 //! writes shadow outputs (`ops::Op::shadow`) and the serving kernel then writes the real
-//! outputs, which the forward continues on. Two properties make the comparison meaningful:
+//! outputs, which the forward continues on. The difference of one operator therefore does not
+//! accumulate through the next: nothing reads a shadow output but the comparison.
 //!
-//! - the difference of one operator does not accumulate through the next, because nothing reads
-//!   a shadow output but the comparison;
-//! - each real output is copied beside its shadow output the moment it is written
-//!   (`ops::Twins::freeze`), because a later operator of the forward writes over the block it
-//!   was allocated in.
-//!
-//! After the forward the pairs are copied to page-locked host memory behind the forward on its
-//! stream, and compared element by element in the element type's own values, each pair within
-//! the tolerance of the call that produced it (`ops::Op::tolerance`).
+//! Each paired call is compared as soon as both kernels ran it: its pairs are copied to
+//! page-locked host memory on the forward's stream right behind the serving kernel, before any
+//! later launch can write over the real outputs, and compared element by element in the element
+//! type's own values, within the tolerance of the call (`ops::Op::tolerance`). The shadow region
+//! thus holds one call's twins at a time, and the next paired call carves it again
+//! (`Graphs::shadow_peak` sizes it).
 
 use std::sync::{Arc, Mutex};
 
@@ -28,18 +26,43 @@ use crate::worker::{Error, Result};
 use service::lock;
 
 /// The route of one paired forward: the calls of one operator, launched with the kernels of two
-/// generations.
+/// generations and compared one call at a time.
 pub(crate) struct Pairing {
     /// The operator whose kernels are compared, by `ops::Op::NAME`.
     operator: &'static str,
     /// The generation that serves: its kernel writes the real outputs.
     serving: Arc<Generation>,
-    /// The region the new kernel's shadow outputs are written in.
-    outputs: Arc<Mutex<Twins>>,
-    /// Per paired call, the number of pairs the region held after it and the bound its outputs
-    /// are compared within. A call's descriptor decides its tolerance, and one operator is
-    /// launched under several.
-    calls: Mutex<Vec<(usize, Tolerance)>>,
+    /// The shadow region and the host copies the calls are compared in.
+    region: Arc<Mutex<Region>>,
+    /// What the forward's paired calls compared so far.
+    outcome: Mutex<Outcome>,
+}
+
+/// The device region a paired call's twins are carved from, and the page-locked memory its
+/// pairs are copied to.
+struct Region {
+    twins: Twins,
+    device: DeviceId,
+    /// The host copies of the real and of the shadow outputs, back to back per pair; grown to
+    /// the largest call compared so far.
+    host: Option<(PinnedBuffer, PinnedBuffer)>,
+}
+
+/// What the paired calls of one forward compared.
+#[derive(Default)]
+struct Outcome {
+    /// The calls both kernels ran.
+    calls: usize,
+    /// The pairs compared, and their elements.
+    pairs: usize,
+    elements: u64,
+    /// The pairs that could not be compared, each with the reason.
+    uncompared: Vec<String>,
+    /// The first call whose twins exceeded the region: no call after it is paired.
+    overflow: Option<String>,
+    /// The first difference beyond a call's tolerance, or the first failure to shadow a call
+    /// for another reason than the region's size: no call after it is paired.
+    failure: Option<String>,
 }
 
 impl ops::Route for Pairing {
@@ -66,105 +89,67 @@ impl ops::Route for Pairing {
             return Ok(false);
         }
 
-        // The new kernel writes the shadow outputs; the serving kernel then writes the real
-        // ones, which are copied beside them before anything writes over their block.
-        let mut outputs = lock(&self.outputs);
-        call.launch_redirected(new, &mut outputs, stream)?;
-        call.launch(serving, stream)?;
-        outputs.freeze(stream);
+        // Once a call has differed or found no room, the rest of the forward launches the
+        // serving kernel alone: the outcome is decided.
+        let mut outcome = lock(&self.outcome);
+        if outcome.overflow.is_some() || outcome.failure.is_some() {
+            call.launch(serving, stream)?;
+            return Ok(true);
+        }
 
-        lock(&self.calls).push((outputs.pairs().len(), call.tolerance()));
+        // The new kernel writes the shadow outputs; the serving kernel then writes the real
+        // ones. A call whose twins do not fit launches the serving kernel alone.
+        let mut region = lock(&self.region);
+        region.twins.reset();
+        call.launch_redirected(new, &mut region.twins, stream)?;
+        call.launch(serving, stream)?;
+        outcome.calls += 1;
+
+        match region.twins.failure() {
+            Some(failure @ ops::Error::Twins { .. }) => {
+                outcome.overflow = Some(format!(
+                    "a call of key {key} needs more than the shadow region of {} bytes: \
+                     {failure}",
+                    region.twins.capacity()
+                ));
+            }
+            Some(failure) => {
+                outcome.failure =
+                    Some(format!("a call's outputs could not be shadowed: {failure}"));
+            }
+            None => {
+                if let Err(error) = region.compare(stream, call.tolerance(), &mut outcome) {
+                    outcome.failure.get_or_insert(error.to_string());
+                }
+            }
+        }
         Ok(true)
     }
 }
 
-/// What a runner's graphs compare paired forwards with: the region shadow outputs are written
-/// in, and the page-locked memory the pairs are copied to.
-pub(crate) struct Shadow {
-    outputs: Arc<Mutex<Twins>>,
-    device: DeviceId,
-    /// The host copies of the real and of the shadow outputs, back to back per pair; grown to
-    /// the largest paired forward compared so far.
-    host: Option<(PinnedBuffer, PinnedBuffer)>,
-}
-
-impl Shadow {
-    /// A shadow over `outputs`, device memory of the scratch pool of `device`.
-    pub(crate) fn new(device: DeviceId, outputs: Twins) -> Self {
-        Self {
-            outputs: Arc::new(Mutex::new(outputs)),
-            device,
-            host: None,
-        }
-    }
-
-    /// The route of one paired forward of `operator` against the kernels `serving` holds, with
-    /// the region emptied for it.
-    pub(crate) fn pairing(&self, operator: &'static str, serving: Arc<Generation>) -> Arc<Pairing> {
-        lock(&self.outputs).reset();
-
-        Arc::new(Pairing {
-            operator,
-            serving,
-            outputs: Arc::clone(&self.outputs),
-            calls: Mutex::new(Vec::new()),
-        })
-    }
-
-    /// Compares the pairs of the paired forward `pairing` routed on `stream`, and returns the
-    /// elements compared; `None` when no pair was, the reason being named in `uncompared`. A
-    /// pair whose two outputs have other sizes cannot be compared: it is named in `uncompared`
-    /// and skipped. A forward whose operator's outputs exceed the region compares nothing: the
-    /// operator is named in `uncompared`, and the batch has no evidence for it. Its calls whose
-    /// shadow outputs had no room launched the new kernel over the forward's own outputs, which
-    /// the serving kernel then wrote again (`ops::Twins`), so the forward still wrote nothing a
-    /// serving request reads. A forward that made no call of the operator is named too.
-    ///
-    /// The copies to the host are issued behind the forward and waited for on their own event.
+impl Region {
+    /// Compares the pairs of the call just launched on `stream` within `tolerance`, adding what
+    /// it compared to `outcome`, and waits for nothing but the call's copies.
     ///
     /// # Errors
     ///
-    /// When a call's outputs could not be shadowed for another reason than the region's size,
-    /// when a pair differs beyond its call's tolerance (the error names how many elements, the
-    /// widest and the bound), or when the driver refuses a copy or the wait.
-    pub(crate) fn compare(
+    /// When a pair differs beyond `tolerance` (the error names how many elements, the widest
+    /// and the bound), or when the driver refuses a copy, the page-locked memory or the wait.
+    fn compare(
         &mut self,
-        pairing: &Pairing,
         stream: &Stream,
-        uncompared: &mut Vec<String>,
-    ) -> Result<Option<u64>> {
-        let calls = std::mem::take(&mut *lock(&pairing.calls));
-        let outputs = lock(&self.outputs);
-        match outputs.failure() {
-            Some(failure @ ops::Error::Twins { .. }) => {
-                uncompared.push(format!(
-                    "`{}`: its outputs in this batch exceed the shadow region of {} bytes: \
-                     {failure}",
-                    pairing.operator,
-                    outputs.capacity()
-                ));
-                return Ok(None);
-            }
-            Some(failure) => {
-                return Err(Error::Invariant(format!(
-                    "the paired forward of `{}` could not shadow a call's outputs: {failure}",
-                    pairing.operator
-                )));
-            }
-            None => {}
-        }
-
+        tolerance: Tolerance,
+        outcome: &mut Outcome,
+    ) -> Result<()> {
         // Each comparable pair: its element type, its element count, its offset in the host
-        // copies, its bytes and the bound of its call.
+        // copies and its bytes.
         let mut pairs = Vec::new();
         let mut total = 0_usize;
-        for (index, pair) in outputs.pairs().iter().enumerate() {
+        for pair in self.twins.pairs() {
             let bytes = pair.real.byte_len()?;
             if bytes != pair.shadow.byte_len()? {
-                uncompared.push(format!(
-                    "`{}`: the real output holds {bytes} bytes of {} and the shadow output {} \
-                     of {}",
-                    pairing.operator,
+                outcome.uncompared.push(format!(
+                    "the real output holds {bytes} bytes of {} and the shadow output {} of {}",
                     ops::abi::name(pair.real.dtype),
                     pair.shadow.byte_len()?,
                     ops::abi::name(pair.shadow.dtype),
@@ -172,25 +157,13 @@ impl Shadow {
                 continue;
             }
 
-            let tolerance = calls
-                .iter()
-                .find(|(end, _)| index < *end)
-                .map(|(_, tolerance)| *tolerance)
-                .ok_or_else(|| {
-                    Error::Invariant("a shadow output belongs to no paired call".into())
-                })?;
-            pairs.push((pair, total, bytes as usize, tolerance));
+            pairs.push((pair.clone(), total, bytes as usize));
             total += bytes as usize;
         }
-
-        if outputs.pairs().is_empty() {
-            uncompared.push(format!(
-                "`{}`: the paired forward made no call of it",
-                pairing.operator
-            ));
-        }
-        if pairs.is_empty() {
-            return Ok(None);
+        // Pairs of no bytes hold no element to compare, and agree.
+        if total == 0 {
+            outcome.pairs += pairs.len();
+            return Ok(());
         }
 
         let held = self.host.as_ref().map_or(0, |(real, _)| real.len());
@@ -200,16 +173,15 @@ impl Shadow {
                 PinnedBuffer::new(self.device, total)?,
             ));
         }
-        // Pairs of no bytes, with nothing allocated for them yet, hold no element to compare.
         let Some((real, shadow)) = &self.host else {
-            return Ok(Some(0));
+            return Ok(());
         };
 
-        for (pair, offset, bytes, _) in &pairs {
-            // SAFETY: both host buffers hold `total` page-locked bytes, of which
-            // `offset..offset + bytes` is this pair's alone; each source is `bytes` bytes of
-            // the shadow region, which nothing writes before the next paired forward, and the
-            // copies are ordered behind the forward on its stream.
+        for (pair, offset, bytes) in &pairs {
+            // SAFETY: both host buffers hold at least `total` page-locked bytes, of which
+            // `offset..offset + bytes` is this pair's alone; the sources are the call's real
+            // outputs and their twins, which no launch writes before the copies, issued right
+            // behind the serving kernel on its stream, have read them.
             unsafe {
                 platform::memcpy_async(
                     real.address() + *offset as u64,
@@ -230,23 +202,88 @@ impl Shadow {
         copied.record(stream)?;
         copied.synchronize()?;
 
-        // SAFETY: the buffers are this shadow's own page-locked memory, read once the copies
+        // SAFETY: the buffers are this region's own page-locked memory, read once the copies
         // into them have completed.
         let (real, shadow) = unsafe { (real.as_slice(), shadow.as_slice()) };
-        let mut elements = 0;
-        for (pair, offset, bytes, tolerance) in pairs {
-            elements += compare_elements(
+        for (pair, offset, bytes) in pairs {
+            outcome.elements += compare_elements(
                 pair.real.dtype,
                 pair.real.numel(),
                 &real[offset..offset + bytes],
                 &shadow[offset..offset + bytes],
                 tolerance,
-            )
-            .map_err(|error| {
-                Error::Invariant(format!("shadow of `{}`: {error}", pairing.operator))
-            })?;
+            )?;
+            outcome.pairs += 1;
         }
-        Ok(Some(elements))
+        Ok(())
+    }
+}
+
+/// What a runner's graphs compare paired forwards with: the region shadow outputs are written
+/// in, and the page-locked memory the pairs are copied to.
+pub(crate) struct Shadow {
+    region: Arc<Mutex<Region>>,
+}
+
+impl Shadow {
+    /// A shadow over `twins`, device memory of the scratch pool of `device`.
+    pub(crate) fn new(device: DeviceId, twins: Twins) -> Self {
+        Self {
+            region: Arc::new(Mutex::new(Region {
+                twins,
+                device,
+                host: None,
+            })),
+        }
+    }
+
+    /// The route of one paired forward of `operator` against the kernels `serving` holds.
+    pub(crate) fn pairing(&self, operator: &'static str, serving: Arc<Generation>) -> Arc<Pairing> {
+        Arc::new(Pairing {
+            operator,
+            serving,
+            region: Arc::clone(&self.region),
+            outcome: Mutex::new(Outcome::default()),
+        })
+    }
+
+    /// What the paired forward `pairing` routed compared: the elements, or `None` when it
+    /// compared no pair, the reason being named in `uncompared`. A pair whose two outputs have
+    /// other sizes cannot be compared: it is named in `uncompared` and skipped. A forward one of
+    /// whose calls needed more than the region compares nothing: the operator is named in
+    /// `uncompared`, and the batch has no evidence for it. A forward that made no call of the
+    /// operator is named too.
+    ///
+    /// # Errors
+    ///
+    /// When a call's outputs could not be shadowed for another reason than the region's size,
+    /// or a pair differed beyond its call's tolerance (the error names how many elements, the
+    /// widest and the bound).
+    pub(crate) fn finish(pairing: &Pairing, uncompared: &mut Vec<String>) -> Result<Option<u64>> {
+        let operator = pairing.operator;
+        let outcome = std::mem::take(&mut *lock(&pairing.outcome));
+
+        if let Some(failure) = outcome.failure {
+            return Err(Error::Invariant(format!(
+                "shadow of `{operator}`: {failure}"
+            )));
+        }
+        uncompared.extend(
+            outcome
+                .uncompared
+                .into_iter()
+                .map(|reason| format!("`{operator}`: {reason}")),
+        );
+        if let Some(overflow) = outcome.overflow {
+            uncompared.push(format!("`{operator}`: {overflow}"));
+            return Ok(None);
+        }
+        if outcome.calls == 0 {
+            uncompared.push(format!(
+                "`{operator}`: the paired forward made no call of it"
+            ));
+        }
+        Ok((outcome.pairs > 0).then_some(outcome.elements))
     }
 }
 

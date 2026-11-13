@@ -67,13 +67,15 @@ pub trait Op {
     /// The new implementation of a replaced operator runs with the same inputs as the old one and
     /// writes into `twins` instead of the real outputs, so the two results can be compared without
     /// the difference of one operator accumulating through the next. An operand the operator
-    /// modifies in place is redirected too, after its current bytes are copied into the twin.
+    /// modifies in place is redirected too ([`Twins::in_place`]), its current bytes copied into
+    /// the twin before the new kernel launches. Nothing is issued here: a counting region states
+    /// what the call's shadow takes ([`Call::shadow_bytes`]).
     ///
     /// The twins borrow is not tied to the arguments' lifetime: `Forward::operate` owns the twins
     /// behind a `RefCell` borrowed for the length of the call, while the argument views carry the
     /// caller's lifetime, and the returned arguments hold views into the twins' buffers rather than
     /// a reference to the twins themselves.
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a>;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a>;
 
     /// How far two implementations of this operator may be from another on this descriptor.
     ///
@@ -107,12 +109,20 @@ pub trait Call {
     fn launch(&self, kernel: &Kernel, stream: &Stream) -> Result<()>;
 
     /// Launches `kernel` with the call's outputs redirected into `twins` ([`Op::shadow`]); the
-    /// redirected arguments are checked first, because the twins are other views than the call's.
+    /// redirected arguments are checked first, because the twins are other views than the call's,
+    /// and the operands the call modifies in place are copied into their twins before the launch.
+    /// A call whose twins do not fit the region launches nothing: its failure is in `twins`
+    /// ([`Twins::failure`]), and a kernel that ran over its real operands instead would write
+    /// them before the serving kernel does.
     ///
     /// # Errors
     ///
-    /// The redirected arguments' refusal, or the launch's failure.
+    /// The redirected arguments' refusal, or a copy's or the launch's failure.
     fn launch_redirected(&self, kernel: &Kernel, twins: &mut Twins, stream: &Stream) -> Result<()>;
+
+    /// The bytes the call's shadow carves from a twin region ([`Op::shadow`]): its outputs and the
+    /// operands it modifies in place, each from a [`crate::twins::ALIGNMENT`] boundary.
+    fn shadow_bytes(&self) -> u64;
 }
 
 /// Where a launching forward sends its calls, when the runtime routes them itself.
@@ -165,8 +175,19 @@ where
     }
 
     fn launch_redirected(&self, kernel: &Kernel, twins: &mut Twins, stream: &Stream) -> Result<()> {
-        let redirected = O::shadow(self.args.clone(), twins, stream);
+        let redirected = O::shadow(self.args.clone(), twins);
+        if twins.failure().is_some() {
+            return Ok(());
+        }
+
         O::check(self.descriptor, &redirected)?;
+        twins.copy_in(stream)?;
         O::launch(kernel, self.descriptor, redirected, stream)
+    }
+
+    fn shadow_bytes(&self) -> u64 {
+        let mut twins = Twins::counting();
+        let _ = O::shadow(self.args.clone(), &mut twins);
+        twins.used()
     }
 }

@@ -367,8 +367,7 @@ impl Op for MoeSort {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         SortArgs {
             tile_to_expert: twins.shadow_of(args.tile_to_expert),
             tile_to_limit: twins.shadow_of(args.tile_to_limit),

@@ -589,11 +589,8 @@ fn load_rank(
     let graphs = crate::runner::Runner::graphs(&profiled);
     let peaks = Peaks {
         graph: graphs.peak(),
-        shadow: graphs.shadow_peak(CausalLmRunner::in_place_bytes(
-            &meta_config,
-            meta.as_ref(),
-            &layout,
-        )?) + scratch_bytes(&meta_config, service::lock(&meta_cache).config()),
+        shadow: graphs.shadow_peak(CausalLmRunner::cache_writes(&meta_config, &layout))
+            + scratch_bytes(&meta_config, service::lock(&meta_cache).config()),
         inputs: graphs.input_peak(),
     };
     drop(profiled);

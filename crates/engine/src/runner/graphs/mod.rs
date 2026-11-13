@@ -7,8 +7,9 @@
 //! - **Profile run.** At load the forward runs under a meta context: it launches nothing and
 //!   yields the bucket's launch table (operator, key and module path of every launch, in launch
 //!   order), the peak of the allocator region, the bytes of its host-to-device copies and the
-//!   outputs of the operator that writes the most over it. The keys are what the engine resolves
-//!   kernels for, and the peaks and outputs are what a device's memory is divided by.
+//!   most one paired call of it carves from a shadow region. The keys are what the engine
+//!   resolves kernels for, and the peaks and the shadow bytes are what a device's memory is
+//!   divided by.
 //! - **Capture.** At warm-up the forward runs eagerly once over idle inputs and is then
 //!   captured, with its launch table, its input copies and its output tensors.
 //! - **Replay.** [`Graphs::prepare_inputs`] takes a slot of the input buffer, lets the runner
@@ -73,7 +74,7 @@ const ALIGNMENT: u64 = ops::allocator::ALIGNMENT;
 type Table = Vec<(&'static str, String, String)>;
 
 /// A launch table as a context records it (`ops::Context::record_launches`): each launch with
-/// the bytes the forward allocated for its outputs.
+/// the bytes a paired launch of it carves from a shadow region (`ops::Call::shadow_bytes`).
 type Recorded = Vec<(&'static str, String, String, u64)>;
 
 /// Input copies: `(offset in a slot's values, device address, bytes)` per copy, in the order the
@@ -130,9 +131,9 @@ struct State {
     update: Update,
     /// The launch table of each profiled bucket.
     profiles: HashMap<Bucket, Table>,
-    /// The outputs of the operator that writes the most in each profiled bucket's forward: the
-    /// bytes of its launches' outputs summed over the forward ([`outputs`]).
-    outputs: HashMap<Bucket, u64>,
+    /// The most one paired call of each profiled bucket's forward carves from a shadow region
+    /// ([`shadowed`]).
+    shadows: HashMap<Bucket, u64>,
     /// The graph of each captured bucket, by the generation it was captured or rebound for.
     graphs: HashMap<(Bucket, u64), Graph>,
     /// The input buffer; made at the first use for graphs that hold no device.
@@ -399,7 +400,7 @@ impl Graphs {
 
     /// Runs the forward of every bucket `runner` states, the captured ones and the eager ones
     /// ([`Runner::eager_buckets`]), under the meta context and keeps each bucket's launch table
-    /// and the outputs of the operator that writes the most in it.
+    /// and the most one paired call of it carves from a shadow region.
     ///
     /// # Errors
     ///
@@ -412,13 +413,13 @@ impl Graphs {
     }
 
     /// Profiles `bucket`: its forward under the meta profile context, whose launch table and
-    /// largest operator outputs ([`outputs`]) these graphs keep.
+    /// largest paired call ([`shadowed`]) these graphs keep.
     fn profile(&self, runner: &dyn Runner, bucket: &Bucket) -> Result<()> {
-        let (table, _, outputs) = self.meta_forward(&self.profile, runner, bucket)?;
+        let (table, _, shadow) = self.meta_forward(&self.profile, runner, bucket)?;
 
         let mut state = self.state.borrow_mut();
         state.profiles.insert(*bucket, table);
-        state.outputs.insert(*bucket, outputs);
+        state.shadows.insert(*bucket, shadow);
         Ok(())
     }
 
@@ -443,29 +444,28 @@ impl Graphs {
         ALIGNMENT + self.inputs.next_multiple_of(ALIGNMENT) + self.profile.peak()
     }
 
-    /// The bytes of the shadow region the paired forwards of the profiled buckets need: twice
-    /// the outputs of the one operator that writes the most in any profiled forward (the bytes
-    /// its launches' outputs took, summed over the forward), or twice `in_place` when that is
-    /// more.
+    /// The bytes of the shadow region the paired forwards of the profiled buckets need: the most
+    /// one launch of any profiled forward carves from it, its outputs and the operands it writes
+    /// in place (`ops::Call::shadow_bytes`), and `cache_writes` beside that.
     ///
-    /// A paired forward pairs one operator, and the region holds, for each of its calls, the
-    /// new kernel's shadow outputs and a copy of the serving kernel's (`ops::Twins`), so twice
-    /// the operator's outputs. `in_place` is the memory one operator of a paired forward writes
-    /// in place that the forward did not allocate, which the shadow path copies too, twice: a
-    /// runner's scratch pages or its request slots' state (the runner states it), zero for a
-    /// runner whose forwards write none. A paired forward whose operator needs more compares
-    /// nothing ([`Graphs::shadow`]).
-    pub(crate) fn shadow_peak(&self, in_place: u64) -> u64 {
-        let outputs = self
+    /// A paired forward compares each paired call as soon as both kernels ran it, so the region
+    /// holds one call's twins at a time ([`Graphs::shadow`]). A paired call is a call of the
+    /// profiled forward over other cache pages: `cache_writes` is what a cache write of a
+    /// paired forward writes in place beyond what the profiled forward's did, the scratch pages'
+    /// planes of one layer (the runner states it), zero for a runner whose paired forwards write
+    /// no other pages. A call that needs more compares nothing, and its batch is reported
+    /// uncompared ([`Graphs::shadow`]).
+    pub fn shadow_peak(&self, cache_writes: u64) -> u64 {
+        let call = self
             .state
             .borrow()
-            .outputs
+            .shadows
             .values()
             .copied()
             .max()
             .unwrap_or(0);
 
-        2 * outputs.max(in_place)
+        call + cache_writes
     }
 
     /// The bytes of host values the largest profiled forward copies to the device: the values
@@ -825,16 +825,16 @@ impl Graphs {
         Ok(done)
     }
 
-    /// Gives these graphs the region the shadow outputs of paired forwards are written in:
+    /// Gives these graphs the region the shadow outputs of paired calls are written in:
     /// device memory of the scratch pool, which no serving forward reads.
     ///
     /// # Errors
     ///
     /// For graphs that hold no device.
-    pub fn set_shadow(&self, outputs: ops::Twins) -> Result<()> {
+    pub fn set_shadow(&self, twins: ops::Twins) -> Result<()> {
         let device = self.cuda()?.stream.device();
 
-        self.state.borrow_mut().shadow = Some(Shadow::new(device, outputs));
+        self.state.borrow_mut().shadow = Some(Shadow::new(device, twins));
         Ok(())
     }
 
@@ -848,8 +848,9 @@ impl Graphs {
     /// The runner prepares the inputs of a paired forward so that it writes no state a serving
     /// request reads. A paired forward it prepared none for ([`Graphs::unpaired`]) runs
     /// nothing and compares nothing: the operator is named in [`Graphs::uncompared`] with the
-    /// runner's reason, and `None` is returned. So is one whose outputs exceed the shadow region
-    /// ([`Graphs::shadow_peak`]).
+    /// runner's reason, and `None` is returned. So is one a call of which needs more than the
+    /// shadow region ([`Graphs::shadow_peak`]). Each paired call is compared as both kernels
+    /// ran it, so the region holds one call's twins at a time.
     ///
     /// # Errors
     ///
@@ -911,14 +912,7 @@ impl Graphs {
         cuda.done.record(&cuda.stream)?;
         outputs?;
 
-        let mut state = self.state.borrow_mut();
-        let State {
-            shadow, uncompared, ..
-        } = &mut *state;
-        let shadow = shadow
-            .as_mut()
-            .ok_or(Error::State("the graphs were given no shadow region"))?;
-        shadow.compare(&pairing, &cuda.stream, uncompared)
+        Shadow::finish(&pairing, &mut self.state.borrow_mut().uncompared)
     }
 
     /// The pairs the paired forwards of the generation being prepared could not compare, each
@@ -1057,8 +1051,8 @@ impl Graphs {
     }
 
     /// Runs `bucket`'s forward under the meta context `context` from an empty allocator, and
-    /// returns its launch table, its input copies and the outputs of the operator that writes
-    /// the most in it ([`outputs`]).
+    /// returns its launch table, its input copies and the most one paired call of it carves
+    /// ([`shadowed`]).
     fn meta_forward(
         &self,
         context: &Context,
@@ -1073,10 +1067,10 @@ impl Graphs {
             runner.forward(bucket)
         };
 
-        let (table, outputs) = outputs(context.take_launches());
+        let (table, shadow) = shadowed(context.take_launches());
         let copies = context.take_input_copies();
         forward?;
-        Ok((table, copies, outputs))
+        Ok((table, copies, shadow))
     }
 
     /// Runs `operation` on the input buffer, making the host ring of graphs that hold no device
@@ -1284,7 +1278,7 @@ impl Graphs {
         };
         cuda.launching.set_profiler(None);
 
-        let (table, _) = outputs(cuda.launching.take_launches());
+        let (table, _) = shadowed(cuda.launching.take_launches());
         let copies = cuda.launching.take_input_copies();
 
         // The slot is free once the stream has passed the copy of the idle inputs.
@@ -1368,7 +1362,7 @@ impl State {
             serving,
             update: Update::Steady,
             profiles: HashMap::new(),
-            outputs: HashMap::new(),
+            shadows: HashMap::new(),
             graphs: HashMap::new(),
             buffer,
             prepared: None,
@@ -1421,18 +1415,18 @@ fn served<'a>(
         .map(|((_, generation), graph)| (*generation, graph))
 }
 
-/// The launch table of the forward `recorded` states, and the outputs of the operator that
-/// writes the most in it: the bytes of each operator's launches summed over the forward, the
-/// largest sum. A graph break writes nothing.
-fn outputs(recorded: Recorded) -> (Table, u64) {
-    let mut written: HashMap<&'static str, u64> = HashMap::new();
+/// The launch table of the forward `recorded` states, and the most one of its launches carves
+/// from a shadow region when it is paired: its outputs and the operands it writes in place. A
+/// graph break carves nothing.
+fn shadowed(recorded: Recorded) -> (Table, u64) {
+    let mut most = 0;
     let mut table = Vec::with_capacity(recorded.len());
 
     for (operator, key, path, bytes) in recorded {
-        *written.entry(operator).or_default() += bytes;
+        most = most.max(bytes);
         table.push((operator, key, path));
     }
-    (table, written.into_values().max().unwrap_or(0))
+    (table, most)
 }
 
 /// Whether two launch tables hold the same launches: the same operators with the same keys in

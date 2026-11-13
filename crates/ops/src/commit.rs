@@ -320,14 +320,14 @@ impl Op for SlotCommit {
         kernel.launch(LaunchGrid::linear(1)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         CommitArgs {
-            future: twins.in_place(args.future, stream),
-            predicates: twins.in_place(args.predicates, stream),
-            logical: twins.in_place(args.logical, stream),
-            sampling: twins.in_place(args.sampling, stream),
-            verified: twins.in_place(args.verified, stream),
-            penalties: twins.in_place(args.penalties, stream),
+            future: twins.in_place(args.future),
+            predicates: twins.in_place(args.predicates),
+            logical: twins.in_place(args.logical),
+            sampling: twins.in_place(args.sampling),
+            verified: twins.in_place(args.verified),
+            penalties: twins.in_place(args.penalties),
             ..args
         }
     }

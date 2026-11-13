@@ -412,26 +412,15 @@ impl CausalLmRunner {
         tokens.div_ceil(page_size.max(1)).saturating_add(rows)
     }
 
-    /// The bytes one operator of a paired forward of a runner of `model` under `config`, over
-    /// a cache of `layout`, may write in place that the forward did not allocate, which the
-    /// shadow path copies beside the operator's outputs (`Graphs::shadow_peak`): the scratch
-    /// page set's planes a cache write writes (`memory::cache::scratch::in_place`), the request
-    /// slots' state the commit writes, or the outputs a runner that speculates keeps, whichever
-    /// is largest, since each is written by other operators.
-    ///
-    /// # Errors
-    ///
-    /// As [`CausalLmRunner::slot_bytes`] and [`CausalLmRunner::kept_bytes`].
-    pub(crate) fn in_place_bytes(
-        config: &CausalLmConfig,
-        model: &dyn TextModel,
-        layout: &CacheLayout,
-    ) -> Result<u64> {
-        let pages = scratch::in_place(layout, config.scratch_pages);
-
-        Ok(pages
-            .max(Self::slot_bytes(config, model)?)
-            .max(Self::kept_bytes(config, model)?))
+    /// The bytes a cache write of a paired forward of a runner under `config`, over a cache of
+    /// `layout`, writes in place beyond what the same call of a profiled forward writes, which
+    /// the shadow region holds beside the largest profiled call (`Graphs::shadow_peak`): one
+    /// layer of the scratch page set (`memory::cache::scratch::in_place`), the pages a paired
+    /// forward's cache writes write instead of the cache's. Zero for a runner that computes no
+    /// paired forward. What every other paired call writes in place, the request slots' state
+    /// and a speculating runner's kept outputs included, is the profiled call's own.
+    pub(crate) fn cache_writes(config: &CausalLmConfig, layout: &CacheLayout) -> u64 {
+        scratch::in_place(layout, config.scratch_pages)
     }
 
     /// The bytes of device memory a runner of `model` that speculates under `config` keeps its

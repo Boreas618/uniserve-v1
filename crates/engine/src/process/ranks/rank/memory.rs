@@ -324,12 +324,48 @@ impl ModelRunner {
     ) -> Result<(u32, u32, u32)> {
         let granularity = granularity(device)?;
         let (share, _) = self.fractions()?;
-        let (now, alone) = unreserved(client, device, share)?;
+        let unreserved = unreserved(client, device, share)?;
+        let transport = self.transport_bytes(device, model)?;
 
+        self.divide_unreserved(
+            unreserved,
+            granularity,
+            host,
+            model,
+            layout,
+            regions,
+            transport,
+        )
+    }
+
+    /// [`Self::divide`] over the bytes the GPU's quota leaves the rank, `(now, alone)` as
+    /// [`unreserved`] states them, for a device of allocation granules of `granularity` bytes:
+    /// the fixed `regions` (the graph and scratch pools, and on a rank that encodes images its
+    /// encoder outputs and image features) and the expert `transport` bytes are taken out, then the
+    /// request slots', and the cache's planes take the rest.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::divide`], but for the measurements.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the division's figures come from the quota, the device, the host group, the \
+                  model, the layout, the pools and the expert union"
+    )]
+    pub(crate) fn divide_unreserved(
+        &self,
+        (now, alone): (u64, u64),
+        granularity: u64,
+        host: &HostGroup,
+        model: &dyn TextModel,
+        layout: &Arc<CacheLayout>,
+        regions: &[(&'static str, u64)],
+        transport: u64,
+    ) -> Result<(u32, u32, u32)> {
         // The pools, the slots and the cache's tables are made at the start, so they fit what
         // the quota holds now; the planes are numbered for what it holds the epoch alone.
         let mut pools = regions.to_vec();
-        pools.push(("expert transport", self.transport_bytes(device, model)?));
+        pools.push(("expert transport", transport));
         let least = fewest_units(layout);
         let left = division::remainder(
             now,

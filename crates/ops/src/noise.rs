@@ -215,8 +215,7 @@ impl Op for PhiloxNoise {
         kernel.launch(plan.grid, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         NoiseArgs {
             out: twins.shadow_of(args.out),
             ..args

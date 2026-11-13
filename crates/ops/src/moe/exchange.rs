@@ -756,8 +756,7 @@ impl Op for ExpertExchange {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         // A dispatch writes only the peer slots inside the transport, which the caller does not see
         // as a tensor, so nothing it returns is compared; a combine writes its own rows.
         if args.out.numel() == 0 {

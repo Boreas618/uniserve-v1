@@ -203,8 +203,7 @@ impl Op for IndexScores {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         IndexScoresArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -376,8 +375,7 @@ impl Op for IndexedAttention {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         IndexedAttentionArgs {
             out: twins.shadow_of(args.out),
             ..args

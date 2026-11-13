@@ -139,11 +139,11 @@ impl Op for CopyStrided {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         // The destination is what is redirected: a redirected source would be compared with
         // itself.
         Args {
-            destination: strided::shadow_window(args.destination, twins, stream),
+            destination: strided::shadow_window(args.destination, twins),
             ..args
         }
     }

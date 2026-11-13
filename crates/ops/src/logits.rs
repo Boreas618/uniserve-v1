@@ -107,8 +107,7 @@ impl Op for LogitsGather {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         GatherArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -238,8 +237,7 @@ impl Op for VocabUnpad {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         UnpadArgs {
             out: twins.shadow_of(args.out),
             ..args

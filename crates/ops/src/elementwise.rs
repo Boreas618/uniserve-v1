@@ -336,8 +336,7 @@ impl Op for ElementwiseUnary {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         UnaryArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -586,8 +585,7 @@ impl Op for ElementwiseBinary {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         BinaryArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -740,8 +738,7 @@ impl Op for ElementwiseWhere {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         WhereArgs {
             out: twins.shadow_of(args.out),
             ..args

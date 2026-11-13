@@ -123,8 +123,7 @@ impl Op for ChannelAffine {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         Args {
             out: twins.shadow_of(args.out),
             ..args

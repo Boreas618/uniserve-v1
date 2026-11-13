@@ -225,14 +225,14 @@ impl Op for KvWrite {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         // The pages are read-modify-write containers: the new kernel writes its twin pages, and the
         // comparison sees the untouched rows as well as the written ones.
         KvWriteArgs {
-            key_cache: twins.in_place(args.key_cache, stream),
-            value_cache: twins.in_place(args.value_cache, stream),
-            key_initialized: twins.in_place(args.key_initialized, stream),
-            value_initialized: twins.in_place(args.value_initialized, stream),
+            key_cache: twins.in_place(args.key_cache),
+            value_cache: twins.in_place(args.value_cache),
+            key_initialized: twins.in_place(args.key_initialized),
+            value_initialized: twins.in_place(args.value_initialized),
             ..args
         }
     }
@@ -462,13 +462,13 @@ impl Op for KvWriteScaled {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         // Every page is read-modify-write here, and so is its scale: the comparison must see the
         // rewritten rows and the grown scale, not only the rows this launch stored.
         ScaledWriteArgs {
-            scales: twins.in_place(args.scales, stream),
-            cache: twins.in_place(args.cache, stream),
-            initialized: twins.in_place(args.initialized, stream),
+            scales: twins.in_place(args.scales),
+            cache: twins.in_place(args.cache),
+            initialized: twins.in_place(args.initialized),
             ..args
         }
     }

@@ -134,9 +134,9 @@ impl Op for VsaZeroPadding {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         ZeroPaddingArgs {
-            values: twins.in_place(args.values, stream),
+            values: twins.in_place(args.values),
             ..args
         }
     }
@@ -245,9 +245,9 @@ impl Op for VsaAddGatedTiles {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         AddGatedTilesArgs {
-            output: twins.in_place(args.output, stream),
+            output: twins.in_place(args.output),
             ..args
         }
     }
@@ -480,8 +480,7 @@ impl Op for VsaComposeGatedRows {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         ComposeGatedRowsArgs {
             output: twins.shadow_of(args.output),
             ..args
@@ -633,8 +632,7 @@ impl Op for VsaSelectTiles {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         SelectTilesArgs {
             indices: twins.shadow_of(args.indices),
             counts: twins.shadow_of(args.counts),
@@ -907,11 +905,11 @@ impl Op for VsaPrepareTiles {
         kernel.launch(LaunchGrid::new([tiles, heads, 1])?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         PrepareTilesArgs {
-            query: twins.in_place(args.query, stream),
-            key: twins.in_place(args.key, stream),
-            value: twins.in_place(args.value, stream),
+            query: twins.in_place(args.query),
+            key: twins.in_place(args.key),
+            value: twins.in_place(args.value),
             pooled_query: twins.shadow_of(args.pooled_query),
             pooled_key: twins.shadow_of(args.pooled_key),
             pooled_value: twins.shadow_of(args.pooled_value),
@@ -1168,8 +1166,7 @@ impl Op for VsaScores {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         ScoresArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -1440,8 +1437,7 @@ impl Op for VsaCompressPooled {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         CompressPooledArgs {
             out: twins.shadow_of(args.out),
             ..args

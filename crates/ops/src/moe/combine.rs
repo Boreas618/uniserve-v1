@@ -278,8 +278,7 @@ impl Op for MoeUnpermute {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         UnpermuteArgs {
             out: twins.shadow_of(args.out),
             ..args

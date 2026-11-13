@@ -333,13 +333,13 @@ impl Op for Index {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         // A scatter updates the destination in place, so its shadow buffer starts as the
         // destination's bytes. A gather writes every element, and its shadow buffer may start as
         // anything: the same bytes serve, which keeps the redirection free of the function the
         // arguments do not name.
         Args {
-            destination: twins.in_place(args.destination, stream),
+            destination: twins.in_place(args.destination),
             ..args
         }
     }

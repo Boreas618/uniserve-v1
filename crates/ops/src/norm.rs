@@ -147,8 +147,7 @@ impl Op for RmsNorm {
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         RmsNormArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -257,10 +256,10 @@ impl Op for AddRmsNorm {
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         AddRmsNormArgs {
             out: twins.shadow_of(args.out),
-            residual_out: twins.in_place(args.residual_out, stream),
+            residual_out: twins.in_place(args.residual_out),
             ..args
         }
     }
@@ -389,8 +388,7 @@ impl Op for GatedRmsNorm {
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         GatedRmsNormArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -519,8 +517,7 @@ impl Op for LayerNorm {
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         LayerNormArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -613,8 +610,7 @@ impl Op for Softmax {
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         SoftmaxArgs {
             out: twins.shadow_of(args.out),
             ..args

@@ -7,7 +7,7 @@
 //! states it and a captured graph's node for it can be found; and it is offered to the context's
 //! route, so execution can run two implementations of it side by side.
 
-use crate::{Checked, Op};
+use crate::{Call, Checked, Op};
 
 use crate::context::{self, Context};
 use crate::{Error, Result, profiler};
@@ -22,9 +22,9 @@ use crate::{Error, Result, profiler};
 /// and every call without a route, is one launch of that kernel on the context's stream.
 ///
 /// While the context records a launch table, each call adds `(O::NAME, key, module path,
-/// bytes)` to it, whichever way the call went, `bytes` being the outputs the forward allocated
-/// for it ([`Context::record_launches`]). A call the route took is one entry, however many
-/// kernels the route launched for it.
+/// bytes)` to it, whichever way the call went, `bytes` being what a paired launch of the call
+/// carves from a twin region ([`Call::shadow_bytes`](crate::Call::shadow_bytes)). A call the
+/// route took is one entry, however many kernels the route launched for it.
 ///
 /// # Errors
 ///
@@ -54,11 +54,15 @@ where
     };
 
     // Every launch of a serving step passes through here and a recording is the exception, so
-    // the key is formatted only when the table will hold it.
-    let key = recording.then(|| crate::descriptor::key(descriptor));
+    // the key and the shadow's bytes are computed only when the table will hold them.
+    let recorded = recording.then(|| {
+        let shadow = Checked::<O>::new(descriptor, args.clone()).shadow_bytes();
+        (crate::descriptor::key(descriptor), shadow)
+    });
+    let key = recorded.as_ref().map(|(key, _)| key);
 
     if let (Some(stream), Some(kernels)) = (context.stream(), kernels) {
-        let kernel = match &key {
+        let kernel = match key {
             Some(key) => kernels.kernel(O::NAME, key),
             None => kernels.op::<O>(descriptor),
         }
@@ -80,24 +84,20 @@ where
         }
     }
 
-    if let Some(key) = key {
-        record(&context, O::NAME, key);
+    if let Some((key, shadow)) = recorded {
+        record(&context, O::NAME, key, shadow);
     }
     Ok(())
 }
 
 /// Adds a launch of `operator` with `key` to the launch table `context` is recording, under the
-/// innermost profiler range, with the bytes the context's allocator handed out since the
-/// table's previous launch.
-fn record(context: &Context, operator: &'static str, key: String) {
-    let handed = context.allocator().allocated();
-    let mut guard = context.state();
-    let state = &mut *guard;
+/// innermost profiler range, with the `shadow` bytes a paired launch of it carves.
+fn record(context: &Context, operator: &'static str, key: String, shadow: u64) {
+    let mut state = context.state();
     let path = profiler::path(&state.paths);
 
     if let Some(launches) = state.launches.as_mut() {
-        launches.push((operator, key, path, handed.saturating_sub(state.handed)));
-        state.handed = handed;
+        launches.push((operator, key, path, shadow));
     }
 }
 
@@ -163,36 +163,39 @@ pub(crate) mod tests {
         launch::<RmsNorm>(&descriptor(8), args(8, 8)).unwrap();
         launch::<RmsNorm>(&descriptor(16), args(16, 16)).unwrap();
 
-        // The calls' operands are memory no allocator handed out.
+        // Each entry states the bytes a paired launch of the call carves: its one output, two
+        // rows of eight and of sixteen BF16 elements.
         assert_eq!(
             context.take_launches(),
             [
-                ("rms_norm", descriptor(8).to_string(), String::new(), 0),
-                ("rms_norm", descriptor(16).to_string(), String::new(), 0),
+                (
+                    "rms_norm",
+                    descriptor(8).to_string(),
+                    String::new(),
+                    2 * 8 * 2
+                ),
+                (
+                    "rms_norm",
+                    descriptor(16).to_string(),
+                    String::new(),
+                    2 * 16 * 2
+                ),
             ]
         );
     }
 
     #[test]
-    fn a_launch_states_the_bytes_the_forward_allocated_for_it() {
+    fn a_launch_states_what_its_shadow_carves_whatever_the_forward_allocated() {
         let context = Context::meta(None);
         let _guard = context.enter();
-
-        // A tensor allocated before the recording begins is no launch's.
-        let _before = crate::empty(64, DType::BF16).unwrap();
         context.record_launches();
 
-        // Two outputs before the first launch, of 400 and 2 bytes, each taken as whole blocks
-        // of the allocator's alignment; none before the second; one of 512 bytes before the
-        // third, counted although the block the first launch's dropped outputs left serves it.
-        let first = (
-            crate::empty(200, DType::BF16).unwrap(),
-            crate::empty(2, DType::U8).unwrap(),
-        );
-        launch_rms_norm().unwrap();
-        drop(first);
-        launch_rms_norm().unwrap();
-        let _third = crate::empty(128, DType::F32).unwrap();
+        // Tensors the forward allocates around the launches are none of their bytes: each launch
+        // states its own output's twin, two rows of 1000 elements and then two rows of eight,
+        // each twin from a 256-byte boundary.
+        let _before = crate::empty(4096, DType::BF16).unwrap();
+        launch::<RmsNorm>(&descriptor(1000), args(1000, 1000)).unwrap();
+        let _after = crate::empty(4096, DType::BF16).unwrap();
         launch_rms_norm().unwrap();
 
         let bytes: Vec<u64> = context
@@ -200,7 +203,7 @@ pub(crate) mod tests {
             .into_iter()
             .map(|(_, _, _, bytes)| bytes)
             .collect();
-        assert_eq!(bytes, [512 + 256, 0, 512]);
+        assert_eq!(bytes, [2 * 1000 * 2, 2 * 8 * 2]);
     }
 
     #[test]

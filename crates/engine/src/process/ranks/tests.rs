@@ -985,3 +985,155 @@ fn a_device_holds_a_rank_of_the_text_group_and_one_of_a_flow_replica() {
     drop(spawned);
     client.close().unwrap();
 }
+
+/// The released checkpoint deliverable E1 serves (`artifacts/buffer-pool/e1/protocol.md`).
+const QWEN3_30B: &str = "/workspace/models/Qwen3-30B-A3B";
+
+/// The bytes of one GB200, whose quota at a fraction of 0.70 is the 138528423936 bytes E1's
+/// deployment is refused or admitted against, and the granule its exportable allocations take.
+const GB200_BYTES: u64 = 197_897_748_480;
+const GB200_GRANULE: u64 = 2 << 20;
+
+/// What the Storage Server measured of E1's deployment on that GPU as it admitted the rank
+/// (`artifacts/buffer-pool/pf1/measure/failed/branch-416dd3b7d-serve.log`, its reservations): the
+/// checkpoint's weights as the server retains them, granule-packed, and the warm process beside
+/// its pools and the server's storages, measured after its warm-up, its request slots' storages
+/// and its cache's tables included.
+const RETAINED_WEIGHTS: u64 = 61_066_969_088;
+const WARM_PROCESS: u64 = 8_604_614_656;
+
+/// E1's launch: one rank of one GPU serving [`QWEN3_30B`] as the protocol's command states it
+/// (`--max-running-requests 128 --mem-fraction-static 0.70 --set
+/// kv_cache_config.max_tokens=131072`), with the checkpoint's 40960-token context and the
+/// daemon's defaults otherwise: 20 log-probability candidates and the default graph tiers.
+fn e1_launch() -> EngineArgs {
+    let mut launch = launch();
+    let config = &mut launch.engine_config;
+
+    config.model.model = QWEN3_30B.to_owned();
+    config.model.max_model_len = 40_960;
+    config.max_running_requests = std::num::NonZeroUsize::new(128).unwrap();
+    config.mem_fraction_static = 0.70;
+    config.max_logprobs = 20;
+    config.kv_cache.max_tokens = std::num::NonZeroU64::new(131_072);
+    config.cuda_graph = Default::default();
+    launch
+}
+
+/// The bytes of the tensors of a checkpoint's safetensors shards, as their headers state them:
+/// each shard's bytes past its eight-byte header length and its header.
+fn checkpoint_bytes(directory: &str) -> u64 {
+    let mut total = 0;
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "safetensors")
+        {
+            continue;
+        }
+
+        let mut length = [0_u8; 8];
+        std::io::Read::read_exact(&mut std::fs::File::open(&path).unwrap(), &mut length).unwrap();
+        total += std::fs::metadata(&path).unwrap().len() - 8 - u64::from_le_bytes(length);
+    }
+    total
+}
+
+/// E1's text rank started on the meta device from the released checkpoint's headers: its profile
+/// run sizes its pools, and its division of a GB200's quota at 0.70 holds every reservation the
+/// Storage Server admits it with: the weights, the cache's 131072 tokens in whole segments, the
+/// graph pool, the scratch pool of the shadow region and the scratch page set, and the warm
+/// process with its 128 request slots.
+#[test]
+#[ignore = "reads the headers of the released Qwen3-30B-A3B checkpoint, which the repository does not hold"]
+fn the_e1_deployment_starts_within_its_gpu_s_quota_at_a_fraction_of_0_70() {
+    assert!(
+        Path::new(QWEN3_30B).is_dir(),
+        "the text rank loads the headers of {QWEN3_30B}, which is missing"
+    );
+    let launch = e1_launch();
+    let ranks = loaded(&launch);
+    assert_eq!(ranks.len(), 1);
+    let rank = &ranks[0];
+    let text = rank.text().unwrap();
+    let layout = std::sync::Arc::clone(service::lock(&text.cache).layout());
+
+    // The server retains the checkpoint's tensors, packed into whole granules.
+    let checkpoint = checkpoint_bytes(QWEN3_30B);
+    assert!(
+        checkpoint <= RETAINED_WEIGHTS && RETAINED_WEIGHTS - checkpoint < 64 * GB200_GRANULE,
+        "the checkpoint's {checkpoint} bytes against the {RETAINED_WEIGHTS} retained"
+    );
+
+    // The catalogue's largest bucket is 128 rows of 16384 tokens, and the scratch page set of the
+    // rank's paired forwards is that bucket's pages, `ceil(16384 / 64) + 128`.
+    assert_eq!(rank.model_runner.buckets().bounds(), (128, 16_384));
+    assert_eq!(text.config.scratch_pages, 256 + 128);
+
+    // The pools as the device maps them: the graph pool the runner's region, and the scratch pool
+    // the shadow region beside the scratch page set, each in whole granules.
+    let peaks = text.peaks;
+    let scratch_set = crate::process::ranks::rank::memory::scratch_bytes(
+        &text.config,
+        service::lock(&text.cache).config(),
+    );
+    let shadow = peaks.shadow - scratch_set;
+    let (graph, scratch) = crate::memory::division::pool_bytes(
+        GB200_GRANULE,
+        &[peaks.graph],
+        &[peaks.shadow],
+        layout.state_snapshot_bytes(),
+    );
+
+    // The shadow region holds one paired call: the most one launch of a profiled forward carves,
+    // beside the scratch page set's planes one layer's cache write writes in place, the key and
+    // value planes of 384 pages of 64 tokens of four heads of 128 BF16 elements and their flags.
+    let cache_writes =
+        crate::runner::causal_lm::CausalLmRunner::cache_writes(&text.config, &layout);
+    assert_eq!(cache_writes, 2 * 384 * 65_536 + 2 * 512);
+    assert!(shadow > cache_writes);
+
+    // The division of what the quota leaves once the weights and the warm process are held: the
+    // deployment's 128 request slots, and the 2048 units of 131072 tokens in whole segments.
+    let limit = crate::memory::client::quota_limit(GB200_BYTES, 0.70);
+    assert_eq!(limit, 138_528_423_936);
+    let unreserved = limit - RETAINED_WEIGHTS - WARM_PROCESS;
+    let host = crate::parallel::host::HostGroup::single();
+    let (slots, units, first) = rank
+        .model_runner
+        .divide_unreserved(
+            (unreserved, unreserved),
+            GB200_GRANULE,
+            &host,
+            text.model.as_ref(),
+            &layout,
+            &[("graph pool", graph), ("scratch pool", scratch)],
+            0,
+        )
+        .unwrap();
+    assert_eq!(slots, 128);
+    assert!(units >= 2048, "the cache holds {units} units");
+    assert_eq!(
+        first, units,
+        "a first epoch creates every unit at its start"
+    );
+
+    // Every reservation the Storage Server admits the rank with, and what the quota leaves. The
+    // warm process holds the request slots' storages, which are counted a second time here, as
+    // the division counts them beside the process it measures before its warm-up.
+    let slot_storage = rank
+        .model_runner
+        .slot_storage(text.model.as_ref(), &layout, slots)
+        .unwrap();
+    let planes = u64::from(units) * layout.unit_bytes;
+    let reserved = RETAINED_WEIGHTS + planes + graph + scratch + WARM_PROCESS;
+    eprintln!(
+        "E1 at 0.70 of a GB200: limit {limit}; weights {RETAINED_WEIGHTS}; cache {units} units, \
+         {planes} bytes; graph pool {graph}; scratch pool {scratch} (shadow region {shadow}, \
+         scratch page set {scratch_set}); request slots {slots}, {slot_storage} bytes (in the warm \
+         process); warm process {WARM_PROCESS}; reserved {reserved}; left {}",
+        limit - reserved
+    );
+    assert!(reserved + slot_storage <= limit);
+}

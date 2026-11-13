@@ -269,10 +269,9 @@ impl Op for PageConversion {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         ConversionArgs {
-            scratch: twins.in_place(args.scratch, stream),
+            scratch: twins.in_place(args.scratch),
             ..args
         }
     }
@@ -515,11 +514,11 @@ impl Op for CacheCopyRegion {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         CopyRegionArgs {
-            values: twins.in_place(args.values, stream),
-            scale: args.scale.map(|scale| twins.in_place(scale, stream)),
-            initialized: twins.in_place(args.initialized, stream),
+            values: twins.in_place(args.values),
+            scale: args.scale.map(|scale| twins.in_place(scale)),
+            initialized: twins.in_place(args.initialized),
             ..args
         }
     }

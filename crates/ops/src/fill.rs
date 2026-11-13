@@ -138,9 +138,9 @@ impl Op for Fill {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         Args {
-            destination: strided::shadow_window(args.destination, twins, stream),
+            destination: strided::shadow_window(args.destination, twins),
             ..args
         }
     }

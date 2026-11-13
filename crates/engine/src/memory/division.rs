@@ -34,29 +34,27 @@
 //!
 //! ## The shadow region's bound
 //!
-//! A paired forward launches every call of one operator whose kernel changed twice, and the
-//! runner's shadow region holds, per output of each such call, the new kernel's shadow output
-//! and a copy of the serving kernel's output (`ops::Twins::freeze`), each rounded up to
-//! `ops::twins::ALIGNMENT`. An operand the call writes in place is copied into the region
-//! before the new kernel writes it and again once the serving kernel has (`ops::Twins::in_place`).
-//! The region is emptied between paired forwards, not between calls, because the pairs are
-//! compared after the forward. A runner's shadow region therefore needs, for the operator that
-//! writes the most in any one forward of the runner's buckets, twice the sum of the aligned
-//! bytes that operator's calls write.
+//! A paired forward launches every call of one operator whose kernel changed twice: the new
+//! kernel into twins carved from the runner's shadow region (`ops::Op::shadow`), the serving
+//! kernel into the real outputs. Each call is compared as soon as both kernels ran it: its pairs
+//! are copied to page-locked host memory right behind the serving kernel, before any later
+//! launch writes over the real outputs, and compared there (`Graphs::shadow`). The region
+//! therefore holds one call's twins at a time: the call's outputs and the operands it writes in
+//! place, each from an `ops::twins::ALIGNMENT` boundary.
 //!
-//! The forward's activation peak does not bound that sum: the context's allocator gives a
-//! freed block out again, so the outputs one operator writes over a forward of many layers
-//! add up to more than the forward ever holds at once. The figure is the profile run's:
-//! each launch of a recorded launch table states the bytes the context's allocator handed out
-//! for it, its outputs (`ops::Context::record_launches`), and `Graphs::shadow_peak` sums them
-//! per operator over each profiled forward and states twice the largest sum. Memory a call
-//! writes in place that the forward did not allocate is not in that sum; the runner states the
-//! most one operator of its paired forward writes so (a causal runner's scratch page set, its
-//! request slots' state or its kept outputs: `CausalLmRunner::in_place_bytes`), and the region
-//! holds twice that when it is more. An operand a call writes in place that the forward
-//! allocated for an earlier launch is counted with that launch. A paired forward whose
-//! operator needs more than the region compares nothing: the update names the operator and the
-//! batch uncompared (`Graphs::shadow`).
+//! The figure is the profile run's: each launch of a recorded launch table states the bytes its
+//! shadow carves (`ops::Call::shadow_bytes`, `ops::Context::record_launches`), the request
+//! slots' state a commit writes and the outputs a speculating runner keeps included, and
+//! `Graphs::shadow_peak` takes the largest over every profiled forward. A paired forward
+//! computes over other pages than the profiled one: its cache writes write the scratch page
+//! set's planes of one layer in place (`CausalLmRunner::cache_writes`), which the region holds
+//! beside the largest call. A paired call that needs more than the region launches the serving
+//! kernel alone and compares nothing: the update names the operator and the batch uncompared.
+//!
+//! The region is held from the rank's start, as the pools are, and not taken when an update is
+//! prepared: a cache that fills the rank's share (no `kv_cache_config.max_tokens`) leaves no
+//! memory to take then, and every update of the deployment compares its changed kernels on
+//! served batches.
 //!
 //! ## The scratch page set
 //!

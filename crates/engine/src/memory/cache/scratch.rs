@@ -53,11 +53,11 @@ pub(crate) fn bytes(layout: &CacheLayout, pages: u32, width: u32) -> u64 {
     total + taken(u64::from(pages) * u64::from(table_width(pages, width)) * 4)
 }
 
-/// The bytes the shadow path copies when the cache writes of a paired forward write a set of
-/// `pages` pages of a cache of `layout` in place (`ops::Twins::in_place`): each layer's key and
-/// value planes over the set, their flags, their scales for an FP8 cache and the layer's index
-/// keys, each copy rounded up to `ops::twins::ALIGNMENT`, over every column. Zero for a set of
-/// no pages.
+/// The bytes the shadow path copies when a cache write of a paired forward writes one layer of
+/// a set of `pages` pages of a cache of `layout` in place (`ops::Twins::in_place`): the layer's
+/// key and value planes over the set, their flags, their scales for an FP8 cache and the
+/// layer's index keys, each copy from an `ops::twins::ALIGNMENT` boundary. A paired call is one
+/// layer's write, and the region holds one call's twins. Zero for a set of no pages.
 pub(crate) fn in_place(layout: &CacheLayout, pages: u32) -> u64 {
     let pages = u64::from(pages);
     let copy = |bytes: u64| bytes.next_multiple_of(ops::twins::ALIGNMENT);
@@ -69,7 +69,7 @@ pub(crate) fn in_place(layout: &CacheLayout, pages: u32) -> u64 {
     if layout.index_bytes() > 0 {
         column += copy(pages * layout.index_bytes());
     }
-    u64::from(layout.columns) * column
+    column
 }
 
 /// The pages a row of a set of `pages` pages' table names, for a cache whose pooled tables are
@@ -533,15 +533,23 @@ mod tests {
         Ok(())
     }
 
-    /// A paired forward's cache writes copy every layer's planes and flags over the set: the
-    /// figure is the set of 384 BF16 pages of 64 tokens over 48 layers of four heads of 128.
+    /// A cache write of a paired forward copies one layer's planes and flags over the set: the
+    /// figure is the set of 384 BF16 pages of 64 tokens of a cache of 48 layers of four heads of
+    /// 128, whatever its layer count.
     #[test]
-    fn the_cache_writes_of_a_paired_forward_copy_every_layer_of_the_set() {
+    fn a_cache_write_of_a_paired_forward_copies_one_layer_of_the_set() {
         let layout = CacheLayout::dense(64, 48, 4, 128, PrefixCacheDtype::BFloat16);
 
-        // Each layer's two planes of 384 pages of 64 KiB, and its two flag planes of 384 bytes,
+        // The layer's two planes of 384 pages of 64 KiB, and its two flag planes of 384 bytes,
         // each copy taking whole blocks of 256 bytes.
-        assert_eq!(in_place(&layout, 384), 48 * (2 * 384 * 65_536 + 2 * 512));
+        assert_eq!(in_place(&layout, 384), 2 * 384 * 65_536 + 2 * 512);
+        assert_eq!(
+            in_place(
+                &CacheLayout::dense(64, 2, 4, 128, PrefixCacheDtype::BFloat16),
+                384
+            ),
+            in_place(&layout, 384)
+        );
         assert_eq!(in_place(&layout, 0), 0);
     }
 

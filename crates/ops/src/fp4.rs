@@ -268,8 +268,7 @@ impl Op for Nvfp4Quantize {
         kernel.launch(LaunchGrid::covering(elements, 1)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         QuantizeArgs {
             values: twins.shadow_of(args.values),
             scales: twins.shadow_of(args.scales),
@@ -554,8 +553,7 @@ impl Op for Nvfp4Gemm {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         GemmArgs {
             out: twins.shadow_of(args.out),
             ..args

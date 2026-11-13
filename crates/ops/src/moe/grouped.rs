@@ -364,8 +364,7 @@ impl Op for GatherGemm {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         GatherGemmArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -502,8 +501,7 @@ impl Op for RouteGemm {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         RouteGemmArgs {
             out: twins.shadow_of(args.out),
             ..args
@@ -1163,8 +1161,7 @@ impl Op for GatherGemmNvfp4 {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         GatherGemmNvfp4Args {
             out: twins.shadow_of(args.out),
             ..args
@@ -1581,8 +1578,7 @@ impl Op for RouteGemmNvfp4 {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         RouteGemmNvfp4Args {
             out: twins.shadow_of(args.out),
             ..args

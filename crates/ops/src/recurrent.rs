@@ -445,12 +445,12 @@ impl Op for CausalConv1d {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         // The state banks are read and rewritten in place, so the shadow runs on copies of them.
         CausalConv1dArgs {
             out: twins.shadow_of(args.out),
-            state: twins.in_place(args.state, stream),
-            checkpoint: twins.in_place(args.checkpoint, stream),
+            state: twins.in_place(args.state),
+            checkpoint: twins.in_place(args.checkpoint),
             trail: args.trail.map(|trail| Trail {
                 bank: twins.shadow_of(trail.bank),
             }),
@@ -802,12 +802,12 @@ impl Op for GatedDeltaRule {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         // The state banks are read and rewritten in place, so the shadow runs on copies of them.
         GatedDeltaRuleArgs {
             out: twins.shadow_of(args.out),
-            state: twins.in_place(args.state, stream),
-            checkpoint: twins.in_place(args.checkpoint, stream),
+            state: twins.in_place(args.state),
+            checkpoint: twins.in_place(args.checkpoint),
             trail: args.trail.map(|trail| Trail {
                 bank: twins.shadow_of(trail.bank),
             }),

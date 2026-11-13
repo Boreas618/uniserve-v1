@@ -75,9 +75,6 @@ pub(crate) struct State {
     /// The launch table being recorded, as `(operator, key, module path, bytes)` in launch
     /// order, or `None` while none is ([`Context::record_launches`]).
     pub(crate) launches: Option<Vec<(&'static str, String, String, u64)>>,
-    /// The bytes the allocator had handed out since the reset when the recorded table's last
-    /// launch was made, or its recording began: where the next launch's bytes start.
-    pub(crate) handed: u64,
     /// The paths of the profiler ranges the forward is inside, outermost first. A range adds its
     /// path only while a launch table is being recorded, the table being its one reader.
     pub(crate) paths: Vec<String>,
@@ -164,7 +161,6 @@ impl Context {
         let mut state = self.state();
         state.input_cursor = 0;
         state.input_copies.clear();
-        state.handed = 0;
     }
 
     /// The furthest byte of the region any forward reached.
@@ -196,21 +192,14 @@ impl Context {
     /// Starts the recording of a launch table: `(operator, key, module path, bytes)` per launch,
     /// in launch order. A table already being recorded is dropped.
     ///
-    /// `bytes` is what the context's allocator handed out between the launch before (or the
-    /// start of the recording) and this one: the outputs the forward allocates for the call,
-    /// which an operation takes from the allocator right before it launches, each block
-    /// rounded up to the allocator's alignment. Memory the call writes in place that the
-    /// forward did not allocate for it is not counted. A graph break's entry states zero, and
-    /// what was handed out before it is the next launch's.
+    /// `bytes` is what a paired launch of the call carves from a twin region
+    /// ([`Call::shadow_bytes`](crate::Call::shadow_bytes)): its outputs and the operands it
+    /// writes in place, each twin from a 256-byte boundary. A graph break's entry states zero.
     ///
     /// Execution starts and takes a table outside the forward it records, so a profiler range
     /// lies wholly inside or wholly outside the recording.
     pub fn record_launches(&self) {
-        let handed = self.allocator.allocated();
-        let mut state = self.state();
-
-        state.launches = Some(Vec::new());
-        state.handed = handed;
+        self.state().launches = Some(Vec::new());
     }
 
     /// Ends the recording and returns the launch table; empty when none was being recorded.
@@ -378,7 +367,6 @@ impl State {
             profiler: None,
             breaks: None,
             launches: None,
-            handed: 0,
             paths: Vec::new(),
             input_memory: None,
             input_cursor: 0,

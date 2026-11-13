@@ -202,8 +202,7 @@ impl Op for CacheBlockSnapshot {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        let _ = stream;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         SnapshotArgs {
             snapshot: twins.shadow_of(args.snapshot),
             ..args
@@ -287,11 +286,11 @@ impl Op for CacheBlockScatter {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         // The field is written in place, so the shadow runs on a copy of it and the snapshot is read
         // from the caller's.
         ScatterArgs {
-            field: twins.in_place(args.field, stream),
+            field: twins.in_place(args.field),
             ..args
         }
     }

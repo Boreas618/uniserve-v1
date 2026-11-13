@@ -260,12 +260,12 @@ impl Op for CopyBlock {
         kernel.launch(grid, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins) -> Self::Args<'a> {
         // The destination is shadowed: a shadow of the source would compare the source with
         // itself and could never fail. The destination is a strided block of a larger tensor, so
         // its shadow is the storage the block reaches, with the block's strides inside it.
         Args {
-            out: crate::strided::shadow_window(args.out, twins, stream),
+            out: crate::strided::shadow_window(args.out, twins),
             ..args
         }
     }
