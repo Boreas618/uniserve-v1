@@ -428,6 +428,59 @@ impl Region {
     }
 }
 
+/// A region in an image of format 1 (`super::image::format1`), which states
+/// no memory a region lies in.
+pub(super) mod format1 {
+    use std::collections::BTreeMap;
+
+    use serde::Deserialize;
+    use storage::protocol::Key;
+    use storage::runtime::Tier;
+
+    use super::Run;
+
+    /// A region in format 1, its fields in their order there.
+    #[derive(Deserialize)]
+    pub(in crate::buffer_pool) struct Region {
+        name: String,
+        tier: Tier,
+        space: u8,
+        unit_bytes: u64,
+        part_bytes: u64,
+        free: BTreeMap<u32, Run>,
+        outside: BTreeMap<u32, Run>,
+        units: u32,
+        span: (u32, u32),
+        returned: Vec<u32>,
+        orders: BTreeMap<(u32, u16), Vec<Key>>,
+    }
+
+    impl From<Region> for super::Region {
+        /// The region, its units existing in every memory that maps it; its
+        /// counts are made again from the pool's holders, as an image's are.
+        fn from(region: Region) -> Self {
+            Self {
+                name: region.name,
+                tier: region.tier,
+                space: region.space,
+                unit_bytes: region.unit_bytes,
+                part_bytes: region.part_bytes,
+                memory: None,
+                free: region.free,
+                outside: region.outside,
+                units: region.units,
+                span: region.span,
+                returned: region.returned,
+                orders: region.orders,
+                free_units: 0,
+                evictable: 0,
+                retiring: 0,
+                installed: BTreeMap::new(),
+            }
+        }
+    }
+}
+
 /// Inserts a run into a list of runs by first unit, joining it with the runs
 /// that end where it begins or begin where it ends.
 fn insert_joined(runs: &mut BTreeMap<u32, Run>, mut run: Run) {

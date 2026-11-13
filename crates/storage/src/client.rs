@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    Claim, ClientMessage, Event, Hello, HostCopy, Item, Key, Link, Listing, Location, Mode,
+    Claim, ClientMessage, Event, Hello, HostCopy, Item, Key, Link, Listing, Location, Mode, OLDEST,
     Priority, Quota, Region, RegionPart, Registration, Request, Response, Role, Scope, Segment,
     ServerMessage, Span, StorageRecord, TaskStatus, TensorRecord, Tensors, Throttle, UnitRun,
     Usage, VERSION, Welcome,
@@ -36,6 +36,10 @@ use service::Connection;
 /// A connection to a Storage Server.
 pub struct Client {
     connection: Connection,
+    /// The protocol version the connection speaks, as the server's welcome
+    /// stated it: this build's [`VERSION`], or [`OLDEST`] with a server of
+    /// that version.
+    version: u32,
     /// How long a blocking call waits for its response: unbounded on this host, the timeout
     /// given for another host's server ([`Client::connect_remote`]).
     timeout: Duration,
@@ -96,16 +100,30 @@ impl Client {
             role,
         }))?;
         match receive(&mut connection, timeout)?.0 {
-            ServerMessage::Welcome(Welcome::Accepted { .. }) => Ok(Self {
-                connection,
-                timeout,
-                next: 1,
-                responses: HashMap::new(),
-                events: VecDeque::new(),
-            }),
+            ServerMessage::Welcome(Welcome::Accepted { version })
+                if (OLDEST..=VERSION).contains(&version) =>
+            {
+                Ok(Self {
+                    connection,
+                    version,
+                    timeout,
+                    next: 1,
+                    responses: HashMap::new(),
+                    events: VecDeque::new(),
+                })
+            }
+            ServerMessage::Welcome(Welcome::Accepted { version }) => Err(Error::Protocol(format!(
+                "the server speaks protocol {version}, this client {OLDEST} to {VERSION}"
+            ))),
             ServerMessage::Welcome(Welcome::Refused { message }) => Err(Error::Refused(message)),
             other => Err(Error::Protocol(format!("{other:?} before a welcome"))),
         }
+    }
+
+    /// The protocol version the connection speaks, which the server's
+    /// welcome stated.
+    pub fn version(&self) -> u32 {
+        self.version
     }
 
     /// The connection's socket and the next request identity, for another
@@ -127,10 +145,12 @@ impl Client {
         Ok((handed.descriptor, self.next))
     }
 
-    /// Goes on with a Unix connection on this host another process passed on.
-    fn resume(descriptor: OwnedFd, next: u64) -> Result<Self> {
+    /// Goes on with a Unix connection on this host another process passed
+    /// on, which speaks `version`.
+    fn resume(descriptor: OwnedFd, version: u32, next: u64) -> Result<Self> {
         Ok(Self {
             connection: Connection::new(UnixStream::from(descriptor))?,
+            version,
             timeout: Duration::MAX,
             next,
             responses: HashMap::new(),
@@ -788,6 +808,17 @@ pub struct ClaimHandoff {
     pub epochs: BTreeMap<u64, Vec<Scope>>,
     /// The connection's next request identity.
     pub next: u64,
+    /// The protocol version the connection speaks. A daemon of a build
+    /// before connections carried their version states none, and its
+    /// connection is taken to speak [`OLDEST`].
+    #[serde(default = "earliest")]
+    pub version: u32,
+}
+
+/// The version a claim's connection is taken to speak when its handoff
+/// states none.
+fn earliest() -> u32 {
+    OLDEST
 }
 
 impl ClaimClient {
@@ -894,12 +925,14 @@ impl ClaimClient {
     ///
     /// Fails when the connection has unread messages.
     pub fn handoff(self) -> Result<(ClaimHandoff, OwnedFd)> {
+        let version = self.client.version;
         let (descriptor, next) = self.client.handoff()?;
         let handoff = ClaimHandoff {
             deployment: self.deployment,
             claim: self.claim,
             epochs: self.epochs,
             next,
+            version,
         };
         Ok((handoff, descriptor))
     }
@@ -912,7 +945,7 @@ impl ClaimClient {
     /// Fails when the connection cannot be configured.
     pub fn resume(handoff: ClaimHandoff, descriptor: OwnedFd) -> Result<Self> {
         Ok(Self {
-            client: Client::resume(descriptor, handoff.next)?,
+            client: Client::resume(descriptor, handoff.version, handoff.next)?,
             deployment: handoff.deployment,
             claim: handoff.claim,
             epochs: handoff.epochs,

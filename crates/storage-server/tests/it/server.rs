@@ -82,6 +82,38 @@ impl Running {
         let socket = directory.path().join("storage.sock");
         let transfer = transfer(&socket);
         let (listener, lock) = service::bind(&socket).unwrap().unwrap();
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        Self::on_thread(directory, socket, address, move || {
+            let mut server = Server::new(listener, host_reserve, None, transfer).unwrap();
+            configure(&mut server);
+            server.listen_tcp(tcp).unwrap();
+            (server, lock)
+        })
+    }
+
+    /// The server a restart in place passed on, `resumed` with the lock of
+    /// its socket `socket` in `directory`.
+    pub(crate) fn resumed(
+        directory: tempfile::TempDir,
+        socket: PathBuf,
+        resumed: (Server, OwnedFd),
+    ) -> Self {
+        let (server, lock) = resumed;
+        let held = socket.clone();
+        Self::on_thread(directory, socket, String::new(), move || {
+            (server, service::SocketLock::resume(lock, held))
+        })
+    }
+
+    /// Runs the server `make` makes, with what holds its socket's lock, on
+    /// a thread of its own until dropped.
+    fn on_thread<L: Send + 'static>(
+        directory: tempfile::TempDir,
+        socket: PathBuf,
+        tcp: String,
+        make: impl FnOnce() -> (Server, L) + Send + 'static,
+    ) -> Self {
         let mut ends = [0; 2];
         // SAFETY: pipe2 fills the two descriptors it creates.
         let created = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_NONBLOCK) };
@@ -91,20 +123,15 @@ impl Running {
             unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = tcp.local_addr().unwrap().to_string();
         let thread = std::thread::spawn(move || {
-            let _lock = lock;
-            let mut server = Server::new(listener, host_reserve, None, transfer).unwrap();
-            configure(&mut server);
-            server.listen_tcp(tcp).unwrap();
+            let (mut server, _lock) = make();
             server
                 .run(reader.as_fd(), &|| stopped.load(Ordering::Acquire))
                 .unwrap();
         });
         Self {
             socket,
-            tcp: address,
+            tcp,
             stop,
             wake: writer,
             thread: Some(thread),
@@ -999,44 +1026,70 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
     }
 }
 
-/// A server serves clients of its own protocol only and refuses any other version.
+/// A server speaks its protocol version and the one before: a client of
+/// either is served in its own, a client one version later in the server's,
+/// which that client speaks as its earlier one, and any other is refused by
+/// the versions the server speaks.
 #[test]
-fn a_server_serves_its_own_protocol_only() {
-    use ::storage::protocol::VERSION;
+fn a_server_serves_its_protocol_and_the_one_before() {
+    use ::storage::protocol::{
+        ClientMessage, Hello, OLDEST, Request, Response, ServerMessage, VERSION, Welcome,
+    };
 
     let server = Running::start();
-    Client::connect(&server.socket, Role::Operator).unwrap();
-
-    let welcome = |version: u32| {
-        let mut connection = service::Connection::new(
-            std::os::unix::net::UnixStream::connect(&server.socket).unwrap(),
-        )
-        .unwrap();
-        connection
-            .send(&::storage::protocol::ClientMessage::Hello(
-                ::storage::protocol::Hello {
-                    version,
-                    role: Role::Operator,
-                },
-            ))
-            .unwrap();
-        connection
-            .recv::<::storage::protocol::ServerMessage>(std::time::Duration::from_secs(30))
-            .unwrap()
-            .unwrap()
+    let timeout = std::time::Duration::from_secs(30);
+    let connect = |version: u32| {
+        let stream = std::os::unix::net::UnixStream::connect(&server.socket).unwrap();
+        let mut connection = service::Connection::new(stream).unwrap();
+        let hello = Hello {
+            version,
+            role: Role::Operator,
+        };
+        connection.send(&ClientMessage::Hello(hello)).unwrap();
+        let welcome = connection.recv::<ServerMessage>(timeout).unwrap().unwrap();
+        (connection, welcome)
     };
-    assert!(matches!(
-        welcome(VERSION),
-        ::storage::protocol::ServerMessage::Welcome(::storage::protocol::Welcome::Accepted { .. })
-    ));
-    for other in [VERSION - 1, VERSION + 1] {
-        assert!(matches!(
-            welcome(other),
-            ::storage::protocol::ServerMessage::Welcome(
-                ::storage::protocol::Welcome::Refused { .. }
-            )
-        ));
+
+    for (version, speaks) in [(VERSION, VERSION), (OLDEST, OLDEST), (VERSION + 1, VERSION)] {
+        let (mut connection, welcome) = connect(version);
+        assert!(
+            matches!(&welcome, ServerMessage::Welcome(Welcome::Accepted { version }) if *version == speaks),
+            "a client of protocol {version}: {welcome:?}"
+        );
+        // The connection is served in the version agreed.
+        let listed = ClientMessage::Request {
+            id: 7,
+            request: Request::List,
+        };
+        connection.send(&listed).unwrap();
+        let response = connection.recv::<ServerMessage>(timeout).unwrap().unwrap();
+        assert!(
+            matches!(
+                response,
+                ServerMessage::Response {
+                    id: 7,
+                    response: Response::Listing(_)
+                }
+            ),
+            "{response:?}"
+        );
     }
+
+    for version in [OLDEST - 1, VERSION + 2] {
+        let (_, welcome) = connect(version);
+        let ServerMessage::Welcome(Welcome::Refused { message }) = welcome else {
+            panic!("a client of protocol {version} is served: {welcome:?}");
+        };
+        assert!(
+            message.contains(&format!("{OLDEST} to {VERSION}"))
+                && message.contains(&format!("the client {version}")),
+            "{message}"
+        );
+    }
+
+    // The workspace's client speaks the version the server's welcome stated.
+    let client = Client::connect(&server.socket, Role::Operator).unwrap();
+    assert_eq!(client.version(), VERSION);
 }
 
 #[test]

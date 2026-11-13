@@ -65,12 +65,12 @@ use serde::{Deserialize, Serialize};
 use storage::QueuePair;
 use storage::protocol::{BufferPoolListing, HostCopy, Key, Segment};
 use storage::runtime::{
-    Cause, Completion, GroupId, Open, Opened, Registers, Request, RequestId, Source,
+    Cause, Completion, GroupId, Open, Opened, Registers, Request, RequestId, Source, VERSION,
 };
 
 use crate::Server;
 use crate::buffer_pool::trace::{Input, Trace, stated_input};
-use crate::buffer_pool::{BufferPool, ClientId, QueueId};
+use crate::buffer_pool::{BufferPool, ClientId, FORMAT, QueueId, format1};
 
 /// How long the thread sleeps when every queue is empty and nothing is
 /// deferred: the longest a request of an idle engine waits to be taken.
@@ -149,9 +149,10 @@ pub(crate) struct Thread {
 
 impl Thread {
     /// Starts the thread: with no pool, or going on with the state a
-    /// predecessor handed over (`image`, the bytes of [`Pools::hand_off`],
-    /// with the queue pairs' memfds in its order). `limits` is how long a
-    /// transfer and a put to the remote store may take, in nanoseconds.
+    /// predecessor handed over (`image`, the bytes of [`Pools::hand_off`] in
+    /// the format stated beside them, with the queue pairs' memfds in its
+    /// order). `limits` is how long a transfer and a put to the remote store
+    /// may take, in nanoseconds.
     ///
     /// # Errors
     ///
@@ -159,7 +160,7 @@ impl Thread {
     /// handed over cannot be made again.
     pub(crate) fn start(
         limits: (u64, u64),
-        image: Option<(Vec<u8>, Vec<OwnedFd>)>,
+        image: Option<(Vec<u8>, u32, Vec<OwnedFd>)>,
     ) -> io::Result<Self> {
         use rustix::pipe::{PipeFlags, pipe_with};
 
@@ -176,7 +177,9 @@ impl Thread {
             .name("buffer-pool".into())
             .spawn(move || {
                 let pools = match image {
-                    Some((bytes, descriptors)) => Pools::resume(&bytes, descriptors, limits),
+                    Some((bytes, format, descriptors)) => {
+                        Pools::resume(&bytes, format, descriptors, limits)
+                    }
                     None => Ok(BTreeMap::new()),
                 };
                 let deployments = match pools {
@@ -418,7 +421,7 @@ impl Watch {
                 if !self.failing {
                     tracing::error!(
                         deployment,
-                        input = %stated_input(&input),
+                        input = %stated_input(pool, &input),
                         position = ?position,
                         %inconsistency,
                         "the buffer pool is inconsistent after an input; it goes on"
@@ -439,9 +442,18 @@ impl Watch {
         }
     }
 
-    /// The trace keeps the completions the pool produced.
-    fn completed(&mut self, deployment: &str, produced: &[(QueueId, RequestId, Completion)]) {
-        if let Some(Err(error)) = self.trace.as_mut().map(|trace| trace.completed(produced)) {
+    /// The trace keeps the completions `pool` produced.
+    fn completed(
+        &mut self,
+        deployment: &str,
+        pool: &BufferPool,
+        produced: &[(QueueId, RequestId, Completion)],
+    ) {
+        let written = self
+            .trace
+            .as_mut()
+            .map(|trace| trace.completed(pool, produced));
+        if let Some(Err(error)) = written {
             self.stop(deployment, &error);
         }
     }
@@ -486,19 +498,20 @@ impl Hosted {
     }
 
     /// Takes the completions the pool produced into their queue pairs'
-    /// pending records, in order; the trace keeps them. Returns whether
-    /// there were any.
+    /// pending records, each in its session's version, in order; the trace
+    /// keeps them. Returns whether there were any.
     fn deliver(&mut self, deployment: &str) -> bool {
         let completions = self.pool.completions();
-        self.watch.completed(deployment, &completions);
+        self.watch.completed(deployment, &self.pool, &completions);
         let any = !completions.is_empty();
         for (queue, request, completion) in completions {
             // A closed session's queue pair is gone, and its completions with it.
             let Some(served) = self.queues.get_mut(&queue) else {
                 continue;
             };
+            let version = self.pool.version(queue.0).unwrap_or(VERSION);
             let mut record = Vec::new();
-            completion.encode(request, &mut record);
+            completion.encode_as(version, request, &mut record);
             served.pending.push_back(record);
         }
         any
@@ -527,6 +540,8 @@ impl Hosted {
             }
             let mut record = Vec::new();
             for (queue, served) in &mut self.queues {
+                // A session's records are of the version its `Open` stated.
+                let version = self.pool.version(queue.0).unwrap_or(VERSION);
                 while !served.broken {
                     match served.pair.next_request(&mut record) {
                         Ok(true) => {}
@@ -538,7 +553,7 @@ impl Hosted {
                         }
                     }
                     busy = true;
-                    match Request::decode(&record) {
+                    match Request::decode_as(&record, version) {
                         Ok((id, request)) => {
                             if let Request::Prefetch { source, .. } = &request {
                                 self.sources.insert((*queue, id), *source);
@@ -552,7 +567,7 @@ impl Hosted {
                                     cause: Cause::Request,
                                 };
                                 let mut answer = Vec::new();
-                                refused.encode(id, &mut answer);
+                                refused.encode_as(version, id, &mut answer);
                                 served.pending.push_back(answer);
                             }
                         }
@@ -568,7 +583,8 @@ impl Hosted {
         let delivered = self.deliver(deployment);
         self.dirty |= busy || delivered;
         for (queue, served) in &mut self.queues {
-            served.flush(deployment, *queue);
+            let version = self.pool.version(queue.0).unwrap_or(VERSION);
+            served.flush(deployment, *queue, version);
         }
         if self.dirty {
             self.dirty = false;
@@ -655,8 +671,8 @@ impl Hosted {
 
 impl Queue {
     /// Writes the pending completions in order, as far as the completion
-    /// queue has room.
-    fn flush(&mut self, deployment: &str, queue: QueueId) {
+    /// queue has room; a refusal is written in the session's `version`.
+    fn flush(&mut self, deployment: &str, queue: QueueId, version: u32) {
         while let Some(record) = self.pending.front() {
             if self.broken {
                 return;
@@ -676,7 +692,7 @@ impl Queue {
                 Completion::Refused {
                     cause: Cause::Request,
                 }
-                .encode(id, &mut refused);
+                .encode_as(version, id, &mut refused);
                 self.pending[0] = refused;
                 continue;
             }
@@ -1084,6 +1100,19 @@ impl Pools {
         self.frozen = true;
     }
 
+    /// The restart in place under way is given up: requests are taken and
+    /// `completed` words read again.
+    pub(crate) fn thaw(&mut self) {
+        self.frozen = false;
+    }
+
+    /// The versions of the runtime interface the open sessions speak, which
+    /// a successor of a restart in place must speak.
+    pub(crate) fn versions(&self) -> BTreeSet<u32> {
+        let pools = self.deployments.values();
+        pools.flat_map(|hosted| hosted.pool.versions()).collect()
+    }
+
     /// Whether the thread is frozen and no task of any pool is outstanding:
     /// its state may pass to a successor.
     pub(crate) fn quiet(&self) -> bool {
@@ -1134,14 +1163,39 @@ impl Pools {
         Ok((bytes, descriptors))
     }
 
-    /// The pools a predecessor handed over, each checked, with their queue
-    /// pairs, which go on from the indices the predecessor published.
+    /// The pools a predecessor handed over in the image format `format`,
+    /// this build's or format 1, each checked, with their queue pairs, which
+    /// go on from the indices the predecessor published.
     fn resume(
         bytes: &[u8],
+        format: u32,
         descriptors: Vec<OwnedFd>,
         limits: (u64, u64),
     ) -> io::Result<BTreeMap<String, Hosted>> {
-        let handed: Handed<BufferPool> = rmp_serde::from_slice(bytes).map_err(io::Error::other)?;
+        let handed: Handed<BufferPool> = match format {
+            FORMAT => rmp_serde::from_slice(bytes).map_err(io::Error::other)?,
+            format1::FORMAT => {
+                let handed: Handed<format1::Image> =
+                    rmp_serde::from_slice(bytes).map_err(io::Error::other)?;
+                let mut deployments = Vec::with_capacity(handed.deployments.len());
+                for (deployment, image, next, queues) in handed.deployments {
+                    let pool = BufferPool::try_from(image).map_err(|error| {
+                        io::Error::other(format!(
+                            "the buffer pool of {deployment} handed over in format 1: {error}"
+                        ))
+                    })?;
+                    deployments.push((deployment, pool, next, queues));
+                }
+                Handed { deployments }
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "the buffer pools are handed over in image format {other}; this build reads \
+                     formats {} and {FORMAT}",
+                    format1::FORMAT
+                )));
+            }
+        };
         let mut descriptors = descriptors.into_iter();
         let mut deployments = BTreeMap::new();
         for (deployment, pool, next, queues) in handed.deployments {

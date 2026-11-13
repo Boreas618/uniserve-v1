@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use storage::protocol::Segment;
-use storage::runtime::{GroupId, Open, Segments, Tier};
+use storage::runtime::{GroupId, OLDEST, Open, Segments, Tier, VERSION};
 
 use super::{
     BufferPool, Class, ClientId, Deferred, Group, MEMORIES, Region, disowned, insert_range,
@@ -293,12 +293,15 @@ impl BufferPool {
     /// on the host, whose memory the server creates; the space's other
     /// regions grow from what that leaves. A region the pool holds keeps
     /// its numbering, whatever limit the layout states for it
-    /// ([`Self::limit_of`] answers it). Returns, per region of the layout,
-    /// its number and its units.
+    /// ([`Self::limit_of`] answers it). The session speaks the version of
+    /// the runtime interface its `Open` states for its life
+    /// ([`Self::version`]). Returns, per region of the layout, its number and
+    /// its units.
     ///
     /// # Errors
     ///
-    /// Refuses, changing nothing, a layout that does not fit: a name stated
+    /// Refuses, changing nothing, a layout that does not fit: a version of
+    /// the interface before [`OLDEST`] or after [`VERSION`], a name stated
     /// twice, a region stated again with another tier, space, unit size or
     /// reserved units, a segment that cannot join its space's table, an index
     /// that names no region of the right tier, a group of no scheduler's or
@@ -399,6 +402,7 @@ impl BufferPool {
             (classes.collect(), open.trajectory),
             groups,
         );
+        self.versions.insert(client, open.version);
         Ok(numbers
             .iter()
             .map(|number| (*number, self.regions[usize::from(*number)].units()))
@@ -500,6 +504,12 @@ impl BufferPool {
 
     /// Whether a layout fits the pool; see [`Self::admit`].
     fn fits(&self, open: &Open) -> Result<(), String> {
+        if !(OLDEST..=VERSION).contains(&open.version) {
+            return Err(format!(
+                "the buffer pool serves versions {OLDEST} to {VERSION} of its interface, not {}",
+                open.version
+            ));
+        }
         self.segments_fit(open)?;
         let mut names = HashSet::new();
         for region in &open.regions {
@@ -654,6 +664,21 @@ impl BufferPool {
     /// The epoch of a session, while it is open.
     pub fn epoch(&self, client: ClientId) -> Option<u64> {
         self.sessions.get(&client).copied()
+    }
+
+    /// The version of the runtime interface a session speaks, while it is
+    /// open: its records are read and written in it.
+    pub fn version(&self, client: ClientId) -> Option<u32> {
+        let open = self.sessions.contains_key(&client);
+        open.then(|| self.versions.get(&client).copied().unwrap_or(VERSION))
+    }
+
+    /// The versions of the runtime interface the open sessions speak.
+    pub fn versions(&self) -> BTreeSet<u32> {
+        let sessions = self.sessions.keys();
+        sessions
+            .filter_map(|client| self.version(*client))
+            .collect()
     }
 
     /// The name of a region, by its number.
@@ -820,6 +845,7 @@ impl BufferPool {
         self.numbers.retain(|queue, _| queue.0 != client);
         self.completions.retain(|(queue, _, _)| queue.0 != client);
         self.sessions.remove(&client);
+        self.versions.remove(&client);
         self.classes.remove(&client);
         self.sweep();
         self.settle();

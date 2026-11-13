@@ -10,6 +10,12 @@
 //! it, so [`BufferPool::check`] holds of the pool made again when it held
 //! of the pool the image was taken of. The pool an image was taken of is
 //! not used afterwards, save that the enumeration goes on from both.
+//!
+//! An image is in the format of the build that wrote it ([`FORMAT`]), which
+//! a restart in place states beside it. A successor reads its own build's
+//! format and the one before ([`format1`]): the server it succeeds may be of
+//! the previous build, and its sessions go on in the versions of the
+//! interface they were opened with.
 
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -18,11 +24,16 @@ use serde::de::Error as _;
 use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use storage::protocol::Key;
-use storage::runtime::{Completion, GroupId, OwnerId, RequestId, Segments};
+use storage::runtime::{Completion, GroupId, OwnerId, RequestId, Segments, VERSION};
 
 use super::{
     Block, BufferPool, Class, ClientId, Copy, Deferred, Entry, Group, Held, Owner, QueueId, Region,
 };
+
+/// The format of the images this build writes: with what version 3 of the
+/// runtime interface added and the version each session speaks, both of
+/// which format 1 lacks.
+pub(crate) const FORMAT: u32 = 2;
 
 /// The image of a pool, over the regions `R` and the blocks `B`: borrowed
 /// from a pool to write it, owned to make a pool of it. Maps keyed by more
@@ -53,6 +64,9 @@ struct Image<R, B> {
     started: Vec<(QueueId, u64)>,
     stopped: Vec<(QueueId, u64)>,
     peers: Vec<(u64, Vec<u32>)>,
+    /// The version of the runtime interface of each session admitted from
+    /// its `Open`.
+    versions: Vec<(ClientId, u32)>,
 }
 
 impl Serialize for BufferPool {
@@ -166,6 +180,11 @@ impl Serialize for BufferPool {
                 .map(|(queue, id)| (*queue, id.0))
                 .collect(),
             peers,
+            versions: self
+                .versions
+                .iter()
+                .map(|(client, version)| (*client, *version))
+                .collect(),
         };
         image.serialize(serializer)
     }
@@ -174,12 +193,25 @@ impl Serialize for BufferPool {
 impl<'de> Deserialize<'de> for BufferPool {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let image = Image::<Vec<Region>, Vec<Block>>::deserialize(deserializer)?;
+        Self::assemble(image, VERSION).map_err(D::Error::custom)
+    }
+}
+
+impl BufferPool {
+    /// The pool an owned image states, whose completions not yet written are
+    /// records of the interface's version `records`.
+    ///
+    /// # Errors
+    ///
+    /// A holder that names a block the image does not list, or a record
+    /// that is no completion.
+    fn assemble(image: Image<Vec<Region>, Vec<Block>>, records: u32) -> Result<Self, String> {
         let blocks: Vec<Rc<Block>> = image.blocks.into_iter().map(Rc::new).collect();
         let mut block = |index: &u32| {
             blocks
                 .get(*index as usize)
                 .map(Rc::clone)
-                .ok_or_else(|| D::Error::custom(format!("the image holds no block {index}")))
+                .ok_or_else(|| format!("the image holds no block {index}"))
         };
 
         let mut pool = Self::new(image.limits);
@@ -223,11 +255,13 @@ impl<'de> Deserialize<'de> for BufferPool {
             .map(|(queue, request, keys)| ((queue, RequestId(request)), keys))
             .collect();
         pool.sessions = image.sessions.into_iter().collect();
+        pool.versions = image.versions.into_iter().collect();
         pool.trial = image.trial.into_iter().collect();
         pool.numbers = image.numbers.into_iter().collect();
         pool.now = image.now;
         for (queue, record) in image.completions {
-            let (request, completion) = Completion::decode(&record).map_err(D::Error::custom)?;
+            let (request, completion) =
+                Completion::decode_as(&record, records).map_err(|error| error.to_string())?;
             pool.completions.push((queue, request, completion));
         }
         pool.started = image
@@ -459,5 +493,132 @@ pub(super) mod owner_id {
         deserializer: D,
     ) -> Result<OwnerId, D::Error> {
         u64::deserialize(deserializer).map(OwnerId)
+    }
+}
+
+/// Format 1: the image of the builds before images stated their format,
+/// which served version 2 of the runtime interface. It lacks what version 3
+/// added: the memory a region lies in, a group's receiving regions and host
+/// parts, the host parts among the memories, and a session's version, which
+/// is 2. A memory is a device memory's name, a block's validity a byte in
+/// which every bit set (255) was a block valid in every memory that maps it
+/// (a slot row, a product of several regions), and the completions not yet
+/// written are records of version 2.
+pub(crate) mod format1 {
+    use std::collections::{BTreeMap, VecDeque};
+
+    use serde::Deserialize;
+    use storage::protocol::Key;
+    use storage::runtime::{GroupId, Segments};
+
+    use super::super::region::format1::Region;
+    use super::super::{Block, BufferPool, Class, ClientId, Copy, Deferred, Entry, Owner, QueueId};
+    use super::Image as Current;
+
+    /// This format's number.
+    pub(crate) const FORMAT: u32 = 1;
+
+    /// The validity format 1 gives a block valid in every memory that maps it.
+    const EVERYWHERE: u64 = u8::MAX as u64;
+
+    /// The version of the runtime interface every session of format 1 speaks.
+    const VERSION: u32 = 2;
+
+    /// An image of format 1, its fields in their order there.
+    #[derive(Deserialize)]
+    pub(crate) struct Image {
+        classes: Vec<(ClientId, Vec<Class>, u8)>,
+        regions: Vec<Region>,
+        spaces: Vec<String>,
+        memories: Vec<String>,
+        quota: Vec<BTreeMap<u64, u64>>,
+        segments: Vec<Segments>,
+        blocks: Vec<Block>,
+        cache: Vec<(Key, Entry<u32>)>,
+        owners: Vec<(ClientId, u64, Owner<u32>)>,
+        groups: Vec<(ClientId, GroupId, Group)>,
+        copies: Vec<(QueueId, u64, Vec<Copy<u32>>)>,
+        answers: Vec<(QueueId, u64, Vec<Key>)>,
+        sessions: Vec<(ClientId, u64)>,
+        trial: Vec<(u64, bool)>,
+        numbers: Vec<(QueueId, (u64, u64))>,
+        limits: (u64, u64),
+        now: u64,
+        completions: Vec<(QueueId, Vec<u8>)>,
+        started: Vec<(QueueId, u64)>,
+        stopped: Vec<(QueueId, u64)>,
+        peers: Vec<(u64, Vec<u32>)>,
+    }
+
+    /// A worker group in format 1: no receiving region and no host part.
+    #[derive(Deserialize)]
+    struct Group {
+        memory: u8,
+        slots: u8,
+        regions: Vec<Vec<u8>>,
+        completed: u64,
+        deferred: VecDeque<(u64, Deferred<u32>)>,
+    }
+
+    impl TryFrom<Image> for BufferPool {
+        type Error = String;
+
+        /// The pool an image of format 1 states, as this build holds it:
+        /// every region's units exist in each memory that maps it, every
+        /// memory is one of the device, a group copies with no host part, a
+        /// block valid everywhere stays so, and every session speaks version 2.
+        fn try_from(image: Image) -> Result<Self, String> {
+            let blocks = image.blocks.into_iter().inspect(|block| {
+                if block.valid.get() == EVERYWHERE {
+                    block.valid.set(super::super::EVERYWHERE);
+                }
+            });
+            let groups = image.groups.into_iter().map(|(client, id, group)| {
+                let group = super::super::Group {
+                    memory: group.memory,
+                    slots: group.slots,
+                    regions: group.regions,
+                    receives: Vec::new(),
+                    parts: Vec::new(),
+                    completed: group.completed,
+                    deferred: group.deferred,
+                };
+                (client, id, group)
+            });
+            let versions = image
+                .sessions
+                .iter()
+                .map(|(client, _)| (*client, VERSION))
+                .collect();
+            let current = Current {
+                classes: image.classes,
+                regions: image.regions.into_iter().map(Into::into).collect(),
+                spaces: image.spaces,
+                memories: image
+                    .memories
+                    .into_iter()
+                    .map(|name| (name, None))
+                    .collect(),
+                quota: image.quota,
+                segments: image.segments,
+                blocks: blocks.collect(),
+                cache: image.cache,
+                owners: image.owners,
+                groups: groups.collect(),
+                copies: image.copies,
+                answers: image.answers,
+                sessions: image.sessions,
+                trial: image.trial,
+                numbers: image.numbers,
+                limits: image.limits,
+                now: image.now,
+                completions: image.completions,
+                started: image.started,
+                stopped: image.stopped,
+                peers: image.peers,
+                versions,
+            };
+            Self::assemble(current, VERSION)
+        }
     }
 }

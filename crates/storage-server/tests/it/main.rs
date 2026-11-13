@@ -5,6 +5,7 @@
 mod claim;
 mod hosts;
 mod remote;
+mod restart;
 mod server;
 mod sessions;
 mod trace;

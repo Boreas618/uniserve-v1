@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use ::storage::protocol::{BlockState, ErrorKind, Event, HostCopy, RegionPart, UnitRun};
 use ::storage::runtime::{
-    Cause, Class, Completion, Group, GroupId, Open, Opened, OwnerId, Region, Registers, Request,
-    RequestId, Source, Tier, VERSION,
+    Cause, Class, Completion, Group, GroupId, OLDEST, Open, Opened, OwnerId, Region, Registers,
+    Request, RequestId, Source, Tier, VERSION,
 };
 use ::storage::{Access, Claim, Client, Key, Location, Mode, QueuePair, Role, Segment};
 
@@ -105,16 +105,24 @@ pub(crate) fn layout(epoch: u64) -> Open {
     }
 }
 
-/// A scheduler's end of its queue pair and its registers.
+/// A scheduler's end of its queue pair and its registers, speaking a
+/// version of the interface.
 pub(crate) struct Scheduler {
     pair: QueuePair,
     registers: Registers,
     number: u64,
+    version: u32,
 }
 
 impl Scheduler {
     /// Each scheduler of an answer to `Open`, in order.
     pub(crate) fn all(opened: &Opened, descriptors: Vec<OwnedFd>) -> Vec<Self> {
+        Self::speaking(VERSION, opened, descriptors)
+    }
+
+    /// Each scheduler of an answer to an `Open` of `version`, in order,
+    /// writing and reading the records of that version.
+    pub(crate) fn speaking(version: u32, opened: &Opened, descriptors: Vec<OwnedFd>) -> Vec<Self> {
         opened
             .registers
             .iter()
@@ -123,6 +131,7 @@ impl Scheduler {
                 pair: QueuePair::open(descriptor, true).unwrap(),
                 registers: registers.clone(),
                 number: 0,
+                version,
             })
             .collect()
     }
@@ -132,7 +141,7 @@ impl Scheduler {
         self.number += 1;
         let id = RequestId(self.number);
         let mut record = Vec::new();
-        request.encode(id, &mut record);
+        request.encode_as(self.version, id, &mut record);
         assert!(
             self.pair.submit(&record).unwrap(),
             "the submission queue is full"
@@ -146,7 +155,7 @@ impl Scheduler {
         let mut record = Vec::new();
         loop {
             if self.pair.next_completion(&mut record).unwrap() {
-                return Completion::decode(&record).unwrap();
+                return Completion::decode_as(&record, self.version).unwrap();
             }
             assert!(Instant::now() < deadline, "no completion arrived");
             std::thread::sleep(Duration::from_micros(100));
@@ -427,10 +436,21 @@ fn a_session_is_refused_what_the_server_does_not_serve() {
     let server = Running::with_transfer(|_| None);
     let mut engine = engine_head(&server.socket, 0);
 
-    // Another interface version, and another epoch than the head's.
-    let mut other = layout(0);
-    other.version = VERSION + 1;
-    assert_eq!(server_error(engine.open_pool(other)), ErrorKind::Invalid);
+    // An interface version the server does not speak, named, and another
+    // epoch than the head's.
+    for version in [OLDEST - 1, VERSION + 1] {
+        let mut other = layout(0);
+        other.version = version;
+        let refused = engine.open_pool(other).unwrap_err();
+        let ::storage::Error::Server { kind, message } = refused else {
+            panic!("{refused}");
+        };
+        assert_eq!(kind, ErrorKind::Invalid);
+        assert!(
+            message.contains(&format!("{OLDEST} to {VERSION}")),
+            "{message}"
+        );
+    }
     assert_eq!(
         server_error(engine.open_pool(layout(1))),
         ErrorKind::Invalid
@@ -466,6 +486,82 @@ fn a_session_is_refused_what_the_server_does_not_serve() {
     let (second, _) = next.open_pool(layout(1)).unwrap();
     assert_eq!(second.regions[UNITS], first.regions[UNITS]);
     assert_ne!(second.regions[1].0, first.regions[1].0);
+}
+
+/// A session keeps the version of the interface its `Open` stated: one of
+/// the version before this build's has its records read and written in
+/// that version, a prefetch without a group and a listing without host
+/// groups, while a session of this build's version is served beside it in
+/// its own, and a crossing, which the earlier version lacks, is refused.
+#[test]
+fn a_session_of_the_version_before_is_served_in_its_records_beside_one_of_this_version() {
+    let server = Running::with_transfer(|_| None);
+    let claim = head(&server.socket)
+        .claim(
+            0,
+            vec![scope("prefill", 0), scope("prefill", 1)],
+            Vec::new(),
+        )
+        .unwrap();
+    let mut earlier = engine_head(&server.socket, 0);
+    let mut open = layout(0);
+    open.version = OLDEST;
+    let (opened, descriptors) = earlier.open_pool(open).unwrap();
+    let _parts = host_parts(&server.socket, claim);
+    let mut schedulers = Scheduler::speaking(OLDEST, &opened, descriptors);
+
+    // Key 7 is cached on the device and on the host in the earlier version's records.
+    store_on_host(&mut schedulers[0]);
+
+    // A prefetch of version 2 names no group: the decode scheduler's is
+    // group 0's, which finds the host copy there without a task.
+    let prefetch = Request::Prefetch {
+        group: PREFILL,
+        class: KV,
+        units: 0,
+        keys: vec![key(7)],
+        source: Source::Remote,
+        deadline: u64::MAX / 2,
+    };
+    assert_eq!(
+        schedulers[1].ask(prefetch.clone()),
+        Completion::Prefetched { found: 1 }
+    );
+
+    // A listing of version 2 states no host groups: the scheduler reads it
+    // in its version.
+    let listing = Completion::Listing {
+        keys: vec![(key(7), KV, 64, 0b011, 0b01, 0)],
+    };
+    assert_eq!(schedulers[0].ask(Request::List), listing);
+
+    // A crossing is not of version 2: refused under its number.
+    let crossing = Request::Replicate {
+        owner: OwnerId(1),
+        class: KV,
+        at: 0,
+        from: opened.regions[UNITS].0,
+        group: DECODE,
+        after: Vec::new(),
+    };
+    let refused = Completion::Refused {
+        cause: Cause::Request,
+    };
+    assert_eq!(schedulers[0].ask(crossing), refused);
+
+    // A session of this build's version beside it speaks its own records.
+    let mut current = engine_head(&server.socket, 1);
+    let (opened, descriptors) = current.open_pool(layout(1)).unwrap();
+    let mut schedulers = Scheduler::all(&opened, descriptors);
+    let found = schedulers[0].ask(Request::List);
+    let Completion::Listing { keys } = found else {
+        panic!("{found:?}");
+    };
+    assert_eq!(keys.len(), 1);
+    assert_eq!(
+        schedulers[0].ask(prefetch),
+        Completion::Prefetched { found: 1 }
+    );
 }
 
 /// The standby of an epoch's serving engine, its own engine of the epoch (its own launch

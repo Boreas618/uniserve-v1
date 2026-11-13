@@ -61,9 +61,9 @@ use rustix::event::{PollFd, PollFlags, poll};
 
 use ::storage::protocol::{
     Access, Allocation, Claim, ClientMessage, DeploymentListing, ErrorKind, Event, Hello,
-    HostStorage, Item, Key, Listing, Location, Mode, Quota, Request, Response, Retainer, Role,
-    Scope, ScopeBytes, ServerMessage, StorageRecord, TensorListing, TensorRecord, Tensors, Usage,
-    VERSION, Welcome,
+    HostStorage, Item, Key, Listing, Location, Mode, OLDEST, Quota, Request, Response, Retainer,
+    Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorListing, TensorRecord, Tensors,
+    Usage, VERSION, Welcome,
 };
 pub use child::Launch;
 pub use error::Error;
@@ -120,6 +120,9 @@ struct Client {
     /// transfer requests or a peer's requests.
     pidfd: Option<Arc<OwnedFd>>,
     role: Option<Role>,
+    /// The protocol version the connection speaks, which its hello agreed
+    /// ([`::storage::protocol::agreed`]); the server's own until then.
+    version: u32,
     /// Requests received and not yet responded, in arrival order.
     queue: VecDeque<(u64, Request, Vec<OwnedFd>)>,
     /// Whether a request taken from the queue waits for the Transfer
@@ -323,8 +326,10 @@ impl Server {
     /// Serve until `stop` reads true. `stop` is checked after every wake;
     /// `wake` is a descriptor whose readability wakes the loop (a signal
     /// pipe), drained when it fires. Returns once `stop` holds, or with the
-    /// restart under way once nothing is in flight, which the caller then
-    /// completes ([`Server::handoff`]).
+    /// restart under way once nothing is in flight and its successor speaks
+    /// every version in use, which the caller then completes
+    /// ([`Server::handoff`]); a restart whose successor does not is given up,
+    /// and the server goes on.
     pub fn run(
         &mut self,
         wake: BorrowedFd<'_>,
@@ -332,7 +337,7 @@ impl Server {
     ) -> io::Result<Option<restart::Pending>> {
         while !stop() {
             self.turn(wake)?;
-            if self.restart.is_some() && self.quiescent() {
+            if self.restart.is_some() && self.quiescent() && self.agree() {
                 return Ok(self.restart.take());
             }
         }
@@ -473,6 +478,7 @@ impl Server {
                     pid: 0,
                     pidfd: None,
                     role: None,
+                    version: VERSION,
                     queue: VecDeque::new(),
                     held: false,
                 },
@@ -491,6 +497,7 @@ impl Server {
             pid: pid.as_raw_nonzero().get(),
             pidfd: Some(Arc::new(pidfd)),
             role: None,
+            version: VERSION,
             queue: VecDeque::new(),
             held: false,
         })
@@ -559,17 +566,18 @@ impl Server {
         }
     }
 
-    /// Admit a client's role, or refuse it.
+    /// Admit a client's role in the version the connection speaks from now
+    /// on, or refuse it.
     fn welcome(&mut self, id: ClientId, hello: Hello) -> Welcome {
-        if hello.version != VERSION {
+        let Some(version) = ::storage::protocol::agreed(hello.version) else {
             return Welcome::Refused {
                 message: format!(
-                    "the storage server speaks protocol {VERSION}, the client {}: a server of \
-                     another protocol is stopped before a process of another build starts its own",
+                    "the storage server speaks protocol {OLDEST} to {VERSION}, the client {}: a \
+                     server restarted in place into a build of the client's protocol serves it",
                     hello.version
                 ),
             };
-        }
+        };
         if let Some(client) = self.clients.get_mut(&id) {
             if client.role.is_some() {
                 return Welcome::Refused {
@@ -601,8 +609,9 @@ impl Server {
         }
         if let Some(client) = self.clients.get_mut(&id) {
             client.role = Some(hello.role);
+            client.version = version;
         }
-        Welcome::Accepted { version: VERSION }
+        Welcome::Accepted { version }
     }
 
     /// Respond to every client's queued requests that can be responded now.

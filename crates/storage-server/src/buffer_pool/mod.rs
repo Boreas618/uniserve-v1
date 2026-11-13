@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use storage::protocol::Key;
 use storage::runtime::{Cause, Completion, GroupId, OwnerId, Request, RequestId, Segments, Stamps};
 
+pub(crate) use image::{FORMAT, format1};
 use region::{Region, Run};
 /// A kind of block, as a session states it in its layout; the pool keeps
 /// its host region by the pool's number of that region.
@@ -439,6 +440,10 @@ pub struct BufferPool {
     answers: HashMap<(QueueId, RequestId), Vec<Key>>,
     /// The epoch of each session.
     sessions: HashMap<ClientId, u64>,
+    /// The version of the runtime interface each session's `Open` stated,
+    /// which its records are read and written in; a session opened without
+    /// one ([`Self::open`]) speaks this build's.
+    versions: HashMap<ClientId, u32>,
     /// Per epoch, whether it is on trial; an epoch whose update was rolled back is absent.
     trial: HashMap<u64, bool>,
     /// Per queue pair, the highest owner number and the highest request number taken.
@@ -478,6 +483,7 @@ impl BufferPool {
             copies: HashMap::new(),
             answers: HashMap::new(),
             sessions: HashMap::new(),
+            versions: HashMap::new(),
             trial: HashMap::new(),
             numbers: HashMap::new(),
             limits,

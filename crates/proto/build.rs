@@ -20,7 +20,9 @@
 //! sources are the root `src/`. A member's tests, benches and examples
 //! are part of no artifact and are left out. Each file enters with its path
 //! relative to the workspace root and its length, so the digest depends on
-//! neither where the tree is checked out nor how files split their bytes.
+//! neither where the tree is checked out nor how files split their bytes. A
+//! build that raises the storage protocol's version
+//! (`UNISERVE_STORAGE_PROTOCOL_RAISE`) adds the variable to the digest.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,6 +36,10 @@ const ROOT_FILES: [&str; 3] = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"
 /// Hex digits of the digest the build version carries: its leading 64 bits,
 /// which tell builds apart as a short commit hash does.
 const DIGEST_HEX_DIGITS: usize = 16;
+
+/// The build-time variable that raises the storage protocol's version by one
+/// (`proto::STORAGE_PROTOCOL`).
+const STORAGE_PROTOCOL_RAISE: &str = "UNISERVE_STORAGE_PROTOCOL_RAISE";
 
 /// The workspace root, as Cargo itself locates it: the directory of the
 /// workspace manifest. The Cargo that runs this script names itself in `CARGO`,
@@ -113,6 +119,14 @@ fn emit_source_digest() -> io::Result<()> {
     }
     for path in &watched {
         println!("cargo:rerun-if-changed={}", root.join(path).display());
+    }
+    // A build whose storage protocol is raised (`proto::STORAGE_PROTOCOL`) is another build of
+    // the same sources; one without the variable keeps the sources' digest.
+    println!("cargo:rerun-if-env-changed={STORAGE_PROTOCOL_RAISE}");
+    if let Some(raise) = std::env::var_os(STORAGE_PROTOCOL_RAISE) {
+        digest.update(STORAGE_PROTOCOL_RAISE.as_bytes());
+        digest.update([0]);
+        digest.update(raise.as_encoded_bytes());
     }
 
     let hex: String = digest

@@ -13,19 +13,39 @@
 //! A record is a little-endian byte string: the request's number, one byte
 //! that names the variant, and the variant's fields in the order they are
 //! declared; a list is its length as a `u32` followed by its elements. A
-//! record that is not one of this version's is an error to its reader, which
-//! the buffer pool answers with [`Completion::Refused`] where it can read the
-//! number and drops otherwise.
+//! record that is not one of its session's version is an error to its
+//! reader, which the buffer pool answers with [`Completion::Refused`] where
+//! it can read the number and drops otherwise.
 //!
-//! [`VERSION`] is stated when a session is opened; a session keeps its version
-//! for its life, and a new request or completion is a new version.
+//! The version is stated when a session is opened ([`Open::version`]); a
+//! session keeps its version for its life, and a new request or completion
+//! is a new version, which an engine adopts at its next epoch. An engine
+//! speaks the version of its build, [`VERSION`]; a Storage Server speaks
+//! that one and the one before, [`OLDEST`], so that a server restarted in
+//! place into the next build goes on serving every session the previous one
+//! opened, and reads and writes each session's records in its version
+//! ([`Request::decode_as`], [`Completion::encode_as`]). What version 2 lacks:
+//!
+//! - an [`Open`] of version 2 states no memory of a region, no receiving
+//!   region and no host part of a group: its regions' units exist in every
+//!   memory that maps them, and a host copy is loadable by any group of the
+//!   session;
+//! - a [`Request::Prefetch`] of version 2 names no group: it is the
+//!   session's group 0, which every layout numbers first, and whose host
+//!   parts are those of every group of a session of version 2: none;
+//! - a [`Completion::Listing`] of version 2 states no host groups;
+//! - version 2 has no [`Request::Replicate`] and no [`Completion::Replicated`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Key, Result, Segment};
 
-/// The version of this interface.
+/// The version of this interface that this build's engine speaks.
 pub const VERSION: u32 = 3;
+
+/// The earliest version a Storage Server of this build serves: the one
+/// before [`VERSION`]. An `Open` of an earlier version is refused.
+pub const OLDEST: u32 = VERSION - 1;
 
 /// A request's number on its queue pair, drawn by the scheduler from a
 /// counter and never reused.
@@ -79,7 +99,9 @@ pub enum Cause {
 /// the answer is [`Opened`], with one queue pair's descriptor per scheduler.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Open {
-    /// The version of this interface the engine speaks: [`VERSION`].
+    /// The version of this interface the engine speaks: its build's
+    /// [`VERSION`]. The fields an earlier version lacks take their defaults
+    /// when an engine of that version sends its `Open`.
     pub version: u32,
     /// The engine epoch, and whether its update is on trial.
     pub epoch: u64,
@@ -151,7 +173,9 @@ pub struct Region {
     /// every memory that maps it (KV units, slot rows) and for a host region.
     /// A block whose runs lie in one memory is valid there from its
     /// allocation; one whose runs lie in several is valid in none until a
-    /// [`Request::Replicate`] names the run its writer wrote.
+    /// [`Request::Replicate`] names the run its writer wrote. Version 2
+    /// states none.
+    #[serde(default)]
     pub memory: String,
 }
 
@@ -244,15 +268,18 @@ pub struct Group {
     /// group's ranks read the class and none of its `regions` lies, the
     /// region a [`Request::Replicate`] into that memory takes the block's
     /// run in (the product buffer of the group's first rank there). Indices
-    /// into [`Open::regions`]; empty for a class read where it is written.
+    /// into [`Open::regions`]; empty for a class read where it is written,
+    /// and in version 2, which states none.
+    #[serde(default)]
     pub receives: Vec<Vec<u8>>,
     /// Per class, the host parts the group's ranks copy the class's host
     /// copies with, each as its host and its part index: for a KV class the
     /// host of each rank with the rank's index; for a block that lies in one
     /// rank's memory, part 0 on each host the ranks that copy it lie on.
-    /// Empty for a class without a host region. A host copy is loaded or
-    /// restored for an owner of the group only when every one of these
-    /// parts holds it.
+    /// Empty for a class without a host region, and in version 2, which
+    /// states none. A host copy is loaded or restored for an owner of the
+    /// group only when every one of these parts holds it.
+    #[serde(default)]
     pub parts: Vec<Vec<(String, u32)>>,
 }
 
@@ -685,9 +712,40 @@ pub fn number(record: &[u8]) -> Option<RequestId> {
     Some(RequestId(u64::from_le_bytes(value)))
 }
 
+/// The version that added crossings ([`Request::Replicate`],
+/// [`Completion::Replicated`]), the group of a prefetch and the host groups
+/// of a listing: a record of an earlier version has none of them.
+const CROSSINGS: u32 = 3;
+
+/// Whether this build reads and writes records of `version`.
+///
+/// # Errors
+///
+/// A version before [`OLDEST`] or after [`VERSION`], named.
+fn spoken(version: u32) -> Result<()> {
+    if (OLDEST..=VERSION).contains(&version) {
+        Ok(())
+    } else {
+        Err(Error::Protocol(format!(
+            "version {version} of the buffer pool's interface is not one this build speaks: it \
+             speaks {OLDEST} to {VERSION}"
+        )))
+    }
+}
+
 impl Request {
-    /// Appends the record of this request under `id` to `record`.
+    /// Appends the record of this request under `id` to `record`, in this
+    /// build's version.
     pub fn encode(&self, id: RequestId, record: &mut Vec<u8>) {
+        self.encode_as(VERSION, id, record);
+    }
+
+    /// Appends the record of this request under `id` to `record`, in
+    /// `version`, one of [`OLDEST`] to [`VERSION`]: a field the version lacks
+    /// is left out (a prefetch's group before version 3). A request the
+    /// version lacks is written as this build writes it, which a reader of
+    /// that version refuses.
+    pub fn encode_as(&self, version: u32, id: RequestId, record: &mut Vec<u8>) {
         let mut writer = Writer(record);
         writer.long(id.0);
         match self {
@@ -832,7 +890,9 @@ impl Request {
                 deadline,
             } => {
                 writer.byte(15);
-                writer.byte(group.0);
+                if version >= CROSSINGS {
+                    writer.byte(group.0);
+                }
                 writer.byte(*class);
                 writer.word(*units);
                 writer.keys(keys);
@@ -867,12 +927,24 @@ impl Request {
         }
     }
 
-    /// Reads a request and its number from a record.
+    /// Reads a request and its number from a record of this build's version.
     ///
     /// # Errors
     ///
     /// Fails when the record is not a request of this version.
     pub fn decode(record: &[u8]) -> Result<(RequestId, Self)> {
+        Self::decode_as(record, VERSION)
+    }
+
+    /// Reads a request and its number from a record of `version`: a
+    /// prefetch of version 2, which names no group, is group 0's.
+    ///
+    /// # Errors
+    ///
+    /// Fails when this build does not speak `version` or the record is not
+    /// a request of it.
+    pub fn decode_as(record: &[u8], version: u32) -> Result<(RequestId, Self)> {
+        spoken(version)?;
         let mut reader = Reader(record);
         let id = RequestId(reader.long()?);
         let request = match reader.byte()? {
@@ -960,7 +1032,11 @@ impl Request {
                 after: reader.stamps()?,
             },
             15 => Self::Prefetch {
-                group: GroupId(reader.byte()?),
+                group: if version >= CROSSINGS {
+                    GroupId(reader.byte()?)
+                } else {
+                    GroupId(0)
+                },
                 class: reader.byte()?,
                 units: reader.word()?,
                 keys: reader.keys()?,
@@ -978,7 +1054,7 @@ impl Request {
                 region: reader.byte()?,
                 units: reader.word()?,
             },
-            18 => Self::Replicate {
+            18 if version >= CROSSINGS => Self::Replicate {
                 owner: OwnerId(reader.long()?),
                 class: reader.byte()?,
                 at: reader.word()?,
@@ -988,7 +1064,7 @@ impl Request {
             },
             other => {
                 return Err(Error::Protocol(format!(
-                    "request variant {other} is not of version {VERSION}"
+                    "request variant {other} is not of version {version}"
                 )));
             }
         };
@@ -998,8 +1074,20 @@ impl Request {
 }
 
 impl Completion {
-    /// Appends the record of this completion of request `id` to `record`.
+    /// Appends the record of this completion of request `id` to `record`,
+    /// in this build's version.
     pub fn encode(&self, id: RequestId, record: &mut Vec<u8>) {
+        self.encode_as(VERSION, id, record);
+    }
+
+    /// Appends the record of this completion of request `id` to `record`,
+    /// in `version`, one of [`OLDEST`] to [`VERSION`]: a field the version
+    /// lacks is left out (a listing's host groups before version 3). A
+    /// completion the version lacks is written as this build writes it,
+    /// which a reader of that version refuses; the buffer pool answers no
+    /// request of a session with one, since the session's version has no
+    /// request it answers.
+    pub fn encode_as(&self, version: u32, id: RequestId, record: &mut Vec<u8>) {
         let mut writer = Writer(record);
         writer.long(id.0);
         match self {
@@ -1086,7 +1174,9 @@ impl Completion {
                     writer.short(*tokens);
                     writer.byte(*tiers);
                     writer.byte(*groups);
-                    writer.byte(*hosts);
+                    if version >= CROSSINGS {
+                        writer.byte(*hosts);
+                    }
                 }
             }
             Self::Resized { units, evicted } => {
@@ -1101,12 +1191,26 @@ impl Completion {
         }
     }
 
-    /// Reads a completion and the number of the request it answers from a record.
+    /// Reads a completion and the number of the request it answers from a
+    /// record of this build's version.
     ///
     /// # Errors
     ///
     /// Fails when the record is not a completion of this version.
     pub fn decode(record: &[u8]) -> Result<(RequestId, Self)> {
+        Self::decode_as(record, VERSION)
+    }
+
+    /// Reads a completion and the number of the request it answers from a
+    /// record of `version`: a listing of version 2 states no host groups.
+    ///
+    /// # Errors
+    ///
+    /// Fails when this build does not speak `version` or the record is not
+    /// a completion of it.
+    pub fn decode_as(record: &[u8], version: u32) -> Result<(RequestId, Self)> {
+        spoken(version)?;
+        let crossings = version >= CROSSINGS;
         let mut reader = Reader(record);
         let id = RequestId(reader.long()?);
         let completion = match reader.byte()? {
@@ -1182,7 +1286,7 @@ impl Completion {
                 found: reader.word()?,
             },
             18 => Self::Listing {
-                keys: (0..reader.length(38)?)
+                keys: (0..reader.length(if crossings { 38 } else { 37 })?)
                     .map(|_| {
                         Ok((
                             reader.key()?,
@@ -1190,7 +1294,7 @@ impl Completion {
                             reader.short()?,
                             reader.byte()?,
                             reader.byte()?,
-                            reader.byte()?,
+                            if crossings { reader.byte()? } else { 0 },
                         ))
                     })
                     .collect::<Result<_>>()?,
@@ -1199,12 +1303,12 @@ impl Completion {
                 units: reader.word()?,
                 evicted: reader.keys()?,
             },
-            20 => Self::Replicated {
+            20 if crossings => Self::Replicated {
                 runs: reader.runs()?,
             },
             other => {
                 return Err(Error::Protocol(format!(
-                    "completion variant {other} is not of version {VERSION}"
+                    "completion variant {other} is not of version {version}"
                 )));
             }
         };
@@ -1428,6 +1532,149 @@ mod tests {
         // The number of a record is readable whatever follows it.
         assert_eq!(number(&unknown), Some(RequestId(1)));
         assert_eq!(number(&record[..4]), None);
+    }
+
+    /// Version 2's records: a prefetch without its group, which reads as
+    /// group 0's; a listing without host groups; no crossing.
+    #[test]
+    fn a_record_of_version_2_is_read_and_written_in_that_version() {
+        let prefetch = Request::Prefetch {
+            group: GroupId(0),
+            class: 1,
+            units: 0,
+            keys: vec![key(7)],
+            source: Source::Remote,
+            deadline: 9,
+        };
+        let mut earlier = Vec::new();
+        prefetch.encode_as(2, RequestId(5), &mut earlier);
+        let mut current = Vec::new();
+        prefetch.encode(RequestId(5), &mut current);
+        assert_eq!(earlier.len() + 1, current.len());
+        assert_eq!(
+            Request::decode_as(&earlier, 2).unwrap(),
+            (RequestId(5), prefetch)
+        );
+        // A prefetch of another group still reads as group 0's in version 2.
+        let other = Request::Prefetch {
+            group: GroupId(3),
+            class: 1,
+            units: 0,
+            keys: vec![],
+            source: Source::Peers,
+            deadline: 1,
+        };
+        let mut record = Vec::new();
+        other.encode_as(2, RequestId(6), &mut record);
+        assert!(matches!(
+            Request::decode_as(&record, 2).unwrap().1,
+            Request::Prefetch {
+                group: GroupId(0),
+                ..
+            }
+        ));
+
+        let listing = Completion::Listing {
+            keys: vec![(key(6), 0, 64, 0b011, 0b01, 0b10)],
+        };
+        let mut earlier = Vec::new();
+        listing.encode_as(2, RequestId(8), &mut earlier);
+        assert_eq!(
+            Completion::decode_as(&earlier, 2).unwrap(),
+            (
+                RequestId(8),
+                Completion::Listing {
+                    keys: vec![(key(6), 0, 64, 0b011, 0b01, 0)]
+                }
+            )
+        );
+        // Each version's listing is no record of the other's.
+        assert!(Completion::decode(&earlier).is_err());
+        let mut current = Vec::new();
+        listing.encode(RequestId(8), &mut current);
+        assert!(Completion::decode_as(&current, 2).is_err());
+
+        // A crossing and its answer are of version 3 only.
+        let mut crossing = Vec::new();
+        Request::Replicate {
+            owner: OwnerId(1),
+            class: 0,
+            at: 0,
+            from: 1,
+            group: GroupId(1),
+            after: vec![],
+        }
+        .encode(RequestId(9), &mut crossing);
+        assert!(Request::decode_as(&crossing, 2).is_err());
+        let mut answer = Vec::new();
+        Completion::Replicated { runs: vec![] }.encode(RequestId(9), &mut answer);
+        assert!(Completion::decode_as(&answer, 2).is_err());
+    }
+
+    #[test]
+    fn a_version_this_build_does_not_speak_is_refused_by_name() {
+        let mut record = Vec::new();
+        Request::List.encode(RequestId(1), &mut record);
+        for version in [OLDEST - 1, VERSION + 1] {
+            let refused = Request::decode_as(&record, version)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                refused.contains(&format!("version {version}"))
+                    && refused.contains(&format!("{OLDEST} to {VERSION}")),
+                "{refused}"
+            );
+            assert!(Completion::decode_as(&record, version).is_err());
+        }
+    }
+
+    /// An engine of version 2 sends an `Open` without the memory of a region,
+    /// the receiving regions and the host parts of a group: it reads with
+    /// none of them.
+    #[test]
+    fn an_open_of_version_2_reads_without_the_fields_version_3_added() {
+        let open = Open {
+            version: 2,
+            epoch: 4,
+            trial: false,
+            regions: vec![Region {
+                name: "units".into(),
+                tier: Tier::Device,
+                space: "units".into(),
+                unit_bytes: 64,
+                part_bytes: 64,
+                reserved: 1,
+                units: 4,
+                limit: 5,
+                segments: Vec::new(),
+                memory: String::new(),
+            }],
+            classes: Vec::new(),
+            trajectory: 0,
+            groups: vec![Group {
+                id: GroupId(0),
+                memory: "gpu0".into(),
+                slots: 0,
+                regions: vec![vec![0]],
+                receives: Vec::new(),
+                parts: Vec::new(),
+            }],
+            schedulers: vec![vec![GroupId(0)]],
+            peers: Vec::new(),
+        };
+
+        // The named encoding the Storage Server's socket carries, less the fields.
+        let mut stated = serde_json::to_value(&open).unwrap();
+        for region in stated["regions"].as_array_mut().unwrap() {
+            region.as_object_mut().unwrap().remove("memory");
+        }
+        for group in stated["groups"].as_array_mut().unwrap() {
+            let group = group.as_object_mut().unwrap();
+            group.remove("receives");
+            group.remove("parts");
+        }
+        let bytes = rmp_serde::to_vec_named(&stated).unwrap();
+        assert_eq!(crate::protocol::decode::<Open>(&bytes).unwrap(), open);
     }
 
     /// A rank's layout holding rows `start..start + count` of a `[rows, 4]`

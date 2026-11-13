@@ -59,8 +59,14 @@ const STORAGE_PROTOCOL_BASE: u32 = 21;
 /// The version of the Storage Server's protocol the engine interface carries:
 /// `storage::protocol::VERSION`, stated here because the interfaces depend on
 /// no storage crate. The two are one fact, and a test of the engine, which
-/// links both, fails if they drift.
-pub const STORAGE_PROTOCOL: u32 = 26;
+/// links both, fails if they drift; `UNISERVE_STORAGE_PROTOCOL_RAISE=1` at
+/// build time raises both by one.
+pub const STORAGE_PROTOCOL: u32 = 26
+    + match option_env!("UNISERVE_STORAGE_PROTOCOL_RAISE") {
+        None => 0,
+        Some(raise) if raise.len() == 1 && raise.as_bytes()[0] == b'1' => 1,
+        Some(_) => panic!("UNISERVE_STORAGE_PROTOCOL_RAISE is 1 when it is set"),
+    };
 
 /// The version of the engine interface: every message an engine exchanges with
 /// the daemon (the process and request interfaces), the Storage Server and the

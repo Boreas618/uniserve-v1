@@ -10,9 +10,22 @@
 //! one error: an [`ErrorKind`] and a message.
 //!
 //! The protocol is versioned ([`VERSION`]), and its version is part of the
-//! engine interface's (`proto::ENGINE_INTERFACE_VERSION`): a Storage Server
-//! serves clients of its own version only and refuses any other at `Hello`.
-//! The encoding is MessagePack with named fields.
+//! engine interface's (`proto::ENGINE_INTERFACE_VERSION`). A build speaks its
+//! version and the one before ([`OLDEST`]), so that a Storage Server
+//! restarted in place into the next build goes on serving every connection
+//! the previous one served, each in the version it agreed at its `Hello`. The
+//! client states its version; the server answers the version the connection
+//! speaks for its life ([`Welcome::Accepted`]): the client's, or the server's
+//! own for a client one version later, which speaks it as its earlier one. A
+//! client of a version before [`OLDEST`], or more than one after
+//! [`VERSION`], is refused at `Hello`, the refusal naming the versions the
+//! server speaks.
+//!
+//! The encoding is MessagePack with named fields. A new version adds
+//! requests, responses, events or optional fields and changes nothing else,
+//! so one encoding serves both versions a build speaks: a peer of the earlier
+//! version never sends what it lacks, is never sent it (a response or an
+//! event answers what it asked), and reads past a field it does not know.
 //!
 //! The server stores bytes with DLPack metadata and never interprets them:
 //! clients compute every [`Key`] and define what the bytes mean. The
@@ -119,12 +132,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::{Open, Opened};
 
-/// The protocol version a Storage Server and its clients speak; a server
-/// refuses a client of any other. The engine interface carries it
+/// The protocol version this build's clients state and its Storage Server
+/// speaks, besides [`OLDEST`]. The engine interface carries it
 /// (`proto::ENGINE_INTERFACE_VERSION`, through `proto::STORAGE_PROTOCOL`, which
 /// a change of this version changes with it), so an engine built for another
 /// storage protocol is refused at its hello to the daemon as well.
-pub const VERSION: u32 = 26;
+///
+/// A build made with `UNISERVE_STORAGE_PROTOCOL_RAISE=1` in its environment
+/// states the version after this one, and nothing else changes: the
+/// executable a restart in place into a further version is tested with. The
+/// variable raises `proto::STORAGE_PROTOCOL` alike.
+pub const VERSION: u32 = 26
+    + match option_env!("UNISERVE_STORAGE_PROTOCOL_RAISE") {
+        None => 0,
+        Some(raise) if raise.len() == 1 && raise.as_bytes()[0] == b'1' => 1,
+        Some(_) => panic!("UNISERVE_STORAGE_PROTOCOL_RAISE is 1 when it is set"),
+    };
+
+/// The earliest protocol version this build's Storage Server serves and its
+/// clients accept: the one before [`VERSION`].
+pub const OLDEST: u32 = VERSION - 1;
 
 /// The most bytes a [`Request::Read`] responds with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
@@ -232,24 +259,35 @@ pub enum Role {
     Operator,
 }
 
-/// The first message on a connection.
+/// The first message on a connection: the client's [`VERSION`] and its role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub version: u32,
     pub role: Role,
 }
 
+/// The version a connection speaks when its client states `version` to a
+/// server of this build: the client's own when this build speaks it, this
+/// build's [`VERSION`] when the client's is the next (a client speaks its
+/// build's version and the one before); `None` otherwise.
+pub fn agreed(version: u32) -> Option<u32> {
+    if (OLDEST..=VERSION).contains(&version) {
+        Some(version)
+    } else if version == VERSION + 1 {
+        Some(VERSION)
+    } else {
+        None
+    }
+}
+
 /// The server's response to [`Hello`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Welcome {
-    Accepted {
-        version: u32,
-    },
+    /// The server serves the client, in `version` for the connection's life.
+    Accepted { version: u32 },
     /// The server does not serve this client, for the reason given.
-    Refused {
-        message: String,
-    },
+    Refused { message: String },
 }
 
 /// Where a storage's physical storage is.

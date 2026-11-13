@@ -572,7 +572,7 @@ fn forged() -> String {
         "{}state 0\n{before}\n\nstate 1\n{}\n\nstep 0 1 {}\n",
         layout(&driver.pool),
         driver.state(),
-        stated_input(&commit)
+        stated_input(&driver.pool, &commit)
     )
 }
 
@@ -613,7 +613,7 @@ fn every_request_sequence_keeps_the_invariants() {
                 }
                 if target != source {
                     transitions.insert((source, target));
-                    steps.insert((source, target, stated_input(&input)));
+                    steps.insert((source, target, stated_input(&from.pool, &input)));
                 }
             }
         }

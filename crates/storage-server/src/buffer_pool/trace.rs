@@ -18,8 +18,8 @@
 //!
 //! A record is a kind byte, the length of its body as a little-endian `u32`,
 //! and the body: little-endian fields, a request or a completion as the
-//! record of [`storage::runtime`] it arrived or left as, and an `Open` and a
-//! pool's image in MessagePack.
+//! record of [`storage::runtime`] it arrived or left as, in the version of
+//! its session, and an `Open` and a pool's image in MessagePack.
 //!
 //! [`replay`] drives a new buffer pool with a trace's inputs, checks every
 //! completion it produces against the run's, and writes after every input
@@ -34,7 +34,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use storage::protocol::{Key, Segment};
-use storage::runtime::{Completion, GroupId, Open, OwnerId, Request, RequestId, Stamps, Tier};
+use storage::runtime::{
+    Completion, GroupId, Open, OwnerId, Request, RequestId, Stamps, Tier, VERSION,
+};
 
 use super::{Block, BufferPool, ClientId, Copy, Deferred, Held, QueueId, SLOT, Target};
 
@@ -406,19 +408,21 @@ impl Trace {
         self.clock.0 = now;
     }
 
-    /// Appends the completions the pool produced, in order.
+    /// Appends the completions `pool` produced, in order, each in the
+    /// version its queue pair is written in.
     ///
     /// # Errors
     ///
     /// Fails when a record cannot be written.
     pub(crate) fn completed(
         &mut self,
+        pool: &BufferPool,
         produced: &[(QueueId, RequestId, Completion)],
     ) -> io::Result<()> {
         for (queue, request, completion) in produced {
             let mut body = Vec::new();
             queued(&mut body, *queue);
-            completion.encode(*request, &mut body);
+            completion.encode_as(version(pool, *queue), *request, &mut body);
             frame(&mut self.completions, COMPLETION, &body)?;
         }
         Ok(())
@@ -433,6 +437,13 @@ impl Trace {
         self.inputs.flush()?;
         self.completions.flush()
     }
+}
+
+/// The version of the runtime interface a queue pair's records are in: its
+/// session's, or this build's once the session is gone, as the buffer pool's
+/// thread writes them.
+fn version(pool: &BufferPool, queue: QueueId) -> u32 {
+    pool.version(queue.0).unwrap_or(VERSION)
 }
 
 /// Acts on an input as the buffer pool's thread does: the replay's pool and
@@ -453,7 +464,7 @@ pub(crate) fn apply(pool: &mut BufferPool, input: &Input) -> Result<(), String> 
         }
         Input::Close(client) => pool.end(*client),
         Input::Request(queue, record) => {
-            if let Ok((id, request)) = Request::decode(record) {
+            if let Ok((id, request)) = Request::decode_as(record, version(pool, *queue)) {
                 pool.take(*queue, id, request);
             }
         }
@@ -496,9 +507,9 @@ pub(crate) fn copies_asked(completion: &Completion) -> u32 {
     }
 }
 
-/// A completion's record as a replay states it.
-fn shown(record: &[u8]) -> String {
-    match Completion::decode(record) {
+/// A completion's record of `version` as a replay states it.
+fn shown(record: &[u8], version: u32) -> String {
+    match Completion::decode_as(record, version) {
         Ok((request, completion)) => format!("{completion:?} for request {}", request.0),
         Err(error) => format!("an unreadable completion ({error})"),
     }
@@ -541,6 +552,8 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
         recorded.push_back((at, queue(&mut body)?, body.to_vec()));
     }
 
+    // An attach is written alike in every version, so this build's reads
+    // each one, whatever its session's version.
     let mut owners = Vec::new();
     for (_, input) in &records {
         if let Input::Request(queue, record) = input
@@ -566,21 +579,22 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
         stated(&pool, &owners, 0)
     ))?;
     for (at, input) in &records {
-        let named = || format!("the input at byte {at} ({})", stated_input(input));
+        let named =
+            |pool: &BufferPool| format!("the input at byte {at} ({})", stated_input(pool, input));
         if let Input::Start(task) = input {
             match started.pop_front() {
                 Some(found) if found == *task => continue,
                 found => {
                     return Err(format!(
                         "{}: the run started the task of request {}, the replay {:?}",
-                        named(),
+                        named(&pool),
                         task.1.0,
                         found.map(|(_, request): Task| request.0)
                     ));
                 }
             }
         }
-        apply(&mut pool, input).map_err(|error| format!("{}: {error}", named()))?;
+        apply(&mut pool, input).map_err(|error| format!("{}: {error}", named(&pool)))?;
         if let Input::Image(_) = input {
             // The tasks a pool started and the run did not record are gone with it.
             started.clear();
@@ -590,14 +604,14 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
         for (queue, request, completion) in pool.completions() {
             copies += copies_asked(&completion);
             let mut record = Vec::new();
-            completion.encode(request, &mut record);
+            completion.encode_as(version(&pool, queue), request, &mut record);
             match recorded.pop_front() {
                 Some((_, ran, ran_record)) if ran == queue && ran_record == record => {}
                 Some((_, ran, ran_record)) => {
                     return Err(format!(
                         "after {}: the run completed {} on queue pair {ran:?}, the replay {completion:?} for request {} on {queue:?}",
-                        named(),
-                        shown(&ran_record),
+                        named(&pool),
+                        shown(&ran_record, version(&pool, ran)),
                         request.0
                     ));
                 }
@@ -607,13 +621,13 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
         started.extend(pool.started());
         pool.stopped();
         pool.check()
-            .map_err(|inconsistency| format!("after {}: {inconsistency}", named()))?;
+            .map_err(|inconsistency| format!("after {}: {inconsistency}", named(&pool)))?;
 
         let changes_layout = matches!(input, Input::Image(_) | Input::Open(..) | Input::Close(_));
         write(format!(
             "step {} {replayed} {}\n{}state {replayed}\n{}\n{}\n\n",
             replayed - 1,
-            stated_input(input),
+            stated_input(&pool, input),
             if changes_layout {
                 layout(&pool)
             } else {
@@ -626,21 +640,22 @@ pub fn replay(inputs: &Path, mut states: Option<&mut dyn Write>) -> Result<u64, 
     if let Some((at, queue, record)) = recorded.pop_front() {
         return Err(format!(
             "the run completed {} on queue pair {queue:?} (byte {at} of its completions), and the replay did not",
-            shown(&record)
+            shown(&record, version(&pool, queue))
         ));
     }
     Ok(replayed)
 }
 
-/// An input as `verification/buffer-pool/steps.py` reads it: its kind, and
-/// what it names in the terms of [`stated`] (owners and positions by number,
-/// groups as `g<n>`, keys by their first byte, stamps as `g<n>:<sequence>`).
-pub(crate) fn stated_input(input: &Input) -> String {
+/// An input to `pool` as `verification/buffer-pool/steps.py` reads it: its
+/// kind, and what it names in the terms of [`stated`] (owners and positions
+/// by number, groups as `g<n>`, keys by their first byte, stamps as
+/// `g<n>:<sequence>`); a request is read in its session's version.
+pub(crate) fn stated_input(pool: &BufferPool, input: &Input) -> String {
     match input {
         Input::Image(_) => "image".into(),
         Input::Open(..) => "open".into(),
         Input::Close(_) => "close".into(),
-        Input::Request(_, record) => match Request::decode(record) {
+        Input::Request(queue, record) => match Request::decode_as(record, version(pool, *queue)) {
             Ok((_, request)) => stated_request(&request),
             Err(_) => "unreadable".into(),
         },
