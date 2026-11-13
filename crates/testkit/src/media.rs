@@ -164,7 +164,7 @@ fn failed(message: String) -> Outcome<BatchOutput> {
 
 /// Publishes `bytes` as a POSIX shared-memory object stating `extra` bytes more than it holds, as
 /// a worker's media stage relinquishes an artifact for the mechanism to take.
-fn publish(bytes: &[u8], extra: u64) -> Result<ipc::MediaOutput, String> {
+pub(crate) fn publish(bytes: &[u8], extra: u64) -> Result<ipc::MediaOutput, String> {
     let storage = || -> std::io::Result<String> {
         let mut storage = tempfile::Builder::new()
             .prefix("uniserve-fake-video-")
