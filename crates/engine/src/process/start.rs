@@ -521,7 +521,7 @@ pub(crate) fn start(
     let mut ranks = load_ranks(model_runner.ranks()?, backing, launch, meeting)?;
 
     // The session, opened before the ranks map memory: its device KV regions state no segment.
-    let open = session_layout(launch, &ranks)?;
+    let open = layout(launch, &ranks)?;
     let mut head = StorageClient::connect(
         Path::new(&storage.socket),
         &launch.engine_config.deployment,
@@ -535,7 +535,7 @@ pub(crate) fn start(
 
     // Every rank maps the segments the answer states and creates the rest, which the head
     // grants once every rank holds them.
-    let created = open_ranks(&mut ranks, &open, &opened.segments)?;
+    let created = open_ranks(&mut ranks, &open, &opened)?;
     for (region, segments) in &created {
         for &(segment, first, units) in segments {
             head.grant(region, segment, first, units)?;
@@ -591,20 +591,6 @@ pub(crate) fn start(
     }
     engine.remotes = remotes.into_iter().map(|(_, remote)| remote).collect();
     Ok(engine)
-}
-
-/// The layout of the session of `ranks`, this process's ranks loaded to their division: the
-/// first rank's cache layout and units, its group's width and its request slots' bytes, which
-/// every rank of the deployment's one configuration states alike.
-fn session_layout(launch: &EngineArgs, ranks: &[LoadedRank]) -> Result<Open> {
-    let first = ranks.first().context("this process loaded no rank")?;
-    let cache = Arc::clone(worker::lock(&first.cache).layout());
-    let tensor = u32::try_from(first.model_runner.world_size())
-        .context("a worker group wider than a session states")?;
-    let slots = first.model_runner.slots()?;
-    let slot_bytes = worker::CausalLmRunner::slot_bytes(&first.config, first.model.as_ref())?
-        / u64::from(slots.max(1));
-    layout(launch, &cache, first.units, tensor, slot_bytes)
 }
 
 /// Captures every bucket of every executor's runners, all at once, and waits for each.

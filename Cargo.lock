@@ -1226,6 +1226,7 @@ dependencies = [
  "crossbeam-channel",
  "ipc",
  "libc",
+ "media",
  "mimalloc",
  "minimax-h3",
  "nn",

@@ -20,16 +20,15 @@
 //! `crate::process::ranks` drives: the model's meta load and the runner's profile run ([`text`]),
 //! the cache's layout and the division of the GPU's quota ([`memory`]), the device's owners and
 //! the serving runner ([`text`]), and what the rank states of its group once its executors are
-//! ready ([`report`]).
-//!
-//! The media rank (`video.rs` beside this file) is not declared: its runners are the worker's
-//! media runners, which this crate does not build on yet.
+//! ready ([`report`]). A rank of a media deployment takes the same steps over the media runners
+//! of the blocks its group places on it and its media memory, and keeps no cache ([`video`]).
 
 pub(crate) mod buckets;
 pub(crate) mod memory;
 mod placement;
 pub(crate) mod report;
 pub(crate) mod text;
+pub(crate) mod video;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -95,10 +94,15 @@ impl crate::data_plane::ModelLoad for RankModel {
             .engine_config
             .model
             .model = target.checkpoint.to_string_lossy().into_owned();
-        model_runner
-            .load_model(Weights::Retained(weights), &target.experts)
-            .map(drop)
-            .map_err(|error| format!("{error:#}"))
+        let loaded = match model_runner.family.model {
+            Model::Text(_) => model_runner
+                .load_text(Weights::Retained(weights), &target.experts)
+                .map(drop),
+            Model::Video(_) => model_runner
+                .load_video(Weights::Retained(weights))
+                .map(drop),
+        };
+        loaded.map_err(|error| format!("{error:#}"))
     }
 
     fn expert_layers(&self) -> BTreeMap<String, u32> {
@@ -143,10 +147,6 @@ pub(crate) struct ModelRunner {
 }
 
 /// A rank's places in its deployment's parallel groups.
-#[expect(
-    dead_code,
-    reason = "the media rank, which reads it, is not started by the main process yet"
-)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ParallelShape {
     /// Members of the denoiser's sequence group.
@@ -322,15 +322,13 @@ impl ModelRunner {
                 })
                 .collect();
         }
+        // A media deployment's devices are each a rank of the worker group that places it.
+        if !text {
+            return self.media_ranks();
+        }
         // The schedulers of an expert-parallel deployment each hold one rank: its own cache and
         // attention, its share of the experts, and a member of the union that runs their steps. A
         // deployment of dedicated expert ranks puts its attention ranks first in the union.
-        if !text {
-            bail!(
-                "this engine serves no media rank: the media runners the rank builds are not \
-                 declared by this build"
-            );
-        }
         if count != union_ranks as usize {
             bail!(
                 "this node serves {count} devices and the deployment's experts are exchanged over \
@@ -559,16 +557,21 @@ impl ModelRunner {
             .collect()
     }
 
-    /// The model this rank's checkpoint holds, its weights reached through `weights` in the order
-    /// the model's load asks for them. An update walks the same code, so what this function reads
-    /// is exactly what a load of another checkpoint or another expert order would, and a meta load
-    /// answers the same weights' element types and extents without reading them.
+    /// Whether this rank serves a media deployment: its family's model is a video pipeline.
+    pub(crate) fn is_video(&self) -> bool {
+        matches!(self.family.model, Model::Video(_))
+    }
+
+    /// The causal language model this rank's checkpoint holds, its weights reached through
+    /// `weights` in the order the model's load asks for them. An update walks the same code, so
+    /// what this function reads is exactly what a load of another checkpoint or another expert
+    /// order would, and a meta load answers the same weights' element types and extents without
+    /// reading them. A media rank's pipeline is [`ModelRunner::load_video`]'s.
     ///
     /// # Errors
     ///
-    /// The checkpoint's or the family's refusal, and a media family, whose rank this build does
-    /// not start.
-    pub(crate) fn load_model(
+    /// The checkpoint's or the family's refusal, and a checkpoint of a media family.
+    pub(crate) fn load_text(
         &self,
         weights: Weights<'_>,
         experts: &ExpertOrder,
@@ -576,8 +579,7 @@ impl ModelRunner {
         let mapping = &self.mapping;
         let Model::Text(family) = self.family.model else {
             bail!(
-                "{} is a media model, and this engine serves no media rank: the media runners \
-                 the rank builds are not declared by this build",
+                "{} is a media model, which a text rank does not load",
                 self.checkpoint().display()
             );
         };
@@ -606,19 +608,11 @@ impl ModelRunner {
 /// What the main process reads of a rank to run it: its thread pools and its devices' build
 /// targets.
 impl ModelRunner {
-    /// The thread pool media host work runs on: half the host's parallelism within one to
-    /// eight, each thread with four tasks of room.
-    #[expect(
-        dead_code,
-        reason = "the media rank, which reads it, is not started by the main process yet"
-    )]
+    /// The thread pool media host work runs on, one per process: half the host's parallelism
+    /// within one to eight, each thread with [`MEDIA_TASKS`] tasks of room.
     pub(crate) fn media_pool(&self) -> Result<ThreadPool> {
         let threads = host_share();
-        Ok(ThreadPool::new(
-            "media",
-            threads.saturating_mul(4),
-            threads,
-        )?)
+        Ok(ThreadPool::new("media", media_tasks(), threads)?)
     }
 
     /// The Build Server's targets this rank resolves a module for: the architecture-specific
@@ -642,12 +636,17 @@ impl ModelRunner {
     }
 }
 
+/// The tasks of host work one thread of the media pool has room for.
+const MEDIA_TASKS: usize = 4;
+
+/// The tasks the process's media pool holds at once: the requests a host phase's stage holds
+/// (`Capacity::rows`).
+pub(crate) fn media_tasks() -> usize {
+    host_share().saturating_mul(MEDIA_TASKS)
+}
+
 /// The threads a pool of host work takes when nothing states its width: half the host's
 /// parallelism, within one to eight.
-#[expect(
-    dead_code,
-    reason = "the media rank, which reads it, is not started by the main process yet"
-)]
 fn host_share() -> usize {
     let available = std::thread::available_parallelism()
         .map(|count| count.get())

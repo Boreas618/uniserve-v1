@@ -25,6 +25,9 @@ clap.workspace = true
 crossbeam-channel.workspace = true
 ipc.workspace = true
 libc.workspace = true
+# The encoders, muxers and readers a media rank's host work runs on (`media::MediaRunner`), one
+# per process.
+media.workspace = true
 mimalloc.workspace = true
 # The model families the executable loads.
 minimax-h3.workspace = true

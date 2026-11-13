@@ -276,19 +276,7 @@ impl ModelRunner {
         fixed: u64,
     ) -> Result<u32> {
         let granularity = granularity(device)?;
-
-        // What the process holds beside its pools and the server's storages. The weight store
-        // waits for each copy of the load before it returns, so the figure counts the load's
-        // work. A communicator states no bytes NVML attributes to no process
-        // (`backend::Group`), so NVML's figure is taken whole.
-        let nvml = platform::Nvml::init().context("opening NVML")?;
-        let process = division::process_bytes(&nvml, device, 0, 0)?;
-
-        let (quota, _) = client.usage(device)?;
-        let (_, kept) = client.scope_bytes(device)?;
-        let free = device.memory_info()?.free;
-        let unreserved =
-            division::unreserved(&quota, client.scope(), client.epoch(), kept, process, free)?;
+        let unreserved = unreserved(client, device)?;
 
         let remainder = division::remainder(
             unreserved,
@@ -331,6 +319,34 @@ impl ModelRunner {
         }
         Ok(units)
     }
+}
+
+/// The bytes of `device`'s quota a starting rank of `client`'s scope may divide (steps 11-12):
+/// what the GPU's quota leaves once the process's own bytes, the epoch's reservations and what
+/// the scope keeps are taken out.
+///
+/// # Errors
+///
+/// The Storage Server's, NVML's or the driver's refusal, or a quota that states no limit.
+pub(crate) fn unreserved(client: &StorageClient, device: DeviceId) -> Result<u64> {
+    // What the process holds beside its pools and the server's storages. The weight store waits
+    // for each copy of the load before it returns, so the figure counts the load's work. A
+    // communicator states no bytes NVML attributes to no process (`backend::Group`), so NVML's
+    // figure is taken whole.
+    let nvml = platform::Nvml::init().context("opening NVML")?;
+    let process = division::process_bytes(&nvml, device, 0, 0)?;
+
+    let (quota, _) = client.usage(device)?;
+    let (_, kept) = client.scope_bytes(device)?;
+    let free = device.memory_info()?.free;
+    Ok(division::unreserved(
+        &quota,
+        client.scope(),
+        client.epoch(),
+        kept,
+        process,
+        free,
+    )?)
 }
 
 /// The segments of a cache of `units` units laid out in `layout` whose planes are allocated in

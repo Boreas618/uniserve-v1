@@ -9,10 +9,6 @@ use proto::config::{EngineArgs, WorkerGroupConfig};
 
 use super::{ModelRunner, ParallelShape};
 
-#[expect(
-    dead_code,
-    reason = "the media rank, which reads it, is not started by the main process yet"
-)]
 impl ModelRunner {
     /// The parallel groups this rank joins: `(sequence group's ranks, tensor group's ranks)` and its
     /// place in each. A rank of a media deployment is in both; the text class joins neither here.
@@ -73,15 +69,16 @@ impl ModelRunner {
     }
 
     /// The denoiser's sequence split and the text encoder's tensor split of this rank, as the
-    /// deployment page states them for `checkpoint`'s blocks.
+    /// deployment page states them for `checkpoint`'s blocks: its own group's, at its position
+    /// there.
     pub(super) fn video_split(
         &self,
         checkpoint: &dyn VideoCheckpoint,
     ) -> Result<(SequenceSplit, Split)> {
         video_split(
             self.capability_groups(),
-            &self.launch.group,
-            self.rank,
+            &self.group,
+            u32::try_from(self.position()?).context("a rank past what the protocol numbers")?,
             Split {
                 size: self.mapping.tensor_parallel,
                 rank: self.mapping.tensor_rank,
@@ -170,13 +167,6 @@ impl Mapping {
 /// partition, a projection this stack does not implement is refused rather than served at degree
 /// one, and a mode that is not Ulysses is refused by name because the denoiser's sequence exchange
 /// is Ulysses' alone.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the media rank, which reads it, is not started by the main process yet"
-    )
-)]
 pub(super) fn video_split(
     groups: Option<&[WorkerGroupConfig]>,
     group: &str,

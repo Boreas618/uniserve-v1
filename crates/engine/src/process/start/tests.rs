@@ -1,18 +1,21 @@
 //! The binary's start on the meta device against a Storage Server in the test's process: one
 //! engine whose scheduler grew its KV region into the segments its rank created, and whose close
-//! ends the session.
+//! ends the session; and one engine of a media launch.
 //!
-//! The model is the Qwen3-MoE fixture of the `qwen3` crate, loaded from its shard headers alone,
-//! and the policy the packaged `fcfs`; no GPU and no Build Server is touched.
+//! The text model is the Qwen3-MoE fixture of the `qwen3` crate and the media model a released
+//! FastH3 checkpoint (`crate::process::ranks::tests::FAST_H3`, which the repository does not
+//! hold), each loaded from its shard headers alone, and the policy the packaged `fcfs`; no GPU
+//! and no Build Server is touched.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use worker::executor::peers::{LOST_EXIT, Liveness};
 
-use super::{FIRST_GENERATION, session_layout, start};
+use super::{FIRST_GENERATION, start};
 use crate::process::epoch::kv_regions;
-use crate::process::ranks::tests::loaded;
+use crate::process::ranks::layout;
+use crate::process::ranks::tests::{FAST_H3, loaded, video_launch};
 use crate::storage_client::StorageClient;
 use crate::support::{DEPLOYMENT, StorageServer, launch};
 
@@ -61,7 +64,7 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     // over the segments the start's rank created and its head granted.
     let mut successor = launch.clone();
     successor.epoch = 2;
-    let next_open = session_layout(&successor, &loaded(&successor)).unwrap();
+    let next_open = layout(&successor, &loaded(&successor)).unwrap();
     let mut next = StorageClient::connect(&server.socket, DEPLOYMENT, 2).unwrap();
     let _pairs = next.open(next_open).unwrap();
     let (_, next_opened) = next.session().unwrap();
@@ -90,6 +93,60 @@ fn a_meta_start_builds_one_engine_whose_close_ends_the_session() {
     assert!(
         outputs.iter().all(|(scheduler, output)| *scheduler == 0
             && !matches!(output, crate::scheduler::Output::Failed(_))),
+        "{outputs:?}"
+    );
+}
+
+#[test]
+#[ignore = "reads the headers of a released FastH3 checkpoint, which the repository does not hold"]
+fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session() {
+    let server = StorageServer::start();
+    let mut launch = video_launch();
+    launch.engine_config.device.device = "meta".to_owned();
+    let registry = nn::family::Registry::new([minimax_h3::family::FAMILY]).unwrap();
+    let storage = ipc::StorageLaunch {
+        socket: server.socket.to_string_lossy().into_owned(),
+        deployment: launch.engine_config.deployment.clone(),
+        claim: [0; 16],
+        host_kv_cache: false,
+        tcp: None,
+        peers: Vec::new(),
+        epoch: launch.epoch,
+        standby: false,
+        standby_storage: Default::default(),
+    };
+    let liveness = Liveness::new(Arc::new(|| {}), LOST_EXIT);
+    let parameters = crate::modules::load::parameters(&launch.modules.policy).unwrap();
+    let policy = (crate::scheduler::packaged("fcfs"), parameters);
+
+    // One scheduler over the one media group of the one rank, whose executor is warm, with no
+    // KV region to grow: every video phase on the group, with its steps and product sizes.
+    assert!(
+        std::path::Path::new(FAST_H3).is_dir(),
+        "{FAST_H3} is missing"
+    );
+    let engine = start(&launch, &registry, &storage, None, policy, liveness).unwrap();
+    assert_eq!(engine.schedulers.len(), 1);
+    assert_eq!(engine.executors.len(), 1);
+    let (id, capacity) = &engine.capacities[0];
+    assert_eq!(id.0, 0);
+    assert!(capacity.serves(ipc::batch::Phase::Denoise) && capacity.serves(ipc::batch::Phase::Mux));
+    assert!(capacity.denoise_steps > 0 && !capacity.media_bytes.is_empty());
+    {
+        let head = worker::lock(engine.head.as_ref().unwrap());
+        let (open, _) = head.session().unwrap();
+        assert!(kv_regions(open).is_empty());
+    }
+
+    // The close ends the epoch's session.
+    let mut outputs = Vec::new();
+    engine
+        .close(|scheduler, output| outputs.push((scheduler, output)))
+        .unwrap();
+    assert!(
+        outputs
+            .iter()
+            .all(|(_, output)| !matches!(output, crate::scheduler::Output::Failed(_))),
         "{outputs:?}"
     );
 }
