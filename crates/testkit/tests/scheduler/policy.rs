@@ -2,7 +2,8 @@
 //! called `observe` and `dispatch` once per step and `init` and `limits` once per instance; a
 //! switch to a module that traps, runs out of fuel or declares limits above a ceiling is refused
 //! and leaves the serving policy; a fault of the serving policy rolls back to the one it replaced,
-//! or fails the scheduler when none is kept; a decision beyond a limit is cut and an id in the
+//! or restarts it when none is kept, and fails the scheduler when the policy so made faults again
+//! before it decides a step; a decision beyond a limit is cut and an id in the
 //! wrong state skipped, neither a fault (SD §7.6); the policy is told one `Updated` per changed
 //! request per step; a starting instance's snapshot holds the blocks of `cache`; and the policy's
 //! `offload` is stored per group by key.
@@ -471,10 +472,51 @@ fn a_fault_of_the_serving_policy_rolls_back_to_the_one_it_replaced() {
     }
 }
 
-/// A fault of the serving policy with no policy kept to roll back to fails the scheduler with the
-/// fault, and every request it held leaves as migratable (SD §3.9, §3.7 `fail`).
+/// A fault of the serving policy with no policy kept to roll back to restarts it: a fresh
+/// instance of the serving module, on a fresh snapshot, serves on and is reported as
+/// `Output::PolicyRolledBack` (SD §5.2 "Faults"). Here the policy traps on the step that tells it
+/// of an arrival; the fresh instance learns of that request from its snapshot, admits it and
+/// serves it to its end, and the request running before serves on.
 #[test]
-fn a_fault_of_the_serving_policy_with_none_kept_fails_the_scheduler() {
+fn a_fault_of_the_serving_policy_with_none_kept_restarts_it_on_a_fresh_snapshot() {
+    let mut harness = Deployment::tokens().build();
+    let first = harness.submit(token(1, 6, 20));
+    harness.run_until(30, |harness| harness.tokens(first).len() >= 2);
+
+    let arrival_traps = Script {
+        observe: Some((r#""kind":"arrived""#.to_owned(), 1)),
+        ..Script::serving(&[1, 2])
+    };
+    set_policy(&mut harness, arrival_traps.module(), Parameters::default()).unwrap();
+    harness.apply(Message::CommitPolicy);
+    harness.step();
+    assert!(rolled_back(&harness).is_empty());
+
+    let second = harness.submit(token(2, 6, 4));
+    harness.settle(200);
+    assert_eq!(harness.failure(), None);
+    let rolled = rolled_back(&harness);
+    assert!(
+        rolled.len() == 1 && rolled[0].starts_with("it trapped in `observe`"),
+        "{rolled:?}"
+    );
+    assert_eq!(
+        harness.tokens(first).len(),
+        20,
+        "the running request runs on"
+    );
+    assert_eq!(
+        harness.tokens(second).len(),
+        4,
+        "the request the faulted policy was told of is served"
+    );
+}
+
+/// A serving policy that a fault restarted, and that faults again before it decides a step, fails
+/// the scheduler with the fault, and every request it held leaves as migratable (SD §5.2
+/// "Faults", §3.7 `fail`).
+#[test]
+fn a_restarted_policy_that_faults_again_before_it_decides_a_step_fails_the_scheduler() {
     let mut harness = Deployment::tokens().build();
     let id = harness.submit(token(1, 6, 20));
     harness.run_until(30, |harness| harness.tokens(id).len() >= 2);
@@ -485,14 +527,18 @@ fn a_fault_of_the_serving_policy_with_none_kept_fails_the_scheduler() {
     };
     set_policy(&mut harness, trapping.module(), Parameters::default()).unwrap();
     harness.apply(Message::CommitPolicy);
-    harness.step();
+    harness.run_until(10, |harness| harness.failure().is_some());
 
     let failure = harness.failure().unwrap();
     assert!(
         failure.starts_with("the scheduling policy faulted: it trapped in `dispatch`"),
         "{failure}"
     );
-    assert!(rolled_back(&harness).is_empty());
+    let rolled = rolled_back(&harness);
+    assert!(
+        rolled.len() == 1 && rolled[0].starts_with("it trapped in `dispatch`"),
+        "the first fault restarts the policy: {rolled:?}"
+    );
     assert!(matches!(
         harness.terminal(id),
         Some(Event::Migratable {

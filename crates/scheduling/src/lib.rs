@@ -38,7 +38,7 @@
 /// built for another. An addition a reader tolerates, as described above,
 /// leaves the version; a change of what an existing call or field means
 /// raises it.
-pub const INTERFACE_VERSION: u32 = 1;
+pub const INTERFACE_VERSION: u32 = 2;
 
 pub mod abi;
 pub mod arrival;

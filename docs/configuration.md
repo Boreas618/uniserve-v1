@@ -538,7 +538,7 @@ The Program Server is the Build Server, and what it builds is named by the modul
 | `UNISERVE_WORKER_EXECUTABLE` (test suites) | `UNISERVE_ENGINE`, `UNISERVE_ENGINE_PACKAGE` |
 | `PUT /admin/config` answering `"change": "program"` with the report under `"program"` | `"change": "generation"`, the report under `"generation"` |
 | `GET /admin/config` records' `programs`, each entry's `program` | `modules`, each entry's `package` |
-| A package manifest without an interface version | `interface_version = 1` in every `package.toml` |
+| A package manifest without an interface version | `interface_version` in every `package.toml`: the version of the interface its modules are built against (2 for a scheduling policy, whose events include `Released`; 1 for a kernel package) |
 
 The Storage Server's accounting of a GPU's storage is a quota: the deployment's limit on the GPU and the reservations against it. A copy its Transfer Server runs is a task. The names a script or an operator reads changed as follows.
 

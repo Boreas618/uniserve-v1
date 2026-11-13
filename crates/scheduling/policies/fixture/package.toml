@@ -6,7 +6,7 @@
 # module as a generation.
 op = "scheduling"
 backend = "fcfs"
-interface_version = 1
+interface_version = 2
 
 # An empty version means any wasmtime this host has, which is what a fixture
 # that must install on an arbitrary test host declares. A serving package pins

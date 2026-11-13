@@ -25,7 +25,7 @@
 //! ([`RequestView::refill_tokens`]) but not the remaining token budget; see
 //! [`Arrival::refill_due`].
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::budget::{Shares, Step, prefill_chunk, work_tokens};
 use crate::decision::{DispatchOutput, Room, Shortage, Storage, Victim};
@@ -35,9 +35,10 @@ use crate::limits::{Limits, Parameters};
 use crate::lru::Lru;
 use crate::phases::Phases;
 use crate::policy::Policy;
+use crate::time::Nanos;
 use crate::view::{
-    CallView, Phase, PhaseClass, RankView, ReplicaView, RequestClass, RequestStatus, RequestView,
-    Snapshot,
+    CallView, PageView, Phase, PhaseClass, RankView, ReplicaView, RequestClass, RequestStatus,
+    RequestView, Snapshot,
 };
 use crate::waiting::{Order, Waiting};
 
@@ -78,15 +79,13 @@ pub struct Arrival<K: Order> {
     waiting: Waiting<K>,
     /// The latest view of every request the mechanism has told this policy
     /// about: queued, running, and those that ended.
-    views: HashMap<RequestId, RequestView>,
+    views: BTreeMap<RequestId, RequestView>,
     /// The running requests, in the order the mechanism admitted them.
     admission: Vec<RequestId>,
-    /// The pages of the device and host caches, least recently used first.
-    pages: Lru<PageId>,
-    /// Whether each page sits in host memory.
-    on_host: HashMap<PageId, bool>,
-    /// Whether no running request continues from each page.
-    evictable: HashMap<PageId, bool>,
+    /// The pages of the device and host caches, least recently used first,
+    /// each with its view as the mechanism last stated it: whether it sits in
+    /// host memory and whether no running request continues from it.
+    pages: Lru<PageId, PageView>,
     /// The encoder cache entries, least recently used first.
     encodings: Lru<EncodingId>,
     /// The rank the last `route` picked, so ties rotate as they do today.
@@ -115,11 +114,9 @@ impl<K: Order> Default for Arrival<K> {
             limits: Limits::default(),
             phases: Phases::default(),
             waiting: Waiting::new(),
-            views: HashMap::new(),
+            views: BTreeMap::new(),
             admission: Vec::new(),
             pages: Lru::new(),
-            on_host: HashMap::new(),
-            evictable: HashMap::new(),
             encodings: Lru::new(),
             route_cursor: 0,
             media_first: false,
@@ -289,11 +286,29 @@ impl<K: Order> Arrival<K> {
     fn offload_pages(&self) -> Vec<PageId> {
         self.pages
             .iter()
-            .filter(|page| {
-                !self.on_host.get(page).copied().unwrap_or(false)
-                    && self.evictable.get(page).copied().unwrap_or(false)
-            })
+            .filter(|(_, view)| !view.on_host && view.evictable)
+            .map(|(page, _)| page)
             .collect()
+    }
+
+    /// One page of a release (`Event::Released`): no request holds it any more,
+    /// so it is evictable, and it was used just now. A page this policy was
+    /// never told of is a device page, since a request held it, whose token
+    /// count it does not know.
+    fn release(&mut self, page: PageId) {
+        match self.pages.touch(page) {
+            Some(view) => view.evictable = true,
+            None => self.pages.insert(
+                page,
+                PageView {
+                    id: page,
+                    tokens: 0,
+                    last_used: Nanos::default(),
+                    on_host: false,
+                    evictable: true,
+                },
+            ),
+        }
     }
 
     /// The pages a shortage of `kind` may take, least recently used first.
@@ -307,14 +322,14 @@ impl<K: Order> Arrival<K> {
     fn page_victims(&self, want_host: bool, need: u64) -> Vec<Victim> {
         let mut victims = Vec::new();
         let mut taken = 0u64;
-        for page in self.pages.iter() {
+        for (page, view) in self.pages.iter() {
             if taken >= need {
                 break;
             }
-            if self.on_host.get(&page).copied().unwrap_or(false) != want_host {
+            if view.on_host != want_host {
                 continue;
             }
-            if !want_host && !self.evictable.get(&page).copied().unwrap_or(false) {
+            if !want_host && !view.evictable {
                 continue;
             }
             victims.push(Victim::Page(page));
@@ -378,26 +393,17 @@ impl<K: Order> Policy for Arrival<K> {
             }
         }
         // The cache orders the snapshot states, least recently used first.
-        let mut pages: Vec<(u64, PageId, bool, bool)> = state
-            .pages
-            .iter()
-            .map(|page| (page.last_used.0, page.id, page.on_host, page.evictable))
-            .collect();
-        pages.sort_unstable_by_key(|(used, id, _, _)| (*used, id.0));
-        for (_, page, on_host, evictable) in pages {
-            self.pages.touch(page);
-            self.on_host.insert(page, on_host);
-            self.evictable.insert(page, evictable);
-        }
+        let mut pages: Vec<&PageView> = state.pages.iter().collect();
+        pages.sort_unstable_by_key(|page| (page.last_used.0, page.id.0));
+        self.pages = Lru::from_least_recent(pages.into_iter().map(|page| (page.id, page.clone())));
         let mut encodings: Vec<(u64, EncodingId)> = state
             .encodings
             .iter()
             .map(|entry| (entry.last_used.0, entry.id))
             .collect();
         encodings.sort_unstable_by_key(|(used, id)| (*used, id.0));
-        for (_, entry) in encodings {
-            self.encodings.touch(entry);
-        }
+        self.encodings =
+            Lru::from_least_recent(encodings.into_iter().map(|(_, entry)| (entry, ())));
     }
 
     fn observe(&mut self, events: &[Event]) {
@@ -452,18 +458,21 @@ impl<K: Order> Policy for Arrival<K> {
                     self.admission.retain(|running| running != request);
                 }
                 Event::Stepped { .. } => {}
-                Event::Cached { page } => {
-                    self.pages.touch(page.id);
-                    self.on_host.insert(page.id, page.on_host);
-                    self.evictable.insert(page.id, page.evictable);
+                Event::Cached { page } => self.pages.insert(page.id, page.clone()),
+                // A page this policy was never told of has no view to keep;
+                // it enters the order when it is stated.
+                Event::Hit { page } => {
+                    self.pages.touch(*page);
                 }
-                Event::Hit { page } => self.pages.touch(*page),
+                Event::Released { pages } => {
+                    for page in pages {
+                        self.release(*page);
+                    }
+                }
                 Event::Freed { page } => {
                     self.pages.remove(*page);
-                    self.on_host.remove(page);
-                    self.evictable.remove(page);
                 }
-                Event::Encoded { entry } => self.encodings.touch(entry.id),
+                Event::Encoded { entry } => self.encodings.insert(entry.id, ()),
                 // An event kind from a newer mechanism.
                 Event::Unknown => {}
             }
@@ -1417,8 +1426,9 @@ mod tests {
     /// from (`validate_victims`), so naming one would fail the policy at the
     /// first offload; `RequestView::cached_pages` and the mechanism's own
     /// `evictable` flag are how the policy knows. The flag moves after a page
-    /// is announced (`Cached` carries it every time), so the case also shows
-    /// the page becoming offloadable once its last user finished.
+    /// is announced (a `Released` names the page its last user gave up), so
+    /// the case also shows the page becoming offloadable once its last user
+    /// finished.
     #[test]
     fn a_page_a_request_still_continues_from_is_not_offloaded() {
         let mut fcfs = Arrival::<crate::ArrivalOrder>::default();
@@ -1448,20 +1458,65 @@ mod tests {
         assert_eq!(fcfs.dispatch(&room(1024, 8)).offload, vec![PageId(1)]);
 
         // The mechanism states the page's last user is gone: it is now the
-        // least recently used page no request continues from.
-        fcfs.observe(&[Event::Cached {
-            page: PageView {
-                id: PageId(2),
-                tokens: 16,
-                last_used: Nanos(3),
-                on_host: false,
-                evictable: true,
-            },
+        // most recently used page no request continues from.
+        fcfs.observe(&[Event::Released {
+            pages: vec![PageId(2)],
         }]);
         assert_eq!(
             fcfs.dispatch(&room(1024, 8)).offload,
             vec![PageId(1), PageId(2)]
         );
+    }
+
+    /// **A release decides what restating each page as evictable decides.**
+    ///
+    /// The mechanism tells the pages their last holders gave up as one
+    /// `Released`, in the order they join the eviction order, where it could
+    /// restate each as a `Cached` page that is now evictable: the policy keeps
+    /// the same order and the same flags either way, so it offloads the same
+    /// pages and names the same victims. A page still held is named by
+    /// neither.
+    #[test]
+    fn a_release_decides_as_restating_each_page_evictable() {
+        let page = |id: u64, used: u64, evictable: bool| Event::Cached {
+            page: PageView {
+                id: PageId(id),
+                tokens: 16,
+                last_used: Nanos(used),
+                on_host: false,
+                evictable,
+            },
+        };
+        let held = [
+            page(1, 1, false),
+            page(2, 2, false),
+            page(3, 3, false),
+            page(4, 4, false),
+        ];
+
+        let mut restated = policy();
+        restated.observe(&held);
+        restated.observe(&[page(3, 10, true), page(1, 11, true)]);
+        let mut released = policy();
+        released.observe(&held);
+        released.observe(&[Event::Released {
+            pages: vec![PageId(3), PageId(1)],
+        }]);
+
+        for fcfs in [&mut restated, &mut released] {
+            assert_eq!(
+                fcfs.dispatch(&room(1024, 8)).offload,
+                vec![PageId(3), PageId(1)]
+            );
+            let victims = fcfs.preempt(&Shortage {
+                kind: Storage::KvUnits,
+                need: 2,
+            });
+            assert_eq!(
+                victims,
+                vec![Victim::Page(PageId(3)), Victim::Page(PageId(1))]
+            );
+        }
     }
 
     /// **A host hit shorter than the floor is not worth prefetching.**

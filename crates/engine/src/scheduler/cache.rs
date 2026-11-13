@@ -8,7 +8,7 @@
 //! Every completion read from the queue pair is applied here (`learn`), one dropped for a
 //! forgotten owner too, since what it states of the buffer pool's cache holds all the same; a
 //! request gives up the blocks it holds by `unpin`. Each change of a row is told to the policy
-//! (`Cached`, `Hit`, `Freed`, `Encoded`, SD §5.2). Before a step schedules, `install_victims`
+//! (`Cached`, `Hit`, `Released`, `Freed`, `Encoded`, SD §5.2). Before a step schedules, `install_victims`
 //! installs the head of each order by `Victims`, ahead of the step's allocations, and asks for a
 //! `List` when the buffer pool counts evictable units the scheduler cannot account for. The table is exact for what this queue pair
 //! commits and evicts; a wrong belief costs reuse, never a wrong block, since every request that
@@ -624,11 +624,13 @@ impl Scheduler {
     }
 
     /// Tells the policy how a row changed (SD §5.2). A KV block (of a class with a block size)
-    /// that enters `cache`, or whose tier or evictability as the policy sees them changes, is
-    /// `Cached`; one held by one more request and nothing else the policy sees is a `Hit`; one
-    /// that leaves is `Freed`. An encoder output (of a sized class a group of the scheduler
-    /// computes into device memory) that enters `cache` or is used again is `Encoded`. A stored
-    /// trajectory, on the host alone, is no object of the policy's.
+    /// that the last request holding it gave up, and nothing else the policy sees changed, is one
+    /// page of a `Released`, which lists the pages of consecutive releases in the order they
+    /// joined the eviction order; one that enters `cache`, or whose tier or evictability as the
+    /// policy sees them changes otherwise, is `Cached`; one held by one more request and nothing
+    /// else the policy sees is a `Hit`; one that leaves is `Freed`. An encoder output (of a sized
+    /// class a group of the scheduler computes into device memory) that enters `cache` or is used
+    /// again is `Encoded`. A stored trajectory, on the host alone, is no object of the policy's.
     fn tell(&mut self, before: Option<Cached>, after: Option<Cached>) {
         let Some(row) = after.or(before) else {
             return;
@@ -641,6 +643,22 @@ impl Scheduler {
                     return;
                 }
                 Event::Hit { page: PageId(id) }
+            }
+            // A release: only the holders and the last use moved, and the last use is the
+            // release itself, which the event's place in the order states.
+            (true, Some(old), Some(new))
+                if old.pins > 0
+                    && new.pins == 0
+                    && old.tokens == new.tokens
+                    && old.page().on_host == new.page().on_host =>
+            {
+                if let Some(Event::Released { pages }) = self.policy.events.last_mut() {
+                    pages.push(PageId(id));
+                    return;
+                }
+                Event::Released {
+                    pages: vec![PageId(id)],
+                }
             }
             (true, _, Some(new)) => Event::Cached { page: new.page() },
             (true, _, None) => Event::Freed { page: PageId(id) },
@@ -1077,18 +1095,53 @@ mod tests {
         bench.scheduler.install_victims();
         assert_eq!(written(&mut bench), [victims(&[key(1), key(2)])]);
 
-        // The policy saw the block enter held, become evictable, and the second enter.
-        let events: Vec<(PageId, bool)> = bench
+        // The policy saw the block enter held, its release, and the second enter given up.
+        let events: Vec<(&str, PageId, bool)> = bench
             .scheduler
             .policy
             .events
             .iter()
-            .map(|event| match event {
-                Event::Cached { page } => (page.id, page.evictable),
+            .flat_map(|event| match event {
+                Event::Cached { page } => vec![("cached", page.id, page.evictable)],
+                Event::Released { pages } => {
+                    pages.iter().map(|page| ("released", *page, true)).collect()
+                }
                 other => panic!("unexpected event {other:?}"),
             })
             .collect();
-        assert_eq!(events, [(page(1), false), (page(1), true), (page(2), true)]);
+        assert_eq!(
+            events,
+            [
+                ("cached", page(1), false),
+                ("released", page(1), true),
+                ("cached", page(2), true)
+            ]
+        );
+    }
+
+    /// A request that gives up the blocks it holds tells the policy one `Released`, which lists
+    /// them in the order they join the eviction order, the deepest first (SD §4.4): the order the
+    /// policy keeps is the one the scheduler installs.
+    #[test]
+    fn a_release_of_many_blocks_is_one_event_in_the_eviction_order() {
+        let mut bench = bench(4096);
+        bench.attach(&[(A, OWNER_A, 3)]);
+        for (at, byte) in [(0, 1), (1, 2), (2, 3)] {
+            stamped(&mut bench, commit(at, key(byte)), &Completion::Committed);
+        }
+        bench.scheduler.install_victims();
+        assert!(written(&mut bench).is_empty());
+        bench.scheduler.policy.events.clear();
+
+        bench.scheduler.unpin(ID, &[key(1), key(2), key(3)]);
+        bench.scheduler.install_victims();
+        assert_eq!(written(&mut bench), [victims(&[key(3), key(2), key(1)])]);
+
+        let events = &bench.scheduler.policy.events;
+        assert!(
+            matches!(&events[..], [Event::Released { pages }] if *pages == [page(3), page(2), page(1)]),
+            "{events:?}"
+        );
     }
 
     #[test]

@@ -206,7 +206,8 @@ pub enum Output {
     Event(RequestId, Event),
     /// The statistics of the last second.
     Stats(SchedulerStats),
-    /// The serving policy faulted and the previous one serves again.
+    /// The serving policy faulted, with this fault, and the policy it replaced serves again, or
+    /// with none a fresh instance of it (SD §5.2 "Faults").
     PolicyRolledBack(String),
     /// A batch computed non-finite logits for these requests.
     NumericalFault(BatchId, Vec<RequestId>),

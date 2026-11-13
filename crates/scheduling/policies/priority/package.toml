@@ -6,7 +6,7 @@
 
 op = "scheduling"
 backend = "priority"
-interface_version = 1
+interface_version = 2
 
 [toolchain]
 kind = "wasm"

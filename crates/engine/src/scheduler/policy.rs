@@ -7,7 +7,7 @@
 //! allocated, packed as `ptr << 32 | len` (`0` for none), or for `route` and `place` the chosen
 //! index itself (`scheduling::wire`). Every export the host enters, the two buffer exports
 //! included, starts with a fuel budget of its own, so a policy that loops ends its call instead
-//! of the step.
+//! of the step; `init`'s grows with the snapshot it decodes.
 //!
 //! The host keeps no view of its own: the policy holds the view, and the scheduler tells it what
 //! changed as events (§5.2). A decision that names something that cannot be done is cut or
@@ -151,6 +151,16 @@ pub fn load(bytes: &[u8]) -> Result<Module, PolicyError> {
 /// bound on one that never returns.
 const DEFAULT_CALL_FUEL: u64 = 10_000_000;
 
+/// The fuel `init` is given beyond [`DEFAULT_CALL_FUEL`] for every byte of its message.
+///
+/// The snapshot states every request and every cached block, so decoding it grows with the cache:
+/// typed JSON decoding in a wasm32 module costs 50 to 100 fuel a byte, and the packaged `fcfs`
+/// spends about 70 a byte of cached blocks on its whole `init`. Twice the decoding's dearest leaves
+/// a policy as much again for its own state, so a policy instantiates on a warm cache of any size,
+/// and the bound still ends an `init` that never returns. No other call grows with the state: the
+/// events of a step cost what the step changed.
+const INIT_FUEL_PER_BYTE: u64 = 200;
+
 /// The longest starvation bound a policy may declare (`limits().timeout`), as `sched_ext` caps
 /// `timeout_ms` at 30 seconds.
 const MAX_TIMEOUT: Nanos = Nanos(30_000_000_000);
@@ -177,6 +187,9 @@ pub(crate) struct Policy {
     /// The module and arguments the last switch replaced, which a rollback instantiates; `None`
     /// once the switch is committed.
     pub previous: Option<(Arc<Module>, Parameters)>,
+    /// Whether the serving instance was made by [`Policy::recover`] and has not completed a
+    /// `dispatch` since: a fault of it then ends the scheduler (SD §5.2 "Faults").
+    recovering: bool,
     /// The limits the serving policy declared: the step's token and call budgets, the chunk limit,
     /// the queue bound, the prefetch threshold and the starvation bound the scheduler enforces.
     pub limits: Limits,
@@ -269,6 +282,7 @@ impl Policy {
             parameters,
             ceilings: *ceilings,
             previous: None,
+            recovering: false,
             limits,
             events: Vec::new(),
             dirty: Vec::new(),
@@ -317,32 +331,45 @@ impl Policy {
     /// [`Error::InvalidRequest`] when no switch is left to roll back, and [`Error::Policy`] with
     /// the previous module's fault; either way the serving policy and `previous` are untouched.
     pub(crate) fn rollback(&mut self, snapshot: Snapshot) -> Result<(), Error> {
-        let Some((module, parameters)) = self.previous.take() else {
+        let Some((module, parameters)) = self.previous.clone() else {
             return Err(Error::InvalidRequest(
                 "no replaced policy is kept to roll back to".into(),
             ));
         };
 
-        let ceilings = self.ceilings;
-        match start(
-            &module,
-            &parameters,
-            snapshot,
-            &ceilings,
-            &mut self.calls,
-            &mut self.fuel,
-        ) {
-            Ok((instance, limits)) => {
-                self.module = module;
-                self.parameters = parameters;
-                self.install(instance, limits, ceilings);
-                Ok(())
-            }
-            Err(fault) => {
-                self.previous = Some((module, parameters));
-                Err(Error::Policy(fault))
-            }
-        }
+        self.serve(module, parameters, snapshot)
+            .map_err(Error::Policy)?;
+        self.previous = None;
+        Ok(())
+    }
+
+    /// Whether a fault of the serving instance can be recovered from by [`Policy::recover`]:
+    /// unless that instance was made by a recovery and has not completed a `dispatch` since, since
+    /// a fault that a fresh instance meets again before it decides a step is not one a recovery
+    /// cures.
+    pub(crate) fn recoverable(&self) -> bool {
+        !self.recovering
+    }
+
+    /// After a fault of the serving instance (SD §5.2 "Faults"): the policy the last switch
+    /// replaced serves again, or with none kept a fresh instance of the serving module, either
+    /// instantiated on `snapshot` under the serving ceilings. The faulted instance's memory and
+    /// the events gathered for it are dropped, since the snapshot states what they told. Nothing
+    /// is kept to roll back to after it.
+    ///
+    /// # Errors
+    ///
+    /// The fault of the instantiation; the faulted instance then stays, and the scheduler fails.
+    pub(crate) fn recover(&mut self, snapshot: Snapshot) -> Result<(), PolicyError> {
+        let (module, parameters) = match &self.previous {
+            Some((module, parameters)) => (Arc::clone(module), parameters.clone()),
+            None => (Arc::clone(&self.module), self.parameters.clone()),
+        };
+
+        self.serve(module, parameters, snapshot)?;
+        self.previous = None;
+        self.recovering = true;
+        Ok(())
     }
 
     /// The trial of the last switch ends in its favour (SD §3.9): the module and arguments it
@@ -389,7 +416,9 @@ impl Policy {
         let reply = self
             .call(Call::Dispatch, wire::encode(room))?
             .ok_or_else(|| malformed(Call::Dispatch, "the policy replied nothing"))?;
-        decoded(Call::Dispatch, wire::decode(&reply))
+        let output = decoded(Call::Dispatch, wire::decode(&reply))?;
+        self.recovering = false;
+        Ok(output)
     }
 
     /// The victims the policy names for a shortage, in its order; an empty reply names none.
@@ -432,6 +461,30 @@ impl Policy {
         self.index(Call::Place, wire::encode(&(call, replicas)))
     }
 
+    /// `module` with `parameters`, instantiated on `snapshot` under the serving ceilings, serves
+    /// in place of the serving instance; on a fault the serving instance is untouched.
+    fn serve(
+        &mut self,
+        module: Arc<Module>,
+        parameters: Parameters,
+        snapshot: Snapshot,
+    ) -> Result<(), PolicyError> {
+        let ceilings = self.ceilings;
+        let (instance, limits) = start(
+            &module,
+            &parameters,
+            snapshot,
+            &ceilings,
+            &mut self.calls,
+            &mut self.fuel,
+        )?;
+
+        self.module = module;
+        self.parameters = parameters;
+        self.install(instance, limits, ceilings);
+        Ok(())
+    }
+
     /// Makes `instance` the serving one, with its limits and the ceilings they were checked
     /// against. The events gathered for the instance it replaces are dropped, since the snapshot
     /// `instance` started from states what they told; marked requests stay marked, and their views
@@ -440,6 +493,7 @@ impl Policy {
         self.instance = instance;
         self.limits = limits;
         self.ceilings = ceilings;
+        self.recovering = false;
         self.events.clear();
     }
 
@@ -526,7 +580,14 @@ impl Instance {
     fn exchange(&mut self, call: Call, message: &[u8], fuel: &mut u64) -> Result<u64, PolicyError> {
         let len = u32::try_from(message.len())
             .map_err(|_| malformed(call, "the message is larger than wasm32 addresses"))?;
-        let ptr = enter(&mut self.store, call, &self.alloc, len, fuel)?;
+        let ptr = enter(
+            &mut self.store,
+            call,
+            &self.alloc,
+            len,
+            DEFAULT_CALL_FUEL,
+            fuel,
+        )?;
         if ptr == 0 && len != 0 {
             return Err(malformed(call, "the module could not hold the message"));
         }
@@ -535,23 +596,32 @@ impl Instance {
             .map_err(|error| malformed(call, format!("cannot write the message: {error}")))?;
 
         let buffer = (ptr, len);
+        let budget = budget(call, len);
+        let store = &mut self.store;
         let result = match call {
-            Call::Init => enter(&mut self.store, call, &self.init, buffer, fuel)?,
-            Call::Observe => enter(&mut self.store, call, &self.observe, buffer, fuel)?,
-            Call::Dispatch => enter(&mut self.store, call, &self.dispatch, buffer, fuel)?,
-            Call::Preempt => enter(&mut self.store, call, &self.preempt, buffer, fuel)?,
-            Call::Route => u64::from(enter(&mut self.store, call, &self.route, buffer, fuel)?),
-            Call::Place => u64::from(enter(&mut self.store, call, &self.place, buffer, fuel)?),
+            Call::Init => enter(store, call, &self.init, buffer, budget, fuel)?,
+            Call::Observe => enter(store, call, &self.observe, buffer, budget, fuel)?,
+            Call::Dispatch => enter(store, call, &self.dispatch, buffer, budget, fuel)?,
+            Call::Preempt => enter(store, call, &self.preempt, buffer, budget, fuel)?,
+            Call::Route => u64::from(enter(store, call, &self.route, buffer, budget, fuel)?),
+            Call::Place => u64::from(enter(store, call, &self.place, buffer, budget, fuel)?),
             Call::Limits => return Err(malformed(call, "this call takes no message")),
         };
 
-        enter(&mut self.store, call, &self.free, buffer, fuel)?;
+        enter(store, call, &self.free, buffer, DEFAULT_CALL_FUEL, fuel)?;
         Ok(result)
     }
 
     /// The limits the policy declares: `sched_limits`, which takes no message.
     fn read_limits(&mut self, fuel: &mut u64) -> Result<Option<Vec<u8>>, PolicyError> {
-        let packed = enter(&mut self.store, Call::Limits, &self.limits, (), fuel)?;
+        let packed = enter(
+            &mut self.store,
+            Call::Limits,
+            &self.limits,
+            (),
+            DEFAULT_CALL_FUEL,
+            fuel,
+        )?;
         self.take(Call::Limits, packed, fuel)
     }
 
@@ -575,7 +645,14 @@ impl Instance {
                     format!("the reply {ptr}+{len} lies outside the module's memory: {error}"),
                 )
             })?;
-        enter(&mut self.store, call, &self.free, (ptr, len), fuel)?;
+        enter(
+            &mut self.store,
+            call,
+            &self.free,
+            (ptr, len),
+            DEFAULT_CALL_FUEL,
+            fuel,
+        )?;
         Ok(Some(reply))
     }
 }
@@ -611,21 +688,33 @@ fn start(
     Ok((instance, limits))
 }
 
-/// Enters one export with a fresh fuel budget, adds what it consumed to `fuel`, and reads a
-/// failure as the fault it is.
+/// The fuel the export of `call` is entered with for a message of `len` bytes:
+/// [`DEFAULT_CALL_FUEL`], and for `init` [`INIT_FUEL_PER_BYTE`] more for each byte of its snapshot.
+fn budget(call: Call, len: u32) -> u64 {
+    match call {
+        Call::Init => {
+            DEFAULT_CALL_FUEL.saturating_add(INIT_FUEL_PER_BYTE.saturating_mul(u64::from(len)))
+        }
+        _ => DEFAULT_CALL_FUEL,
+    }
+}
+
+/// Enters one export with a fresh fuel budget of `budget`, adds what it consumed to `fuel`, and
+/// reads a failure as the fault it is.
 fn enter<P: WasmParams, R: WasmResults>(
     store: &mut Store<()>,
     call: Call,
     export: &TypedFunc<P, R>,
     params: P,
+    budget: u64,
     fuel: &mut u64,
 ) -> Result<R, PolicyError> {
     store
-        .set_fuel(DEFAULT_CALL_FUEL)
+        .set_fuel(budget)
         .map_err(|error| malformed(call, format!("cannot set the call's fuel: {error}")))?;
     let result = export.call(&mut *store, params);
     let left = store.get_fuel().unwrap_or(0);
-    *fuel = fuel.saturating_add(DEFAULT_CALL_FUEL.saturating_sub(left));
+    *fuel = fuel.saturating_add(budget.saturating_sub(left));
 
     result.map_err(|error| match error.downcast_ref::<Trap>() {
         Some(Trap::OutOfFuel) => PolicyError::Fuel { call },
@@ -781,17 +870,20 @@ impl Scheduler {
         self.policy.switch(module, parameters, snapshot, &ceilings)
     }
 
-    /// The serving policy faulted during a step: the policy it replaced serves again from a fresh
-    /// snapshot and the engine is told with `Output::PolicyRolledBack`; with none to roll back to,
-    /// or one that faults too, the scheduler fails with the fault.
+    /// The serving policy faulted during a step (SD §5.2 "Faults"): the policy it replaced, or
+    /// with none a fresh instance of it, serves again from a fresh snapshot and the engine is told
+    /// with `Output::PolicyRolledBack`. The scheduler fails with the fault when that instantiation
+    /// faults too, or when the faulted instance was itself made so and had not yet decided a step.
     pub(super) fn policy_failed(&mut self, fault: PolicyError) {
-        let snapshot = self.snapshot();
-        if self.policy.rollback(snapshot).is_ok() {
-            // An engine that no longer listens has stopped this scheduler's epoch.
-            let _ = self
-                .output
-                .send(Output::PolicyRolledBack(fault.to_string()));
-            return;
+        if self.policy.recoverable() {
+            let snapshot = self.snapshot();
+            if self.policy.recover(snapshot).is_ok() {
+                // An engine that no longer listens has stopped this scheduler's epoch.
+                let _ = self
+                    .output
+                    .send(Output::PolicyRolledBack(fault.to_string()));
+                return;
+            }
         }
         self.fail(Error::Policy(fault));
     }
@@ -803,7 +895,12 @@ pub(crate) mod tests {
     use std::process::Command;
     use std::sync::OnceLock;
 
-    use scheduling::ids::RequestId as GuestId;
+    use scheduling::End;
+    use scheduling::ids::{PageId, RequestId as GuestId, StageId};
+    use scheduling::time::Duration;
+    use scheduling::view::{
+        PageView, Phase as GuestPhase, PhaseView, RequestClass, RequestStatus as GuestStatus,
+    };
 
     use super::super::view::tests::waiting;
     use super::super::view::view_of;
@@ -1081,26 +1178,258 @@ pub(crate) mod tests {
         );
     }
 
-    /// The default policies' packages declare the same wasmtime version: the Build Server
-    /// precompiles a package with the toolchain its manifest names, and a module precompiled by
-    /// another version does not load.
+    /// The packaged policies declare the version of the policy interface this engine runs, and
+    /// the default policies the wasmtime version it runs: the engine refuses a module built for
+    /// another version of the interface, the Build Server precompiles a package with the toolchain
+    /// its manifest names, and a module precompiled by another version does not load. The
+    /// fixture states no wasmtime version, so that it installs on any test host.
     #[test]
-    fn the_default_policies_declare_the_same_wasmtime_version() {
-        let declared = format!("version = \"{WASMTIME_VERSION}\"");
-        for (backend, manifest) in [
+    fn the_packaged_policies_declare_this_engines_interface_and_wasmtime() {
+        let interface = format!("interface_version = {}", scheduling::INTERFACE_VERSION);
+        let toolchain = format!("version = \"{WASMTIME_VERSION}\"");
+        for (backend, manifest, pinned) in [
             (
                 "fcfs",
                 include_str!("../../../scheduling/policies/fcfs/package.toml"),
+                true,
             ),
             (
                 "priority",
                 include_str!("../../../scheduling/policies/priority/package.toml"),
+                true,
+            ),
+            (
+                "fixture",
+                include_str!("../../../scheduling/policies/fixture/package.toml"),
+                false,
             ),
         ] {
+            let declares = |line: &str| manifest.lines().any(|stated| stated == line);
             assert!(
-                manifest.contains(&declared),
-                "the {backend} package does not declare {declared}"
+                declares(&interface),
+                "the {backend} package does not declare {interface}"
+            );
+            assert!(
+                !pinned || declares(&toolchain),
+                "the {backend} package does not declare {toolchain}"
             );
         }
+    }
+
+    /// A page id as the leading eight bytes of a block's key give them: spread over every bit.
+    fn spread(number: u64) -> PageId {
+        let mut mixed = number.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        PageId(mixed ^ (mixed >> 31))
+    }
+
+    /// An instant on the host's monotonic clock some months after it started.
+    const NOW: u64 = 12_300_000_000_000_000;
+
+    /// The view a scheduler states of request `id` of a decode load: a 512-token prompt and
+    /// 1024 tokens to generate, of which it has generated `generated`, holding `pages` blocks.
+    fn decoding(id: u64, state: GuestStatus, generated: u32, pages: u32) -> RequestView {
+        let running = state == GuestStatus::Running;
+        RequestView {
+            id: GuestId(id),
+            state,
+            phase: running.then_some(GuestPhase::Decode.id()),
+            priority: 0,
+            arrived_at: Nanos(NOW + id * 1_000_000),
+            admitted_at: running.then_some(Nanos(NOW + id * 1_000_000)),
+            prompt_tokens: 512,
+            prefill_tokens: 512,
+            generated_tokens: generated,
+            cached_prefix_tokens: 0,
+            prefilled_tokens: 512,
+            cached_pages: pages,
+            last_emitted_at: None,
+            class: RequestClass::Token,
+            waiting_transfer: false,
+            next_tokens: 1,
+            reservation_units: 0,
+            prefetch_tokens: 0,
+            refill_tokens: None,
+            remaining_tokens: 1024 - generated,
+            migratable: true,
+            cache_rank: None,
+        }
+    }
+
+    /// A 64-token block of a decode load's cache, last used at `used`.
+    fn block(page: PageId, used: u64, evictable: bool) -> PageView {
+        PageView {
+            id: page,
+            tokens: 64,
+            last_used: Nanos(NOW + used),
+            on_host: false,
+            evictable,
+        }
+    }
+
+    /// The phases a text deployment's snapshot states.
+    fn text_phases() -> Vec<PhaseView> {
+        [GuestPhase::Prefill, GuestPhase::Decode]
+            .map(|kind| PhaseView {
+                id: kind.id(),
+                kind,
+                block: StageId(0),
+            })
+            .to_vec()
+    }
+
+    /// The fuel one call of the policy consumed, the call's message and reply included, and its
+    /// reply.
+    fn metered(policy: &mut Policy, call: Call, message: Vec<u8>) -> (u64, Option<Vec<u8>>) {
+        let before = policy.fuel;
+        let reply = policy.call(call, Ok(message)).unwrap();
+        (policy.fuel - before, reply)
+    }
+
+    /// A step of a decode load in which most requests end together: 64 requests decode, and 60
+    /// of them end and give up the 16 blocks each held, which the step tells in 253 events
+    /// (an advance and an emission per request, an end and one release per ending request, the
+    /// views of the 4 that run on, the step's end). The step's `observe` and `dispatch`, and
+    /// those of a step in which all 64 decode on, each consume at most half of
+    /// [`DEFAULT_CALL_FUEL`]: half leaves room for a step twice as heavy (twice the requests
+    /// ending, or twice the blocks each) before a call runs out, while telling each block as a
+    /// restated page, or decoding each event through a buffered copy, exceeds it. The policy saw
+    /// the release: it offloads every block given up.
+    #[test]
+    fn a_step_in_which_most_requests_end_stays_well_within_a_calls_fuel() {
+        const RUNNING: u64 = 64;
+        const ENDING: u64 = 60;
+        const BLOCKS: u64 = 16;
+        const LIMIT: u64 = DEFAULT_CALL_FUEL / 2;
+        let held = |id: u64| (0..BLOCKS).map(move |index| spread(id * BLOCKS + index));
+
+        let (parameters, ceilings) = limited(8192, 128);
+        let snapshot = Snapshot {
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+        let mut policy = Policy::new(packaged("fcfs"), parameters, snapshot, &ceilings).unwrap();
+        let observe = |policy: &mut Policy, events: &[Event]| {
+            metered(policy, Call::Observe, wire::encode(&events).unwrap()).0
+        };
+
+        // The requests arrive, are admitted and fill their blocks over earlier steps.
+        let arrivals: Vec<Event> = (1..=RUNNING)
+            .map(|id| Event::Arrived {
+                request: decoding(id, GuestStatus::Waiting, 0, 0),
+            })
+            .chain((1..=RUNNING).map(|id| Event::Admitted {
+                request: GuestId(id),
+            }))
+            .collect();
+        observe(&mut policy, &arrivals);
+        for id in 1..=RUNNING {
+            let filled: Vec<Event> = held(id)
+                .enumerate()
+                .map(|(used, page)| Event::Cached {
+                    page: block(page, id * BLOCKS + used as u64, false),
+                })
+                .collect();
+            observe(&mut policy, &filled);
+        }
+
+        // A step in which every request decodes on.
+        let progress = |id: u64| {
+            [
+                Event::Advanced {
+                    request: GuestId(id),
+                    phase: GuestPhase::Decode.id(),
+                    tokens: 1,
+                },
+                Event::Emitted {
+                    request: GuestId(id),
+                    tokens: 1,
+                    at: Nanos(NOW + id),
+                },
+            ]
+        };
+        let mut steady: Vec<Event> = (1..=RUNNING).flat_map(progress).collect();
+        steady.extend((1..=RUNNING).map(|id| Event::Updated {
+            request: decoding(id, GuestStatus::Running, 1000, 16),
+        }));
+        steady.push(Event::Stepped {
+            step: 1000,
+            duration: Duration(9_500_000),
+        });
+
+        // The step in which 60 of them end.
+        let mut ending: Vec<Event> = (1..=RUNNING).flat_map(progress).collect();
+        for id in 1..=ENDING {
+            ending.push(Event::Finished {
+                request: GuestId(id),
+                end: End::Completed,
+            });
+            ending.push(Event::Released {
+                pages: held(id).collect(),
+            });
+        }
+        ending.extend((ENDING + 1..=RUNNING).map(|id| Event::Updated {
+            request: decoding(id, GuestStatus::Running, 1001, 16),
+        }));
+        ending.push(Event::Stepped {
+            step: 1001,
+            duration: Duration(9_500_000),
+        });
+        assert_eq!(ending.len(), 253);
+
+        let room = Room {
+            token_budget: 8192,
+            call_budget: 128,
+            page_tokens: 64,
+            ..Room::default()
+        };
+        for (step, events) in [("decoding", &steady), ("ending", &ending)] {
+            let observed = observe(&mut policy, events);
+            let (dispatched, reply) =
+                metered(&mut policy, Call::Dispatch, wire::encode(&room).unwrap());
+            assert!(observed <= LIMIT, "{step}: observe took {observed} fuel");
+            assert!(
+                dispatched <= LIMIT,
+                "{step}: dispatch took {dispatched} fuel"
+            );
+
+            let output: DispatchOutput = wire::decode(&reply.unwrap()).unwrap();
+            let released = if step == "ending" { ENDING * BLOCKS } else { 0 };
+            assert_eq!(output.offload.len() as u64, released, "{step}");
+        }
+    }
+
+    /// A policy instantiates on the snapshot of a warm cache: 128 running requests and the 2048
+    /// blocks of 64 tokens a cache of 131072 tokens holds, half of them given up. Its `init`
+    /// decodes far more than [`DEFAULT_CALL_FUEL`] allows a step's call, and is given fuel for
+    /// every byte of the snapshot; the policy knows every block, and offloads the ones given up.
+    #[test]
+    fn a_policy_instantiates_on_the_snapshot_of_a_warm_cache() {
+        let (parameters, ceilings) = limited(8192, 128);
+        let snapshot = Snapshot {
+            requests: (1..=128)
+                .map(|id| decoding(id, GuestStatus::Running, 500, 16))
+                .collect(),
+            pages: (0..2048)
+                .map(|number| block(spread(number), number, number % 2 == 0))
+                .collect(),
+            phases: text_phases(),
+            ..Snapshot::default()
+        };
+
+        let mut policy = Policy::new(packaged("fcfs"), parameters, snapshot, &ceilings).unwrap();
+        assert!(
+            policy.fuel > DEFAULT_CALL_FUEL,
+            "the snapshot is one a step's budget cannot decode"
+        );
+        let room = Room {
+            token_budget: 8192,
+            call_budget: 128,
+            page_tokens: 64,
+            ..Room::default()
+        };
+        let output = policy.dispatch(&room, &mut HashMap::new(), &[]).unwrap();
+        assert_eq!(output.offload.len(), 1024);
     }
 }
