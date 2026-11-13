@@ -170,6 +170,7 @@ pub(super) fn capacity() -> Capacity {
         phases: 0,
         slots: 16,
         kv_cache: None,
+        cache_groups: Vec::new(),
         buckets: Vec::new(),
         rows: [0; ipc::batch::Phase::COUNT],
         max_model_len: 4096,

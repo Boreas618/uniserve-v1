@@ -770,6 +770,7 @@ mod tests {
             feature_bytes: 0,
             media_bytes,
             call_window: 2,
+            cache_groups: Vec::new(),
         }
     }
 

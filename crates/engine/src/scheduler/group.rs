@@ -25,6 +25,7 @@
 
 use std::cmp::Reverse;
 
+use ipc::CacheGroupKind;
 use ipc::batch::{Batch, Phase, Shape, Variant};
 use proto::config::{
     KvCacheConfig, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig, WorkerGroupRole,
@@ -210,6 +211,10 @@ pub struct Capacity {
     /// intervals, from which keys and the block rules are computed; `None` for a group that holds
     /// no cache.
     pub kv_cache: Option<KvCacheConfig>,
+    /// The model's cache groups, in class order: class `c` of the session is cache group `c`,
+    /// with its retention kind (a sliding window's window) and its block size in tokens. Empty
+    /// for a group that holds no cache.
+    pub cache_groups: Vec<(CacheGroupKind, u32)>,
     /// The shapes the group's executors captured; a batch must fit one of them.
     pub buckets: Vec<Shape>,
     /// Per phase, by [`Phase::index`], the requests the stage serving it holds at once: one for
@@ -457,6 +462,7 @@ mod tests {
             phases: 0,
             slots: 8,
             kv_cache: None,
+            cache_groups: Vec::new(),
             buckets: Vec::new(),
             rows: [0; Phase::COUNT],
             max_model_len: 4096,

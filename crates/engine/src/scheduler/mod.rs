@@ -36,6 +36,15 @@ mod cache;
 mod group;
 mod policy;
 mod request;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the step's assembly, `schedule`, which appends the rows and seals the batches, \
+                  is not in the crate yet"
+    )
+)]
+mod rows;
 mod stats;
 #[cfg(test)]
 mod tests;
