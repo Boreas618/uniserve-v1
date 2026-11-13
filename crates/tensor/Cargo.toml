@@ -1,0 +1,37 @@
+[package]
+name = "uniserve-tensor"
+version = "0.1.0"
+edition = "2021"
+description = "Inference tensors for UniServe: views, tensor operations, a CPU backend and an open device-backend interface, derived from candle-core"
+repository = "https://github.com/Boreas618/uniserve-tensor"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[lib]
+name = "uniserve_tensor"
+
+[dependencies]
+byteorder = "1.4.3"
+float8 = { version = "0.7.0", features = ["num-traits"] }
+# Without the `f16` feature: `gemm-f16` does not build unoptimized for aarch64 targets that lack
+# FP16 in their baseline, and the CPU backend multiplies F16 matrices in F32 instead.
+gemm = { version = "0.19.0", default-features = false, features = ["std", "rayon", "wasm-simd128-enable"] }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics"] }
+libc = "0.2.147"
+libm = "0.2.15"
+memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
+num-traits = "0.2.15"
+num_cpus = "1.15.0"
+parking_lot = "0.12.5"
+rayon = "1.7.0"
+safetensors = "0.8.0"
+thiserror = "2"
+yoke = { version = "0.8.1", features = ["derive"] }
+
+[dev-dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+criterion = { version = "0.8", default-features = false }
+
+[[bench]]
+name = "bench_main"
+harness = false
