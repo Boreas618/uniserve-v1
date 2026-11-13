@@ -24,7 +24,7 @@ mod supervisor;
 
 pub(crate) use service::ServiceHandoff;
 pub use supervisor::LIFELINE_ENV;
-pub(crate) use supervisor::engine_executable;
+pub(crate) use supervisor::{engine_executable, pidfd_exited, pidfd_open};
 
 use std::net::IpAddr;
 use std::os::fd::OwnedFd;

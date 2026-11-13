@@ -15,11 +15,12 @@
 //! - [`module`]: the package revisions an epoch fills its operators with, the phases
 //!   and slots they fill, and the operators a build has.
 //!
-//! Each connection opens with a hello exchange that compares
-//! [`ENGINE_INTERFACE_VERSION`]. The workspace's one connection
-//! (`service::Connection`) carries the messages, one length-prefixed frame
-//! each, over a Unix socket on one node or TCP between nodes: every envelope
-//! of the interfaces implements `service::Message` here.
+//! Each connection opens with a hello exchange that agrees the version of the
+//! engine interface it speaks ([`ENGINE_INTERFACE_VERSION`], [`speaks`]). The
+//! workspace's one connection (`service::Connection`) carries the messages,
+//! one length-prefixed frame each, over a Unix socket on one node or TCP
+//! between nodes: every envelope of the interfaces implements
+//! `service::Message` here.
 
 pub mod catalog;
 pub mod config;
@@ -68,20 +69,50 @@ pub const STORAGE_PROTOCOL: u32 = 26
         Some(_) => panic!("UNISERVE_STORAGE_PROTOCOL_RAISE is 1 when it is set"),
     };
 
+/// The storage protocol's version at which the messages took their revision
+/// ([`MESSAGES_REVISION`]): an engine built for an earlier storage protocol
+/// exchanges other messages with the daemon. A change that raises the
+/// revision sets this to the storage protocol's version it is made at.
+const MESSAGES_STORAGE_PROTOCOL: u32 = 24;
+
 /// The version of the engine interface: every message an engine exchanges with
 /// the daemon (the process and request interfaces), the Storage Server and the
 /// Build Server. The interface has this one version. The engine package's
-/// manifest states it, an engine sends it in its hello, and a daemon refuses
-/// an engine built for another version.
+/// manifest states it, an engine sends it in its hello, and a daemon serves an
+/// engine of a version its build speaks ([`speaks`]) and refuses any other.
 ///
 /// The version carries the storage protocol's ([`STORAGE_PROTOCOL`]): each
 /// version of that protocol past the base raises it by one, as each change of
 /// this crate's messages that is not an addition does. Neither term ever
-/// falls, so an engine built for another storage protocol states another
-/// interface version and is refused at its hello, before any of its ranks
-/// reaches the Storage Server.
+/// falls, so an engine built for a storage protocol a build does not speak
+/// states an interface version it does not speak either, and is refused at its
+/// hello, before any of its ranks reaches the Storage Server.
 pub const ENGINE_INTERFACE_VERSION: u32 =
     MESSAGES_REVISION + (STORAGE_PROTOCOL - STORAGE_PROTOCOL_BASE);
+
+/// The earliest version of the engine interface this build speaks: that of the
+/// storage protocol before its own at the same revision of the messages. A
+/// build speaks its storage protocol and the one before
+/// (`storage::protocol::OLDEST`), and an engine built for the one before
+/// exchanges this build's messages with the daemon, so a daemon restarted in
+/// place into the next build goes on serving the engine it adopts until the
+/// next epoch replaces it. A build whose messages took their revision at its
+/// own storage protocol speaks its own version alone.
+pub const ENGINE_INTERFACE_OLDEST: u32 = MESSAGES_REVISION
+    + (if STORAGE_PROTOCOL > MESSAGES_STORAGE_PROTOCOL {
+        STORAGE_PROTOCOL - 1
+    } else {
+        STORAGE_PROTOCOL
+    })
+    - STORAGE_PROTOCOL_BASE;
+
+/// Whether this build speaks version `version` of the engine interface: one
+/// from [`ENGINE_INTERFACE_OLDEST`] to [`ENGINE_INTERFACE_VERSION`]. A daemon
+/// welcomes a peer whose hello states such a version in the peer's own, which
+/// the connection speaks for its life, and refuses a peer of any other.
+pub const fn speaks(version: u32) -> bool {
+    ENGINE_INTERFACE_OLDEST <= version && version <= ENGINE_INTERFACE_VERSION
+}
 
 /// The longest frame a peer of the interfaces may send: their messages are
 /// small, and a longer length is a corrupt stream.

@@ -15,7 +15,8 @@
 //
 // The interface is versioned across builds: a persistent daemon serves
 // engines of successive builds. Messages change only by additions; the hello
-// exchange compares major versions.
+// exchange agrees a major version: the daemon speaks its build's and the one
+// before (`proto::speaks`).
 
 syntax = "proto3";
 
@@ -34,6 +35,8 @@ message Hello {
 
 // The answer to a `Hello`.
 message Welcome {
+  // The version the link speaks for its life: the engine's own when the daemon speaks it, the
+  // daemon's own with a refusal.
   uint32 major = 1;
   string build = 3;
   // Why the engine is refused; empty when it is accepted.

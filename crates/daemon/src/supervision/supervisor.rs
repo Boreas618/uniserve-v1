@@ -165,8 +165,8 @@ pub(crate) struct Supervisor {
 /// package the launch's module set names, at the Build Server the launch names.
 ///
 /// The module was built when the epoch's module set was fixed, so this is a read of the store;
-/// a store that lost it builds it again first. A module of another version of the engine
-/// interface than this daemon speaks is refused here, before a process starts.
+/// a store that lost it builds it again first. A module of a version of the engine interface
+/// this daemon does not speak ([`proto::speaks`]) is refused here, before a process starts.
 pub(crate) fn engine_executable(launch: &proto::config::EngineArgs) -> Result<PathBuf, String> {
     let engine = &launch.modules.engine;
     let named = format!(
@@ -196,11 +196,14 @@ pub(crate) fn engine_executable(launch: &proto::config::EngineArgs) -> Result<Pa
             },
         )
         .map_err(|error| format!("resolving {named}: {error}"))?;
-    if module.interface_version != proto::ENGINE_INTERFACE_VERSION {
+    // The engine of the build this daemon replaced implements the version before its own: its
+    // relaunches and standbys start from its epoch's module until the next epoch replaces it.
+    if !proto::speaks(module.interface_version) {
         return Err(format!(
             "{named} implements version {} of the engine interface and this daemon speaks \
-             version {}",
+             versions {} to {}",
             module.interface_version,
+            proto::ENGINE_INTERFACE_OLDEST,
             proto::ENGINE_INTERFACE_VERSION
         ));
     }
@@ -968,26 +971,7 @@ impl Child {
     fn ended(&self, block: bool) -> std::io::Result<bool> {
         match &self.process {
             Process::Spawned(child) => exited(child.id(), if block { 0 } else { libc::WNOHANG }),
-            Process::Adopted { pidfd, .. } => {
-                let mut polled = libc::pollfd {
-                    fd: pidfd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                loop {
-                    // SAFETY: one valid pollfd for the call.
-                    let ready = unsafe { libc::poll(&mut polled, 1, if block { -1 } else { 0 }) };
-                    if ready == -1 {
-                        let error = std::io::Error::last_os_error();
-                        if error.kind() == std::io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        return Err(error);
-                    }
-                    // A pidfd turns readable once its process exited.
-                    return Ok(ready > 0);
-                }
-            }
+            Process::Adopted { pidfd, .. } => pidfd_exited(pidfd, block),
         }
     }
 
@@ -1039,8 +1023,32 @@ fn exited(pid: u32, flags: libc::c_int) -> std::io::Result<bool> {
     }
 }
 
-/// A pidfd of process `pid`.
-fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
+/// Whether the process `pidfd` names has exited: a pidfd turns readable once
+/// its process exited, whichever process's child it is. Blocks until it exits
+/// when `block`.
+pub(crate) fn pidfd_exited(pidfd: &OwnedFd, block: bool) -> std::io::Result<bool> {
+    let mut polled = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd for the call.
+        let ready = unsafe { libc::poll(&mut polled, 1, if block { -1 } else { 0 }) };
+        if ready == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        return Ok(ready > 0);
+    }
+}
+
+/// A pidfd of process `pid`, which names that process whatever process later
+/// takes its id.
+pub(crate) fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
     // SAFETY: the call takes integers only.
     let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if descriptor == -1 {

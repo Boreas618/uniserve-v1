@@ -190,6 +190,8 @@ impl Shared {
 /// The client of one engine process that serves requests.
 pub struct EngineClient {
     shared: Arc<Shared>,
+    /// The version of the engine interface the engine's link speaks, which its hello stated.
+    interface: u32,
     info: EngineInfo,
     reader: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The daemon connection the engine's process lives under, which reports
@@ -213,11 +215,12 @@ pub struct EngineClient {
 
 impl EngineClient {
     /// A client of the engine read through `reader` and written through
-    /// `writer`, two ends of one connection over which the engine reported
-    /// itself in `state` (ready or standing by) with `info`; frames `reader`
-    /// already holds are filed first. `stats` receives the schedulers'
-    /// statistics. `control` is the daemon connection the engine's process
-    /// lives under, which the client keeps; the process ends with it.
+    /// `writer`, two ends of one connection that speaks version `interface`
+    /// of the engine interface, over which the engine reported itself in
+    /// `state` (ready or standing by) with `info`; frames `reader` already
+    /// holds are filed first. `stats` receives the schedulers' statistics.
+    /// `control` is the daemon connection the engine's process lives under,
+    /// which the client keeps; the process ends with it.
     ///
     /// # Errors
     ///
@@ -225,6 +228,7 @@ impl EngineClient {
     pub fn new(
         reader: Connection,
         writer: Connection,
+        interface: u32,
         info: EngineInfo,
         state: EngineState,
         stats: StatsSink,
@@ -247,6 +251,7 @@ impl EngineClient {
         };
         Ok(Self {
             shared,
+            interface,
             info,
             reader: Mutex::new(Some(thread)),
             control: Mutex::new(control),
@@ -311,6 +316,12 @@ impl EngineClient {
     /// start.
     pub fn epoch(&self) -> u64 {
         self.shared.epoch.load(Ordering::Relaxed)
+    }
+
+    /// The version of the engine interface the engine speaks: a daemon's
+    /// successor that does not speak it declines the restart.
+    pub fn interface(&self) -> u32 {
+        self.interface
     }
 
     /// What the engine reported it serves.

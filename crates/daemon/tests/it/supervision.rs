@@ -242,21 +242,34 @@ fn a_stopped_daemon_takes_its_processes_with_it() {
     assert!(!alive(pid), "a process outlived its daemon's stop");
 }
 
-/// The engine interface's version carries the storage protocol's, so the next version is what
-/// an engine built for the next storage protocol states.
+/// The engine interface's version carries the storage protocol's, so the version before a
+/// build's own is what the engine of the build a restarted daemon replaced states, and the next
+/// one what an engine built for the next storage protocol states. A daemon serves its build's
+/// version and the one before, each engine in its own, and refuses any other, saying why.
 #[test]
-fn an_engine_of_another_major_version_is_refused() {
+fn a_daemon_serves_engines_of_its_version_and_the_one_before() {
     let directory = tempfile::tempdir().unwrap();
     let daemon = start(&directory, "node");
 
-    let (_, welcome) = Engine::hello(
-        daemon.address().unwrap(),
-        proto::ENGINE_INTERFACE_VERSION + 1,
-    );
-    assert!(
-        welcome.refusal.contains("major version"),
-        "the refusal says why: {welcome:?}"
-    );
+    let ours = proto::ENGINE_INTERFACE_VERSION;
+    for major in [ours - 1, ours] {
+        let (_, welcome) = Engine::hello(daemon.address().unwrap(), major);
+        assert_eq!(
+            welcome.refusal, "",
+            "an engine of version {major} is refused"
+        );
+        assert_eq!(
+            welcome.major, major,
+            "the engine is welcomed in another version than its own"
+        );
+    }
+    for major in [ours - 2, ours + 1] {
+        let (_, welcome) = Engine::hello(daemon.address().unwrap(), major);
+        assert!(
+            welcome.refusal.contains("major version"),
+            "an engine of version {major} is served, or its refusal does not say why: {welcome:?}"
+        );
+    }
 }
 
 /// The daemon of [`a_killed_daemon_takes_its_processes_with_it`], in a

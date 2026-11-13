@@ -231,8 +231,8 @@ fn hello(connection: &mut Connection, engine: u64, timeout: Duration) -> Result<
     if !welcome.refusal.is_empty() {
         bail!("the daemon refused this engine: {}", welcome.refusal);
     }
-    // The daemon compares the major versions too and refuses on a difference; a welcome that
-    // states another is a daemon of another interface.
+    // The daemon welcomes this engine in its own version when the daemon's build speaks it and
+    // refuses it otherwise; a welcome that states another is a daemon of another interface.
     if welcome.major != proto::ENGINE_INTERFACE_VERSION {
         bail!(
             "the daemon's interface is version {} and this engine's {}",

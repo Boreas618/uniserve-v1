@@ -209,7 +209,8 @@ pub(crate) fn fake_engine(
         .recv(STALL)
         .expect("the request link reads")
         .expect("the engine says hello in time");
-    crate::engine::control::welcome(&mut writer, &hello, engine).expect("the engine is welcome");
+    let interface = crate::engine::control::welcome(&mut writer, &hello, engine)
+        .expect("the engine is welcome");
     let deadline = Instant::now() + STALL;
     let (info, state) = loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -233,6 +234,7 @@ pub(crate) fn fake_engine(
     let client = EngineClient::new(
         reader,
         writer,
+        interface,
         info,
         state,
         crate::leader::stats_sink(model_name, std::sync::Arc::default(), 0),

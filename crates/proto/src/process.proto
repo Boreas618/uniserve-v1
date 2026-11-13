@@ -11,7 +11,8 @@
 // The interface is versioned across builds: a persistent daemon serves
 // engines of successive builds. Messages change only by additions: a new
 // field has a default, a peer skips fields it does not know, and the hello
-// exchange compares major versions.
+// exchange agrees a major version: the daemon speaks its build's and the one
+// before (`proto::speaks`).
 
 syntax = "proto3";
 
@@ -20,7 +21,7 @@ package uniserve.process;
 // The first message on a connection, from the connecting side.
 message Hello {
   // `ENGINE_INTERFACE_VERSION` of the sender's build, which carries the storage protocol's
-  // version; the peers refuse each other on a difference.
+  // version; the daemon refuses a peer of a version its build does not speak.
   uint32 major = 1;
   // The sender's build: package version and source digest.
   string build = 3;
@@ -84,6 +85,8 @@ enum Interface {
 
 // The response to a `Hello`.
 message Welcome {
+  // The version the connection speaks for its life: the peer's own when the daemon speaks it,
+  // the daemon's own with a refusal.
   uint32 major = 1;
   string build = 3;
   // Why the peer is refused; empty when it is accepted.

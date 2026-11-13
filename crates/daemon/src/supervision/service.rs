@@ -285,8 +285,13 @@ impl Joins {
                             .any(|known| known.node_rank == member.node_rank))
                     .then(|| format!("node rank {} is taken", member.node_rank))
                 });
+            // A member joins in its own version, which the connection speaks for its life.
             let welcome = Welcome {
-                major: proto::ENGINE_INTERFACE_VERSION,
+                major: if refusal.is_none() {
+                    hello.major
+                } else {
+                    proto::ENGINE_INTERFACE_VERSION
+                },
                 build: proto::BUILD.to_owned(),
                 refusal: refusal.clone().unwrap_or_default(),
                 nodes: Vec::new(),
@@ -758,8 +763,15 @@ pub(crate) fn run_leader(
                                     _ => None,
                                 };
                             }
+                            // A peer is welcomed in its own version, which
+                            // the connection speaks for its life: an engine
+                            // of the build this daemon replaced keeps serving.
                             let welcome = Welcome {
-                                major: proto::ENGINE_INTERFACE_VERSION,
+                                major: if refusal.is_none() {
+                                    hello.major
+                                } else {
+                                    proto::ENGINE_INTERFACE_VERSION
+                                },
                                 build: proto::BUILD.to_owned(),
                                 refusal: refusal.clone().unwrap_or_default(),
                                 nodes: nodes.clone(),
@@ -1681,13 +1693,15 @@ pub(crate) fn resume(
     }
 }
 
-/// Why a hello is refused, when it is: another major version, or a peer of
-/// the wrong kind for the socket it reached.
+/// Why a hello is refused, when it is: a major version this daemon's build
+/// does not speak ([`proto::speaks`]), or a peer of the wrong kind for the
+/// socket it reached.
 pub(crate) fn refusal(hello: &Hello, accepts: impl Fn(&hello::Peer) -> bool) -> Option<String> {
-    if hello.major != proto::ENGINE_INTERFACE_VERSION {
+    if !proto::speaks(hello.major) {
         return Some(format!(
-            "the peer speaks major version {} and this daemon {}",
+            "the peer speaks major version {} and this daemon {} to {}",
             hello.major,
+            proto::ENGINE_INTERFACE_OLDEST,
             proto::ENGINE_INTERFACE_VERSION
         ));
     }

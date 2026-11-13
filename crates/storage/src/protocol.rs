@@ -135,8 +135,9 @@ use crate::runtime::{Open, Opened};
 /// The protocol version this build's clients state and its Storage Server
 /// speaks, besides [`OLDEST`]. The engine interface carries it
 /// (`proto::ENGINE_INTERFACE_VERSION`, through `proto::STORAGE_PROTOCOL`, which
-/// a change of this version changes with it), so an engine built for another
-/// storage protocol is refused at its hello to the daemon as well.
+/// a change of this version changes with it), so an engine built for a
+/// storage protocol the daemon's build does not speak is refused at its hello
+/// to the daemon as well.
 ///
 /// A build made with `UNISERVE_STORAGE_PROTOCOL_RAISE=1` in its environment
 /// states the version after this one, and nothing else changes: the
