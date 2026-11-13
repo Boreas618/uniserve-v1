@@ -152,6 +152,9 @@ impl Scheduler {
             request => (request, None),
         };
 
+        if *request == R::List {
+            self.lists_answered += 1;
+        }
         match (request, completion, copy) {
             (R::List, Completion::Listing { keys }, None) => self.listed(keys),
             (
@@ -761,11 +764,12 @@ impl Scheduler {
         (pages, encodings)
     }
 
-    /// Before a step schedules (SD §3.1, §4.5), for each region of this queue pair whose order's
-    /// head is not the one installed: `Victims { region, keys }` with the leading keys of the
-    /// order whose units cover what one step's allocations can take there (the whole order, as
-    /// far as a record holds it, while a drain shrinks the regions). It is held ahead of the
-    /// step's `Allocate`s, which `available` lets take those units. Then `List`, when a region's
+    /// Once a step has scheduled (SD §3.1, §4.5), for each region of this queue pair whose
+    /// order's head is not the one installed: `Victims { region, keys }` with the leading keys of
+    /// the order whose units cover what one step's allocations can take there and what the
+    /// requests not yet written take, a `Load` of an admission's host hit included (the whole
+    /// order, as far as a record holds it, while a drain shrinks the regions). It is held ahead
+    /// of those requests, which `available` lets take those units. Then `List`, when a region's
     /// `evictable` word counts more units than the scheduler can account for: blocks another
     /// queue pair or a closed session committed, which this queue pair's allocations evict only
     /// once a `Victims` names them.
@@ -779,8 +783,25 @@ impl Scheduler {
             .filter_map(|&(number, _)| Some((number, self.region_index(number)?)))
             .collect();
 
+        // Per region, the units the requests not yet written take: those held and those waiting
+        // behind a `Release` being stamped.
+        let mut taking = vec![0u32; self.regions.len()];
+        let waiting = self
+            .stamping
+            .values()
+            .flat_map(|(_, _, following)| following.iter());
+        for request in self.held.iter().chain(waiting) {
+            for (region, units) in self.taken(request) {
+                if let Some(taken) = taking.get_mut(region) {
+                    *taken = taken.saturating_add(units);
+                }
+            }
+        }
+
+        let mut installing = Vec::new();
         for &(number, region) in &regions {
-            let reserve = (!shrinking).then(|| self.reserve(region));
+            let taken = taking.get(region).copied().unwrap_or(0);
+            let reserve = (!shrinking).then(|| self.reserve(region).max(taken));
             let reserve = reserve.unwrap_or(u32::MAX);
             let (mut head, mut covered) = (Vec::new(), 0u32);
             for &(_, id) in self.order.get(region).into_iter().flatten() {
@@ -799,7 +820,7 @@ impl Scheduler {
                     .iter()
                     .filter_map(|id| Some(self.cache.get(id)?.key))
                     .collect();
-                self.submit(runtime::Request::Victims {
+                installing.push(runtime::Request::Victims {
                     region: number,
                     keys,
                 });
@@ -808,6 +829,19 @@ impl Scheduler {
                 }
             }
         }
+        // Ahead of every request not yet written, whatever step held it; each replaces a
+        // `Victims` of its region not yet written, which would replace it in turn.
+        let replaced = |held: &runtime::Request| {
+            installing.iter().any(|victims| match (held, victims) {
+                (
+                    runtime::Request::Victims { region: held, .. },
+                    runtime::Request::Victims { region, .. },
+                ) => held == region,
+                _ => false,
+            })
+        };
+        self.held.retain(|held| !replaced(held));
+        self.held.splice(0..0, installing);
 
         // The order cannot count the units of blocks that state their own size.
         let unknown = regions.iter().any(|&(_, region)| {

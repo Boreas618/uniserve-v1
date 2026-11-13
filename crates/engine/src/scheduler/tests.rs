@@ -265,6 +265,7 @@ impl Bench {
             num_cached_tokens: 0,
             num_host_tokens: 0,
             num_peer_tokens: 0,
+            listing: 0,
             keys: Vec::new(),
             spec_token_ids: Vec::new(),
             num_draft_tokens: 0,

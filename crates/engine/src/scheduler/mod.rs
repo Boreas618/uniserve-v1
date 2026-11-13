@@ -372,6 +372,10 @@ pub struct Scheduler {
     /// The region, by number, of each `Resize` outstanding and its reply, owed at `Resized` with
     /// the units the region reached.
     resizing: Vec<(u8, Sender<u32>)>,
+    /// The `List`s submitted, and those answered, which the buffer pool answers in the order it
+    /// takes them: a resumed request waits for one asked after it arrived (SD §4.4, §4.5).
+    lists_asked: u64,
+    lists_answered: u64,
     next_batch: u64,
     step: u64,
 }
@@ -538,6 +542,8 @@ impl Scheduler {
             boundary: Vec::new(),
             draining: None,
             resizing: Vec::new(),
+            lists_asked: 0,
+            lists_answered: 0,
             next_batch: 0,
             step: 0,
         };
@@ -767,11 +773,10 @@ impl Scheduler {
     /// One step after the messages, which waits for nothing:
     ///
     /// 1. every completion the buffer pool wrote is applied as it is read, the capacity words of
-    ///    every region are read (SD §4.1), every copy past its bound is given up (§4.4), and the
-    ///    eviction order of each region whose head changed is installed, ahead of the requests
-    ///    the step's allocations make;
+    ///    every region are read (SD §4.1), and every copy past its bound is given up (§4.4);
     /// 2. unless the scheduler is paused, `schedule` assembles the batches that fit now, and each
-    ///    is handed to the executor;
+    ///    is handed to the executor; the eviction order of each region whose installed head no
+    ///    longer covers what the step's requests take is installed, ahead of them;
     /// 3. the step's requests are written into the submission queue as far as it and the
     ///    completion queue have room;
     /// 4. a drain's deadline ends what it ends, `Pause` and `Drain` are answered once due
@@ -803,10 +808,6 @@ impl Scheduler {
         // A prefill whose decode groups were all full when it finished transfers once one has
         // room.
         self.start_transfers();
-        // The eviction order goes ahead of the step's requests: `available` counts the units of
-        // the order beyond the installed head, which this step's allocations may take only once
-        // the buffer pool has taken a `Victims` that names them (SD §4.5).
-        self.install_victims();
 
         let batches = if self.paused {
             Vec::new()
@@ -817,6 +818,10 @@ impl Scheduler {
         if self.stopped {
             return false;
         }
+        // The eviction order goes ahead of the step's requests: `available` counts the units of
+        // the order beyond the installed head, which the step's requests may take only once the
+        // buffer pool has taken a `Victims` that names them (SD §4.5).
+        self.install_victims();
         let formed = !batches.is_empty();
         for batch in batches {
             if let Some(group) = self.group_index(batch.group) {
@@ -1171,6 +1176,9 @@ impl Scheduler {
     fn submit(&mut self, request: runtime::Request) -> bool {
         if self.merge(&request) {
             return false;
+        }
+        if request == runtime::Request::List {
+            self.lists_asked += 1;
         }
 
         let groups = match &request {
@@ -1682,8 +1690,9 @@ impl Scheduler {
     /// Reads the `available` and `retiring` words of every region this queue pair uses, raises
     /// `available` by the units of `order` beyond the installed head, which the buffer pool may
     /// evict once a later `Victims` names them, and lowers it by the units of the scheduler's
-    /// `Allocate`s held, being stamped or outstanding, which the buffer pool's word may not show
-    /// yet.
+    /// `Allocate`s, `Load`s and `Clone`s held, being stamped or outstanding, which the buffer
+    /// pool's word may not show yet: a `Load` or a `Clone` answered `Copy` took its blocks then,
+    /// and the word shows them.
     fn read_capacity(&mut self) {
         let words: Vec<(usize, u32, u32)> = self
             .registers
@@ -1700,15 +1709,21 @@ impl Scheduler {
             self.retiring[region] = retiring;
         }
 
+        let copying = self.copying();
         let waiting = self
             .stamping
             .values()
             .flat_map(|(_, _, following)| following.iter());
+        let unanswered = self
+            .outstanding
+            .iter()
+            .filter(|(number, _)| !copying.contains(number))
+            .map(|(_, (_, request, _))| request);
         let asked: Vec<(usize, u32)> = self
             .held
             .iter()
             .chain(waiting)
-            .chain(self.outstanding.values().map(|(_, request, _)| request))
+            .chain(unanswered)
             .flat_map(|request| self.taken(request))
             .collect();
         for (region, units) in asked {
@@ -1716,6 +1731,25 @@ impl Scheduler {
                 *available = available.saturating_sub(units);
             }
         }
+    }
+
+    /// The numbers of the requests answered `Copy` whose copy has not been answered yet: the
+    /// copies the workers hold, and those whose `Finish` is held, being stamped or outstanding.
+    fn copying(&self) -> HashSet<u64> {
+        let stamped = self
+            .stamping
+            .values()
+            .flat_map(|(request, _, following)| std::iter::once(request).chain(following.iter()));
+        let finishes = self
+            .held
+            .iter()
+            .chain(stamped)
+            .chain(self.outstanding.values().map(|(_, request, _)| request))
+            .filter_map(|request| match request {
+                runtime::Request::Finish { copy, .. } => Some(copy.0),
+                _ => None,
+            });
+        self.copies.keys().copied().chain(finishes).collect()
     }
 
     /// Word `at` of the capacity words of `region` (by index) in shared memory: 0 its
@@ -1906,18 +1940,28 @@ impl Scheduler {
                 .any(|(later, (_, other, _))| *later > number && names(other))
     }
 
-    /// Per region (by index), the units an `Allocate` takes: its blocks in each region of its
-    /// class in the owner's group.
+    /// Per region (by index), the units a request takes from the device regions of a class in
+    /// its owner's group: an `Allocate` its blocks, a `Load` a block per key, which the copy
+    /// from the host fills, and a `Clone` the one block it copies into.
     fn taken(&self, request: &runtime::Request) -> Vec<(usize, u32)> {
-        let runtime::Request::Allocate {
-            owner,
-            class,
-            count,
-            units,
-            ..
-        } = *request
-        else {
-            return Vec::new();
+        let (owner, class, count, units) = match request {
+            runtime::Request::Allocate {
+                owner,
+                class,
+                count,
+                units,
+                ..
+            } => (*owner, *class, *count, *units),
+            runtime::Request::Load {
+                owner, class, keys, ..
+            } => (
+                *owner,
+                *class,
+                u32::try_from(keys.len()).unwrap_or(u32::MAX),
+                0,
+            ),
+            runtime::Request::Clone { owner, class, .. } => (*owner, *class, 1, 0),
+            _ => return Vec::new(),
         };
         let Some(regions) = self.class_regions(owner, class) else {
             return Vec::new();

@@ -2317,7 +2317,8 @@ def test_requests_that_outgrow_the_cache_in_decode_all_finish(
     eight counts on a cache of 8192 tokens outgrow it as they decode. The one
     admitted last gives its units back and continues from the tokens it
     generated, so every count ends whole and none starves. A count alone that
-    fills the whole cache ends at the length the cache holds.
+    fills the whole cache ends at the length the cache holds, with the finish
+    reason ``cache_capacity`` (``specs/scheduler-design.md`` §3.6).
     """
     name = "qwen3-live-decode-growth"
     log = tmp_path / "server.log"
@@ -2370,7 +2371,7 @@ def test_requests_that_outgrow_the_cache_in_decode_all_finish(
         # one ending whole is the request given up continuing.
         print("numbers of each count:", counts)
         # A count longer than the cache holds runs alone until it fills it, and
-        # ends there as it would at its token limit.
+        # ends there: its next token needs a block the whole cache lacks.
         read: list[str] = []
         done = threading.Event()
         reasons: list[str] = []
@@ -2384,7 +2385,7 @@ def test_requests_that_outgrow_the_cache_in_decode_all_finish(
         assert whole == list(range(1, len(whole) + 1)), whole[-60:]
         # The cache is full where it ends, which may be inside its last number.
         assert str(len(whole) + 1).startswith(str(last)), (whole[-5:], last)
-        assert reasons == ["length"], reasons
+        assert reasons == ["cache_capacity"], reasons
 
 
 def test_a_weight_update_leaves_the_blocks_of_the_old_weights_unread(

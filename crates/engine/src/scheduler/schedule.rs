@@ -83,7 +83,8 @@ impl Scheduler {
 
         // A resumed request's generated tokens continue its prompt; it is named for its
         // continuation by this epoch unless it carries a name.
-        let request = Request::new(input, self.epoch, Instant::now());
+        let mut request = Request::new(input, self.epoch, Instant::now());
+        request.listing = self.lists_asked;
         let at = if request.resumes() {
             self.waiting
                 .iter()
@@ -822,9 +823,11 @@ impl Scheduler {
     ///
     /// A request is admitted only while the running requests and the admissions under way are
     /// fewer than `max_running_requests`. It is placed on a group for each phase it runs; one
-    /// that would hold more than a region's capacity alone is rejected; one whose need, with the hit
-    /// `cache` expects, does not fit what the regions have available beyond what the running
-    /// requests still need is placed nowhere again and stops the queue. Otherwise one round
+    /// that would hold more than a region's capacity alone is rejected; a resumed one of which
+    /// `cache` expects less than its previous life computed waits for a `List` asked after it
+    /// arrived (`awaits_listing`), and one whose need, with the hit `cache` expects, does not fit
+    /// what the regions have available beyond what the running requests still need: either is
+    /// placed nowhere again and stops the queue. Otherwise one round
     /// starts, which the buffer pool takes in this order: an `Attach` with a new owner for every
     /// group it is placed on, then the pins, loads, clones, restores, prefetches and allocations
     /// of its expected hit (SD §4.4). It waits in `WaitingForRemoteKvs` while other requests are
@@ -871,6 +874,15 @@ impl Scheduler {
             return true;
         };
         let expected = self.expected(request);
+        // A resumed request's previous life committed its blocks, through another queue pair
+        // when it ran on another epoch, whose commits `cache` learns only from a `Listing`.
+        if self.awaits_listing(id, expected) {
+            self.requeue(id);
+            return false;
+        }
+        let Some(request) = self.requests.get(&id) else {
+            return true;
+        };
         if !self.fits(request, expected) {
             self.requeue(id);
             return false;
@@ -935,8 +947,15 @@ impl Scheduler {
     /// Submits `request`, one of request `id`'s admission: its answer is one more the admission
     /// waits for, unless it raised the count of a held `Allocate` of the same owner and class
     /// (SD §3.1), whose one answer the admission already waits for. The round that made it
-    /// counted what it asks in the request's tables.
+    /// counted what it asks in the request's tables. The units it takes leave the regions'
+    /// `available`, as `allocate_ahead`'s do, so that the step's later admissions are compared
+    /// with what is left (SD §3.5).
     pub(super) fn ask(&mut self, id: RequestId, request: runtime::Request) {
+        for (region, units) in self.taken(&request) {
+            if let Some(available) = self.available.get_mut(region) {
+                *available = available.saturating_sub(units);
+            }
+        }
         if self.submit(request)
             && let Some(row) = self.requests.get_mut(&id)
         {

@@ -94,6 +94,14 @@ fn needed(kind: CacheGroupKind, block: u32, boundary: u32) -> Range<u32> {
     }
 }
 
+/// Whether a hit of `request` may read host copies: never for a request that continues another
+/// epoch's state under the seeds it states (SD §4.4 "The hit").
+fn reads_host(request: &Request) -> bool {
+    request
+        .generation()
+        .is_some_and(|input| input.cache.state_seeds.is_empty())
+}
+
 /// Over `range` of a class's expected tiers, the blocks on the device in the owner's group and
 /// then those on the host alone, when the range is those two runs in that order: a `Pin` and a
 /// `Load` after it hold it. `None` when a block is neither, or lies beyond the tiers known.
@@ -871,10 +879,11 @@ impl Scheduler {
     /// allocates (SD §7.2, `S/admission.rs:1051-1160`, `S/kv_cache/mod.rs:2101-2206`): what
     /// `fits` compares with the units available. Per cache class but the draft cache, the most
     /// of the blocks its first call and the low watermark take and the least of the blocks after
-    /// the prefix and the fewest that must coexist to compute the prompt in chunks; a request
-    /// with context images every block of its context. Then every encoder output and declared
-    /// result but those it holds and those whose `Pin` `cache` expects to find, which take no
-    /// units of the region (SD §4.4).
+    /// the prefix and the fewest that must coexist to compute the prompt in chunks, and the
+    /// blocks of the hit that `cache` holds on the host alone, which its `Load` allocates on the
+    /// device; a request with context images every block of its context. Then every encoder
+    /// output and declared result but those it holds and those whose `Pin` `cache` expects to
+    /// find, which take no units of the region (SD §4.4).
     pub(super) fn units_needed(&self, request: &Request, hit: u32) -> Vec<u32> {
         self.units(request, Some(hit))
     }
@@ -921,6 +930,10 @@ impl Scheduler {
         let prompt = request.num_prompt_tokens;
         let cached = hit.unwrap_or(0);
         let chunk = self.first_chunk(request, cached);
+        // The tiers `cache` expects of the prompt's blocks: a hit's blocks on the host alone are
+        // loaded into blocks the `Load` allocates on the device, those on the device are pinned.
+        let tiers = allocating.then(|| self.tiers(request, group));
+        let host = reads_host(request);
         for (index, &(kind, block)) in self.shapes(request).iter().enumerate() {
             let Ok(class) = u8::try_from(index) else {
                 continue;
@@ -958,7 +971,13 @@ impl Scheduler {
             } else {
                 pages.saturating_sub(cached / block).min(least)
             };
-            self.charge_units(&mut units, group, class, blocks.max(first), 0);
+            let loaded = tiers
+                .as_ref()
+                .and_then(|tiers| tiers.get(index))
+                .and_then(|tiers| usable(tiers, needed(kind, block, cached), host))
+                .map_or(0, |(_, loaded)| loaded);
+            let blocks = blocks.max(first).saturating_add(loaded);
+            self.charge_units(&mut units, group, class, blocks, 0);
         }
 
         if let Some(class) = self.encoder_class(request) {
@@ -1005,6 +1024,30 @@ impl Scheduler {
             .map_or(0, |group| self.lookup(request, group, true).0)
     }
 
+    /// Whether the admission of request `id`, whose hit `cache` expects to be `expected` tokens,
+    /// waits for `cache` to learn the blocks its previous life committed (SD §4.4 "The hit",
+    /// §4.5): a resumed token request that reads the cache, of which `cache` expects less than
+    /// that life computed (every token but its last), waits until a `List` asked after it
+    /// arrived has been answered. The `List` is asked here unless one asked since it arrived is
+    /// on its way, or one asked before is, whose answer comes first: one is outstanding at a
+    /// time.
+    pub(super) fn awaits_listing(&mut self, id: RequestId, expected: u32) -> bool {
+        let Some(request) = self.requests.get(&id) else {
+            return false;
+        };
+        let computed = request.num_prompt_tokens.saturating_sub(1);
+        let token = request.generation().is_some();
+        let short = token && request.resumes() && self.reads(request) && expected < computed;
+        if !short || self.lists_answered > request.listing {
+            return false;
+        }
+
+        if self.lists_asked == request.listing && self.lists_answered == self.lists_asked {
+            self.submit(runtime::Request::List);
+        }
+        true
+    }
+
     /// What `cache` expects of a token request's prefix on `group` (SD §4.4 "The hit"): the
     /// deepest multiple of the step, at most the reuse limit, that every cache class but the
     /// draft cache accepts, a rejected boundary not ending the search; with `tails`, extended
@@ -1023,9 +1066,7 @@ impl Scheduler {
         let step = step(shapes);
         let prompt = request.num_prompt_tokens;
         let limit = prompt.saturating_sub(1) / step * step;
-        let host = request
-            .generation()
-            .is_some_and(|input| input.cache.state_seeds.is_empty());
+        let host = reads_host(request);
         let tiers = self.tiers(request, group);
         let required: Vec<usize> = (0..shapes.len())
             .filter(|&class| !shapes[class].0.is_draft())

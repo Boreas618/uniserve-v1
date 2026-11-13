@@ -478,3 +478,75 @@ fn a_starved_request_with_nothing_else_to_serve_fails_the_scheduler() {
         })
     ));
 }
+
+/// The daemon's part for request `id` between two steps: its consumer takes every event it was
+/// sent (`taken` counts those taken before), and a request that left as migratable since
+/// (`lives` counts its lives that did) is resubmitted with what it generated, as `request`.
+fn serve(
+    harness: &mut Harness,
+    id: RequestId,
+    request: impl Fn() -> proto::request::GenerationRequest,
+    taken: &mut usize,
+    lives: &mut usize,
+) {
+    let events = harness.events(id);
+    harness.apply(Message::Consumed(id, (events.len() - *taken) as u32));
+    *taken = events.len();
+    let left = events
+        .iter()
+        .filter(|event| matches!(event, Event::Migratable { .. }))
+        .count();
+    if left > *lives {
+        *lives = left;
+        let mut resumed = request();
+        resumed.generated_token_ids = harness.tokens(id);
+        harness.submit(resumed);
+    }
+}
+
+/// Requests that outgrow the cache while they decode give units up by preemption and get them
+/// back when the daemon resubmits them, and once every one has ended none of the region's units
+/// stays held: a request alone then writes every position of the region's blocks and ends with
+/// `CacheCapacity` only when its next call needs a block beyond them (SD §3.6, §7.2 "Preemption
+/// order"; `FinishReason::CacheCapacity`).
+#[test]
+fn after_requests_that_outgrew_the_cache_a_request_alone_fills_every_unit() {
+    const UNITS: u32 = 32;
+    let mut harness = Deployment::tokens().kv_units(UNITS).build();
+
+    // Eight requests of twelve blocks each by their ends, three times what the region holds.
+    let ids: Vec<RequestId> = (1..=8).map(|id| harness.submit(token(id, 6, 40))).collect();
+    let mut taken = vec![0; ids.len()];
+    let mut lives = vec![0; ids.len()];
+    harness.run_until(4_000, |harness| {
+        for (index, &id) in ids.iter().enumerate() {
+            let request = || token(id.0, 6, 40);
+            serve(harness, id, request, &mut taken[index], &mut lives[index]);
+        }
+        ids.iter()
+            .all(|id| matches!(harness.terminal(*id), Some(Event::Finished { .. })))
+    });
+    for &id in &ids {
+        assert!(harness.finished_with(id, FinishReason::MaxTokens));
+        assert_eq!(harness.tokens(id).len(), 40, "every life together");
+    }
+    assert!(
+        lives.iter().any(|lived| *lived > 0),
+        "the region was outgrown"
+    );
+
+    let alone = harness.submit(token(100, 6, 1_000));
+    let (mut taken, mut lives) = (0, 0);
+    harness.run_until(1_000, |harness| {
+        let request = || token(100, 6, 1_000);
+        serve(harness, alone, request, &mut taken, &mut lives);
+        harness.terminal(alone).is_some()
+    });
+    let written = harness
+        .batches_of(alone)
+        .iter()
+        .flat_map(|batch| batch.columns.rows.cache_positions.clone())
+        .max();
+    assert_eq!(written, Some((UNITS * BLOCK) as i32 - 1));
+    assert!(harness.finished_with(alone, FinishReason::CacheCapacity));
+}

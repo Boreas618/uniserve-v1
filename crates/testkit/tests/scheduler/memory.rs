@@ -23,6 +23,7 @@ use std::time::Duration;
 use engine::batch::cache::CacheGroupKind;
 use engine::batch::{Batch, Phase};
 use engine::scheduler::Message;
+use proto::request::wire::WeightsInFlight;
 use proto::request::{Event, FinishReason, MigrationCause, RejectionKind, RequestId};
 use storage::Key;
 use storage::key::{page_key, page_root};
@@ -1091,4 +1092,146 @@ fn a_request_that_ends_before_its_commits_are_answered_enters_the_order_deepest_
     assert_eq!(keys.len(), 3);
     harness.run(3);
     assert_eq!(installed(&mut harness), [keys[2], keys[1], keys[0]]);
+}
+
+/// Requests whose host hits take more units than the device has free all end, one after another,
+/// each reading its prefix from the host: an admission's `Load` allocates the device blocks of
+/// its host part, which `fits` counts beside the blocks it computes, and the eviction order the
+/// scheduler installs ahead of the step's requests covers what they take, the blocks a `Load`
+/// copies to included, so that no admission the scheduler counted as fitting is answered `Full`
+/// (SD §3.5 `fits`, §4.4 "Pins, loads, clones and prefetches", §4.5 "Installing the order").
+///
+/// Four prompts of 31 full blocks each leave their blocks on the host and none on the device,
+/// then each is asked again with a tail of three more blocks, all four at once: the device's 64
+/// units hold one such request and not two, and once one has run its blocks wait in the eviction
+/// order, beyond the head a step's token budget covers.
+#[test]
+fn host_hits_beyond_what_the_device_has_free_are_admitted_in_turn_and_all_end() {
+    let mut harness = Deployment::tokens()
+        .kv_units(64)
+        .host(256)
+        .batch(8, 32)
+        .chunk(32)
+        .build();
+    let end = [7];
+    let tail = prompt(9, 12);
+    let asked = |turn: u64, tail: &[u32]| -> Vec<u32> {
+        let words = prompt(turn, 126);
+        words
+            .into_iter()
+            .chain(tail.iter().copied())
+            .chain(end)
+            .collect()
+    };
+    for turn in 1..=4 {
+        let mut request = token(turn, 1, 1);
+        request.prompt_token_ids = asked(turn, &[]);
+        let id = harness.submit(request);
+        harness.run_until(400, |harness| harness.terminal(id).is_some());
+    }
+    stored(&mut harness, Tier::Host);
+    crate::pause_flush_resize::flush(&mut harness, None, WeightsInFlight::Keep).unwrap();
+    harness.run(5);
+
+    let ids: Vec<RequestId> = (1..=4)
+        .map(|turn| {
+            let mut request = token(10 + turn, 1, 1);
+            request.prompt_token_ids = asked(turn, &tail);
+            harness.submit(request)
+        })
+        .collect();
+    harness.settle(1_000);
+
+    for id in &ids {
+        assert!(
+            harness.finished_with(*id, FinishReason::MaxTokens),
+            "{:?}",
+            harness.events(*id)
+        );
+        assert_eq!(
+            harness.first_written(*id, 0),
+            Some(124),
+            "it read 31 blocks"
+        );
+    }
+    // Each read its 31 blocks from the host.
+    assert_eq!(hits(&mut harness), (4 * 124, 4 * 124, 0));
+    let refused = harness.answers().into_iter().any(|(request, answer)| {
+        matches!(request, Request::Load { .. }) && matches!(answer, Completion::Full { .. })
+    });
+    assert!(!refused, "no admission counted as fitting found no room");
+}
+
+/// A request resumed on the engine of a later epoch of the same layout reads every block its
+/// previous life committed there, its partial last block by its tail key, though those commits
+/// came through the earlier epoch's queue pair after this scheduler listed the cache: its
+/// admission waits for a `List` asked after it arrived, then pins the full blocks, clones the
+/// tail, and computes only the last token its previous life emitted (SD §3.8 "A drain to an
+/// epoch of the same layout", §4.3 "Writing", §4.4 "The hit", §4.5).
+#[test]
+fn a_request_resumed_from_another_epoch_reads_every_block_that_epoch_committed() {
+    let mut harness = Deployment::tokens().build();
+
+    // Its previous life, on epoch 2's queue pair: a prompt of 7 tokens and 12 generated, of
+    // which it computed all but the last: four full blocks and a tail of two tokens.
+    let generated: Vec<u32> = (500..512).collect();
+    let tokens: Vec<u32> = prompt(1, 7).into_iter().chain(generated.clone()).collect();
+    let keys = prompt_keys(&tokens[..16]);
+    let tail = page_key(&keys[3], 0, 0, &tokens[16..18]);
+    let owner = OwnerId(1);
+    let after = vec![(A, 0)];
+    let mut asks = vec![
+        Request::Attach { owner, group: A },
+        Request::Allocate {
+            owner,
+            class: 0,
+            at: 0,
+            count: 5,
+            units: 0,
+        },
+    ];
+    for (at, &key) in (0u32..).zip(&keys) {
+        asks.push(Request::Commit {
+            owner,
+            class: 0,
+            at,
+            key,
+            tokens: BLOCK as u16,
+            after: after.clone(),
+        });
+    }
+    asks.push(Request::Commit {
+        owner,
+        class: 0,
+        at: 4,
+        key: tail,
+        tokens: 2,
+        after: after.clone(),
+    });
+    asks.push(Request::Detach { owner, after });
+    let answers = harness.elsewhere(&asks);
+    let committed = answers
+        .iter()
+        .filter(|answer| **answer == Completion::Committed)
+        .count();
+    assert_eq!(committed, 5, "{answers:?}");
+
+    // The daemon resubmits it at once, with what it generated.
+    let mut resumed = token(1, 7, 20);
+    resumed.generated_token_ids = generated;
+    let id = harness.submit(resumed);
+    harness.run_until(200, |harness| {
+        let published = harness.tokens(id).len() as u32;
+        harness.apply(Message::Acknowledge(id, published));
+        harness.finished_with(id, FinishReason::MaxTokens)
+    });
+
+    let owner = harness.owner(id, A).unwrap();
+    let cloned = asked_by(&harness, owner).into_iter().any(
+        |request| matches!(request, Request::Clone { class: 0, at: 4, key, .. } if key == tail),
+    );
+    assert!(cloned, "the tail is cloned at its position");
+    assert_eq!(harness.first_written(id, 0), Some(18));
+    assert_eq!(harness.tokens(id).len(), 8);
+    assert_eq!(hits(&mut harness), (18, 0, 0));
 }

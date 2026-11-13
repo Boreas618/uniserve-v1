@@ -103,6 +103,10 @@ pub(crate) struct Request {
     /// Of `num_host_tokens`, the tokens a `Prefetch` from the peers brought to the host (the
     /// peers' `Prefetched`), counted as peer hits at admission.
     pub num_peer_tokens: u32,
+    /// The `List`s the scheduler had asked when the request arrived. A resumed request whose
+    /// expected hit falls short of what its previous life computed is admitted once a `List`
+    /// asked after it arrived has been answered (SD §4.4 "The hit").
+    pub listing: u64,
     /// Per cache group, the key of every complete block of `token_ids`.
     pub keys: Vec<Vec<Key>>,
     /// The drafts the next verification carries.
@@ -239,6 +243,7 @@ impl Request {
             num_cached_tokens: 0,
             num_host_tokens: 0,
             num_peer_tokens: 0,
+            listing: 0,
             keys: Vec::new(),
             spec_token_ids: Vec::new(),
             num_draft_tokens: 0,
