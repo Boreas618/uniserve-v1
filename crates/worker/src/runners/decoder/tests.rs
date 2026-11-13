@@ -1,8 +1,8 @@
 //! `DecoderRunner` without a device: where a decode round's copies read and write in the rank's
 //! product buffer, the tail one round leaves for the next, a round dealt to two ranks of one
-//! process with the tail handed between them, the refusals of a row, and the profile run and
-//! capture of a clip's and a track's buckets, over decoders whose forwards launch only the
-//! runner's own conversions.
+//! process with the tail handed between them after the successor's rank decoded, the refusals
+//! of a row, and the profile run and capture of a clip's, a splice's and a track's buckets, over
+//! decoders whose forwards launch only the runner's own conversions.
 
 use std::sync::Arc;
 
@@ -11,12 +11,14 @@ use ipc::batch::{Batch, BatchId, Columns, Extent, MediaRow, Phase, Shape, Varian
 use nn::vae::TemporalClips;
 use nn::{Clip, Decoder, LatentShape, Layout, PixelNorm, Splice, Splicer};
 use ops::Generation;
+use platform::PitchedBatch;
 use proto::module::operator::{PCM_INTERLEAVE, RGB_BYTES};
 use storage::Key;
 use storage::runtime::{self, Completion, GroupId, OwnerId, Request, Run};
 use uniserve_tensor::{DType, Tensor};
 
 use super::{DecoderConfig, DecoderRunner, RoundConfig};
+use crate::Error;
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
 use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
@@ -355,25 +357,42 @@ fn a_decode_round_writes_its_units_frames_and_tails_into_the_blocks_its_row_name
         .collect();
     assert_eq!(windows, [(0, 64, 32, 4), (16, 64, 32, 4)]);
 
-    // Each keeps the bytes of its own splice, the forward's output after the raster, from its
-    // first frame of the timeline in the units block.
-    let kept: Vec<_> = units.iter().map(|(_, kept, ..)| *kept).collect();
-    assert_eq!(kept, [(1, UNIT), (2, UNIT + 4 * FRAME)]);
+    // Each places its own splice and keeps its bytes from its first frame of the timeline in the
+    // units block: the first keeps four frames, the second four, the first two of them faded.
+    let kept: Vec<_> = units.iter().map(|unit| (unit.2.2, unit.3)).collect();
+    let splice = |keep, overlap| {
+        Some(Splice {
+            keep,
+            overlap,
+            first: 0,
+        })
+    };
+    assert_eq!(
+        kept,
+        [(splice(4, 0), UNIT), (splice(4, 2), UNIT + 4 * FRAME)]
+    );
 
-    // Each leaves its successor the raster's last two frames in its own tail block, and the
-    // second fades against the first's.
-    let tails: Vec<_> = units.iter().map(|(_, _, tail, _)| *tail).collect();
-    assert_eq!(tails, [Some((12 * UNIT, 2)), Some((15 * UNIT, 2))]);
+    // Each leaves its successor the raster's last two frames of each of three channels, 128
+    // bytes a frame, in its own tail block, and the second fades against the first's.
+    let tails: Vec<_> = units
+        .iter()
+        .map(|unit| {
+            let copy = unit.1.0.copies()[0];
+            (copy.destination, copy.width, copy.height)
+        })
+        .collect();
+    assert_eq!(tails, [(12 * UNIT, 256, 3), (15 * UNIT, 256, 3)]);
     assert!(
-        units.iter().all(|unit| unit.3 == (None, None)),
+        units
+            .iter()
+            .all(|unit| (unit.1.1, unit.2.0) == (None, None)),
         "a rank that decodes the whole round hands no tail to another"
     );
-    assert_eq!(
-        units[0].0.len(),
-        1,
+    assert!(
+        units[0].2.1.is_empty(),
         "the timeline's first unit fades against nothing"
     );
-    assert_eq!(units[1].0.copies()[1].source, 12 * UNIT);
+    assert_eq!(units[1].2.1.copies()[0].source, 12 * UNIT);
 }
 
 #[test]
@@ -385,15 +404,16 @@ fn the_tail_a_round_leaves_is_the_one_the_next_round_fades_against() {
 
     // The last unit of the first round left its tail where the next round reads it: the whole
     // tail of two frames of three channels, 768 bytes.
-    let left = first[1].2.unwrap().0;
-    let read = second[0].0.copies()[1];
+    let left = first[1].1.0.copies()[0].destination;
+    let read = second[0].2.1.copies()[0];
     assert_eq!((read.source, read.width), (left, 768));
 
     // The timeline's last unit reads the trajectory's last latent frames, keeps its body and its
     // tail from frame 8, and leaves no tail.
     assert_eq!(second[0].0.copies()[0].source, 32);
-    assert_eq!(second[0].1, (3, UNIT + 8 * FRAME));
-    assert_eq!(second[0].2, None);
+    assert_eq!(second[0].2.2.map(|splice| splice.keep), Some(6));
+    assert_eq!(second[0].3, UNIT + 8 * FRAME);
+    assert!(second[0].1.0.is_empty());
 }
 
 /// A timeline of six units of four frames and a tail of two, from seven latent frames.
@@ -488,22 +508,30 @@ fn a_round_that_names_no_rank_is_dealt_to_the_ranks_and_hands_a_tail_between_the
 
     // Unit 1 leaves its tail in rank 0's run and hands it, 768 bytes, to rank 1, which decodes
     // unit 2; unit 2 takes that hand-off and fades against the tail in rank 1's own run.
-    assert_eq!(ours[1].2, Some((tail(0, 1), 2)));
-    assert_eq!(ours[1].3, (None, Some((1, 3, 768))));
-    assert_eq!(theirs[0].3, (Some(3), None));
-    assert_eq!(theirs[0].0.copies()[1].source, tail(1, 1));
+    assert_eq!(ours[1].1.0.copies()[0].destination, tail(0, 1));
+    assert_eq!(ours[1].1.1, Some((tail(0, 1), 1, 3, 768)));
+    assert_eq!((theirs[0].1.1, theirs[0].2.0), (None, Some(3)));
+    assert_eq!(theirs[0].2.1.copies()[0].source, tail(1, 1));
 
     // Unit 3 fades against unit 2's tail on its own rank and hands its own to nobody: the next
     // round reads it once this one completed.
-    assert_eq!(theirs[1].0.copies()[1].source, tail(1, 2));
-    assert_eq!(theirs[1].2, Some((tail(1, 3), 2)));
-    assert_eq!(theirs[1].3, (None, None));
+    assert_eq!(theirs[1].2.1.copies()[0].source, tail(1, 2));
+    assert_eq!(theirs[1].1.0.copies()[0].destination, tail(1, 3));
+    assert_eq!((theirs[1].1.1, theirs[1].2.0), (None, None));
+
+    // Each unit reads and writes in its rank's run what rank 0 alone does in its own when it
+    // decodes the whole round: the products hold the single rank's bytes where it writes them.
+    let mut alone = long_round(0, vec![0, 1, 2, 3, 4, 5], 1);
+    alone.media[0].rank = Some(0);
+    let (_, single) = first.units(&alone, &first_tables).unwrap();
+    let dealt = (ours.iter().map(|unit| relative(unit, at(0, 0))))
+        .chain(theirs.iter().map(|unit| relative(unit, at(1, 0))));
+    let single: Vec<_> = single.iter().map(|unit| relative(unit, at(0, 0))).collect();
+    assert_eq!(dealt.collect::<Vec<_>>(), single);
 
     // The hand-off rank 0 makes is the one rank 1 takes for unit 2.
-    first
-        .hand(&first_tables, SLOT, ours[1].2, ours[1].3.1)
-        .unwrap();
-    second.take(&second_tables, SLOT, theirs[0].3.0).unwrap();
+    first.hand(&first_tables, SLOT, ours[1].1.1).unwrap();
+    second.take(&second_tables, SLOT, theirs[0].2.0).unwrap();
 
     // The next round's units are rank 0's, and unit 4 reads unit 3's tail where rank 1 left it,
     // with no hand-off; rank 1 decodes nothing of it.
@@ -511,8 +539,8 @@ fn a_round_that_names_no_rank_is_dealt_to_the_ranks_and_hands_a_tail_between_the
     let (_, ours) = first.units(&next, &first_tables).unwrap();
     let (_, theirs) = second.units(&next, &second_tables).unwrap();
     assert_eq!(windows(&ours), [at(0, 0) + 64, at(0, 0) + 80]);
-    assert_eq!(ours[0].0.copies()[1].source, tail(1, 3));
-    assert_eq!(ours[0].3, (None, None));
+    assert_eq!(ours[0].2.1.copies()[0].source, tail(1, 3));
+    assert_eq!((ours[0].1.1, ours[0].2.0), (None, None));
     assert!(theirs.is_empty());
 
     // A row that names no rank covers one round from its first unit.
@@ -523,6 +551,38 @@ fn a_round_that_names_no_rank_is_dealt_to_the_ranks_and_hands_a_tail_between_the
     );
     let wide = long_round(0, vec![0, 1, 2, 3, 4, 5, 6], 1);
     assert!(first.units(&wide, &first_tables).is_err());
+}
+
+/// What `unit` reads and writes, from `base`, the first byte of its rank's products: its
+/// window, the tail it leaves, the tail it fades against, its splice and its bytes.
+fn relative(unit: &super::Unit, base: u64) -> (u64, Option<u64>, Option<u64>, Option<Splice>, u64) {
+    let (before, (left, _), (_, fade, splice), kept) = unit;
+    let first = |copies: &PitchedBatch| copies.copies().first().copied();
+
+    (
+        before.copies()[0].source - base,
+        first(left).map(|copy| copy.destination - base),
+        first(fade).map(|copy| copy.source - base),
+        *splice,
+        kept - base,
+    )
+}
+
+#[test]
+fn a_rank_decodes_its_unit_before_the_rank_of_the_predecessor_hands_it_the_tail() {
+    let [(first, first_tables), (mut second, second_tables)] = two_ranks();
+    let call = long_round(0, vec![0, 1, 2, 3, 4, 5], 1);
+
+    // Rank 1 issues unit 2's decode while rank 0 has handed it no tail: graphs that hold no
+    // device refuse that replay, where a rank that waited for the tail first would still wait.
+    let refused = second.execute(&call, &second_tables).unwrap_err();
+    assert!(matches!(refused, Error::State(_)), "{refused}");
+
+    // Only then does rank 0 hand unit 1's tail, which rank 1's splice of unit 2 takes.
+    let (_, ours) = first.units(&call, &first_tables).unwrap();
+    let (_, theirs) = second.units(&call, &second_tables).unwrap();
+    first.hand(&first_tables, SLOT, ours[1].1.1).unwrap();
+    second.take(&second_tables, SLOT, theirs[0].2.0).unwrap();
 }
 
 #[test]
@@ -560,7 +620,7 @@ fn an_audio_decode_reads_its_track_and_writes_its_samples() {
     let audio = batch(Phase::AudioDecode, Variant::AudioDecode, 0, vec![0, 1], 1);
     let (chosen, units) = runner.units(&audio, &held).unwrap();
     assert_eq!(chosen, bucket);
-    let [(before, kept, tail, _)] = units.as_slice() else {
+    let [(before, (left, _), (_, _, splice), kept)] = units.as_slice() else {
         panic!("a track is one unit");
     };
     let copy = before.copies()[0];
@@ -568,7 +628,11 @@ fn an_audio_decode_reads_its_track_and_writes_its_samples() {
         (copy.destination, copy.source, copy.width),
         (0, 3 * UNIT, 128)
     );
-    assert_eq!((*kept, *tail), ((0, 7 * UNIT), None));
+    assert_eq!(*kept, 7 * UNIT);
+    assert!(
+        left.is_empty() && splice.is_none(),
+        "a track leaves no tail and places no splice"
+    );
 }
 
 #[test]
@@ -578,11 +642,15 @@ fn every_bucket_is_profiled_and_captured_with_its_conversions() {
         table.iter().filter(|(name, ..)| *name == operator).count()
     };
 
-    // A clip's graph packs the bytes of each of the timeline's three distinct splices.
+    // A clip's graph decodes alone; its splice into the timeline runs eagerly, and the splice's
+    // profile packs the bytes of each of the timeline's three distinct splices.
     let clip = Bucket::clip(8, 8, 8);
     let video = runner(vec![clip], true);
+    let splice = clip.serving(FRAMES, 8, 8);
+    assert_eq!(video.eager_buckets(), [splice]);
     video.graphs().profile_run(&video).unwrap();
-    assert_eq!(launches(&video, &clip, RGB_BYTES), 3);
+    assert_eq!(launches(&video, &clip, RGB_BYTES), 0);
+    assert_eq!(launches(&video, &splice, RGB_BYTES), 3);
     video.graphs().capture(&video, &clip).unwrap();
 
     // A track's graph interleaves its waveform once.

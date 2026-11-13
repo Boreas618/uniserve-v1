@@ -13,31 +13,35 @@
 //! splice tail the row writes. An audio decode is the request's track, one unit. A row that names
 //! no rank is run by every rank of the decoder group, and each decodes its share of the round
 //! ([`RoundConfig`]); a row that names a rank is run by that rank alone, which decodes every unit
-//! of it. Each unit a rank decodes is one replay of its bucket's graph on the runner's stream, in
-//! unit order:
+//! of it. Each unit a rank decodes is issued on the runner's stream, in unit order:
 //!
-//! 1. the unit's latents are copied into the runner's latent buffer: a clip's window of the
-//!    trajectory, the latent frames from `Decoder::clip_start`, or the whole track; a clip whose
-//!    splice fades against its predecessor has the predecessor's tail copied into the runner's
-//!    tail buffer;
-//! 2. the graph replays: the window gathered and decoded into a raster, which is placed and packed
-//!    into bytes under every distinct splice of the deployment's timelines; or the track decoded
-//!    and interleaved into 16-bit PCM;
-//! 3. the unit's output is copied into its product: the bytes of the unit's own splice into the
-//!    video units block from the splice's first frame, or the PCM into the audio samples block;
-//!    a clip that a successor fades against copies the raster's last frames into its tail block.
+//! 1. **The decode.** The unit's latents are copied into the runner's latent buffer (a clip's
+//!    window of the trajectory, the latent frames from `Decoder::clip_start`, or the whole track)
+//!    and its bucket's graph replays: the window gathered and decoded into the runner's raster
+//!    buffer, or the track decoded and interleaved into 16-bit PCM. A clip that a successor fades
+//!    against then copies the raster's last frames into its tail block.
+//! 2. **The splice** of a clip a splicer places. A clip whose splice fades against its
+//!    predecessor has the predecessor's tail copied into the runner's tail buffer, and the splice
+//!    runs eagerly: the raster placed under the unit's splice and packed into bytes.
+//! 3. The unit's output is copied into its product: the bytes of its splice into the video units
+//!    block from the splice's first frame, the raster of a clip no splicer places, or the PCM into
+//!    the audio samples block.
 //!
 //! Every address is computed and every block checked before anything is issued: a position the
 //! tables hold no entry for, a write to a read-only entry, or bytes past a block refuse the
-//! batch. The copies are the driver's, so the graph's launches are the only kernels of a call.
+//! batch. The copies are the driver's, so the forwards' launches are the only kernels of a call.
 //!
-//! ## Why a clip's graph places every distinct splice
+//! ## Why a clip's splice runs eagerly
 //!
-//! A captured graph's launches follow from its bucket, and a splice's runs, their number and
-//! their frames, follow from the clip's place in its timeline. A canvas's graph therefore places
-//! the decoded clip under each distinct splice of the deployment's timelines (`first` taken as
-//! zero), and a unit keeps the bytes of its own. That costs the packing of a few clips' frames
-//! beside the decode, and keeps one graph per canvas.
+//! A splice's runs, their number and their frames, follow from the clip's place in its timeline
+//! (`Splicer::splice`), which is a request's value, and a captured graph's launches follow from
+//! its bucket alone: a graph would place the clip under every distinct splice of the deployment's
+//! timelines to keep one. The splice runs eagerly instead, as the forward of a splice bucket
+//! ([`Runner::eager_buckets`]): a clip's bucket stating the timeline it serves, whose forward
+//! places the splice `serve` stages, a few launches beside a clip's decode. Its profile places
+//! every distinct splice of the timeline, so the runner's region holds the largest and every
+//! generation resolves their kernels. The raster lies in the runner's buffers, outside the
+//! region a forward allocates from, so the splice reads it where the decode left it.
 //!
 //! ## What the products hold
 //!
@@ -59,22 +63,21 @@
 //! - **Another rank, the same call.** A round's units are dealt to the ranks in order, so the
 //!   first unit of a rank's share follows the last of the share before it. The rank that decodes
 //!   the predecessor copies its tail into the successor's rank's run of the tail block behind its
-//!   own tail copy and hands that rank an event recorded behind it
-//!   ([`BufferMemory::hand_off`]); the successor's rank waits on the host for the hand-off, which
-//!   is the other rank's issue and not its completion, and its stream waits for the event before
-//!   the copies of the unit ([`BufferMemory::take_hand_off`]). This is the only wait between
-//!   executors (`specs/engine-worker-port.md` §2.2).
+//!   own tail copy, which follows the decode alone, and hands that rank an event recorded behind
+//!   it ([`BufferMemory::hand_off`]) before it waits for any tail itself. The successor's rank
+//!   decodes its unit first, then waits on the host for the hand-off, which is the other rank's
+//!   issue and not its completion, and its stream waits for the event before the splice's copies
+//!   ([`BufferMemory::take_hand_off`]). This is the only wait between executors
+//!   (`specs/engine-worker-port.md` §2.2): the ranks of a round decode at once, and a splice
+//!   waits for its predecessor's decode, never for another splice.
 //! - **An earlier call.** The first unit of a round reads the tail of the round before it, which
 //!   the scheduler gives it only once that round completed, and `execute` returns only once its
 //!   stream passed every copy: the write is ordered before the read by completion, and the read
 //!   finds the tail where it lies, in the run of the rank that decoded the round's last unit,
 //!   which the device reaches by peer access. A row that names a rank reads it from that rank's
 //!   own run, where its earlier rounds wrote it.
-//!
-//! The graph of a unit replays its decode and its splice together, so a stream that waits for a
-//! hand-off before the replay waits with the decode: a rank's decode of the first unit of its
-//! share follows the predecessor's rank's decode of its last.
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -106,17 +109,21 @@ const PCM_CHANNELS: u32 = 2;
 /// runs.
 const TAIL_WAIT: Duration = Duration::from_secs(120);
 
-/// What one unit of a call moves around its replay: the copies into the runner's buffers before
-/// it; the forward's output the unit keeps, with the address in the product buffer it lands at;
-/// the tail it leaves its successor, with the address it lands at and its frames; and the
-/// hand-offs between ranks (module documentation): the position of the tail block whose hand-off
-/// the unit takes before its copies, and the rank, the tail's position and its bytes it hands its
-/// own tail to after them.
+/// What one unit of a call issues, in the order `serve` issues it (module documentation):
+///
+/// - the copies before its decode: the clip's window or the track into the latent buffer;
+/// - the tail it leaves its successor: the copy of the raster's last frames into its tail block
+///   behind the decode, and, when another rank decodes the successor in this call, the tail's
+///   address, the rank it is handed to, the tail block's position and its bytes;
+/// - its splice: the position of the tail block whose hand-off it takes first, the copy of the
+///   predecessor's tail into the tail buffer, and the splice it places, `None` for a unit whose
+///   decode is its output;
+/// - the address in the product buffer its output lands at.
 type Unit = (
     PitchedBatch,
-    (usize, u64),
-    Option<(u64, u32)>,
-    (Option<u32>, Option<(u32, u32, u64)>),
+    (PitchedBatch, Option<(u64, u32, u32, u64)>),
+    (Option<u32>, PitchedBatch, Option<Splice>),
+    u64,
 );
 
 /// What a deployment fixes of a decoder runner. Immutable once the runner is built.
@@ -194,13 +201,14 @@ pub struct DecoderRunner {
     done: Option<Event>,
     /// Each bucket's latent layout: the model's map of a clip, or a track's own.
     layouts: Vec<(Bucket, Layout)>,
-    /// The distinct splices of the deployment's timelines, each from frame zero, in the order a
-    /// clip bucket's forward returns their bytes after its raster.
-    splices: Vec<Splice>,
-    /// The latent buffer from byte 0 and the tail buffer from byte `tail`, `bytes` in all;
-    /// `None` for graphs that hold no device.
+    /// The splice a splice bucket's forward places, from frame zero, while `serve` runs it;
+    /// `None` outside, when the forward places every distinct splice of its timeline.
+    staged: Cell<Option<Splice>>,
+    /// The latent buffer from byte 0, the tail buffer from byte `tail` and the raster buffer
+    /// from byte `raster`, `bytes` in all; `None` for graphs that hold no device.
     buffers: Option<Arc<Storage>>,
     tail: u64,
+    raster: u64,
     bytes: u64,
 }
 
@@ -214,7 +222,8 @@ impl DecoderRunner {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for no bucket, a bucket that is neither a clip nor a track, a video
+    /// [`Error::Invalid`] for no bucket, a bucket that is neither a clip nor a track, a clip's
+    /// that states a request (a splice's, [`Runner::eager_buckets`]), a video
     /// decoder serving no timeline or with a round that deals no unit to its memory's rank, a
     /// splicer of another element type, a track that is not stereo, a stream without a device or
     /// the reverse; what the model or the splicer refuses:
@@ -243,24 +252,21 @@ impl DecoderRunner {
             ));
         }
 
-        // The distinct splices of every timeline a canvas's graph places.
-        let mut splices = Vec::new();
+        // The most frames a splice of the deployment's timelines fades.
+        let mut overlap = 0;
         if let Some(splicer) = &splicer {
             for &(frames, _) in &config.timelines {
-                for splice in splicer.splices(frames)? {
-                    let splice = Splice { first: 0, ..splice };
-                    if !splices.contains(&splice) {
-                        splices.push(splice);
-                    }
-                }
+                let splices = splicer.splices(frames)?;
+                let faded = splices.iter().map(|splice| splice.overlap).max();
+                overlap = overlap.max(faded.unwrap_or(0));
             }
         }
-        let overlap = splices.iter().map(|splice| splice.overlap).max();
 
-        // Each bucket's layout, and the bytes its latents and the tail a clip fades against take.
+        // Each bucket's layout, and the bytes its latents, a clip's raster and the tail a clip
+        // fades against take.
         let latent = element_bytes(model.latent_type())?;
-        let raster = element_bytes(model.element_type())?;
-        let (mut layouts, mut latents, mut tails) = (Vec::new(), 0, 0);
+        let element = element_bytes(model.element_type())?;
+        let (mut layouts, mut latents, mut tails, mut rasters) = (Vec::new(), 0, 0, 0);
         for bucket in config.buckets.iter().copied() {
             let layout = match bucket.extent {
                 Extent::Clip {
@@ -270,6 +276,12 @@ impl DecoderRunner {
                 } if config.timelines.is_empty() => {
                     return Err(Error::Invalid(format!(
                         "a video decoder of {frames}x{height}x{width} clips serves no timeline"
+                    )));
+                }
+                // A clip's bucket that states a request is a splice's (`Runner::eager_buckets`).
+                Extent::Clip { .. } if bucket.serves.is_some() => {
+                    return Err(Error::Invalid(format!(
+                        "bucket {bucket} states the request a splice serves, and no clip's decode"
                     )));
                 }
                 Extent::Clip { .. }
@@ -292,10 +304,11 @@ impl DecoderRunner {
                         height,
                         width,
                     })?;
-                    let pixels = u64::from(height) * u64::from(width);
+                    let plane = CHANNELS * u64::from(height) * u64::from(width) * element;
                     let video = layout.video;
                     latents = latents.max(u64::from(video.channels) * voxels(&video) * latent);
-                    tails = tails.max(CHANNELS * u64::from(overlap.unwrap_or(0)) * pixels * raster);
+                    tails = tails.max(u64::from(overlap) * plane);
+                    rasters = rasters.max(u64::from(frames) * plane);
                     layout
                 }
                 Extent::Latents(layout) => {
@@ -319,7 +332,8 @@ impl DecoderRunner {
             layouts.push((bucket, layout));
         }
         let tail = latents.next_multiple_of(UNIT_BYTES);
-        let bytes = tail + tails;
+        let raster = (tail + tails).next_multiple_of(UNIT_BYTES);
+        let bytes = raster + rasters;
 
         // The buffers hold defined values for the capture's first forward.
         let buffers = match &stream {
@@ -345,15 +359,16 @@ impl DecoderRunner {
             memory,
             stream,
             layouts,
-            splices,
+            staged: Cell::new(None),
             buffers,
             tail,
+            raster,
             bytes,
         })
     }
 
-    /// The bytes of device memory the runner holds beside its graphs' region: its latent and
-    /// tail buffers, sized for its largest bucket.
+    /// The bytes of device memory the runner holds beside its graphs' region: its latent, tail
+    /// and raster buffers, sized for its largest bucket.
     pub const fn device_bytes(&self) -> u64 {
         self.bytes
     }
@@ -526,13 +541,14 @@ impl DecoderRunner {
         let pixels = u64::from(height) * u64::from(width);
         let raster = pixels * element_bytes(self.model.element_type())?;
         let base = self.buffers.as_ref().map_or(0, |storage| storage.address());
+        let copies = || PitchedBatch::new(SourceOrder::Stream);
 
         let mut units = Vec::with_capacity(tails.len());
         for (index, unit) in (row.unit..).take(tails.len()).enumerate() {
             if decoder(unit) != Some(own) {
                 continue;
             }
-            let mut before = PitchedBatch::new(SourceOrder::Stream);
+            let mut before = copies();
 
             // The clip's window: its latent frames of every channel, a trajectory's row apart.
             let first = self.model.clip_start(unit);
@@ -561,7 +577,7 @@ impl DecoderRunner {
                 let bytes = CHANNELS * u64::from(frames) * raster;
                 let at = (u64::from(unit) * bytes, bytes);
                 let kept = self.place(tables, row, (media_class, media), true, at)?;
-                units.push((before, (0, kept), None, (None, None)));
+                units.push((before, (copies(), None), (None, copies(), None), kept));
                 continue;
             };
             let splice = schedule.get(unit as usize).copied().ok_or_else(|| {
@@ -581,7 +597,7 @@ impl DecoderRunner {
 
             // The tail it fades against: the round's own before it, or the one before the round,
             // found as the module documentation states by the rank that decodes its predecessor.
-            let mut taken = None;
+            let (mut taken, mut fade) = (None, copies());
             if splice.overlap > 0 {
                 let previous = match index {
                     0 => row.results.get(1),
@@ -604,7 +620,7 @@ impl DecoderRunner {
                     }
                     rank => self.read_on(tables, row, read, rank, bytes)?,
                 };
-                before.push(pitched(
+                fade.push(pitched(
                     (base + self.tail, bytes),
                     (source, bytes),
                     bytes,
@@ -613,37 +629,37 @@ impl DecoderRunner {
             }
 
             // The bytes of its own splice, from the splice's first frame of the timeline.
-            let output = self
-                .splices
-                .iter()
-                .position(|held| *held == Splice { first: 0, ..splice })
-                .ok_or_else(|| Error::Invariant(format!("{splice:?} is none the graph places")))?;
             let at = (
                 u64::from(splice.first) * pixels * CHANNELS,
                 u64::from(splice.keep) * pixels * CHANNELS,
             );
             let kept = self.place(tables, row, (media_class, media), true, at)?;
 
-            // The tail it leaves its successor, handed to the successor's rank when another rank
+            // The tail it leaves its successor: the end of each channel's frames of the raster,
+            // `[3, frames, rows, columns]`, handed to the successor's rank when another rank
             // decodes it in this call; one the next round reads stays where it lies.
-            let mut handed = None;
-            let tail = match successor {
-                0 => None,
-                frames => {
-                    let bytes = CHANNELS * u64::from(frames) * raster;
-                    let at =
-                        self.place(tables, row, (tail_class, tails[index]), true, (0, bytes))?;
-                    let reader = decoder(unit + 1).filter(|&rank| rank != own);
+            let (mut left, mut handed) = (copies(), None);
+            if successor > 0 {
+                // A channel's last frames and its whole frames, then the tail's bytes.
+                let (end, length) = (u64::from(successor) * raster, u64::from(frames) * raster);
+                let (position, bytes) = (tails[index], CHANNELS * end);
+                let at = self.place(tables, row, (tail_class, position), true, (0, bytes))?;
+                left.push(pitched(
+                    (at, end),
+                    (base + self.raster + length - end, length),
+                    end,
+                    CHANNELS as u32,
+                )?)?;
 
-                    if let Some(reader) = reader.filter(|_| index + 1 < tails.len()) {
-                        // The reader backs the tail block: checked before anything is issued.
-                        self.read_on(tables, row, (tail_class, tails[index]), reader, bytes)?;
-                        handed = Some((reader, tails[index], bytes));
-                    }
-                    Some((at, frames))
+                let reader = decoder(unit + 1).filter(|&rank| rank != own);
+                if let Some(reader) = reader.filter(|_| index + 1 < tails.len()) {
+                    // The reader backs the tail block: checked before anything is issued.
+                    self.read_on(tables, row, (tail_class, position), reader, bytes)?;
+                    handed = Some((at, reader, position, bytes));
                 }
-            };
-            units.push((before, (1 + output, kept), tail, (taken, handed)));
+            }
+            let splice = Some(Splice { first: 0, ..splice });
+            units.push((before, (left, handed), (taken, fade, splice), kept));
         }
         Ok(units)
     }
@@ -671,9 +687,10 @@ impl DecoderRunner {
         let kept = self.place(tables, row, (media_class, samples), true, pcm)?;
 
         let base = self.buffers.as_ref().map_or(0, |storage| storage.address());
-        let mut before = PitchedBatch::new(SourceOrder::Stream);
+        let copies = || PitchedBatch::new(SourceOrder::Stream);
+        let mut before = copies();
         before.push(pitched((base, bytes), (source, bytes), bytes, 1)?)?;
-        Ok((before, (0, kept), None, (None, None)))
+        Ok((before, (copies(), None), (None, copies(), None), kept))
     }
 
     /// Waits for the tail another rank hands this one into its run of the tail block `slot`
@@ -688,17 +705,16 @@ impl DecoderRunner {
             .take_hand_off(tables, entry, self.stream.as_ref(), TAIL_WAIT)
     }
 
-    /// Hands the tail a unit left in this rank's run at `tail` to the rank `handed` names, which
-    /// decodes the unit's successor in the same call: copied into that rank's run of the tail
-    /// block on the runner's stream, behind the unit's own tail copy.
+    /// Hands the tail a unit left in this rank's run at the address `handed` names to the rank it
+    /// names, which decodes the unit's successor in the same call: copied into that rank's run of
+    /// the tail block on the runner's stream, behind the unit's own tail copy.
     fn hand(
         &self,
         tables: &BlockTables,
         slot: u32,
-        tail: Option<(u64, u32)>,
-        handed: Option<(u32, u32, u64)>,
+        handed: Option<(u64, u32, u32, u64)>,
     ) -> Result<()> {
-        let (Some((at, _)), Some((reader, position, bytes))) = (tail, handed) else {
+        let Some((at, reader, position, bytes)) = handed else {
             return Ok(());
         };
         let entry = (slot, self.config.classes[2], position);
@@ -713,41 +729,84 @@ impl DecoderRunner {
         Ok(())
     }
 
-    /// Serves `batch`: every unit's copies and replay, on the stream, with the hand-offs of
-    /// their tails between the ranks. Returns when the units were issued, for a batch that names
-    /// a call.
+    /// Serves `batch`: every unit's decode, tail and splice on the stream, with the hand-offs of
+    /// the tails between the ranks (module documentation). Returns when the units were issued,
+    /// for a batch that names a call. A runner whose graphs hold no device issues no copy, and
+    /// its graphs refuse the first replay.
     fn serve(&self, batch: &Batch, tables: &BlockTables) -> Result<Option<Instant>> {
         // A batch that names no call carries copies alone.
         if batch.requests.is_empty() {
             return Ok(None);
         }
         let (bucket, units) = self.units(batch, tables)?;
-        let slot = batch.media.first().map_or(0, |row| row.slot);
-        let stream = self.stream.as_ref().ok_or(Error::State(
-            "a decoder runner with no device decodes nothing",
-        ))?;
+        let (slot, frames) = batch
+            .media
+            .first()
+            .map_or((0, 0), |row| (row.slot, row.frames));
 
+        // Every copy below is safe for one reason: each range lies in a block the tables give
+        // this call or in the runner's buffers (`units`), which stay mapped until the batch
+        // ends, and a forward's outputs stay until the next forward. The stream orders each
+        // copy after the forward before it, and a buffer's next write after the forward that
+        // read it.
         let launched = Instant::now();
-        for (before, kept, tail, (taken, handed)) in &units {
+        for (before, (left, handed), (taken, fade, splice), kept) in &units {
+            // The decode reads the unit's latents alone, so it waits for no other rank; the tail
+            // it leaves is handed on before this rank waits for one.
             self.graphs.prepare_inputs(self, &bucket, |_| Ok(()))?;
-            self.take(tables, slot, *taken)?;
+            // SAFETY: as stated above the loop.
+            unsafe { self.submit(before) }?;
+            let mut outputs = self.graphs.replay(&bucket)?;
 
-            // SAFETY: every range lies in a block the tables give this call or in the runner's
-            // buffers (`units`), which stay mapped until the batch ends; the stream orders the
-            // copies after the replay before them, whose graph read the buffers, and after the
-            // copy of a tail another rank handed over.
-            unsafe { before.submit(stream) }?;
-            let outputs = self.graphs.replay(&bucket)?;
+            // SAFETY: as stated above the loop.
+            unsafe { self.submit(left) }?;
+            self.hand(tables, slot, *handed)?;
 
-            // SAFETY: as above, and the graph's outputs stay until its next replay, which the
-            // stream orders after these copies.
-            unsafe { after(&outputs, *kept, *tail)?.submit(stream) }?;
-            self.hand(tables, slot, *tail, *handed)?;
+            // The splice fades against its predecessor's tail, behind that tail's hand-off.
+            if let Some(splice) = *splice {
+                self.take(tables, slot, *taken)?;
+                // SAFETY: as stated above the loop.
+                unsafe { self.submit(fade) }?;
+                outputs = self.splice(&bucket, frames, splice)?;
+            }
+
+            // SAFETY: as stated above the loop.
+            unsafe { self.submit(&after(&outputs, *kept)?) }?;
         }
         Ok(Some(launched))
     }
 
-    /// The clip forward of `layout` decoding to rasters of `extent`, `(frames, rows, columns)`.
+    /// Submits `copies` on the runner's stream; with graphs that hold no device, none.
+    ///
+    /// # Safety
+    ///
+    /// As [`PitchedBatch::submit`]: every range stays valid until the stream passed the copies.
+    unsafe fn submit(&self, copies: &PitchedBatch) -> Result<()> {
+        let Some(stream) = &self.stream else {
+            return Ok(());
+        };
+
+        // SAFETY: forwarded from the caller.
+        Ok(unsafe { copies.submit(stream) }?)
+    }
+
+    /// Places `splice` of the clip `clip`'s graph decoded last into a timeline of `frames`
+    /// frames: the eager forward of the splice bucket with `splice` staged. Returns its bytes.
+    fn splice(&self, clip: &Bucket, frames: u32, splice: Splice) -> Result<Vec<Tensor>> {
+        let bucket = splicing(clip, frames)
+            .ok_or_else(|| Error::Invariant(format!("bucket {clip} splices no clip")))?;
+
+        self.staged.set(Some(splice));
+        let placed = self
+            .graphs
+            .prepare_inputs(self, &bucket, |_| Ok(()))
+            .and_then(|()| self.graphs.eager(self, &bucket));
+        self.staged.set(None);
+        placed
+    }
+
+    /// The clip forward of `layout` decoding into the raster buffer, `[3, frames, rows, columns]`
+    /// of `extent`, `(frames, rows, columns)`; it returns the raster.
     fn decode_clip(
         &self,
         layout: &Layout,
@@ -766,12 +825,46 @@ impl DecoderRunner {
         let block = backend::empty((rows, channels), latent)?;
         self.model.gather_latents(layout, &window, 0, &block)?;
 
-        let (rgb, height, width) = (CHANNELS as usize, height as usize, width as usize);
-        let raster = backend::empty((rgb, frames as usize, height, width), dtype)?;
+        let shape = (
+            CHANNELS as usize,
+            frames as usize,
+            height as usize,
+            width as usize,
+        );
+        let raster = self.buffer(self.raster, shape, dtype)?;
         self.model.decode(layout, &block, Some(&raster), None)?;
-        let Some(splicer) = &self.splicer else {
-            return Ok(vec![raster]);
+        Ok(vec![raster])
+    }
+
+    /// The splice forward of a clip of `extent`, `(frames, rows, columns)`, into a timeline of
+    /// `timeline` frames: the staged splice, or every distinct splice of the timeline, placed
+    /// over the raster buffer and the tail buffer; it returns each splice's bytes,
+    /// `[keep, rows, columns, 3]`.
+    fn splice_clip(
+        &self,
+        timeline: u32,
+        (frames, height, width): (u32, u32, u32),
+    ) -> Result<Vec<Tensor>> {
+        let splicer = self.splicer.as_ref().ok_or_else(|| {
+            Error::Invariant("a decoder that places no clip runs no splice".into())
+        })?;
+        let splices = match self.staged.get() {
+            Some(splice) => vec![splice],
+            None => {
+                let mut distinct = Vec::new();
+                for splice in splicer.splices(timeline)? {
+                    let splice = Splice { first: 0, ..splice };
+                    if !distinct.contains(&splice) {
+                        distinct.push(splice);
+                    }
+                }
+                distinct
+            }
         };
+
+        let (rgb, height, width) = (CHANNELS as usize, height as usize, width as usize);
+        let dtype = self.model.element_type();
+        let raster = self.buffer(self.raster, (rgb, frames as usize, height, width), dtype)?;
 
         // The de-normalization's constants: the three means, then the three deviations.
         let norm = splicer.pixel_norm();
@@ -780,15 +873,15 @@ impl DecoderRunner {
             Tensor::from_slice(&constants, 2 * rgb, &Device::Cpu)?.to_device(raster.device())?;
         let (mean, std) = (constants.narrow(0, 0, rgb)?, constants.narrow(0, rgb, rgb)?);
 
-        let mut outputs = vec![raster];
-        for splice in &self.splices {
+        let mut outputs = Vec::with_capacity(splices.len());
+        for splice in splices {
             let previous = match splice.overlap as usize {
                 0 => None,
                 overlap => Some(self.buffer(self.tail, (rgb, overlap, height, width), dtype)?),
             };
             let bytes = backend::empty((splice.keep as usize, height, width, rgb), DType::U8)?;
 
-            for (run, frame) in splicer.splice(previous.as_ref(), &outputs[0], *splice)? {
+            for (run, frame) in splicer.splice(previous.as_ref(), &raster, splice)? {
                 let length = run.dims().get(1).copied().unwrap_or(0);
                 let out = bytes.narrow(0, frame as usize, length)?;
                 backend::launch::<RgbBytes>(
@@ -853,18 +946,38 @@ impl Runner for DecoderRunner {
         self.config.buckets.capture_order().copied().collect()
     }
 
-    /// A clip bucket's forward returns its raster and then, with a splicer, the bytes of each
-    /// distinct splice in turn; a track bucket's returns its PCM.
-    fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
-        let layout = self.layout(bucket)?;
+    /// With a splicer, the splice of each clip bucket into each timeline the deployment serves:
+    /// the clip's bucket stating the request it serves (module documentation).
+    fn eager_buckets(&self) -> Vec<Bucket> {
+        if self.splicer.is_none() {
+            return Vec::new();
+        }
+        let clips = self.config.buckets.capture_order();
 
-        match bucket.extent {
-            Extent::Clip {
-                frames,
-                height,
-                width,
-            } => self.decode_clip(&layout, (frames, height, width)),
-            _ => self.decode_track(&layout),
+        clips
+            .flat_map(|clip| {
+                let timelines = self.config.timelines.iter();
+                timelines.filter_map(|&(frames, _)| splicing(clip, frames))
+            })
+            .collect()
+    }
+
+    /// A clip bucket's forward returns its raster, a splice bucket's the bytes of its staged
+    /// splice, or of every distinct splice of its timeline when none is staged, and a track
+    /// bucket's its PCM.
+    fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
+        let Extent::Clip {
+            frames,
+            height,
+            width,
+        } = bucket.extent
+        else {
+            return self.decode_track(&self.layout(bucket)?);
+        };
+
+        match bucket.serves {
+            Some((timeline, ..)) => self.splice_clip(timeline, (frames, height, width)),
+            None => self.decode_clip(&self.layout(bucket)?, (frames, height, width)),
         }
     }
 
@@ -929,39 +1042,25 @@ pub(super) fn elements(shape: &nn::LatentShape) -> u64 {
     u64::from(shape.channels) * voxels(shape)
 }
 
-/// The copies of a unit's output after its replay, from the forward's `outputs`: the output it
-/// keeps into the product, and the last frames of the raster into its tail block.
-fn after(
-    outputs: &[Tensor],
-    (output, at): (usize, u64),
-    tail: Option<(u64, u32)>,
-) -> Result<PitchedBatch> {
-    let missing = || Error::Invariant(format!("the forward returned no output {output}"));
-    let mut copies = PitchedBatch::new(SourceOrder::Stream);
-
-    let kept = outputs.get(output).ok_or_else(missing)?;
-    let bytes = kept.elem_count() as u64 * element_bytes(kept.dtype())?;
-    copies.push(pitched((at, bytes), (address(kept)?, bytes), bytes, 1)?)?;
-
-    // The raster is `[3, frames, rows, columns]`: the tail is the end of each channel's frames.
-    if let Some((at, frames)) = tail {
-        let raster = outputs.first().ok_or_else(missing)?;
-        let &[channels, length, height, width] = raster.dims() else {
-            return Err(Error::Invariant(
-                "a clip's raster is not four-dimensional".into(),
-            ));
-        };
-        let plane = (height * width) as u64 * element_bytes(raster.dtype())?;
-        let (kept, length) = (u64::from(frames) * plane, length as u64 * plane);
-
-        let source = address(raster)? + length - kept;
-        copies.push(pitched(
-            (at, kept),
-            (source, length),
-            kept,
-            channels as u32,
-        )?)?;
+/// The bucket of the splice of `clip`'s clips into a timeline of `frames` frames: the clip's
+/// bucket stating the request it serves; `None` for a bucket of no clip.
+fn splicing(clip: &Bucket, frames: u32) -> Option<Bucket> {
+    match clip.extent {
+        Extent::Clip { height, width, .. } => Some(clip.serving(frames, width, height)),
+        _ => None,
     }
+}
+
+/// The copy of a unit's output into the product at `at`: the first of the `outputs` of the
+/// unit's last forward, its splice's bytes, or its decode's raster or PCM.
+fn after(outputs: &[Tensor], at: u64) -> Result<PitchedBatch> {
+    let kept = outputs
+        .first()
+        .ok_or_else(|| Error::Invariant("the unit's forward returned no output".into()))?;
+    let bytes = kept.elem_count() as u64 * element_bytes(kept.dtype())?;
+
+    let mut copies = PitchedBatch::new(SourceOrder::Stream);
+    copies.push(pitched((at, bytes), (address(kept)?, bytes), bytes, 1)?)?;
     Ok(copies)
 }
 
