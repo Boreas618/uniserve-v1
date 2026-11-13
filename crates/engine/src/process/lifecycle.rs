@@ -21,6 +21,10 @@
 //! | `Draining` | `Promote` | `Draining`, then `Serving` once parked | `Drained`, `Serving` |
 //! | `Parked` | `Drain` | `Parked` | `Drained` at once |
 //! | `Starting`, `Stopped`, `Failed` | `Drain`, `Promote` | unchanged | `Fault` |
+//! | `Parked`, `Serving` | `Grow`, a promotion's `grow` | unchanged; the regions grow now | — |
+//! | `Starting`, `Draining` | `Grow`, a promotion's `grow` | unchanged; the grow is kept | — |
+//! | `Starting` | the start ended | `Parked` or `Serving`; a kept grow applies | as above |
+//! | `Draining` | every scheduler drained | `Serving` again on a promotion, a kept grow applying; `Parked` otherwise, a kept grow dropped | `Drained` |
 //! | any | shutdown | `Stopped` | — |
 //! | any | a process-fatal failure | `Failed` | the failure's own |
 //!
@@ -175,11 +179,31 @@ pub(crate) fn drain(lifecycle: &mut Lifecycle, epoch: u64) -> Result<bool, Repor
 }
 
 /// Every scheduler drained: the engine is parked. Returns whether a promotion that arrived
-/// meanwhile makes it serve again now.
-pub(crate) fn drained(lifecycle: &mut Lifecycle) -> bool {
+/// meanwhile makes it serve again now. A grow `kept` during the drain applies only then: an
+/// engine that stays parked gave its memory to the epoch that serves, and drops it.
+pub(crate) fn drained(lifecycle: &mut Lifecycle, kept: &mut bool) -> bool {
     let serves_again = matches!(lifecycle, Lifecycle::Draining { serves_again: true });
     *lifecycle = Lifecycle::Parked;
+    if !serves_again {
+        *kept = false;
+    }
     serves_again
+}
+
+/// `Grow`, or a promotion's `grow` (`specs/updates.md` §3.7): `true` when the control thread
+/// grows the regions now, the engine being parked or serving. Otherwise the grow is `kept` while
+/// the engine starts, whose session and regions do not exist yet, and while it drains, whose
+/// regions shrink; it applies once the start ended, or once a promotion that overtook the drain
+/// makes the drained engine serve again ([`drained`]). A stopped or failed engine grows nothing.
+pub(crate) fn grow(lifecycle: Lifecycle, kept: &mut bool) -> bool {
+    match lifecycle {
+        Lifecycle::Parked | Lifecycle::Serving => true,
+        Lifecycle::Starting | Lifecycle::Draining { .. } => {
+            *kept = true;
+            false
+        }
+        Lifecycle::Stopped | Lifecycle::Failed => false,
+    }
 }
 
 /// `Promote`: `Ok(true)` when the control thread opens admission now (the engine is parked),
@@ -479,7 +503,7 @@ mod tests {
         assert_eq!(lifecycle.state(), EngineState::Draining);
         assert!(lifecycle.refusal().is_some());
 
-        assert!(!drained(&mut lifecycle));
+        assert!(!drained(&mut lifecycle, &mut false));
         assert_eq!(lifecycle, Lifecycle::Parked);
     }
 
@@ -536,7 +560,7 @@ mod tests {
         assert_eq!(promote(&mut lifecycle, serving(LAUNCH, 1)), Ok(false));
         assert_eq!(lifecycle.state(), EngineState::Draining);
 
-        assert!(drained(&mut lifecycle));
+        assert!(drained(&mut lifecycle, &mut false));
         assert_eq!(lifecycle, Lifecycle::Parked);
     }
 
@@ -546,7 +570,61 @@ mod tests {
         assert_eq!(drain(&mut lifecycle, 4), Ok(true));
         assert_eq!(promote(&mut lifecycle, serving(LAUNCH, 1)), Ok(false));
         assert_eq!(drain(&mut lifecycle, 4), Ok(false));
-        assert!(!drained(&mut lifecycle));
+        assert!(!drained(&mut lifecycle, &mut false));
+    }
+
+    #[test]
+    fn a_grow_applies_at_once_to_an_engine_that_is_parked_or_serves() {
+        for state in [Lifecycle::Parked, Lifecycle::Serving] {
+            let mut kept = false;
+            assert!(grow(state, &mut kept));
+            assert!(!kept);
+        }
+        // A stopped or failed engine grows nothing, now or later.
+        for state in [Lifecycle::Stopped, Lifecycle::Failed] {
+            let mut kept = false;
+            assert!(!grow(state, &mut kept));
+            assert!(!kept);
+        }
+    }
+
+    #[test]
+    fn a_grow_during_the_start_is_kept_until_the_start_ends() {
+        let mut kept = false;
+        assert!(!grow(Lifecycle::Starting, &mut kept));
+        assert!(
+            kept,
+            "the grow waits for the session and regions the start makes"
+        );
+    }
+
+    #[test]
+    fn a_promotion_that_overtakes_a_drain_grows_once_the_engine_serves_again() {
+        let mut lifecycle = Lifecycle::Serving;
+        let mut kept = false;
+        assert_eq!(drain(&mut lifecycle, 4), Ok(true));
+
+        // The promotion's grow, and a grow the other epoch's release sends meanwhile, wait for
+        // the drain: its regions still shrink.
+        assert_eq!(promote(&mut lifecycle, serving(LAUNCH, 1)), Ok(false));
+        assert!(!grow(lifecycle, &mut kept));
+        assert!(kept);
+
+        // Drained and promoted, the engine serves again, and the kept grow applies.
+        assert!(drained(&mut lifecycle, &mut kept));
+        assert!(kept);
+    }
+
+    #[test]
+    fn a_grow_kept_through_a_drain_that_parks_the_engine_is_dropped() {
+        let mut lifecycle = Lifecycle::Serving;
+        let mut kept = false;
+        assert_eq!(drain(&mut lifecycle, 4), Ok(true));
+        assert!(!grow(lifecycle, &mut kept));
+
+        // No promotion: the memory the drain gave back is the serving epoch's.
+        assert!(!drained(&mut lifecycle, &mut kept));
+        assert!(!kept);
     }
 
     #[test]

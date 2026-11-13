@@ -160,6 +160,20 @@ pub fn unreserved(
         .min(free.saturating_add(kept)))
 }
 
+/// The bytes of `quota` that other epochs of the deployment hold and `epoch` does not: the
+/// storages, pools and processes of an epoch that serves beside it, which return to the quota
+/// and to the device once that epoch ends.
+///
+/// What `epoch` shares with them (weights both map) is not among them, nor are the Transfer
+/// Server's items, which no epoch holds. Passed to [`unreserved`] as storage the rank counts as
+/// free, it gives what the rank may divide as if its epoch served the GPU alone: the size a
+/// device KV region of a layout new to the quota grows to as the serving epoch drains
+/// (`specs/updates.md` §3.7).
+pub fn held_elsewhere(quota: &Quota, epoch: u64) -> u64 {
+    quota
+        .bytes(|reservation| !reservation.epochs.is_empty() && !reservation.epochs.contains(&epoch))
+}
+
 /// The bytes the graph pool and the scratch pool of a device map for its runners, in that
 /// order.
 ///
@@ -477,6 +491,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rest, 14 * GIB - 4 * GIB - GIB);
+    }
+
+    #[test]
+    fn an_epoch_of_another_layout_divides_as_if_it_served_alone_once_the_first_ends() {
+        // The first epoch serves its cache, pools and process beside the second, which maps
+        // the same weights; the Transfer Server holds its context against every epoch.
+        let first = scope(0);
+        let mut quota = quota(
+            70 * GIB,
+            vec![
+                reservation(Item::Weights, None, &[1, 2], 20 * GIB),
+                reservation(Item::CacheSegment, Some(first.clone()), &[1], 30 * GIB),
+                reservation(Item::GraphPool, Some(first.clone()), &[1], 4 * GIB),
+                reservation(Item::Process, Some(first), &[1], GIB),
+                reservation(Item::TransferContext, None, &[], GIB),
+            ],
+        );
+        quota.transfer_context = GIB;
+
+        // What only the first epoch holds returns once it ends; the shared weights and the
+        // Transfer Server's context stay.
+        let elsewhere = held_elsewhere(&quota, 2);
+        assert_eq!(elsewhere, (30 + 4 + 1) * GIB);
+
+        // Now the second divides what the first left; alone, it divides the whole limit less
+        // the weights, the context and its own process, and the device's free bytes grow by
+        // what the first epoch gives back.
+        let now = unreserved(&quota, &scope(0), 2, 0, GIB, 16 * GIB).unwrap();
+        assert_eq!(now, 70 * GIB - (20 + 35 + 1) * GIB - GIB);
+        let alone = unreserved(&quota, &scope(0), 2, elsewhere, GIB, 16 * GIB).unwrap();
+        assert_eq!(alone, 70 * GIB - (20 + 1) * GIB - GIB);
+
+        // The first epoch holds nothing elsewhere of the second.
+        assert_eq!(held_elsewhere(&quota, 1), 0);
     }
 
     #[test]

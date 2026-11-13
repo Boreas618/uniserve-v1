@@ -32,6 +32,7 @@ use anyhow::{Context as _, Result, bail};
 use build_server::Target;
 use crossbeam_channel::{Receiver, Sender};
 use ipc::Capacity;
+use ipc::batch::Phase;
 use ops::Generation;
 use platform::DeviceId;
 use proto::config::{EngineArgs, SchedulerConfig, WorkerGroupConfig};
@@ -44,6 +45,7 @@ use worker::Executor;
 use worker::completion::Outcome;
 use worker::executor::Executors;
 use worker::executor::peers::{Liveness, Remote, Upstream};
+use worker::profiling::counters::Counters;
 
 use super::epoch;
 use super::ranks::{
@@ -105,6 +107,10 @@ pub struct Engine {
     pub(crate) upstream: Option<Upstream>,
     /// Whether every peer link still serves, which ends the process when one is lost.
     pub(crate) liveness: Option<Arc<Liveness>>,
+    /// CUPTI's always-on counters of the ranks' streams and of the threads that wait for the
+    /// devices, for as long as the engine serves; `None` without devices, or when the process is
+    /// not subscribed to CUPTI.
+    pub(crate) counters: Option<Counters>,
 }
 
 /// One scheduler of an [`Engine`] and how the control thread reaches it.
@@ -190,12 +196,17 @@ impl Engine {
 
         // The workers compute `max_logprobs` candidates at every position: what a request may ask
         // for. The model's facts state no feature before its workers do: the engine serves the
-        // features its schedulers' groups serve, which each scheduler resolves for its own.
-        let mut limits = GenerationLimits {
-            max_logprobs: config.max_logprobs,
-            ..config.model.generation_limits.clone()
-        };
+        // features its schedulers' groups serve, which each scheduler resolves for its own. Every
+        // numeric limit is the lower of the launch's and what the groups were sized for.
         let ceilings = policy::ceilings(capacities.iter().map(|(_, capacity)| capacity));
+        let mut limits = lowered(
+            GenerationLimits {
+                max_logprobs: config.max_logprobs,
+                ..config.model.generation_limits.clone()
+            },
+            &capacities,
+            &ceilings,
+        );
         let served = Arc::new(AtomicU64::new(FIRST_GENERATION));
 
         // The schedulers' limits as the deployment states them, which each scheduler lowers to
@@ -299,16 +310,13 @@ impl Engine {
             session,
             executors: Vec::new(),
             groups: None,
-            data: Arc::new(DataPlane::new(
-                Vec::new(),
-                LoadTarget::default(),
-                config.mem_fraction_static,
-            )),
+            data: Arc::new(DataPlane::new(Vec::new(), LoadTarget::default())),
             head: None,
             build: None,
             remotes: Vec::new(),
             upstream: None,
             liveness: None,
+            counters: None,
         })
     }
 
@@ -344,6 +352,7 @@ impl Engine {
             upstream,
             liveness,
             session,
+            counters,
             ..
         } = self;
         let mut outcome: Result<()> = Ok(());
@@ -362,6 +371,8 @@ impl Engine {
             }
         }
         drop(route);
+        // The counters record the streams the executors issue on, and stop before they close.
+        drop(counters);
 
         // An executor's thread holds its runners, and an expert union's runners reach the other
         // members' executors: every queue closes before any executor is joined.
@@ -530,7 +541,7 @@ pub(crate) fn start(
             head.grant(region, segment, first, units)?;
         }
     }
-    bind(&ranks, &open, &opened)?;
+    bind(&mut ranks, &open, &opened)?;
     let (route, executors) = spawn(&mut ranks, &head, &pairs, remotes.clone())?;
 
     // Range markers and PC sampling attach to what a graph captures, so they precede the
@@ -539,6 +550,19 @@ pub(crate) fn start(
         instrument(launch, model_runner.devices())?;
     }
     warm_up(&executors)?;
+
+    // The always-on counters, once the ranks are warm: every stream a runner computes on is
+    // `device`, and every one the copies of a rank's blocks move on is `copy`. A graph's launch
+    // is one record unless the deployment keeps PC sampling on, which refuses that record.
+    let streams: Vec<(&'static str, platform::Stream)> = ranks
+        .iter()
+        .flat_map(|rank| rank.streams.iter().cloned())
+        .collect();
+    let counters = if streams.is_empty() {
+        None
+    } else {
+        Counters::start(&streams, !launch.engine_config.profiling.graph_pc_sampling)
+    };
 
     let capacities = capacities(&ranks, &open)?;
     let data = data_plane(launch, &model_runner, &ranks, &executors)?;
@@ -573,6 +597,7 @@ pub(crate) fn start(
     engine.executors = executors;
     engine.groups = Some(route);
     engine.data = data;
+    engine.counters = counters;
     engine.head = Some(head);
     engine.build = build.map(|client| (client, targets));
     if !remotes.is_empty() {
@@ -580,6 +605,61 @@ pub(crate) fn start(
     }
     engine.remotes = remotes.into_iter().map(|(_, remote)| remote).collect();
     Ok(engine)
+}
+
+/// `configured`, the generation limits a launch states, lowered to what the worker groups of
+/// `capacities`, whose captured buckets bound `ceilings`, were sized for: the limits the engine
+/// checks requests against and reports to its daemon.
+///
+/// An image encoding of a kind no group computes (`VisionEncode`, `LatentEncode`) has no
+/// capacity: its grid tokens and feature bytes are zero, and so are the encoder cache's entries
+/// when no group encodes at all. An encoding a group computes is written whole by one prefill
+/// into the cache, so its grid takes at most the tokens a step's budget holds, and its features
+/// the bytes of that many tokens of the widest row a group of that kind writes
+/// (`Capacity::feature_bytes`).
+fn lowered(
+    configured: GenerationLimits,
+    capacities: &[(GroupId, Capacity)],
+    ceilings: &Limits,
+) -> GenerationLimits {
+    let mut limits = configured;
+    let tokens = ceilings.max_num_batched_tokens;
+
+    // The grid tokens and the feature bytes a group of the kind that computes `phase` holds;
+    // nothing when no group does.
+    let held = |phase: Phase, grid: u32, bytes: u64| -> (u32, u64) {
+        let rows = capacities
+            .iter()
+            .map(|(_, capacity)| capacity)
+            .filter(|capacity| capacity.serves(phase))
+            .map(|capacity| u64::from(capacity.feature_bytes))
+            .max();
+        match rows {
+            Some(row) => {
+                let grid = grid.min(tokens);
+                (grid, bytes.min(u64::from(grid).saturating_mul(row)))
+            }
+            None => (0, 0),
+        }
+    };
+    (limits.max_vit_grid_tokens, limits.max_vision_feature_bytes) = held(
+        Phase::VisionEncode,
+        limits.max_vit_grid_tokens,
+        limits.max_vision_feature_bytes,
+    );
+    (limits.max_vae_grid_tokens, limits.max_latent_feature_bytes) = held(
+        Phase::LatentEncode,
+        limits.max_vae_grid_tokens,
+        limits.max_latent_feature_bytes,
+    );
+
+    let encodes = capacities.iter().any(|(_, capacity)| {
+        capacity.serves(Phase::VisionEncode) || capacity.serves(Phase::LatentEncode)
+    });
+    if !encodes {
+        limits.encoder_cache_entries = 0;
+    }
+    limits
 }
 
 /// Captures every bucket of every executor's runners, all at once, and waits for each.
@@ -622,11 +702,7 @@ fn data_plane(
         checkpoint: PathBuf::from(&launch.engine_config.model.model),
         experts: model_runner.experts(),
     };
-    Ok(Arc::new(DataPlane::new(
-        served,
-        target,
-        launch.engine_config.mem_fraction_static,
-    )))
+    Ok(Arc::new(DataPlane::new(served, target)))
 }
 
 /// Installs what the deployment's always-on profiling captures into every graph of `devices`:

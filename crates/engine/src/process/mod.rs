@@ -262,6 +262,10 @@ pub(crate) struct MainProcess {
     recompute: bool,
     /// Whether admission opened once and the serving path's warm-up ran.
     warmed: bool,
+    /// A grow that arrived while the engine could not apply it (`lifecycle::grow`): during its
+    /// start, or during a drain; applied once the engine is parked or serves after its start, or
+    /// serves again after the drain.
+    grow: bool,
     operations: Sender<Job>,
     watchdog: Watchdog,
     /// The metrics' running sums since the start, and each scheduler's lifetime counts as its
@@ -326,6 +330,7 @@ impl MainProcess {
             paused: false,
             recompute: false,
             warmed: false,
+            grow: false,
             operations,
             metrics: wire::Metrics::default(),
             lifetime: Vec::new(),
@@ -613,6 +618,7 @@ impl MainProcess {
         self.lifecycle = lifecycle::started(true);
         self.announce(true);
         self.report(lifecycle::parked(self.launch.engine, self.generation));
+        self.grow_kept();
     }
 
     /// Opens admission: the graph storage restored, what serving holds reserved and every
@@ -647,6 +653,7 @@ impl MainProcess {
         self.announce(true);
         self.report(lifecycle::serving(self.launch.engine, self.generation));
         self.release();
+        self.grow_kept();
     }
 
     /// One command of the process interface.
@@ -680,13 +687,16 @@ impl MainProcess {
                 self.recompute = promote.recompute;
                 let serving = lifecycle::serving(self.launch.engine, self.generation);
                 match lifecycle::promote(&mut self.lifecycle, serving) {
-                    Ok(true) => {
-                        self.open_admission();
+                    // Parked, the engine grows behind the opening; draining, once it serves
+                    // again.
+                    Ok(admits) => {
+                        if admits {
+                            self.open_admission();
+                        }
                         if promote.grow {
                             self.grow();
                         }
                     }
-                    Ok(false) => {}
                     Err(report) => self.report(report),
                 }
             }
@@ -1016,7 +1026,7 @@ impl MainProcess {
         if !matches!(self.lifecycle, Lifecycle::Draining { .. }) {
             return;
         }
-        let serves_again = lifecycle::drained(&mut self.lifecycle);
+        let serves_again = lifecycle::drained(&mut self.lifecycle, &mut self.grow);
         self.metrics();
         self.report(lifecycle::drained_report(epoch));
         self.announce(false);
@@ -1054,8 +1064,12 @@ impl MainProcess {
     }
 
     /// `Grow`, or a promotion with `grow`: the ranks create the segments their quotas now hold,
-    /// the head grants them, and the schedulers grow their regions into them.
+    /// the head grants them, and the schedulers grow their regions into them. While the engine
+    /// starts or drains the grow is kept instead ([`lifecycle::grow`]).
     fn grow(&mut self) {
+        if !lifecycle::grow(self.lifecycle, &mut self.grow) {
+            return;
+        }
         let (schedulers, head, data) = match self.segment_parts() {
             Ok(parts) => parts,
             Err(error) => {
@@ -1071,6 +1085,13 @@ impl MainProcess {
                 }
             })
         }));
+    }
+
+    /// Applies the grow kept while the engine could not grow, once it is parked or serves.
+    fn grow_kept(&mut self) {
+        if std::mem::take(&mut self.grow) {
+            self.grow();
+        }
     }
 
     /// One command of the request interface for the whole engine.

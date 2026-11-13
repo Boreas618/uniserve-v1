@@ -71,6 +71,7 @@ use ipc::CacheTable;
 use ipc::memory::WeightsUpdated;
 use nn::WeightKey;
 use platform::{DeviceId, Nvml, Stream};
+use proto::request::wire::{DeviceMemory, PoolMemory};
 use storage::Item;
 use storage::runtime::GroupId;
 use worker::completion::Outcome;
@@ -83,6 +84,11 @@ use worker::memory::state::StateMemory;
 use worker::memory::weights::WeightStore;
 use worker::profiling::session::Change;
 use worker::{Error, Executor, Result, Runner, lock};
+
+/// The name [`DataPlane::memory`] reports the planes of a device's KV regions under, beside the
+/// pools of its allocators (`graph`, `scratch`, `resident`): the segments the ranks map, with the
+/// flags, scales, index keys and state planes beside them.
+pub const KV_POOL: &str = "kv";
 
 /// What a load of the served model reads: which checkpoint, and which expert sits in which slot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -125,6 +131,9 @@ pub struct Rank {
     pub executor: Weak<Executor>,
     /// The rank's device.
     pub device: DeviceId,
+    /// The fraction of the device its epoch's quota of the GPU is limited to, which a
+    /// reservation states with it (`WorkerGroupConfig::device_fraction`).
+    pub fraction: f64,
     /// The rank's Storage Server client.
     pub client: Arc<StorageClient>,
     /// The weights the rank serves from, which a second load publishes beside.
@@ -266,8 +275,6 @@ pub struct DataPlane {
     /// A mapping change failed part of the way: the rank's weights are no one checkpoint's, and
     /// the epoch ends rather than computing with them.
     poisoned: Mutex<Option<String>>,
-    /// The share of each device the deployment may hold.
-    fraction: f64,
     /// What each rank's process reserves, in rank order, once the ranks serve.
     reserved: Mutex<Vec<Reservation>>,
 }
@@ -331,8 +338,8 @@ fn reload(
 }
 
 impl DataPlane {
-    /// The data plane over `ranks`, which serve `target` within `fraction` of each device.
-    pub fn new(ranks: Vec<Rank>, target: Target, fraction: f64) -> Self {
+    /// The data plane over `ranks`, which serve `target`.
+    pub fn new(ranks: Vec<Rank>, target: Target) -> Self {
         Self {
             ranks: ranks.into_iter().map(Mutex::new).collect(),
             target: Mutex::new(target),
@@ -342,7 +349,6 @@ impl DataPlane {
             suspended: AtomicBool::new(false),
             derived_stale: AtomicBool::new(false),
             poisoned: Mutex::new(None),
-            fraction,
             reserved: Mutex::new(Vec::new()),
         }
     }
@@ -483,7 +489,7 @@ impl DataPlane {
         rank.client.reserve(
             rank.device,
             total,
-            quota_limit(total, self.fraction),
+            quota_limit(total, rank.fraction),
             vec![(Item::Process, bytes)],
         )?;
         Ok(())
@@ -689,6 +695,53 @@ impl DataPlane {
     /// When the quota or the device cannot be read.
     pub fn room(&self) -> Result<Vec<Room>> {
         self.ranks.iter().map(|rank| room_of(&lock(rank))).collect()
+    }
+
+    /// What the ranks' devices map now, one entry per device in the order of its first rank, as
+    /// the process's metrics report it: the limit of the GPU's quota the mappings are reserved
+    /// against, the bytes each pool of the device's allocators maps (`GraphPool::usage`), and
+    /// the bytes the planes of the ranks' KV regions map, as the pool [`KV_POOL`]. The ranks of
+    /// one device add up.
+    ///
+    /// A rank whose owners another thread holds at the moment is left out of this sample: the
+    /// control thread that takes it once a second waits on no rank, and a series a report does
+    /// not name keeps its last value.
+    pub fn memory(&self) -> Vec<DeviceMemory> {
+        let mut devices: Vec<DeviceMemory> = Vec::new();
+        for rank in &self.ranks {
+            let Ok(rank) = rank.try_lock() else {
+                continue;
+            };
+            let Ok(graphs) = rank.graphs.try_lock() else {
+                continue;
+            };
+            let mut stated = graphs.usage();
+            drop(graphs);
+            if let Some(cache) = &rank.cache
+                && let Ok(cache) = cache.try_lock()
+            {
+                stated.pools.push(PoolMemory {
+                    pool: KV_POOL.to_owned(),
+                    mapped: cache.mapped_bytes(),
+                });
+            }
+
+            match devices
+                .iter_mut()
+                .find(|device| device.device == stated.device)
+            {
+                Some(device) => {
+                    for pool in stated.pools {
+                        match device.pools.iter_mut().find(|held| held.pool == pool.pool) {
+                            Some(held) => held.mapped += pool.mapped,
+                            None => device.pools.push(pool),
+                        }
+                    }
+                }
+                None => devices.push(stated),
+            }
+        }
+        devices
     }
 
     /// The bytes of device storage the graph pools map, on the device that maps the fewest: what

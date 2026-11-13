@@ -1112,9 +1112,10 @@ impl ModelRunner {
     }
 
     /// Checks that a media rank's regions on `device` fit what its GPU's quota leaves it once its
-    /// weights are mapped (steps 11-14): the graph and scratch pools `pools` of its runners'
-    /// regions, its media memory `resident` from the resident pool, and the `buffers` its runners
-    /// hold beside them. A media rank keeps no cache, so nothing takes the remainder.
+    /// weights are mapped, within its own share of the GPU (steps 11-14): the graph and scratch
+    /// pools `pools` of its runners' regions, its media memory `resident` from the resident
+    /// pool, and the `buffers` its runners hold beside them. A media rank keeps no cache, so
+    /// nothing takes the remainder, and nothing of it waits for another epoch to drain.
     ///
     /// # Errors
     ///
@@ -1127,7 +1128,8 @@ impl ModelRunner {
         resident: u64,
         buffers: u64,
     ) -> Result<()> {
-        let unreserved = unreserved(client, device)?;
+        let (share, _) = self.fractions()?;
+        let (unreserved, _) = unreserved(client, device, share)?;
         division::remainder(
             unreserved,
             &[

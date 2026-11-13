@@ -166,7 +166,7 @@ impl Node {
             schedulers: vec![inbox],
             outputs,
             executors,
-            data: Arc::new(DataPlane::new(Vec::new(), Target::default(), 0.9)),
+            data: Arc::new(DataPlane::new(Vec::new(), Target::default())),
             head: Mutex::new(head),
             served,
             threads: vec![thread],

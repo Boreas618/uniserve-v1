@@ -141,6 +141,9 @@ struct State {
     /// The pairs the paired forwards of the generation being prepared could not compare, each
     /// with the reason.
     uncompared: Vec<String>,
+    /// The kernels the serving forwards launched since the graphs were made: a replay's
+    /// captured kernel nodes, an eager forward's launches ([`Graphs::launches`]).
+    launches: u64,
 }
 
 /// Where a generation update stands.
@@ -545,6 +548,7 @@ impl Graphs {
             graphs,
             buffer,
             step,
+            launches,
             ..
         } = &mut *state;
         let (_, graph) = served(graphs, serving, bucket).ok_or_else(|| {
@@ -562,6 +566,7 @@ impl Graphs {
         executable.launch(&cuda.stream)?;
         end_step(&cuda.stream, step)?;
         cuda.done.record(&cuda.stream)?;
+        *launches += executable.kernel_nodes();
 
         Ok(graph.outputs.clone())
     }
@@ -594,7 +599,26 @@ impl Graphs {
         // The forward's own copies read the slot, so the slot is free only behind them.
         self.with_buffer(|buffer| buffer.release(slot, &cuda.stream))?;
         cuda.done.record(&cuda.stream)?;
+
+        // A forward that ran launched what the bucket's profile run did.
+        if outputs.is_ok() {
+            let mut state = self.state.borrow_mut();
+            let launched = state.profiles.get(bucket).map_or(0, |table| {
+                table
+                    .iter()
+                    .filter(|(operator, _, _)| *operator != BREAK)
+                    .count() as u64
+            });
+            state.launches += launched;
+        }
         outputs
+    }
+
+    /// The kernels the serving forwards of these graphs launched since they were made: every
+    /// kernel node of each replayed graph and every launch of each eager forward. Paired
+    /// forwards and captures are not serving forwards; graphs that hold no device launch none.
+    pub fn launches(&self) -> u64 {
+        self.state.borrow().launches
     }
 
     /// Instantiates every graph's executables again: what replays need after the process's
@@ -1120,7 +1144,7 @@ impl Graphs {
             %bucket,
             generation = generation.number(),
             launches,
-            kernel_nodes = executable.kernel_nodes()?,
+            kernel_nodes = executable.kernel_nodes(),
             input_copies = graph.copies.len(),
             "captured a bucket"
         );
@@ -1261,6 +1285,7 @@ impl State {
             step: None,
             shadow: None,
             uncompared: Vec::new(),
+            launches: 0,
         }
     }
 

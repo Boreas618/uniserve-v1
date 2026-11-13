@@ -5,10 +5,16 @@
 //! A rank divides what its GPU's quota leaves it once its weights are mapped, from figures that
 //! are stated or measured by then (`worker::memory::division`): the process's own bytes, the
 //! graph region and shadow region the runner's profile run states, the storages its request slots
-//! and its cache's tables take, and the expert transport of a union member. The cache's planes
-//! take what remains, in whole units agreed over the rank's host group and rounded to whole
-//! segments: the memory of the buffer pool's region is the segments the ranks map or create once
-//! the session is open (`specs/buffer-pool.md` §14.1).
+//! and its cache's tables take, and the expert transport of a union member, within its own share
+//! of the GPU (its worker group's `mem_fraction_static`). The cache's planes take what remains,
+//! in whole units agreed over the rank's host group and rounded to whole segments: the memory of
+//! the buffer pool's region is the segments the ranks map or create once the session is open
+//! (`specs/buffer-pool.md` §14.1).
+//!
+//! The region is numbered for what the quota holds as if the rank's epoch served the GPU alone,
+//! and the start creates the segments of it the quota holds now. They differ for an epoch that
+//! starts beside the epoch it succeeds in another layout: its regions grow into the rest by
+//! `Grow` as the serving epoch drains (`specs/updates.md` §3.7).
 
 use std::sync::Arc;
 
@@ -16,12 +22,13 @@ use anyhow::{Context as _, Result, bail};
 use ipc::batch::Variant;
 use nn::family::{StateField, TextModel};
 use platform::DeviceId;
+use proto::config::WorkerGroupConfig;
 use storage::runtime::Segments;
 use tensor::DType;
 use worker::buckets::Buckets;
 use worker::memory::cache::segments::{self, PlaneSegment};
 use worker::memory::cache::{ATTENTION_WORKSPACE_BYTES, CacheLayout, KvCacheConfig};
-use worker::memory::client::StorageClient;
+use worker::memory::client::{StorageClient, quota_limit};
 use worker::memory::division;
 use worker::memory::state::StateConfig;
 use worker::parallel::host::HostGroup;
@@ -247,15 +254,23 @@ impl ModelRunner {
         ))
     }
 
-    /// The units of the cache planes on `device` (steps 11-12 and 14-15): what the GPU's quota
-    /// leaves once the weights are mapped, less the graph and scratch `pools`, the recurrent
-    /// state's `resident` bytes, the request slots' `slot_bytes`, the bytes `fixed` the cache
-    /// keeps beside its planes and the expert transport of a union member, agreed over `host` as
-    /// the smallest count of its ranks, and rounded down to whole segments of whole granules.
+    /// The units of the cache planes on `device` (steps 11-12 and 14-15), and the units of them
+    /// the rank's start creates: `(units, first)`.
+    ///
+    /// The units are the region's numbering: what the GPU's quota leaves once the weights are
+    /// mapped as if the epoch served the GPU alone, less the graph and scratch `pools`, the
+    /// recurrent state's `resident` bytes, the request slots' `slot_bytes`, the bytes `fixed`
+    /// the cache keeps beside its planes and the expert transport of a union member, agreed
+    /// over `host` as the smallest count of its ranks, and rounded down to whole segments of
+    /// whole granules. The first units are the whole segments of them the quota holds free now
+    /// ([`first_units`]), agreed over `host` alike: an epoch that starts beside the epoch it
+    /// succeeds has the units the serving epoch holds as the rest, which its regions grow into
+    /// by `Grow` as that epoch drains (`specs/updates.md` §3.7). A first epoch holds every unit
+    /// at once.
     ///
     /// # Errors
     ///
-    /// The Storage Server's or the driver's refusal, the region the quota cannot hold, or a
+    /// The Storage Server's or the driver's refusal, the region the quota cannot hold now, or a
     /// cache too small for one segment of whole granules: the memory of a device KV region is
     /// the segments its ranks create, and planes that do not split are none.
     #[expect(
@@ -274,23 +289,23 @@ impl ModelRunner {
         resident: u64,
         slot_bytes: u64,
         fixed: u64,
-    ) -> Result<u32> {
+    ) -> Result<(u32, u32)> {
         let granularity = granularity(device)?;
-        let unreserved = unreserved(client, device)?;
+        let (share, _) = self.fractions()?;
+        let (now, alone) = unreserved(client, device, share)?;
 
-        let remainder = division::remainder(
-            unreserved,
-            &[
-                ("graph pool", graph),
-                ("scratch pool", scratch),
-                ("resident pool", resident),
-                ("request slots", slot_bytes),
-                ("cache tables", fixed),
-                ("expert transport", self.transport_bytes(device, model)?),
-            ],
-            0,
-            &[],
-        )?;
+        // The pools, the slots and the cache's tables are made at the start, so they fit what
+        // the quota holds now; the planes are numbered for what it holds the epoch alone.
+        let regions = [
+            ("graph pool", graph),
+            ("scratch pool", scratch),
+            ("resident pool", resident),
+            ("request slots", slot_bytes),
+            ("cache tables", fixed),
+            ("expert transport", self.transport_bytes(device, model)?),
+        ];
+        let remainder = division::remainder(now, &regions, 0, &[])?;
+        let whole = division::remainder(alone, &regions, 0, &[])?;
 
         let slots = u64::from(self.slots()?);
         let capacity = self
@@ -299,7 +314,7 @@ impl ModelRunner {
             .max_tokens
             .map(|tokens| layout.token_units(tokens.get(), slots));
         let units = division::cache_units(
-            remainder,
+            whole,
             layout.unit_bytes,
             u64::from(fewest_units(layout)),
             capacity,
@@ -317,18 +332,84 @@ impl ModelRunner {
                 layout.plane_bytes
             );
         }
-        Ok(units)
+
+        // Every rank of a region creates the same segments of it.
+        let first = first_units(units, layout, granularity, remainder);
+        let first = host
+            .all_reduce_min(&[i64::from(first)])
+            .context("agreeing the units the ranks create at their start")?[0];
+        let first = u32::try_from(first).context("a negative count of units was agreed")?;
+        Ok((units, first))
+    }
+
+    /// This rank's share of its GPU's storage, and the fraction of the GPU its epoch's quota of
+    /// the GPU is limited to (`WorkerGroupConfig::fraction`, `WorkerGroupConfig::device_fraction`):
+    /// its worker group's `mem_fraction_static`, or the deployment's, and the shares of every
+    /// rank the deployment places on the GPU.
+    ///
+    /// # Errors
+    ///
+    /// A rank the deployment's worker groups do not place.
+    pub(crate) fn fractions(&self) -> Result<(f64, f64)> {
+        let config = self.engine_config();
+        let groups = &config.parallel.worker_groups;
+        let rank = self.rank();
+        let (group, position) = WorkerGroupConfig::place_rank(groups, rank as usize)
+            .with_context(|| format!("the deployment's worker groups place no rank {rank}"))?;
+        let group = &groups[group];
+
+        let deployment = config.mem_fraction_static;
+        Ok((
+            group.fraction(deployment),
+            WorkerGroupConfig::device_fraction(groups, &group.ranks[position], deployment),
+        ))
     }
 }
 
-/// The bytes of `device`'s quota a starting rank of `client`'s scope may divide (steps 11-12):
-/// what the GPU's quota leaves once the process's own bytes, the epoch's reservations and what
-/// the scope keeps are taken out.
+/// The units of a cache of `units` units laid out in `layout`, split into segments of whole
+/// `granularity`-byte granules, that `remainder` bytes hold now: the planes that are not split
+/// (flags, scales, index keys, state planes) are made for every unit at once, and of the value
+/// planes the segments from the first on, as many whole ones as the rest holds. Zero when the
+/// unsplit planes do not fit, or the cache does not split.
+pub(crate) fn first_units(
+    units: u32,
+    layout: &CacheLayout,
+    granularity: u64,
+    remainder: u64,
+) -> u32 {
+    let Some((count, per_segment)) =
+        segments::segment_layout(units, layout.plane_bytes, granularity)
+    else {
+        return 0;
+    };
+
+    // One unit of both value planes over every column, which its segment holds; the rest of a
+    // unit's bytes is in planes that are not split.
+    let values = 2 * u64::from(layout.columns) * layout.plane_bytes;
+    let unsplit = u64::from(units) * layout.unit_bytes.saturating_sub(values);
+    let segment = (u64::from(per_segment) * values).max(1);
+
+    let fitting = remainder
+        .checked_sub(unsplit)
+        .map_or(0, |left| left / segment);
+    u32::try_from(fitting).unwrap_or(u32::MAX).min(count) * per_segment
+}
+
+/// The bytes of `device`'s quota a starting rank of `client`'s scope may divide (steps 11-12),
+/// `(now, alone)`: what the GPU's quota leaves once the process's own bytes, the epoch's
+/// reservations and what the scope keeps are taken out; and the same as if the rank's epoch
+/// served the GPU alone, the storages other epochs of the deployment hold apart from it being
+/// given back (`division::held_elsewhere`). Both are at most the rank's own `share` of the GPU
+/// less the storages its scope holds there.
 ///
 /// # Errors
 ///
 /// The Storage Server's, NVML's or the driver's refusal, or a quota that states no limit.
-pub(crate) fn unreserved(client: &StorageClient, device: DeviceId) -> Result<u64> {
+pub(crate) fn unreserved(
+    client: &StorageClient,
+    device: DeviceId,
+    share: f64,
+) -> Result<(u64, u64)> {
     // What the process holds beside its pools and the server's storages. The weight store waits
     // for each copy of the load before it returns, so the figure counts the load's work. A
     // communicator states no bytes NVML attributes to no process (`ops::Group`), so NVML's
@@ -337,36 +418,50 @@ pub(crate) fn unreserved(client: &StorageClient, device: DeviceId) -> Result<u64
     let process = division::process_bytes(&nvml, device, 0, 0)?;
 
     let (quota, _) = client.usage(device)?;
-    let (_, kept) = client.scope_bytes(device)?;
-    let free = device.memory_info()?.free;
-    Ok(division::unreserved(
+    let (held, kept) = client.scope_bytes(device)?;
+    let memory = device.memory_info()?;
+    let (scope, epoch) = (client.scope(), client.epoch());
+
+    let now = division::unreserved(&quota, scope, epoch, kept, process, memory.free)?;
+    let elsewhere = division::held_elsewhere(&quota, epoch);
+    let alone = division::unreserved(
         &quota,
-        client.scope(),
-        client.epoch(),
-        kept,
+        scope,
+        epoch,
+        kept.saturating_add(elsewhere),
         process,
-        free,
-    )?)
+        memory.free,
+    )?;
+
+    // A rank of a group that states its own share holds no more of the GPU than it, whatever
+    // the deployment's quota of the GPU holds for the other ranks placed there. The process's own
+    // bytes are not the rank's alone (ranks of one process on one device share its context, and
+    // NVML states the process whole), so the quota above counts them, and the share does not.
+    let own = quota_limit(memory.total, share).saturating_sub(held);
+    Ok((now.min(own), alone.min(own)))
 }
 
 /// The segments of a cache of `units` units laid out in `layout` whose planes are allocated in
 /// granules of `granularity` bytes (step 16), given the region's segment table `table`
 /// (`storage::runtime::Opened::segments`): the segments the table states, which the rank maps
 /// where their epoch created them (`segments::of_table`), then the segments `epoch` creates for
-/// the units past them; and those created alone, as a segment table states them (the segment,
-/// its first unit and its units), which the session's head grants.
+/// the units past them up to `held`, the units the GPU's quota holds now
+/// ([`ModelRunner::divide`]), and past those the segments left given back, which a grow creates
+/// once the quota holds them; and the created segments alone, as a segment table states them
+/// (the segment, its first unit and its units), which the session's head grants.
 ///
-/// The created segments are the ones `segments::own` splits the whole cache into, from the end
-/// of the table on: a region of one layout is split alike by every epoch that names it, so a
-/// table that ends inside one of them is not this layout's.
+/// The segments past the table are the ones `segments::own` splits the whole cache into, from
+/// the end of the table on: a region of one layout is split alike by every epoch that names it,
+/// so a table that ends inside one of them is not this layout's.
 ///
 /// # Errors
 ///
 /// A table whose segments do not lie back to back from unit 0, that covers more than `units` or
-/// ends inside a segment of the split, or a cache that does not split.
+/// ends inside a segment of the split; a cache that does not split; or a region that would hold
+/// no segment, neither in its table nor one the quota holds now.
 pub(crate) fn plane_segments(
     epoch: u64,
-    units: u32,
+    (units, held): (u32, u32),
     layout: &CacheLayout,
     granularity: u64,
     table: &[(storage::Segment, u32, u32)],
@@ -385,16 +480,21 @@ pub(crate) fn plane_segments(
     })?;
 
     let mut first = 0;
-    let mut created = Vec::new();
+    let mut past = Vec::new();
     let mut stated = Vec::new();
-    for part in split {
+    for mut part in split {
         if first >= covered {
-            let segment = storage::Segment {
-                epoch: part.segment.epoch,
-                ordinal: part.segment.ordinal,
-            };
-            stated.push((segment, first, part.segment.units));
-            created.push(part);
+            // A segment the quota does not hold yet is left given back: unmapped, and created
+            // by a grow.
+            part.create = first + part.segment.units <= held;
+            if part.create {
+                let segment = storage::Segment {
+                    epoch: part.segment.epoch,
+                    ordinal: part.segment.ordinal,
+                };
+                stated.push((segment, first, part.segment.units));
+            }
+            past.push(part);
         } else if first + part.segment.units > covered {
             bail!(
                 "the region's segment table ends at unit {covered}, inside segment {} of units \
@@ -406,7 +506,16 @@ pub(crate) fn plane_segments(
         first += part.segment.units;
     }
 
-    let segments = mapped.into_iter().chain(created).collect();
+    // The padding unit lies in the first segment, which every table holds.
+    if covered == 0 && stated.is_empty() {
+        bail!(
+            "the GPU's quota holds none of the {units} units of the region's cache now, not one \
+             segment of {} units: the device has too little free beside the epoch that serves",
+            past.first().map_or(0, |part| part.segment.units)
+        );
+    }
+
+    let segments = mapped.into_iter().chain(past).collect();
     Ok((segments, stated))
 }
 
@@ -456,5 +565,106 @@ pub(super) fn cache_dtype(
         other => {
             bail!("this build lays out no KV cache in a model whose activations are {other:?}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proto::request::PrefixCacheDtype;
+    use storage::Segment;
+
+    use super::*;
+
+    /// The allocation granularity of the devices the tests split caches for.
+    const GRANULE: u64 = 2 << 20;
+
+    /// A dense cache of four layers whose planes take 32 KiB a unit, so 64 units fill a granule:
+    /// 1024 units split into eight segments of 128.
+    fn layout() -> CacheLayout {
+        CacheLayout::dense(64, 4, 2, 128, PrefixCacheDtype::BFloat16)
+    }
+
+    /// The bytes one unit of the value planes takes, which its segment holds.
+    fn values(layout: &CacheLayout) -> u64 {
+        2 * u64::from(layout.columns) * layout.plane_bytes
+    }
+
+    #[test]
+    fn the_start_creates_the_whole_segments_the_quota_holds_beside_the_unsplit_planes() {
+        let layout = layout();
+        let unsplit = 1024 * (layout.unit_bytes - values(&layout));
+        let segment = 128 * values(&layout);
+
+        // Three segments and most of a fourth fit beside the planes that are made whole.
+        assert_eq!(
+            first_units(1024, &layout, GRANULE, unsplit + 4 * segment - 1),
+            384
+        );
+        // A quota that holds every segment holds the whole cache, and never more.
+        assert_eq!(
+            first_units(1024, &layout, GRANULE, unsplit + 20 * segment),
+            1024
+        );
+        // The unsplit planes are made for every unit, or the start holds no segment at all.
+        assert_eq!(first_units(1024, &layout, GRANULE, unsplit - 1), 0);
+    }
+
+    #[test]
+    fn a_region_new_to_the_quota_creates_what_it_holds_and_leaves_the_rest_given_back() {
+        let layout = layout();
+        let (segments, stated) = plane_segments(2, (1024, 384), &layout, GRANULE, &[]).unwrap();
+
+        // Every segment of the split is the cache's; the first three are created and granted,
+        // the rest left given back for a grow to create.
+        assert_eq!(segments.len(), 8);
+        assert_eq!(
+            segments.iter().map(|part| part.create).collect::<Vec<_>>(),
+            [true, true, true, false, false, false, false, false]
+        );
+        let segment = |ordinal| Segment { epoch: 2, ordinal };
+        assert_eq!(
+            stated,
+            [
+                (segment(0), 0, 128),
+                (segment(1), 128, 128),
+                (segment(2), 256, 128)
+            ]
+        );
+
+        // A region with no segment, which the quota holds none of, cannot open.
+        let error = plane_segments(2, (1024, 0), &layout, GRANULE, &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("holds none"), "{error:#}");
+    }
+
+    #[test]
+    fn a_region_another_epoch_named_maps_its_table_and_creates_what_the_quota_holds_past_it() {
+        let layout = layout();
+        let first = |ordinal| Segment { epoch: 1, ordinal };
+        let table = [(first(0), 0, 128), (first(1), 128, 128)];
+
+        // The two segments of the table are mapped; the third, which the quota holds, is created.
+        let (segments, stated) = plane_segments(2, (1024, 384), &layout, GRANULE, &table).unwrap();
+        assert_eq!(segments.len(), 8);
+        assert_eq!(segments[0].segment.epoch, 1);
+        assert_eq!(
+            stated,
+            [(
+                Segment {
+                    epoch: 2,
+                    ordinal: 2
+                },
+                256,
+                128
+            )]
+        );
+        assert!(segments[2].create && !segments[3].create);
+
+        // A table that covers the whole cache needs nothing of the quota.
+        let whole: Vec<_> = (0..8)
+            .map(|ordinal| (first(ordinal), ordinal * 128, 128))
+            .collect();
+        let (segments, stated) = plane_segments(2, (1024, 0), &layout, GRANULE, &whole).unwrap();
+        assert_eq!(segments.len(), 8);
+        assert!(stated.is_empty());
     }
 }

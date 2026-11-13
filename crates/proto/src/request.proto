@@ -87,20 +87,24 @@ message QueueDepth {
   uint32 depth = 2;
 }
 
-// One device's allocator as the main process reports it.
+// One device's memory as the main process reports it.
 message DeviceMemory {
   uint32 device = 1;
-  // The bytes the device's budget allows this epoch (design §8): the share
-  // of the device's memory, `mem_fraction_static`, that the deployment's
-  // epochs and transfers account against.
+  // The bytes the device's budget allows this epoch (design §8): the limit
+  // of the deployment's quota of the GPU, the shares of the ranks it places
+  // there (each its group's `mem_fraction_static`, or the deployment's),
+  // which the deployment's epochs and transfers account against.
   uint64 budget = 2;
-  // The allocator's pools (`crates/platform`'s `Allocator`, design §4.1).
+  // The pools of the device's allocators (`crates/platform`'s `Allocator`,
+  // design §4.1), and the planes of its KV regions.
   repeated PoolMemory pools = 3;
 }
 
-// One pool of a device's allocator.
+// One pool of a device's memory.
 message PoolMemory {
-  // The pool: `graph`, `scratch` or `resident` (design §4.1).
+  // The pool: an allocator's `graph`, `scratch` or `resident` (design §4.1),
+  // or `kv`, the planes of the device's KV regions: the segments its ranks
+  // map, with the flags, scales, index keys and state planes beside them.
   string pool = 1;
   // The bytes of physical memory the pool has mapped now.
   uint64 mapped = 2;

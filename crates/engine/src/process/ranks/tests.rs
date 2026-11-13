@@ -148,7 +148,7 @@ fn a_meta_rank_creates_its_region_s_segments_once_the_session_is_open_and_a_succ
         client.grant(region, segment, first, count).unwrap();
     }
 
-    bind(&ranks, &open, &opened).unwrap();
+    bind(&mut ranks, &open, &opened).unwrap();
     let (executors, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
     assert_eq!(spawned.len(), 1);
 
@@ -416,7 +416,7 @@ fn a_meta_media_rank_opens_its_media_memory_and_spawns_its_runners() {
     assert!(opened.segments.iter().all(Vec::is_empty));
     let created = open_ranks(&mut ranks, &open, &opened).unwrap();
     assert!(created.is_empty());
-    bind(&ranks, &open, &opened).unwrap();
+    bind(&mut ranks, &open, &opened).unwrap();
     let (executors, spawned) = spawn(&mut ranks, &client, &pairs, Vec::new()).unwrap();
     assert_eq!(spawned.len(), 1);
 

@@ -134,19 +134,25 @@ impl MainProcess {
         }
     }
 
-    /// States the process's metrics on every front: the schedulers' sums since the start, and the
-    /// device time the executors spent in forwards (`Executor::counters`).
+    /// States the process's metrics on every front: the schedulers' sums since the start; the
+    /// device time the executors spent in forwards and the kernels their serving forwards
+    /// launched (`Executor::counters`); and what each device maps now, against the limit of its
+    /// GPU's quota: each pool of its allocators and its KV regions' planes (`DataPlane::memory`),
+    /// which the daemon exports as `uniserve:memory_budget` and `uniserve:memory_mapped`.
     pub(super) fn metrics(&mut self) {
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
-        // The executors count the forwards they ran and their time, not the kernels those
-        // launched: the launches are stated as none.
-        self.metrics.device_ns = engine
-            .executors
-            .iter()
-            .map(|executor| executor.counters().1)
-            .sum();
+        let (mut device_ns, mut kernel_launches) = (0, 0);
+        for executor in &engine.executors {
+            let (_, forward_ns, launches) = executor.counters();
+            device_ns += forward_ns;
+            kernel_launches += launches;
+        }
+        self.metrics.device_ns = device_ns;
+        self.metrics.kernel_launches = kernel_launches;
+        self.metrics.memory = engine.data.memory();
+
         let metrics = self.metrics.clone();
         self.broadcast(&from_engine::Kind::Metrics(metrics));
     }

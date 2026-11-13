@@ -1,6 +1,7 @@
 //! The binary's start on the meta device against a Storage Server in the test's process: one
 //! engine whose scheduler grew its KV region into the segments its rank created, and whose close
-//! ends the session; and one engine of a media launch.
+//! ends the session; and one engine of a media launch. Then the generation limits an engine
+//! reports, against what its groups state.
 //!
 //! The text model is the Qwen3-MoE fixture of the `qwen3` crate and the media model a released
 //! FastH3 checkpoint (`crate::process::ranks::tests::FAST_H3`, which the repository does not
@@ -10,9 +11,13 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use ipc::Capacity;
+use ipc::batch::{Phase, Shape, Variant};
+use proto::request::GenerationLimits;
+use storage::runtime::GroupId;
 use worker::executor::peers::{LOST_EXIT, Liveness};
 
-use super::{FIRST_GENERATION, start};
+use super::{FIRST_GENERATION, lowered, start};
 use crate::process::epoch::kv_regions;
 use crate::process::ranks::layout;
 use crate::process::ranks::tests::{FAST_H3, loaded, video_launch};
@@ -160,4 +165,96 @@ fn a_meta_start_of_a_media_launch_builds_one_engine_whose_close_ends_the_session
             .all(|(_, output)| !matches!(output, crate::scheduler::Output::Failed(_))),
         "{outputs:?}"
     );
+}
+
+/// What a worker group serving `phases` states, with a prefill bucket of `tokens` tokens and
+/// encoder outputs of `feature_bytes` a token.
+fn capacity(phases: &[Phase], tokens: u32, feature_bytes: u32) -> Capacity {
+    let mut served = 0;
+    let mut rows = [0; Phase::COUNT];
+    for phase in phases {
+        served |= 1 << phase.index();
+        rows[phase.index()] = 4;
+    }
+    Capacity {
+        phases: served,
+        slots: 4,
+        kv_cache: None,
+        cache_groups: Vec::new(),
+        seeds: Vec::new(),
+        buckets: vec![
+            Shape::prefill(4, tokens, Variant::PrefillOutput),
+            Shape::decode(4, Variant::DecodeSampled),
+        ],
+        rows,
+        max_model_len: 4096,
+        denoise_steps: 0,
+        bos_token_id: 1,
+        eos_token_ids: vec![2],
+        feature_bytes,
+        media_bytes: Vec::new(),
+        call_window: 2,
+    }
+}
+
+/// The limits a family that takes images configures: no bound of its own on their encodings.
+fn unbounded() -> GenerationLimits {
+    GenerationLimits {
+        max_vae_grid_tokens: u32::MAX,
+        max_vit_grid_tokens: u32::MAX,
+        max_latent_feature_bytes: u64::MAX,
+        max_vision_feature_bytes: u64::MAX,
+        encoder_cache_entries: u32::MAX,
+        max_logprobs: 20,
+        ..GenerationLimits::default()
+    }
+}
+
+#[test]
+fn the_limits_an_engine_reports_are_the_lower_of_the_launch_s_and_its_groups() {
+    // Groups that encode no image hold no encoding: whatever the launch states, a request with
+    // an image is refused for want of a bound.
+    let text = vec![(
+        GroupId(0),
+        capacity(&[Phase::Prefill, Phase::Decode], 2048, 0),
+    )];
+    let ceilings = crate::scheduler::policy::ceilings(text.iter().map(|(_, capacity)| capacity));
+    let limits = lowered(unbounded(), &text, &ceilings);
+    assert_eq!(
+        (limits.max_vit_grid_tokens, limits.max_vision_feature_bytes),
+        (0, 0)
+    );
+    assert_eq!(
+        (limits.max_vae_grid_tokens, limits.max_latent_feature_bytes),
+        (0, 0)
+    );
+    assert_eq!(limits.encoder_cache_entries, 0);
+    assert_eq!(limits.max_logprobs, 20);
+
+    // A group that encodes images holds a grid one prefill writes whole, and its features at
+    // the bytes of a row of its encoder output.
+    let vision = vec![(
+        GroupId(0),
+        capacity(
+            &[Phase::Prefill, Phase::Decode, Phase::VisionEncode],
+            2048,
+            4096,
+        ),
+    )];
+    let ceilings = crate::scheduler::policy::ceilings(vision.iter().map(|(_, capacity)| capacity));
+    let limits = lowered(unbounded(), &vision, &ceilings);
+    assert_eq!(limits.max_vit_grid_tokens, 2048);
+    assert_eq!(limits.max_vision_feature_bytes, 2048 * 4096);
+    assert_eq!(limits.max_latent_feature_bytes, 0);
+    assert_eq!(limits.encoder_cache_entries, u32::MAX);
+
+    // A launch that states less than the groups hold keeps its own.
+    let stated = GenerationLimits {
+        max_vit_grid_tokens: 1024,
+        max_vision_feature_bytes: 1 << 20,
+        ..unbounded()
+    };
+    let limits = lowered(stated, &vision, &ceilings);
+    assert_eq!(limits.max_vit_grid_tokens, 1024);
+    assert_eq!(limits.max_vision_feature_bytes, 1 << 20);
 }

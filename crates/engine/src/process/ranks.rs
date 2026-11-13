@@ -10,7 +10,8 @@
 //!    segment and ask for no unit, since none of their memory exists yet. The head opens the
 //!    session with it.
 //! 3. [`open_ranks`] maps on every rank the segments the answer's table states for its region,
-//!    creates the segments that cover the rest of the region's units, and opens the graph pool,
+//!    creates the segments that cover the rest of the region's units as far as the GPU's quota
+//!    held them at the division (the rest a grow creates), and opens the graph pool,
 //!    the cache over those segments, the recurrent state, the scratch pages and the serving
 //!    runner. It returns the segments it created, which the head grants, and the schedulers
 //!    then grow their regions into them by `Resize`.
@@ -134,6 +135,10 @@ pub(crate) struct LoadedRank {
     /// The device's graph and scratch pools, which the runners' graphs address, once the rank is
     /// opened; `None` for a meta start.
     pub(crate) pool: Option<Arc<Mutex<GraphPool>>>,
+    /// The streams the rank's runners compute on (`device`) and its copies run on (`copy`),
+    /// named as the always-on counters record their device time
+    /// (`worker::profiling::counters::Counters::start`); empty for a meta start.
+    pub(crate) streams: Vec<(&'static str, Stream)>,
     /// Every kernel the rank launches.
     pub(crate) keys: Keys,
     /// The generation the rank serves.
@@ -155,8 +160,13 @@ pub(crate) struct TextRank {
     /// The rank's partition of the model.
     pub(crate) model: Arc<dyn TextModel>,
     /// The units of the rank's cache, the padding unit included: the division's count, which every
-    /// rank of its host group agreed, in whole segments.
+    /// rank of its host group agreed, in whole segments. It numbers the region as if the epoch
+    /// served the GPU alone.
     pub(crate) units: u32,
+    /// The units of `units` the rank's start creates segments for, which every rank of its host
+    /// group agreed: the whole segments the GPU's quota held at the division. The rest are
+    /// created by a grow as the epoch the rank's succeeds gives its memory back.
+    pub(crate) first: u32,
     /// What the profile run states of the rank's runner, which its pools are sized by.
     pub(crate) peaks: Peaks,
     /// The rank's tensor group's communicator; `None` for a group of one and on the meta device.
@@ -200,10 +210,12 @@ impl LoadedRank {
             Loaded::Video(_) => (None, None),
         };
 
+        let (_, fraction) = self.model_runner.fractions()?;
         Ok(Some(crate::data_plane::Rank {
             rank: self.model_runner.rank(),
             executor: Arc::downgrade(executor),
             device,
+            fraction,
             client: Arc::clone(client),
             weights: Arc::clone(store),
             cache,
@@ -389,7 +401,8 @@ fn load_rank(
         .first()
         .context("this rank serves no device")?;
 
-    // Step 1: the rank's Storage Server client, and the epoch's limit of its GPU.
+    // Step 1: the rank's Storage Server client, and the epoch's limit of its GPU: the shares of
+    // every rank the deployment places on the GPU, which each of them states alike.
     let client = match backing {
         Backing::Serving { storage, .. } => {
             let client = StorageClient::connect(
@@ -399,8 +412,9 @@ fn load_rank(
                 model_runner.launch().engine,
             )
             .context("connecting to the Storage Server")?;
+            let (_, fraction) = model_runner.fractions()?;
             client
-                .state_quota(device, model_runner.engine_config().mem_fraction_static)
+                .state_quota(device, fraction)
                 .context("stating this rank's quota of its device")?;
             Some(client)
         }
@@ -514,11 +528,13 @@ fn load_rank(
                 store: None,
                 weights: Vec::new(),
                 pool: None,
+                streams: Vec::new(),
                 keys,
                 kernels: Arc::new(Generation::new(FIRST_GENERATION, [])),
                 loaded: Loaded::Text(Box::new(TextRank {
                     model: meta,
                     units,
+                    first: units,
                     peaks,
                     tensor,
                     config: meta_config,
@@ -553,7 +569,7 @@ fn load_rank(
         + CausalLmRunner::kept_bytes(&meta_config, model.as_ref())?;
     let fixed = worker::lock(&meta_cache).config().fixed_bytes();
     let pools = model_runner.pools(device, &layout, peaks)?;
-    let units = model_runner.divide(
+    let (units, first) = model_runner.divide(
         &client,
         device,
         &host,
@@ -569,6 +585,7 @@ fn load_rank(
         rank = model_runner.rank(),
         group = model_runner.group(),
         units,
+        first,
         storage = %storage.socket,
         "the rank loaded its model and divided its device's quota"
     );
@@ -578,11 +595,13 @@ fn load_rank(
         store: Some(store),
         weights,
         pool: None,
+        streams: Vec::new(),
         keys,
         kernels,
         loaded: Loaded::Text(Box::new(TextRank {
             model,
             units,
+            first,
             peaks,
             tensor,
             config: meta_config,
@@ -638,6 +657,7 @@ fn load_video_rank(
                 store: None,
                 weights: Vec::new(),
                 pool: None,
+                streams: Vec::new(),
                 keys,
                 kernels: Arc::new(Generation::new(FIRST_GENERATION, [])),
                 loaded: Loaded::Video(Box::new(video)),
@@ -670,6 +690,7 @@ fn load_video_rank(
         store: Some(store),
         weights,
         pool: None,
+        streams: Vec::new(),
         keys,
         kernels,
         loaded: Loaded::Video(Box::new(video)),
@@ -1458,6 +1479,7 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
         model_runner,
         client,
         pool: rank_pool,
+        streams,
         kernels,
         loaded,
         ..
@@ -1480,16 +1502,17 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
         None => None,
     };
 
-    // Step 16: the segments of the region the table states, mapped, and the rest, created. A
-    // segment's every part is whole granules of the device's allocations; the meta device
-    // allocates nothing, and each unit is a whole granule of it.
+    // Step 16: the segments of the region the table states, mapped, and the rest, created as
+    // far as the quota held them at the division. A segment's every part is whole granules of
+    // the device's allocations; the meta device allocates nothing, and each unit is a whole
+    // granule of it.
     let granularity = match client {
         Some(_) => granularity(device)?,
         None => layout.plane_bytes,
     };
     let (segments, created) = plane_segments(
         model_runner.launch().epoch,
-        units,
+        (units, rank.first),
         &layout,
         granularity,
         table,
@@ -1531,10 +1554,11 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
     let resident = state_config
         .as_ref()
         .map_or(0, |state| state.bytes(&layout));
+    let (_, fraction) = model_runner.fractions()?;
     let mut pool = GraphPool::open(
         Arc::clone(&client),
         device,
-        model_runner.engine_config().mem_fraction_static,
+        fraction,
         &[(RunnerId(0), rank.peaks.graph)],
         scratch,
         resident,
@@ -1581,7 +1605,7 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
         Arc::clone(&rank.model),
         config.clone(),
         graphs,
-        Some(stream),
+        Some(stream.clone()),
         &cache,
         state.as_ref(),
         rank.tensor.clone(),
@@ -1591,6 +1615,7 @@ fn open_rank(rank: &mut LoadedRank, table: &Segments) -> Result<Segments> {
     let shadow = rank.peaks.shadow.saturating_sub(scratch_bytes);
     worker::Runner::graphs(&runner).set_shadow(pool.shadow(shadow)?)?;
     profile(&runner)?;
+    streams.push(("device", stream));
 
     tracing::info!(
         rank = model_runner.rank(),
@@ -1828,10 +1853,11 @@ fn open_media_memory(
         .iter()
         .map(|(id, peaks)| (*id, peaks.graph))
         .collect();
+    let (_, fraction) = model_runner.fractions()?;
     let mut graph_pool = GraphPool::open(
         Arc::clone(client),
         device,
-        model_runner.engine_config().mem_fraction_static,
+        fraction,
         &regions,
         pools.1,
         resident,
@@ -1878,6 +1904,7 @@ fn open_media_runners(
     let LoadedRank {
         model_runner,
         pool,
+        streams,
         kernels,
         loaded,
         ..
@@ -1923,6 +1950,7 @@ fn open_media_runners(
                             peak(id)?.inputs,
                             2,
                         )?;
+                        streams.push(("device", stream.clone()));
                         Ok((graphs, Some(stream)))
                     },
                     (video.tensor.clone(), video.sequence.clone()),
@@ -1950,6 +1978,9 @@ fn open_media_runners(
         serving.push(runner);
     }
     let copies = pool.as_ref().map(|_| stream()).transpose()?;
+    if let Some(copies) = &copies {
+        streams.push(("copy", copies.clone()));
+    }
     if let Some(media) =
         model_runner.media_host(model.as_ref(), (&memory, copies), host, kernels, &classes)?
     {
@@ -1968,8 +1999,8 @@ fn open_media_runners(
 /// # Errors
 ///
 /// A rank whose group the session does not state, or the Storage Server's refusal.
-pub(crate) fn bind(ranks: &[LoadedRank], layout: &Open, opened: &Opened) -> Result<()> {
-    for rank in ranks {
+pub(crate) fn bind(ranks: &mut [LoadedRank], layout: &Open, opened: &Opened) -> Result<()> {
+    for rank in ranks.iter_mut() {
         let Loaded::Text(text) = &rank.loaded else {
             continue;
         };
@@ -1983,6 +2014,7 @@ pub(crate) fn bind(ranks: &[LoadedRank], layout: &Open, opened: &Opened) -> Resu
         };
 
         let mut cache = worker::lock(&text.cache);
+        let mut copies = None;
         if let Some(client) = &rank.client {
             crate::storage_client::place(
                 client,
@@ -2004,8 +2036,9 @@ pub(crate) fn bind(ranks: &[LoadedRank], layout: &Open, opened: &Opened) -> Resu
                 let stream = Stream::new(device)
                     .with_context(|| format!("creating device {}'s copy stream", device.0))?;
                 cache
-                    .map_host_parts(client, &names, stream, Arc::clone(&rank.kernels))
+                    .map_host_parts(client, &names, stream.clone(), Arc::clone(&rank.kernels))
                     .context("mapping the rank's parts of the host KV regions")?;
+                copies = Some(stream);
             }
         }
 
@@ -2019,6 +2052,11 @@ pub(crate) fn bind(ranks: &[LoadedRank], layout: &Open, opened: &Opened) -> Resu
             host,
             sources: vec![None; groups],
         })?;
+        drop(cache);
+
+        if let Some(stream) = copies {
+            rank.streams.push(("copy", stream));
+        }
     }
     Ok(())
 }

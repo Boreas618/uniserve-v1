@@ -125,6 +125,9 @@ pub(crate) struct Executable {
     segments: Vec<Segment>,
     /// Every kernel the segments call.
     kernels: Vec<Arc<Kernel>>,
+    /// The kernel nodes one replay launches, over every segment: what a replay adds to the
+    /// device's count of kernel launches. A rebind's executable has its template's.
+    kernel_nodes: u64,
 }
 
 impl Executable {
@@ -187,9 +190,11 @@ impl Executable {
         }
         segments.push(Segment::new(last, session.nodes, None)?);
 
+        let kernel_nodes = Self::count_kernel_nodes(&segments)?;
         let executable = Self {
             segments,
             kernels: Vec::new(),
+            kernel_nodes,
         };
         Ok((executable, output))
     }
@@ -237,9 +242,14 @@ impl Executable {
     }
 
     /// The kernel nodes one replay launches.
-    pub(crate) fn kernel_nodes(&self) -> Result<u64> {
+    pub(crate) fn kernel_nodes(&self) -> u64 {
+        self.kernel_nodes
+    }
+
+    /// The kernel nodes of `segments`' templates, read from the driver once per executable.
+    fn count_kernel_nodes(segments: &[Segment]) -> Result<u64> {
         let mut kernels = 0;
-        for segment in &self.segments {
+        for segment in segments {
             for node in segment.template.nodes()? {
                 if node.kind()? == GraphNodeKind::Kernel {
                     kernels += 1;
@@ -319,7 +329,11 @@ impl Executable {
             });
         }
 
-        Ok(Some(Self { segments, kernels }))
+        Ok(Some(Self {
+            segments,
+            kernels,
+            kernel_nodes: self.kernel_nodes,
+        }))
     }
 
     /// How `fresh`'s launch structure differs from this executable's, or `None` when a rebind

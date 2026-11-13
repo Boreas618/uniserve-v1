@@ -1,8 +1,9 @@
 //! The main process's allocator as the deployment exports it.
 //!
 //! Two questions, one family each: how much physical memory a device's budget allows this epoch
-//! (`uniserve:memory_budget`, labelled by device) and how much the device's allocator pools have
-//! mapped now (`uniserve:memory_mapped`, labelled by device and pool). The invariant the design
+//! (`uniserve:memory_budget`, labelled by device) and how much the device's allocator pools and
+//! its KV regions' planes have mapped now (`uniserve:memory_mapped`, labelled by device and
+//! pool). The invariant the design
 //! states - a device never maps more than its budget allows - is then a comparison of two series the
 //! deployment publishes, rather than a claim only the main process can see.
 //!
@@ -37,7 +38,8 @@ pub struct DeviceLabels {
 pub struct PoolLabels {
     /// The device's index, as the main process numbers it.
     pub device: u32,
-    /// The allocator's pool: `graph`, `scratch` or `resident`.
+    /// The pool: an allocator's `graph`, `scratch` or `resident`, or `kv`, the planes of the
+    /// device's KV regions.
     pub pool: String,
 }
 

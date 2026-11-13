@@ -461,6 +461,36 @@ impl WorkerGroupConfig {
         None
     }
 
+    /// The share of its GPU's storage a rank of this group may hold: the group's own
+    /// `mem_fraction_static`, or `deployment`, the deployment-wide fraction, when the group
+    /// states none.
+    pub fn fraction(&self, deployment: f64) -> f64 {
+        self.mem_fraction_static.unwrap_or(deployment)
+    }
+
+    /// The fraction of the GPU at `placed` (its host and device) that the deployment's quota of
+    /// the GPU is limited to: the shares of every rank `groups` place there, where a rank whose
+    /// group states its own `mem_fraction_static` adds that share and the ranks that take the
+    /// deployment's share hold `deployment` together; never more than the whole GPU.
+    ///
+    /// One deployment has one quota per GPU, whose limit an epoch states once
+    /// (`docs/admin.md`), so every rank on the GPU states this one figure, and each rank's own
+    /// share ([`Self::fraction`]) bounds what the rank itself divides.
+    pub fn device_fraction(groups: &[Self], placed: &WorkerRank, deployment: f64) -> f64 {
+        let mut own = 0.0;
+        let mut shares_deployment = false;
+        for group in groups {
+            let ranks = group.ranks.iter().filter(|rank| *rank == placed).count();
+            match group.mem_fraction_static {
+                Some(fraction) => own += fraction * ranks as f64,
+                None => shares_deployment |= ranks > 0,
+            }
+        }
+
+        let deployment = if shares_deployment { deployment } else { 0.0 };
+        (own + deployment).min(1.0)
+    }
+
     /// The deployment rank of position 0 of each group, in the order the groups are stated.
     pub fn first_ranks(groups: &[Self]) -> Vec<usize> {
         groups
@@ -961,5 +991,81 @@ mod tests {
              queue_depth = 2\n[worker_groups.blocks.model]\n",
         );
         assert!(uneven.is_err(), "a hand-off copies between equal ranks");
+    }
+
+    /// Each rank holds its group's share of its GPU; the deployment's quota of a GPU holds every
+    /// rank's there, the ranks that take the deployment's share holding it together.
+    #[test]
+    fn a_gpu_s_quota_holds_the_shares_of_the_ranks_placed_on_it() {
+        // A text encoder of 0.18 and a denoiser replica of 0.81 on each GPU.
+        let colocated = workers(
+            r#"
+            [[worker_groups]]
+            id = "text"
+            ranks = ["cuda:0-1"]
+            queue_depth = 2
+            mem_fraction_static = 0.18
+            [worker_groups.blocks.text_encoder]
+            tensor_parallel_size = 2
+
+            [[worker_groups]]
+            id = "flow"
+            replicas = 2
+            ranks = ["cuda:0-1"]
+            queue_depth = 2
+            mem_fraction_static = 0.81
+            [worker_groups.blocks.transformer]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(colocated[0].fraction(0.7), 0.18);
+        assert_eq!(colocated[1].fraction(0.7), 0.81);
+        let gpu = WorkerGroupConfig::device_fraction(&colocated, &rank("engine", "cuda:1"), 0.7);
+        assert!((gpu - 0.99).abs() < 1e-12, "{gpu}");
+
+        // Ranks of groups that state no share hold the deployment's together, beside a group
+        // that states its own; a device no rank is placed on holds nothing.
+        let shared = workers(
+            r#"
+            [[worker_groups]]
+            id = "model"
+            ranks = ["cuda:0-1"]
+            queue_depth = 2
+            [worker_groups.blocks.transformer]
+            sequence_parallel = { kind = "ulysses", ulysses_degree = 2 }
+
+            [[worker_groups]]
+            id = "muxer"
+            ranks = ["cuda:0"]
+            queue_depth = 2
+            [worker_groups.blocks.muxer]
+
+            [[worker_groups]]
+            id = "reader"
+            ranks = ["cuda:0"]
+            queue_depth = 2
+            mem_fraction_static = 0.04
+            [worker_groups.blocks.media_reader]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(shared[1].fraction(0.7), 0.7);
+        let first = WorkerGroupConfig::device_fraction(&shared, &rank("engine", "cuda:0"), 0.7);
+        assert!((first - 0.74).abs() < 1e-12, "{first}");
+        let second = WorkerGroupConfig::device_fraction(&shared, &rank("engine", "cuda:1"), 0.7);
+        assert_eq!(second, 0.7);
+        let other = WorkerGroupConfig::device_fraction(&shared, &rank("other", "cuda:0"), 0.7);
+        assert_eq!(other, 0.0);
+
+        // The shares never take more than the whole GPU.
+        let whole = WorkerGroupConfig::device_fraction(&colocated, &rank("engine", "cuda:0"), 0.7);
+        assert!(whole <= 1.0);
+        let mut doubled = colocated.clone();
+        doubled[0].mem_fraction_static = Some(0.5);
+        doubled[1].mem_fraction_static = Some(0.6);
+        assert_eq!(
+            WorkerGroupConfig::device_fraction(&doubled, &rank("engine", "cuda:0"), 0.7),
+            1.0
+        );
     }
 }

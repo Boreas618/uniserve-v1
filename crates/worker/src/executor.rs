@@ -380,6 +380,10 @@ struct Counters {
     steps: AtomicU64,
     /// Nanoseconds the executor spent in jobs that run a runner's forwards.
     forward_ns: AtomicU64,
+    /// Kernels the runners' serving forwards launched ([`Graphs::launches`]), summed over them.
+    ///
+    /// [`Graphs::launches`]: crate::Graphs::launches
+    launches: AtomicU64,
 }
 
 /// The executor of one device, as every other thread holds it.
@@ -749,14 +753,17 @@ impl Executor {
         }
     }
 
-    /// The batches executed since the executor started, and the nanoseconds it spent in jobs
-    /// that run a runner's forwards: batches, captures, preparations and paired forwards. A
-    /// runner's `execute` returns once the device completed the step, so the time is the
-    /// device's as well as the host's.
-    pub fn counters(&self) -> (u64, u64) {
+    /// The batches executed since the executor started; the nanoseconds it spent in jobs that
+    /// run a runner's forwards: batches, captures, preparations and paired forwards; and the
+    /// kernels its runners' serving forwards launched, each replay's captured kernel nodes and
+    /// each eager forward's launches ([`Graphs::launches`](crate::Graphs::launches)). A runner's
+    /// `execute` returns once the device completed the step, so the time is the device's as well
+    /// as the host's.
+    pub fn counters(&self) -> (u64, u64, u64) {
         (
             self.counters.steps.load(Ordering::Relaxed),
             self.counters.forward_ns.load(Ordering::Relaxed),
+            self.counters.launches.load(Ordering::Relaxed),
         )
     }
 
@@ -862,6 +869,14 @@ struct Thread {
 }
 
 impl Thread {
+    /// The kernels the runners' serving forwards launched so far, summed over the runners.
+    fn launches(&self) -> u64 {
+        self.runners
+            .iter()
+            .map(|runner| runner.graphs().launches())
+            .sum()
+    }
+
     /// Performs the queue's jobs until it closes.
     fn run(mut self) {
         // The device's context stays current on this thread: a native module reads the device
@@ -898,6 +913,7 @@ impl Thread {
             }
 
             let counted = job.runs_forwards();
+            let launched = if counted { self.launches() } else { 0 };
             let started = Instant::now();
             let turn = self.turn(job, started.saturating_duration_since(submitted));
             if counted {
@@ -905,6 +921,9 @@ impl Thread {
                 self.counters
                     .forward_ns
                     .fetch_add(elapsed, Ordering::Relaxed);
+                self.counters
+                    .launches
+                    .fetch_add(self.launches().saturating_sub(launched), Ordering::Relaxed);
             }
 
             match turn {

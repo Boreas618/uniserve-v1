@@ -3511,6 +3511,33 @@ mod tests {
         .into()
     }
 
+    /// The limits an engine reports, which the leader checks requests against,
+    /// are the lower of its launch's and what its groups were sized for: a
+    /// family that takes images bounds none of their encodings itself, and an
+    /// engine whose groups encode no image reports no capacity for one.
+    #[tokio::test]
+    async fn an_engine_reports_no_image_capacity_its_groups_were_not_sized_for() {
+        let mut launch = testkit::args("image-model");
+        launch.engine_config.model.generation_limits = proto::request::GenerationLimits {
+            max_vit_grid_tokens: u32::MAX,
+            max_vision_feature_bytes: u64::MAX,
+            encoder_cache_entries: u32::MAX,
+            ..Default::default()
+        };
+        let client =
+            tokio::task::spawn_blocking(move || fake_client(launch, Fixture::new(text_fake)))
+                .await
+                .unwrap();
+
+        let limits = &client.info().limits;
+        assert_eq!(limits.max_vit_grid_tokens, 0);
+        assert_eq!(limits.max_vision_feature_bytes, 0);
+        assert_eq!(limits.encoder_cache_entries, 0);
+        tokio::task::spawn_blocking(move || client.shutdown())
+            .await
+            .unwrap();
+    }
+
     /// An engine that is lost while it serves ends the leader's serving: it
     /// reports itself unhealthy and refuses every later request, naming the
     /// loss.
