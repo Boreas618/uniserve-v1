@@ -73,7 +73,7 @@ use crate::memory::buffers::{BufferMemory, UNIT_BYTES};
 use crate::memory::lend;
 use crate::memory::tables::{BlockCopy, BlockTables};
 use crate::runner::Runner;
-use crate::runners::causal_lm::output::performed;
+use crate::runners::{address, performed};
 use crate::{Error, Result};
 
 /// The channels of a decoded raster and of its packed bytes: red, green and blue.
@@ -740,11 +740,6 @@ fn voxels(shape: &nn::LatentShape) -> u64 {
 /// The elements of a latent shape.
 fn elements(shape: &nn::LatentShape) -> u64 {
     u64::from(shape.channels) * voxels(shape)
-}
-
-/// The address of `tensor`'s first element.
-fn address(tensor: &Tensor) -> Result<u64> {
-    Ok(backend::operand(tensor)?.ptr.address())
 }
 
 /// The copies of a unit's output after its replay, from the forward's `outputs`: the output it

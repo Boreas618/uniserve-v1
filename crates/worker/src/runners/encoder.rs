@@ -1,1026 +1,784 @@
-//! The encoder runner: a media computation's token batch, walked once per bucket and replayed (4.5).
+//! `EncoderRunner`: the runner of a text encoder (`nn::capability::Encoder`), which encodes a
+//! video request's prompt into its conditioning.
 //!
-//! An encoder takes the packed token rows of a request - a prompt, a vision tower's merged rows, a
-//! latent sequence - and writes hidden states. It reads no cache and samples no token, so this
-//! runner has none of the causal-LM runner's staging of pages, block tables or slots; what it does
-//! share is the shape of the work: one stream, a bucket per declared extent, a captured graph per
-//! bucket, and the generation lifecycle the hot update runs through.
+//! A text encoding batch carries one row of token columns per request, its prompt, and one
+//! media row per request naming its results as positions in the request's product table: the
+//! products the call reads, then the conditioning it writes. Once the encode has run, each
+//! prompt's rows of its `[tokens, width]` output are copied into the conditioning block the
+//! rank's tables hold at that position, of the conditioning's class.
 //!
-//! The values an encode reads beyond its columns (the tower's positions, the prompt rows its images
-//! replace) are the model's to compute from the prompt inside `encode`, uploaded through the
-//! runner's staging region; before each replay the same encode runs in staging mode with the
-//! served prompt ([`crate::runners::lifecycle::Lifecycle::replay`]).
+//! ## Captured and eager encodes
 //!
-//! **A prompt that carries vision blocks runs eagerly.** A graph is captured for a layout, and a
-//! prompt's vision grids are the request's: a captured graph per grid would be one per image size a
-//! client can send. So such a prompt is walked once, operator by operator, over its own layout
-//! ([`EncoderRunner::encode_vision`]): only a
-//! prompt without vision tokens is captured. That eager encode runs over the same stream region the
-//! captured ones address, so the recorded walk encodes, beside each bucket's captured encode, every
-//! vision prompt the deployment admits that fits the bucket ([`WarmVision`]), through the same
-//! function the serving path calls ([`EncoderRunner::encode_images`]).
+//! A prompt of text alone is encoded by the captured graph of the smallest bucket that holds its
+//! batch, one bucket per `(rows, prompt capacity)` the rank states. A prompt that presents vision
+//! blocks (its conditioning's `vision` grids) is encoded alone and eagerly over its own grids,
+//! which no graph is captured for: its patch rows are the vision pixels product its row reads
+//! first, lent in place. The eager encode takes its memory from the runner's region, over the
+//! inputs of the bucket that holds the prompt.
 //!
-//! **It keeps no cache and therefore no state group.** The state group of §8 is what a recurrent
-//! model must checkpoint at a boundary it declares, and an encoder computes its hidden states from
-//! the rows it was handed and carries nothing across batches: so this runner takes no snapshot,
-//! constructs no `Snapshot`, and has no boundary to name. A model that does keep state - a recurrent
-//! or hybrid one - states the boundary itself and its runner snapshots there; this is the statement
-//! that this class is not that one, written down so a runner that never checkpoints is not mistaken
-//! for one that silently forgot to.
+//! An encode reads no cache and samples no token: its batch's slot mapping writes nothing, and
+//! its output is the one tensor its forward returns.
 
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::time::Instant;
 
-use ipc::TimingCounters;
-use nn::capability::{
-    Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput, ImageShape,
-    PatchFormat, TokenBatch, WarmPrompt,
-};
-use ops::Operand;
-use platform::DeviceId;
-use proto::module::PhaseKind;
-use uniserve_tensor::DType;
+use ipc::batch::{Batch, BatchOutput, Phase, TimingCounters, Variant};
+use nn::capability::{Encoder, PatchFormat};
+use nn::{NO_SLOT, PhaseKind, TokenBatch};
+use platform::Stream;
+use uniserve_tensor::{DType, Tensor};
 
-use crate::arena::Pools;
-use crate::batch::{Job, Jobs, answered};
-use crate::memory::encoders::EncoderHostPool;
-use crate::plan::{Bucket, Buckets};
-use crate::runner::{Binding, Runner, RunnerId};
-use crate::runners::columns::{Column, Region, encode_i32};
-use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
-use crate::runners::products::{self, Product, Products};
-use crate::runners::recording::Footprint;
+use super::{DeviceCopy, address, element_bytes, issue, performed, settle};
+use crate::buckets::{Bucket, Buckets};
+use crate::graphs::Graphs;
+use crate::memory::buffers::BufferMemory;
+use crate::memory::tables::{BlockCopy, BlockTables};
+use crate::runner::Runner;
 use crate::{Error, Result};
-use ipc::execution::Variant;
-use ipc::execution::{Batch, BatchOutput, CallId};
 
-/// The figures an encoder's columns are sized by, which the model package states once at open.
-#[derive(Clone, Copy, Debug)]
-pub struct EncoderShape {
-    /// The width of the hidden states the encode writes.
-    pub hidden: u32,
-    /// The element type of those states.
+/// The phase an encoder runner serves.
+const PHASES: &[Phase] = &[Phase::TextEncode];
+
+/// The alignment of each input column in the input block.
+const ALIGNMENT: u64 = backend::allocator::ALIGNMENT;
+
+/// The input columns, in the order they lie in the input block, each of 4-byte elements:
+/// `[tokens]` U32 ids, `[tokens]` I32 positions, `[tokens]` U32 slot mapping, `[rows]` U32
+/// sequence lengths, `[rows + 1]` U32 query offsets, `[rows]` U32 logits rows.
+const IDS: usize = 0;
+const POSITIONS: usize = 1;
+const SLOT_MAPPING: usize = 2;
+const SEQ_LENS: usize = 3;
+const QUERY_OFFSETS: usize = 4;
+const LOGITS_ROWS: usize = 5;
+
+/// What a deployment fixes of an encoder runner. Immutable once the runner is built.
+#[derive(Clone, Debug)]
+pub struct EncoderConfig {
+    /// The buckets the runner captures, `Bucket::prefill(rows, tokens, Variant::Encode)` each:
+    /// one per `(rows, prompt capacity)` the rank states.
+    pub buckets: Buckets,
+    /// The width of the conditioning's rows: an encode writes `[prompt tokens, width]`.
+    pub width: u32,
+    /// The conditioning's element type.
     pub dtype: DType,
+    /// How the vision pixels product lays out a vision block's patch rows
+    /// (`nn::capability::MediaFormat::patches`); `None` for an encoder that takes no image.
+    pub patches: Option<PatchFormat>,
+    /// The class of the conditioning product, which a row writes.
+    pub conditioning: u8,
+    /// The class of the vision pixels product, which a prompt with vision blocks reads.
+    pub pixels: u8,
 }
 
-/// The prompts with vision blocks a deployment admits, which the recorded walk encodes beside the
-/// captured buckets, and the patch rows their blocks read.
-pub struct WarmVision {
-    /// Each admitted prompt's vision blocks ([`nn::family::VideoModel::warm_prompts`]).
-    pub prompts: Vec<WarmPrompt>,
-    /// How the media stage writes the patch rows a vision encode reads
-    /// ([`Product::VisionPixels`]): their element type and row width.
-    pub patches: PatchFormat,
+/// The runner of a text encoder (module documentation).
+pub struct EncoderRunner {
+    model: Arc<dyn Encoder + Send + Sync>,
+    config: EncoderConfig,
+    graphs: Graphs,
+    /// The stream the graphs replay on; `None` for graphs that hold no device.
+    stream: Option<Stream>,
+    /// The rank's media memory, where the products lie.
+    memory: Arc<BufferMemory>,
+    /// Each input column's byte offset in the input block.
+    offsets: [u64; 6],
+    /// The prompt ids of the step being prepared, padded to its bucket's tokens: what the
+    /// encode computes its host values from (`Encoder::encode`).
+    prompt: RefCell<Vec<u32>>,
+    /// The vision blocks of the prompt being encoded eagerly: each block's grid and its patch
+    /// rows in the vision pixels product.
+    images: RefCell<Vec<([u32; 3], Tensor)>>,
 }
 
-/// The columns an encoder stages a batch into, sized for the largest bucket it was bound with.
-struct EncoderColumns {
-    /// `[tokens]` u32 embedder ids: what the stateless encoder reads instead of a cache slot.
-    ids: Column,
-    /// `[tokens]` i32 rotary positions.
-    positions: Column,
-    /// `[rows]` i32 keys visible to each row.
-    seq_lens: Column,
-    /// `[rows + 1]` i32 packed query offsets.
-    query_offsets: Column,
-    /// `[rows]` i32 the hidden rows whose logits are wanted: never written, and zeroed so a model
-    /// that reads the column anyway reads a defined row rather than uninitialised memory.
-    logits_rows: Column,
-    /// `[tokens × hidden]` the encoded states, in the model's own element type.
-    ///
-    /// A region rather than arena scratch: the states are a product another call of the same
-    /// request reads, so the region they live in must be the runner's for as long as it serves
-    /// rather than a reservation the captured graph happens to address. One region holds every
-    /// request of the largest bucket this runner stages, one request's rows after another.
-    ///
-    /// **On the device, not a column**, because the stack's residual stream is these rows: every
-    /// layer reads and writes them, and in pinned host memory each normalization took 1.7 ms.
-    hidden: Region,
+/// The elements of each input column for `rows` rows and `tokens` tokens.
+const fn extents(rows: usize, tokens: usize) -> [usize; 6] {
+    [tokens, tokens, tokens, rows, rows + 1, rows]
 }
 
-impl EncoderColumns {
-    fn new(device: DeviceId, tokens: u32, rows: u32, shape: EncoderShape) -> Result<Self> {
-        let tokens64 = u64::from(tokens.max(1));
-        let rows64 = u64::from(rows.max(1));
-        let hidden = tokens64
-            .checked_mul(u64::from(shape.hidden.max(1)))
-            .ok_or_else(|| Error::Invalid("an encoder's hidden column overflows".into()))?;
-        Ok(Self {
-            ids: Column::new(device, DType::I32, tokens64)?,
-            positions: Column::new(device, DType::I32, tokens64)?,
-            seq_lens: Column::new(device, DType::I32, rows64)?,
-            query_offsets: Column::new(device, DType::I32, rows64 + 1)?,
-            logits_rows: Column::new(device, DType::I32, rows64)?,
-            hidden: Region::new(device, shape.dtype, hidden)?,
-        })
+/// Each input column's byte offset for buckets of at most `rows` rows and `tokens` tokens, and
+/// the bytes of the input block.
+fn offsets(rows: usize, tokens: usize) -> ([u64; 6], u64) {
+    let mut offsets = [0; 6];
+    let mut bytes = 0;
+    for (offset, extent) in offsets.iter_mut().zip(extents(rows, tokens)) {
+        *offset = bytes;
+        bytes += (extent as u64 * 4).next_multiple_of(ALIGNMENT);
     }
+    (offsets, bytes)
 }
 
-/// The token span each request of a batch owns, as `(first row, count)`.
-///
-/// A call's span is its **real** tokens and the mechanism's offsets are their boundaries, so the
-/// first row is the offset itself rather than a sum of the rows before it: a batch whose first span
-/// does not begin at zero - a padded or offset allocation - keeps the rows the mechanism named,
-/// which a running sum would silently shift. A span that runs backwards, or a row count that does
-/// not fit, is refused rather than wrapped.
-fn spans(offsets: &[i32]) -> Result<Vec<(u32, u32)>> {
-    let mut spans = Vec::with_capacity(offsets.len().saturating_sub(1));
-    for window in offsets.windows(2) {
-        let rows = window[1].checked_sub(window[0]).ok_or_else(|| {
-            Error::Invalid(format!(
-                "a call's span runs backwards: {} then {}",
-                window[0], window[1]
-            ))
-        })?;
-        let first = u32::try_from(window[0]).map_err(|_| {
-            Error::Invalid("a request's first token row does not fit a count".into())
-        })?;
-        let rows = u32::try_from(rows)
-            .map_err(|_| Error::Invalid("a request's token rows do not fit a count".into()))?;
-        spans.push((first, rows));
+/// The largest rows and tokens of `buckets`, which the input columns are sized for.
+fn bounds(buckets: &Buckets) -> (usize, usize) {
+    buckets.iter().fold((0, 0), |(rows, tokens), bucket| {
+        (
+            rows.max(bucket.rows as usize),
+            tokens.max(bucket.tokens as usize),
+        )
+    })
+}
+
+/// The patch grids of the vision blocks a video request's `conditioning` presents, in
+/// presentation order: one per condition with a vision view.
+fn vision_grids(conditioning: &[u8]) -> Result<Vec<[u32; 3]>> {
+    if conditioning.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(spans)
-}
-
-/// The encoder's runner: one device stream, the buckets its plan captures, and its model.
-pub struct EncoderRunner<M: Encoder + Send + Sync + ?Sized> {
-    id: RunnerId,
-    phases: Vec<ipc::PhaseId>,
-    model: Arc<M>,
-    lifecycle: Lifecycle,
-    buckets: Buckets,
-    device: DeviceId,
-    stream: platform::Stream,
-    shape: EncoderShape,
-    counters: Option<Arc<crate::device::SharedCounters>>,
-    columns: EncoderColumns,
-    /// The host ids of the batch staged last: the prompt every forward of the batch hands the
-    /// model ([`EncoderPrompt`]), the capture's warm one included.
-    ids: Vec<u32>,
-    /// The bucket the columns are staged for, so a capture smaller than the largest bucket knows how
-    /// far the columns it uploads run.
-    /// The calls of the batch staged last, which its replay answers.
-    calls: Vec<CallId>,
-    staged: Option<Bucket>,
-    /// The epoch's product store, attached by the worker that starts this runner: what an encode
-    /// produces and a denoise step of the same request reads.
-    products: Option<std::sync::Arc<dyn Products>>,
-    /// The requests of the batch staged last: `(request, first token row, count)` in request order.
-    ///
-    /// A replay publishes what its own launch wrote, and the batch numbers its calls by position,
-    /// so the request's name is kept here beside the rows it covers (`Batch::media`'s staged record
-    /// is the only place a request is named). The rows are the batch's own offline offsets rather
-    /// than a running sum, so the publish reads the same numbers the encode read: a call's span is
-    /// its real tokens, and whatever the mechanism put before or after it is not this runner's.
-    pending: Vec<(ipc::RequestKey, u32, u32)>,
-    /// The vision blocks of the prompt staged last, when it carries any: the replay of that batch
-    /// walks the encode instead of launching a graph.
-    vision: Option<VisionPrompt>,
-    /// The vision prompts the recorded walk encodes beside the captured buckets.
-    warm: WarmVision,
-    /// The tensor group this runner's rank reduces over, absent when one rank holds the encoder.
-    group: Option<Arc<nn::Group>>,
-    /// The host encoder pool of this runner's device, which a request's encoded states are read
-    /// from instead of computed when the engine found them stored, and written to when it reserved
-    /// pages for them. `None` on a device that maps none.
-    host_pool: Option<Arc<EncoderHostPool>>,
-    /// Whether this device writes the rows it computed to the pool: every rank of a tensor group
-    /// holds the whole states, so one of them writes them for all.
-    writes_outputs: bool,
-    /// The host outputs of the batch staged last, by request.
-    host_outputs: Vec<(ipc::RequestKey, ipc::HostOutput)>,
-}
-
-/// A prompt's vision blocks, as its conditioning states them.
-struct VisionPrompt {
-    /// The request the patch rows were read for.
-    request: ipc::RequestKey,
-    /// Each block's `[time, rows, columns]` patch grid, in presentation order.
-    images: Vec<ImageShape>,
-}
-
-/// The vision blocks a request's conditioning presents, in presentation order.
-///
-/// Every condition with a conditioner's view is one block, and they are presented in request order
-/// (its model's request processing). An audio reference and a `ref2va` keyframe present none.
-fn vision_images(conditioning: &[u8]) -> Result<Vec<ImageShape>> {
     let decoded = proto::video::Conditions::decode(conditioning).map_err(|error| {
         Error::Invalid(format!(
             "a media request's conditioning does not decode: {error}"
         ))
     })?;
+
     Ok(decoded
         .conditions
         .iter()
         .filter_map(|condition| condition.vision.as_ref())
-        .map(|vision| ImageShape {
-            grid: [vision.grid.t, vision.grid.h, vision.grid.w],
-        })
+        .map(|vision| [vision.grid.t, vision.grid.h, vision.grid.w])
         .collect())
 }
 
-impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
-    /// Binds an encoder to one device stream.
+impl EncoderRunner {
+    /// The bytes of the runner's input tensors for `config`: the `inputs` its [`Graphs`] are
+    /// made with.
+    pub fn input_bytes(config: &EncoderConfig) -> u64 {
+        let (rows, tokens) = bounds(&config.buckets);
+        offsets(rows, tokens).1
+    }
+
+    /// A runner of `model` under `config` over `graphs`, made for
+    /// [`EncoderRunner::input_bytes`] bytes of input tensors, which replay on `stream` (`None`
+    /// for graphs that hold no device). It reads and writes products in `memory`, the rank's
+    /// media memory.
     ///
-    /// The buckets are the ones the plan states for this runner (`Runner::media_plan`), and the
-    /// columns are sized for the largest of them: an encoder captures per bucket and stages into
-    /// one set of columns, because the buckets differ only in how many tokens they carry. `vision`
-    /// is what the deployment admits of prompts with vision blocks, which the recorded walk encodes
-    /// beside the buckets so the stream's region holds their eager encodes.
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a config with no bucket or a bucket that is no encode, a stream
+    /// without a device or the reverse, or graphs that hold fewer bytes than the input tensors.
     pub fn new(
-        binding: Binding,
-        model: Arc<M>,
-        buckets: Buckets,
-        vision: WarmVision,
-        shape: EncoderShape,
-        generation: Arc<ops::Generation>,
+        model: Arc<dyn Encoder + Send + Sync>,
+        config: EncoderConfig,
+        graphs: Graphs,
+        stream: Option<Stream>,
+        memory: Arc<BufferMemory>,
     ) -> Result<Self> {
-        let largest = buckets
-            .iter()
-            .filter(|bucket| bucket.variant.media())
-            .max_by_key(|bucket| bucket.tokens)
-            .ok_or_else(|| {
-                Error::Invalid(
-                    "an encoder runner was bound with no media bucket to capture; its plan must \
-                     state the layouts the checkpoint declares"
-                        .into(),
-                )
-            })?;
-        let columns = EncoderColumns::new(binding.device, largest.tokens, largest.rows, shape)?;
-        let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
-        Ok(Self {
-            id: binding.id,
-            phases: binding.phases,
-            model,
-            lifecycle,
-            buckets,
-            device: binding.device,
-            stream: binding.stream,
-            shape,
-            counters: None,
-            columns,
-            ids: Vec::new(),
-            calls: Vec::new(),
-            staged: None,
-            products: None,
-            pending: Vec::new(),
-            vision: None,
-            warm: vision,
-            group: None,
-            host_pool: None,
-            writes_outputs: false,
-            host_outputs: Vec::new(),
-        })
-    }
-
-    /// This runner with its device's host encoder pool: a request's encoded states are read from it
-    /// when the engine found them stored, and, when `writes` is set, written to it when the engine
-    /// reserved pages for them.
-    #[must_use]
-    pub fn with_host_outputs(mut self, pool: Arc<EncoderHostPool>, writes: bool) -> Self {
-        self.host_pool = Some(pool);
-        self.writes_outputs = writes;
-        self
-    }
-
-    /// The host output of `request` in the batch staged last, when it has one.
-    fn host_output(&self, request: ipc::RequestKey) -> Option<&ipc::HostOutput> {
-        self.host_outputs
-            .iter()
-            .find(|(key, _)| *key == request)
-            .map(|(_, output)| output)
-    }
-
-    /// Whether every request of the batch staged last reads its states from the host encoder pool,
-    /// so the encode computes nothing.
-    fn imports_all(&self) -> bool {
-        self.host_pool.is_some()
-            && !self.pending.is_empty()
-            && self.pending.iter().all(|(request, _, _)| {
-                self.host_output(*request)
-                    .is_some_and(|output| output.import)
-            })
-    }
-
-    /// Copies between each pending request's rows of the hidden column and its stored output's pages:
-    /// from the pages when `import`, to them otherwise. The copies have completed when this returns,
-    /// before the call's result lets the engine release or commit the pages.
-    fn copy_host_outputs(&self, import: bool) -> Result<()> {
-        let Some(pool) = self.host_pool.as_ref() else {
-            return Ok(());
-        };
-        let element = ops::abi::bytes(self.shape.dtype).ok_or_else(|| {
-            Error::Invalid(format!(
-                "{} has no whole-byte size",
-                ops::abi::name(self.shape.dtype)
-            ))
-        })?;
-        let width = u64::from(self.shape.hidden.max(1));
-        let row_bytes = width * element;
-        let mut copied = false;
-        for (request, first, rows) in &self.pending {
-            let Some(output) = self.host_output(*request) else {
-                continue;
-            };
-            if output.import != import || (!import && !self.writes_outputs) {
-                continue;
-            }
-            if output.pool != pool.pool() || output.row_bytes == 0 {
-                return Err(Error::Invalid(format!(
-                    "a host output of pool {} with rows of {} bytes reached a runner of pool {}",
-                    output.pool,
-                    output.row_bytes,
-                    pool.pool()
-                )));
-            }
-            // The stored output's rows are the engine's unit, which need not be this encoder's:
-            // the request's rows of the hidden column are as many of the stored output's bytes as
-            // they fill, from its first stored row on.
-            let stored = u64::from(output.rows[1] - output.rows[0]);
-            let units = (u64::from(*rows) * row_bytes / output.row_bytes).min(stored);
-            let base = self.columns.hidden.device.ptr.address() + u64::from(*first) * row_bytes;
-            for copy in crate::memory::encoders::page_copies(
-                output.rows[0],
-                0..units,
-                output.row_bytes,
-                pool.page_bytes(),
-            ) {
-                // An export leaves a page the pool holds already as it is.
-                let Some(slot) = output.slots.get(copy.page).copied().flatten() else {
-                    continue;
-                };
-                let page = pool.view(slot)?.address() + copy.offset;
-                let row = base + copy.output;
-                let (destination, source) = if import { (row, page) } else { (page, row) };
-                // SAFETY: the pages stay pinned or reserved until this call's result, and the
-                // copies complete before this returns; the hidden column is this runner's, which
-                // no other launch writes while it serves this batch.
-                unsafe {
-                    platform::memcpy_async(destination, source, copy.bytes as usize, &self.stream)
-                }?;
-                copied = true;
-            }
-        }
-        if copied {
-            self.stream.synchronize()?;
-        }
-        Ok(())
-    }
-
-    /// This runner over the tensor `group`: every forward it runs carries the group.
-    #[must_use]
-    pub fn in_group(mut self, group: Option<Arc<nn::Group>>) -> Self {
-        self.group = group;
-        self
-    }
-
-    /// The buckets this runner captures: the media ones, largest first.
-    fn capture_order(&self) -> Vec<Bucket> {
-        let mut buckets: Vec<Bucket> = self
+        let encodes = config
             .buckets
             .iter()
-            .filter(|bucket| bucket.variant.media())
-            .copied()
-            .collect();
-        buckets.sort_by_key(|bucket| std::cmp::Reverse(bucket.tokens));
-        buckets
-    }
-
-    /// The layout of `bucket`'s encode, as the model states it.
-    ///
-    /// The layout is a function of the bucket alone - an encoder's rows are its tokens and its
-    /// images are stated by the mechanism's own `Computation` - so two requests of one shape share
-    /// one graph.
-    fn layout(&self, bucket: Bucket) -> EncoderLayout {
-        EncoderLayout {
-            rows: bucket.tokens,
-            tokens: bucket.tokens,
-            images: Vec::new(),
+            .all(|bucket| bucket.variant == Variant::Encode && bucket.rows > 0);
+        if config.buckets.is_empty() || !encodes {
+            return Err(Error::Invalid(
+                "an encoder runner captures encode buckets of at least one row, and at least one"
+                    .into(),
+            ));
         }
-    }
+        if graphs.enter().is_ok() != stream.is_some() {
+            return Err(Error::Invalid(
+                "an encoder runner takes the stream of its graphs, and none for graphs that hold \
+                 no device"
+                    .into(),
+            ));
+        }
 
-    /// The token batch a bucket's graph reads.
-    fn token_batch(&self, bucket: Bucket) -> Result<TokenBatch> {
-        let tokens = u64::from(bucket.tokens);
-        let rows = u64::from(bucket.rows);
-        Ok(TokenBatch {
-            positions: self.columns.positions.extent(0..tokens),
-            // An encoder reads no cache: `-1` is 4.3's statement of that, and a layer that gathers
-            // by slot only reads it when it has a cache to gather from.
-            slot_mapping: self.columns.logits_rows.extent(0..tokens.max(1)),
-            seq_lens: self.columns.seq_lens.extent(0..rows),
-            query_offsets: self.columns.query_offsets.extent(0..rows + 1),
-            logits_rows: self.columns.logits_rows.extent(0..rows),
-            phase: PhaseKind::Prefill,
-            page_size: 0,
-            num_tokens: bucket.tokens,
-            // A row attends over its own tokens, and a bucket holds no more than its tokens.
-            max_kv_len: bucket.tokens,
-            draft_lens: None,
-            rope_positions: None,
+        let (rows, tokens) = bounds(&config.buckets);
+        let (offsets, bytes) = offsets(rows, tokens);
+        if graphs.input(0, bytes as usize, DType::U8).is_err() {
+            return Err(Error::Invalid(format!(
+                "the graphs hold fewer than the {bytes} bytes of the runner's input tensors"
+            )));
+        }
+
+        Ok(Self {
+            model,
+            config,
+            graphs,
+            stream,
+            memory,
+            offsets,
+            prompt: RefCell::new(Vec::new()),
+            images: RefCell::new(Vec::new()),
         })
     }
 
-    /// Stages a batch's columns, sized to `bucket`, and records them for the capture.
-    fn stage(&mut self, batch: &Batch, bucket: Bucket) -> Result<()> {
-        let columns = &batch.columns;
-        let threads = &columns.rows;
-        let rows = usize::try_from(bucket.rows)
-            .map_err(|_| Error::Invalid("a bucket of more rows than memory holds".into()))?;
-        if threads.seq_lens.len() != rows {
+    /// The input column `column`, its first `elements` elements of `dtype`.
+    fn column(&self, column: usize, elements: usize, dtype: DType) -> Result<Tensor> {
+        self.graphs.input(self.offsets[column], elements, dtype)
+    }
+
+    /// Writes `values`, padded with `padding` to `elements`, into column `column` of `block`.
+    fn write(
+        &self,
+        block: &mut [u8],
+        column: usize,
+        values: impl Iterator<Item = u32>,
+        (elements, padding): (usize, u32),
+    ) -> Result<()> {
+        let start = self.offsets[column] as usize;
+        let bytes = block
+            .get_mut(start..start + 4 * elements)
+            .ok_or_else(|| Error::Invariant("an input column lies past the input block".into()))?;
+
+        let values = values.chain(std::iter::repeat(padding));
+        for (entry, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+            *entry = value.to_le_bytes();
+        }
+        Ok(())
+    }
+
+    /// Checks `batch` and returns the bucket that serves it and the copies of each prompt's rows
+    /// of the encode's output into its conditioning block, each from a byte offset of the
+    /// output. A prompt with vision blocks is encoded eagerly in the extent of the bucket that
+    /// holds it, under a key of [`Variant::ConditionEncode`] no graph is captured for, so its
+    /// inputs are prepared without a pass for a graph's copies; its blocks are staged for its
+    /// forward. Nothing is issued: everything that can refuse the batch is here.
+    ///
+    /// # Errors
+    ///
+    /// A batch no captured bucket holds, a media row that does not name one conditioning it
+    /// writes after the products it reads, a result the tables hold no block for, or a writable
+    /// one where the row writes, a block smaller than the rows written to it, and vision blocks
+    /// in a batch of more than one prompt or for an encoder that takes no image.
+    fn place(&self, batch: &Batch, tables: &BlockTables) -> Result<(Bucket, Vec<DeviceCopy>)> {
+        batch.check()?;
+        let rows = &batch.columns.rows;
+        if rows.rows() != batch.media.len() {
             return Err(Error::Invalid(format!(
-                "a batch of {} row(s) was planned into the bucket of {rows} rows",
-                threads.seq_lens.len()
+                "batch {} encodes {} prompts for {} media rows",
+                batch.id.0,
+                rows.rows(),
+                batch.media.len()
             )));
         }
-        // The ids are the vocabulary's own indices: an encoder reads them as integers, and the
-        // element type is the one its descriptor names (`DType::I32`), so the column is signed and
-        // the cast cannot lose a value a vocabulary can hold.
-        self.ids = columns.input_ids.iter().map(|id| *id as u32).collect();
-        let mut buffer = Vec::new();
+        let bucket = self
+            .graphs
+            .select(|bucket| bucket.holds(&batch.shape))
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "batch {} of {} holds in no captured encode bucket",
+                    batch.id.0, batch.shape
+                ))
+            })?;
 
-        encode_i32(
-            &mut buffer,
-            &self.ids.iter().map(|id| *id as i32).collect::<Vec<_>>(),
-        );
-        self.columns.ids.write(&buffer)?;
-        encode_i32(&mut buffer, &threads.positions);
-        self.columns.positions.write(&buffer)?;
-        encode_i32(&mut buffer, &threads.seq_lens);
-        self.columns.seq_lens.write(&buffer)?;
-        encode_i32(&mut buffer, &threads.query_offsets);
-        self.columns.query_offsets.write(&buffer)?;
-        encode_i32(&mut buffer, &threads.logits_rows);
-        self.columns.logits_rows.write(&buffer)?;
-        self.staged = Some(bucket);
-        // Which request is at which rows: a replay publishes what its own launch wrote, and a batch
-        // numbers its calls by position, so the name the store is keyed by is kept here with the
-        // token rows that request covers (`Batch::media`'s record is where a request is named).
-        self.pending.clear();
-        self.vision = None;
-        if let Some(media) = &batch.media {
-            for (index, (first, rows)) in spans(&threads.query_offsets)?.into_iter().enumerate() {
-                let staged = media.request(index)?;
-                self.pending.push((staged.request, first, rows));
-                let images = vision_images(&staged.conditioning)?;
-                if images.is_empty() {
-                    continue;
-                }
-                // One walk serves one prompt: its layout is that prompt's grids, and a batch of two
-                // would lay one prompt's blocks over the other's rows.
-                if threads.seq_lens.len() != 1 {
-                    return Err(Error::Invalid(format!(
-                        "a batch of {} prompts carries vision blocks, and a prompt with vision \
-                         blocks is encoded alone",
-                        threads.seq_lens.len()
-                    )));
-                }
-                self.vision = Some(VisionPrompt {
-                    request: staged.request,
-                    images,
-                });
-            }
-        }
-        // The columns are sized for the largest bucket the runner was bound with; a batch planned
-        // into a smaller one writes exactly its own prefix and the graph reads only that far.
-        Ok(())
-    }
+        let (width, dtype) = (self.config.width as usize, self.config.dtype);
+        let row_bytes = width as u64 * element_bytes(dtype)?;
+        let mut copies = Vec::with_capacity(batch.media.len());
+        let mut images = Vec::new();
 
-    /// Stages a bucket with no batch behind it, so a first capture has defined columns to read.
-    fn stage_warm(&mut self, bucket: Bucket) -> Result<()> {
-        if self.staged == Some(bucket) {
-            return Ok(());
-        }
-        let tokens = bucket.tokens as usize;
-        let rows = bucket.rows as usize;
-        let mut buffer = Vec::new();
-        self.ids = vec![0u32; tokens];
-        encode_i32(&mut buffer, &vec![0i32; tokens]);
-        self.columns.ids.write(&buffer)?;
-        encode_i32(&mut buffer, &vec![0i32; tokens]);
-        self.columns.positions.write(&buffer)?;
-        encode_i32(&mut buffer, &vec![0i32; rows]);
-        self.columns.seq_lens.write(&buffer)?;
-        encode_i32(&mut buffer, &vec![0i32; rows + 1]);
-        self.columns.query_offsets.write(&buffer)?;
-        encode_i32(&mut buffer, &vec![0i32; rows]);
-        self.columns.logits_rows.write(&buffer)?;
-        self.staged = Some(bucket);
-        // A warm capture serves no request, so its launch publishes nothing: a row left here would
-        // name a request whose states this capture overwrote.
-        self.pending.clear();
-        Ok(())
-    }
+        for (index, row) in batch.media.iter().enumerate() {
+            let reads = row.reads as usize;
+            let (first, end) = (rows.query_offsets[index], rows.query_offsets[index + 1]);
+            let (Some(&written), true, Ok(first), Ok(end)) = (
+                row.results.get(reads),
+                row.results.len() == reads + 1,
+                u32::try_from(first),
+                u32::try_from(end),
+            ) else {
+                return Err(Error::Invalid(format!(
+                    "request {} encodes rows {first}..{end} and names results {:?} reading {}: \
+                     an encode writes one conditioning after what it reads",
+                    row.request.0, row.results, row.reads
+                )));
+            };
 
-    /// Uploads the staged columns, in one place, so a capture and a replay agree on what the graph
-    /// reads.
-    fn upload(&self) -> Result<()> {
-        self.columns.ids.upload(&self.stream)?;
-        self.columns.positions.upload(&self.stream)?;
-        self.columns.seq_lens.upload(&self.stream)?;
-        self.columns.query_offsets.upload(&self.stream)?;
-        self.columns.logits_rows.upload(&self.stream)?;
-        Ok(())
-    }
+            let tokens = end.saturating_sub(first) as usize;
+            let block = self.memory.lend(
+                tables,
+                (row.slot, self.config.conditioning, written),
+                true,
+                0,
+                &[tokens, width],
+                dtype,
+            )?;
+            copies.push((
+                u64::from(first) * row_bytes,
+                address(&block)?,
+                tokens as u64 * row_bytes,
+            ));
 
-    /// Publishes the encoded states this replay's launch wrote: one `Text` product per request of
-    /// the batch staged last.
-    ///
-    /// The region is the runner's own hidden **column** - pinned memory the runner owns rather than
-    /// a graph pool's arena - so the view stays readable until the next encode writes it, whatever
-    /// else the device launches in between. That is why the states are a column and not arena
-    /// scratch: a graph pool's buckets share one base (`arena::Pools::record`: a stream's plans are
-    /// extents and the addresses repeat), so an arena-backed product would be good only until the
-    /// next capture or replay of *any* bucket on the producer's stream.
-    ///
-    /// **One region, therefore one in-flight encode per runner.** The captured graph writes
-    /// `EncoderOutputs::hidden` at the address the capture fixed, so a runner cannot give a second
-    /// request its own span: a second encode batch overwrites the rows the first request's product
-    /// still points at, silently, because the store's view is a name for the producer's memory and
-    /// not a copy of it. Two requests inside **one** batch are fine - their spans are disjoint inside
-    /// that write - and a second batch must wait for the first request's products to be forgotten.
-    /// That is the admission rule the media path already keeps in one place (a decode bucket refuses a
-    /// batch of two clips for the same reason), and it belongs to execution rather than here: this
-    /// runner states the region's lifetime, and the scheduler states when a second encode may run.
-    ///
-    /// Only `Text` is published, because this encoder writes one region
-    /// (`EncoderOutputs::hidden`): a vision tower's features are spliced into it by the encode that
-    /// read them, and a condition's rows are the denoiser's conditioner's to write.
-    fn publish(&self) -> Result<()> {
-        let Some(products) = self.products.as_ref() else {
-            // A runner whose store was not attached publishes nothing. The consumer that reads a
-            // product refuses by name, so the gap is named where it is felt rather than here.
-            return Ok(());
-        };
-        let width = u64::from(self.shape.hidden.max(1));
-        for (request, first, rows) in &self.pending {
-            let (first, rows) = (u64::from(*first), u64::from(*rows));
-            if rows == 0 {
+            // A prompt that presents vision blocks reads their patch rows first.
+            let grids = vision_grids(&row.conditioning)?;
+            if grids.is_empty() {
                 continue;
             }
-            let view = self
-                .columns
-                .hidden
-                .device
-                .at(self.columns.hidden.device.offset_elements(first * width))
-                .reshape(ops::Shape::new(&[rows, width]));
-            let written = crate::runners::products::written_on(&self.stream)?;
-            products.publish(
-                *request,
-                Product::Text,
-                self.device,
-                self.lifecycle.stream_id(),
-                Some(written),
-                &view,
+            let (Some(format), 1, Some(&read)) = (
+                self.config.patches,
+                batch.media.len(),
+                row.results[..reads].first(),
+            ) else {
+                return Err(Error::Invalid(format!(
+                    "request {} presents vision blocks in a batch of {} prompts, to an encoder \
+                     that {}, reading {} results: a prompt with vision blocks is encoded alone \
+                     and reads its patch rows",
+                    row.request.0,
+                    batch.media.len(),
+                    if self.config.patches.is_some() {
+                        "takes images"
+                    } else {
+                        "takes none"
+                    },
+                    row.reads
+                )));
+            };
+
+            let patches = |grid: &[u32; 3]| grid.iter().map(|extent| *extent as usize).product();
+            let total: usize = grids.iter().map(patches).sum();
+            let patch_rows = self.memory.lend(
+                tables,
+                (row.slot, self.config.pixels, read),
+                false,
+                0,
+                &[total, format.width() as usize],
+                format.dtype,
             )?;
+
+            let mut start = 0;
+            for grid in grids {
+                let count = patches(&grid);
+                images.push((grid, patch_rows.narrow(0, start, count)?));
+                start += count;
+            }
         }
-        Ok(())
+
+        let bucket = match images.is_empty() {
+            true => bucket,
+            false => Bucket::prefill(bucket.rows, bucket.tokens, Variant::ConditionEncode),
+        };
+        *self.images.borrow_mut() = images;
+        Ok((bucket, copies))
     }
 
-    /// Encodes a prompt that carries vision blocks, operator by operator.
-    ///
-    /// The layout is the prompt's own - its presented tokens and its blocks' grids. The arena and
-    /// the staging region are the stream's, whose bucket extents a graph of this runner addresses:
-    /// nothing of a graph is live between its replays, so this walk may reuse them, and the recorded
-    /// walk encodes the vision prompts the deployment admits so the regions hold it.
-    fn encode_vision(&self, bucket: Bucket, generation: u64, prompt: VisionPrompt) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
-        let stream = self.stream.clone();
-        let tokens = u32::try_from(self.ids.len())
-            .map_err(|_| Error::Invalid("a prompt of more tokens than a u32 counts".into()))?;
+    /// Writes `batch`'s columns, padded to `bucket`, into the input block, with the host values
+    /// the bucket's forward computes.
+    fn fill(&self, batch: &Batch, bucket: &Bucket) -> Result<()> {
+        let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
+        let columns = &batch.columns;
+        let last = columns.rows.query_offsets.last().copied().unwrap_or(0);
 
-        let products = self
-            .products
-            .as_ref()
-            .ok_or_else(|| products::no_store(prompt.request))?;
-        let patches = products
-            .ordered(prompt.request, Product::VisionPixels, &stream)?
-            .ok_or_else(|| products::absent(prompt.request, Product::VisionPixels))?;
+        // The ids are the vocabulary's own indices, which the columns carry as I32.
+        let ids: Vec<u32> = columns.input_ids.iter().map(|id| *id as u32).collect();
+        let mut prompt = ids.clone();
+        prompt.resize(tokens, 0);
+        *self.prompt.borrow_mut() = prompt;
 
-        let arena = self.lifecycle.arena()?;
-        let group = self.group.clone();
-        let staging = self.lifecycle.staging.slot()?;
-        let forward = crate::runners::denoiser::grouped(
-            nn::Forward::new(&stream, &kernels, &arena).with_staging(staging),
-            group.as_deref(),
-        )?;
-        self.upload()?;
-        self.encode_images(&forward, bucket, tokens, &prompt.images, patches)?;
-        self.lifecycle.staging.release(&stream)
+        let as_u32 = |values: &[i32]| values.iter().map(|value| *value as u32).collect::<Vec<_>>();
+        self.graphs.prepare_inputs(self, bucket, |block| {
+            self.write(block, IDS, ids.into_iter(), (tokens, 0))?;
+            self.write(
+                block,
+                POSITIONS,
+                as_u32(&columns.rows.positions).into_iter(),
+                (tokens, 0),
+            )?;
+            self.write(block, SLOT_MAPPING, std::iter::empty(), (tokens, NO_SLOT))?;
+            self.write(
+                block,
+                SEQ_LENS,
+                as_u32(&columns.rows.seq_lens).into_iter(),
+                (rows, 0),
+            )?;
+            // A padding row is empty: its offsets repeat the last.
+            self.write(
+                block,
+                QUERY_OFFSETS,
+                as_u32(&columns.rows.query_offsets).into_iter(),
+                (rows + 1, last as u32),
+            )?;
+            self.write(
+                block,
+                LOGITS_ROWS,
+                as_u32(&columns.rows.logits_rows).into_iter(),
+                (rows, 0),
+            )
+        })
     }
 
-    /// Encodes one prompt of `tokens` tokens whose vision blocks are `images` on `forward`: the
-    /// layout and the model call, which the eager serving path ([`Self::encode_vision`]) and the
-    /// recorded walk both run.
-    ///
-    /// `patches` is the `[rows, width]` patch rows of every block, one block's rows after
-    /// another's, in the media stage's element type. The prompt's columns are the staged ones, and
-    /// its states land in the hidden column's first rows.
-    fn encode_images(
-        &self,
-        forward: &nn::Forward<'_>,
-        bucket: Bucket,
-        tokens: u32,
-        images: &[ImageShape],
-        patches: Operand,
-    ) -> Result<()> {
-        let layout = EncoderLayout {
-            rows: tokens,
-            tokens,
-            images: images.to_vec(),
+    /// Serves `batch` over `tables`: everything of [`Runner::execute`] but waiting for the
+    /// device when the step fails.
+    fn serve(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
+        let started = Instant::now();
+
+        // A batch that names no request carries copies alone.
+        if batch.requests.is_empty() {
+            return Ok(BatchOutput::default());
+        }
+        let (bucket, copies) = self.place(batch, tables)?;
+        self.fill(batch, &bucket)?;
+
+        let launched = Instant::now();
+        let outputs = match bucket.variant {
+            Variant::ConditionEncode => self.graphs.eager(&*self, &bucket)?,
+            _ => self.graphs.replay(&bucket)?,
+        };
+        let output = outputs.first().ok_or_else(|| {
+            Error::Invariant("an encode returns the conditioning it computed".into())
+        })?;
+
+        // Each prompt's rows, behind the encode on its stream.
+        let base = address(output)?;
+        let copies: Vec<DeviceCopy> = copies
+            .into_iter()
+            .map(|(offset, to, bytes)| (base + offset, to, bytes))
+            .collect();
+        // SAFETY: the output lies in the runner's region until its next forward, which this
+        // stream issues after the copies, and each destination is its row's writable
+        // conditioning block, which the buffer pool holds until the batch has ended.
+        unsafe { issue(&copies, self.stream.as_ref()) }?;
+        settle(self.stream.as_ref())?;
+
+        Ok(BatchOutput {
+            calls: vec![performed(); batch.requests.len()],
+            timing: TimingCounters {
+                host_us: launched.duration_since(started).as_micros() as u64,
+                device_us: launched.elapsed().as_micros() as u64,
+                ..TimingCounters::default()
+            },
+            forward_stats: None,
+        })
+    }
+}
+
+impl Runner for EncoderRunner {
+    fn phases(&self) -> &[Phase] {
+        PHASES
+    }
+
+    fn buckets(&self) -> Vec<Bucket> {
+        self.config.buckets.capture_order().copied().collect()
+    }
+
+    /// The encode of the prompt the runner prepared, padded to `bucket`, over the input
+    /// columns, with the vision blocks of a prompt encoded eagerly: `[rows, width]`, one output
+    /// row per row of the encode's layout.
+    fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
+        let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
+        let [
+            _,
+            positions,
+            slot_mapping,
+            seq_lens,
+            query_offsets,
+            logits_rows,
+        ] = extents(rows, tokens);
+
+        // A profile run computes over a prompt of its bucket's tokens like any other.
+        let prompt = {
+            let staged = self.prompt.borrow();
+            match staged.len() == tokens {
+                true => staged.clone(),
+                false => vec![0; tokens],
+            }
         };
 
-        // Each block reads its own run of the patch rows: `time × rows × columns` of them.
-        let width = patches.shape.dim(1);
-        let mut pixels = Vec::with_capacity(images.len());
-        let mut first = 0_u64;
-        for image in images {
-            let [time, height, columns] = image.grid;
-            let rows = u64::from(time) * u64::from(height) * u64::from(columns);
-            pixels.push(ImageInput {
-                pixels: patches
-                    .at(patches.offset_elements(first * width))
-                    .reshape(ops::Shape::new(&[rows, width])),
-            });
-            first += rows;
-        }
-
-        // One prompt alone: one row of `tokens` keys, whose bound is the bucket's.
-        let rows = u64::from(tokens);
-        let hidden_width = u64::from(self.shape.hidden.max(1));
         let batch = TokenBatch {
-            positions: self.columns.positions.extent(0..rows),
-            slot_mapping: self.columns.logits_rows.extent(0..rows.max(1)),
-            seq_lens: self.columns.seq_lens.extent(0..1),
-            query_offsets: self.columns.query_offsets.extent(0..2),
-            logits_rows: self.columns.logits_rows.extent(0..1),
+            positions: self.column(POSITIONS, positions, DType::I32)?,
+            slot_mapping: self.column(SLOT_MAPPING, slot_mapping, DType::U32)?,
+            seq_lens: self.column(SEQ_LENS, seq_lens, DType::U32)?,
+            query_offsets: self.column(QUERY_OFFSETS, query_offsets, DType::U32)?,
+            logits_rows: self.column(LOGITS_ROWS, logits_rows, DType::U32)?,
             phase: PhaseKind::Prefill,
+            // An encode reads no cache, and a row attends over its own tokens, which a bucket
+            // holds no more than.
             page_size: 0,
-            num_tokens: tokens,
+            num_tokens: bucket.tokens,
             max_kv_len: bucket.tokens,
             draft_lens: None,
             rope_positions: None,
+            live_tokens: None,
+            token_ids: None,
+            ngram_context: None,
         };
-        let hidden = self
-            .columns
-            .hidden
-            .extent(0..rows * hidden_width)
-            .reshape(ops::Shape::new(&[rows, hidden_width]));
-        self.model
-            .encode(
-                forward,
-                &EncoderPrompt { ids: &self.ids },
-                EncoderInputs {
-                    ids: self.columns.ids.extent(0..rows),
-                    batch,
-                    images: &pixels,
-                    layout: &layout,
-                },
-                EncoderOutputs { hidden },
-            )
-            .map_err(Error::from)
-    }
-}
 
-impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
-    /// Encodes `bucket`'s staged prompts on `forward`: the model call a capture walk records, the
-    /// staging walk before each replay repeats with the served prompt, and the recorded walk
-    /// records.
-    fn encode(&self, forward: &nn::Forward<'_>, bucket: Bucket) -> Result<()> {
-        let layout = self.layout(bucket);
-        let batch = self.token_batch(bucket)?;
-        let tokens = u64::from(bucket.tokens);
-        let width = u64::from(self.shape.hidden.max(1));
-        // The states are the column's first `tokens × width` elements: a warm capture writes them
-        // and so does every replay, at the offset a request's rows begin, which is why the region
-        // is the runner's rather than the walk's.
-        let hidden = self
-            .columns
-            .hidden
-            .extent(0..tokens * width)
-            .reshape(ops::Shape::new(&[tokens, width]));
-        let inputs = EncoderInputs {
-            ids: self.columns.ids.extent(0..tokens),
-            batch,
-            images: &[],
-            layout: &layout,
-        };
-        self.model
-            .encode(
-                forward,
-                &EncoderPrompt { ids: &self.ids },
-                inputs,
-                EncoderOutputs { hidden },
-            )
-            .map_err(Error::from)
-    }
-}
+        let images = self.images.borrow();
+        let grids: Vec<[u32; 3]> = images.iter().map(|(grid, _)| *grid).collect();
+        let pixels: Vec<Tensor> = images.iter().map(|(_, pixels)| pixels.clone()).collect();
+        let layout = self.model.layout(&batch, &grids);
 
-impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
-    fn phases(&self) -> &[ipc::PhaseId] {
-        &self.phases
+        let shape = (layout.rows as usize, self.config.width as usize);
+        // SAFETY: the encode writes every row of its layout before anything reads them.
+        let out = unsafe { Tensor::empty(shape, self.config.dtype, &self.graphs.device()) }?;
+        self.model.encode(
+            &prompt,
+            &self.column(IDS, tokens, DType::U32)?,
+            &batch,
+            &pixels,
+            &layout,
+            &out,
+        )?;
+        Ok(vec![out])
     }
 
-    fn stream(&self) -> Option<&platform::Stream> {
-        Some(&self.stream)
-    }
-
-    /// Serves one encode: choose its bucket, stage its columns, and return the replay (4.5).
-    ///
-    /// The bucket is chosen from the computation the batch states, never from how many tokens it
-    /// happens to carry: a media graph is captured for one extent, and a batch that a smaller bucket
-    /// could hold is still served by the bucket its computation names, because the alternative is a
-    /// graph whose capture assumed another canvas.
-    fn lifecycle_mut(&mut self) -> Option<&mut Lifecycle> {
-        Some(&mut self.lifecycle)
-    }
-
-    fn submit(&mut self, batch: Batch) -> Result<Jobs> {
-        let media = batch.media.clone().ok_or_else(|| {
-            Error::Invalid(
-                "an encoder runner serves a media batch; this one states no computation".into(),
-            )
-        })?;
-        media.check()?;
-        let computation = media.computation;
-        if computation.variant() != Some(Variant::Encode) {
-            return Err(Error::Invalid(format!(
-                "an encoder runner serves an encode; this batch states a {:?}",
-                computation.call
+    /// A prompt of zeros in one empty row: an encode that writes no request's conditioning.
+    fn idle_inputs(&self, bucket: &Bucket, columns: &mut [u8]) -> Result<()> {
+        if !self.config.buckets.contains(bucket) {
+            return Err(Error::Invariant(format!(
+                "bucket {bucket} is none the runner states"
             )));
         }
-        let bucket = self.buckets.select_media(&computation).ok_or_else(|| {
-            Error::Invalid(format!(
-                "no bucket was captured for {:?} of {} row(s) and {} token(s)",
-                computation.call, computation.rows, computation.tokens
-            ))
-        })?;
-        self.stage(&batch, bucket)?;
-        self.host_outputs.clone_from(&batch.host_outputs);
-        self.calls.clone_from(&batch.calls);
-        Ok(Jobs::new([Job::Replay {
-            runner: self.id,
-            bucket,
-            generation: batch.generation,
-            batch: batch.id,
-        }]))
-    }
+        let (rows, tokens) = (bucket.rows as usize, bucket.tokens as usize);
 
-    fn media_plan(&self) -> Vec<Bucket> {
-        self.capture_order()
-    }
-
-    fn capture_plan(&self) -> Vec<Bucket> {
-        self.capture_order()
-    }
-
-    fn cache(&self) -> Option<Arc<Mutex<crate::memory::prefix_cache::PrefixCache>>> {
-        // An encoder holds no paged cache: what it reads is the rows it was handed.
-        None
-    }
-
-    fn purge(&mut self, generation: u64) {
-        self.lifecycle.purge(generation);
-    }
-
-    fn attach_products(&mut self, products: Arc<dyn Products>) {
-        self.products = Some(products);
-    }
-
-    fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
-        self.lifecycle.attach_pools(pools);
-    }
-
-    fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
-        self.counters = Some(counters);
-    }
-
-    /// The encode every bucket's graph captures, and the eager encode of every admitted vision
-    /// prompt the bucket serves.
-    ///
-    /// A prompt with vision blocks is encoded alone (`stage`), so it rides a bucket of one row,
-    /// and only one of at least its vision tokens. It is walked at the bucket's whole token count,
-    /// the longest prompt that bucket serves, over placeholder patch rows of the media stage's
-    /// element type and width; its eager encode starts at the region's first address, as a walk
-    /// of its own does.
-    fn record_walk(&mut self) -> Result<Footprint> {
-        let mut footprint = Footprint::default();
-        let group = self.group.clone();
-        let patch_dtype = self.warm.patches.dtype;
-        let patch_width = u64::from(self.warm.patches.width());
-        for bucket in self.capture_order() {
-            footprint.walk(Some(bucket), |walk| {
-                self.encode(&walk.forward(group.as_deref())?, bucket)
-            })?;
-
-            if bucket.rows != 1 {
-                continue;
-            }
-            for prompt in &self.warm.prompts {
-                if prompt.tokens > bucket.tokens {
-                    continue;
-                }
-                let rows: u64 = prompt
-                    .images
-                    .iter()
-                    .map(|image| {
-                        image
-                            .grid
-                            .iter()
-                            .map(|extent| u64::from(*extent))
-                            .product::<u64>()
-                    })
-                    .sum();
-                footprint.walk(Some(bucket), |walk| {
-                    let patches =
-                        walk.placeholder(patch_dtype, ops::Shape::new(&[rows, patch_width]))?;
-                    self.encode_images(
-                        &walk.forward(group.as_deref())?,
-                        bucket,
-                        bucket.tokens,
-                        &prompt.images,
-                        patches,
-                    )
-                })?;
-            }
-        }
-        Ok(footprint)
-    }
-
-    fn serve(&mut self, job: &Job) -> Result<BatchOutput> {
-        match job {
-            Job::Replay {
-                bucket, generation, ..
-            } => {
-                // Every request's states are stored: they are read from the host encoder pool into
-                // the rows the encode would have written, and nothing is computed.
-                if self.imports_all() {
-                    let launched = std::time::Instant::now();
-                    self.vision = None;
-                    self.copy_host_outputs(true)?;
-                    self.publish()?;
-                    return Ok(BatchOutput {
-                        calls: answered(&mut self.calls),
-                        timing: TimingCounters {
-                            copy_us: launched.elapsed().as_micros() as u64,
-                            ..Default::default()
-                        },
-                        forward_stats: None,
-                    });
-                }
-                if let Some(prompt) = self.vision.take() {
-                    let launched = std::time::Instant::now();
-                    self.encode_vision(*bucket, *generation, prompt)?;
-                    self.copy_host_outputs(false)?;
-                    self.publish()?;
-                    return Ok(BatchOutput {
-                        calls: answered(&mut self.calls),
-                        timing: TimingCounters {
-                            device_us: launched.elapsed().as_micros() as u64,
-                            ..Default::default()
-                        },
-                        forward_stats: None,
-                    });
-                }
-                self.upload()?;
-                let (served, captured) = self
-                    .lifecycle
-                    .graphs
-                    .captured_for(*bucket, *generation)
-                    .ok_or_else(|| {
-                    Error::Invariant(format!(
-                        "no graph of bucket {bucket} in generation {generation} or in a \
-                             generation it replaces"
-                    ))
-                })?;
-                if served != *generation {
-                    tracing::debug!(
-                        bucket = %bucket,
-                        generation,
-                        served,
-                        "the bucket was prepared for an earlier generation; its programs did not change"
-                    );
-                }
-                let launched = std::time::Instant::now();
-                // The staging walk runs the encode the graph was captured from over the served
-                // prompt, so the values its captured copies read are this prompt's.
-                let group = self.group.clone();
-                self.lifecycle.replay(captured, |arena, staging| {
-                    let forward = crate::runners::denoiser::grouped(
-                        nn::Forward::staging(arena, staging),
-                        group.as_deref(),
-                    )?;
-                    self.encode(&forward, *bucket)
-                })?;
-                if let Some(counters) = &self.counters {
-                    counters.launches(captured.kernel_nodes());
-                }
-                // The encoded states are a product a denoise step of the same request reads, so
-                // they are named for it after this launch wrote them: the stream's order is what
-                // makes them readable, and the wait is the worker's on the runner's stream. The ones
-                // the engine reserved pages for are written there first.
-                self.copy_host_outputs(false)?;
-                self.publish()?;
-                Ok(BatchOutput {
-                    calls: answered(&mut self.calls),
-                    timing: TimingCounters {
-                        device_us: launched.elapsed().as_micros() as u64,
-                        ..Default::default()
-                    },
-                    forward_stats: None,
-                })
-            }
-            Job::Capture {
-                bucket, generation, ..
-            } => self
-                .capture(*bucket, *generation)
-                .map(|()| BatchOutput::default()),
-            Job::Rebind {
-                bucket, generation, ..
-            } => self
-                .rebind(*bucket, *generation)
-                .map(|()| BatchOutput::default()),
-            Job::Join { .. } => Err(Error::Invariant(
-                "an encoder runner joins no expert step".into(),
-            )),
-            Job::Shadow { operator, key, .. } => Err(Error::Invariant(format!(
-                "an encoder runner compares no operator, and the device asked it to shadow \
-                 {operator} {key}"
-            ))),
-            Job::Prepare { call, .. } => Err(Error::Invariant(format!(
-                "a runner that steps no trajectory was asked to prepare call {}",
-                call.0
-            ))),
-            // A host call is no device work: the media stage performs it, and a device runner
-            // handed one was given a job another runner returned.
-            Job::Host { call, .. } => Err(Error::Invariant(format!(
-                "a runner that serves device work was asked for host call {}",
-                call.0
-            ))),
-        }
-    }
-}
-
-impl<M: Encoder + Send + Sync + ?Sized> RunnerLifecycle for EncoderRunner<M> {
-    fn lifecycle(&mut self) -> &mut Lifecycle {
-        &mut self.lifecycle
-    }
-
-    /// Walks the encode once for `bucket`, recording every operator launch's nodes into the
-    /// generation's capture (4.5).
-    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
-        let stream = self.stream.clone();
-        if self.staged != Some(bucket) {
-            self.stage_warm(bucket)?;
-        }
-        let first = self
-            .lifecycle
-            .pool()?
-            .begin(self.lifecycle.stream_id(), bucket)?;
-        self.upload()?;
-        let arena = self.lifecycle.arena()?;
-        let group = self.group.clone();
-        let probes = crate::profiling::fences::capturing(&stream);
-        let staging = self.lifecycle.staging.captured(&stream)?;
-        let forward = crate::runners::denoiser::grouped(
-            nn::Forward::new(&stream, generation, &arena)
-                .with_staging(staging)
-                .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence)),
-            group.as_deref(),
-        )?;
-        self.encode(&forward, bucket)?;
-        if first {
-            self.lifecycle
-                .pool()?
-                .record(self.lifecycle.stream_id(), bucket, arena.peak())?;
+        *self.prompt.borrow_mut() = vec![0; tokens];
+        self.images.borrow_mut().clear();
+        for (column, elements) in extents(rows, tokens).into_iter().enumerate() {
+            let padding = if column == SLOT_MAPPING { NO_SLOT } else { 0 };
+            self.write(columns, column, std::iter::empty(), (elements, padding))?;
         }
         Ok(())
+    }
+
+    fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
+        let (bucket, ..) = self.place(batch, tables)?;
+        self.fill(batch, &bucket)?;
+        Ok(bucket)
+    }
+
+    /// Encodes every prompt of `batch` and writes its rows into the conditioning block its row
+    /// names (module documentation). It returns once the device has completed the encode, the
+    /// copies of its rows and the copies [`Runner::copy`] issued.
+    fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
+        let served = self.serve(batch, tables);
+        self.images.borrow_mut().clear();
+
+        // A step that failed still ends with what it issued.
+        let ended = match served {
+            Ok(_) => Ok(()),
+            Err(_) => settle(self.stream.as_ref()),
+        };
+        let output = served?;
+        ended?;
+        Ok(output)
+    }
+
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+
+    /// Issues the copies of products that start with the runner's next batch through the rank's
+    /// media memory (`BufferMemory::copy`), on the runner's stream ahead of the batch, whose end
+    /// covers them. A copy of other memory is refused.
+    fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
+        self.memory.copy(copies, self.stream.as_ref())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
 
-    /// A request's span is the pair of offsets the mechanism wrote, not the sum of the rows before
-    /// it: a batch whose first span begins at zero answers the same pair either way, and one that
-    /// does not is the case a sum would shift without saying so.
-    ///
-    /// The publisher reads this pair to place each request's rows in the hidden column, so a shift
-    /// here is a product that names another request's tokens - bytes that read as a prompt and are
-    /// not one.
+    use ipc::RequestId;
+    use ipc::batch::{Batch, BatchId, Columns, Extent, MediaRow, Phase, Rows, Shape, Variant};
+    use nn::TokenBatch;
+    use nn::capability::{Encoder, EncoderLayout};
+    use ops::Generation;
+    use storage::Key;
+    use storage::runtime::{Completion, GroupId, OwnerId, Request};
+    use uniserve_tensor::{DType, Tensor};
+
+    use super::{EncoderConfig, EncoderRunner};
+    use crate::buckets::{Bucket, Buckets};
+    use crate::graphs::Graphs;
+    use crate::memory::buffers::BufferMemory;
+    use crate::memory::tables::BlockTables;
+    use crate::runner::Runner;
+
+    /// The slot region and the product buffer, and the classes of the conditioning and the
+    /// vision pixels.
+    const SLOTS: u8 = 0;
+    const PRODUCTS: u8 = 2;
+    const CONDITIONING: u8 = 4;
+    const PIXELS: u8 = 5;
+    const GROUP: GroupId = GroupId(0);
+
+    /// The bytes of a conditioning row: four BF16 elements.
+    const ROW: usize = 8;
+
+    /// An encoder whose encode writes nothing: the tests read where its output goes.
+    struct Silent;
+
+    impl Encoder for Silent {
+        fn layout(&self, batch: &TokenBatch, images: &[[u32; 3]]) -> EncoderLayout {
+            EncoderLayout {
+                rows: batch.num_tokens,
+                tokens: batch.num_tokens,
+                images: images.to_vec(),
+            }
+        }
+
+        fn encode(
+            &self,
+            prompt: &[u32],
+            ids: &Tensor,
+            _: &TokenBatch,
+            _: &[Tensor],
+            layout: &EncoderLayout,
+            out: &Tensor,
+        ) -> nn::Result<()> {
+            assert_eq!(prompt.len(), ids.elem_count());
+            assert_eq!(out.dims(), [layout.rows as usize, 4]);
+            Ok(())
+        }
+    }
+
+    /// A runner over graphs that hold no device with an encode bucket of one row of eight
+    /// tokens and one of two rows of sixteen, both captured.
+    fn runner() -> EncoderRunner {
+        let config = EncoderConfig {
+            buckets: Buckets::new([
+                Bucket::prefill(1, 8, Variant::Encode),
+                Bucket::prefill(2, 16, Variant::Encode),
+            ]),
+            width: 4,
+            dtype: DType::BF16,
+            patches: None,
+            conditioning: CONDITIONING,
+            pixels: PIXELS,
+        };
+        let graphs = Graphs::meta(
+            Arc::new(Generation::new(0, [])),
+            EncoderRunner::input_bytes(&config),
+        );
+        let memory = BufferMemory::meta(0, (PRODUCTS, 64), (SLOTS, 4), 0, &[]).unwrap();
+        let runner =
+            EncoderRunner::new(Arc::new(Silent), config, graphs, None, Arc::new(memory)).unwrap();
+
+        runner.graphs().profile_run(&runner).unwrap();
+        for bucket in runner.buckets() {
+            runner.graphs().capture(&runner, &bucket).unwrap();
+        }
+        runner
+    }
+
+    /// Tables in which the requests on slots 1 and 2 hold their conditioning at position 3:
+    /// one unit from unit 0 for the first, from unit 5 for the second, the second's read-only
+    /// when `pinned`.
+    fn tables(pinned: bool) -> BlockTables {
+        let mut tables =
+            BlockTables::new(GROUP, &[SLOTS, PRODUCTS], &[(SLOTS, 256), (PRODUCTS, 256)]);
+        for (slot, run) in [(1, (PRODUCTS, 0, 1)), (2, (PRODUCTS, 5, 1))] {
+            let owner = OwnerId(u64::from(slot));
+            let attach = Request::Attach {
+                owner,
+                group: GROUP,
+            };
+            tables
+                .map(
+                    slot,
+                    storage::runtime::RequestId(0),
+                    &attach,
+                    &Completion::Attached { slot },
+                )
+                .unwrap();
+
+            let held: (Request, Completion) = match pinned && slot == 2 {
+                true => (
+                    Request::Pin {
+                        owner,
+                        class: CONDITIONING,
+                        at: 3,
+                        keys: vec![Key([2; 32])],
+                    },
+                    Completion::Pinned {
+                        runs: vec![run],
+                        host: 0,
+                    },
+                ),
+                false => (
+                    Request::Allocate {
+                        owner,
+                        class: CONDITIONING,
+                        at: 3,
+                        count: 1,
+                        units: 1,
+                    },
+                    Completion::Allocated {
+                        runs: vec![run],
+                        evicted: vec![],
+                    },
+                ),
+            };
+            tables
+                .map(slot, storage::runtime::RequestId(1), &held.0, &held.1)
+                .unwrap();
+        }
+        tables
+    }
+
+    /// A text encoding of a prompt of five tokens on slot 1 and one of three on slot 2, each
+    /// writing its conditioning at position `written`.
+    fn encoding(written: u32) -> Batch {
+        let row = |request: u64, slot: u32| MediaRow {
+            request: RequestId(request),
+            slot,
+            conditioning: Vec::new(),
+            step: 0,
+            steps: 0,
+            seed: 0,
+            width: 0,
+            height: 0,
+            frames: 0,
+            rounds: 0,
+            unit: 0,
+            rank: None,
+            image: None,
+            results: vec![written],
+            reads: 0,
+        };
+
+        Batch {
+            id: BatchId(3),
+            group: GROUP,
+            phase: Phase::TextEncode,
+            generation: 0,
+            shape: Shape {
+                rows: 2,
+                tokens: 8,
+                variant: Variant::Encode,
+                extent: Extent::None,
+            },
+            requests: vec![RequestId(10), RequestId(11)],
+            columns: Columns {
+                rows: Rows {
+                    positions: vec![0, 1, 2, 3, 4, 0, 1, 2],
+                    seq_lens: vec![5, 3],
+                    query_offsets: vec![0, 5, 8],
+                    logits_rows: vec![4, 7],
+                    ..Rows::default()
+                },
+                input_ids: vec![7; 8],
+                ..Columns::default()
+            },
+            media: vec![row(10, 1), row(11, 2)],
+            new_slots: Vec::new(),
+        }
+    }
+
     #[test]
-    fn a_span_is_the_offsets_and_not_a_running_sum() {
+    fn a_batch_s_prompts_are_encoded_into_the_conditioning_blocks_its_rows_name() {
+        let mut runner = runner();
+        let (tables, batch) = (tables(false), encoding(3));
+
+        // The two prompts ride the two-row bucket, captured.
+        let (bucket, copies) = runner.place(&batch, &tables).unwrap();
+        assert_eq!(bucket, Bucket::prefill(2, 16, Variant::Encode));
+        assert_eq!(runner.prepare_inputs(&batch, &tables).unwrap(), bucket);
+
+        // Over host mirrors of the encode's output and the product buffer, each prompt's rows
+        // land in its own block.
+        let output: Vec<u8> = (0..16 * ROW).map(|byte| byte as u8).collect();
+        let mut products = vec![0_u8; 64 * 256];
+        for (from, to, bytes) in copies {
+            let (from, to, bytes) = (from as usize, to as usize, bytes as usize);
+            products[to..to + bytes].copy_from_slice(&output[from..from + bytes]);
+        }
+        assert_eq!(products[..5 * ROW], output[..5 * ROW]);
         assert_eq!(
-            spans(&[0, 4, 6, 6]).expect("a tiling of the batch's own rows"),
-            vec![(0, 4), (4, 2), (6, 0)]
+            products[5 * 256..5 * 256 + 3 * ROW],
+            output[5 * ROW..8 * ROW]
         );
-        assert_eq!(
-            spans(&[5, 9]).expect("a batch whose first span begins at row five"),
-            vec![(5, 4)]
-        );
-        assert!(
-            spans(&[9, 5]).is_err(),
-            "a span that runs backwards is refused rather than wrapped"
-        );
+        assert!(products[5 * ROW..5 * 256].iter().all(|byte| *byte == 0));
+
+        // A result the tables hold no block at, and a block the request may only read, refuse
+        // the batch.
+        assert!(runner.place(&encoding(4), &tables).is_err());
+        assert!(runner.place(&batch, &self::tables(true)).is_err());
     }
 }

@@ -43,6 +43,11 @@
 //! stand, which the slots keep. A forward of a prompt or a decode leaves one standing, and a
 //! verification its accepted tokens (`speculation`). A paired forward advances neither.
 //!
+//! A runner lent a feature buffer ([`CausalLmRunner::set_features`]) serves prefills with image
+//! rows: before the replay the encoder output each image block names is copied from the block
+//! the rank's tables hold into the buffer, and the forward of every prefill bucket takes the
+//! marked rows' embeddings from it and lends the batch its rotary coordinates (`features`).
+//!
 //! ## A step
 //!
 //! Before a batch, the executor hands the runner the changes of the rank's device block table
@@ -117,7 +122,8 @@
 
 mod columns;
 pub mod experts;
-pub(crate) mod output;
+mod features;
+mod output;
 mod slots;
 pub mod speculation;
 pub mod wiring;
@@ -139,13 +145,16 @@ use uniserve_tensor::{DType, Shape, Tensor};
 
 use self::columns::{Column, Layout, Refusal};
 use self::experts::Member;
+use self::features::Features;
 use self::slots::Slots;
 use self::speculation::{DraftPool, DraftTable, Kept, Speculation};
 use crate::buckets::{Bucket, Buckets};
 use crate::graphs::Graphs;
+use crate::memory::buffers::BufferMemory;
 use crate::memory::state::layer_fields;
 use crate::memory::tables::{BlockCopy, BlockTables, Change};
 use crate::runner::Runner;
+use crate::runners::DeviceCopy;
 use crate::sampler::{self, Sampler, SamplerConfig};
 use crate::{Error, Result};
 
@@ -256,6 +265,8 @@ pub struct CausalLmRunner {
     speculation: Option<Speculation>,
     /// The stream the graphs replay on; `None` for graphs that hold no device.
     stream: Option<Stream>,
+    /// The feature buffer of prefills with image rows, for a runner lent one.
+    features: Option<Features>,
     /// The bytes of the input block of the step being prepared: a batch's columns are padded
     /// here, where a refusal costs nothing, before anything of the step is issued.
     staged: Vec<u8>,
@@ -453,6 +464,7 @@ impl CausalLmRunner {
             paired: Cell::new(false),
             union: None,
             stream,
+            features: None,
             staged: Vec::new(),
         };
 
@@ -574,6 +586,57 @@ impl CausalLmRunner {
     /// A hook's error fails the batch.
     pub fn set_page_work(&mut self, hook: PageWorkHook) {
         self.page_work = Some(hook);
+    }
+
+    /// The bytes of device memory the feature buffer of a runner of `model` under `config`
+    /// takes ([`CausalLmRunner::set_features`]): zero for a model without a vision tower.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a config with no bucket.
+    pub fn image_bytes(config: &CausalLmConfig, model: &dyn TextModel) -> Result<u64> {
+        Features::bytes(model, stated(config)?.1.tokens())
+    }
+
+    /// Lends the runner a feature buffer, [`CausalLmRunner::image_bytes`] of device memory it
+    /// allocates on its stream's device, through which its prefills place image rows: the
+    /// encoder output of an image block is the block of class `class` that the rank's tables
+    /// hold at the block's position, in `memory`, the rank's media memory. The runner also
+    /// issues through `memory` the copies of encoder outputs that start with its batches.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a model without a vision tower; the driver's refusal of the
+    /// allocation.
+    pub fn set_features(&mut self, memory: Arc<BufferMemory>, class: u8) -> Result<()> {
+        let features = Features::new(
+            &*self.model,
+            self.layout.tokens(),
+            self.stream.as_ref(),
+            memory,
+            class,
+        )?;
+
+        self.features = Some(features);
+        Ok(())
+    }
+
+    /// The copies that place `batch`'s image rows through `tables` (`features`); none for a
+    /// runner lent no feature buffer.
+    fn image_copies(&self, batch: &Batch, tables: &BlockTables) -> Result<Vec<DeviceCopy>> {
+        match &self.features {
+            Some(features) => features.copies(batch, tables),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Issues `copies`, those of [`CausalLmRunner::image_copies`], and marks `batch`'s image
+    /// rows, on the runner's stream ahead of the replay.
+    fn place_images(&mut self, batch: &Batch, copies: &[DeviceCopy]) -> Result<()> {
+        match self.features.as_mut() {
+            Some(features) => features.issue(batch, copies, self.stream.as_ref()),
+            None => Ok(()),
+        }
     }
 
     /// Makes the runner `member` of an expert union: its buckets become the capacity classes
@@ -712,13 +775,6 @@ impl CausalLmRunner {
             )));
         }
 
-        // Work the runner states no bucket for is refused by its name, never served as text.
-        if !columns.vision.is_empty() {
-            return Err(Error::Unsupported(format!(
-                "batch {} carries image rows, and this runner places no image features",
-                batch.id.0
-            )));
-        }
         let verify = match &self.speculation {
             Some(speculation) => {
                 // A refill evaluates positions behind its slot's own, and leaves the slot's
@@ -751,6 +807,17 @@ impl CausalLmRunner {
         };
 
         refuse_drawn_rows(shape.variant, &columns.parameters)?;
+
+        // Image rows are placed by the prefill of a runner lent a feature buffer, and work the
+        // runner states no bucket for is refused by its name, never served as text.
+        let prefill = !verify && !shape.variant.is_decode();
+        if !columns.vision.is_empty() && (self.features.is_none() || !prefill) {
+            return Err(Error::Unsupported(format!(
+                "batch {} carries image rows, which this runner places only in a prefill and \
+                 only when it is lent a feature buffer",
+                batch.id.0
+            )));
+        }
 
         // A verification is served from the verification bucket of its selection, whether its
         // batch states a decode's shape or a verification's.
@@ -1033,6 +1100,7 @@ impl CausalLmRunner {
         // A refused call writes nothing and fails alone; the others are served.
         let (mapping, refused) = self.slot_mapping(batch, tables)?;
         let masks = self.stage(batch, &base, tables, &mapping, false)?;
+        let images = self.image_copies(batch, tables)?;
 
         // The slot state's writes, ahead of the replay that reads them.
         self.slots.begin()?;
@@ -1046,6 +1114,7 @@ impl CausalLmRunner {
         if !masks.is_empty() {
             self.slots.ban(&masks)?;
         }
+        self.place_images(batch, &images)?;
 
         if let Some(hook) = self.page_work.as_mut() {
             hook(PageWork::BeforeReplay(batch, tables))?;
@@ -1287,10 +1356,18 @@ impl Runner for CausalLmRunner {
             None => None,
         };
 
+        // A prefill of a runner lent a feature buffer takes its image rows from it.
+        let images = self.features.as_ref().filter(|_| !decode);
+        let positions = self.column(Column::Positions, tokens)?;
+
         let batch = TokenBatch {
             token_ids: contexts.as_ref().map(|_| ids.clone()),
             ngram_context: contexts.clone(),
-            positions: self.column(Column::Positions, tokens)?,
+            rope_positions: match images {
+                Some(features) => Some(features.rope(&positions, tokens)?),
+                None => None,
+            },
+            positions,
             slot_mapping: self.column(Column::SlotMapping, tokens)?,
             seq_lens: self.column(Column::SeqLens, rows)?,
             query_offsets: self.column(Column::QueryOffsets, rows + 1)?,
@@ -1304,7 +1381,6 @@ impl Runner for CausalLmRunner {
             num_tokens: bucket.tokens,
             max_kv_len: self.config.max_kv_len,
             draft_lens: None,
-            rope_positions: None,
             live_tokens: Some(self.column(Column::LiveTokens, 1)?),
         };
         batch.check()?;
@@ -1326,6 +1402,10 @@ impl Runner for CausalLmRunner {
 
         let hidden = {
             let embedded = self.model.embed_input_ids(&ids)?;
+            let embedded = match images {
+                Some(features) => features.merge(&embedded, tokens)?,
+                None => embedded,
+            };
             self.model
                 .forward(&batch, &cache, state.as_ref(), exchange.as_ref(), &embedded)?
         };
@@ -1542,8 +1622,10 @@ impl Runner for CausalLmRunner {
         if let Some((_, reason)) = refused.first() {
             return Err(Error::Invalid(format!("batch {}: {reason}", batch.id.0)));
         }
+        let images = self.image_copies(batch, tables)?;
 
         self.fill(batch, &bucket, tables, &mapping, false)?;
+        self.place_images(batch, &images)?;
         Ok(bucket)
     }
 
@@ -1591,6 +1673,13 @@ impl Runner for CausalLmRunner {
                     .into(),
             ));
         }
+        if !batch.columns.vision.is_empty() {
+            return Err(Error::Unsupported(
+                "a paired forward of a prefill with image rows, whose feature buffer holds the \
+                 images of the batch served last"
+                    .into(),
+            ));
+        }
 
         let rows = &batch.columns.rows;
         let scratch = columns::scratch_column(
@@ -1602,6 +1691,8 @@ impl Runner for CausalLmRunner {
         )?;
 
         self.fill(batch, &bucket, tables, &scratch, true)?;
+        // No row an earlier batch's image marked stays marked.
+        self.place_images(batch, &[])?;
 
         // The rows' cached history reaches their scratch pages ahead of the forward.
         if let Some(hook) = self.page_work.as_mut() {
@@ -1622,8 +1713,13 @@ impl Runner for CausalLmRunner {
             Some(hook) => hook(PageWork::Ended),
             None => Ok(()),
         };
+        let settled = match self.features.as_mut() {
+            Some(features) => features.settle(self.stream.as_ref()),
+            None => Ok(()),
+        };
         let output = served?;
         ended?;
+        settled?;
         Ok(output)
     }
 
@@ -1646,14 +1742,21 @@ impl Runner for CausalLmRunner {
         }
     }
 
-    /// Issues `copies` through the page-work hook ([`PageWork::Copies`]); the next step's end
-    /// covers them ([`PageWork::Ended`]).
+    /// Issues `copies` through the page-work hook ([`PageWork::Copies`]), and those of encoder
+    /// outputs, for a runner lent a feature buffer, through the rank's media memory on its
+    /// stream; the next step's end covers them ([`PageWork::Ended`]).
     ///
     /// # Errors
     ///
-    /// What the hook refuses; [`Error::Unsupported`] for a copy with runs given to a runner
-    /// that was given nothing that issues copies.
+    /// What the hook or the media memory refuses; [`Error::Unsupported`] for a copy with runs
+    /// given to a runner that was given nothing that issues copies.
     fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
+        let copies = match self.features.as_mut() {
+            Some(features) => features.copy(copies, self.stream.as_ref())?,
+            None => copies.to_vec(),
+        };
+        let copies = copies.as_slice();
+
         match self.page_work.as_mut() {
             Some(hook) => hook(PageWork::Copies(copies)),
             None => match copies.iter().find(|copy| !copy.runs.is_empty()) {

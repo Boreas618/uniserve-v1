@@ -1,569 +1,821 @@
-//! A causal language model's image input on its rank: the vision encodings of token requests and
-//! the feature products their prefills read.
+//! `VisionRunner`: the vision tower of a causal language model on its text rank, which encodes
+//! a token request's image into the encoder output its prefills read.
 //!
-//! A token request's image reaches the rank twice. Its vision encoding (`ipc::MediaCall::
-//! VisionEncoding`) names the image's bytes and the feature product it writes
-//! (`ipc::execution::ImageEncoding`): the runner reads the image's size, sizes it by the model's
-//! processor rule ([`nn::capability::Vision::image_grid`]), and a host lane decodes, resizes and
-//! lays its pixels out as patch rows ([`ImageRead`]) while the device thread serves other work. The
-//! device thread then encodes them into the product's rows, which a slot of the rank's feature
-//! storage holds ([`Features`]); an encoding the host encoder pool already holds is copied in from
-//! its pages instead, and one the engine reserved pages for is copied out to them. A later prefill
-//! names the product in its columns (`ipc::execution::VisionRows`), and the runner writes its rows
-//! into the prefill's hidden rows before the stack runs. The engine frees a product once its last
-//! reader completed (`ipc::execution::Batch::frees`).
+//! A chat image's encoding is one media row of a `VisionEncode` batch: the image's bytes and,
+//! as its one result, the position of the request's encoder output in its encoder-output table.
+//! The runner sizes the image by the model's processor rule ([`Vision::image_grid`]), decodes,
+//! resizes and lays it out as the tower's patch rows on the host, directly into the input
+//! block, and encodes it on the device. The output is copied into the block the rank's tables
+//! hold at that position, of the encoder-output class:
 //!
-//! Every slot holds the largest image the processor sizes, which is what the engine's buffer pool
-//! books each encoding at, so the engine never asks for more encodings at once than the slots hold.
+//! | Bytes from the block's first | Hold |
+//! | --- | --- |
+//! | `rows · hidden · element` | `[rows, hidden]` features in the model's activation type |
+//! | `rows · axes · 4`, after them | `[rows, axes]` I32 rotary coordinates of the block from position 0 |
+//!
+//! [`VisionRunner::feature_bytes`] is the bytes of one row of it, which the rank states as
+//! `Capacity::feature_bytes`. The coordinates travel with the features because a prefill knows
+//! of an image block only its rows and the logical position it starts at, never the image's
+//! grid, and an output found cached was encoded for another request. A prefill moves them by
+//! the block's start on every axis ([`CausalLmRunner::set_features`]): the runner checks at
+//! construction that the model's coordinates from position `p` are those from 0 plus `p`.
+//!
+//! ## The bucket
+//!
+//! One bucket, the largest image's: a grid of [`Vision::max_image_rows`] rows, whose patch rows
+//! the input block holds, so every image the processor sizes fits it. Its profile run sizes the
+//! runner's region; an image of exactly that grid replays its captured graph, and every other
+//! grid runs eagerly over the same input block and region.
+//!
+//! [`CausalLmRunner::set_features`]: super::CausalLmRunner::set_features
 
-use std::collections::HashMap;
+use std::cell::Cell;
 use std::sync::Arc;
+use std::time::Instant;
 
+use ipc::batch::{Batch, BatchOutput, MediaRow, Phase, TimingCounters, Variant};
 use nn::capability::{PatchFormat, Vision};
-use ops::Operand;
-use platform::DeviceId;
-use uniserve_tensor::DType;
+use nn::family::TextModel;
+use platform::Stream;
+use uniserve_tensor::{DType, Tensor};
 
-use crate::host::{HostAction, Lane, Outcome};
-use crate::memory::encoders::EncoderHostPool;
+use super::{DeviceCopy, address, conditions, element_bytes, issue, performed, refused, settle};
+use crate::buckets::Bucket;
+use crate::graphs::Graphs;
+use crate::memory::buffers::BufferMemory;
+use crate::memory::tables::{BlockCopy, BlockTables};
+use crate::runner::Runner;
 use crate::{Error, Result};
 
-/// The encodings the rank's feature storage holds at once: as many images as one request reads
-/// whole, or the images of several requests.
-pub const FEATURE_ENTRIES: u32 = 8;
+/// The phase a vision runner serves.
+const PHASES: &[Phase] = &[Phase::VisionEncode];
 
-/// The device bytes the feature slots of a model take: [`FEATURE_ENTRIES`] encodings of `rows`
-/// rows of `row_bytes` each.
-pub fn feature_bytes(rows: u32, row_bytes: u64) -> u64 {
-    Features::bytes(rows, row_bytes)
+/// The bytes of one rotary coordinate of an encoder output: an I32.
+const COORDINATE_BYTES: u64 = 4;
+
+/// The runner of a causal language model's vision tower (module documentation).
+pub struct VisionRunner {
+    model: Arc<dyn TextModel>,
+    graphs: Graphs,
+    /// The stream the graphs replay on; `None` for graphs that hold no device.
+    stream: Option<Stream>,
+    /// The rank's media memory, where the encoder outputs lie.
+    memory: Arc<BufferMemory>,
+    /// The class of encoder outputs, in whose table a row names its output's position.
+    class: u8,
+    /// The grid of the largest image: the bucket's.
+    largest: [u32; 3],
+    /// The grid of the forward being prepared or run: the largest image's but while an image of
+    /// another grid is encoded.
+    grid: Cell<[u32; 3]>,
 }
 
-/// One image's pixels laid out as the tower reads them, on a host lane.
-pub struct ImageRead {
-    /// The image's encoded bytes.
-    bytes: Vec<u8>,
-    /// Its displayed size, `(width, height)`.
-    size: (u32, u32),
-    /// The patch grid the processor sized it to.
-    grid: [u32; 3],
-    /// How the tower reads the patches.
-    format: PatchFormat,
-}
+/// One image of a batch, read far enough to know its block: its encoded bytes, its displayed
+/// `(width, height)`, its patch grid and the address of the encoder output it is written to.
+type Sized = (Vec<u8>, (u32, u32), [u32; 3], u64);
 
-impl HostAction for ImageRead {
-    /// The patch rows, `[patches, width]` in the format's element type.
-    type Output = Vec<u8>;
-
-    fn run(&self) -> Result<Self::Output> {
-        let (width, height) = self.size;
-        let mut rgb = vec![0_u8; width as usize * height as usize * 3];
-        media::read::read_image(
-            &self.bytes,
-            &media::read::ImageTransform {
-                resized: (width, height),
-                window: (0, 0, width, height),
-            },
-            &mut rgb,
-        )
-        .map_err(|error| Error::Invalid(format!("decoding an input image: {error}")))?;
-        let element = ops::abi::bytes(self.format.dtype).unwrap_or(0) as usize;
-        let patches: usize = self.grid.iter().map(|extent| *extent as usize).product();
-        let mut out = vec![0_u8; patches * self.format.width() as usize * element];
-        super::media::pack_block(&self.format, &rgb, 1, (height, width), self.grid, &mut out)?;
-        Ok(out)
-    }
-
-    /// Nothing to release: the bytes are the action's own.
-    fn release(&self) -> Result<()> {
-        Ok(())
-    }
-
-    /// The bytes were decoded from the call's own payload, which no device work produces.
-    fn input_outcome(&self) -> Outcome {
-        Outcome::Success(())
-    }
-}
-
-/// One feature product the storage holds.
-#[derive(Clone, Copy, Debug)]
-struct Entry {
-    /// Its slot.
-    slot: u32,
-    /// The rows it holds.
-    rows: u32,
-    /// The image's patch grid, which places its rows' rotary coordinates.
-    grid: [u32; 3],
-}
-
-/// The rank's feature storage: slots of the largest encoding each, carved from the resident pool.
-pub(crate) struct Features {
-    storage: platform::Buffer,
-    /// The bytes of one feature row.
-    row_bytes: u64,
-    /// The rows one slot holds.
-    slot_rows: u32,
-    /// The products held, by their identity.
-    entries: HashMap<ipc::BufferId, Entry>,
-    /// The slots no product holds.
-    free: Vec<u32>,
-}
-
-impl Features {
-    /// The bytes [`FEATURE_ENTRIES`] slots of `slot_rows` rows of `row_bytes` take.
-    pub(crate) fn bytes(slot_rows: u32, row_bytes: u64) -> u64 {
-        u64::from(FEATURE_ENTRIES) * u64::from(slot_rows) * row_bytes
-    }
-
-    /// The storage over `storage`, of [`Self::bytes`] bytes.
-    fn new(storage: platform::Buffer, slot_rows: u32, row_bytes: u64) -> Self {
-        Self {
-            storage,
-            row_bytes,
-            slot_rows,
-            entries: HashMap::new(),
-            free: (0..FEATURE_ENTRIES).rev().collect(),
-        }
-    }
-
-    /// The `[rows, hidden]` view of slot `slot`.
-    fn view(&self, slot: u32, rows: u32, dtype: DType, hidden: u32) -> Operand {
-        let address =
-            self.storage.address() + u64::from(slot) * u64::from(self.slot_rows) * self.row_bytes;
-        Operand::new(
-            ops::DevicePtr::new(address),
-            dtype,
-            ops::Shape::new(&[u64::from(rows), u64::from(hidden)]),
-        )
-    }
-
-    /// Takes a slot for `product` of `rows` rows of an image of `grid`.
-    fn insert(&mut self, product: ipc::BufferId, rows: u32, grid: [u32; 3]) -> Result<u32> {
-        if rows > self.slot_rows {
-            return Err(Error::Invalid(format!(
-                "an image of {rows} feature rows exceeds the {} a slot holds",
-                self.slot_rows
-            )));
-        }
-        if self.entries.contains_key(&product) {
-            return Err(Error::Invariant(format!(
-                "feature product {product:?} was written twice"
-            )));
-        }
-        let slot = self.free.pop().ok_or_else(|| {
-            Error::Invariant(format!(
-                "every one of the {FEATURE_ENTRIES} feature slots holds a product: the engine \
-                 books no more encodings than the slots hold"
-            ))
-        })?;
-        self.entries.insert(product, Entry { slot, rows, grid });
-        Ok(slot)
-    }
-
-    /// Releases `product`'s slot; a product this rank never held is no fault, since the engine
-    /// frees a product on every rank of the batch's group.
-    fn free(&mut self, product: &ipc::BufferId) {
-        if let Some(entry) = self.entries.remove(product) {
-            self.free.push(entry.slot);
-        }
-    }
-}
-
-/// One vision encoding staged at submit, which the device thread performs.
-struct Staged {
-    request: ipc::RequestKey,
-    output: ipc::BufferId,
-    grid: [u32; 3],
-    rows: u32,
-    /// The host lane's read of the image's patches; `None` for an encoding the host encoder pool
-    /// holds, which is copied in instead.
-    read: Option<Arc<crate::host::HostTask<ImageRead>>>,
-    /// Where the encoding lies in the host encoder pool, when the engine found it or reserved
-    /// pages for it.
-    host: Option<ipc::HostOutput>,
-}
-
-/// One image block of the staged prefill, resolved against the storage.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Block {
-    /// The batch's token index of its first row.
-    pub(crate) token: u32,
-    /// The feature rows.
-    pub(crate) features: Operand,
-    /// The image's patch grid.
-    pub(crate) grid: [u32; 3],
-    /// The logical position of its first row.
-    pub(crate) start: u32,
-}
-
-/// The image input of a causal language model's runner.
-pub(crate) struct Images {
-    device: DeviceId,
-    /// How the tower reads an image's pixels.
-    format: PatchFormat,
-    /// The activation type and width of a feature row.
-    dtype: DType,
-    hidden: u32,
-    /// The rows of the largest image the processor sizes: one slot's rows.
-    slot_rows: u32,
-    /// The slots, once the device's pools are attached.
-    features: Option<Features>,
-    /// The host lane that reads images.
-    lane: Lane<ImageRead>,
-    /// The host encoder pool, and whether this rank writes the encodings it computes to it.
-    pool: Option<(Arc<EncoderHostPool>, bool)>,
-    /// The encodings of the batch submitted last, by call.
-    staged: Vec<Staged>,
-    /// The generation the batch submitted last names.
-    generation: u64,
-    /// Pinned host buffers the device reads in place, kept until the event behind their reader.
-    retained: Vec<(platform::Event, Vec<platform::PinnedBuffer>)>,
-}
-
-impl Images {
-    /// The image input of a model whose tower reads `format` and writes rows of `hidden` in
-    /// `dtype`, `slot_rows` for the largest image, its images read on `lane`.
-    pub(crate) fn new(
-        device: DeviceId,
-        format: PatchFormat,
-        dtype: DType,
-        hidden: u32,
-        slot_rows: u32,
-        lane: Lane<ImageRead>,
-    ) -> Self {
-        Self {
-            device,
-            format,
-            dtype,
-            hidden,
-            slot_rows,
-            features: None,
-            lane,
-            pool: None,
-            staged: Vec::new(),
-            generation: 0,
-            retained: Vec::new(),
-        }
-    }
-
-    /// The generation the batch submitted last names.
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// The bytes of one feature row.
-    pub(crate) fn row_bytes(&self) -> u64 {
-        u64::from(self.hidden) * ops::abi::bytes(self.dtype).unwrap_or(0)
-    }
-
-    /// The rows of the largest image: one slot's rows.
-    pub(crate) fn slot_rows(&self) -> u32 {
-        self.slot_rows
-    }
-
-    /// The patch rows of the largest image, which the recorded walk encodes.
-    pub(crate) fn largest_patches(&self) -> u32 {
-        self.slot_rows * self.format.merge * self.format.merge
-    }
-
-    /// The tower's patch format.
-    pub(crate) fn format(&self) -> PatchFormat {
-        self.format
-    }
-
-    /// Copies encodings from and to `pool`'s pages, writing those this rank computes when
-    /// `writes`.
-    pub(crate) fn with_pool(&mut self, pool: Arc<EncoderHostPool>, writes: bool) {
-        self.pool = Some((pool, writes));
-    }
-
-    /// Carves the slots from the device's resident pool.
-    pub(crate) fn bind(&mut self, pools: &mut crate::arena::Pools) -> Result<()> {
-        if self.features.is_some() {
-            return Ok(());
-        }
-        let bytes = Features::bytes(self.slot_rows, self.row_bytes());
-        let storage = pools.allocate(platform::PoolKind::Resident, bytes)?;
-        self.features = Some(Features::new(storage, self.slot_rows, self.row_bytes()));
-        Ok(())
-    }
-
-    fn features(&self) -> Result<&Features> {
-        self.features.as_ref().ok_or(Error::State(
-            "the feature slots are carved when the pools are attached",
-        ))
-    }
-
-    /// Releases the products a batch frees.
-    pub(crate) fn free(&mut self, products: &[ipc::BufferId]) {
-        if let Some(features) = self.features.as_mut() {
-            for product in products {
-                features.free(product);
-            }
-        }
-    }
-
-    /// Stages the vision encodings of `batch`, one per call in call order, starting each image's
-    /// read on the host lane.
-    pub(crate) fn stage(
-        &mut self,
-        vision: &dyn Vision,
-        batch: &ipc::execution::Batch,
-    ) -> Result<()> {
-        use base64::Engine as _;
-
-        if batch.images.len() != batch.calls.len() {
-            return Err(Error::Invalid(format!(
-                "a vision encoding batch of {} calls names {} images",
-                batch.calls.len(),
-                batch.images.len()
-            )));
-        }
-        self.staged.clear();
-        self.generation = batch.generation;
-        for encoding in &batch.images {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoding.image.as_bytes())
-                .map_err(|error| Error::Invalid(format!("an input image's base64: {error}")))?;
-            // The displayed size, orientation applied, as the reader decodes the pixels and the
-            // frontend sized the image's block.
-            let facts = media::probe::probe_image(&bytes)
-                .map_err(|error| Error::Invalid(format!("reading an input image: {error}")))?;
-            let grid = vision
-                .image_grid(facts.height, facts.width)
-                .map_err(Error::from)?;
-            let rows = vision.image_rows(grid).map_err(Error::from)?;
-            let host = batch
-                .host_outputs
-                .iter()
-                .find(|(request, _)| *request == encoding.request)
-                .map(|(_, output)| output.clone());
-            let import = host.as_ref().is_some_and(|output| output.import) && self.pool.is_some();
-            let read = if import {
-                None
-            } else {
-                Some(self.lane.admit(ImageRead {
-                    bytes,
-                    size: (facts.width, facts.height),
-                    grid,
-                    format: self.format,
-                })?)
-            };
-            self.staged.push(Staged {
-                request: encoding.request,
-                output: encoding.output,
-                grid,
-                rows,
-                read,
-                host,
-            });
-        }
-        Ok(())
-    }
-
-    /// Performs the staged encoding of call `index` on `stream` with `kernels`: the read's patches
-    /// encoded into the product's slot, or the stored encoding copied in. The tower's grid values
-    /// are uploaded through a slot of `staging`, the runner's staging regions.
-    pub(crate) fn encode(
-        &mut self,
-        vision: &dyn Vision,
-        index: usize,
-        stream: &platform::Stream,
-        (arena, staging): (&nn::Arena, &crate::staging::StagingRegion),
-        kernels: &Arc<ops::Generation>,
-        group: Option<&nn::Group>,
-    ) -> Result<()> {
-        // Pinned buffers whose reader completed are freed; the stream is never waited for here.
-        self.retained
-            .retain(|(read, _)| !matches!(read.query(), Ok(true)));
-        let staged = self.staged.get(index).ok_or_else(|| {
-            Error::Invariant(format!("no vision encoding was staged for call {index}"))
-        })?;
-        let (dtype, hidden) = (self.dtype, self.hidden);
-        let features = self.features.as_mut().ok_or(Error::State(
-            "the feature slots are carved when the pools are attached",
-        ))?;
-        let slot = features.insert(staged.output, staged.rows, staged.grid)?;
-        let out = features.view(slot, staged.rows, dtype, hidden);
-        let Some(read) = staged.read.as_ref() else {
-            // The host encoder pool holds the encoding.
-            return self.copy_host(index, out, true, stream);
-        };
-        let patches = match read.wait() {
-            Outcome::Success(patches) => patches,
-            Outcome::Failed(error) => {
-                return Err(Error::Invalid(format!(
-                    "request {}'s input image could not be read: {error}",
-                    staged.request.request_id.0
-                )));
-            }
-            Outcome::Cancelled => {
-                return Err(Error::State(
-                    "an input image's read was withdrawn before it ran",
-                ));
-            }
-        };
-        let grid = staged.grid;
-        let mut held = Vec::new();
-        let pixels = self.pinned(&patches, &mut held)?;
-        let patch_rows: u64 = grid.iter().map(|extent| u64::from(*extent)).product();
-        let pixels = Operand::new(
-            ops::DevicePtr::new(pixels),
-            self.format.dtype,
-            ops::Shape::new(&[patch_rows, u64::from(self.format.width())]),
-        );
-        let slot = staging.slot()?;
-        let forward = super::denoiser::grouped(
-            nn::Forward::new(stream, kernels, arena).with_staging(slot),
-            group,
-        )?;
-        vision
-            .encode_image(&forward, grid, pixels, out)
-            .map_err(Error::from)?;
-        staging.release(stream)?;
-        let read = platform::Event::new(platform::EventFlags::default());
-        read.record(stream)?;
-        self.retained.push((read, held));
-        self.copy_host(index, out, false, stream)
-    }
-
-    /// Copies `bytes` into a pinned host buffer pushed onto `held`, answering its address.
-    fn pinned(&self, bytes: &[u8], held: &mut Vec<platform::PinnedBuffer>) -> Result<u64> {
-        let mut buffer = platform::PinnedBuffer::new(self.device, bytes.len().max(1))?;
-        // SAFETY: the buffer was allocated above and no device work reads it yet.
-        unsafe {
-            buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        }
-        let address = buffer.address();
-        held.push(buffer);
-        Ok(address)
-    }
-
-    /// Copies between staged call `index`'s feature rows `features` and its stored encoding's
-    /// pages: from the pages when `import`, to them otherwise when this rank writes encodings.
-    /// The copies have completed when this returns, before the call's result lets the engine
-    /// release or commit the pages.
-    fn copy_host(
-        &self,
-        index: usize,
-        features: Operand,
-        import: bool,
-        stream: &platform::Stream,
-    ) -> Result<()> {
-        let (Some((pool, writes)), Some(output)) = (
-            self.pool.as_ref(),
-            self.staged
-                .get(index)
-                .and_then(|staged| staged.host.as_ref()),
-        ) else {
-            return if import {
-                Err(Error::Invariant(
-                    "an encoding read from the host encoder pool names no pool".into(),
-                ))
-            } else {
-                Ok(())
-            };
-        };
-        if output.import != import || (!import && !*writes) {
-            return Ok(());
-        }
-        if output.pool != pool.pool() || output.row_bytes != self.row_bytes() {
-            return Err(Error::Invalid(format!(
-                "a host output of pool {} with rows of {} bytes reached a rank of pool {} with \
-                 rows of {}",
-                output.pool,
-                output.row_bytes,
-                pool.pool(),
-                self.row_bytes()
-            )));
-        }
-        let rows = u64::from(output.rows[1] - output.rows[0]).min(features.rows());
-        let mut copied = false;
-        for copy in crate::memory::encoders::page_copies(
-            output.rows[0],
-            0..rows,
-            output.row_bytes,
-            pool.page_bytes(),
-        ) {
-            // An export leaves a page the pool holds already as it is.
-            let Some(slot) = output.slots.get(copy.page).copied().flatten() else {
-                continue;
-            };
-            let page = pool.view(slot)?.address() + copy.offset;
-            let row = features.ptr.address() + copy.output;
-            let (destination, source) = if import { (row, page) } else { (page, row) };
-            // SAFETY: the pages stay pinned or reserved until this call's result, the copies
-            // complete before this returns, and the feature slot is this product's alone.
-            unsafe { platform::memcpy_async(destination, source, copy.bytes as usize, stream) }?;
-            copied = true;
-        }
-        if copied {
-            stream.synchronize()?;
-        }
-        Ok(())
-    }
-
-    /// The image blocks of a prefill's `rows`, resolved to the products' slots.
+impl VisionRunner {
+    /// The bytes of the runner's input tensors for `model`: the patch rows of its largest image.
     ///
     /// # Errors
     ///
-    /// A block of a product this rank does not hold, or of other rows than its product's.
-    pub(crate) fn blocks(&self, rows: &[ipc::execution::VisionRows]) -> Result<Vec<Block>> {
-        let features = self.features()?;
-        rows.iter()
-            .map(|block| {
-                let entry = features.entries.get(&block.feature).ok_or_else(|| {
-                    Error::Invalid(format!(
-                        "a prefill reads feature product {:?}, which this rank does not hold",
-                        block.feature
-                    ))
-                })?;
-                if entry.rows != block.rows {
-                    return Err(Error::Invalid(format!(
-                        "a prefill places {} rows of an image whose features are {} rows",
-                        block.rows, entry.rows
-                    )));
+    /// [`Error::Invalid`] for a model without a vision tower, or whose tower sizes no image.
+    pub fn input_bytes(model: &dyn TextModel) -> Result<u64> {
+        let vision = tower(model)?;
+        patch_bytes(&vision.patch_format(), largest(vision)?)
+    }
+
+    /// The bytes of one row of the encoder output a runner of `model` writes (module
+    /// documentation): what the rank states as `Capacity::feature_bytes`, and zero for a model
+    /// without a vision tower, which encodes nothing.
+    pub fn feature_bytes(model: &dyn TextModel) -> u32 {
+        let Some(vision) = model.vision() else {
+            return 0;
+        };
+        let element = ops::abi::bytes(model.dtype()).unwrap_or(0);
+        let bytes = u64::from(model.hidden()) * element
+            + u64::from(vision.position_axes()) * COORDINATE_BYTES;
+
+        u32::try_from(bytes).unwrap_or(u32::MAX)
+    }
+
+    /// A runner of `model`'s vision tower over `graphs`, made for
+    /// [`VisionRunner::input_bytes`] bytes of input tensors, which replay on `stream` (`None`
+    /// for graphs that hold no device). It writes encoder outputs of class `class` in `memory`,
+    /// the rank's media memory.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a model without a vision tower, a stream without a device or the
+    /// reverse, graphs that hold fewer bytes than the input tensors, or a tower whose rotary
+    /// coordinates do not move with the position a block starts at.
+    pub fn new(
+        model: Arc<dyn TextModel>,
+        graphs: Graphs,
+        stream: Option<Stream>,
+        memory: Arc<BufferMemory>,
+        class: u8,
+    ) -> Result<Self> {
+        let vision = tower(&*model)?;
+        let largest = largest(vision)?;
+
+        if graphs.enter().is_ok() != stream.is_some() {
+            return Err(Error::Invalid(
+                "a vision runner takes the stream of its graphs, and none for graphs that hold \
+                 no device"
+                    .into(),
+            ));
+        }
+        let bytes = patch_bytes(&vision.patch_format(), largest)?;
+        if graphs.input(0, bytes as usize, DType::U8).is_err() {
+            return Err(Error::Invalid(format!(
+                "the graphs hold fewer than the {bytes} bytes of the largest image's patch rows"
+            )));
+        }
+
+        // A prefill moves a cached block's coordinates by its start (module documentation).
+        let from = |start| -> Result<Vec<i32>> {
+            Ok(vision
+                .image_positions(largest, start)?
+                .flatten_all()?
+                .to_vec1()?)
+        };
+        let (zero, one) = (from(0)?, from(1)?);
+        if zero.len() != one.len() || zero.iter().zip(&one).any(|(at, moved)| moved - at != 1) {
+            return Err(Error::Invalid(
+                "the vision tower's rotary coordinates of a block do not move with the position \
+                 it starts at"
+                    .into(),
+            ));
+        }
+
+        Ok(Self {
+            model,
+            graphs,
+            stream,
+            memory,
+            class,
+            largest,
+            grid: Cell::new(largest),
+        })
+    }
+
+    /// The model's vision tower.
+    fn vision(&self) -> Result<&dyn Vision> {
+        tower(&*self.model)
+    }
+
+    /// The bucket a forward of an image of `grid` runs as: the one bucket for the largest
+    /// image's grid, which is captured, and one that is not for any other.
+    fn bucket(&self, grid: [u32; 3]) -> Result<Bucket> {
+        let patches = grid
+            .iter()
+            .try_fold(1_u32, |product, extent| product.checked_mul(*extent))
+            .ok_or_else(|| Error::Invalid(format!("an image grid {grid:?} overflows")))?;
+
+        Ok(Bucket::prefill(1, patches, Variant::ConditionEncode))
+    }
+
+    /// Sizes the image of `row` and finds the block it is written to in `tables`: `Ok(Err(..))`
+    /// names an image the request sent that cannot be read or sized, which fails its call
+    /// alone.
+    ///
+    /// # Errors
+    ///
+    /// A row that is no image encoding of one result, or whose result the tables hold no
+    /// writable block of the image's bytes for.
+    fn size(
+        &self,
+        row: &MediaRow,
+        tables: &BlockTables,
+    ) -> Result<std::result::Result<Sized, String>> {
+        use base64::Engine as _;
+
+        let (Some(image), [position], 0) = (&row.image, row.results.as_slice(), row.reads) else {
+            return Err(Error::Invalid(format!(
+                "request {} is encoded by the vision runner with no image, or with results other \
+                 than its encoder output",
+                row.request.0
+            )));
+        };
+
+        let read = || -> std::result::Result<_, String> {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(image.as_bytes())
+                .map_err(|error| format!("an input image's base64: {error}"))?;
+
+            // The displayed size, orientation applied, as the reader decodes the pixels and
+            // the frontend sized the image's block.
+            let facts = media::probe::probe_image(&bytes)
+                .map_err(|error| format!("reading an input image: {error}"))?;
+            let grid = self
+                .vision()
+                .and_then(|vision| Ok(vision.image_grid(facts.height, facts.width)?))
+                .map_err(|error| format!("sizing an input image: {error}"))?;
+
+            Ok((bytes, (facts.width, facts.height), grid))
+        };
+        let (bytes, size, grid) = match read() {
+            Ok(read) => read,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+
+        let rows = self.vision()?.image_rows(grid)?;
+        let block = u64::from(rows) * u64::from(Self::feature_bytes(&*self.model));
+        let output = self.memory.lend(
+            tables,
+            (row.slot, self.class, *position),
+            true,
+            0,
+            &[block as usize],
+            DType::U8,
+        )?;
+        Ok(Ok((bytes, size, grid, address(&output)?)))
+    }
+
+    /// Decodes a sized image and lays its patch rows out into the input block of its bucket,
+    /// which it returns; `Ok(Err(..))` names an image that cannot be decoded, which fails its
+    /// call alone.
+    fn prepare(
+        &self,
+        (bytes, (width, height), grid, _): &Sized,
+    ) -> Result<std::result::Result<Bucket, String>> {
+        let mut rgb = vec![0_u8; *width as usize * *height as usize * 3];
+        let transform = media::read::ImageTransform {
+            resized: (*width, *height),
+            window: (0, 0, *width, *height),
+        };
+        if let Err(error) = media::read::read_image(bytes, &transform, &mut rgb) {
+            return Ok(Err(format!("decoding an input image: {error}")));
+        }
+
+        let format = self.vision()?.patch_format();
+        let patches = patch_bytes(&format, *grid)? as usize;
+        let bucket = self.bucket(*grid)?;
+
+        self.grid.set(*grid);
+        self.graphs.prepare_inputs(self, &bucket, |block| {
+            let out = block.get_mut(..patches).ok_or_else(|| {
+                Error::Invariant("an image's patch rows exceed the input block".into())
+            })?;
+            pack_block(&format, &rgb, 1, (*height, *width), *grid, out)
+        })?;
+        Ok(Ok(bucket))
+    }
+
+    /// Encodes a prepared image: its bucket's graph is replayed, or its forward run eagerly,
+    /// and its features and coordinates are copied into its block behind it.
+    fn encode(&self, bucket: &Bucket, (_, _, grid, block): &Sized) -> Result<()> {
+        let outputs = match *grid == self.largest {
+            true => self.graphs.replay(bucket)?,
+            false => self.graphs.eager(self, bucket)?,
+        };
+        let [features, coordinates] = outputs.as_slice() else {
+            return Err(Error::Invariant(
+                "a vision forward returns its features and their coordinates".into(),
+            ));
+        };
+
+        let features_bytes = (features.elem_count() as u64) * element_bytes(self.model.dtype())?;
+        let coordinates_bytes = coordinates.elem_count() as u64 * COORDINATE_BYTES;
+        let copies: [DeviceCopy; 2] = [
+            (address(features)?, *block, features_bytes),
+            (
+                address(coordinates)?,
+                block + features_bytes,
+                coordinates_bytes,
+            ),
+        ];
+
+        // SAFETY: the outputs lie in the runner's region until its next forward, which this
+        // stream issues after the copies, and the block is the row's writable encoder output,
+        // which the buffer pool holds until the batch has ended.
+        unsafe { issue(&copies, self.stream.as_ref()) }
+    }
+
+    /// Serves `batch` over `tables`: every image's block is found first, then each image is
+    /// read and encoded in turn, the host reading an image while the device encodes the one
+    /// before it. It waits for the device but when the step fails.
+    fn serve(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
+        let started = Instant::now();
+        if batch.requests.is_empty() {
+            return Ok(BatchOutput::default());
+        }
+        batch.check()?;
+
+        let sized = batch
+            .media
+            .iter()
+            .map(|row| self.size(row, tables))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut calls = Vec::with_capacity(sized.len());
+        let mut launched = None;
+        for image in sized {
+            let prepared = match image {
+                Ok(image) => self.prepare(&image)?.map(|bucket| (bucket, image)),
+                Err(refusal) => Err(refusal),
+            };
+            calls.push(match prepared {
+                Ok((bucket, image)) => {
+                    launched.get_or_insert_with(Instant::now);
+                    self.encode(&bucket, &image)?;
+                    performed()
                 }
-                Ok(Block {
-                    token: block.token,
-                    features: features.view(entry.slot, entry.rows, self.dtype, self.hidden),
-                    grid: entry.grid,
-                    start: block.start,
-                })
-            })
-            .collect()
+                Err(refusal) => refused(refusal),
+            });
+        }
+        settle(self.stream.as_ref())?;
+
+        // The device's time runs from the first launch to the end of the last copy.
+        let launched = launched.unwrap_or_else(Instant::now);
+        Ok(BatchOutput {
+            calls,
+            timing: TimingCounters {
+                host_us: launched.duration_since(started).as_micros() as u64,
+                device_us: launched.elapsed().as_micros() as u64,
+                ..TimingCounters::default()
+            },
+            forward_stats: None,
+        })
     }
 }
 
-/// The batch's rotary coordinates, `[axes, tokens]` axis-major: every token's text position on
-/// every axis, and each image block's rows at the coordinates the model states for its grid.
-///
-/// # Errors
-///
-/// A block past the batch's tokens, or what the model refuses.
-pub(crate) fn rope_positions(
-    vision: &dyn Vision,
-    positions: &[i32],
-    blocks: &[Block],
-) -> Result<Vec<i32>> {
-    let tokens = positions.len();
-    let axes = vision.position_axes() as usize;
-    let mut out: Vec<i32> = (0..axes).flat_map(|_| positions.iter().copied()).collect();
-    for block in blocks {
-        let first = block.token as usize;
-        let rows = vision.image_rows(block.grid).map_err(Error::from)? as usize;
-        if first + rows > tokens {
-            return Err(Error::Invalid(format!(
-                "an image block of rows {first}..{} lies past the batch's {tokens} tokens",
-                first + rows
+impl Runner for VisionRunner {
+    fn phases(&self) -> &[Phase] {
+        PHASES
+    }
+
+    fn buckets(&self) -> Vec<Bucket> {
+        self.bucket(self.largest).into_iter().collect()
+    }
+
+    /// The tower over the patch rows at the head of the input block, for the grid the runner
+    /// prepared: `[rows, hidden]` features, then their `[rows, axes]` I32 rotary coordinates
+    /// from position 0.
+    fn forward(&self, bucket: &Bucket) -> Result<Vec<Tensor>> {
+        let vision = self.vision()?;
+        let grid = self.grid.get();
+        if *bucket != self.bucket(grid)? {
+            return Err(Error::Invariant(format!(
+                "bucket {bucket} is not the one of the image grid {grid:?} being encoded"
             )));
         }
-        let mut slices: Vec<&mut [i32]> = out
-            .chunks_mut(tokens.max(1))
-            .map(|axis| &mut axis[first..first + rows])
-            .collect();
-        vision
-            .image_positions(block.grid, block.start, &mut slices)
-            .map_err(Error::from)?;
+
+        let format = vision.patch_format();
+        let pixels = self.graphs.input(
+            0,
+            (bucket.tokens as usize, format.width() as usize),
+            format.dtype,
+        )?;
+        let rows = vision.image_rows(grid)? as usize;
+        let device = self.graphs.device();
+
+        // SAFETY: the tower writes every element of the features before anything reads them.
+        let features = unsafe {
+            Tensor::empty(
+                (rows, self.model.hidden() as usize),
+                self.model.dtype(),
+                &device,
+            )
+        }?;
+        vision.encode_image(grid, &pixels, &features)?;
+
+        let coordinates = vision
+            .image_positions(grid, 0)?
+            .t()?
+            .contiguous()?
+            .to_device(&device)?;
+        Ok(vec![features, coordinates])
     }
-    Ok(out)
+
+    /// The largest image's grid over patch rows of zeros, which encode to rows no request reads.
+    fn idle_inputs(&self, bucket: &Bucket, columns: &mut [u8]) -> Result<()> {
+        if *bucket != self.bucket(self.largest)? {
+            return Err(Error::Invariant(format!(
+                "bucket {bucket} is none the runner states"
+            )));
+        }
+        self.grid.set(self.largest);
+        columns.fill(0);
+        Ok(())
+    }
+
+    /// Prepares the encode of a batch of one image, whose block `tables` hold.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runner::prepare_inputs`]; a batch of other than one image, or one the request sent
+    /// that cannot be read.
+    fn prepare_inputs(&mut self, batch: &Batch, tables: &BlockTables) -> Result<Bucket> {
+        let [row] = batch.media.as_slice() else {
+            return Err(Error::Invalid(format!(
+                "batch {} prepares {} images, and a vision runner prepares one",
+                batch.id.0,
+                batch.media.len()
+            )));
+        };
+        let image = self.size(row, tables)?.map_err(Error::Invalid)?;
+
+        self.prepare(&image)?.map_err(Error::Invalid)
+    }
+
+    /// Encodes every image of `batch` into the encoder output its row names (module
+    /// documentation). An image the request sent that cannot be read or sized fails its call
+    /// with the reason; the others are encoded.
+    fn execute(&mut self, batch: &Batch, tables: &BlockTables) -> Result<BatchOutput> {
+        let served = self.serve(batch, tables);
+        self.grid.set(self.largest);
+
+        // A step that failed still ends with what it issued.
+        let ended = match served {
+            Ok(_) => Ok(()),
+            Err(_) => settle(self.stream.as_ref()),
+        };
+        let output = served?;
+        ended?;
+        Ok(output)
+    }
+
+    fn graphs(&self) -> &Graphs {
+        &self.graphs
+    }
+
+    /// Issues the copies of encoder outputs between the product buffer and the host encoder
+    /// pool through the rank's media memory (`BufferMemory::copy`), on the runner's stream ahead
+    /// of its batch, whose end covers them. A copy of other memory, such as the KV cache's, is
+    /// refused.
+    fn copy(&mut self, copies: &[BlockCopy]) -> Result<()> {
+        self.memory.copy(copies, self.stream.as_ref())
+    }
+}
+
+/// `model`'s vision tower.
+fn tower(model: &dyn TextModel) -> Result<&dyn Vision> {
+    model.vision().ok_or_else(|| {
+        Error::Invalid("a vision runner was given a model without a vision tower".into())
+    })
+}
+
+/// The grid of the largest image `vision` sizes: one time step and [`Vision::max_image_rows`]
+/// rows, its sides the most nearly equal whole merge blocks that make them. The tower's work and
+/// memory follow its patch rows, which no image the processor sizes exceeds.
+fn largest(vision: &dyn Vision) -> Result<[u32; 3]> {
+    let rows = vision.max_image_rows();
+    let merge = vision.patch_format().merge;
+    let short = (1..=rows.isqrt())
+        .rev()
+        .find(|side| rows.is_multiple_of(*side))
+        .unwrap_or(1);
+
+    let grid = [1, short * merge, rows / short.max(1) * merge];
+    if rows == 0 || vision.image_rows(grid)? != rows {
+        return Err(Error::Invalid(format!(
+            "the vision tower sizes no image of {rows} rows to a grid of whole merge blocks"
+        )));
+    }
+    Ok(grid)
+}
+
+/// The bytes of the patch rows of an image of `grid` in `format`.
+fn patch_bytes(format: &PatchFormat, grid: [u32; 3]) -> Result<u64> {
+    let patches: u64 = grid.iter().map(|extent| u64::from(*extent)).product();
+    Ok(patches * u64::from(format.width()) * element_bytes(format.dtype)?)
+}
+
+/// One vision block's frames, `[frames, height, width, 3]` RGB at `raster`, as its patch rows.
+///
+/// The tower reads a grid's own pixels, so each frame is resized to the raster the processor sized
+/// the grid from ([`PatchFormat::raster`]) first and packed second.
+pub(crate) fn pack_block(
+    format: &PatchFormat,
+    rgb: &[u8],
+    frames: u32,
+    raster: (u32, u32),
+    grid: [u32; 3],
+    out: &mut [u8],
+) -> Result<()> {
+    let (height, width) = raster;
+    let (rows, columns) = format.raster(grid);
+    let planes = planes_of(rgb, frames as usize, height as usize, width as usize);
+    let planes = if (rows, columns) == (height, width) {
+        planes
+    } else {
+        let frame = 3 * height as usize * width as usize;
+        let mut resized = Vec::with_capacity(frames as usize * 3 * (rows * columns) as usize);
+        for source in planes.chunks_exact(frame) {
+            resized.extend(media::resample::bicubic_antialias_u8(
+                source, 3, height, width, rows, columns,
+            )?);
+        }
+        resized
+    };
+    conditions::patches(format, &planes, frames, grid, out)
+}
+
+/// `[frames, height, width, 3]` interleaved RGB as `[frames, 3, height, width]` planes.
+fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> {
+    let area = height * width;
+    let mut planes = vec![0_u8; frames * 3 * area];
+
+    // A reference image at its encoding size is seven million pixels on a request's critical path,
+    // so a frame's pixels are shared out in bands of its three planes.
+    let band = conditions::band(area, frames);
+    let mut bands = Vec::new();
+    for (frame, block) in planes.chunks_mut((3 * area).max(1)).enumerate() {
+        let (red, rest) = block.split_at_mut(area);
+        let (green, blue) = rest.split_at_mut(area);
+        let mut first = frame * area;
+        for ((red, green), blue) in red
+            .chunks_mut(band)
+            .zip(green.chunks_mut(band))
+            .zip(blue.chunks_mut(band))
+        {
+            let pixels = red.len();
+            bands.push((first, red, green, blue));
+            first += pixels;
+        }
+    }
+    conditions::share(&mut bands, |(first, red, green, blue)| {
+        let pixels = &rgb[*first * 3..(*first + red.len()) * 3];
+        for (index, pixel) in pixels.as_chunks::<3>().0.iter().enumerate() {
+            red[index] = pixel[0];
+            green[index] = pixel[1];
+            blue[index] = pixel[2];
+        }
+    });
+    planes
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::sync::Arc;
+
+    use base64::Engine as _;
+    use ipc::RequestId as CallRequest;
+    use ipc::batch::MediaRow;
+    use nn::capability::{CausalLm, PatchFormat, PixelNorm, Vision};
+    use nn::family::{CacheShape, ExpertShape, StateShape, TextModel};
+    use nn::{Drafter, ExpertExchange, KvCache, RecurrentState, TokenBatch};
+    use ops::Generation;
+    use storage::runtime::{Completion, GroupId, OwnerId, Request, RequestId, Run};
+    use uniserve_tensor::{DType, Device, Tensor};
+
+    use super::VisionRunner;
+    use crate::graphs::Graphs;
+    use crate::memory::buffers::BufferMemory;
+    use crate::memory::tables::BlockTables;
+    use crate::runner::Runner;
+
+    /// The width of a hidden row, the rows of the largest image and the patch rows' side.
+    pub(crate) const HIDDEN: usize = 8;
+    const MAX_ROWS: u32 = 6;
+    const SIDE: u32 = 2;
+    const MERGE: u32 = 2;
+
+    /// The slot region and the product buffer the tables name, and the encoder-output class.
+    pub(crate) const SLOTS: u8 = 0;
+    pub(crate) const PRODUCTS: u8 = 2;
+    pub(crate) const ENCODER: u8 = 3;
+    const GROUP: GroupId = GroupId(0);
+
+    /// A causal language model with a vision tower: rows of [`HIDDEN`] BF16 over three rotary
+    /// axes, and patch rows of `SIDE × SIDE` pixels merged `MERGE × MERGE`. Its forwards are
+    /// never run; its tower writes nothing.
+    pub(crate) struct Seeing;
+
+    impl CausalLm for Seeing {
+        fn embed_input_ids(&self, _: &Tensor) -> nn::Result<Tensor> {
+            unreachable!("the tests run no forward of the language model")
+        }
+
+        fn forward(
+            &self,
+            _: &TokenBatch,
+            _: &[KvCache],
+            _: Option<&RecurrentState>,
+            _: Option<&ExpertExchange>,
+            _: &Tensor,
+        ) -> nn::Result<Tensor> {
+            unreachable!("the tests run no forward of the language model")
+        }
+
+        fn compute_logits(&self, _: &Tensor) -> nn::Result<Tensor> {
+            unreachable!("the tests run no forward of the language model")
+        }
+    }
+
+    impl TextModel for Seeing {
+        fn hidden(&self) -> u32 {
+            HIDDEN as u32
+        }
+
+        fn vocabulary(&self) -> u32 {
+            16
+        }
+
+        fn dtype(&self) -> DType {
+            DType::BF16
+        }
+
+        fn cache(&self) -> CacheShape {
+            CacheShape {
+                layers: 1,
+                kv_heads: 1,
+                head_dim: 8,
+                index_keys: None,
+            }
+        }
+
+        fn state(&self) -> Option<StateShape> {
+            None
+        }
+
+        fn experts(&self) -> Option<ExpertShape> {
+            None
+        }
+
+        fn drafter(&self) -> Option<&dyn Drafter> {
+            None
+        }
+
+        fn vision(&self) -> Option<&dyn Vision> {
+            Some(self)
+        }
+    }
+
+    impl Vision for Seeing {
+        /// Whole merge blocks over the image, rounded up.
+        fn image_grid(&self, height: u32, width: u32) -> nn::Result<[u32; 3]> {
+            let block = SIDE * MERGE;
+            Ok([
+                1,
+                height.div_ceil(block) * MERGE,
+                width.div_ceil(block) * MERGE,
+            ])
+        }
+
+        fn patch_format(&self) -> PatchFormat {
+            PatchFormat {
+                side: SIDE,
+                temporal: 1,
+                merge: MERGE,
+                channels: 3,
+                norm: PixelNorm {
+                    mean: [0.5; 3],
+                    std: [0.5; 3],
+                },
+                dtype: DType::BF16,
+            }
+        }
+
+        fn image_rows(&self, grid: [u32; 3]) -> nn::Result<u32> {
+            Ok(grid[0] * grid[1] * grid[2] / (MERGE * MERGE))
+        }
+
+        fn max_image_rows(&self) -> u32 {
+            MAX_ROWS
+        }
+
+        fn position_axes(&self) -> u32 {
+            3
+        }
+
+        /// Row `k` of a block `columns` merged rows wide at `start + (0, k / columns, k %
+        /// columns)`.
+        fn image_positions(&self, grid: [u32; 3], start: u32) -> nn::Result<Tensor> {
+            let (rows, columns) = (self.image_rows(grid)?, grid[2] / MERGE);
+            let mut coordinates = Vec::new();
+            for axis in 0..3 {
+                coordinates.extend((0..rows).map(|row| {
+                    let along = [0, row / columns, row % columns][axis];
+                    (start + along) as i32
+                }));
+            }
+            Ok(Tensor::from_vec(
+                coordinates,
+                (3, rows as usize),
+                &Device::Cpu,
+            )?)
+        }
+
+        fn encode_image(&self, _: [u32; 3], _: &Tensor, _: &Tensor) -> nn::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The tables of one rank with an owner attached at each of `slots`.
+    pub(crate) fn tables(slots: &[u32]) -> BlockTables {
+        let mut tables =
+            BlockTables::new(GROUP, &[SLOTS, PRODUCTS], &[(SLOTS, 256), (PRODUCTS, 256)]);
+        for &slot in slots {
+            let attach = Request::Attach {
+                owner: OwnerId(u64::from(slot)),
+                group: GROUP,
+            };
+            tables
+                .map(slot, RequestId(0), &attach, &Completion::Attached { slot })
+                .unwrap();
+        }
+        tables
+    }
+
+    /// Gives `slot`'s owner the encoder output at `position`, the run `run`.
+    pub(crate) fn encoded(tables: &mut BlockTables, slot: u32, position: u32, run: Run) {
+        let allocate = Request::Allocate {
+            owner: OwnerId(u64::from(slot)),
+            class: ENCODER,
+            at: position,
+            count: 1,
+            units: run.2,
+        };
+        let allocated = Completion::Allocated {
+            runs: vec![run],
+            evicted: vec![],
+        };
+        tables
+            .map(slot, RequestId(1), &allocate, &allocated)
+            .unwrap();
+    }
+
+    /// A `width × height` 24-bit BMP of distinct pixels.
+    fn bmp(width: u32, height: u32) -> Vec<u8> {
+        let stride = (width * 3).next_multiple_of(4);
+        let pixels = stride * height;
+
+        let mut file = b"BM".to_vec();
+        for value in [54 + pixels, 0, 54, 40] {
+            file.extend(value.to_le_bytes());
+        }
+        file.extend(width.to_le_bytes());
+        file.extend(height.to_le_bytes());
+        file.extend(1_u16.to_le_bytes());
+        file.extend(24_u16.to_le_bytes());
+        for value in [0, pixels, 2835, 2835, 0, 0] {
+            file.extend(value.to_le_bytes());
+        }
+        file.extend((0..pixels).map(|byte| byte as u8));
+        file
+    }
+
+    /// The row that encodes `image` for the request on slot 1 into its encoder output at
+    /// position 2.
+    fn row(image: &[u8]) -> MediaRow {
+        MediaRow {
+            request: CallRequest(1),
+            slot: 1,
+            conditioning: Vec::new(),
+            step: 0,
+            steps: 0,
+            seed: 0,
+            width: 0,
+            height: 0,
+            frames: 0,
+            rounds: 0,
+            unit: 0,
+            rank: None,
+            image: Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(image)
+                    .into(),
+            ),
+            results: vec![2],
+            reads: 0,
+        }
+    }
+
+    #[test]
+    fn an_image_is_encoded_into_the_block_its_row_names_and_one_unread_fails_alone() {
+        let model = Arc::new(Seeing);
+        let graphs = Graphs::meta(
+            Arc::new(Generation::new(0, [])),
+            VisionRunner::input_bytes(&Seeing).unwrap(),
+        );
+        let memory = BufferMemory::meta(0, (PRODUCTS, 64), (SLOTS, 4), 0, &[]).unwrap();
+        let runner = VisionRunner::new(model, graphs, None, Arc::new(memory), ENCODER).unwrap();
+
+        // The largest image's bucket is profiled and captured.
+        runner.graphs().profile_run(&runner).unwrap();
+        for bucket in runner.buckets() {
+            runner.graphs().capture(&runner, &bucket).unwrap();
+        }
+        assert_eq!(runner.graphs().buckets(), runner.buckets());
+
+        // A row is `HIDDEN` BF16 features and three I32 coordinates.
+        assert_eq!(VisionRunner::feature_bytes(&Seeing), 16 + 12);
+
+        // An 8 × 4 image is two merged rows of a 2 × 4 grid: 56 bytes of its block at unit 3.
+        let mut tables = tables(&[1]);
+        encoded(&mut tables, 1, 2, (PRODUCTS, 3, 1));
+        let image = runner.size(&row(&bmp(8, 4)), &tables).unwrap().unwrap();
+        assert_eq!((image.1, image.2, image.3), ((8, 4), [1, 2, 4], 3 * 256));
+        let bucket = runner.prepare(&image).unwrap().unwrap();
+        assert_eq!(bucket.tokens, 8);
+
+        // Bytes that are no image fail their call; a result the tables hold no block for, or
+        // one too small for the image, fails the batch.
+        assert!(runner.size(&row(b"no image"), &tables).unwrap().is_err());
+        assert!(runner.size(&row(&bmp(8, 4)), &self::tables(&[1])).is_err());
+        assert!(runner.size(&row(&bmp(200, 200)), &tables).is_err());
+    }
 }

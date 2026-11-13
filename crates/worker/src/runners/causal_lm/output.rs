@@ -55,6 +55,7 @@ use uniserve_tensor::{Tensor, WithDType};
 use super::columns::Refusal;
 use super::speculation::token_rows;
 use crate::buckets::Bucket;
+use crate::runners::performed;
 use crate::sampler::scored;
 use crate::{Error, Result};
 
@@ -72,24 +73,6 @@ const fn length(value: i32) -> u32 {
 /// call past the column reads no other call's position.
 fn position(column: &[i32], index: usize) -> u32 {
     length(column.get(index).copied().unwrap_or(0))
-}
-
-/// A call's output before anything is known of it: performed, with no token and the default
-/// state.
-pub(crate) fn performed() -> CallOutput {
-    CallOutput {
-        status: CallStatus::Ok,
-        error_code: None,
-        error_message: None,
-        tokens: Vec::new(),
-        step_index: 0,
-        cache_computed_len: 0,
-        cache_visible_len: 0,
-        token_logprobs: Vec::new(),
-        prompt_logprobs: Vec::new(),
-        media_output: None,
-        draft_token_ids: Vec::new(),
-    }
 }
 
 /// The completion of the step that served the batch of `columns` from `bucket`, from the
